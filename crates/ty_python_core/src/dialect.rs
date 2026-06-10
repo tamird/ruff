@@ -39,6 +39,10 @@ impl SourceDialect {
     }
 }
 
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "Bazel and Starlark file suffixes are case-sensitive"
+)]
 fn is_starlark_path(path: &str) -> bool {
     path.ends_with(".bzl") || path.ends_with(".bzl.pyi")
 }
@@ -65,6 +69,10 @@ mod tests {
         );
         assert_eq!(
             SourceDialect::try_from_path(SystemPath::new("README.md")),
+            None
+        );
+        assert_eq!(
+            SourceDialect::try_from_path(SystemPath::new("rules.BZL")),
             None
         );
     }

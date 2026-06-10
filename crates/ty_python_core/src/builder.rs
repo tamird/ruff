@@ -241,7 +241,7 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     imported_modules: FxHashSet<ModuleName>,
     starlark_loads: FxHashSet<ExpressionNodeKey>,
     starlark_load_syntax_errors: FxHashMap<ExpressionNodeKey, StarlarkLoadSyntaxError>,
-    seen_starlark_non_load_statement: bool,
+    starlark_load_order: StarlarkLoadOrder,
     seen_submodule_imports: FxHashSet<String>,
     // A map from a lambda expression to its enclosing statement.
     enclosing_lambda_statements: FxHashMap<ExpressionNodeKey, Statement<'db>>,
@@ -264,6 +264,12 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
 
     /// Alias metadata for predicate leaf names in the current file.
     alias_predicates: FxHashMap<ExpressionNodeKey, NarrowingAliasPredicate<'db>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StarlarkLoadOrder {
+    LoadsAllowed,
+    LoadsDisallowed,
 }
 
 impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
@@ -304,7 +310,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             imported_modules: FxHashSet::default(),
             starlark_loads: FxHashSet::default(),
             starlark_load_syntax_errors: FxHashMap::default(),
-            seen_starlark_non_load_statement: false,
+            starlark_load_order: StarlarkLoadOrder::LoadsAllowed,
             generator_functions: FxHashSet::default(),
 
             enclosing_snapshots: FxHashMap::default(),
@@ -2557,7 +2563,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 ast::Stmt::Expr(ast::StmtExpr { value, .. }) if value.is_string_literal_expr()
             )
         {
-            self.seen_starlark_non_load_statement = true;
+            self.starlark_load_order = StarlarkLoadOrder::LoadsDisallowed;
         }
 
         let in_type_checking_block = self.in_type_checking_block;
@@ -3832,7 +3838,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                             kind: StarlarkLoadSyntaxErrorKind::NotTopLevel,
                             range: call.range(),
                         })
-                    } else if self.seen_starlark_non_load_statement {
+                    } else if self.starlark_load_order == StarlarkLoadOrder::LoadsDisallowed {
                         Some(StarlarkLoadSyntaxError {
                             kind: StarlarkLoadSyntaxErrorKind::AfterStatement,
                             range: call.range(),

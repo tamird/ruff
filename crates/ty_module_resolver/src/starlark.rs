@@ -129,6 +129,10 @@ fn is_package(db: &dyn Db, directory: &SystemPath) -> bool {
         .any(|marker| system_path_to_file(db, directory.join(marker)).is_ok())
 }
 
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "Bazel requires the exact lowercase .bzl suffix"
+)]
 fn is_valid_target(target: &str) -> bool {
     !target.contains(':') && target.ends_with(".bzl") && is_valid_relative_path(target, false)
 }
@@ -199,6 +203,10 @@ mod tests {
         );
         assert_eq!(
             resolve_starlark_load(&db, importer, ":../outside.bzl"),
+            Err(StarlarkLoadError::InvalidLabel)
+        );
+        assert_eq!(
+            resolve_starlark_load(&db, importer, ":lib.BZL"),
             Err(StarlarkLoadError::InvalidLabel)
         );
         assert_eq!(

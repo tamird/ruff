@@ -1469,7 +1469,7 @@ impl StarlarkLoadDefinitionKind {
 
     pub fn exported_name<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast str {
         match self.binding {
-            StarlarkLoadBindingIndex::Positional(index) => &self.call(module).arguments.args
+            StarlarkLoadBindingIndex::Positional(index) => self.call(module).arguments.args
                 [index as usize + 1]
                 .as_string_literal_expr()
                 .expect("Starlark load bindings should be string literals")
