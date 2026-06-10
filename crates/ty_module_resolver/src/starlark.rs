@@ -13,6 +13,8 @@ pub enum StarlarkLoadError {
     UnknownWorkspace,
     #[error("the Starlark file is outside a Bazel package")]
     UnknownPackage,
+    #[error("the load target crosses a Bazel package boundary")]
+    PackageBoundary,
     #[error("the loaded file does not exist")]
     NotFound,
 }
@@ -57,7 +59,7 @@ fn resolve_starlark_load_query(
     let workspace_root = find_ancestor(db, importing_path, None, is_workspace_root)
         .ok_or(StarlarkLoadError::UnknownWorkspace)?;
 
-    let target = if let Some(absolute) = label.strip_prefix("//") {
+    let (package_root, target) = if let Some(absolute) = label.strip_prefix("//") {
         let (package, target) = absolute
             .split_once(':')
             .ok_or(StarlarkLoadError::InvalidLabel)?;
@@ -68,17 +70,28 @@ fn resolve_starlark_load_query(
         if !is_package(db, &package_root) {
             return Err(StarlarkLoadError::UnknownPackage);
         }
-        package_root.join(target)
+        let target = package_root.join(target);
+        (package_root, target)
     } else if let Some(target) = label.strip_prefix(':') {
         if !is_valid_target(target) {
             return Err(StarlarkLoadError::InvalidLabel);
         }
-        find_ancestor(db, importing_path, Some(&workspace_root), is_package)
-            .ok_or(StarlarkLoadError::UnknownPackage)?
-            .join(target)
+        let package_root = find_ancestor(db, importing_path, Some(&workspace_root), is_package)
+            .ok_or(StarlarkLoadError::UnknownPackage)?;
+        let target = package_root.join(target);
+        (package_root, target)
     } else {
         return Err(StarlarkLoadError::InvalidLabel);
     };
+
+    if target.parent().is_some_and(|parent| {
+        parent
+            .ancestors()
+            .take_while(|directory| *directory != package_root.as_path())
+            .any(|directory| is_package(db, directory))
+    }) {
+        return Err(StarlarkLoadError::PackageBoundary);
+    }
 
     let implementation =
         system_path_to_file(db, &target).map_err(|_| StarlarkLoadError::NotFound)?;
@@ -172,6 +185,8 @@ mod tests {
                 ("BUILD.bazel", ""),
                 ("app/BUILD.bazel", ""),
                 ("app/use.bzl", ""),
+                ("app/sub/BUILD.bazel", ""),
+                ("app/sub/lib.bzl", ""),
                 ("app/stub-only.bzl.pyi", ""),
                 ("outside.bzl", ""),
             ])
@@ -193,6 +208,18 @@ mod tests {
         assert_eq!(
             resolve_starlark_load(&db, importer, "//missing:lib.bzl"),
             Err(StarlarkLoadError::UnknownPackage)
+        );
+        for label in ["//app:sub/lib.bzl", ":sub/lib.bzl"] {
+            assert_eq!(
+                resolve_starlark_load(&db, importer, label),
+                Err(StarlarkLoadError::PackageBoundary)
+            );
+        }
+        assert_eq!(
+            resolve_starlark_load(&db, importer, "//app/sub:lib.bzl")
+                .unwrap()
+                .path(&db),
+            &src.join("app/sub/lib.bzl")
         );
     }
 
