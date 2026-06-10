@@ -1509,7 +1509,9 @@ mod resolve_definition {
                     return Vec::new();
                 };
                 let definitions =
-                    find_symbol_in_scope(db, global_scope(db, loaded_file), exported_name);
+                    find_symbol_in_scope(db, global_scope(db, loaded_file), exported_name)
+                        .into_iter()
+                        .filter(|definition| definition.is_reexported(db));
 
                 let mut resolved = Vec::new();
                 for definition in definitions {

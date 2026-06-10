@@ -127,7 +127,10 @@ pub(super) mod test {
                 "main.bzl",
                 "load(\"//:reexports.bzl\", \"accepts_int\")\naccepts_int<CURSOR>(1)",
             )
-            .source("reexports.bzl", "load(\"//:defs.bzl\", \"accepts_int\")")
+            .source(
+                "reexports.bzl",
+                "load(\"//:defs.bzl\", _accepts_int = \"accepts_int\")\naccepts_int = _accepts_int",
+            )
             .source("defs.bzl", "def accepts_int(value: int) -> None:\n    pass")
             .build();
 
@@ -139,12 +142,41 @@ pub(super) mod test {
           | ^^^^^^^^^^^ Clicking here
           |
         info: Found 1 definition
-         --> defs.bzl:1:5
+         --> reexports.bzl:2:1
           |
-        1 | def accepts_int(value: int) -> None:
-          |     -----------
+        2 | accepts_int = _accepts_int
+          | -----------
           |
         ");
+    }
+
+    #[test]
+    fn goto_definition_starlark_implicit_reexport() {
+        let test = CursorTest::builder()
+            .source("MODULE.bazel", "")
+            .source("BUILD.bazel", "")
+            .source(
+                "main.bzl",
+                "load(\"//:reexports.bzl\", \"accepts_int\")\naccepts_int<CURSOR>(1)",
+            )
+            .source("reexports.bzl", "load(\"//:defs.bzl\", \"accepts_int\")")
+            .source("defs.bzl", "def accepts_int(value: int) -> None:\n    pass")
+            .build();
+
+        assert_snapshot!(test.goto_definition(), @r#"
+        info[goto-definition]: Go to definition
+         --> main.bzl:2:1
+          |
+        2 | accepts_int(1)
+          | ^^^^^^^^^^^ Clicking here
+          |
+        info: Found 1 definition
+         --> main.bzl:1:26
+          |
+        1 | load("//:reexports.bzl", "accepts_int")
+          |                          -------------
+          |
+        "#);
     }
 
     /// goto-definition on a module should go to the .py not the .pyi
