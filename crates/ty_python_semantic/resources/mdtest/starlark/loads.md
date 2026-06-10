@@ -208,32 +208,6 @@ load("//:a.bzl", "a")
 b = a
 ```
 
-## Project builtins
-
-`MODULE.bazel`:
-
-```text
-module(name = "test")
-```
-
-`BUILD.bazel`:
-
-```text
-# Package marker.
-```
-
-`__builtins__.pyi`:
-
-```pyi
-def fail(message: str) -> None: ...
-```
-
-`main.bzl`:
-
-```bzl
-fail(1)  # error: [invalid-argument-type]
-```
-
 ## Explicit re-exports
 
 `MODULE.bazel`:

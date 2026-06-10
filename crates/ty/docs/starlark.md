@@ -14,7 +14,6 @@ The initial end-to-end result is:
 
 1. Two annotated `.bzl` files connected by `load()`.
 1. A `.bzl.pyi` stub that supplies an unannotated dependency's interface.
-1. Starlark and Bazel builtins supplied without editing the checked source.
 1. A cross-file type error reported at its original `.bzl` source range.
 1. The same `.bzl` files continuing to load under stable Bazel.
 
@@ -56,15 +55,15 @@ Relevant upstream work:
     language separately from Python's implementation/stub source kind.
 - The prototype binds positional and renamed symbols from top-level `load()`
     calls and infers their types directly from the resolved file.
-- Main-repository absolute labels with an explicit target and same-directory
-    relative labels are supported. Repository-qualified labels and full Bazel
-    package discovery are not yet supported.
+- Main-repository `//package:file.bzl` and `:file.bzl` labels resolve from
+    Bazel repository and package markers. Repository-qualified labels are not
+    yet supported.
 - A sibling `.bzl.pyi` takes precedence over the loaded `.bzl` implementation,
     but does not make a missing implementation loadable.
-- Starlark loads re-export names from `.bzl.pyi` files without applying
-    Python's explicit-stub-re-export convention.
-- Invalid labels, missing loaded files, and missing exports currently become
-    `Unknown` without a Starlark-specific diagnostic.
+- Loaded names are private to the importing module unless explicitly assigned
+    to a public name, matching Bazel's export behavior.
+- Malformed loads, missing loaded files, and missing exports produce
+    deterministic diagnostics even when the loaded binding is unused.
 - Python module resolution only considers Python package names and `.py` or
     `.pyi` files.
 
@@ -85,8 +84,8 @@ parts of this project:
     evaluation.
 1. Starlark behavior must be explicit in the database. A `.bzl` file must not
     silently acquire Python semantics merely because both use the same parser.
-1. `load()` handling belongs in semantic indexing and module resolution, not
-    in preprocessing.
+1. Semantic indexing owns structural `load()` identity and local bindings;
+    tracked module resolution owns labels, packages, repositories, and stubs.
 1. Builtin declarations should eventually be generated from Bazel metadata,
     not maintained as a second handwritten API definition.
 1. The initial implementation should expose the smallest useful dialect
@@ -108,8 +107,8 @@ would create unrelated exhaustiveness and behavior changes.
 
 ### Loads and modules
 
-Recognize a top-level call with the Starlark `load()` shape during semantic
-indexing:
+Recognize a call with the Starlark `load()` shape during semantic indexing and
+validate that it is a top-level statement before other executable statements:
 
 ```starlark
 load("//pkg:lib.bzl", "name", local_name = "exported_name")
@@ -119,27 +118,29 @@ The first argument identifies a module. Positional string arguments bind the
 same exported and local name. Keyword arguments bind the keyword name locally
 to the string-valued exported name.
 
-Resolve the initial spike's labels relative to the importing file and workspace
-root. Later support apparent repository names using `bazel mod dump_repo_mapping` and resolve external repository roots through Bazel.
+Keep only the load expression and binding index in the semantic index. Resolve
+labels through a tracked module-resolver query when inference or IDE features
+need the target. Main-repository labels use the nearest Bazel repository and
+package markers. Later support apparent repository names using
+`bazel mod dump_repo_mapping` and resolve external repository roots through
+Bazel.
 
 ### Stubs
 
-Use `foo.bzl.pyi` as the sibling stub for `foo.bzl`. The final `.pyi` extension
-already gives the file stub semantics in ty, while the `.bzl` component makes
-the association unambiguous.
+Use `foo.bzl.pyi` as the sibling overlay for `foo.bzl`. This is a ty-specific
+Starlark interface convention, not a Python stub module. The final `.pyi`
+extension gives the file stub semantics in ty, while the `.bzl` component
+makes the association unambiguous.
 
 Sibling stubs are insufficient for external repositories. A later phase needs
 an explicit label-to-stub overlay whose keys are canonical Bazel labels.
 
 ### Builtins
 
-Use ty's existing project-level `__builtins__.pyi` support for the spike. Begin
-with only the Starlark values required by the fixture. Investigate generating
-the complete declaration set from Bazel's Starlark API metadata after the
-cross-file path works.
-
-This mechanism is project-wide, so a production design must avoid exposing
-Starlark-only builtins to Python files in mixed projects.
+Do not use ty's project-level `__builtins__.pyi`: it also changes Python files
+in a mixed project. Starlark builtins need a dialect-specific source that can
+eventually be generated from Bazel's Starlark API metadata. Until that source
+is designed, builtin coverage remains intentionally incomplete.
 
 ### Type semantics
 
@@ -198,7 +199,7 @@ Never use that override in a private or internal repository.
 - [x] M0: Discover and parse `.bzl` files in explicit Starlark mode.
 - [x] M1: Bind same-repository `load()` symbols without source rewriting.
 - [x] M2: Prefer a sibling `.bzl.pyi` over an implementation's exported types.
-- [x] M3: Supply minimal Starlark builtins and report a cross-file type error.
+- [ ] M3: Supply Starlark builtins without changing Python analysis.
 - [ ] M4: Add repository mapping and external repository resolution.
 - [ ] M5: Generate Bazel builtin declarations from an upstream source of truth.
 - [ ] M6: Review correctness, incrementality, architecture, and upstream fit.
@@ -212,7 +213,7 @@ Never use that override in a private or internal repository.
 | 2026-06-10 | Ruff `7dd5f3029d`              | Project branch baseline                                           | No project changes                                                      |
 | 2026-06-10 | `starlark-typing` working tree | `dialect_from_path` and `starlark_files_are_discovered`           | Passed                                                                  |
 | 2026-06-10 | `starlark-typing` working tree | Module-resolver Starlark tests                                    | Passed                                                                  |
-| 2026-06-10 | `starlark-typing` working tree | Starlark load, sibling-stub, and builtin mdtests                  | Passed; inline assertions retain consumer and declaration ranges        |
+| 2026-06-10 | `starlark-typing` working tree | Starlark load and sibling-overlay mdtests                         | Passed; inline assertions retain consumer and declaration ranges        |
 | 2026-06-10 | `starlark-typing` working tree | Transitive load typing and goto-definition tests                  | Passed; both resolve to the originating declaration                     |
 | 2026-06-10 | Bazel 9.1.1                    | `bazel query --lockfile_mode=off //...` in the checked-in fixture | Passed; stable Bazel evaluated the annotated load graph                 |
 | 2026-06-10 | `starlark-typing` working tree | `ty check crates/ty/tests/fixtures/starlark`                      | Passed on the same files evaluated by Bazel                             |
@@ -220,6 +221,8 @@ Never use that override in a private or internal repository.
 | 2026-06-10 | `starlark-typing` working tree | All 103 mdtest parser tests                                       | Passed                                                                  |
 | 2026-06-10 | `starlark-typing` working tree | `cargo check -p ty -p ty_test -p mdtest`                          | Passed                                                                  |
 | 2026-06-10 | `starlark-typing` working tree | Full tracked-file `prek` plus explicit new files                  | Passed using the OSS-only public PyPI override                          |
+| 2026-06-10 | `2877bf588d`                   | Resolver, index, semantic, incrementality, and IDE Starlark tests | Passed; eight focused tests across six binaries                         |
+| 2026-06-10 | `2877bf588d`                   | `invalid-starlark-load` with concise output                       | Passed; one source location and concise diagnostic                      |
 
 ## Decision log
 
@@ -232,9 +235,11 @@ Never use that override in a private or internal repository.
 | 2026-06-10 | Classify dialect in `ty_python_core`                              | Project discovery and semantic analysis share one language-level owner without changing Ruff's Python source model |
 | 2026-06-10 | Limit the first resolver to the main repository                   | This proves the type-checking contract before introducing Bazel server and bzlmod integration                      |
 | 2026-06-10 | Represent each loaded symbol as a dedicated definition            | Starlark loads retain their original AST nodes and Bazel labels without pretending to be Python imports            |
-| 2026-06-10 | Resolve loads to `File` and reuse public-symbol inference         | Cross-file type inference is shared while Python module naming and resolution remain separate                      |
+| 2026-06-10 | Store load syntax identity rather than resolved files             | Target resolution remains a tracked consumer query, preserving Salsa invalidation boundaries                       |
 | 2026-06-10 | Require the `.bzl` implementation before selecting a sibling stub | A stub supplies type information but must not make an invalid Bazel load appear valid                              |
-| 2026-06-10 | Do not apply Python stub re-export rules to Starlark loads        | Loaded Starlark globals retain Bazel's re-export behavior even when their types come from `.bzl.pyi`               |
+| 2026-06-10 | Require explicit assignment to re-export a loaded name            | Bazel does not expose a name merely because another module loaded it                                               |
+| 2026-06-10 | Resolve labels from Bazel repository and package markers          | `//` is repository-relative and `:` is package-relative, independent of the importing file's directory             |
+| 2026-06-10 | Reject project-wide builtins for Starlark                         | Reusing `__builtins__.pyi` would leak Starlark-only names into Python analysis                                     |
 
 ## Open questions
 
@@ -243,9 +248,9 @@ Never use that override in a private or internal repository.
     builtin stubs?
 - Which parts of `starpls` label resolution can be reused directly, and which
     should only inform an independent implementation?
-- Where should statement-level load validation live so one unresolved module
-    diagnostic is emitted per `load()` while missing exports remain anchored to
-    their individual bindings?
+- What source and database boundary can supply builtins only to Starlark files?
+- Which additional Starlark syntax differences must be rejected before this
+    can move beyond an experimental dialect?
 
 ## Progress log
 
@@ -265,17 +270,22 @@ Never use that override in a private or internal repository.
 - Added dedicated load definitions for positional and renamed bindings and
     connected them to cross-file public-symbol inference.
 - Validated cross-file call diagnostics and `.bzl.pyi` precedence end to end.
-- Validated a minimal real Starlark builtin through project-level
-    `__builtins__.pyi` alongside a cross-file load diagnostic.
 - Added a checked-in annotated fixture and validated the same load graph with
     stable Bazel 9.1.1 and the patched ty checker.
 - Validated transitive typing and goto-definition through two `load()` edges.
-- Required sibling stubs to accompany real implementations and preserved
-    Starlark re-exports through `.bzl.pyi` files.
+- Required sibling overlays to accompany real implementations and required
+    explicit assignments for Starlark re-exports.
 - Validated resolver invalidation when a stub appears and when its underlying
     implementation disappears.
 - Extended mdtest with `bzl` files and migrated Starlark semantic coverage from
     CLI snapshots to literate, multi-file tests.
-- Reviewed unresolved-load diagnostics, external repository resolution, and
-    dialect-specific builtins as the remaining architectural boundaries rather
-    than adding local compatibility behavior.
+- Moved target resolution out of semantic indexing so editing a dependency does
+    not invalidate the importer's structural index.
+- Corrected label resolution to use Bazel repository and package markers.
+- Added static load validation and deterministic diagnostics for unresolved
+    files and exports.
+- Ran adversarial reviews from ty, Bazel/Starlark, Rust performance, Python,
+    and general software-design perspectives. Accepted findings on ownership,
+    traversal, export semantics, package semantics, diagnostics, and builtin
+    isolation. Deferred external repositories, complete syntax rejection, and
+    generated builtins as explicit later milestones.
