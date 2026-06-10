@@ -58,6 +58,8 @@ Relevant upstream work:
 - Main-repository `//package:file.bzl` and `:file.bzl` labels resolve from
     Bazel repository and package markers. Repository-qualified labels are not
     yet supported.
+- Labels that enter a descendant Bazel package are rejected; the target must be
+    addressed through that package's own label.
 - A sibling `.bzl.pyi` takes precedence over the loaded `.bzl` implementation,
     but does not make a missing implementation loadable.
 - Loaded names are private to the importing module unless explicitly assigned
@@ -202,7 +204,7 @@ Never use that override in a private or internal repository.
 - [ ] M3: Supply Starlark builtins without changing Python analysis.
 - [ ] M4: Add repository mapping and external repository resolution.
 - [ ] M5: Generate Bazel builtin declarations from an upstream source of truth.
-- [ ] M6: Review correctness, incrementality, architecture, and upstream fit.
+- [x] M6: Review correctness, incrementality, architecture, and upstream fit.
 
 ## Validation record
 
@@ -214,7 +216,7 @@ Never use that override in a private or internal repository.
 | 2026-06-10 | `starlark-typing` working tree | `dialect_from_path` and `starlark_files_are_discovered`           | Passed                                                                  |
 | 2026-06-10 | `starlark-typing` working tree | Module-resolver Starlark tests                                    | Passed                                                                  |
 | 2026-06-10 | `starlark-typing` working tree | Starlark load and sibling-overlay mdtests                         | Passed; inline assertions retain consumer and declaration ranges        |
-| 2026-06-10 | `starlark-typing` working tree | Transitive load typing and goto-definition tests                  | Passed; both resolve to the originating declaration                     |
+| 2026-06-10 | `starlark-typing` working tree | Transitive load typing and goto-definition tests                  | Passed through valid load and explicit re-export edges                  |
 | 2026-06-10 | Bazel 9.1.1                    | `bazel query --lockfile_mode=off //...` in the checked-in fixture | Passed; stable Bazel evaluated the annotated load graph                 |
 | 2026-06-10 | `starlark-typing` working tree | `ty check crates/ty/tests/fixtures/starlark`                      | Passed on the same files evaluated by Bazel                             |
 | 2026-06-10 | `starlark-typing` working tree | Resolver filesystem-transition test                               | Passed; stub creation and implementation deletion invalidate resolution |
@@ -223,6 +225,10 @@ Never use that override in a private or internal repository.
 | 2026-06-10 | `starlark-typing` working tree | Full tracked-file `prek` plus explicit new files                  | Passed using the OSS-only public PyPI override                          |
 | 2026-06-10 | `2877bf588d`                   | Resolver, index, semantic, incrementality, and IDE Starlark tests | Passed; eight focused tests across six binaries                         |
 | 2026-06-10 | `2877bf588d`                   | `invalid-starlark-load` with concise output                       | Passed; one source location and concise diagnostic                      |
+| 2026-06-10 | `df91751f48`                   | Nested Bazel package-boundary resolution                          | Passed for repository-relative and package-relative labels              |
+| 2026-06-10 | `ca18aa6181`                   | Explicit and implicit re-export navigation                        | Passed; invalid traversal stops at the local load binding               |
+| 2026-06-10 | `f9e7303660`                   | Starlark-focused nextest run                                      | Passed; 11 tests across 11 binaries                                     |
+| 2026-06-10 | `f9e7303660`                   | Clippy for all affected crates, targets, and features             | Passed with warnings denied                                             |
 
 ## Decision log
 
@@ -240,6 +246,38 @@ Never use that override in a private or internal repository.
 | 2026-06-10 | Require explicit assignment to re-export a loaded name            | Bazel does not expose a name merely because another module loaded it                                               |
 | 2026-06-10 | Resolve labels from Bazel repository and package markers          | `//` is repository-relative and `:` is package-relative, independent of the importing file's directory             |
 | 2026-06-10 | Reject project-wide builtins for Starlark                         | Reusing `__builtins__.pyi` would leak Starlark-only names into Python analysis                                     |
+| 2026-06-10 | Reject labels that cross into descendant packages                 | Bazel assigns files below another package marker to that package                                                   |
+| 2026-06-10 | Apply explicit export rules to IDE navigation                     | Navigation must not cross a module boundary that inference rejects                                                 |
+
+## Review record
+
+Review rounds covered ty and Ruff architecture, Bazel and Starlark semantics,
+Rust performance, Python compatibility, and general API design.
+
+Accepted findings:
+
+- Keep target resolution out of semantic indexing and retain only AST identity
+    plus binding position there.
+- Visit the complete load expression structurally even though inference gives
+    it Starlark-specific behavior.
+- Require explicit re-exports in inference and IDE navigation.
+- Resolve labels from repository and package roots, and reject descendant
+    package crossings.
+- Keep Starlark builtins separate from Python project builtins.
+
+Rejected finding:
+
+- One review proposed allowing only a leading docstring before `load()`.
+    Bazel's `Resolver.checkLoadAfterStatement` ignores every top-level string
+    literal while finding the first non-load statement, so the implementation
+    intentionally does the same.
+
+Deferred findings:
+
+- External repositories and repository mappings belong in M4.
+- Complete rejection of Python syntax that Starlark does not support remains a
+    prerequisite for moving beyond the experimental dialect.
+- Dialect-specific, generated Starlark builtins belong in M3 and M5.
 
 ## Open questions
 
@@ -289,3 +327,7 @@ Never use that override in a private or internal repository.
     traversal, export semantics, package semantics, diagnostics, and builtin
     isolation. Deferred external repositories, complete syntax rejection, and
     generated builtins as explicit later milestones.
+- Rejected labels that cross nested Bazel package boundaries and aligned IDE
+    navigation with inference's explicit re-export requirement.
+- Completed the affected-crate clippy pass and an 11-test cross-crate Starlark
+    validation run.
