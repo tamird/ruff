@@ -161,6 +161,10 @@ impl<'db> Lister<'db> {
         }
 
         let Some(name) = path.file_name() else { return };
+        // Starlark stubs participate in label resolution, not Python module resolution.
+        if name.ends_with(".bzl.pyi") {
+            return;
+        }
         let mut module_path = self.search_path.to_module_path();
         module_path.push(name);
         let Some(module_name) = module_path.to_module_name() else {

@@ -31,6 +31,7 @@ fn should_consider_definition(kind: &DefinitionKind<'_>) -> bool {
         | DefinitionKind::ImportFrom(_)
         | DefinitionKind::ImportFromSubmodule(_)
         | DefinitionKind::StarImport(_)
+        | DefinitionKind::StarlarkLoad(_)
         | DefinitionKind::Function(_)
         | DefinitionKind::Class(_)
         | DefinitionKind::TypeAlias(_)

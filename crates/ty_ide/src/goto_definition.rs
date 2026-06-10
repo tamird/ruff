@@ -118,6 +118,33 @@ pub(super) mod test {
         ");
     }
 
+    #[test]
+    fn goto_definition_starlark_load() {
+        let test = CursorTest::builder()
+            .source(
+                "main.bzl",
+                "load(\"//:reexports.bzl\", \"accepts_int\")\naccepts_int<CURSOR>(1)",
+            )
+            .source("reexports.bzl", "load(\"//:defs.bzl\", \"accepts_int\")")
+            .source("defs.bzl", "def accepts_int(value: int) -> None:\n    pass")
+            .build();
+
+        assert_snapshot!(test.goto_definition(), @"
+        info[goto-definition]: Go to definition
+         --> main.bzl:2:1
+          |
+        2 | accepts_int(1)
+          | ^^^^^^^^^^^ Clicking here
+          |
+        info: Found 1 definition
+         --> defs.bzl:1:5
+          |
+        1 | def accepts_int(value: int) -> None:
+          |     -----------
+          |
+        ");
+    }
+
     /// goto-definition on a module should go to the .py not the .pyi
     ///
     /// TODO: this currently doesn't work right! This is especially surprising

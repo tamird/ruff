@@ -334,6 +334,7 @@ pub(crate) enum DefinitionNodeRef<'ast, 'db> {
     ImportFrom(ImportFromDefinitionNodeRef<'ast>),
     ImportFromSubmodule(ImportFromSubmoduleDefinitionNodeRef<'ast>),
     ImportStar(StarImportDefinitionNodeRef<'ast>),
+    StarlarkLoad(StarlarkLoadDefinitionNodeRef<'ast>),
     For(ForStmtDefinitionNodeRef<'ast, 'db>),
     Function(&'ast ast::StmtFunctionDef),
     Class(&'ast ast::StmtClassDef),
@@ -427,6 +428,12 @@ impl<'ast> From<ImportFromSubmoduleDefinitionNodeRef<'ast>> for DefinitionNodeRe
     }
 }
 
+impl<'ast> From<StarlarkLoadDefinitionNodeRef<'ast>> for DefinitionNodeRef<'ast, '_> {
+    fn from(node_ref: StarlarkLoadDefinitionNodeRef<'ast>) -> Self {
+        Self::StarlarkLoad(node_ref)
+    }
+}
+
 impl<'ast, 'db> From<ForStmtDefinitionNodeRef<'ast, 'db>> for DefinitionNodeRef<'ast, 'db> {
     fn from(value: ForStmtDefinitionNodeRef<'ast, 'db>) -> Self {
         Self::For(value)
@@ -511,6 +518,28 @@ pub(crate) struct ImportFromDefinitionNodeRef<'ast> {
 pub(crate) struct ImportFromSubmoduleDefinitionNodeRef<'ast> {
     pub(crate) node: &'ast ast::StmtImportFrom,
     pub(crate) module_index: usize,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum StarlarkLoadBindingNodeRef<'ast> {
+    Positional(&'ast ast::ExprStringLiteral),
+    Keyword(&'ast ast::Keyword),
+}
+
+impl StarlarkLoadBindingNodeRef<'_> {
+    fn key(self) -> DefinitionNodeKey {
+        match self {
+            Self::Positional(node) => node.into(),
+            Self::Keyword(node) => node.into(),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct StarlarkLoadDefinitionNodeRef<'ast> {
+    pub(crate) binding: StarlarkLoadBindingNodeRef<'ast>,
+    pub(crate) loaded_file: Option<File>,
+    pub(crate) exported_name: &'ast str,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -668,6 +697,22 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
                     symbol_id,
                 })
             }
+            DefinitionNodeRef::StarlarkLoad(StarlarkLoadDefinitionNodeRef {
+                binding,
+                loaded_file,
+                exported_name,
+            }) => DefinitionKind::StarlarkLoad(StarlarkLoadDefinitionKind {
+                binding: match binding {
+                    StarlarkLoadBindingNodeRef::Positional(node) => {
+                        StarlarkLoadBindingKind::Positional(AstNodeRef::new(parsed, node))
+                    }
+                    StarlarkLoadBindingNodeRef::Keyword(node) => {
+                        StarlarkLoadBindingKind::Keyword(AstNodeRef::new(parsed, node))
+                    }
+                },
+                loaded_file,
+                exported_name: Name::new(exported_name),
+            }),
             DefinitionNodeRef::Function(function) => {
                 DefinitionKind::Function(AstNodeRef::new(parsed, function))
             }
@@ -822,6 +867,7 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
                     should always have at least one `alias` with the name `*`.",
                 )
                 .into(),
+            Self::StarlarkLoad(node) => node.binding.key(),
 
             Self::Function(node) => node.into(),
             Self::Class(node) => node.into(),
@@ -916,6 +962,7 @@ pub enum DefinitionKind<'db> {
     ImportFrom(ImportFromDefinitionKind),
     ImportFromSubmodule(ImportFromSubmoduleDefinitionKind),
     StarImport(StarImportDefinitionKind),
+    StarlarkLoad(StarlarkLoadDefinitionKind),
     Function(AstNodeRef<ast::StmtFunctionDef>),
     Class(AstNodeRef<ast::StmtClassDef>),
     TypeAlias(AstNodeRef<ast::StmtTypeAlias>),
@@ -970,6 +1017,7 @@ impl<'db> DefinitionKind<'db> {
                 | DefinitionKind::ImportFrom(_)
                 | DefinitionKind::StarImport(_)
                 | DefinitionKind::ImportFromSubmodule(_)
+                | DefinitionKind::StarlarkLoad(_)
         )
     }
 
@@ -1015,6 +1063,7 @@ impl<'db> DefinitionKind<'db> {
             DefinitionKind::ImportFrom(import) => import.alias(module).range(),
             DefinitionKind::ImportFromSubmodule(import) => import.target_range(module),
             DefinitionKind::StarImport(import) => import.alias(module).range(),
+            DefinitionKind::StarlarkLoad(load) => load.target_range(module),
             DefinitionKind::Function(function) => function.node(module).name.range(),
             DefinitionKind::Class(class) => class.node(module).name.range(),
             DefinitionKind::TypeAlias(type_alias) => type_alias.node(module).name.range(),
@@ -1065,6 +1114,7 @@ impl<'db> DefinitionKind<'db> {
             DefinitionKind::ImportFrom(import) => import.alias(module).range(),
             DefinitionKind::ImportFromSubmodule(import) => import.module(module).range(),
             DefinitionKind::StarImport(import) => import.import(module).range(),
+            DefinitionKind::StarlarkLoad(load) => load.target_range(module),
             DefinitionKind::Function(function) => function.node(module).range(),
             DefinitionKind::Class(class) => class.node(module).range(),
             DefinitionKind::TypeAlias(type_alias) => type_alias.node(module).range(),
@@ -1122,6 +1172,7 @@ impl<'db> DefinitionKind<'db> {
             | DefinitionKind::Import(_)
             | DefinitionKind::ImportFrom(_)
             | DefinitionKind::StarImport(_)
+            | DefinitionKind::StarlarkLoad(_)
             | DefinitionKind::TypeVar(_)
             | DefinitionKind::ParamSpec(_)
             | DefinitionKind::TypeVarTuple(_) => DefinitionCategory::DeclarationAndBinding,
@@ -1383,6 +1434,58 @@ pub struct ImportFromSubmoduleDefinitionKind {
     module_index: u32,
 }
 
+#[derive(Clone, Debug, get_size2::GetSize)]
+enum StarlarkLoadBindingKind {
+    Positional(AstNodeRef<ast::ExprStringLiteral>),
+    Keyword(AstNodeRef<ast::Keyword>),
+}
+
+impl StarlarkLoadBindingKind {
+    fn target_range(&self, module: &ParsedModuleRef) -> TextRange {
+        match self {
+            Self::Positional(node) => node.node(module).range(),
+            Self::Keyword(node) => node
+                .node(module)
+                .arg
+                .as_ref()
+                .expect("Starlark load keyword bindings must be named")
+                .range(),
+        }
+    }
+
+    fn node<'ast>(&self, module: &'ast ParsedModuleRef) -> AnyNodeRef<'ast> {
+        match self {
+            Self::Positional(node) => AnyNodeRef::from(node.node(module)),
+            Self::Keyword(node) => AnyNodeRef::from(node.node(module)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, get_size2::GetSize)]
+pub struct StarlarkLoadDefinitionKind {
+    binding: StarlarkLoadBindingKind,
+    loaded_file: Option<File>,
+    exported_name: Name,
+}
+
+impl StarlarkLoadDefinitionKind {
+    pub fn target_range(&self, module: &ParsedModuleRef) -> TextRange {
+        self.binding.target_range(module)
+    }
+
+    pub fn binding_node<'ast>(&self, module: &'ast ParsedModuleRef) -> AnyNodeRef<'ast> {
+        self.binding.node(module)
+    }
+
+    pub fn loaded_file(&self) -> Option<File> {
+        self.loaded_file
+    }
+
+    pub fn exported_name(&self) -> &Name {
+        &self.exported_name
+    }
+}
+
 impl ImportFromSubmoduleDefinitionKind {
     pub fn import<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::StmtImportFrom {
         self.node.node(module)
@@ -1628,6 +1731,18 @@ impl DefinitionNodeKey {
 
 impl From<&ast::Alias> for DefinitionNodeKey {
     fn from(node: &ast::Alias) -> Self {
+        Self(NodeKey::from_node(node))
+    }
+}
+
+impl From<&ast::ExprStringLiteral> for DefinitionNodeKey {
+    fn from(node: &ast::ExprStringLiteral) -> Self {
+        Self(NodeKey::from_node(node))
+    }
+}
+
+impl From<&ast::Keyword> for DefinitionNodeKey {
+    fn from(node: &ast::Keyword) -> Self {
         Self(NodeKey::from_node(node))
     }
 }

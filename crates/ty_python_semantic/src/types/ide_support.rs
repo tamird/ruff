@@ -1493,6 +1493,32 @@ mod resolve_definition {
                 )
             }
 
+            DefinitionKind::StarlarkLoad(load) => {
+                if alias_resolution == ImportAliasResolution::PreserveAliases
+                    && symbol_name.is_some_and(|name| name != load.exported_name())
+                {
+                    return vec![ResolvedDefinition::Definition(definition)];
+                }
+
+                let Some(loaded_file) = load.loaded_file() else {
+                    return Vec::new();
+                };
+                let definitions =
+                    find_symbol_in_scope(db, global_scope(db, loaded_file), load.exported_name());
+
+                let mut resolved = Vec::new();
+                for definition in definitions {
+                    resolved.extend(resolve_definition_recursive(
+                        db,
+                        definition,
+                        visited,
+                        Some(load.exported_name()),
+                        alias_resolution,
+                    ));
+                }
+                resolved
+            }
+
             // For star imports, try to resolve to the specific symbol being accessed
             DefinitionKind::StarImport(star_import_def) => {
                 let file = definition.file(db);
@@ -1868,6 +1894,7 @@ mod resolve_definition {
             | DefinitionKind::ImportFrom(_)
             | DefinitionKind::ImportFromSubmodule(_)
             | DefinitionKind::StarImport(_)
+            | DefinitionKind::StarlarkLoad(_)
             | DefinitionKind::NamedExpression(_)
             | DefinitionKind::Assignment(_)
             | DefinitionKind::AnnotatedAssignment(_)

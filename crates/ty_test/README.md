@@ -8,9 +8,9 @@ under a certain directory as test suites.
 
 A Markdown test suite can contain any number of tests. A test consists of one or more embedded
 "files", each defined by a triple-backticks fenced code block. The code block must have a tag string
-specifying its language. We currently support `py` (Python files), `pyi` (type stub files), and
-`ipynb` (Jupyter notebook files), as well as [typeshed `VERSIONS`] files and `toml` for
-configuration.
+specifying its language. We currently support `py` (Python files), `pyi` (type stub files), `bzl`
+(Starlark files), and `ipynb` (Jupyter notebook files), as well as [typeshed `VERSIONS`] files and
+`toml` for configuration.
 
 The simplest possible test suite consists of just a single test, with a single embedded file:
 
@@ -230,6 +230,10 @@ this is a feature we will want to add in the future.
 
 So the above test creates two files, `/src/mdtest_snippet.py` and `/src/b.py`, and sets the workspace
 root to `/src/`, allowing imports from `b.py` using the module name `b`.
+
+Starlark tests use `bzl` code blocks. An unnamed block is written to
+`/src/mdtest_snippet.bzl`; explicit paths support multi-file `load()` tests. A sibling Starlark stub
+uses an explicit `.bzl.pyi` path with a `pyi` code block.
 
 ## Multi-test suites
 

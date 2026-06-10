@@ -212,6 +212,42 @@ fn configuration_include_no_extension() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn starlark_files_are_discovered() -> anyhow::Result<()> {
+    let case = CliTest::with_files([
+        (
+            "rules.bzl",
+            r#"
+            print(undefined_var)  # error: unresolved-reference
+            "#,
+        ),
+        (
+            "README.md",
+            r#"
+            print(ignored_undefined_var)
+            "#,
+        ),
+    ])?;
+
+    assert_cmd_snapshot!(case.command(), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    error[unresolved-reference]: Name `undefined_var` used when not defined
+     --> rules.bzl:2:7
+      |
+    2 | print(undefined_var)  # error: unresolved-reference
+      |       ^^^^^^^^^^^^^
+      |
+
+    Found 1 diagnostic
+
+    ----- stderr -----
+    ");
+
+    Ok(())
+}
+
 /// Test configuration file exclude functionality
 #[test]
 fn configuration_exclude() -> anyhow::Result<()> {

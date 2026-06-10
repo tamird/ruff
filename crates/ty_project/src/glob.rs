@@ -1,5 +1,5 @@
 use ruff_db::system::{System, SystemPath};
-use ruff_python_ast::PySourceType;
+use ty_python_core::SourceDialect;
 
 use crate::glob::include::MatchFile;
 pub(crate) use exclude::{ExcludeFilter, ExcludeFilterBuilder};
@@ -154,10 +154,7 @@ impl IncludeResult {
         };
 
         literal_match == Some(true)
-            || path
-                .extension()
-                .and_then(PySourceType::try_from_extension)
-                .or_else(|| system.source_type(path))
-                .is_some()
+            || SourceDialect::try_from_path(path).is_some()
+            || system.source_type(path).is_some()
     }
 }

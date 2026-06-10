@@ -6,7 +6,10 @@ use ty_module_resolver::{
 
 use crate::{
     Program, TypeQualifiers, add_inferred_python_version_hint_to_diagnostic,
-    place::{DefinedPlace, Definedness, Place, PlaceAndQualifiers, TypeOrigin},
+    place::{
+        DefinedPlace, Definedness, Place, PlaceAndQualifiers, RequiresExplicitReExport, TypeOrigin,
+        imported_symbol,
+    },
     types::{
         ModuleLiteralType, Type, TypeAndQualifiers,
         diagnostic::{
@@ -18,9 +21,51 @@ use crate::{
         infer_definition_types,
     },
 };
-use ty_python_core::definition::Definition;
+use ty_python_core::definition::{Definition, StarlarkLoadDefinitionKind};
 
 impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
+    pub(super) fn infer_starlark_load_definition(
+        &mut self,
+        load: &StarlarkLoadDefinitionKind,
+        definition: Definition<'db>,
+    ) {
+        let binding_node = load.binding_node(self.module());
+        let Some(loaded_file) = load.loaded_file() else {
+            self.add_unknown_declaration_with_binding(binding_node, definition);
+            return;
+        };
+
+        let PlaceAndQualifiers {
+            place:
+                Place::Defined(DefinedPlace {
+                    ty, definedness: _, ..
+                }),
+            qualifiers,
+        } = imported_symbol(
+            self.db(),
+            Some(loaded_file),
+            load.exported_name(),
+            Some(RequiresExplicitReExport::No),
+        )
+        else {
+            self.add_unknown_declaration_with_binding(binding_node, definition);
+            return;
+        };
+
+        self.add_declaration_with_binding(
+            binding_node,
+            definition,
+            &DeclaredAndInferredType::MightBeDifferent {
+                declared_ty: TypeAndQualifiers {
+                    inner: ty,
+                    origin: TypeOrigin::Declared,
+                    qualifiers,
+                },
+                inferred_ty: ty,
+            },
+        );
+    }
+
     pub(super) fn infer_import_statement(&mut self, import: &ast::StmtImport) {
         let ast::StmtImport {
             names,

@@ -19,7 +19,7 @@ use ruff_python_parser::semantic_errors::{
 };
 use ruff_text_size::{Ranged, TextRange};
 use smallvec::SmallVec;
-use ty_module_resolver::{ModuleName, resolve_module};
+use ty_module_resolver::{ModuleName, resolve_module, resolve_starlark_load};
 
 use crate::HasTrackedScope;
 use crate::ast_ids::AstIdsBuilder;
@@ -33,7 +33,8 @@ use crate::definition::{
     ImportFromDefinitionNodeRef, ImportFromSubmoduleDefinitionNodeRef,
     LambdaParameterDefinitionNodeRef, LoopHeaderDefinitionNodeRef, LoopStmtRef,
     MatchPatternDefinitionNodeRef, NestedBindingsDefinitionKind, ParameterDefinitionNodeRef,
-    StarImportDefinitionNodeRef, WithItemDefinitionNodeRef,
+    StarImportDefinitionNodeRef, StarlarkLoadBindingNodeRef, StarlarkLoadDefinitionNodeRef,
+    WithItemDefinitionNodeRef,
 };
 use crate::expression::{Expression, ExpressionKind};
 use crate::frozen::{FrozenMap, FrozenSet};
@@ -60,7 +61,7 @@ use crate::use_def::{
     EnclosingSnapshotKey, FlowSnapshot, FutureDefinitions, PreviousDefinitions, ScopedDefinitionId,
     ScopedEnclosingSnapshotId, UseDefMapBuilder,
 };
-use crate::{Db, Statement, StatementNodeKey};
+use crate::{Db, SourceDialect, Statement, StatementNodeKey};
 use crate::{
     DefinitionsByNode, EvaluationMode, ExpressionsScopeMap, LoopHeader, LoopToken,
     NarrowingAliasPredicate, PossiblyNarrowedPlaces, SemanticIndex, VisibleAncestorsIter,
@@ -194,6 +195,7 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     db: &'db dyn Db,
     file: File,
     source_type: PySourceType,
+    source_dialect: SourceDialect,
     module: &'ast ParsedModuleRef,
     scope_stack: Vec<ScopeInfo<'ast>>,
     /// The assignments we're currently visiting, with
@@ -234,6 +236,7 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     condition_flow_snapshots_by_node: FxHashMap<ExpressionNodeKey, ConditionFlowSnapshots>,
     statements_by_node: FxHashMap<StatementNodeKey, Statement<'db>>,
     imported_modules: FxHashSet<ModuleName>,
+    starlark_loads: FxHashSet<ExpressionNodeKey>,
     seen_submodule_imports: FxHashSet<String>,
     // A map from a lambda expression to its enclosing statement.
     enclosing_lambda_statements: FxHashMap<ExpressionNodeKey, Statement<'db>>,
@@ -264,6 +267,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             db,
             file,
             source_type: file.source_type(db),
+            source_dialect: SourceDialect::from_file(db, file),
             module: module_ref,
             scope_stack: Vec::new(),
             current_assignments: Vec::new(),
@@ -293,6 +297,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
             seen_submodule_imports: FxHashSet::default(),
             imported_modules: FxHashSet::default(),
+            starlark_loads: FxHashSet::default(),
             generator_functions: FxHashSet::default(),
 
             enclosing_snapshots: FxHashMap::default(),
@@ -2513,6 +2518,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             collections_by_use: FrozenMap::from(self.collections_by_use),
             uses_by_collection,
             imported_modules: Arc::new(FrozenSet::from(self.imported_modules)),
+            starlark_loads: FrozenSet::from(self.starlark_loads),
             has_future_annotations: self.has_future_annotations,
             enclosing_snapshots: FrozenMap::from(self.enclosing_snapshots),
             semantic_syntax_errors,
@@ -3793,6 +3799,67 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 range: _,
                 node_index: _,
             }) => {
+                if self.source_dialect == SourceDialect::Starlark
+                    && self.in_module_scope()
+                    && let Some(call) = value.as_call_expr()
+                    && call
+                        .func
+                        .as_name_expr()
+                        .is_some_and(|name| name.id == "load")
+                    && let Some((label, bindings)) = call.arguments.args.split_first()
+                    && let Some(label) = label.as_string_literal_expr()
+                    && bindings
+                        .iter()
+                        .all(|binding| binding.is_string_literal_expr())
+                    && call.arguments.keywords.iter().all(|binding| {
+                        binding.arg.is_some() && binding.value.is_string_literal_expr()
+                    })
+                {
+                    let loaded_file =
+                        resolve_starlark_load(self.db, self.file, label.value.to_str()).ok();
+
+                    for binding in bindings {
+                        let binding = binding
+                            .as_string_literal_expr()
+                            .expect("Starlark load bindings were validated above");
+                        let exported_name = binding.value.to_str();
+                        let symbol = self.add_symbol(Name::new(exported_name));
+                        self.add_definition(
+                            symbol.into(),
+                            StarlarkLoadDefinitionNodeRef {
+                                binding: StarlarkLoadBindingNodeRef::Positional(binding),
+                                loaded_file,
+                                exported_name,
+                            },
+                        );
+                    }
+
+                    for binding in &call.arguments.keywords {
+                        let local_name = binding
+                            .arg
+                            .as_ref()
+                            .expect("Starlark load keyword bindings were validated above");
+                        let exported_name = binding
+                            .value
+                            .as_string_literal_expr()
+                            .expect("Starlark load bindings were validated above")
+                            .value
+                            .to_str();
+                        let symbol = self.add_symbol(local_name.id.clone());
+                        self.add_definition(
+                            symbol.into(),
+                            StarlarkLoadDefinitionNodeRef {
+                                binding: StarlarkLoadBindingNodeRef::Keyword(binding),
+                                loaded_file,
+                                exported_name,
+                            },
+                        );
+                    }
+
+                    self.starlark_loads.insert(value.into());
+                    return;
+                }
+
                 if self.in_module_scope() {
                     if let Some(expr) = dunder_all_extend_argument(value) {
                         self.add_standalone_expression(expr);

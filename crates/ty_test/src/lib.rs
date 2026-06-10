@@ -152,9 +152,9 @@ fn run_test(
             assert!(
                 matches!(
                     embedded.lang,
-                    "py" | "pyi" | "python" | "ipynb" | "text" | "cfg" | "pth"
+                    "py" | "pyi" | "python" | "bzl" | "ipynb" | "text" | "cfg" | "pth"
                 ),
-                "Supported file types are: py (or python), pyi, ipynb, text, cfg and ignore"
+                "Supported file types are: py (or python), pyi, bzl, ipynb, text, cfg and ignore"
             );
 
             let mut full_path = embedded.full_path(&project_root);
@@ -202,7 +202,7 @@ fn run_test(
             db.write_file(&full_path, to_write).unwrap();
 
             if !(full_path.starts_with(&src_path)
-                && matches!(embedded.lang, "py" | "python" | "pyi" | "ipynb"))
+                && matches!(embedded.lang, "py" | "python" | "pyi" | "bzl" | "ipynb"))
             {
                 // These files need to be written to the file system (above), but we don't run any checks on them.
                 return None;
@@ -212,7 +212,7 @@ fn run_test(
 
             Some(TestFile {
                 file,
-                code_blocks: embedded.python_code_blocks.clone(),
+                code_blocks: embedded.checkable_code_blocks.clone(),
             })
         })
         .collect();

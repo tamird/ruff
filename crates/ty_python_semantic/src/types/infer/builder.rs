@@ -981,6 +981,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     definition,
                 );
             }
+            DefinitionKind::StarlarkLoad(load) => {
+                self.infer_starlark_load_definition(load, definition);
+            }
             DefinitionKind::Assignment(assignment) => {
                 self.infer_assignment_definition(assignment, definition);
             }
@@ -1670,6 +1673,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 value,
             }) = statement
             {
+                if self.index.is_starlark_load(value) {
+                    continue;
+                }
+
                 let ty = self.expression_type(value);
                 if ty.is_awaitable(self.db()) && !self.is_known_function_call(value) {
                     if let Some(builder) =
@@ -1696,7 +1703,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }) => {
                 // If this is a call expression, we would have added an `IsNonTerminalCall`
                 // constraint, meaning this will be a standalone expression.
-                self.infer_maybe_standalone_expression(value, TypeContext::default());
+                if !self.index.is_starlark_load(value) {
+                    self.infer_maybe_standalone_expression(value, TypeContext::default());
+                }
             }
             ast::Stmt::If(if_statement) => self.infer_if_statement(if_statement),
             ast::Stmt::Try(try_statement) => self.infer_try_statement(try_statement),

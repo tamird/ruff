@@ -44,6 +44,7 @@ pub mod ast_node_ref;
 mod builder;
 mod db;
 pub mod definition;
+mod dialect;
 pub mod expression;
 pub mod frozen;
 pub(crate) mod member;
@@ -61,6 +62,7 @@ pub mod symbol;
 pub mod unpack;
 mod use_def;
 pub use db::Db;
+pub use dialect::SourceDialect;
 pub mod program;
 
 /// Returns the semantic index for `file`.
@@ -347,6 +349,9 @@ pub struct SemanticIndex<'db> {
     /// The set of modules that are imported anywhere within this file.
     imported_modules: Arc<FrozenSet<ModuleName>>,
 
+    /// Top-level call expressions recognized as Starlark `load()` statements.
+    starlark_loads: FrozenSet<ExpressionNodeKey>,
+
     /// Flags about the global scope (code usage impacting inference)
     has_future_annotations: bool,
 
@@ -405,6 +410,10 @@ impl<'db> SemanticIndex<'db> {
     /// of why this analysis is intentionally limited.
     pub fn imported_modules(&self) -> impl Iterator<Item = &ModuleName> {
         self.imported_modules.iter()
+    }
+
+    pub fn is_starlark_load(&self, expression: &ast::Expr) -> bool {
+        self.starlark_loads.contains(&expression.into())
     }
 
     #[track_caller]

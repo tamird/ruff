@@ -12,6 +12,7 @@ pub use resolve::{
     resolve_real_module_confident, resolve_real_shadowable_module,
 };
 pub use settings::{SearchPathSettings, SearchPathSettingsError};
+pub use starlark::{StarlarkLoadError, resolve_starlark_load};
 pub use strategy::{FallibleStrategy, MisconfigurationStrategy, UseDefaultStrategy};
 pub use typeshed::{
     PyVersionRange, TypeshedVersions, TypeshedVersionsParseError, vendored_typeshed_versions,
@@ -29,6 +30,7 @@ mod module_name;
 mod path;
 mod resolve;
 mod settings;
+mod starlark;
 mod strategy;
 mod typeshed;
 
