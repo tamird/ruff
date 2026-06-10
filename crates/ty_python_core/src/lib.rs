@@ -1168,6 +1168,34 @@ mod tests {
     }
 
     #[test]
+    fn starlark_load_expression_is_indexed() {
+        let db = TestDbBuilder::new()
+            .with_file("test.bzl", "load(\"//:defs.bzl\", \"value\")")
+            .build()
+            .unwrap();
+        let file = system_path_to_file(&db, "test.bzl").unwrap();
+        let module = parsed_module(&db, file).load(&db);
+        let expression = module.syntax().body[0]
+            .as_expr_stmt()
+            .unwrap()
+            .value
+            .as_ref();
+        let call = expression.as_call_expr().unwrap();
+        let index = semantic_index(&db, file);
+
+        assert!(index.is_starlark_load(expression));
+        assert_eq!(index.expression_scope_id(expression), FileScopeId::global());
+        assert_eq!(
+            index.expression_scope_id(call.func.as_ref()),
+            FileScopeId::global()
+        );
+        assert_eq!(
+            index.expression_scope_id(&call.arguments.args[0]),
+            FileScopeId::global()
+        );
+    }
+
+    #[test]
     fn annotation_only() {
         let TestCase { db, file } = test_case("x: int");
         let scope = global_scope(&db, file);

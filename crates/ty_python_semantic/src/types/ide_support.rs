@@ -1494,17 +1494,22 @@ mod resolve_definition {
             }
 
             DefinitionKind::StarlarkLoad(load) => {
+                let file = definition.file(db);
+                let module = parsed_module(db, file).load(db);
+                let exported_name = load.exported_name(&module);
                 if alias_resolution == ImportAliasResolution::PreserveAliases
-                    && symbol_name.is_some_and(|name| name != load.exported_name())
+                    && symbol_name.is_some_and(|name| name != exported_name)
                 {
                     return vec![ResolvedDefinition::Definition(definition)];
                 }
 
-                let Some(loaded_file) = load.loaded_file() else {
+                let Ok(loaded_file) =
+                    ty_module_resolver::resolve_starlark_load(db, file, load.label(&module))
+                else {
                     return Vec::new();
                 };
                 let definitions =
-                    find_symbol_in_scope(db, global_scope(db, loaded_file), load.exported_name());
+                    find_symbol_in_scope(db, global_scope(db, loaded_file), exported_name);
 
                 let mut resolved = Vec::new();
                 for definition in definitions {
@@ -1512,7 +1517,7 @@ mod resolve_definition {
                         db,
                         definition,
                         visited,
-                        Some(load.exported_name()),
+                        Some(exported_name),
                         alias_resolution,
                     ));
                 }

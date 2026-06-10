@@ -520,26 +520,31 @@ pub(crate) struct ImportFromSubmoduleDefinitionNodeRef<'ast> {
     pub(crate) module_index: usize,
 }
 
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum StarlarkLoadBindingNodeRef<'ast> {
-    Positional(&'ast ast::ExprStringLiteral),
-    Keyword(&'ast ast::Keyword),
-}
-
-impl StarlarkLoadBindingNodeRef<'_> {
-    fn key(self) -> DefinitionNodeKey {
-        match self {
-            Self::Positional(node) => node.into(),
-            Self::Keyword(node) => node.into(),
-        }
-    }
+#[derive(Copy, Clone, Debug, get_size2::GetSize)]
+pub(crate) enum StarlarkLoadBindingIndex {
+    Positional(u32),
+    Keyword(u32),
 }
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct StarlarkLoadDefinitionNodeRef<'ast> {
-    pub(crate) binding: StarlarkLoadBindingNodeRef<'ast>,
-    pub(crate) loaded_file: Option<File>,
-    pub(crate) exported_name: &'ast str,
+    pub(crate) call: &'ast ast::ExprCall,
+    pub(crate) binding: StarlarkLoadBindingIndex,
+}
+
+impl StarlarkLoadDefinitionNodeRef<'_> {
+    fn key(self) -> DefinitionNodeKey {
+        match self.binding {
+            StarlarkLoadBindingIndex::Positional(index) => self.call.arguments.args
+                [index as usize + 1]
+                .as_string_literal_expr()
+                .expect("Starlark load bindings should be string literals")
+                .into(),
+            StarlarkLoadBindingIndex::Keyword(index) => {
+                (&self.call.arguments.keywords[index as usize]).into()
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -697,22 +702,12 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
                     symbol_id,
                 })
             }
-            DefinitionNodeRef::StarlarkLoad(StarlarkLoadDefinitionNodeRef {
-                binding,
-                loaded_file,
-                exported_name,
-            }) => DefinitionKind::StarlarkLoad(StarlarkLoadDefinitionKind {
-                binding: match binding {
-                    StarlarkLoadBindingNodeRef::Positional(node) => {
-                        StarlarkLoadBindingKind::Positional(AstNodeRef::new(parsed, node))
-                    }
-                    StarlarkLoadBindingNodeRef::Keyword(node) => {
-                        StarlarkLoadBindingKind::Keyword(AstNodeRef::new(parsed, node))
-                    }
-                },
-                loaded_file,
-                exported_name: Name::new(exported_name),
-            }),
+            DefinitionNodeRef::StarlarkLoad(StarlarkLoadDefinitionNodeRef { call, binding }) => {
+                DefinitionKind::StarlarkLoad(StarlarkLoadDefinitionKind {
+                    call: AstNodeRef::new(parsed, call),
+                    binding,
+                })
+            }
             DefinitionNodeRef::Function(function) => {
                 DefinitionKind::Function(AstNodeRef::new(parsed, function))
             }
@@ -867,7 +862,7 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
                     should always have at least one `alias` with the name `*`.",
                 )
                 .into(),
-            Self::StarlarkLoad(node) => node.binding.key(),
+            Self::StarlarkLoad(node) => node.key(),
 
             Self::Function(node) => node.into(),
             Self::Class(node) => node.into(),
@@ -992,6 +987,7 @@ impl<'db> DefinitionKind<'db> {
             DefinitionKind::Import(import) => import.is_reexported(),
             DefinitionKind::ImportFrom(import) => import.is_reexported(),
             DefinitionKind::ImportFromSubmodule(_) => true,
+            DefinitionKind::StarlarkLoad(_) => false,
             _ => true,
         }
     }
@@ -1435,54 +1431,58 @@ pub struct ImportFromSubmoduleDefinitionKind {
 }
 
 #[derive(Clone, Debug, get_size2::GetSize)]
-enum StarlarkLoadBindingKind {
-    Positional(AstNodeRef<ast::ExprStringLiteral>),
-    Keyword(AstNodeRef<ast::Keyword>),
-}
-
-impl StarlarkLoadBindingKind {
-    fn target_range(&self, module: &ParsedModuleRef) -> TextRange {
-        match self {
-            Self::Positional(node) => node.node(module).range(),
-            Self::Keyword(node) => node
-                .node(module)
-                .arg
-                .as_ref()
-                .expect("Starlark load keyword bindings must be named")
-                .range(),
-        }
-    }
-
-    fn node<'ast>(&self, module: &'ast ParsedModuleRef) -> AnyNodeRef<'ast> {
-        match self {
-            Self::Positional(node) => AnyNodeRef::from(node.node(module)),
-            Self::Keyword(node) => AnyNodeRef::from(node.node(module)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, get_size2::GetSize)]
 pub struct StarlarkLoadDefinitionKind {
-    binding: StarlarkLoadBindingKind,
-    loaded_file: Option<File>,
-    exported_name: Name,
+    call: AstNodeRef<ast::ExprCall>,
+    binding: StarlarkLoadBindingIndex,
 }
 
 impl StarlarkLoadDefinitionKind {
+    pub fn call<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::ExprCall {
+        self.call.node(module)
+    }
+
+    pub fn label<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast str {
+        self.call(module).arguments.args[0]
+            .as_string_literal_expr()
+            .expect("Starlark load labels should be string literals")
+            .value
+            .to_str()
+    }
+
     pub fn target_range(&self, module: &ParsedModuleRef) -> TextRange {
-        self.binding.target_range(module)
+        self.binding_node(module).range()
     }
 
     pub fn binding_node<'ast>(&self, module: &'ast ParsedModuleRef) -> AnyNodeRef<'ast> {
-        self.binding.node(module)
+        let call = self.call(module);
+        match self.binding {
+            StarlarkLoadBindingIndex::Positional(index) => AnyNodeRef::from(
+                call.arguments.args[index as usize + 1]
+                    .as_string_literal_expr()
+                    .expect("Starlark load bindings should be string literals"),
+            ),
+            StarlarkLoadBindingIndex::Keyword(index) => {
+                AnyNodeRef::from(&call.arguments.keywords[index as usize])
+            }
+        }
     }
 
-    pub fn loaded_file(&self) -> Option<File> {
-        self.loaded_file
-    }
-
-    pub fn exported_name(&self) -> &Name {
-        &self.exported_name
+    pub fn exported_name<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast str {
+        match self.binding {
+            StarlarkLoadBindingIndex::Positional(index) => &self.call(module).arguments.args
+                [index as usize + 1]
+                .as_string_literal_expr()
+                .expect("Starlark load bindings should be string literals")
+                .value
+                .to_str(),
+            StarlarkLoadBindingIndex::Keyword(index) => self.call(module).arguments.keywords
+                [index as usize]
+                .value
+                .as_string_literal_expr()
+                .expect("Starlark load bindings should be string literals")
+                .value
+                .to_str(),
+        }
     }
 }
 

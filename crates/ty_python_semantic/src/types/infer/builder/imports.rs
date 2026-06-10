@@ -1,7 +1,8 @@
 use ruff_python_ast as ast;
 use ruff_text_size::{Ranged, TextRange};
 use ty_module_resolver::{
-    ModuleName, ModuleNameResolutionError, ModuleResolveMode, resolve_module, search_paths,
+    ModuleName, ModuleNameResolutionError, ModuleResolveMode, resolve_module,
+    resolve_starlark_load, search_paths,
 };
 
 use crate::{
@@ -30,10 +31,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         definition: Definition<'db>,
     ) {
         let binding_node = load.binding_node(self.module());
-        let Some(loaded_file) = load.loaded_file() else {
+        let Ok(loaded_file) = resolve_starlark_load(
+            self.db(),
+            definition.file(self.db()),
+            load.label(self.module()),
+        ) else {
             self.add_unknown_declaration_with_binding(binding_node, definition);
             return;
         };
+        let exported_name = load.exported_name(self.module());
 
         let PlaceAndQualifiers {
             place:
@@ -44,8 +50,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } = imported_symbol(
             self.db(),
             Some(loaded_file),
-            load.exported_name(),
-            Some(RequiresExplicitReExport::No),
+            exported_name,
+            Some(RequiresExplicitReExport::Yes),
         )
         else {
             self.add_unknown_declaration_with_binding(binding_node, definition);

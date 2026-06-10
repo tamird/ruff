@@ -19,7 +19,7 @@ use ruff_python_parser::semantic_errors::{
 };
 use ruff_text_size::{Ranged, TextRange};
 use smallvec::SmallVec;
-use ty_module_resolver::{ModuleName, resolve_module, resolve_starlark_load};
+use ty_module_resolver::{ModuleName, resolve_module};
 
 use crate::HasTrackedScope;
 use crate::ast_ids::AstIdsBuilder;
@@ -33,7 +33,7 @@ use crate::definition::{
     ImportFromDefinitionNodeRef, ImportFromSubmoduleDefinitionNodeRef,
     LambdaParameterDefinitionNodeRef, LoopHeaderDefinitionNodeRef, LoopStmtRef,
     MatchPatternDefinitionNodeRef, NestedBindingsDefinitionKind, ParameterDefinitionNodeRef,
-    StarImportDefinitionNodeRef, StarlarkLoadBindingNodeRef, StarlarkLoadDefinitionNodeRef,
+    StarImportDefinitionNodeRef, StarlarkLoadBindingIndex, StarlarkLoadDefinitionNodeRef,
     WithItemDefinitionNodeRef,
 };
 use crate::expression::{Expression, ExpressionKind};
@@ -3799,7 +3799,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 range: _,
                 node_index: _,
             }) => {
-                if self.source_dialect == SourceDialect::Starlark
+                let is_starlark_load = if self.source_dialect == SourceDialect::Starlark
                     && self.in_module_scope()
                     && let Some(call) = value.as_call_expr()
                     && call
@@ -3807,18 +3807,15 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         .as_name_expr()
                         .is_some_and(|name| name.id == "load")
                     && let Some((label, bindings)) = call.arguments.args.split_first()
-                    && let Some(label) = label.as_string_literal_expr()
+                    && label.is_string_literal_expr()
+                    && (!bindings.is_empty() || !call.arguments.keywords.is_empty())
                     && bindings
                         .iter()
                         .all(|binding| binding.is_string_literal_expr())
                     && call.arguments.keywords.iter().all(|binding| {
                         binding.arg.is_some() && binding.value.is_string_literal_expr()
-                    })
-                {
-                    let loaded_file =
-                        resolve_starlark_load(self.db, self.file, label.value.to_str()).ok();
-
-                    for binding in bindings {
+                    }) {
+                    for (index, binding) in bindings.iter().enumerate() {
                         let binding = binding
                             .as_string_literal_expr()
                             .expect("Starlark load bindings were validated above");
@@ -3827,38 +3824,40 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         self.add_definition(
                             symbol.into(),
                             StarlarkLoadDefinitionNodeRef {
-                                binding: StarlarkLoadBindingNodeRef::Positional(binding),
-                                loaded_file,
-                                exported_name,
+                                call,
+                                binding: StarlarkLoadBindingIndex::Positional(
+                                    index
+                                        .try_into()
+                                        .expect("Starlark load binding index should fit in u32"),
+                                ),
                             },
                         );
                     }
 
-                    for binding in &call.arguments.keywords {
+                    for (index, binding) in call.arguments.keywords.iter().enumerate() {
                         let local_name = binding
                             .arg
                             .as_ref()
                             .expect("Starlark load keyword bindings were validated above");
-                        let exported_name = binding
-                            .value
-                            .as_string_literal_expr()
-                            .expect("Starlark load bindings were validated above")
-                            .value
-                            .to_str();
                         let symbol = self.add_symbol(local_name.id.clone());
                         self.add_definition(
                             symbol.into(),
                             StarlarkLoadDefinitionNodeRef {
-                                binding: StarlarkLoadBindingNodeRef::Keyword(binding),
-                                loaded_file,
-                                exported_name,
+                                call,
+                                binding: StarlarkLoadBindingIndex::Keyword(
+                                    index
+                                        .try_into()
+                                        .expect("Starlark load binding index should fit in u32"),
+                                ),
                             },
                         );
                     }
 
                     self.starlark_loads.insert(value.into());
-                    return;
-                }
+                    true
+                } else {
+                    false
+                };
 
                 if self.in_module_scope() {
                     if let Some(expr) = dunder_all_extend_argument(value) {
@@ -3867,6 +3866,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 }
 
                 self.visit_expr(value);
+
+                if is_starlark_load {
+                    return;
+                }
 
                 // If the statement is a call (or an `await` wrapping a call), it could
                 // possibly be a call to a function marked with `NoReturn` (for example,

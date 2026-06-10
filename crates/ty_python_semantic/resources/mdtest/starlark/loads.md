@@ -20,16 +20,8 @@ renamed("also bad")  # error: [invalid-argument-type]
 
 ## Sibling stubs
 
-The implementation's annotation is deliberately wrong for the caller. The sibling stub re-exports
-the correctly typed function from another Starlark file, proving both stub precedence and Starlark
-re-export semantics.
-
-`stub_defs.bzl`:
-
-```bzl
-def accepts_int(value: int) -> None:
-    pass
-```
+The implementation's annotation is deliberately wrong for the caller, proving that the sibling stub
+takes precedence.
 
 `defs.bzl`:
 
@@ -41,7 +33,7 @@ def accepts_int(value: str) -> None:
 `defs.bzl.pyi`:
 
 ```pyi
-load("//:stub_defs.bzl", "accepts_int")
+def accepts_int(value: int) -> None: ...
 ```
 
 `main.bzl`:
@@ -66,7 +58,7 @@ def fail(message: str) -> None: ...
 fail(1)  # error: [invalid-argument-type]
 ```
 
-## Transitive loads
+## Explicit re-exports
 
 `defs.bzl`:
 
@@ -78,7 +70,9 @@ def accepts_int(value: int) -> None:
 `reexports.bzl`:
 
 ```bzl
-load("//:defs.bzl", "accepts_int")
+load("//:defs.bzl", _accepts_int = "accepts_int")
+
+accepts_int = _accepts_int
 ```
 
 `main.bzl`:

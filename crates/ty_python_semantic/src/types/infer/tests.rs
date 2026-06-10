@@ -295,6 +295,42 @@ fn first_public_binding<'db>(db: &'db TestDb, file: File, name: &str) -> Definit
 }
 
 #[test]
+fn starlark_load_target_change_preserves_importer_index() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_files([
+        ("/src/defs.bzl", "value: int = 1"),
+        ("/src/main.bzl", "load(\"//:defs.bzl\", \"value\")"),
+    ])?;
+
+    let main = system_path_to_file(&db, "/src/main.bzl")?;
+    assert_eq!(
+        global_symbol(&db, main, "value")
+            .place
+            .expect_type()
+            .display(&db)
+            .to_string(),
+        "int"
+    );
+
+    db.write_file("/src/defs.bzl", "value: str = \"\"")?;
+    db.clear_salsa_events();
+
+    assert_eq!(
+        global_symbol(&db, main, "value")
+            .place
+            .expect_type()
+            .display(&db)
+            .to_string(),
+        "str"
+    );
+
+    let events = db.take_salsa_events();
+    assert_function_query_was_not_run(&db, semantic_index, main, &events);
+
+    Ok(())
+}
+
+#[test]
 fn dependency_public_symbol_type_change() -> anyhow::Result<()> {
     let mut db = setup_db();
 
