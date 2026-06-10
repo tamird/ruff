@@ -2,6 +2,18 @@
 
 ## Direct and renamed loads
 
+`MODULE.bazel`:
+
+```text
+module(name = "test")
+```
+
+`BUILD.bazel`:
+
+```text
+# Package marker.
+```
+
 `defs.bzl`:
 
 ```bzl
@@ -22,6 +34,18 @@ renamed("also bad")  # error: [invalid-argument-type]
 
 The implementation's annotation is deliberately wrong for the caller, proving that the sibling stub
 takes precedence.
+
+`MODULE.bazel`:
+
+```text
+module(name = "test")
+```
+
+`BUILD.bazel`:
+
+```text
+# Package marker.
+```
 
 `defs.bzl`:
 
@@ -46,6 +70,18 @@ accepts_int("bad")  # error: [invalid-argument-type]
 
 ## Project builtins
 
+`MODULE.bazel`:
+
+```text
+module(name = "test")
+```
+
+`BUILD.bazel`:
+
+```text
+# Package marker.
+```
+
 `__builtins__.pyi`:
 
 ```pyi
@@ -59,6 +95,18 @@ fail(1)  # error: [invalid-argument-type]
 ```
 
 ## Explicit re-exports
+
+`MODULE.bazel`:
+
+```text
+module(name = "test")
+```
+
+`BUILD.bazel`:
+
+```text
+# Package marker.
+```
 
 `defs.bzl`:
 

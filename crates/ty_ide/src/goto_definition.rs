@@ -121,6 +121,8 @@ pub(super) mod test {
     #[test]
     fn goto_definition_starlark_load() {
         let test = CursorTest::builder()
+            .source("MODULE.bazel", "")
+            .source("BUILD.bazel", "")
             .source(
                 "main.bzl",
                 "load(\"//:reexports.bzl\", \"accepts_int\")\naccepts_int<CURSOR>(1)",

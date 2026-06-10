@@ -298,6 +298,8 @@ fn first_public_binding<'db>(db: &'db TestDb, file: File, name: &str) -> Definit
 fn starlark_load_target_change_preserves_importer_index() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_files([
+        ("/src/MODULE.bazel", ""),
+        ("/src/BUILD.bazel", ""),
         ("/src/defs.bzl", "value: int = 1"),
         ("/src/main.bzl", "load(\"//:defs.bzl\", \"value\")"),
     ])?;
