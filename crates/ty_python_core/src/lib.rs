@@ -349,8 +349,11 @@ pub struct SemanticIndex<'db> {
     /// The set of modules that are imported anywhere within this file.
     imported_modules: Arc<FrozenSet<ModuleName>>,
 
-    /// Top-level call expressions recognized as Starlark `load()` statements.
+    /// Call expressions recognized as Starlark `load()` statements.
     starlark_loads: FrozenSet<ExpressionNodeKey>,
+
+    /// Starlark `load()` statements that violate the language's static rules.
+    starlark_load_syntax_errors: FrozenMap<ExpressionNodeKey, StarlarkLoadSyntaxError>,
 
     /// Flags about the global scope (code usage impacting inference)
     has_future_annotations: bool,
@@ -414,6 +417,15 @@ impl<'db> SemanticIndex<'db> {
 
     pub fn is_starlark_load(&self, expression: &ast::Expr) -> bool {
         self.starlark_loads.contains(&expression.into())
+    }
+
+    pub fn starlark_load_syntax_error(
+        &self,
+        expression: &ast::Expr,
+    ) -> Option<StarlarkLoadSyntaxError> {
+        self.starlark_load_syntax_errors
+            .get(&expression.into())
+            .copied()
     }
 
     #[track_caller]
@@ -780,6 +792,24 @@ impl<'db> SemanticIndex<'db> {
     pub fn semantic_syntax_errors(&self) -> &[SemanticSyntaxError] {
         &self.semantic_syntax_errors
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub struct StarlarkLoadSyntaxError {
+    pub kind: StarlarkLoadSyntaxErrorKind,
+    pub range: TextRange,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub enum StarlarkLoadSyntaxErrorKind {
+    NotTopLevel,
+    AfterStatement,
+    MissingLabel,
+    InvalidLabel,
+    MissingBinding,
+    InvalidBinding,
+    PrivateSymbol,
+    DuplicateBinding,
 }
 
 pub struct AncestorsIter<'a> {

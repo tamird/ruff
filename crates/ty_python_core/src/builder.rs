@@ -61,7 +61,10 @@ use crate::use_def::{
     EnclosingSnapshotKey, FlowSnapshot, FutureDefinitions, PreviousDefinitions, ScopedDefinitionId,
     ScopedEnclosingSnapshotId, UseDefMapBuilder,
 };
-use crate::{Db, SourceDialect, Statement, StatementNodeKey};
+use crate::{
+    Db, SourceDialect, StarlarkLoadSyntaxError, StarlarkLoadSyntaxErrorKind, Statement,
+    StatementNodeKey,
+};
 use crate::{
     DefinitionsByNode, EvaluationMode, ExpressionsScopeMap, LoopHeader, LoopToken,
     NarrowingAliasPredicate, PossiblyNarrowedPlaces, SemanticIndex, VisibleAncestorsIter,
@@ -237,6 +240,8 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     statements_by_node: FxHashMap<StatementNodeKey, Statement<'db>>,
     imported_modules: FxHashSet<ModuleName>,
     starlark_loads: FxHashSet<ExpressionNodeKey>,
+    starlark_load_syntax_errors: FxHashMap<ExpressionNodeKey, StarlarkLoadSyntaxError>,
+    seen_starlark_non_load_statement: bool,
     seen_submodule_imports: FxHashSet<String>,
     // A map from a lambda expression to its enclosing statement.
     enclosing_lambda_statements: FxHashMap<ExpressionNodeKey, Statement<'db>>,
@@ -298,6 +303,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             seen_submodule_imports: FxHashSet::default(),
             imported_modules: FxHashSet::default(),
             starlark_loads: FxHashSet::default(),
+            starlark_load_syntax_errors: FxHashMap::default(),
+            seen_starlark_non_load_statement: false,
             generator_functions: FxHashSet::default(),
 
             enclosing_snapshots: FxHashMap::default(),
@@ -2519,6 +2526,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             uses_by_collection,
             imported_modules: Arc::new(FrozenSet::from(self.imported_modules)),
             starlark_loads: FrozenSet::from(self.starlark_loads),
+            starlark_load_syntax_errors: FrozenMap::from(self.starlark_load_syntax_errors),
             has_future_annotations: self.has_future_annotations,
             enclosing_snapshots: FrozenMap::from(self.enclosing_snapshots),
             semantic_syntax_errors,
@@ -2540,6 +2548,17 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
     fn visit_stmt_impl(&mut self, stmt: &'ast ast::Stmt) {
         self.with_semantic_checker(|semantic, context| semantic.visit_stmt(stmt, context));
+
+        if self.source_dialect == SourceDialect::Starlark
+            && self.current_statements.len() == 1
+            && starlark_load_call(stmt).is_none()
+            && !matches!(
+                stmt,
+                ast::Stmt::Expr(ast::StmtExpr { value, .. }) if value.is_string_literal_expr()
+            )
+        {
+            self.seen_starlark_non_load_statement = true;
+        }
 
         let in_type_checking_block = self.in_type_checking_block;
         self.current_use_def_map_mut()
@@ -3800,21 +3819,109 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 node_index: _,
             }) => {
                 let is_starlark_load = if self.source_dialect == SourceDialect::Starlark
-                    && self.in_module_scope()
                     && let Some(call) = value.as_call_expr()
                     && call
                         .func
                         .as_name_expr()
                         .is_some_and(|name| name.id == "load")
-                    && let Some((label, bindings)) = call.arguments.args.split_first()
-                    && label.is_string_literal_expr()
-                    && (!bindings.is_empty() || !call.arguments.keywords.is_empty())
-                    && bindings
-                        .iter()
-                        .all(|binding| binding.is_string_literal_expr())
-                    && call.arguments.keywords.iter().all(|binding| {
-                        binding.arg.is_some() && binding.value.is_string_literal_expr()
-                    }) {
+                {
+                    self.starlark_loads.insert(value.into());
+
+                    let syntax_error = if self.current_statements.len() != 1 {
+                        Some(StarlarkLoadSyntaxError {
+                            kind: StarlarkLoadSyntaxErrorKind::NotTopLevel,
+                            range: call.range(),
+                        })
+                    } else if self.seen_starlark_non_load_statement {
+                        Some(StarlarkLoadSyntaxError {
+                            kind: StarlarkLoadSyntaxErrorKind::AfterStatement,
+                            range: call.range(),
+                        })
+                    } else if let Some((label, bindings)) = call.arguments.args.split_first() {
+                        let mut local_names = FxHashSet::default();
+                        let mut error = None;
+
+                        if !label.is_string_literal_expr() {
+                            error = Some(StarlarkLoadSyntaxError {
+                                kind: StarlarkLoadSyntaxErrorKind::InvalidLabel,
+                                range: label.range(),
+                            });
+                        } else if bindings.is_empty() && call.arguments.keywords.is_empty() {
+                            error = Some(StarlarkLoadSyntaxError {
+                                kind: StarlarkLoadSyntaxErrorKind::MissingBinding,
+                                range: call.range(),
+                            });
+                        }
+
+                        for binding in bindings {
+                            let Some(binding) = binding.as_string_literal_expr() else {
+                                error.get_or_insert(StarlarkLoadSyntaxError {
+                                    kind: StarlarkLoadSyntaxErrorKind::InvalidBinding,
+                                    range: binding.range(),
+                                });
+                                continue;
+                            };
+                            let name = binding.value.to_str();
+                            if name.starts_with('_') {
+                                error.get_or_insert(StarlarkLoadSyntaxError {
+                                    kind: StarlarkLoadSyntaxErrorKind::PrivateSymbol,
+                                    range: binding.range(),
+                                });
+                            } else if !local_names.insert(name) {
+                                error.get_or_insert(StarlarkLoadSyntaxError {
+                                    kind: StarlarkLoadSyntaxErrorKind::DuplicateBinding,
+                                    range: binding.range(),
+                                });
+                            }
+                        }
+
+                        for binding in &call.arguments.keywords {
+                            let Some(local_name) = binding.arg.as_ref() else {
+                                error.get_or_insert(StarlarkLoadSyntaxError {
+                                    kind: StarlarkLoadSyntaxErrorKind::InvalidBinding,
+                                    range: binding.range(),
+                                });
+                                continue;
+                            };
+                            let Some(exported_name) = binding.value.as_string_literal_expr() else {
+                                error.get_or_insert(StarlarkLoadSyntaxError {
+                                    kind: StarlarkLoadSyntaxErrorKind::InvalidBinding,
+                                    range: binding.value.range(),
+                                });
+                                continue;
+                            };
+                            if exported_name.value.to_str().starts_with('_') {
+                                error.get_or_insert(StarlarkLoadSyntaxError {
+                                    kind: StarlarkLoadSyntaxErrorKind::PrivateSymbol,
+                                    range: exported_name.range(),
+                                });
+                            } else if !local_names.insert(local_name.id.as_str()) {
+                                error.get_or_insert(StarlarkLoadSyntaxError {
+                                    kind: StarlarkLoadSyntaxErrorKind::DuplicateBinding,
+                                    range: local_name.range(),
+                                });
+                            }
+                        }
+
+                        error
+                    } else {
+                        Some(StarlarkLoadSyntaxError {
+                            kind: StarlarkLoadSyntaxErrorKind::MissingLabel,
+                            range: call.range(),
+                        })
+                    };
+
+                    if let Some(error) = syntax_error {
+                        self.starlark_load_syntax_errors.insert(value.into(), error);
+                        self.visit_expr(value);
+                        return;
+                    }
+
+                    let (_, bindings) = call
+                        .arguments
+                        .args
+                        .split_first()
+                        .expect("validated Starlark loads should have a label");
                     for (index, binding) in bindings.iter().enumerate() {
                         let binding = binding
                             .as_string_literal_expr()
@@ -3853,7 +3960,6 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         );
                     }
 
-                    self.starlark_loads.insert(value.into());
                     true
                 } else {
                     false
@@ -4798,6 +4904,14 @@ fn dunder_all_extend_argument(value: &ast::Expr) -> Option<&ast::Expr> {
     let ast::ExprAttribute { value, attr, .. } = single_argument.as_attribute_expr()?;
 
     (attr == "__all__").then_some(value)
+}
+
+fn starlark_load_call(stmt: &ast::Stmt) -> Option<&ast::ExprCall> {
+    let call = stmt.as_expr_stmt()?.value.as_call_expr()?;
+    call.func
+        .as_name_expr()
+        .is_some_and(|name| name.id == "load")
+        .then_some(call)
 }
 
 /// Builds an interval-map that matches expressions (by their node index) to their enclosing scopes.

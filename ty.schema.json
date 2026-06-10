@@ -910,6 +910,16 @@
             }
           ]
         },
+        "invalid-starlark-load": {
+          "title": "detects invalid Starlark load statements",
+          "description": "## What it does\nChecks for Starlark `load` statements that violate Starlark's static rules.\n\n## Why is this bad?\nBazel rejects malformed, nested, late, duplicate, and private-symbol loads\nbefore evaluating a Starlark module.\n\n## Examples\n\n```starlark\nload(\"//:defs.bzl\", \"_private\")  # error: [invalid-starlark-load]\n```",
+          "default": "error",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/Level"
+            }
+          ]
+        },
         "invalid-super-argument": {
           "title": "detects invalid arguments for `super()`",
           "description": "## What it does\nDetects `super()` calls where:\n- the first argument is not a valid class literal, or\n- the second argument is not an instance or subclass of the first argument.\n\n## Why is this bad?\n`super(type, obj)` expects:\n- the first argument to be a class,\n- and the second argument to satisfy one of the following:\n  - `isinstance(obj, type)` is `True`\n  - `issubclass(obj, type)` is `True`\n\nViolating this relationship will raise a `TypeError` at runtime.\n\n## Examples\n```python\nclass A:\n    ...\nclass B(A):\n    ...\n\nsuper(A, B())  # it's okay! `A` satisfies `isinstance(B(), A)`\n\nsuper(A(), B()) # error: `A()` is not a class\n\nsuper(B, A())  # error: `A()` does not satisfy `isinstance(A(), B)`\nsuper(B, A)  # error: `A` does not satisfy `issubclass(A, B)`\n```\n\n## References\n- [Python documentation: super()](https://docs.python.org/3/library/functions.html#super)",
@@ -1432,7 +1442,7 @@
         },
         "unresolved-import": {
           "title": "detects unresolved imports",
-          "description": "## What it does\nChecks for import statements for which the module cannot be resolved.\n\n## Why is this bad?\nImporting a module that cannot be resolved will raise a `ModuleNotFoundError`\nat runtime.\n\n## Examples\n```python\nimport foo  # ModuleNotFoundError: No module named 'foo'\n```",
+          "description": "## What it does\nChecks for imports and Starlark loads that cannot be resolved.\n\n## Why is this bad?\nPython raises `ModuleNotFoundError` for unresolved imports, and Starlark\nevaluation fails for unresolved modules or symbols.\n\n## Examples\n```python\nimport foo  # ModuleNotFoundError: No module named 'foo'\n```\n\n```starlark\nload(\"//:defs.bzl\", \"missing\")  # error: [unresolved-import]\n```",
           "default": "error",
           "oneOf": [
             {

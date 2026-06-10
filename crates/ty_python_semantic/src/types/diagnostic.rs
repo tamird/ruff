@@ -93,6 +93,7 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&INVALID_GENERIC_CLASS);
     registry.register_lint(&INVALID_LEGACY_TYPE_VARIABLE);
     registry.register_lint(&INVALID_PARAMSPEC);
+    registry.register_lint(&INVALID_STARLARK_LOAD);
     registry.register_lint(&INVALID_TYPE_ALIAS_TYPE);
     registry.register_lint(&INVALID_NEWTYPE);
     registry.register_lint(&MISMATCHED_TYPE_NAME);
@@ -2945,15 +2946,39 @@ declare_lint! {
 
 declare_lint! {
     /// ## What it does
-    /// Checks for import statements for which the module cannot be resolved.
+    /// Checks for Starlark `load` statements that violate Starlark's static rules.
     ///
     /// ## Why is this bad?
-    /// Importing a module that cannot be resolved will raise a `ModuleNotFoundError`
-    /// at runtime.
+    /// Bazel rejects malformed, nested, late, duplicate, and private-symbol loads
+    /// before evaluating a Starlark module.
+    ///
+    /// ## Examples
+    ///
+    /// ```starlark
+    /// load("//:defs.bzl", "_private")  # error: [invalid-starlark-load]
+    /// ```
+    pub(crate) static INVALID_STARLARK_LOAD = {
+        summary: "detects invalid Starlark load statements",
+        status: LintStatus::stable("0.0.48"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    /// ## What it does
+    /// Checks for imports and Starlark loads that cannot be resolved.
+    ///
+    /// ## Why is this bad?
+    /// Python raises `ModuleNotFoundError` for unresolved imports, and Starlark
+    /// evaluation fails for unresolved modules or symbols.
     ///
     /// ## Examples
     /// ```python
     /// import foo  # ModuleNotFoundError: No module named 'foo'
+    /// ```
+    ///
+    /// ```starlark
+    /// load("//:defs.bzl", "missing")  # error: [unresolved-import]
     /// ```
     pub(crate) static UNRESOLVED_IMPORT = {
         summary: "detects unresolved imports",

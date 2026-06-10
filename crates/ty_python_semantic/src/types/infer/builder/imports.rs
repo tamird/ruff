@@ -14,7 +14,7 @@ use crate::{
     types::{
         ModuleLiteralType, Type, TypeAndQualifiers,
         diagnostic::{
-            POSSIBLY_MISSING_IMPORT, UNRESOLVED_IMPORT,
+            INVALID_STARLARK_LOAD, POSSIBLY_MISSING_IMPORT, UNRESOLVED_IMPORT,
             hint_if_stdlib_attribute_exists_on_other_versions,
             hint_if_stdlib_submodule_exists_on_other_versions,
         },
@@ -22,9 +22,115 @@ use crate::{
         infer_definition_types,
     },
 };
+use ty_python_core::StarlarkLoadSyntaxErrorKind;
 use ty_python_core::definition::{Definition, StarlarkLoadDefinitionKind};
 
 impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
+    pub(super) fn infer_starlark_load_statement(&self, expression: &ast::Expr) {
+        if let Some(error) = self.index.starlark_load_syntax_error(expression) {
+            let message = match error.kind {
+                StarlarkLoadSyntaxErrorKind::NotTopLevel => {
+                    "Starlark load statements must appear at the top level"
+                }
+                StarlarkLoadSyntaxErrorKind::AfterStatement => {
+                    "Starlark load statements must appear before any other statement"
+                }
+                StarlarkLoadSyntaxErrorKind::MissingLabel => {
+                    "Starlark load statements require a label"
+                }
+                StarlarkLoadSyntaxErrorKind::InvalidLabel => {
+                    "Starlark load labels must be string literals"
+                }
+                StarlarkLoadSyntaxErrorKind::MissingBinding => {
+                    "Starlark load statements require at least one symbol"
+                }
+                StarlarkLoadSyntaxErrorKind::InvalidBinding => {
+                    "Starlark load bindings must be string literals with optional names"
+                }
+                StarlarkLoadSyntaxErrorKind::PrivateSymbol => {
+                    "Private Starlark symbols cannot be loaded"
+                }
+                StarlarkLoadSyntaxErrorKind::DuplicateBinding => {
+                    "Starlark load statements cannot bind the same name more than once"
+                }
+            };
+            if let Some(builder) = self
+                .context
+                .report_lint(&INVALID_STARLARK_LOAD, error.range)
+            {
+                builder.into_diagnostic(message);
+            }
+            return;
+        }
+
+        let call = expression
+            .as_call_expr()
+            .expect("Starlark load statements should be call expressions");
+        let label = call.arguments.args[0]
+            .as_string_literal_expr()
+            .expect("valid Starlark load labels should be string literals");
+        let loaded_file = match resolve_starlark_load(self.db(), self.file(), label.value.to_str())
+        {
+            Ok(loaded_file) => loaded_file,
+            Err(error) => {
+                if let Some(builder) = self.context.report_lint(&UNRESOLVED_IMPORT, label) {
+                    builder.into_diagnostic(format_args!(
+                        "Cannot resolve Starlark load `{}`: {error}",
+                        label.value.to_str()
+                    ));
+                }
+                return;
+            }
+        };
+
+        for binding in &call.arguments.args[1..] {
+            let binding = binding
+                .as_string_literal_expr()
+                .expect("valid Starlark load bindings should be string literals");
+            let exported_name = binding.value.to_str();
+            if !matches!(
+                imported_symbol(
+                    self.db(),
+                    Some(loaded_file),
+                    exported_name,
+                    Some(RequiresExplicitReExport::Yes),
+                )
+                .place,
+                Place::Defined(_)
+            ) && let Some(builder) = self.context.report_lint(&UNRESOLVED_IMPORT, binding)
+            {
+                builder.into_diagnostic(format_args!(
+                    "Cannot load symbol `{exported_name}` from `{}`",
+                    label.value.to_str()
+                ));
+            }
+        }
+
+        for binding in &call.arguments.keywords {
+            let exported_name = binding
+                .value
+                .as_string_literal_expr()
+                .expect("valid Starlark load bindings should be string literals");
+            let exported_name_str = exported_name.value.to_str();
+            if !matches!(
+                imported_symbol(
+                    self.db(),
+                    Some(loaded_file),
+                    exported_name_str,
+                    Some(RequiresExplicitReExport::Yes),
+                )
+                .place,
+                Place::Defined(_)
+            ) && let Some(builder) = self.context.report_lint(&UNRESOLVED_IMPORT, exported_name)
+            {
+                builder.into_diagnostic(format_args!(
+                    "Cannot load symbol `{exported_name_str}` from `{}`",
+                    label.value.to_str()
+                ));
+            }
+        }
+    }
+
     pub(super) fn infer_starlark_load_definition(
         &mut self,
         load: &StarlarkLoadDefinitionKind,

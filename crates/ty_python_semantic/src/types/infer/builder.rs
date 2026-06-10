@@ -1703,7 +1703,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }) => {
                 // If this is a call expression, we would have added an `IsNonTerminalCall`
                 // constraint, meaning this will be a standalone expression.
-                if !self.index.is_starlark_load(value) {
+                if self.index.is_starlark_load(value) {
+                    self.infer_starlark_load_statement(value);
+                } else {
                     self.infer_maybe_standalone_expression(value, TypeContext::default());
                 }
             }
