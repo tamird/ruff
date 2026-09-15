@@ -1,9 +1,9 @@
-//! Standalone Bazel `.bzl` checking with a source-owned Starlark database.
+//! Standalone Bazel `.bzl` and host-owned `.star` checking.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::Command as ChildCommand;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
@@ -67,7 +67,7 @@ impl Db for StyDb {
 impl salsa::Database for StyDb {}
 
 #[derive(Parser)]
-#[command(name = "sty", about = "Check selected Bazel Starlark sources")]
+#[command(name = "sty", about = "Check Bazel .bzl or host-owned .star sources")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -75,7 +75,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check one or more main-repository `.bzl` labels.
+    /// Check main-repository `.bzl` labels or one `.star` with its host.
     Check(CheckCommand),
 }
 
@@ -85,32 +85,116 @@ struct CheckCommand {
     #[arg(long, value_name = "ROOT")]
     workspace: Option<PathBuf>,
 
-    /// `//pkg:file.bzl`, `@@//pkg:file.bzl`, or `:file.bzl` from cwd's BUILD package.
-    #[arg(required = true, value_name = "LABEL")]
+    /// Executable host for checking a single `.star` file.
+    #[arg(long, value_name = "EXE")]
+    host_checker: Option<PathBuf>,
+
+    /// A named host input as NAME=PATH; the host decides when to read it.
+    #[arg(long = "input", value_name = "NAME=PATH")]
+    inputs: Vec<String>,
+
+    /// Bazel labels, or one `.star` path when --host-checker is supplied.
+    #[arg(value_name = "LABEL_OR_PATH")]
     labels: Vec<String>,
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(false) => ExitCode::from(1),
-        Ok(true) => ExitCode::SUCCESS,
+fn main() {
+    let status = match run() {
+        Ok(status) => status,
         Err(error) => {
             let _ = writeln!(io::stderr().lock(), "sty failed: {error:#}");
-            ExitCode::from(2)
+            2
         }
-    }
+    };
+    std::process::exit(status);
 }
 
-fn run() -> Result<bool> {
+fn run() -> Result<i32> {
     let Cli {
         command: Command::Check(options),
     } = Cli::parse();
     let cwd = absolute_cwd()?;
-    let db = StyDb::new(&cwd);
+    if let Some(checker) = options.host_checker.as_ref() {
+        return run_host(&cwd, checker, &options);
+    }
+    if !options.inputs.is_empty() {
+        return Err(anyhow!("--input requires --host-checker"));
+    }
+    if options.labels.is_empty() {
+        return Err(anyhow!("check requires at least one Bazel label"));
+    }
+    if options.labels.iter().any(|label| is_star_path(label)) {
+        return Err(anyhow!(
+            ".star files require --host-checker with a file path"
+        ));
+    }
+    let healthy = run_bazel(&cwd, options)?;
+    Ok(i32::from(!healthy))
+}
+
+fn run_host(cwd: &SystemPath, checker: &PathBuf, options: &CheckCommand) -> Result<i32> {
+    if options.workspace.is_some() {
+        return Err(anyhow!("--workspace applies only to Bazel .bzl labels"));
+    }
+    let [source] = options.labels.as_slice() else {
+        return Err(anyhow!(
+            "host checking requires exactly one .star file path"
+        ));
+    };
+    if source.starts_with(':')
+        || (source.starts_with("//") && source.contains(':'))
+        || (source.starts_with('@') && source.contains("//"))
+    {
+        return Err(anyhow!(
+            "host checking requires a file path, not a Bazel label"
+        ));
+    }
+    if !is_star_path(source) {
+        return Err(anyhow!("host checking requires a .star file path"));
+    }
+    let source = absolute_host_path(source, cwd);
+    let mut command = ChildCommand::new(checker);
+    command
+        .arg("--sty-check-v1")
+        .arg("--source")
+        .arg(source.as_std_path());
+    for input in &options.inputs {
+        let (name, path) = input
+            .split_once('=')
+            .ok_or_else(|| anyhow!("host input must have NAME=PATH form: {input}"))?;
+        if name.is_empty() || path.is_empty() {
+            return Err(anyhow!("host input needs nonempty NAME and PATH: {input}"));
+        }
+        let path = absolute_host_path(path, cwd);
+        command.arg("--input").arg(format!("{name}={path}"));
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("cannot start host checker {}", checker.display()))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn absolute_host_path(path: &str, cwd: &SystemPath) -> SystemPathBuf {
+    let path = SystemPath::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        SystemPath::absolute(path, cwd)
+    }
+}
+
+fn is_star_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension == "star")
+}
+
+fn run_bazel(cwd: &SystemPath, options: CheckCommand) -> Result<bool> {
+    let db = StyDb::new(cwd);
     let root = if let Some(workspace) = options.workspace {
         let workspace = SystemPathBuf::from_path_buf(workspace)
             .map_err(|path| anyhow!("workspace path is not UTF-8: {path:?}"))?;
-        let path = SystemPath::absolute(&workspace, &cwd);
+        let path = SystemPath::absolute(&workspace, cwd);
         SystemPathBuf::from_path_buf(
             path.as_std_path()
                 .canonicalize()
@@ -118,7 +202,7 @@ fn run() -> Result<bool> {
         )
         .map_err(|path| anyhow!("workspace path is not UTF-8: {path:?}"))?
     } else {
-        find_bazel_repository(&db, &cwd)
+        find_bazel_repository(&db, cwd)
             .ok_or_else(|| anyhow!("no Bazel repository marker above current directory {cwd}"))?
     };
     db.files().try_add_root(&db, &root, FileRootKind::Project);
@@ -127,7 +211,7 @@ fn run() -> Result<bool> {
         .labels
         .iter()
         .map(|label| {
-            let relative = label.starts_with(':').then_some(cwd.as_path());
+            let relative = label.starts_with(':').then_some(cwd);
             resolve_bazel_target(&db, repository, relative, label)
                 .with_context(|| format!("cannot select Bazel label {label}"))
         })

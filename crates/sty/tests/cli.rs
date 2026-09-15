@@ -9,9 +9,14 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn unmarked() -> anyhow::Result<Self> {
+        Ok(Self {
+            root: tempfile::tempdir()?,
+        })
+    }
+
     fn new() -> anyhow::Result<Self> {
-        let root = tempfile::tempdir()?;
-        let fixture = Self { root };
+        let fixture = Self::unmarked()?;
         fixture.write("MODULE.bazel", "")?;
         Ok(fixture)
     }
@@ -208,6 +213,147 @@ fn parser_limit_and_duplicate_loads_fail_with_concrete_reason_and_related_span()
     assert!(
         duplicate_error.contains("pkg/duplicate.bzl:1:"),
         "{duplicate_error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn host_usage_errors_before_bazel_repository_discovery() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    let missing = Fixture::run(fixture.root.path(), &["check", "deploy.star"])?;
+    assert_eq!(missing.status.code(), Some(2), "{}", stderr(&missing));
+    assert!(stderr(&missing).contains(".star files require --host-checker"));
+
+    let double_slash_source = format!("/{}", fixture.path("deploy.star").display());
+    let double_slash = Fixture::run(
+        fixture.root.path(),
+        &["check", double_slash_source.as_str()],
+    )?;
+    assert_eq!(double_slash.status.code(), Some(2));
+    assert!(stderr(&double_slash).contains(".star files require --host-checker"));
+
+    let extra_input = Fixture::run(
+        fixture.root.path(),
+        &["check", "--input", "catalog=missing.json", "//pkg:defs.bzl"],
+    )?;
+    assert_eq!(extra_input.status.code(), Some(2));
+    assert!(stderr(&extra_input).contains("--input requires --host-checker"));
+
+    let invalid_label = Fixture::run(
+        fixture.root.path(),
+        &[
+            "check",
+            "--host-checker",
+            "missing",
+            "@external//pkg:defs.bzl",
+        ],
+    )?;
+    assert_eq!(invalid_label.status.code(), Some(2));
+    assert!(stderr(&invalid_label).contains("not a Bazel label"));
+
+    let main_repo_label = Fixture::run(
+        fixture.root.path(),
+        &["check", "--host-checker", "missing", "//pkg:defs.star"],
+    )?;
+    assert_eq!(main_repo_label.status.code(), Some(2));
+    assert!(stderr(&main_repo_label).contains("not a Bazel label"));
+
+    let two_sources = Fixture::run(
+        fixture.root.path(),
+        &["check", "--host-checker", "missing", "a.star", "b.star"],
+    )?;
+    assert_eq!(two_sources.status.code(), Some(2));
+    assert!(stderr(&two_sources).contains("exactly one .star"));
+
+    let malformed_input = Fixture::run(
+        fixture.root.path(),
+        &[
+            "check",
+            "--host-checker",
+            "missing",
+            "--input",
+            "catalog",
+            "a.star",
+        ],
+    )?;
+    assert_eq!(malformed_input.status.code(), Some(2));
+    assert!(stderr(&malformed_input).contains("NAME=PATH form"));
+
+    let bad_executable = Fixture::run(
+        fixture.root.path(),
+        &["check", "--host-checker", "./missing-host", "a.star"],
+    )?;
+    assert_eq!(bad_executable.status.code(), Some(2));
+    assert!(stderr(&bad_executable).contains("cannot start host checker"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::unmarked()?;
+    fixture.write("@notes.star", "VALUE = 1\n")?;
+    fixture.write("source/local module=west.star", "VALUE = 2\n")?;
+    fixture.write(
+        "host-checker",
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' \"$@\" > \"$STY_TEST_ARGV_LOG\"\n",
+            "printf 'manifest:%s\\n' \"$RUNFILES_MANIFEST_FILE\" >> \"$STY_TEST_ARGV_LOG\"\n",
+            "printf 'host stdout\\n'\n",
+            "printf 'host stderr\\n' >&2\n",
+            "exit 37\n",
+        ),
+    )?;
+    let checker = fixture.path("host-checker");
+    let mut permissions = fs::metadata(&checker)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&checker, permissions)?;
+    let log = fixture.path("host-argv.txt");
+    let absolute_input = fixture.path("source/../source/local module=west.star");
+    let named_input = format!("local={}", absolute_input.display());
+    let missing_input = "unused=missing data=west.json";
+    let output = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("RUNFILES_MANIFEST_FILE", "host-manifest.txt")
+        .arg("check")
+        .arg("--host-checker")
+        .arg(&checker)
+        .arg("--input")
+        .arg(&named_input)
+        .arg("--input")
+        .arg(missing_input)
+        .arg("@notes.star")
+        .output()?;
+    assert_eq!(output.status.code(), Some(37), "{}", stderr(&output));
+    assert_eq!(output.stdout, b"host stdout\n");
+    assert_eq!(output.stderr, b"host stderr\n");
+    let cwd = fixture.root.path().canonicalize()?;
+    let expected = format!(
+        "--sty-check-v1\n--source\n{}\n--input\n{named_input}\n--input\nunused={}\nmanifest:host-manifest.txt\n",
+        cwd.join("@notes.star").display(),
+        cwd.join("missing data=west.json").display(),
+    );
+    assert_eq!(fs::read_to_string(log)?, expected);
+
+    let double_slash_source = format!("/{}", fixture.path("@notes.star").display());
+    let double_log = fixture.path("double-slash-argv.txt");
+    let double = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &double_log)
+        .env("RUNFILES_MANIFEST_FILE", "host-manifest.txt")
+        .arg("check")
+        .arg("--host-checker")
+        .arg(&checker)
+        .arg(&double_slash_source)
+        .output()?;
+    assert_eq!(double.status.code(), Some(37), "{}", stderr(&double));
+    assert_eq!(
+        fs::read_to_string(double_log)?,
+        format!("--sty-check-v1\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n")
     );
     Ok(())
 }
