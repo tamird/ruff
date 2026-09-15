@@ -301,6 +301,41 @@ fn same_shaped_records_keep_distinct_declared_types() -> anyhow::Result<()> {
 }
 
 #[test]
+fn nominal_unions_and_list_literals_check_each_known_alternative() -> anyhow::Result<()> {
+    let root_source = format!(
+        "load(\"{LABEL}\", \"Left\", \"Right\", \"Envelope\")\nunknown = native_value()\nif False:\n    Envelope(choice=None, slots=[Left(value=\"ok\"), None])\n    Envelope(choice=Left(value=\"ok\"), slots=[Left(value=\"ok\")])\n    Envelope(choice=Right(value=\"bad\"), slots=[Right(value=\"bad\")])\n    Envelope(choice=unknown, slots=[])\n"
+    );
+    let module_source = "Left = record(value=str)\nRight = record(value=str)\nOptional = Left | None\nEnvelope = record(choice=Optional, slots=list[Optional])\n";
+    let (_db, mut graph) = case(&root_source, module_source)?;
+    graph.root.loads[0].bindings = Box::new([
+        StarLoadBinding {
+            local: "Left".to_string(),
+            source: "Left".to_string(),
+        },
+        StarLoadBinding {
+            local: "Right".to_string(),
+            source: "Right".to_string(),
+        },
+        StarLoadBinding {
+            local: "Envelope".to_string(),
+            source: "Envelope".to_string(),
+        },
+    ]);
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [choice, slots] = analysis.problems() else {
+        anyhow::bail!("expected two nominal mismatches: {analysis:?}");
+    };
+    assert_eq!(choice.field(), "choice");
+    assert_eq!(slots.field(), "slots");
+    assert_eq!(choice.expected().to_string(), "Left | None");
+    assert_eq!(slots.expected().to_string(), "list[Left | None]");
+    assert_eq!(choice.actual().to_string(), "Right");
+    assert_eq!(slots.actual().to_string(), "list[Right]");
+    assert_eq!(analysis.unproved_arguments(), 2);
+    Ok(())
+}
+
+#[test]
 fn root_local_record_is_visible_only_after_its_source_declaration() -> anyhow::Result<()> {
     let source = "if False:\n    Local(item=Other(value=\"x\"))\nOther = record(value=str)\nLocal = record(item=Other)\nif False:\n    Local(item=\"wrong\")\n";
     let (_db, graph) = root_only(source)?;
@@ -389,9 +424,10 @@ fn transitive_import_keeps_the_original_record_identity_and_type_alias() -> anyh
     let base_id = "//example:base.star";
     let alias_id = "//example:alias.star";
     let base_source = "Base = record(value=str)\n";
-    let alias_source = format!("load(\"{base_id}\", \"Base\")\nAgain = Base\n");
+    let alias_source =
+        format!("load(\"{base_id}\", \"Base\")\nAgain = Base\nOptional = Again | None\n");
     let root_source = format!(
-        "load(\"{alias_id}\", \"Again\")\nLocal = record(item=Again)\nif False:\n    Local(item=Again(value=\"ok\"))\n    Local(item=\"wrong\")\n"
+        "load(\"{alias_id}\", \"Again\", \"Optional\")\nLocal = record(item=Optional)\nif False:\n    Local(item=Again(value=\"ok\"))\n    Local(item=None)\n    Local(item=\"wrong\")\n"
     );
     let (db, root) = test_db(&[
         ("root.star", &root_source),
@@ -410,10 +446,16 @@ fn transitive_import_keeps_the_original_record_identity_and_type_alias() -> anyh
             loads: Box::new([StarDirectLoad {
                 module_id: alias_id.to_string(),
                 label_range: span(&root_source, &format!("\"{alias_id}\""))?,
-                bindings: Box::new([StarLoadBinding {
-                    local: "Again".to_string(),
-                    source: "Again".to_string(),
-                }]),
+                bindings: Box::new([
+                    StarLoadBinding {
+                        local: "Again".to_string(),
+                        source: "Again".to_string(),
+                    },
+                    StarLoadBinding {
+                        local: "Optional".to_string(),
+                        source: "Optional".to_string(),
+                    },
+                ]),
             }]),
         },
         modules: Box::new([
@@ -446,10 +488,13 @@ fn transitive_import_keeps_the_original_record_identity_and_type_alias() -> anyh
     let [problem] = analysis.problems() else {
         anyhow::bail!("expected one wrong argument after transitive import: {analysis:?}");
     };
-    assert_eq!(problem.expected().to_string(), "Base");
+    assert_eq!(problem.expected().to_string(), "Base | None");
     assert_eq!(problem.actual().to_string(), "str");
     assert_eq!(slice(&root_source, problem.range()), Some("\"wrong\""));
-    assert_eq!(slice(&root_source, problem.related_range()), Some("Again"));
+    assert_eq!(
+        slice(&root_source, problem.related_range()),
+        Some("Optional")
+    );
     Ok(())
 }
 

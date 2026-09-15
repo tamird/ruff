@@ -130,6 +130,8 @@ impl std::fmt::Display for StarPrimitive {
 pub enum StarKnownType {
     Primitive(StarPrimitive),
     Record(StarRecordId),
+    Union(Box<[StarKnownType]>),
+    List(Box<StarKnownType>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,6 +161,16 @@ impl std::fmt::Display for StarKnownType {
         match self {
             Self::Primitive(primitive) => primitive.fmt(formatter),
             Self::Record(record) => formatter.write_str(&record.name),
+            Self::Union(alternatives) => {
+                for (index, alternative) in alternatives.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(" | ")?;
+                    }
+                    alternative.fmt(formatter)?;
+                }
+                Ok(())
+            }
+            Self::List(element) => write!(formatter, "list[{element}]"),
         }
     }
 }
@@ -936,8 +948,53 @@ fn type_expression(
             Some(StarKnownType::Primitive(primitive))
         }
         Expr::NoneLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::None)),
+        Expr::BinOp(binary) => {
+            if binary.op != ast::Operator::BitOr {
+                return None;
+            }
+            let left = type_expression(parsed, visible, &binary.left)?;
+            let right = type_expression(parsed, visible, &binary.right)?;
+            Some(type_union(left, [right]))
+        }
+        Expr::Subscript(subscript) => {
+            let Expr::Name(name) = subscript.value.as_ref() else {
+                return None;
+            };
+            if name.id != "list" || !parsed.is_host_global("list") {
+                return None;
+            }
+            let element = type_expression(parsed, visible, &subscript.slice)?;
+            Some(StarKnownType::List(Box::new(element)))
+        }
         _ => None,
     }
+}
+
+fn type_union(
+    first: StarKnownType,
+    rest: impl IntoIterator<Item = StarKnownType>,
+) -> StarKnownType {
+    let mut alternatives = Vec::new();
+    for ty in std::iter::once(first).chain(rest) {
+        match ty {
+            StarKnownType::Union(members) => {
+                for member in members {
+                    if !alternatives.contains(&member) {
+                        alternatives.push(member);
+                    }
+                }
+            }
+            other => {
+                if !alternatives.contains(&other) {
+                    alternatives.push(other);
+                }
+            }
+        }
+    }
+    if let [only] = alternatives.as_slice() {
+        return only.clone();
+    }
+    StarKnownType::Union(alternatives.into_boxed_slice())
 }
 
 struct CallScanner<'types> {
@@ -1044,17 +1101,38 @@ fn argument_type(
             };
             Some(constructor.ty.clone())
         }
+        Expr::List(list) => {
+            let mut elements = list.elts.iter();
+            let first = elements.next()?;
+            let first = argument_type(first, visible)?;
+            let mut types = Vec::new();
+            for element in elements {
+                let actual = argument_type(element, visible)?;
+                types.push(actual);
+            }
+            let element = type_union(first, types);
+            Some(StarKnownType::List(Box::new(element)))
+        }
         _ => None,
     }
 }
 
 fn type_accepts(expected: &StarKnownType, actual: &StarKnownType) -> bool {
+    if let StarKnownType::Union(members) = actual {
+        return members.iter().all(|member| type_accepts(expected, member));
+    }
     match expected {
         StarKnownType::Primitive(expected) => {
             matches!(actual, StarKnownType::Primitive(actual) if actual == expected)
         }
         StarKnownType::Record(expected) => {
             matches!(actual, StarKnownType::Record(actual) if actual == expected)
+        }
+        StarKnownType::Union(alternatives) => alternatives
+            .iter()
+            .any(|member| type_accepts(member, actual)),
+        StarKnownType::List(element) => {
+            matches!(actual, StarKnownType::List(actual) if type_accepts(element, actual))
         }
     }
 }
