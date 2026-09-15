@@ -5,6 +5,8 @@ use ruff_python_ast::PythonVersion;
 use ruff_python_parser::{Mode, ParseOptions, parse_unchecked};
 
 use crate::bazel::{BazelLoadError, BazelRepository};
+use crate::checker::{BazelCheckedSource, summarize_bazel_source};
+use crate::overlay::{BazelVerifiedSource, verify_bazel_source};
 use crate::preflight::{BazelPreflight, preflight_bazel_source};
 use crate::testing::test_db;
 
@@ -470,6 +472,91 @@ fn rejects_python_literals_and_indentation_unrecognized_by_bazel_9() -> anyhow::
         assert_eq!(diagnostic.id(), DiagnosticId::InvalidSyntax);
         assert_eq!(diagnostic.range(), failure.range());
     }
+    Ok(())
+}
+
+#[test]
+fn rejects_unicode_identifiers_even_when_python_admits_them() -> anyhow::Result<()> {
+    for (code, site) in [
+        ("def café():\n    return 1\nGOOD = 1\n", "café"),
+        ("def 𝒞():\n    return 1\nGOOD = 1\n", "𝒞"),
+        ("def public(café):\n    return café\nGOOD = 1\n", "café"),
+        ("café = 1\nGOOD = 1\n", "café"),
+        ("𝒞 = 1\nGOOD = 1\n", "𝒞"),
+        ("def public():\n    return café\nGOOD = 1\n", "café"),
+        ("def public(obj):\n    return obj.café\nGOOD = 1\n", "café"),
+        ("load(\":defs.bzl\", café=\"public\")\nGOOD = 1\n", "café"),
+        ("load(\":defs.bzl\", 𝒞=\"public\")\nGOOD = 1\n", "𝒞"),
+    ] {
+        let module = parse_unchecked(
+            code,
+            ParseOptions::from(Mode::Module).with_target_version(PythonVersion::PY310),
+        )
+        .try_into_module()
+        .ok_or(anyhow::anyhow!("shared parser did not parse: {code:?}"))?;
+        assert!(module.errors().is_empty(), "{code}: {:?}", module.errors());
+
+        let (db, root) = test_db(&[
+            ("MODULE.bazel", ""),
+            ("pkg/BUILD", ""),
+            ("pkg/defs.bzl", code),
+        ])?;
+        let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+        let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+        let failure = opaque(admit_bazel_source(&db, source))?;
+        assert!(
+            matches!(
+                failure.reason(),
+                BazelAdmissionError::BazelSyntax("identifiers not recognized by Bazel 9")
+            ),
+            "{code}: {:?}",
+            failure.reason()
+        );
+        assert_eq!(
+            failure.range().map(|range| range.start().to_usize()),
+            code.find(site)
+        );
+        assert_eq!(
+            failure.range().map(|range| range.len().to_usize()),
+            Some(site.len()),
+            "{code}"
+        );
+        assert!(matches!(
+            preflight_bazel_source(&db, source),
+            BazelPreflight::Opaque(_)
+        ));
+        assert!(matches!(
+            summarize_bazel_source(&db, source),
+            BazelCheckedSource::Opaque(_)
+        ));
+        assert!(matches!(
+            verify_bazel_source(&db, source),
+            BazelVerifiedSource::Opaque(_)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn keeps_unicode_strings_and_comments_without_unicode_identifiers() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        (
+            "pkg/defs.bzl",
+            "# Legitimate Unicode comment: π\nGOOD = \"café\"\n",
+        ),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    assert!(matches!(
+        admit_bazel_source(&db, source),
+        BazelSourceAdmission::Admitted(_)
+    ));
+    assert!(matches!(
+        preflight_bazel_source(&db, source),
+        BazelPreflight::Ready
+    ));
     Ok(())
 }
 

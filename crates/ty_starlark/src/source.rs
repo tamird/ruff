@@ -363,6 +363,15 @@ impl<'source> BazelSyntax<'source> {
             }
         }
     }
+
+    fn reject_non_bazel_identifier(&mut self, range: TextRange) {
+        let raw = self
+            .text
+            .get(range.start().to_usize()..range.end().to_usize());
+        if !raw.is_some_and(is_bazel_9_identifier) {
+            self.reject(range, "identifiers not recognized by Bazel 9");
+        }
+    }
 }
 
 impl<'a> Visitor<'a> for BazelSyntax<'_> {
@@ -412,6 +421,7 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
             Stmt::AnnAssign(_) => Some("annotated variable assignments"),
             Stmt::IpyEscapeCommand(_) => Some("IPython commands"),
             Stmt::FunctionDef(function) => {
+                self.reject_non_bazel_identifier(function.name.range());
                 if function.name.as_str() == "load" {
                     self.reject(function.name.range(), "rebinding the reserved load name");
                 }
@@ -444,6 +454,7 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
     fn visit_expr(&mut self, expression: &'a Expr) {
         let description = match expression {
             Expr::Name(name) => {
+                self.reject_non_bazel_identifier(name.range());
                 if name.id != "load"
                     || self
                         .top_level_load
@@ -489,6 +500,10 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
                 } else {
                     None
                 }
+            }
+            Expr::Attribute(attribute) => {
+                self.reject_non_bazel_identifier(attribute.attr.range());
+                None
             }
             Expr::Named(_) => Some("named assignment expressions"),
             Expr::Tuple(tuple) if !tuple.parenthesized => {
@@ -569,6 +584,30 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
         }
         ast::visitor::walk_expr(self, expression);
     }
+
+    fn visit_parameter(&mut self, parameter: &'a ast::Parameter) {
+        self.reject_non_bazel_identifier(parameter.name.range());
+        ast::visitor::walk_parameter(self, parameter);
+    }
+
+    fn visit_keyword(&mut self, keyword: &'a ast::Keyword) {
+        if let Some(name) = &keyword.arg {
+            self.reject_non_bazel_identifier(name.range());
+        }
+        ast::visitor::walk_keyword(self, keyword);
+    }
+}
+
+/// Bazel 9's Java lexer recognizes only ASCII identifier characters.
+/// <https://github.com/bazelbuild/bazel/blob/9.0.0/src/main/java/net/starlark/java/syntax/Lexer.java>
+pub(crate) fn is_bazel_9_identifier(name: &str) -> bool {
+    let Some(first) = name.as_bytes().first() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || *first == b'_')
+        && name.as_bytes()[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
 }
 
 fn is_docstring(statement: &Stmt) -> bool {
