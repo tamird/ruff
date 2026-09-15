@@ -256,9 +256,12 @@ fn inline_annotations_need_an_explicit_typed_bazel_profile() -> anyhow::Result<(
 
 #[test]
 fn unresolved_loads_and_unmodeled_body_control_flow_are_opaque() -> anyhow::Result<()> {
-    for code in [
-        "load(\":defs.bzl\", \"symbol\")\nGOOD = 1\n",
-        "def public(value):\n    if value:\n        return 1\n    return 0\nGOOD = 1\n",
+    for (code, expected_unresolved_load) in [
+        ("load(\":defs.bzl\", \"symbol\")\nGOOD = 1\n", true),
+        (
+            "def public(value):\n    if value:\n        return 1\n    return 0\nGOOD = 1\n",
+            false,
+        ),
     ] {
         let (db, root) = test_db(&[
             ("MODULE.bazel", ""),
@@ -268,11 +271,11 @@ fn unresolved_loads_and_unmodeled_body_control_flow_are_opaque() -> anyhow::Resu
         let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
         let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
         let failure = opaque(preflight_bazel_source(&db, source))?;
-        assert!(
-            matches!(failure.reason(), BazelPreflightError::Unsupported(_)),
-            "{code}: {:?}",
-            failure.reason()
-        );
+        match failure.reason() {
+            BazelPreflightError::UnresolvedLoad if expected_unresolved_load => {}
+            BazelPreflightError::Unsupported(_) if !expected_unresolved_load => {}
+            other => anyhow::bail!("{code}: expected {expected_unresolved_load}, found {other:?}"),
+        }
         assert!(failure.range().is_some());
     }
     Ok(())

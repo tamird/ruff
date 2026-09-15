@@ -12,6 +12,9 @@ use ruff_db::files::File;
 use ruff_python_ast::{self as ast, Expr, Number, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 
+use crate::loads::{
+    BazelCandidateLoad, BazelLoadPlan, BazelLoadPlanError, BazelLoadPlanFailure, plan_bazel_loads,
+};
 use crate::source::{BazelAdmissionFailure, BazelSource, BazelSourceAdmission, admit_bazel_source};
 
 /// A later checker may summarize only a whole file in this stable Bazel subset.
@@ -71,6 +74,10 @@ impl BazelPreflightFailure {
     pub fn admission_diagnostic(&self) -> Option<Diagnostic> {
         match &self.reason {
             BazelPreflightError::Admission(failure) => failure.diagnostic(),
+            BazelPreflightError::LoadPlan(failure) => match failure.reason() {
+                BazelLoadPlanError::Admission(admission) => admission.diagnostic(),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -80,6 +87,10 @@ impl BazelPreflightFailure {
 pub enum BazelPreflightError {
     #[error("the selected Bazel source cannot be admitted")]
     Admission(BazelAdmissionFailure),
+    #[error("the Bazel load statement contains invalid file bindings")]
+    LoadPlan(Box<BazelLoadPlanFailure>),
+    #[error("Bazel load statements must be resolved before checking this source")]
+    UnresolvedLoad,
     #[error("name '{0}' has no binding modeled by this source preflight")]
     UnknownName(String),
     #[error("duplicate module binding '{0}'")]
@@ -113,6 +124,23 @@ pub fn preflight_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelPref
             return BazelPreflight::Opaque(BazelPreflightFailure::from_admission(file, failure));
         }
     };
+    match plan_bazel_loads(db, source) {
+        BazelLoadPlan::NoLoads => {}
+        BazelLoadPlan::Pending(loads) => {
+            return BazelPreflight::Opaque(BazelPreflightFailure {
+                file,
+                range: loads.first().map(BazelCandidateLoad::range),
+                reason: BazelPreflightError::UnresolvedLoad,
+            });
+        }
+        BazelLoadPlan::Opaque(failure) => {
+            return BazelPreflight::Opaque(BazelPreflightFailure {
+                file: failure.file(),
+                range: failure.range(),
+                reason: BazelPreflightError::LoadPlan(Box::new(failure.clone())),
+            });
+        }
+    }
     match Names::new(suite).check_module(suite) {
         Ok(()) => BazelPreflight::Ready,
         Err(problem) => BazelPreflight::Opaque(BazelPreflightFailure {
