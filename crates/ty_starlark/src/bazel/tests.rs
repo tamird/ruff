@@ -180,6 +180,101 @@ fn rejects_missing_packages_and_nested_boundaries() -> anyhow::Result<()> {
 }
 
 #[test]
+fn explicit_main_repository_labels_use_the_selected_root() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("BUILD.bazel", ""),
+        ("root.bzl", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/importer.bzl", ""),
+        ("shared/BUILD", ""),
+        ("shared/defs.bzl", ""),
+    ])?;
+    let repository = BazelRepository::new(&db, root.clone());
+    let importer = system_path_to_file(&db, root.join("pkg/importer.bzl"))?;
+
+    for (label, path) in [
+        ("//shared:defs.bzl", "shared/defs.bzl"),
+        ("@@//shared:defs.bzl", "shared/defs.bzl"),
+        ("//:root.bzl", "root.bzl"),
+        ("@@//:root.bzl", "root.bzl"),
+    ] {
+        let loaded = resolve_bazel_load(&db, repository, importer, label)?;
+        assert_eq!(loaded.source.path(&db), &root.join(path), "{label}");
+    }
+    for label in ["@external//shared:defs.bzl", "@@external//shared:defs.bzl"] {
+        assert_eq!(
+            resolve_bazel_load(&db, repository, importer, label),
+            Err(BazelLoadError::UnsupportedRepository)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn target_names_reject_spaces_controls_and_unicode_even_for_existing_files() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("REPO.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/importer.bzl", ""),
+        ("pkg/foo bar.bzl", ""),
+        ("pkg/déf.bzl", ""),
+        ("pkg/new\nline.bzl", ""),
+        ("pkg/good+defs.bzl", ""),
+    ])?;
+    let repository = BazelRepository::new(&db, root.clone());
+    let importer = system_path_to_file(&db, root.join("pkg/importer.bzl"))?;
+
+    for label in [
+        ":foo bar.bzl",
+        "//pkg:foo bar.bzl",
+        ":déf.bzl",
+        ":new\nline.bzl",
+        "@@//pkg:foo bar.bzl",
+    ] {
+        assert_eq!(
+            resolve_bazel_load(&db, repository, importer, label),
+            Err(BazelLoadError::InvalidLabel),
+            "{label:?}"
+        );
+    }
+    let loaded = resolve_bazel_load(&db, repository, importer, ":good+defs.bzl")?;
+    assert_eq!(loaded.source.path(&db), &root.join("pkg/good+defs.bzl"));
+    Ok(())
+}
+
+#[test]
+fn package_names_preserve_spaces_and_reject_invalid_components() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("WORKSPACE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/importer.bzl", ""),
+        ("shared space/BUILD", ""),
+        ("shared space/defs.bzl", ""),
+        ("bad~/BUILD", ""),
+        ("bad~/defs.bzl", ""),
+        ("dép/BUILD", ""),
+        ("dép/defs.bzl", ""),
+        ("dots/.../BUILD", ""),
+        ("dots/.../defs.bzl", ""),
+    ])?;
+    let repository = BazelRepository::new(&db, root.clone());
+    let importer = system_path_to_file(&db, root.join("pkg/importer.bzl"))?;
+    for label in ["//shared space:defs.bzl", "@@//shared space:defs.bzl"] {
+        let loaded = resolve_bazel_load(&db, repository, importer, label)?;
+        assert_eq!(loaded.source.path(&db), &root.join("shared space/defs.bzl"));
+    }
+    for label in ["//bad~:defs.bzl", "//dép:defs.bzl", "//dots/...:defs.bzl"] {
+        assert_eq!(
+            resolve_bazel_load(&db, repository, importer, label),
+            Err(BazelLoadError::InvalidLabel),
+            "{label}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn observes_marker_stub_and_source_changes() -> anyhow::Result<()> {
     let (mut db, root) = test_db(&[
         ("MODULE.bazel", ""),

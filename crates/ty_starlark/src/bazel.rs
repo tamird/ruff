@@ -62,9 +62,10 @@ struct BazelLoad<'db> {
 /// Resolve a `.bzl` load in the selected main Bazel repository.
 ///
 /// Relative `:file.bzl` labels use the importer's BUILD package. Absolute
-/// `//pkg:file.bzl` labels use the package named in the label, including when
-/// that package differs from the importer's. External repositories and nested
-/// repository or package boundaries are outside this resolver's scope.
+/// `//pkg:file.bzl` and `@@//pkg:file.bzl` use the selected main repository,
+/// including when the package differs from the importer's. External
+/// repositories and nested repository or package boundaries are outside this
+/// resolver's scope.
 /// Callers must validate `.bzl` load visibility and exported bindings before
 /// trusting declarations from the returned source file.
 pub fn resolve_bazel_load(
@@ -87,16 +88,19 @@ fn resolve_bazel_load_query(
     let root = load.repository(db).root(db);
 
     let label = load.label(db);
-    let (package_root, target) = if label.starts_with('@') {
-        return Err(BazelLoadError::UnsupportedRepository);
-    } else if let Some(absolute) = label.strip_prefix("//") {
+    let (package_root, target) = if let Some(absolute) = label
+        .strip_prefix("//")
+        .or_else(|| label.strip_prefix("@@//"))
+    {
         let (package, target) = absolute
             .split_once(':')
             .ok_or(BazelLoadError::InvalidLabel)?;
-        if !is_valid_relative_path(package, true) || !is_valid_target(target) {
+        if !is_valid_package(package) || !is_valid_target(target) {
             return Err(BazelLoadError::InvalidLabel);
         }
         (root.join(package), target)
+    } else if label.starts_with('@') {
+        return Err(BazelLoadError::UnsupportedRepository);
     } else if let Some(target) = label.strip_prefix(':') {
         if !is_valid_target(target) {
             return Err(BazelLoadError::InvalidLabel);
@@ -193,8 +197,30 @@ fn is_package(db: &dyn Db, directory: &SystemPath) -> bool {
     reason = "Bazel requires the exact lowercase .bzl suffix"
 )]
 fn is_valid_target(target: &str) -> bool {
-    !target.contains(':') && target.ends_with(".bzl") && is_valid_relative_path(target, false)
+    !target.contains(':')
+        && target.ends_with(".bzl")
+        && is_valid_relative_path(target, false)
+        && target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || TARGET_PUNCTUATION.contains(&byte))
 }
+
+// Bazel 9 allows spaces and dots in package names, but not arbitrary Unicode
+// or components made entirely of dots.
+// <https://bazel.build/versions/9.0.0/concepts/labels>
+fn is_valid_package(package: &str) -> bool {
+    is_valid_relative_path(package, true)
+        && (package.is_empty()
+            || package
+                .split('/')
+                .all(|component| component.bytes().any(|byte| byte != b'.')))
+        && package
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || PACKAGE_PUNCTUATION.contains(&byte))
+}
+
+const TARGET_PUNCTUATION: &[u8] = b"!%-@^_\"#$&'()*+,;<=>?[]{|}~/.";
+const PACKAGE_PUNCTUATION: &[u8] = b"! \"#$%&'()*+,-.;<=>?@[]^_`{|}/";
 
 fn is_valid_relative_path(path: &str, allow_empty: bool) -> bool {
     if path.is_empty() {
