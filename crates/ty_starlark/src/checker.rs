@@ -4,7 +4,7 @@
 //! results justified by the initialized file and bodies of its own functions.
 //! A sibling stub or an explicit host profile is required for parameter types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ruff_db::Db;
 use ruff_db::files::File;
@@ -81,7 +81,7 @@ pub enum BazelExportKind {
 }
 
 /// Scalar precision derived from the runtime source, without stub types.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize)]
 pub enum BazelScalar {
     Int,
     Str,
@@ -192,10 +192,10 @@ pub fn summarize_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelChec
     };
     let file = source.selected_file(db);
     match ModuleBuilder::new(file, suite) {
-        Ok(mut builder) => {
-            builder.validate_calls(suite);
-            BazelCheckedSource::Checked(builder.finish(suite))
-        }
+        Ok(mut builder) => match builder.validate_calls(suite) {
+            Ok(()) => BazelCheckedSource::Checked(builder.finish(suite)),
+            Err(failure) => BazelCheckedSource::Opaque(failure),
+        },
         Err(failure) => BazelCheckedSource::Opaque(failure),
     }
 }
@@ -223,17 +223,25 @@ impl BodyValue {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Visit {
-    Visiting,
-    Done(BodyValue),
+/// Finished results depend on the values supplied to this invocation.
+#[derive(Eq, Hash, PartialEq)]
+struct CallContext<'source> {
+    name: &'source str,
+    inputs: Box<[BazelScalar]>,
 }
+
+const MAX_SPECIALIZED_CONTEXTS: usize = 1024;
+const MAX_ACTIVE_FUNCTIONS: usize = 128;
 
 struct ModuleBuilder<'source> {
     file: File,
     scalars: HashMap<&'source str, BazelScalar>,
     functions: HashMap<&'source str, &'source ast::StmtFunctionDef>,
-    visited: HashMap<&'source str, Visit>,
+    results: HashMap<CallContext<'source>, BodyValue>,
+    specialized_contexts: usize,
+    active_functions: HashSet<&'source str>,
+    invalid_call_sites: HashSet<TextRange>,
+    exhausted_at: Option<TextRange>,
     problems: Vec<BazelCheckProblem>,
 }
 
@@ -286,36 +294,68 @@ impl<'source> ModuleBuilder<'source> {
             file,
             scalars,
             functions,
-            visited: HashMap::new(),
+            results: HashMap::new(),
+            specialized_contexts: 0,
+            active_functions: HashSet::new(),
+            invalid_call_sites: HashSet::new(),
+            exhausted_at: None,
             problems: Vec::new(),
         })
     }
 
     /// Check every body, including functions that no other source function calls.
-    fn validate_calls(&mut self, suite: &'source [Stmt]) {
+    fn validate_calls(&mut self, suite: &'source [Stmt]) -> Result<(), BazelPreflightFailure> {
         for statement in suite {
             if let Stmt::FunctionDef(function) = statement {
-                self.function_result(function.name.as_str());
+                let inputs = vec![BazelScalar::Unknown; function.parameters.args.len()];
+                self.function_result(function.name.as_str(), &inputs);
+                if let Some(range) = self.exhausted_at {
+                    return Err(BazelPreflightFailure::analysis_limit(self.file, range));
+                }
             }
         }
+        Ok(())
     }
 
-    fn function_result(&mut self, name: &'source str) -> BodyValue {
-        match self.visited.get(name).copied() {
-            Some(Visit::Done(result)) => return result,
-            Some(Visit::Visiting) => return BodyValue::invalid_call(),
-            None => {}
+    fn function_result(&mut self, name: &'source str, inputs: &[BazelScalar]) -> BodyValue {
+        // Bazel rejects reentering the same function even with new arguments.
+        // Check the active function before consulting an earlier cached result.
+        if self.active_functions.contains(name) {
+            return BodyValue::invalid_call();
         }
         let Some(function) = self.functions.get(name).copied() else {
             return BodyValue::invalid_call();
         };
-        self.visited.insert(name, Visit::Visiting);
+        if inputs.len() != function.parameters.args.len() {
+            return BodyValue::invalid_call();
+        }
+        let context = CallContext {
+            name,
+            inputs: inputs.to_vec().into_boxed_slice(),
+        };
+        if let Some(result) = self.results.get(&context) {
+            return *result;
+        }
+        // Mandatory all-Unknown validation scales with the number of
+        // declarations. Only additional concrete-input contexts consume the
+        // specialization budget.
+        let specialized = inputs.iter().any(|input| *input != BazelScalar::Unknown);
+        if (specialized && self.specialized_contexts >= MAX_SPECIALIZED_CONTEXTS)
+            || self.active_functions.len() >= MAX_ACTIVE_FUNCTIONS
+        {
+            self.exhausted_at.get_or_insert(function.name.range());
+            return BodyValue::invalid_call();
+        }
+        if specialized {
+            self.specialized_contexts += 1;
+        }
+        self.active_functions.insert(name);
 
-        // Defaults determine arity, but do not establish the type of a
-        // parameter: callers may supply any value instead of that default.
+        // Unspecified exported parameters start Unknown. A particular call
+        // supplies its own inputs, with source defaults filled only when omitted.
         let mut locals = HashMap::new();
-        for parameter in &function.parameters.args {
-            locals.insert(parameter.name().as_str(), BazelScalar::Unknown);
+        for (parameter, input) in function.parameters.args.iter().zip(inputs) {
+            locals.insert(parameter.name().as_str(), *input);
         }
 
         let mut may_fail = false;
@@ -357,7 +397,8 @@ impl<'source> ModuleBuilder<'source> {
             },
             may_fail,
         };
-        self.visited.insert(name, Visit::Done(result));
+        self.active_functions.remove(name);
+        self.results.insert(context, result);
         result
     }
 
@@ -380,8 +421,11 @@ impl<'source> ModuleBuilder<'source> {
             Expr::Call(call) => {
                 // Each argument is evaluated even when the callee ignores it.
                 let mut may_fail = false;
+                let mut inputs = Vec::with_capacity(call.arguments.args.len());
                 for argument in &call.arguments.args {
-                    may_fail |= self.body_expr(argument, locals).may_fail;
+                    let input = self.body_expr(argument, locals);
+                    may_fail |= input.may_fail;
+                    inputs.push(input.scalar);
                 }
                 let Expr::Name(callee) = call.func.as_ref() else {
                     return BodyValue::invalid_call();
@@ -397,20 +441,31 @@ impl<'source> ModuleBuilder<'source> {
                 let maximum = parameters.len();
                 let actual = call.arguments.args.len();
                 if actual < minimum || actual > maximum {
-                    self.problems.push(BazelCheckProblem {
-                        file: self.file,
-                        range: call.range(),
-                        declaration_range: function.name.range(),
-                        reason: BazelCheckError::InvalidArity {
-                            callee: callee.id.to_string(),
-                            minimum,
-                            maximum,
-                            actual,
-                        },
-                    });
+                    if self.invalid_call_sites.insert(call.range()) {
+                        self.problems.push(BazelCheckProblem {
+                            file: self.file,
+                            range: call.range(),
+                            declaration_range: function.name.range(),
+                            reason: BazelCheckError::InvalidArity {
+                                callee: callee.id.to_string(),
+                                minimum,
+                                maximum,
+                                actual,
+                            },
+                        });
+                    }
                     return BodyValue::invalid_call();
                 }
-                let result = self.function_result(callee.id.as_str());
+                for parameter in parameters.iter().skip(actual) {
+                    let Some(default) = parameter.default() else {
+                        return BodyValue::invalid_call();
+                    };
+                    let Some(default) = eager_scalar(default, &self.scalars) else {
+                        return BodyValue::invalid_call();
+                    };
+                    inputs.push(default);
+                }
+                let result = self.function_result(callee.id.as_str(), &inputs);
                 may_fail |= result.may_fail;
                 BodyValue {
                     scalar: if may_fail {
@@ -430,7 +485,11 @@ impl<'source> ModuleBuilder<'source> {
             file,
             scalars,
             functions: _,
-            visited,
+            results,
+            specialized_contexts: _,
+            active_functions: _,
+            invalid_call_sites: _,
+            exhausted_at: _,
             mut problems,
         } = self;
         let mut exports = Vec::new();
@@ -468,9 +527,14 @@ impl<'source> ModuleBuilder<'source> {
                             has_default: parameter.default().is_some(),
                         })
                         .collect();
-                    let (result, body_may_fail) = match visited.get(function.name.as_str()) {
-                        Some(Visit::Done(result)) => (result.scalar, result.may_fail),
-                        _ => (BazelScalar::Unknown, true),
+                    let context = CallContext {
+                        name: function.name.as_str(),
+                        inputs: vec![BazelScalar::Unknown; function.parameters.args.len()]
+                            .into_boxed_slice(),
+                    };
+                    let (result, body_may_fail) = match results.get(&context) {
+                        Some(result) => (result.scalar, result.may_fail),
+                        None => (BazelScalar::Unknown, true),
                     };
                     exports.push(BazelExport {
                         name: function.name.to_string(),

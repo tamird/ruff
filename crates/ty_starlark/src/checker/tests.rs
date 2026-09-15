@@ -1,7 +1,10 @@
+use std::fmt::Write as _;
+
 use ruff_db::files::system_path_to_file;
 use ruff_db::system::DbWithWritableSystem as _;
 
 use crate::bazel::BazelRepository;
+use crate::preflight::BazelPreflightError;
 use crate::source::BazelSource;
 use crate::testing::test_db;
 
@@ -143,6 +146,161 @@ fn forward_bindings_and_file_edits_revalidate_function_results() -> anyhow::Resu
     assert_eq!(function(summary, "first")?.result(), BazelScalar::Str);
     assert_eq!(function(summary, "second")?.result(), BazelScalar::Str);
     assert_eq!(scalar(summary, "LATER")?, BazelScalar::Str);
+    Ok(())
+}
+
+#[test]
+fn source_calls_use_supplied_values_and_only_omitted_defaults() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        (
+            "pkg/defs.bzl",
+            "BASE = 1\ndef echo(value=BASE):\n    return value\ndef default_call():\n    return echo()\ndef str_call():\n    return echo(\"text\")\ndef twice():\n    first = echo(2)\n    second = echo(\"other\")\n    return second\n",
+        ),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let summary = checked(summarize_bazel_source(&db, source))?;
+    let echo = function(summary, "echo")?;
+    assert_eq!(echo.result(), BazelScalar::Unknown);
+    assert!(!echo.body_may_fail());
+    assert_eq!(
+        function(summary, "default_call")?.result(),
+        BazelScalar::Int
+    );
+    assert_eq!(function(summary, "str_call")?.result(), BazelScalar::Str);
+    assert_eq!(function(summary, "twice")?.result(), BazelScalar::Str);
+    assert!(summary.problems().is_empty());
+    Ok(())
+}
+
+#[test]
+fn bad_call_site_is_reported_once_across_specialized_contexts() -> anyhow::Result<()> {
+    let runtime = "def broken(value):\n    return keep()\ndef keep(value):\n    return 1\ndef first():\n    return broken(1)\ndef second():\n    return broken(\"text\")\nGOOD = 1\n";
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", runtime),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let summary = checked(summarize_bazel_source(&db, source))?;
+    assert_eq!(scalar(summary, "GOOD")?, BazelScalar::Int);
+    for name in ["broken", "first", "second"] {
+        let affected = function(summary, name)?;
+        assert_eq!(affected.result(), BazelScalar::Unknown);
+        assert!(affected.body_may_fail());
+    }
+    let [problem] = summary.problems() else {
+        anyhow::bail!("expected one source call problem: {:?}", summary.problems());
+    };
+    assert_eq!(problem.file(), file);
+    assert_eq!(
+        problem.range().start().to_usize(),
+        runtime.find("keep()").unwrap()
+    );
+    Ok(())
+}
+
+#[test]
+fn changed_argument_recursion_remains_unknown_after_prior_evaluation() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        (
+            "pkg/defs.bzl",
+            "def bounce(value):\n    return bounce(1)\ndef caller():\n    return bounce(\"text\")\n",
+        ),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let summary = checked(summarize_bazel_source(&db, source))?;
+    assert!(function(summary, "bounce")?.body_may_fail());
+    assert_eq!(function(summary, "bounce")?.result(), BazelScalar::Unknown);
+    assert!(function(summary, "caller")?.body_may_fail());
+    assert_eq!(function(summary, "caller")?.result(), BazelScalar::Unknown);
+    Ok(())
+}
+
+#[test]
+fn excessive_call_graph_depth_keeps_every_export_opaque() -> anyhow::Result<()> {
+    let mut code = String::from("GOOD = 1\n");
+    for index in 0..=super::MAX_ACTIVE_FUNCTIONS {
+        if index < super::MAX_ACTIVE_FUNCTIONS {
+            write!(
+                code,
+                "def step_{index}():\n    return step_{}()\n",
+                index + 1
+            )?;
+        } else {
+            write!(code, "def step_{index}():\n    return 1\n")?;
+        }
+    }
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", &code),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let BazelCheckedSource::Opaque(failure) = summarize_bazel_source(&db, source) else {
+        anyhow::bail!("exhausted proof exposed checked exports");
+    };
+    assert_eq!(failure.file(), file);
+    assert!(failure.range().is_some());
+    assert!(matches!(
+        failure.reason(),
+        BazelPreflightError::AnalysisLimit
+    ));
+    Ok(())
+}
+
+#[test]
+fn independent_generic_functions_do_not_consume_specialization_quota() -> anyhow::Result<()> {
+    let mut code = String::from("GOOD = 1\n");
+    for index in 0..=super::MAX_SPECIALIZED_CONTEXTS {
+        write!(code, "def separate_{index}():\n    return 1\n")?;
+    }
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", &code),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let summary = checked(summarize_bazel_source(&db, source))?;
+    assert_eq!(scalar(summary, "GOOD")?, BazelScalar::Int);
+    assert_eq!(summary.exports().len(), super::MAX_SPECIALIZED_CONTEXTS + 2);
+    assert!(summary.problems().is_empty());
+    Ok(())
+}
+
+#[test]
+fn excessive_distinct_specializations_keep_every_export_opaque() -> anyhow::Result<()> {
+    let mut code = String::from("GOOD = 1\n");
+    for index in 0..=super::MAX_SPECIALIZED_CONTEXTS {
+        write!(
+            code,
+            "def _helper_{index}(value):\n    return value\ndef public_{index}():\n    return _helper_{index}(1)\n"
+        )?;
+    }
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", &code),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let BazelCheckedSource::Opaque(failure) = summarize_bazel_source(&db, source) else {
+        anyhow::bail!("exhausted specialization exposed checked exports");
+    };
+    assert_eq!(failure.file(), file);
+    assert!(failure.range().is_some());
+    assert!(matches!(
+        failure.reason(),
+        BazelPreflightError::AnalysisLimit
+    ));
     Ok(())
 }
 

@@ -46,6 +46,14 @@ impl BazelPreflightFailure {
         }
     }
 
+    pub(crate) fn analysis_limit(file: File, range: TextRange) -> Self {
+        Self {
+            file,
+            range: Some(range),
+            reason: BazelPreflightError::AnalysisLimit,
+        }
+    }
+
     pub fn file(&self) -> File {
         self.file
     }
@@ -84,6 +92,8 @@ pub enum BazelPreflightError {
     UninitializedModule(String),
     #[error("inline type annotations require an experimental Bazel profile")]
     InlineAnnotation,
+    #[error("Sty reached its Bazel function analysis limit")]
+    AnalysisLimit,
     #[error("cannot check {0} in this stable Bazel subset")]
     Unsupported(&'static str),
 }
