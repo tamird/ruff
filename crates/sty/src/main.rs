@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command as ChildCommand;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
@@ -27,6 +26,8 @@ use ty_starlark::overlay::{
 use ty_starlark::preflight::BazelPreflightError;
 use ty_starlark::source::BazelSource;
 use ty_starlark::stub::BazelStubError;
+
+mod host;
 
 #[salsa::db]
 #[derive(Clone)]
@@ -85,7 +86,7 @@ struct CheckCommand {
     #[arg(long, value_name = "ROOT")]
     workspace: Option<PathBuf>,
 
-    /// Executable host for checking a single `.star` file.
+    /// Executable host providing a source graph and native `.star` check.
     #[arg(long, value_name = "EXE")]
     host_checker: Option<PathBuf>,
 
@@ -115,7 +116,7 @@ fn run() -> Result<i32> {
     } = Cli::parse();
     let cwd = absolute_cwd()?;
     if let Some(checker) = options.host_checker.as_ref() {
-        return run_host(&cwd, checker, &options);
+        return host::run_host(&cwd, checker, &options);
     }
     if !options.inputs.is_empty() {
         return Err(anyhow!("--input requires --host-checker"));
@@ -130,48 +131,6 @@ fn run() -> Result<i32> {
     }
     let healthy = run_bazel(&cwd, options)?;
     Ok(i32::from(!healthy))
-}
-
-fn run_host(cwd: &SystemPath, checker: &PathBuf, options: &CheckCommand) -> Result<i32> {
-    if options.workspace.is_some() {
-        return Err(anyhow!("--workspace applies only to Bazel .bzl labels"));
-    }
-    let [source] = options.labels.as_slice() else {
-        return Err(anyhow!(
-            "host checking requires exactly one .star file path"
-        ));
-    };
-    if source.starts_with(':')
-        || (source.starts_with("//") && source.contains(':'))
-        || (source.starts_with('@') && source.contains("//"))
-    {
-        return Err(anyhow!(
-            "host checking requires a file path, not a Bazel label"
-        ));
-    }
-    if !is_star_path(source) {
-        return Err(anyhow!("host checking requires a .star file path"));
-    }
-    let source = absolute_host_path(source, cwd);
-    let mut command = ChildCommand::new(checker);
-    command
-        .arg("--sty-check-v1")
-        .arg("--source")
-        .arg(source.as_std_path());
-    for input in &options.inputs {
-        let (name, path) = input
-            .split_once('=')
-            .ok_or_else(|| anyhow!("host input must have NAME=PATH form: {input}"))?;
-        if name.is_empty() || path.is_empty() {
-            return Err(anyhow!("host input needs nonempty NAME and PATH: {input}"));
-        }
-        let path = absolute_host_path(path, cwd);
-        command.arg("--input").arg(format!("{name}={path}"));
-    }
-    let status = command
-        .status()
-        .with_context(|| format!("cannot start host checker {}", checker.display()))?;
-    Ok(status.code().unwrap_or(1))
 }
 
 fn absolute_host_path(path: &str, cwd: &SystemPath) -> SystemPathBuf {

@@ -2,7 +2,7 @@
 name = "ty_starlark"
 version = "0.0.0"
 publish = false
-description = "Bazel Starlark source checks for Sty"
+description = "Bazel and host graph Starlark source checks for Sty"
 edition.workspace = true
 rust-version.workspace = true
 homepage.workspace = true

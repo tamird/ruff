@@ -2,7 +2,7 @@
 name = "sty"
 version = "0.0.0"
 publish = false
-description = "Standalone Starlark checker for Bazel sources"
+description = "Static Starlark checks for Bazel sources and host graphs"
 edition.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
@@ -20,6 +20,8 @@ ruff_text_size = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 salsa = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

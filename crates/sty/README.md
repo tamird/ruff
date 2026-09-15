@@ -27,29 +27,48 @@ parser also marks valid Starlark forms outside the shared Python parser
 subset opaque. Unsupported source semantics and uncheckable stubs are
 opaque, and opaque sources cause a nonzero exit.
 
-For a `.star` file, supply an executable checker that implements the v1
-host process interface. This mode works from any directory and requires
-no Bazel marker or BUILD file. It rejects Bazel selectors such as
-`//pkg:file.star`, while `//abs/path.star` is an absolute file path:
+For a `.star` file, supply a host implementing both v1 process modes.
+This works from any directory without a Bazel marker or BUILD file.
+`//pkg:file.star` is a Bazel selector; `//abs/path.star` is an absolute
+file path. A host built with Bazel needs its own runfiles manifest in
+the process environment when launched outside Bazel:
 
 ```sh
-/abs/ruff/target/debug/sty check \
+RUNFILES_MANIFEST_FILE=/abs/bin/deploy_star.runfiles_manifest \
+  /abs/ruff/target/debug/sty check \
   --host-checker /abs/bin/deploy_star \
-  --input locations=/abs/locations.json \
-  --input clusters=/abs/clusters.json \
+  --input cloud_locations=/abs/locations.json \
+  --input engine_clusters=/abs/clusters.json \
   /abs/deploy.star
 ```
 
-Sty invokes the executable with `--sty-check-v1 --source ABS` and each
-`--input NAME=ABS`. Relative source and input paths become absolute from
-the current directory; already absolute paths keep their spelling. The
-host parses `.star`, resolves its loads, and decides when to read named
-inputs. An unused input may remain unopened.
+Sty first invokes `--sty-graph-v1 --source ABS` with each named
+`--input NAME=ABS`. The host parses the captured UTF-8 source, resolves
+custom loads, and returns direct aliases and declarative record forms.
+Sty checks `int`, `str`, and `bool` record fields declared in source
+against literal arguments in the root and loaded modules, including
+dead top level `if` arms. It reports an argument source span and the
+related field declaration span on a known mismatch.
 
-Sty inherits the process environment, stdout, and stderr and relays the
-host exit code. A Bazel-built host may need `RUNFILES_MANIFEST_FILE` set
-to its own adjacent runfiles manifest when launched outside Bazel.
+Nominal records, lists, unions, attributes, callback and function
+bodies, record declarations in the root, and values computed at runtime
+remain unproved. The shared Python parser may also mark a valid host
+Starlark form opaque. A clear bounded source pass must then invoke
+`--sty-check-v1` with the same source and inputs. The host still owns
+its parser, loader, native annotation checks, and runtime checks.
+Native v1 rereads files, so keep sources and catalogs stable across
+the two invocations; it does not attest one shared source revision.
+
+Relative source and input paths become absolute from the current
+directory; already absolute paths keep their spelling. The host
+decides when to read named inputs, and an unused input may remain
+unopened. Sty captures graph stdout privately and inherits graph
+stderr and the process environment. Native check stdout and stderr
+are inherited unchanged.
 
 Bazel checks return 0 when clear, 1 for checked problems or opaque
-sources, and 2 for invalid invocation or label selection. Host checks
-return the executable's exit code; setup errors return 2.
+sources, and 2 for invalid invocation or label selection. `.star`
+returns 1 for a known source type problem or an opaque source, and 2
+for malformed graph facts or Sty setup errors. A failed graph process
+relays the host exit code, including its native parser error status.
+A clear Sty pass relays the subsequent native host check exit code.

@@ -4261,6 +4261,8 @@ dependencies = [
  "ruff_source_file",
  "ruff_text_size",
  "salsa",
+ "serde",
+ "serde_json",
  "tempfile",
  "ty_starlark",
 ]

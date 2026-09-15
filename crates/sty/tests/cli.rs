@@ -46,6 +46,68 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn utf8_path(path: &Path) -> anyhow::Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF8 fixture source path: {path:?}"))
+}
+
+fn star_graph_json(
+    path: &Path,
+    source: &str,
+    loads: &[serde_json::Value],
+    modules: &[serde_json::Value],
+) -> anyhow::Result<String> {
+    let path = utf8_path(path)?;
+    let graph = serde_json::json!({
+        "version": "sty-star-graph-v1",
+        "profile": "example-star-host-v1",
+        "root": {"path": path, "source": source, "loads": loads},
+        "modules": modules,
+        "special_forms": [
+            {
+                "name": "record", "kind": "builtin_record", "validator": "none",
+                "field_types": "named_keyword_type_expressions"
+            },
+            {
+                "name": "wrapper_record", "kind": "record_with_validator",
+                "validator": "first_positional_callable",
+                "field_types": "named_keyword_type_expressions"
+            }
+        ]
+    });
+    Ok(serde_json::to_string(&graph)?)
+}
+
+#[cfg(unix)]
+fn host_fixture(fixture: &Fixture) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fixture.write(
+        "host-checker",
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' \"$@\" >> \"$STY_TEST_ARGV_LOG\"\n",
+            "printf 'manifest:%s\\n' \"$RUNFILES_MANIFEST_FILE\" >> \"$STY_TEST_ARGV_LOG\"\n",
+            "if [ \"$1\" = '--sty-graph-v1' ]; then\n",
+            "  if [ \"${STY_TEST_GRAPH_EXIT:-0}\" -ne 0 ]; then\n",
+            "    printf 'graph producer failed\\n' >&2\n",
+            "    exit \"$STY_TEST_GRAPH_EXIT\"\n",
+            "  fi\n",
+            "  cat \"$STY_TEST_GRAPH\"\n",
+            "  exit 0\n",
+            "fi\n",
+            "printf 'host stdout\\n'\n",
+            "printf 'host stderr\\n' >&2\n",
+            "exit 37\n",
+        ),
+    )?;
+    let checker = fixture.path("host-checker");
+    let mut permissions = fs::metadata(&checker)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&checker, permissions)?;
+    Ok(checker)
+}
+
 #[test]
 fn absolute_labels_need_only_a_marked_root_and_relative_labels_need_cwd_build() -> anyhow::Result<()>
 {
@@ -284,40 +346,30 @@ fn host_usage_errors_before_bazel_repository_discovery() -> anyhow::Result<()> {
         &["check", "--host-checker", "./missing-host", "a.star"],
     )?;
     assert_eq!(bad_executable.status.code(), Some(2));
-    assert!(stderr(&bad_executable).contains("cannot start host checker"));
+    assert!(stderr(&bad_executable).contains("cannot start host graph producer"));
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
 fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
     let fixture = Fixture::unmarked()?;
     fixture.write("@notes.star", "VALUE = 1\n")?;
     fixture.write("source/local module=west.star", "VALUE = 2\n")?;
-    fixture.write(
-        "host-checker",
-        concat!(
-            "#!/bin/sh\n",
-            "printf '%s\\n' \"$@\" > \"$STY_TEST_ARGV_LOG\"\n",
-            "printf 'manifest:%s\\n' \"$RUNFILES_MANIFEST_FILE\" >> \"$STY_TEST_ARGV_LOG\"\n",
-            "printf 'host stdout\\n'\n",
-            "printf 'host stderr\\n' >&2\n",
-            "exit 37\n",
-        ),
-    )?;
-    let checker = fixture.path("host-checker");
-    let mut permissions = fs::metadata(&checker)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&checker, permissions)?;
+    let checker = host_fixture(&fixture)?;
     let log = fixture.path("host-argv.txt");
+    let graph_file = fixture.path("graph.json");
+    let cwd = fixture.root.path().canonicalize()?;
+    let source_path = cwd.join("@notes.star");
+    let graph = star_graph_json(&source_path, "VALUE = 1\n", &[], &[])?;
+    fixture.write("graph.json", &graph)?;
     let absolute_input = fixture.path("source/../source/local module=west.star");
     let named_input = format!("local={}", absolute_input.display());
     let missing_input = "unused=missing data=west.json";
     let output = Command::new(env!("CARGO_BIN_EXE_sty"))
         .current_dir(fixture.root.path())
         .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", &graph_file)
         .env("RUNFILES_MANIFEST_FILE", "host-manifest.txt")
         .arg("check")
         .arg("--host-checker")
@@ -331,19 +383,25 @@ fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<(
     assert_eq!(output.status.code(), Some(37), "{}", stderr(&output));
     assert_eq!(output.stdout, b"host stdout\n");
     assert_eq!(output.stderr, b"host stderr\n");
-    let cwd = fixture.root.path().canonicalize()?;
-    let expected = format!(
-        "--sty-check-v1\n--source\n{}\n--input\n{named_input}\n--input\nunused={}\nmanifest:host-manifest.txt\n",
-        cwd.join("@notes.star").display(),
+    let arguments = format!(
+        "--source\n{}\n--input\n{named_input}\n--input\nunused={}\nmanifest:host-manifest.txt\n",
+        source_path.display(),
         cwd.join("missing data=west.json").display(),
     );
-    assert_eq!(fs::read_to_string(log)?, expected);
+    assert_eq!(
+        fs::read_to_string(log)?,
+        format!("--sty-graph-v1\n{arguments}--sty-check-v1\n{arguments}")
+    );
 
-    let double_slash_source = format!("/{}", fixture.path("@notes.star").display());
+    let double_slash_source = format!("/{}", source_path.display());
     let double_log = fixture.path("double-slash-argv.txt");
+    let double_graph_file = fixture.path("double-graph.json");
+    let double_graph = star_graph_json(Path::new(&double_slash_source), "VALUE = 1\n", &[], &[])?;
+    fixture.write("double-graph.json", &double_graph)?;
     let double = Command::new(env!("CARGO_BIN_EXE_sty"))
         .current_dir(fixture.root.path())
         .env("STY_TEST_ARGV_LOG", &double_log)
+        .env("STY_TEST_GRAPH", &double_graph_file)
         .env("RUNFILES_MANIFEST_FILE", "host-manifest.txt")
         .arg("check")
         .arg("--host-checker")
@@ -353,7 +411,142 @@ fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<(
     assert_eq!(double.status.code(), Some(37), "{}", stderr(&double));
     assert_eq!(
         fs::read_to_string(double_log)?,
-        format!("--sty-check-v1\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n")
+        format!(
+            "--sty-graph-v1\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n--sty-check-v1\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n"
+        )
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn host_graph_yields_a_sty_owned_dead_branch_error_from_captured_text() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    let checker = host_fixture(&fixture)?;
+    let root_path = fixture.path("root.star");
+    let module_path = fixture.path("limits.star");
+    let root_source = "load(\"//example:limits.star\", \"LimitConfig\")\nif False:\n    LimitConfig(max_connections=\"wrong\")\n";
+    let declaration = "def validate(value):\n    pass\nLimitConfig = wrapper_record(validate, max_connections=int)\n";
+    // The host graph owns the analyzed snapshot. The physical file has a
+    // different line structure so disk reads would misreport this error.
+    fixture.write("root.star", "GOOD = 1\n")?;
+    fixture.write("limits.star", declaration)?;
+    let literal = "\"//example:limits.star\"";
+    let offset = root_source
+        .find(literal)
+        .ok_or_else(|| anyhow::anyhow!("fixture load label missing"))?;
+    let start = u32::try_from(offset)?;
+    let literal_len = u32::try_from(literal.len())?;
+    let end = start + literal_len;
+    let module_name = utf8_path(&module_path)?;
+    let graph = star_graph_json(
+        &root_path,
+        root_source,
+        &[serde_json::json!({
+            "module_id": "//example:limits.star", "start": start, "end": end,
+            "symbols": [{"local": "LimitConfig", "source": "LimitConfig"}]
+        })],
+        &[serde_json::json!({
+            "id": "//example:limits.star", "path": module_name,
+            "source": declaration, "loads": []
+        })],
+    )?;
+    fixture.write("graph.json", &graph)?;
+    let log = fixture.path("host-argv.txt");
+    let graph_file = fixture.path("graph.json");
+    let checker_name = utf8_path(&checker)?;
+    let root_name = utf8_path(&root_path)?;
+    let args = ["check", "--host-checker", checker_name, root_name];
+    let output = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", &graph_file)
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .args(args)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(output.stdout.is_empty(), "graph stdout leaked source JSON");
+    let diagnostic = stderr(&output);
+    assert!(diagnostic.contains("root.star:3:"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("LimitConfig.max_connections, expected int, got str"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("limits.star:3:"), "{diagnostic}");
+    assert_eq!(
+        fs::read_to_string(&log)?,
+        format!(
+            "--sty-graph-v1\n--source\n{}\nmanifest:\n",
+            root_path.display()
+        )
+    );
+
+    let mut stale: serde_json::Value = serde_json::from_str(&graph)?;
+    stale["root"]["loads"][0]["symbols"][0]["local"] = "stale".into();
+    let stale_graph = serde_json::to_string(&stale)?;
+    fixture.write("graph.json", &stale_graph)?;
+    fs::write(&log, "")?;
+    let invalid = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", &graph_file)
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .args(args)
+        .output()?;
+    assert_eq!(invalid.status.code(), Some(2), "{}", stderr(&invalid));
+    assert!(stderr(&invalid).contains("parsed Starlark load differs"));
+    assert_eq!(
+        fs::read_to_string(log)?.matches("--sty-check-v1").count(),
+        0
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn malformed_host_graph_exits_two_and_producer_failure_relays_its_status() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    fixture.write("root.star", "VALUE = 1\n")?;
+    fixture.write("graph.json", "{")?;
+    let root_path = fixture.path("root.star");
+    let checker = host_fixture(&fixture)?;
+    let graph_file = fixture.path("graph.json");
+    let log = fixture.path("host-argv.txt");
+    let checker_name = utf8_path(&checker)?;
+    let root_name = utf8_path(&root_path)?;
+    let args = ["check", "--host-checker", checker_name, root_name];
+    let malformed = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", &graph_file)
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .args(args)
+        .output()?;
+    assert_eq!(malformed.status.code(), Some(2), "{}", stderr(&malformed));
+    assert!(stderr(&malformed).contains("invalid versioned JSON"));
+    assert!(
+        malformed.stdout.is_empty(),
+        "malformed JSON leaked to stdout"
+    );
+    assert_eq!(
+        fs::read_to_string(&log)?.matches("--sty-check-v1").count(),
+        0
+    );
+
+    fs::write(&log, "")?;
+    let failed = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", &graph_file)
+        .env("STY_TEST_GRAPH_EXIT", "23")
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .args(args)
+        .output()?;
+    assert_eq!(failed.status.code(), Some(23), "{}", stderr(&failed));
+    assert_eq!(failed.stderr, b"graph producer failed\n");
+    assert_eq!(
+        fs::read_to_string(log)?.matches("--sty-check-v1").count(),
+        0
     );
     Ok(())
 }
