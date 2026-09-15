@@ -754,15 +754,19 @@ fn source_constructors(
             }
         }
         let mut fields = HashMap::new();
+        let mut seen_fields = HashSet::new();
         let mut safe = true;
         for keyword in &call.arguments.keywords {
             let Some(name) = keyword.arg.as_ref() else {
                 safe = false;
                 break;
             };
-            let Expr::Name(annotation) = &keyword.value else {
+            if !seen_fields.insert(name.as_str()) {
                 safe = false;
                 break;
+            }
+            let Expr::Name(annotation) = &keyword.value else {
+                continue;
             };
             let scalar = match annotation.id.as_str() {
                 "int" => parsed.is_host_global("int").then_some(StarPrimitive::Int),
@@ -771,23 +775,17 @@ fn source_constructors(
                 _ => None,
             };
             let Some(scalar) = scalar else {
-                safe = false;
-                break;
+                continue;
             };
-            match fields.entry(name.as_str().to_string()) {
-                Entry::Occupied(_) => {
-                    safe = false;
-                    break;
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(StarField {
-                        scalar,
-                        range: annotation.range(),
-                    });
-                }
-            }
+            fields.insert(
+                name.as_str().to_string(),
+                StarField {
+                    scalar,
+                    range: annotation.range(),
+                },
+            );
         }
-        if safe {
+        if safe && !fields.is_empty() {
             constructors.insert(
                 target.id.as_str().to_string(),
                 StarConstructor {

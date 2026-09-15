@@ -238,6 +238,26 @@ fn builtin_record_declares_the_same_named_primitive_fields() -> anyhow::Result<(
 }
 
 #[test]
+fn primitive_fields_remain_proved_in_mixed_records() -> anyhow::Result<()> {
+    let root_source = format!(
+        "load(\"{LABEL}\", \"LimitConfig\")\nif False:\n    LimitConfig(limit=\"wrong\", other=None, tags=[])\n"
+    );
+    let module_source =
+        "Other = record(value=str)\nLimitConfig = record(limit=int, other=Other, tags=list[str])\n";
+    let (_db, graph) = case(&root_source, module_source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected primitive field mismatch in mixed record: {analysis:?}");
+    };
+    assert_eq!(problem.field(), "limit");
+    assert_eq!(slice(&root_source, problem.range()), Some("\"wrong\""));
+    assert_eq!(slice(module_source, problem.related_range()), Some("int"));
+    assert_eq!(analysis.checked_arguments(), 1);
+    assert_eq!(analysis.unproved_arguments(), 2);
+    Ok(())
+}
+
+#[test]
 fn declaration_rebinding_or_shadowed_builtin_cannot_lend_a_false_type() -> anyhow::Result<()> {
     let root_source = format!(
         "load(\"{LABEL}\", \"LimitConfig\")\nif False:\n    LimitConfig(max_connections=\"wrong\")\n"
