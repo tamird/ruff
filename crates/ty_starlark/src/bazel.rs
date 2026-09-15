@@ -27,7 +27,7 @@ impl BazelLoadedFile {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize, thiserror::Error)]
 pub enum BazelLoadError {
     #[error("selected root is not a Bazel repository")]
     InvalidRepository,
@@ -82,27 +82,9 @@ fn resolve_bazel_load_query(
     db: &dyn Db,
     load: BazelLoad<'_>,
 ) -> Result<BazelLoadedFile, BazelLoadError> {
+    let importing_package =
+        validate_bazel_source(db, *load.repository(db), *load.importing_file(db))?;
     let root = load.repository(db).root(db);
-    if !root.as_path().is_absolute() || !is_repository_root(db, root) {
-        return Err(BazelLoadError::InvalidRepository);
-    }
-
-    let importing_path = load
-        .importing_file(db)
-        .path(db)
-        .as_system_path()
-        .ok_or(BazelLoadError::ImporterOutsideRepository)?;
-    if importing_path.extension() != Some("bzl") {
-        return Err(BazelLoadError::InvalidImporter);
-    }
-    if !importing_path.starts_with(root)
-        || find_ancestor(db, importing_path, None, is_repository_root).as_deref()
-            != Some(root.as_path())
-    {
-        return Err(BazelLoadError::ImporterOutsideRepository);
-    }
-    let importing_package = find_ancestor(db, importing_path, Some(root), is_package)
-        .ok_or(BazelLoadError::ImporterOutsidePackage)?;
 
     let label = load.label(db);
     let (package_root, target) = if label.starts_with('@') {
@@ -145,6 +127,35 @@ fn resolve_bazel_load_query(
     let stub_path = SystemPathBuf::from(format!("{}.pyi", source_path.as_str()));
     let stub = system_path_to_file(db, &stub_path).ok();
     Ok(BazelLoadedFile { source, stub })
+}
+
+/// Validate the selected repository and a `.bzl` file's owning BUILD package.
+/// A source reached via `load()` and one selected directly have the same owner.
+pub(crate) fn validate_bazel_source(
+    db: &dyn Db,
+    repository: BazelRepository<'_>,
+    file: File,
+) -> Result<SystemPathBuf, BazelLoadError> {
+    let root = repository.root(db);
+    if !root.as_path().is_absolute() || !is_repository_root(db, root) {
+        return Err(BazelLoadError::InvalidRepository);
+    }
+
+    let importing_path = file
+        .path(db)
+        .as_system_path()
+        .ok_or(BazelLoadError::ImporterOutsideRepository)?;
+    if importing_path.extension() != Some("bzl") {
+        return Err(BazelLoadError::InvalidImporter);
+    }
+    if !importing_path.starts_with(root)
+        || find_ancestor(db, importing_path, None, is_repository_root).as_deref()
+            != Some(root.as_path())
+    {
+        return Err(BazelLoadError::ImporterOutsideRepository);
+    }
+    find_ancestor(db, importing_path, Some(root), is_package)
+        .ok_or(BazelLoadError::ImporterOutsidePackage)
 }
 
 fn find_ancestor(

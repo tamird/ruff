@@ -1,59 +1,9 @@
-use ruff_db::Db as _;
-use ruff_db::files::{File, FileRootKind, Files, system_path_to_file};
-use ruff_db::system::{
-    DbWithTestSystem as _, DbWithWritableSystem as _, System, SystemPathBuf, TestSystem,
-};
-use ruff_db::vendored::VendoredFileSystem;
+use ruff_db::files::{File, system_path_to_file};
+use ruff_db::system::{DbWithTestSystem as _, DbWithWritableSystem as _};
+
+use crate::testing::test_db;
 
 use super::{BazelLoadError, BazelRepository, resolve_bazel_load};
-
-#[salsa::db]
-#[derive(Clone, Default)]
-struct TestDb {
-    storage: salsa::Storage<Self>,
-    files: Files,
-    system: TestSystem,
-    vendored: VendoredFileSystem,
-}
-
-#[salsa::db]
-impl ruff_db::Db for TestDb {
-    fn vendored(&self) -> &VendoredFileSystem {
-        &self.vendored
-    }
-
-    fn system(&self) -> &dyn System {
-        &self.system
-    }
-
-    fn files(&self) -> &Files {
-        &self.files
-    }
-}
-
-impl ruff_db::system::DbWithTestSystem for TestDb {
-    fn test_system(&self) -> &TestSystem {
-        &self.system
-    }
-
-    fn test_system_mut(&mut self) -> &mut TestSystem {
-        &mut self.system
-    }
-}
-
-#[salsa::db]
-impl salsa::Database for TestDb {}
-
-fn test_db(files: &[(&str, &str)]) -> anyhow::Result<(TestDb, SystemPathBuf)> {
-    let mut db = TestDb::default();
-    let root = SystemPathBuf::from(if cfg!(windows) { "C:/src" } else { "/src" });
-    db.memory_file_system().create_directory_all(&root)?;
-    db.files().try_add_root(&db, &root, FileRootKind::Project);
-    for (path, contents) in files {
-        db.write_file(root.join(path), contents)?;
-    }
-    Ok((db, root))
-}
 
 #[test]
 fn resolves_named_packages_and_selects_stubs() -> anyhow::Result<()> {

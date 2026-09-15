@@ -5009,6 +5009,9 @@ dependencies = [
  "get-size2",
  "ruff_db",
  "ruff_memory_usage",
+ "ruff_python_ast",
+ "ruff_python_parser",
+ "ruff_text_size",
  "salsa",
  "thiserror 2.0.20",
 ]

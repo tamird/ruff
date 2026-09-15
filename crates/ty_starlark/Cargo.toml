@@ -2,7 +2,7 @@
 name = "ty_starlark"
 version = "0.0.0"
 publish = false
-description = "Starlark source resolution for ty"
+description = "Starlark source resolution and admission for ty"
 edition.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
@@ -17,6 +17,9 @@ doctest = false
 [dependencies]
 ruff_db = { workspace = true }
 ruff_memory_usage = { workspace = true }
+ruff_python_ast = { workspace = true, features = ["get-size"] }
+ruff_python_parser = { workspace = true }
+ruff_text_size = { workspace = true, features = ["get-size"] }
 
 get-size2 = { workspace = true }
 salsa = { workspace = true }

@@ -1,0 +1,411 @@
+use ruff_db::diagnostic::{DiagnosticId, Severity};
+use ruff_db::files::{File, system_path_to_file};
+use ruff_db::system::{DbWithTestSystem as _, DbWithWritableSystem as _};
+
+use crate::bazel::{BazelLoadError, BazelRepository};
+use crate::testing::test_db;
+
+use super::{
+    AdmittedBazelSource, BazelAdmissionError, BazelAdmissionFailure, BazelSource,
+    BazelSourceAdmission, admit_bazel_source,
+};
+
+fn admitted(admission: &BazelSourceAdmission) -> anyhow::Result<&AdmittedBazelSource> {
+    match admission {
+        BazelSourceAdmission::Admitted(source) => Ok(source),
+        BazelSourceAdmission::Opaque(failure) => {
+            anyhow::bail!("expected admitted .bzl source, found {failure:?}")
+        }
+    }
+}
+
+fn opaque(admission: &BazelSourceAdmission) -> anyhow::Result<&BazelAdmissionFailure> {
+    match admission {
+        BazelSourceAdmission::Opaque(failure) => Ok(failure),
+        BazelSourceAdmission::Admitted(source) => {
+            anyhow::bail!("expected opaque .bzl source, found {source:?}")
+        }
+    }
+}
+
+#[test]
+fn admits_entire_plain_bazel_source_without_python_project() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD.bazel", ""),
+        (
+            "pkg/defs.bzl",
+            "def keep_int(value):\n    if value > 0:\n        return value\n    return 0\n\nRESULT = keep_int(1)\n",
+        ),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let admission = admit_bazel_source(&db, source);
+    assert_eq!(admitted(admission)?.suite().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn admits_annotation_syntax_for_experimental_typed_bazel() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD.bazel", ""),
+        (
+            "pkg/defs.bzl",
+            "def keep_int(value: int) -> int:\n    return value\n",
+        ),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn admits_only_syntactically_placed_plain_loads() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD.bazel", ""),
+        (
+            "pkg/defs.bzl",
+            "\"\"\"Module docs.\"\"\"\nload(\":other.bzl\", \"x\", alias=\"y\")\n\ndef public():\n    return x\n",
+        ),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 3);
+    Ok(())
+}
+
+#[test]
+fn requires_selected_root_package_and_source_ownership() -> anyhow::Result<()> {
+    let (mut db, root) = test_db(&[
+        ("pkg/defs.bzl", "RESULT = 1\n"),
+        ("pkg/sub/MODULE.bazel", ""),
+        ("pkg/sub/BUILD.bazel", ""),
+        ("pkg/sub/defs.bzl", "RESULT = 2\n"),
+        ("pkg/sub/defs.star", "RESULT = 3\n"),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let outer = BazelRepository::new(&db, root.clone());
+    let source = BazelSource::new(&db, outer, file);
+    assert!(matches!(
+        opaque(admit_bazel_source(&db, source))?.reason(),
+        BazelAdmissionError::InvalidSource(BazelLoadError::InvalidRepository)
+    ));
+
+    db.write_file(root.join("MODULE.bazel"), "")?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root.clone()), file);
+    assert!(matches!(
+        opaque(admit_bazel_source(&db, source))?.reason(),
+        BazelAdmissionError::InvalidSource(BazelLoadError::ImporterOutsidePackage)
+    ));
+    db.write_file(root.join("pkg/BUILD"), "")?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root.clone()), file);
+    assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 1);
+
+    let nested_root = root.join("pkg/sub");
+    let nested_file = system_path_to_file(&db, nested_root.join("defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), nested_file);
+    assert!(matches!(
+        opaque(admit_bazel_source(&db, source))?.reason(),
+        BazelAdmissionError::InvalidSource(BazelLoadError::ImporterOutsideRepository)
+    ));
+    let source = BazelSource::new(
+        &db,
+        BazelRepository::new(&db, nested_root.clone()),
+        nested_file,
+    );
+    assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 1);
+
+    let star = system_path_to_file(&db, nested_root.join("defs.star"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, nested_root), star);
+    assert!(matches!(
+        opaque(admit_bazel_source(&db, source))?.reason(),
+        BazelAdmissionError::InvalidSource(BazelLoadError::InvalidImporter)
+    ));
+    Ok(())
+}
+
+#[test]
+fn rejects_python_only_forms_before_exposing_any_export() -> anyhow::Result<()> {
+    let (mut db, root) = test_db(&[
+        ("WORKSPACE.bazel", ""),
+        ("pkg/BUILD", ""),
+        (
+            "pkg/defs.bzl",
+            "class PythonOnly:\n    pass\n\ndef public() -> int:\n    return 1\n",
+        ),
+    ])?;
+    let path = root.join("pkg/defs.bzl");
+    let file = system_path_to_file(&db, &path)?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root.clone()), file);
+    let failure = opaque(admit_bazel_source(&db, source))?;
+    assert!(matches!(
+        failure.reason(),
+        BazelAdmissionError::BazelSyntax("class definitions")
+    ));
+    assert_eq!(failure.file(), file);
+    assert_eq!(
+        failure.range().map(|range| range.start().to_usize()),
+        Some(0)
+    );
+    let diagnostic = failure
+        .diagnostic()
+        .ok_or(anyhow::anyhow!("missing syntax diagnostic"))?;
+    assert_eq!(diagnostic.id(), DiagnosticId::InvalidSyntax);
+    assert_eq!(diagnostic.severity(), Severity::Error);
+    assert_eq!(
+        diagnostic.primary_span().map(|span| span.expect_ty_file()),
+        Some(file)
+    );
+    assert_eq!(diagnostic.range(), failure.range());
+
+    db.write_file(&path, "def public() -> int:\n    return 1\n")?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn parser_recovery_cannot_admit_otherwise_valid_exports() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("REPO.bazel", ""),
+        ("pkg/BUILD", ""),
+        (
+            "pkg/defs.bzl",
+            "def broken(:\n    pass\n\ndef public() -> int:\n    return 1\n",
+        ),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let failure = opaque(admit_bazel_source(&db, source))?;
+    assert!(matches!(
+        failure.reason(),
+        BazelAdmissionError::PythonParser(_)
+    ));
+    assert_eq!(failure.file(), file);
+    assert!(failure.range().is_some());
+    assert!(failure.diagnostic().is_none());
+    Ok(())
+}
+
+#[test]
+fn valid_mixed_order_starlark_load_is_opaque_with_shared_parser() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        (
+            "pkg/defs.bzl",
+            "load(\":defs.bzl\", \"x\", alias=\"y\", \"z\")\n\ndef public() -> int:\n    return 1\n",
+        ),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let failure = opaque(admit_bazel_source(&db, source))?;
+    assert!(matches!(
+        failure.reason(),
+        BazelAdmissionError::PythonParser(_)
+    ));
+    assert!(
+        failure
+            .reason()
+            .to_string()
+            .contains("shared Python parser")
+    );
+    assert_eq!(failure.file(), file);
+    assert!(failure.range().is_some());
+    assert!(failure.diagnostic().is_none());
+    Ok(())
+}
+
+#[test]
+fn nested_and_late_loads_taint_every_export() -> anyhow::Result<()> {
+    for (code, reason) in [
+        (
+            "def internal():\n    load(\":defs.bzl\", \"symbol\")\n\ndef public():\n    return 1\n",
+            "load statements outside the top-level load prefix",
+        ),
+        (
+            "RESULT = 1\nload(\":defs.bzl\", \"symbol\")\n\ndef public():\n    return 1\n",
+            "load statements after other top-level statements",
+        ),
+        (
+            "RESULT = load(\":defs.bzl\", \"symbol\")\n\ndef public():\n    return 1\n",
+            "load statements outside the top-level load prefix",
+        ),
+        (
+            "\"Module doc\"\nload(\":defs.bzl\", \"x\")\n\"another string\"\nload(\":defs.bzl\", \"y\")\n",
+            "load statements after other top-level statements",
+        ),
+    ] {
+        let (db, root) = test_db(&[
+            ("MODULE.bazel", ""),
+            ("pkg/BUILD", ""),
+            ("pkg/defs.bzl", code),
+        ])?;
+        let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+        let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+        let failure = opaque(admit_bazel_source(&db, source))?;
+        assert!(
+            matches!(failure.reason(), BazelAdmissionError::BazelSyntax(found) if *found == reason),
+            "expected {reason}, found {:?}",
+            failure.reason()
+        );
+        assert_eq!(failure.file(), file);
+        assert!(failure.range().is_some());
+    }
+    Ok(())
+}
+
+#[test]
+fn reserved_load_bindings_and_dynamic_load_arguments_taint_source() -> anyhow::Result<()> {
+    for (code, reason) in [
+        (
+            "load = 1\n\ndef public():\n    return 1\n",
+            "rebinding the reserved load name",
+        ),
+        (
+            "def load():\n    pass\n\ndef public():\n    return 1\n",
+            "rebinding the reserved load name",
+        ),
+        (
+            "RESULT = lambda load: 1\n\ndef public():\n    return 1\n",
+            "rebinding the reserved load name",
+        ),
+        (
+            "RESULT = f(load=1)\n\ndef public():\n    return 1\n",
+            "the reserved load name as a keyword argument",
+        ),
+        (
+            "RESULT = load\n\ndef public():\n    return 1\n",
+            "using the reserved load name as an identifier",
+        ),
+        (
+            "load(\":defs.bzl\", symbol)\n\ndef public():\n    return 1\n",
+            "load arguments other than literal strings",
+        ),
+    ] {
+        let (db, root) = test_db(&[("WORKSPACE", ""), ("pkg/BUILD", ""), ("pkg/defs.bzl", code)])?;
+        let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+        let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+        let failure = opaque(admit_bazel_source(&db, source))?;
+        assert!(
+            matches!(failure.reason(), BazelAdmissionError::BazelSyntax(found) if *found == reason),
+            "expected {reason}, found {:?}",
+            failure.reason()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn fixed_parser_version_rejects_new_python_syntax() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        (
+            "pkg/defs.bzl",
+            "def public[T](value: T) -> T:\n    return value\n",
+        ),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let failure = opaque(admit_bazel_source(&db, source))?;
+    assert!(matches!(
+        failure.reason(),
+        BazelAdmissionError::PythonVersion(_)
+    ));
+    assert_eq!(failure.file(), file);
+    assert!(failure.range().is_some());
+    assert!(failure.diagnostic().is_none());
+    Ok(())
+}
+
+#[test]
+fn excludes_python_control_flow_and_expressions_anywhere() -> anyhow::Result<()> {
+    for (code, reason) in [
+        ("if True:\n    RESULT = 1\n", "top-level if statements"),
+        ("for x in []:\n    RESULT = x\n", "top-level for statements"),
+        ("def f():\n    return 1 < 2 < 3\n", "chained comparisons"),
+        (
+            "def f(value):\n    return value is None\n",
+            "Python identity comparisons",
+        ),
+        ("def f():\n    return 3.14\n", "float literals"),
+        ("RESULT: int = 1\n", "annotated variable assignments"),
+        ("RESULT = 1,\n", "unparenthesized singleton tuples"),
+        (
+            "RESULT = 1, 2,\n",
+            "unparenthesized tuples with trailing commas",
+        ),
+        (
+            "RESULT = 1, (2),\n",
+            "unparenthesized tuples with trailing commas",
+        ),
+    ] {
+        let (db, root) = test_db(&[("WORKSPACE", ""), ("pkg/BUILD", ""), ("pkg/defs.bzl", code)])?;
+        let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+        let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+        let failure = opaque(admit_bazel_source(&db, source))?;
+        assert!(
+            matches!(failure.reason(), BazelAdmissionError::BazelSyntax(found) if *found == reason),
+            "expected {reason}, found {:?}",
+            failure.reason()
+        );
+        assert_eq!(failure.file(), file);
+        assert!(failure.range().is_some());
+    }
+    Ok(())
+}
+
+#[test]
+fn accepts_parenthesized_trailing_comma_and_bare_pair() -> anyhow::Result<()> {
+    for code in [
+        "RESULT = (1,)\n",
+        "RESULT = (1, 2,)\n",
+        "RESULT = 1, 2\n",
+        "RESULT = 1, (2)\n",
+    ] {
+        let (db, root) = test_db(&[
+            ("MODULE.bazel", ""),
+            ("pkg/BUILD", ""),
+            ("pkg/defs.bzl", code),
+        ])?;
+        let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+        let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+        assert_eq!(
+            admitted(admit_bazel_source(&db, source))?.suite().len(),
+            1,
+            "{code}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn read_errors_keep_the_source_opaque_without_a_syntax_span() -> anyhow::Result<()> {
+    let (mut db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", "RESULT = 1\n"),
+    ])?;
+    let path = root.join("pkg/defs.bzl");
+    let file = system_path_to_file(&db, &path)?;
+    db.memory_file_system().remove_file(&path)?;
+    File::sync_path(&mut db, &path);
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let failure = opaque(admit_bazel_source(&db, source))?;
+    assert!(matches!(failure.reason(), BazelAdmissionError::Read(_)));
+    assert_eq!(failure.range(), None);
+    let diagnostic = failure
+        .diagnostic()
+        .ok_or(anyhow::anyhow!("missing read diagnostic"))?;
+    assert_eq!(diagnostic.id(), DiagnosticId::Io);
+    assert_eq!(diagnostic.range(), None);
+    assert_eq!(
+        diagnostic.primary_span().map(|span| span.expect_ty_file()),
+        Some(file)
+    );
+    Ok(())
+}
