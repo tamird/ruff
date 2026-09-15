@@ -162,6 +162,7 @@ impl BazelParameter {
 pub struct BazelCheckProblem {
     file: File,
     range: TextRange,
+    declaration_file: File,
     declaration_range: TextRange,
     reason: BazelCheckError,
 }
@@ -173,6 +174,11 @@ impl BazelCheckProblem {
 
     pub fn range(&self) -> TextRange {
         self.range
+    }
+
+    /// The function declaration may live in a different loaded source.
+    pub fn declaration_file(&self) -> File {
+        self.declaration_file
     }
 
     pub fn declaration_range(&self) -> TextRange {
@@ -637,6 +643,7 @@ impl<'source> ModuleBuilder<'source> {
                         self.problems.push(BazelCheckProblem {
                             file: self.file,
                             range: call.range(),
+                            declaration_file: self.file,
                             declaration_range: function.name.range(),
                             reason: BazelCheckError::InvalidArity {
                                 callee: callee.id.to_string(),

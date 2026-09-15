@@ -326,6 +326,7 @@ fn invalid_arity_in_unused_body_reports_range_without_opaque_exports() -> anyhow
         anyhow::bail!("expected one invalid call: {:?}", summary.problems());
     };
     assert_eq!(problem.file(), file);
+    assert_eq!(problem.declaration_file(), file);
     assert_eq!(
         problem.range().start().to_usize(),
         runtime.find("keep(1, 2)").unwrap()
