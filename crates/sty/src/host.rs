@@ -15,7 +15,8 @@ use ruff_text_size::{TextRange, TextSize};
 use serde::Deserialize;
 use ty_starlark::star::{
     StarAnalysis, StarCheck, StarDirectLoad, StarFailure, StarFailureReason, StarHostProfile,
-    StarLoadBinding, StarModule, StarResolvedGraph, StarSource, StarSpecialForm, check_star_graph,
+    StarIntrinsic, StarLoadBinding, StarModule, StarResolvedGraph, StarSource, StarSpecialForm,
+    check_star_graph,
 };
 
 use super::{CheckCommand, StyDb, absolute_host_path, is_star_path};
@@ -25,7 +26,7 @@ pub(super) fn run_host(cwd: &SystemPath, checker: &PathBuf, options: &CheckComma
     // The graph's stdout contains complete source snapshots. Capture it for
     // analysis, inherit stderr, and never print the JSON on parse failures.
     let output = invocation
-        .command(checker, "--sty-graph-v1")
+        .command(checker, "--sty-graph-v2")
         .stderr(Stdio::inherit())
         .output()
         .with_context(|| format!("cannot start host graph producer {}", checker.display()))?;
@@ -153,6 +154,7 @@ struct CapturedGraph {
     root: CapturedSource,
     modules: Vec<CapturedModule>,
     special_forms: Vec<CapturedSpecialForm>,
+    intrinsics: Vec<CapturedIntrinsic>,
 }
 
 #[derive(Deserialize)]
@@ -197,6 +199,13 @@ struct CapturedSpecialForm {
     field_types: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapturedIntrinsic {
+    name: String,
+    kind: String,
+}
+
 impl CapturedGraph {
     fn into_star_graph(self, db: &dyn Db, selected: &SystemPath) -> Result<StarResolvedGraph> {
         let CapturedGraph {
@@ -205,6 +214,7 @@ impl CapturedGraph {
             root,
             modules,
             special_forms,
+            intrinsics,
         } = self;
         let CapturedSource {
             path,
@@ -245,11 +255,19 @@ impl CapturedGraph {
                 }
             })
             .collect();
+        let intrinsics = intrinsics
+            .into_iter()
+            .map(|intrinsic| {
+                let CapturedIntrinsic { name, kind } = intrinsic;
+                StarIntrinsic { name, kind }
+            })
+            .collect();
         Ok(StarResolvedGraph {
             version,
             profile: StarHostProfile {
                 name: profile,
                 special_forms: forms,
+                intrinsics,
             },
             root,
             modules: resolved_modules.into_boxed_slice(),

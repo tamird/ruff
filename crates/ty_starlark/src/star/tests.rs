@@ -5,9 +5,9 @@ use ruff_text_size::{TextRange, TextSize};
 use crate::testing::{TestDb, test_db};
 
 use super::{
-    StarAnalysis, StarCheck, StarDirectLoad, StarFailureReason, StarHostProfile, StarKnownType,
-    StarLoadBinding, StarModule, StarPrimitive, StarResolvedGraph, StarSource, StarSpecialForm,
-    check_star_graph,
+    StarAnalysis, StarCheck, StarDirectLoad, StarFailureReason, StarHostProfile, StarIntrinsic,
+    StarKnownType, StarLoadBinding, StarModule, StarPrimitive, StarResolvedGraph, StarSource,
+    StarSpecialForm, check_star_graph,
 };
 
 const LABEL: &str = "//example:limits.star";
@@ -43,7 +43,24 @@ fn profile() -> StarHostProfile {
                 field_types: "named_keyword_type_expressions".to_string(),
             },
         ]),
+        intrinsics: Box::new([]),
     }
+}
+
+fn v2_profile() -> StarHostProfile {
+    let mut host = profile();
+    host.name = "example-star-host-v2".to_string();
+    host.intrinsics = Box::new([
+        StarIntrinsic {
+            name: "field".to_string(),
+            kind: "field_first_type_optional_default".to_string(),
+        },
+        StarIntrinsic {
+            name: "struct".to_string(),
+            kind: "struct_named_members".to_string(),
+        },
+    ]);
+    host
 }
 
 fn case(root_source: &str, module_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)> {
@@ -94,6 +111,55 @@ fn root_only(root_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)> {
             modules: Box::new([]),
         },
     ))
+}
+
+fn v2_root_only(root_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)> {
+    let (db, mut graph) = root_only(root_source)?;
+    graph.version = "sty-star-graph-v2".to_string();
+    graph.profile = v2_profile();
+    Ok((db, graph))
+}
+
+fn profile_failure(graph: &StarResolvedGraph) -> anyhow::Result<()> {
+    let StarCheck::Opaque(failure) = check_star_graph(graph) else {
+        anyhow::bail!("invalid host profile unexpectedly established source types");
+    };
+    assert!(matches!(failure.reason(), StarFailureReason::Profile));
+    assert_eq!(failure.file(), graph.root.file);
+    Ok(())
+}
+
+#[test]
+fn v2_requires_recognized_forms_and_intrinsic_facts() -> anyhow::Result<()> {
+    let source = "Config = record(value=int)\nConfig(value=\"wrong\")\n";
+    let (_db, mut graph) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert_eq!(analysis.checked_arguments(), 1);
+    assert_eq!(analysis.problems().len(), 1);
+
+    graph.profile.name.clear();
+    profile_failure(&graph)?;
+    graph.profile = v2_profile();
+    graph.profile.intrinsics[0].kind = "field_accepts_any_type".to_string();
+    profile_failure(&graph)?;
+    graph.profile = v2_profile();
+    graph.profile.intrinsics[1].name = "field".to_string();
+    profile_failure(&graph)?;
+    graph.profile = v2_profile();
+    graph.profile.intrinsics = Box::new([]);
+    profile_failure(&graph)?;
+    graph.profile = v2_profile();
+    graph.profile.special_forms[1].field_types = "arbitrary_python_keyword".to_string();
+    profile_failure(&graph)?;
+    graph.profile = v2_profile();
+    graph.profile.special_forms[1].name = "record".to_string();
+    profile_failure(&graph)?;
+    graph.profile = v2_profile();
+    graph.version = "sty-star-graph-v1".to_string();
+    profile_failure(&graph)?;
+    graph.version = "sty-star-graph-v3".to_string();
+    profile_failure(&graph)?;
+    Ok(())
 }
 
 fn analyzed(result: StarCheck) -> anyhow::Result<StarAnalysis> {

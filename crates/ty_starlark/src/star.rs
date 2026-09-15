@@ -54,10 +54,18 @@ pub struct StarSpecialForm {
     pub field_types: String,
 }
 
+/// Producer-attested semantics of a native Starlark global.
+#[derive(Debug)]
+pub struct StarIntrinsic {
+    pub name: String,
+    pub kind: String,
+}
+
 #[derive(Debug)]
 pub struct StarHostProfile {
     pub name: String,
     pub special_forms: Box<[StarSpecialForm]>,
+    pub intrinsics: Box<[StarIntrinsic]>,
 }
 
 /// Caller must also run the host's native check on the captured invocation.
@@ -347,7 +355,8 @@ impl StarBinding {
     }
 }
 
-const GRAPH_VERSION: &str = "sty-star-graph-v1";
+const GRAPH_VERSION_V1: &str = "sty-star-graph-v1";
+const GRAPH_VERSION_V2: &str = "sty-star-graph-v2";
 
 #[derive(Clone, Copy)]
 enum RecordForm {
@@ -367,10 +376,7 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
         root,
         modules,
     } = graph;
-    if version != GRAPH_VERSION {
-        return StarCheck::Opaque(StarFailure::at(root.file, None, StarFailureReason::Profile));
-    }
-    let Some(forms) = supported_forms(profile) else {
+    let Some(forms) = supported_forms(version, profile) else {
         return StarCheck::Opaque(StarFailure::at(root.file, None, StarFailureReason::Profile));
     };
 
@@ -585,11 +591,40 @@ fn validate_load_dag(
     Ok(order)
 }
 
-fn supported_forms(profile: &StarHostProfile) -> Option<HashMap<&str, RecordForm>> {
+fn supported_forms<'profile>(
+    version: &str,
+    profile: &'profile StarHostProfile,
+) -> Option<HashMap<&'profile str, RecordForm>> {
     let StarHostProfile {
         name,
         special_forms,
+        intrinsics,
     } = profile;
+    match version {
+        GRAPH_VERSION_V1 => {
+            if !intrinsics.is_empty() {
+                return None;
+            }
+        }
+        GRAPH_VERSION_V2 => {
+            if intrinsics.len() != 2 {
+                return None;
+            }
+            let mut found = HashSet::new();
+            for intrinsic in intrinsics {
+                let StarIntrinsic { name, kind } = intrinsic;
+                if !matches!(
+                    (name.as_str(), kind.as_str()),
+                    ("field", "field_first_type_optional_default")
+                        | ("struct", "struct_named_members")
+                ) || !found.insert(name.as_str())
+                {
+                    return None;
+                }
+            }
+        }
+        _ => return None,
+    }
     if name.is_empty() || special_forms.is_empty() {
         return None;
     }

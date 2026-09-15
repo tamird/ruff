@@ -27,7 +27,8 @@ parser also marks valid Starlark forms outside the shared Python parser
 subset opaque. Unsupported source semantics and uncheckable stubs are
 opaque, and opaque sources cause a nonzero exit.
 
-For a `.star` file, supply a host implementing both v1 process modes.
+For a `.star` file, supply a host implementing `--sty-graph-v2` and
+`--sty-check-v1`.
 This works from any directory without a Bazel marker or BUILD file.
 `//pkg:file.star` is a Bazel selector; `//abs/path.star` is an absolute
 file path. A host built with Bazel needs its own runfiles manifest in
@@ -42,17 +43,19 @@ RUNFILES_MANIFEST_FILE=/abs/bin/deploy_star.runfiles_manifest \
   /abs/deploy.star
 ```
 
-Sty first invokes `--sty-graph-v1 --source ABS` with each named
+Sty first invokes `--sty-graph-v2 --source ABS` with each named
 `--input NAME=ABS`. The host parses the captured UTF-8 source, resolves
-custom loads, and returns direct aliases and declarative record forms.
-Sty checks `int`, `str`, and `bool` record fields declared in source
-against literal arguments in the root and loaded modules, including
-dead top level `if` arms. It reports an argument source span and the
-related field declaration span on a known mismatch.
+custom loads, and returns direct aliases, declarative record forms, and
+the native `field` and `struct` intrinsic facts. Sty requires recognized
+record semantics and both attested intrinsic behaviors. It checks
+source-declared primitive, nominal record, union, and list fields against
+known arguments in the root and loaded modules, including dead top level
+`if` arms. It reports an argument source span and the related field
+declaration span on a known mismatch.
 
-Nominal records, lists, unions, attributes, callback and function
-bodies, record declarations in the root, and values computed at runtime
-remain unproved. The shared Python parser may also mark a valid host
+`field(TYPE, default=...)` declarations, `struct` members, attributes,
+callback and function bodies, and values computed at runtime remain
+unproved. The shared Python parser may also mark a valid host
 Starlark form opaque. A clear bounded source pass must then invoke
 `--sty-check-v1` with the same source and inputs. The host still owns
 its parser, loader, native annotation checks, and runtime checks.

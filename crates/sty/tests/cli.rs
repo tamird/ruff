@@ -59,8 +59,8 @@ fn star_graph_json(
 ) -> anyhow::Result<String> {
     let path = utf8_path(path)?;
     let graph = serde_json::json!({
-        "version": "sty-star-graph-v1",
-        "profile": "example-star-host-v1",
+        "version": "sty-star-graph-v2",
+        "profile": "example-star-host-v2",
         "root": {"path": path, "source": source, "loads": loads},
         "modules": modules,
         "special_forms": [
@@ -73,6 +73,10 @@ fn star_graph_json(
                 "validator": "first_positional_callable",
                 "field_types": "named_keyword_type_expressions"
             }
+        ],
+        "intrinsics": [
+            {"name": "field", "kind": "field_first_type_optional_default"},
+            {"name": "struct", "kind": "struct_named_members"}
         ]
     });
     Ok(serde_json::to_string(&graph)?)
@@ -88,7 +92,7 @@ fn host_fixture(fixture: &Fixture) -> anyhow::Result<PathBuf> {
             "#!/bin/sh\n",
             "printf '%s\\n' \"$@\" >> \"$STY_TEST_ARGV_LOG\"\n",
             "printf 'manifest:%s\\n' \"$RUNFILES_MANIFEST_FILE\" >> \"$STY_TEST_ARGV_LOG\"\n",
-            "if [ \"$1\" = '--sty-graph-v1' ]; then\n",
+            "if [ \"$1\" = '--sty-graph-v2' ]; then\n",
             "  if [ \"${STY_TEST_GRAPH_EXIT:-0}\" -ne 0 ]; then\n",
             "    printf 'graph producer failed\\n' >&2\n",
             "    exit \"$STY_TEST_GRAPH_EXIT\"\n",
@@ -390,7 +394,7 @@ fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<(
     );
     assert_eq!(
         fs::read_to_string(log)?,
-        format!("--sty-graph-v1\n{arguments}--sty-check-v1\n{arguments}")
+        format!("--sty-graph-v2\n{arguments}--sty-check-v1\n{arguments}")
     );
 
     let double_slash_source = format!("/{}", source_path.display());
@@ -412,7 +416,7 @@ fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<(
     assert_eq!(
         fs::read_to_string(double_log)?,
         format!(
-            "--sty-graph-v1\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n--sty-check-v1\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n"
+            "--sty-graph-v2\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n--sty-check-v1\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n"
         )
     );
     Ok(())
@@ -476,7 +480,7 @@ fn host_graph_yields_a_sty_owned_dead_branch_error_from_captured_text() -> anyho
     assert_eq!(
         fs::read_to_string(&log)?,
         format!(
-            "--sty-graph-v1\n--source\n{}\nmanifest:\n",
+            "--sty-graph-v2\n--source\n{}\nmanifest:\n",
             root_path.display()
         )
     );
@@ -548,5 +552,71 @@ fn malformed_host_graph_exits_two_and_producer_failure_relays_its_status() -> an
         fs::read_to_string(log)?.matches("--sty-check-v1").count(),
         0
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn host_v2_intrinsics_must_be_present_and_supported() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    fixture.write("root.star", "VALUE = 1\n")?;
+    let root_path = fixture.path("root.star");
+    let graph_file = fixture.path("graph.json");
+    let log = fixture.path("host-argv.txt");
+    let checker = host_fixture(&fixture)?;
+    let checker_name = utf8_path(&checker)?;
+    let root_name = utf8_path(&root_path)?;
+    let graph = star_graph_json(&root_path, "VALUE = 1\n", &[], &[])?;
+    let original: serde_json::Value = serde_json::from_str(&graph)?;
+    for drift in [
+        "missing intrinsics",
+        "wrong intrinsic behavior",
+        "duplicate intrinsic",
+        "unknown intrinsic entry",
+        "wrong graph version",
+    ] {
+        let mut changed = original.clone();
+        match drift {
+            "missing intrinsics" => {
+                let object = changed
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("graph fixture is not an object"))?;
+                object.remove("intrinsics");
+            }
+            "wrong intrinsic behavior" => {
+                changed["intrinsics"][0]["kind"] = "unknown_field_behavior".into();
+            }
+            "duplicate intrinsic" => {
+                changed["intrinsics"][1]["name"] = "field".into();
+            }
+            "unknown intrinsic entry" => {
+                changed["intrinsics"][0]["parameters"] = "unknown".into();
+            }
+            "wrong graph version" => {
+                changed["version"] = "sty-star-graph-v1".into();
+            }
+            _ => anyhow::bail!("unknown fixture drift {drift}"),
+        }
+        fixture.write("graph.json", &serde_json::to_string(&changed)?)?;
+        fs::write(&log, "")?;
+        let output = Command::new(env!("CARGO_BIN_EXE_sty"))
+            .current_dir(fixture.root.path())
+            .env("STY_TEST_ARGV_LOG", &log)
+            .env("STY_TEST_GRAPH", &graph_file)
+            .args(["check", "--host-checker", checker_name, root_name])
+            .output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{drift}: {}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty(), "{drift}: source JSON leaked");
+        assert_eq!(
+            fs::read_to_string(&log)?.matches("--sty-check-v1").count(),
+            0,
+            "{drift}: native check accepted invalid graph facts"
+        );
+    }
     Ok(())
 }
