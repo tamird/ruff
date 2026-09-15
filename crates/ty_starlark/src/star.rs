@@ -1,9 +1,9 @@
 //! A bounded static source check for host-owned typed `.star` graphs.
 //!
 //! The host captures exact source text and resolves direct loads with its
-//! parser. This pass uses those snapshots to check
-//! primitive fields of source-declared record constructors. Other Starlark
-//! forms remain unproved; an analyzed graph is never a full type proof.
+//! parser. This pass checks source-declared record fields whose types and
+//! arguments can be established from the graph. Other Starlark forms remain
+//! unproved; an analyzed graph is never a full type proof.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -77,7 +77,7 @@ pub enum StarCheck {
     Opaque(StarFailure),
 }
 
-/// Only source-backed constructor arguments in this primitive slice are proved.
+/// Only source-backed constructor arguments with known types are proved.
 #[derive(Debug)]
 pub struct StarAnalysis {
     problems: Box<[StarTypeProblem]>,
@@ -90,13 +90,13 @@ impl StarAnalysis {
         &self.problems
     }
 
-    /// Keyword arguments of recognized imported record calls with known
-    /// primitive fields and literal argument kinds, including mismatches.
+    /// Keyword arguments of recognized record calls with known field and
+    /// argument types, including mismatches.
     pub fn checked_arguments(&self) -> usize {
         self.checked_arguments
     }
 
-    /// Unproved keyword arguments of those recognized imported record calls.
+    /// Unproved keyword arguments of those recognized record calls.
     /// Other calls, declarations, and deferred bodies are not counted.
     pub fn unproved_arguments(&self) -> usize {
         self.unproved_arguments
@@ -124,6 +124,45 @@ impl std::fmt::Display for StarPrimitive {
     }
 }
 
+/// A source-backed type, with nominal record identity scoped to an evaluated
+/// logical module rather than its physical source file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StarKnownType {
+    Primitive(StarPrimitive),
+    Record(StarRecordId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StarRecordId {
+    module: StarRecordModule,
+    declaration: TextRange,
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StarRecordModule {
+    Root,
+    Loaded(String),
+}
+
+impl std::fmt::Display for StarRecordModule {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root => formatter.write_str("source root"),
+            Self::Loaded(id) => formatter.write_str(id),
+        }
+    }
+}
+
+impl std::fmt::Display for StarKnownType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Primitive(primitive) => primitive.fmt(formatter),
+            Self::Record(record) => formatter.write_str(&record.name),
+        }
+    }
+}
+
 /// The argument owns the primary location; the declared field is secondary.
 #[derive(Debug)]
 pub struct StarTypeProblem {
@@ -133,8 +172,8 @@ pub struct StarTypeProblem {
     related_range: TextRange,
     constructor: String,
     field: String,
-    expected: StarPrimitive,
-    actual: StarPrimitive,
+    expected: StarKnownType,
+    actual: StarKnownType,
 }
 
 impl StarTypeProblem {
@@ -162,17 +201,33 @@ impl StarTypeProblem {
         &self.field
     }
 
-    pub fn expected(&self) -> StarPrimitive {
-        self.expected
+    pub fn expected(&self) -> &StarKnownType {
+        &self.expected
     }
 
-    pub fn actual(&self) -> StarPrimitive {
-        self.actual
+    pub fn actual(&self) -> &StarKnownType {
+        &self.actual
     }
 }
 
 impl std::fmt::Display for StarTypeProblem {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let (StarKnownType::Record(expected), StarKnownType::Record(actual)) =
+            (&self.expected, &self.actual)
+            && expected.name == actual.name
+            && expected != actual
+        {
+            return write!(
+                formatter,
+                "{}.{}, expected {} ({}), got {} ({})",
+                self.constructor,
+                self.field,
+                expected.name,
+                expected.module,
+                actual.name,
+                actual.module
+            );
+        }
         write!(
             formatter,
             "{}.{}, expected {}, got {}",
@@ -254,14 +309,30 @@ impl ParsedStarSource<'_> {
 
 #[derive(Clone, Debug)]
 struct StarField {
-    scalar: StarPrimitive,
+    ty: StarKnownType,
     range: TextRange,
 }
 
 #[derive(Clone, Debug)]
 struct StarConstructor {
     file: File,
+    ty: StarKnownType,
     fields: HashMap<String, StarField>,
+}
+
+#[derive(Clone, Debug)]
+enum StarBinding {
+    Constructor(StarConstructor),
+    Alias(StarKnownType),
+}
+
+impl StarBinding {
+    fn annotation_type(&self) -> &StarKnownType {
+        match self {
+            Self::Constructor(constructor) => &constructor.ty,
+            Self::Alias(ty) => ty,
+        }
+    }
 }
 
 const GRAPH_VERSION: &str = "sty-star-graph-v1";
@@ -363,28 +434,50 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
             }
         }
     }
-    if let Err(failure) = validate_load_dag(modules, &by_id) {
-        return StarCheck::Opaque(failure);
-    }
+    let dependency_order = match validate_load_dag(modules, &by_id) {
+        Ok(order) => order,
+        Err(failure) => return StarCheck::Opaque(failure),
+    };
 
-    let constructors: Vec<_> = parsed_modules
-        .iter()
-        .map(|parsed| source_constructors(parsed, &forms))
-        .collect();
+    // A loaded module is initialized once under its logical load spelling.
+    // Build its exports only after the exports of its verified dependencies.
+    let mut exports = vec![HashMap::new(); modules.len()];
+    for index in dependency_order {
+        let parsed = &parsed_modules[index];
+        let imported = match imported_bindings(parsed, &exports, &by_id) {
+            Ok(imported) => imported,
+            Err(failure) => return StarCheck::Opaque(failure),
+        };
+        exports[index] = source_bindings(
+            parsed,
+            &StarRecordModule::Loaded(modules[index].id.clone()),
+            &forms,
+            imported,
+        );
+    }
+    let root_imports = match imported_bindings(&parsed_root, &exports, &by_id) {
+        Ok(imported) => imported,
+        Err(failure) => return StarCheck::Opaque(failure),
+    };
+    let root_exports = source_bindings(&parsed_root, &StarRecordModule::Root, &forms, root_imports);
     let mut problems = Vec::new();
     let mut checked_arguments = 0;
     let mut unproved_arguments = 0;
-    for parsed in parsed_modules.iter().chain(std::iter::once(&parsed_root)) {
-        // Every source sees only constructors from modules its own verified
-        // direct loads selected. Root-local declarations need source-order
-        // initialization and remain unproved in this first slice.
-        let visible = match imported_constructors(parsed, &constructors, &by_id) {
+    for (parsed, declarations) in parsed_modules
+        .iter()
+        .zip(&exports)
+        .chain(std::iter::once((&parsed_root, &root_exports)))
+    {
+        let visible = match imported_bindings(parsed, &exports, &by_id) {
             Ok(visible) => visible,
             Err(failure) => return StarCheck::Opaque(failure),
         };
         let mut scanner = CallScanner {
             file: parsed.source.file,
-            visible: &visible,
+            visible,
+            declarations,
+            writes: &parsed.writes,
+            loaded_names: &parsed.loaded_names,
             problems: Vec::new(),
             checked_arguments: 0,
             unproved_arguments: 0,
@@ -401,11 +494,11 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
     })
 }
 
-fn imported_constructors(
+fn imported_bindings(
     parsed: &ParsedStarSource<'_>,
-    constructors: &[HashMap<String, StarConstructor>],
+    exports: &[HashMap<String, StarBinding>],
     by_id: &HashMap<&str, usize>,
-) -> Result<HashMap<String, StarConstructor>, StarFailure> {
+) -> Result<HashMap<String, StarBinding>, StarFailure> {
     let mut visible = HashMap::new();
     for load in &parsed.source.loads {
         let Some(&index) = by_id.get(load.module_id.as_str()) else {
@@ -420,8 +513,8 @@ fn imported_constructors(
             // A shadowed file-block alias cannot retain the imported type.
             if parsed.writes.contains_key(local) {
                 visible.remove(local);
-            } else if let Some(constructor) = constructors[index].get(source) {
-                visible.insert(local.clone(), constructor.clone());
+            } else if let Some(value) = exports[index].get(source) {
+                visible.insert(local.clone(), value.clone());
             }
         }
     }
@@ -431,7 +524,7 @@ fn imported_constructors(
 fn validate_load_dag(
     modules: &[StarModule],
     by_id: &HashMap<&str, usize>,
-) -> Result<(), StarFailure> {
+) -> Result<Vec<usize>, StarFailure> {
     let mut dependencies = vec![0usize; modules.len()];
     let mut dependents = vec![Vec::new(); modules.len()];
     for (index, module) in modules.iter().enumerate() {
@@ -452,9 +545,9 @@ fn validate_load_dag(
         .enumerate()
         .filter_map(|(index, count)| (*count == 0).then_some(index))
         .collect();
-    let mut peeled = 0;
+    let mut order = Vec::with_capacity(modules.len());
     while let Some(target) = ready.pop() {
-        peeled += 1;
+        order.push(target);
         for &importer in &dependents[target] {
             dependencies[importer] -= 1;
             if dependencies[importer] == 0 {
@@ -462,13 +555,13 @@ fn validate_load_dag(
             }
         }
     }
-    if peeled != modules.len() {
+    if order.len() != modules.len() {
         let Some((index, _)) = dependencies
             .iter()
             .enumerate()
             .find(|(_, count)| **count > 0)
         else {
-            return Ok(());
+            return Ok(order);
         };
         let source = &modules[index].source;
         return Err(StarFailure::at(
@@ -477,7 +570,7 @@ fn validate_load_dag(
             StarFailureReason::LoadCycle,
         ));
     }
-    Ok(())
+    Ok(order)
 }
 
 fn supported_forms(profile: &StarHostProfile) -> Option<HashMap<&str, RecordForm>> {
@@ -692,12 +785,14 @@ impl<'source> Visitor<'source> for ModuleWrites {
     }
 }
 
-fn source_constructors(
+fn source_bindings(
     parsed: &ParsedStarSource<'_>,
+    module: &StarRecordModule,
     forms: &HashMap<&str, RecordForm>,
-) -> HashMap<String, StarConstructor> {
-    let mut constructors = HashMap::new();
+    mut visible: HashMap<String, StarBinding>,
+) -> HashMap<String, StarBinding> {
     let mut preceding_callables = HashSet::new();
+    let mut exports = HashMap::new();
     for statement in parsed.suite() {
         let assign = match statement {
             Stmt::FunctionDef(function) => {
@@ -716,91 +811,141 @@ fn source_constructors(
         let [Expr::Name(target)] = assign.targets.as_slice() else {
             continue;
         };
-        if parsed.writes.get(target.id.as_str()) != Some(&1)
-            || parsed.loaded_names.contains(target.id.as_str())
+        // Shadowing a native type name must not establish a replacement host
+        // global from this bounded source summary.
+        let name = target.id.as_str();
+        if parsed.writes.get(name) != Some(&1)
+            || parsed.loaded_names.contains(name)
+            || matches!(name, "int" | "str" | "bool" | "list")
         {
             continue;
         }
-        let Expr::Call(call) = assign.value.as_ref() else {
-            continue;
+        let declaration = match assign.value.as_ref() {
+            Expr::Call(call) => record_declaration(
+                parsed,
+                module,
+                name,
+                call,
+                forms,
+                &visible,
+                &preceding_callables,
+            )
+            .map(StarBinding::Constructor),
+            Expr::Name(name) => visible.get(name.id.as_str()).cloned().or_else(|| {
+                type_expression(parsed, &visible, &assign.value).map(StarBinding::Alias)
+            }),
+            expression => type_expression(parsed, &visible, expression).map(StarBinding::Alias),
         };
-        let Expr::Name(callee) = call.func.as_ref() else {
-            continue;
-        };
-        if !parsed.is_host_global(callee.id.as_str()) {
-            continue;
-        }
-        let expected_args = match forms.get(callee.id.as_str()) {
-            Some(RecordForm::Builtin) => 0,
-            Some(RecordForm::WithValidator) => 1,
-            None => continue,
-        };
-        if call.arguments.args.len() != expected_args
-            || call.arguments.args.iter().any(Expr::is_starred_expr)
-            || call
-                .arguments
-                .keywords
-                .iter()
-                .any(|keyword| keyword.arg.is_none())
-        {
-            continue;
-        }
-        if expected_args == 1 {
-            let [Expr::Name(validator)] = call.arguments.args.as_ref() else {
-                continue;
-            };
-            if !preceding_callables.contains(validator.id.as_str()) {
-                continue;
-            }
-        }
-        let mut fields = HashMap::new();
-        let mut seen_fields = HashSet::new();
-        let mut safe = true;
-        for keyword in &call.arguments.keywords {
-            let Some(name) = keyword.arg.as_ref() else {
-                safe = false;
-                break;
-            };
-            if !seen_fields.insert(name.as_str()) {
-                safe = false;
-                break;
-            }
-            let Expr::Name(annotation) = &keyword.value else {
-                continue;
-            };
-            let scalar = match annotation.id.as_str() {
-                "int" => parsed.is_host_global("int").then_some(StarPrimitive::Int),
-                "str" => parsed.is_host_global("str").then_some(StarPrimitive::Str),
-                "bool" => parsed.is_host_global("bool").then_some(StarPrimitive::Bool),
-                _ => None,
-            };
-            let Some(scalar) = scalar else {
-                continue;
-            };
-            fields.insert(
-                name.as_str().to_string(),
-                StarField {
-                    scalar,
-                    range: annotation.range(),
-                },
-            );
-        }
-        if safe && !fields.is_empty() {
-            constructors.insert(
-                target.id.as_str().to_string(),
-                StarConstructor {
-                    file: parsed.source.file,
-                    fields,
-                },
-            );
+        if let Some(declaration) = declaration {
+            visible.insert(name.to_string(), declaration.clone());
+            exports.insert(name.to_string(), declaration);
         }
     }
-    constructors
+    // v1 does not attest whether load aliases themselves are reexported.
+    // Explicit declarations can retain an imported type's identity.
+    exports
+}
+
+fn record_declaration(
+    parsed: &ParsedStarSource<'_>,
+    module: &StarRecordModule,
+    name: &str,
+    call: &ast::ExprCall,
+    forms: &HashMap<&str, RecordForm>,
+    visible: &HashMap<String, StarBinding>,
+    preceding_callables: &HashSet<&str>,
+) -> Option<StarConstructor> {
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if !parsed.is_host_global(callee.id.as_str()) {
+        return None;
+    }
+    let expected_args = match forms.get(callee.id.as_str()) {
+        Some(RecordForm::Builtin) => 0,
+        Some(RecordForm::WithValidator) => 1,
+        None => return None,
+    };
+    if call.arguments.args.len() != expected_args
+        || call.arguments.args.iter().any(Expr::is_starred_expr)
+        || call
+            .arguments
+            .keywords
+            .iter()
+            .any(|keyword| keyword.arg.is_none())
+    {
+        return None;
+    }
+    if expected_args == 1 {
+        let [Expr::Name(validator)] = call.arguments.args.as_ref() else {
+            return None;
+        };
+        if !preceding_callables.contains(validator.id.as_str()) {
+            return None;
+        }
+    }
+    let mut fields = HashMap::new();
+    let mut seen_fields = HashSet::new();
+    for keyword in &call.arguments.keywords {
+        let name = keyword.arg.as_ref()?;
+        if !seen_fields.insert(name.as_str()) {
+            return None;
+        }
+        let Some(ty) = type_expression(parsed, visible, &keyword.value) else {
+            continue;
+        };
+        fields.insert(
+            name.as_str().to_string(),
+            StarField {
+                ty,
+                range: keyword.value.range(),
+            },
+        );
+    }
+    Some(StarConstructor {
+        file: parsed.source.file,
+        ty: StarKnownType::Record(StarRecordId {
+            module: module.clone(),
+            declaration: call.range(),
+            name: name.to_string(),
+        }),
+        fields,
+    })
+}
+
+fn type_expression(
+    parsed: &ParsedStarSource<'_>,
+    visible: &HashMap<String, StarBinding>,
+    expression: &Expr,
+) -> Option<StarKnownType> {
+    match expression {
+        Expr::Name(name) => {
+            let name = name.id.as_str();
+            if let Some(binding) = visible.get(name) {
+                return Some(binding.annotation_type().clone());
+            }
+            if !parsed.is_host_global(name) {
+                return None;
+            }
+            let primitive = match name {
+                "int" => StarPrimitive::Int,
+                "str" => StarPrimitive::Str,
+                "bool" => StarPrimitive::Bool,
+                _ => return None,
+            };
+            Some(StarKnownType::Primitive(primitive))
+        }
+        Expr::NoneLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::None)),
+        _ => None,
+    }
 }
 
 struct CallScanner<'types> {
     file: File,
-    visible: &'types HashMap<String, StarConstructor>,
+    visible: HashMap<String, StarBinding>,
+    declarations: &'types HashMap<String, StarBinding>,
+    writes: &'types HashMap<String, usize>,
+    loaded_names: &'types HashSet<String>,
     problems: Vec<StarTypeProblem>,
     checked_arguments: usize,
     unproved_arguments: usize,
@@ -814,6 +959,19 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
             // values need a separate lexical context before trusting names.
             Stmt::FunctionDef(_) => {}
             Stmt::ClassDef(_) => {}
+            Stmt::Assign(assign) => {
+                ast::visitor::walk_stmt(self, statement);
+                let [Expr::Name(target)] = assign.targets.as_slice() else {
+                    return;
+                };
+                let name = target.id.as_str();
+                if self.writes.get(name) == Some(&1)
+                    && !self.loaded_names.contains(name)
+                    && let Some(binding) = self.declarations.get(name)
+                {
+                    self.visible.insert(name.to_string(), binding.clone());
+                }
+            }
             _ => ast::visitor::walk_stmt(self, statement),
         }
     }
@@ -832,7 +990,7 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
         }
         if let Expr::Call(call) = expression
             && let Expr::Name(name) = call.func.as_ref()
-            && let Some(constructor) = self.visible.get(name.id.as_str())
+            && let Some(StarBinding::Constructor(constructor)) = self.visible.get(name.id.as_str())
         {
             for keyword in &call.arguments.keywords {
                 let Some(field_name) = &keyword.arg else {
@@ -843,12 +1001,12 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
                     self.unproved_arguments += 1;
                     continue;
                 };
-                let Some(actual) = literal_type(&keyword.value) else {
+                let Some(actual) = argument_type(&keyword.value, &self.visible) else {
                     self.unproved_arguments += 1;
                     continue;
                 };
                 self.checked_arguments += 1;
-                if actual != field.scalar {
+                if !type_accepts(&field.ty, &actual) {
                     self.problems.push(StarTypeProblem {
                         file: self.file,
                         range: keyword.value.range(),
@@ -856,7 +1014,7 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
                         related_range: field.range,
                         constructor: name.id.to_string(),
                         field: field_name.to_string(),
-                        expected: field.scalar,
+                        expected: field.ty.clone(),
                         actual,
                     });
                 }
@@ -866,15 +1024,38 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
     }
 }
 
-fn literal_type(expression: &Expr) -> Option<StarPrimitive> {
+fn argument_type(
+    expression: &Expr,
+    visible: &HashMap<String, StarBinding>,
+) -> Option<StarKnownType> {
     match expression {
-        Expr::NumberLiteral(number) => {
-            matches!(number.value, Number::Int(_)).then_some(StarPrimitive::Int)
+        Expr::NumberLiteral(number) => matches!(number.value, Number::Int(_))
+            .then_some(StarKnownType::Primitive(StarPrimitive::Int)),
+        Expr::StringLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::Str)),
+        Expr::BooleanLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::Bool)),
+        Expr::NoneLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::None)),
+        Expr::Call(call) => {
+            let Expr::Name(callee) = call.func.as_ref() else {
+                return None;
+            };
+            let Some(StarBinding::Constructor(constructor)) = visible.get(callee.id.as_str())
+            else {
+                return None;
+            };
+            Some(constructor.ty.clone())
         }
-        Expr::StringLiteral(_) => Some(StarPrimitive::Str),
-        Expr::BooleanLiteral(_) => Some(StarPrimitive::Bool),
-        Expr::NoneLiteral(_) => Some(StarPrimitive::None),
         _ => None,
+    }
+}
+
+fn type_accepts(expected: &StarKnownType, actual: &StarKnownType) -> bool {
+    match expected {
+        StarKnownType::Primitive(expected) => {
+            matches!(actual, StarKnownType::Primitive(actual) if actual == expected)
+        }
+        StarKnownType::Record(expected) => {
+            matches!(actual, StarKnownType::Record(actual) if actual == expected)
+        }
     }
 }
 

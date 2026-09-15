@@ -5,8 +5,9 @@ use ruff_text_size::{TextRange, TextSize};
 use crate::testing::{TestDb, test_db};
 
 use super::{
-    StarAnalysis, StarCheck, StarDirectLoad, StarFailureReason, StarHostProfile, StarLoadBinding,
-    StarModule, StarPrimitive, StarResolvedGraph, StarSource, StarSpecialForm, check_star_graph,
+    StarAnalysis, StarCheck, StarDirectLoad, StarFailureReason, StarHostProfile, StarKnownType,
+    StarLoadBinding, StarModule, StarPrimitive, StarResolvedGraph, StarSource, StarSpecialForm,
+    check_star_graph,
 };
 
 const LABEL: &str = "//example:limits.star";
@@ -130,8 +131,14 @@ fn reports_wrong_primitive_field_in_dead_top_level_branch() -> anyhow::Result<()
     assert_eq!(slice(DECLARATION, problem.related_range()), Some("int"));
     assert_eq!(problem.constructor(), "LimitConfig");
     assert_eq!(problem.field(), "max_connections");
-    assert_eq!(problem.actual(), StarPrimitive::Str);
-    assert_eq!(problem.expected(), StarPrimitive::Int);
+    assert_eq!(
+        problem.actual(),
+        &StarKnownType::Primitive(StarPrimitive::Str)
+    );
+    assert_eq!(
+        problem.expected(),
+        &StarKnownType::Primitive(StarPrimitive::Int)
+    );
     assert_eq!(
         problem.to_string(),
         "LimitConfig.max_connections, expected int, got str"
@@ -246,14 +253,289 @@ fn primitive_fields_remain_proved_in_mixed_records() -> anyhow::Result<()> {
         "Other = record(value=str)\nLimitConfig = record(limit=int, other=Other, tags=list[str])\n";
     let (_db, graph) = case(&root_source, module_source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
-    let [problem] = analysis.problems() else {
-        anyhow::bail!("expected primitive field mismatch in mixed record: {analysis:?}");
+    let [primitive, nominal] = analysis.problems() else {
+        anyhow::bail!("expected primitive and nominal field mismatches: {analysis:?}");
     };
-    assert_eq!(problem.field(), "limit");
+    assert_eq!(primitive.field(), "limit");
+    assert_eq!(slice(&root_source, primitive.range()), Some("\"wrong\""));
+    assert_eq!(slice(module_source, primitive.related_range()), Some("int"));
+    assert_eq!(nominal.field(), "other");
+    assert_eq!(slice(&root_source, nominal.range()), Some("None"));
+    assert_eq!(slice(module_source, nominal.related_range()), Some("Other"));
+    assert_eq!(analysis.checked_arguments(), 2);
+    assert_eq!(analysis.unproved_arguments(), 1);
+    Ok(())
+}
+
+#[test]
+fn same_shaped_records_keep_distinct_declared_types() -> anyhow::Result<()> {
+    let root_source = format!(
+        "load(\"{LABEL}\", \"Envelope\", \"Right\")\nif False:\n    Envelope(item=Right(value=\"right\"))\n"
+    );
+    let module_source =
+        "Left = record(value=str)\nRight = record(value=str)\nEnvelope = record(item=Left)\n";
+    let (_db, mut graph) = case(&root_source, module_source)?;
+    graph.root.loads[0].bindings = Box::new([
+        StarLoadBinding {
+            local: "Envelope".to_string(),
+            source: "Envelope".to_string(),
+        },
+        StarLoadBinding {
+            local: "Right".to_string(),
+            source: "Right".to_string(),
+        },
+    ]);
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected distinct nominal record mismatch: {analysis:?}");
+    };
+    assert_eq!(problem.field(), "item");
+    assert_eq!(
+        slice(&root_source, problem.range()),
+        Some("Right(value=\"right\")")
+    );
+    assert_eq!(slice(module_source, problem.related_range()), Some("Left"));
+    assert_eq!(problem.expected().to_string(), "Left");
+    assert_eq!(problem.actual().to_string(), "Right");
+    Ok(())
+}
+
+#[test]
+fn root_local_record_is_visible_only_after_its_source_declaration() -> anyhow::Result<()> {
+    let source = "if False:\n    Local(item=Other(value=\"x\"))\nOther = record(value=str)\nLocal = record(item=Other)\nif False:\n    Local(item=\"wrong\")\n";
+    let (_db, graph) = root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected only the call after local declaration: {analysis:?}");
+    };
+    assert_eq!(problem.field(), "item");
+    assert_eq!(slice(source, problem.range()), Some("\"wrong\""));
+    assert_eq!(problem.expected().to_string(), "Other");
+    Ok(())
+}
+
+#[test]
+fn different_load_ids_keep_distinct_nominal_types_for_one_physical_file() -> anyhow::Result<()> {
+    let first_id = "//example:first.star";
+    let second_id = "//example:second.star";
+    let root_source = format!(
+        "load(\"{first_id}\", first=\"Config\")\nload(\"{second_id}\", second=\"Config\")\nHolder = record(item=first)\nif False:\n    Holder(item=second(value=\"ok\"))\n"
+    );
+    let module_source = "Config = record(value=str)\n";
+    let (db, root) = test_db(&[("root.star", &root_source), ("shared.star", module_source)])?;
+    let root_file = system_path_to_file(&db, root.join("root.star"))?;
+    let shared_file = system_path_to_file(&db, root.join("shared.star"))?;
+    let graph = StarResolvedGraph {
+        version: "sty-star-graph-v1".to_string(),
+        profile: profile(),
+        root: StarSource {
+            file: root_file,
+            text: root_source.clone(),
+            loads: Box::new([
+                StarDirectLoad {
+                    module_id: first_id.to_string(),
+                    label_range: span(&root_source, &format!("\"{first_id}\""))?,
+                    bindings: Box::new([StarLoadBinding {
+                        local: "first".to_string(),
+                        source: "Config".to_string(),
+                    }]),
+                },
+                StarDirectLoad {
+                    module_id: second_id.to_string(),
+                    label_range: span(&root_source, &format!("\"{second_id}\""))?,
+                    bindings: Box::new([StarLoadBinding {
+                        local: "second".to_string(),
+                        source: "Config".to_string(),
+                    }]),
+                },
+            ]),
+        },
+        modules: Box::new([
+            StarModule {
+                id: first_id.to_string(),
+                source: StarSource {
+                    file: shared_file,
+                    text: module_source.to_string(),
+                    loads: Box::new([]),
+                },
+            },
+            StarModule {
+                id: second_id.to_string(),
+                source: StarSource {
+                    file: shared_file,
+                    text: module_source.to_string(),
+                    loads: Box::new([]),
+                },
+            },
+        ]),
+    };
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected distinct logical load identities: {analysis:?}");
+    };
+    assert_eq!(problem.file(), root_file);
+    assert_eq!(problem.related_file(), root_file);
+    assert_eq!(slice(&root_source, problem.related_range()), Some("first"));
+    assert_eq!(problem.expected().to_string(), "Config");
+    assert_eq!(problem.actual().to_string(), "Config");
+    let message = problem.to_string();
+    assert!(message.contains(first_id), "{message}");
+    assert!(message.contains(second_id), "{message}");
+    Ok(())
+}
+
+#[test]
+fn transitive_import_keeps_the_original_record_identity_and_type_alias() -> anyhow::Result<()> {
+    let base_id = "//example:base.star";
+    let alias_id = "//example:alias.star";
+    let base_source = "Base = record(value=str)\n";
+    let alias_source = format!("load(\"{base_id}\", \"Base\")\nAgain = Base\n");
+    let root_source = format!(
+        "load(\"{alias_id}\", \"Again\")\nLocal = record(item=Again)\nif False:\n    Local(item=Again(value=\"ok\"))\n    Local(item=\"wrong\")\n"
+    );
+    let (db, root) = test_db(&[
+        ("root.star", &root_source),
+        ("base.star", base_source),
+        ("alias.star", &alias_source),
+    ])?;
+    let root_file = system_path_to_file(&db, root.join("root.star"))?;
+    let base_file = system_path_to_file(&db, root.join("base.star"))?;
+    let alias_file = system_path_to_file(&db, root.join("alias.star"))?;
+    let graph = StarResolvedGraph {
+        version: "sty-star-graph-v1".to_string(),
+        profile: profile(),
+        root: StarSource {
+            file: root_file,
+            text: root_source.clone(),
+            loads: Box::new([StarDirectLoad {
+                module_id: alias_id.to_string(),
+                label_range: span(&root_source, &format!("\"{alias_id}\""))?,
+                bindings: Box::new([StarLoadBinding {
+                    local: "Again".to_string(),
+                    source: "Again".to_string(),
+                }]),
+            }]),
+        },
+        modules: Box::new([
+            StarModule {
+                id: alias_id.to_string(),
+                source: StarSource {
+                    file: alias_file,
+                    text: alias_source.clone(),
+                    loads: Box::new([StarDirectLoad {
+                        module_id: base_id.to_string(),
+                        label_range: span(&alias_source, &format!("\"{base_id}\""))?,
+                        bindings: Box::new([StarLoadBinding {
+                            local: "Base".to_string(),
+                            source: "Base".to_string(),
+                        }]),
+                    }]),
+                },
+            },
+            StarModule {
+                id: base_id.to_string(),
+                source: StarSource {
+                    file: base_file,
+                    text: base_source.to_string(),
+                    loads: Box::new([]),
+                },
+            },
+        ]),
+    };
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected one wrong argument after transitive import: {analysis:?}");
+    };
+    assert_eq!(problem.expected().to_string(), "Base");
+    assert_eq!(problem.actual().to_string(), "str");
     assert_eq!(slice(&root_source, problem.range()), Some("\"wrong\""));
-    assert_eq!(slice(module_source, problem.related_range()), Some("int"));
-    assert_eq!(analysis.checked_arguments(), 1);
-    assert_eq!(analysis.unproved_arguments(), 2);
+    assert_eq!(slice(&root_source, problem.related_range()), Some("Again"));
+    Ok(())
+}
+
+#[test]
+fn bare_loaded_binding_is_not_reexported_without_a_host_attestation() -> anyhow::Result<()> {
+    let base_id = "//example:base.star";
+    let alias_id = "//example:alias.star";
+    let base_source = "Base = record(value=str)\n";
+    let alias_source = format!("load(\"{base_id}\", \"Base\")\n");
+    let root_source = format!("load(\"{alias_id}\", \"Base\")\nif False:\n    Base(value=5)\n");
+    let (db, root) = test_db(&[
+        ("root.star", &root_source),
+        ("base.star", base_source),
+        ("alias.star", &alias_source),
+    ])?;
+    let root_file = system_path_to_file(&db, root.join("root.star"))?;
+    let base_file = system_path_to_file(&db, root.join("base.star"))?;
+    let alias_file = system_path_to_file(&db, root.join("alias.star"))?;
+    let graph = StarResolvedGraph {
+        version: "sty-star-graph-v1".to_string(),
+        profile: profile(),
+        root: StarSource {
+            file: root_file,
+            text: root_source.clone(),
+            loads: Box::new([StarDirectLoad {
+                module_id: alias_id.to_string(),
+                label_range: span(&root_source, &format!("\"{alias_id}\""))?,
+                bindings: Box::new([StarLoadBinding {
+                    local: "Base".to_string(),
+                    source: "Base".to_string(),
+                }]),
+            }]),
+        },
+        modules: Box::new([
+            StarModule {
+                id: alias_id.to_string(),
+                source: StarSource {
+                    file: alias_file,
+                    text: alias_source.clone(),
+                    loads: Box::new([StarDirectLoad {
+                        module_id: base_id.to_string(),
+                        label_range: span(&alias_source, &format!("\"{base_id}\""))?,
+                        bindings: Box::new([StarLoadBinding {
+                            local: "Base".to_string(),
+                            source: "Base".to_string(),
+                        }]),
+                    }]),
+                },
+            },
+            StarModule {
+                id: base_id.to_string(),
+                source: StarSource {
+                    file: base_file,
+                    text: base_source.to_string(),
+                    loads: Box::new([]),
+                },
+            },
+        ]),
+    };
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
+    assert_eq!(analysis.checked_arguments(), 0);
+    Ok(())
+}
+
+#[test]
+fn nominal_constructor_names_in_deferred_lexical_scopes_are_unproved() -> anyhow::Result<()> {
+    let root_source = format!(
+        "load(\"{LABEL}\", \"Envelope\", \"Right\")\ndef unused(Envelope):\n    return Envelope(item=Right(value=\"wrong\"))\ncallback = lambda Envelope: Envelope(item=Right(value=\"wrong\"))\n"
+    );
+    let module_source =
+        "Left = record(value=str)\nRight = record(value=str)\nEnvelope = record(item=Left)\n";
+    let (_db, mut graph) = case(&root_source, module_source)?;
+    graph.root.loads[0].bindings = Box::new([
+        StarLoadBinding {
+            local: "Envelope".to_string(),
+            source: "Envelope".to_string(),
+        },
+        StarLoadBinding {
+            local: "Right".to_string(),
+            source: "Right".to_string(),
+        },
+    ]);
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
+    assert_eq!(analysis.checked_arguments(), 0);
     Ok(())
 }
 
