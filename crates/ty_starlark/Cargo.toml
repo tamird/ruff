@@ -1,0 +1,31 @@
+[package]
+name = "ty_starlark"
+version = "0.0.0"
+publish = false
+description = "Starlark source resolution for ty"
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+ruff_db = { workspace = true }
+ruff_memory_usage = { workspace = true }
+
+get-size2 = { workspace = true }
+salsa = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ruff_db = { workspace = true, features = ["testing"] }
+
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

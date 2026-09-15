@@ -5002,6 +5002,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ty_starlark"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "get-size2",
+ "ruff_db",
+ "ruff_memory_usage",
+ "salsa",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "ty_static"
 version = "0.0.12"
 dependencies = [
