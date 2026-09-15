@@ -4,6 +4,7 @@ pub mod bazel;
 pub mod checker;
 pub mod preflight;
 pub mod source;
+pub mod stub;
 
 #[cfg(test)]
 pub(crate) mod testing;
