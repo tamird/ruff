@@ -7,12 +7,13 @@ use ruff_db::Db;
 use ruff_db::diagnostic::{Annotation, Diagnostic, DiagnosticId, Severity, Span};
 use ruff_db::files::File;
 use ruff_db::source::{SourceTextError, source_text};
+use ruff_python_ast::str_prefix::StringLiteralPrefix;
 use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::{self as ast, CmpOp, Expr, ModModule, Number, PythonVersion, Stmt};
 use ruff_python_parser::{
     Mode, ParseError, ParseOptions, Parsed, UnsupportedSyntaxError, parse_unchecked,
 };
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::bazel::{BazelLoadError, BazelRepository, validate_bazel_source};
 
@@ -168,6 +169,7 @@ pub fn admit_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelSourceAd
 
     let mut syntax = BazelSyntax::new(text.as_str());
     syntax.visit_body(parsed.suite());
+    syntax.reject_invalid_indentation();
     if let Some((range, description)) = syntax.first_failure {
         return BazelSourceAdmission::Opaque(BazelAdmissionFailure {
             file,
@@ -184,9 +186,13 @@ pub fn admit_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelSourceAd
 /// <https://bazel.build/versions/9.0.0/rules/language>. The reserved `load`
 /// statement and its top-level placement are documented at
 /// <https://bazel.build/versions/9.0.0/concepts/build-files>.
+/// The pinned Bazel 9 lexer defines which escapes, numeric tokens, raw-string
+/// prefixes and indentation bytes it actually recognizes:
+/// <https://github.com/bazelbuild/bazel/blob/9.0.0/src/main/java/net/starlark/java/syntax/Lexer.java>.
 struct BazelSyntax<'source> {
     text: &'source str,
     first_failure: Option<(TextRange, &'static str)>,
+    string_ranges: Vec<TextRange>,
     statement_depth: usize,
     allow_load: bool,
     first_root_statement: bool,
@@ -198,6 +204,7 @@ impl<'source> BazelSyntax<'source> {
         Self {
             text,
             first_failure: None,
+            string_ranges: Vec::new(),
             statement_depth: 0,
             allow_load: true,
             first_root_statement: true,
@@ -220,6 +227,141 @@ impl<'source> BazelSyntax<'source> {
             .checked_sub(1)
             .and_then(|offset| self.text.as_bytes().get(offset))
             == Some(&b',')
+    }
+
+    fn invalid_escape(&self, literal: &ast::StringLiteral) -> Option<TextRange> {
+        let content_range = literal.content_range();
+        let Some(content) = self
+            .text
+            .as_bytes()
+            .get(content_range.start().to_usize()..content_range.end().to_usize())
+        else {
+            return Some(literal.range());
+        };
+        let mut offset = 0;
+        while offset < content.len() {
+            if content[offset] != b'\\' {
+                offset += 1;
+                continue;
+            }
+            let start = offset;
+            offset += 1;
+            let Some(&next) = content.get(offset) else {
+                return Some(literal.range());
+            };
+            offset += 1;
+            let invalid = match next {
+                b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v' | b'\\' | b'\'' | b'"' | b'\n' => {
+                    false
+                }
+                b'\r' => {
+                    if content.get(offset) == Some(&b'\n') {
+                        offset += 1;
+                    }
+                    false
+                }
+                b'0'..=b'7' => {
+                    let mut value = u32::from(next - b'0');
+                    for _ in 0..2 {
+                        let Some(&digit @ b'0'..=b'7') = content.get(offset) else {
+                            break;
+                        };
+                        value = value * 8 + u32::from(digit - b'0');
+                        offset += 1;
+                    }
+                    value > 0xff
+                }
+                _ => true,
+            };
+            if invalid {
+                let Ok(start) = TextSize::try_from(start) else {
+                    return Some(literal.range());
+                };
+                let Ok(end) = TextSize::try_from(offset) else {
+                    return Some(literal.range());
+                };
+                return Some(TextRange::new(
+                    content_range.start() + start,
+                    content_range.start() + end,
+                ));
+            }
+        }
+        None
+    }
+
+    /// Bazel treats leading tabs as indentation errors, except on continued
+    /// lines and inside grouped expressions. Strings and comments are tokens.
+    fn reject_invalid_indentation(&mut self) {
+        self.string_ranges.sort_unstable_by_key(Ranged::start);
+        let mut string_index = 0;
+        let mut grouped = 0_usize;
+        let mut in_comment = false;
+        let mut leading = true;
+        let mut continued = false;
+        let mut next_continuation = false;
+        let bytes = self.text.as_bytes();
+        for (offset, byte) in bytes.iter().copied().enumerate() {
+            let Ok(position) = TextSize::try_from(offset) else {
+                self.reject(TextRange::default(), "source larger than supported range");
+                return;
+            };
+            while self
+                .string_ranges
+                .get(string_index)
+                .is_some_and(|range| position >= range.end())
+            {
+                string_index += 1;
+            }
+            if let Some(range) = self.string_ranges.get(string_index)
+                && range.start() <= position
+                && position < range.end()
+            {
+                // The lexer consumes internal newlines as literal content.
+                // Its opener is a token, so trailing tabs are ordinary space.
+                if position == range.start() {
+                    leading = false;
+                }
+                continue;
+            }
+            if byte == b'\n' {
+                leading = true;
+                in_comment = false;
+                continued = next_continuation;
+                next_continuation = false;
+                continue;
+            }
+            if in_comment {
+                continue;
+            }
+            if leading {
+                match byte {
+                    b' ' | b'\r' => continue,
+                    b'\t' => {
+                        if grouped == 0 && !continued {
+                            self.reject(
+                                TextRange::new(position, position + TextSize::new(1)),
+                                "tabs used for Bazel indentation",
+                            );
+                        }
+                        continue;
+                    }
+                    _ => leading = false,
+                }
+            }
+            match byte {
+                b'#' => in_comment = true,
+                b'\\'
+                    if bytes.get(offset + 1) == Some(&b'\n')
+                        || (bytes.get(offset + 1) == Some(&b'\r')
+                            && bytes.get(offset + 2) == Some(&b'\n')) =>
+                {
+                    next_continuation = true;
+                }
+                b'(' | b'[' | b'{' => grouped += 1,
+                b')' | b']' | b'}' => grouped = grouped.saturating_sub(1),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -368,11 +510,42 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
             Expr::TString(_) => Some("Python interpolated strings"),
             Expr::EllipsisLiteral(_) => Some("Python ellipsis literals"),
             Expr::IpyEscapeCommand(_) => Some("IPython commands"),
-            Expr::StringLiteral(string) => (string.value.is_implicit_concatenated()
-                || string.value.is_unicode())
-            .then_some("implicitly concatenated or Unicode-prefixed strings"),
+            Expr::StringLiteral(string) => {
+                for literal in &string.value {
+                    self.string_ranges.push(literal.range());
+                    match literal.flags.prefix() {
+                        StringLiteralPrefix::Raw { uppercase: true } => {
+                            self.reject(
+                                TextRange::new(
+                                    literal.range().start(),
+                                    literal.range().start() + TextSize::new(1),
+                                ),
+                                "uppercase raw-string prefixes",
+                            );
+                        }
+                        StringLiteralPrefix::Empty => {
+                            if let Some(range) = self.invalid_escape(literal) {
+                                self.reject(range, "string escapes not recognized by Bazel 9");
+                            }
+                        }
+                        StringLiteralPrefix::Unicode => {}
+                        StringLiteralPrefix::Raw { uppercase: false } => {}
+                    }
+                }
+                (string.value.is_implicit_concatenated() || string.value.is_unicode())
+                    .then_some("implicitly concatenated or Unicode-prefixed strings")
+            }
             Expr::NumberLiteral(number) => match &number.value {
-                Number::Int(_) => None,
+                Number::Int(_) => match self
+                    .text
+                    .get(number.range().start().to_usize()..number.range().end().to_usize())
+                {
+                    Some(token) if token.contains('_') => {
+                        Some("numeric separators not recognized by Bazel 9")
+                    }
+                    Some(_) => None,
+                    None => Some("numeric literal source spans unavailable"),
+                },
                 Number::Float(_) => Some("float literals"),
                 Number::Complex { real: _, imag: _ } => Some("complex literals"),
             },

@@ -1,8 +1,11 @@
 use ruff_db::diagnostic::{DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::system::{DbWithTestSystem as _, DbWithWritableSystem as _};
+use ruff_python_ast::PythonVersion;
+use ruff_python_parser::{Mode, ParseOptions, parse_unchecked};
 
 use crate::bazel::{BazelLoadError, BazelRepository};
+use crate::preflight::{BazelPreflight, preflight_bazel_source};
 use crate::testing::test_db;
 
 use super::{
@@ -380,6 +383,174 @@ fn accepts_parenthesized_trailing_comma_and_bare_pair() -> anyhow::Result<()> {
             "{code}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn rejects_python_literals_and_indentation_unrecognized_by_bazel_9() -> anyhow::Result<()> {
+    for (code, reason, site) in [
+        (
+            "BAD = \"\\x41\"\nGOOD = 1\n",
+            "string escapes not recognized by Bazel 9",
+            "\\x41",
+        ),
+        (
+            "BAD = \"\\u0041\"\nGOOD = 1\n",
+            "string escapes not recognized by Bazel 9",
+            "\\u0041",
+        ),
+        (
+            "# A UTF-8 comment: π\nBAD = \"\\x41\"\nGOOD = 1\n",
+            "string escapes not recognized by Bazel 9",
+            "\\x41",
+        ),
+        (
+            "BAD = \"\\400\"\nGOOD = 1\n",
+            "string escapes not recognized by Bazel 9",
+            "\\400",
+        ),
+        (
+            "BAD = 1_0\nGOOD = 1\n",
+            "numeric separators not recognized by Bazel 9",
+            "1_0",
+        ),
+        (
+            "BAD = 0xA_B\nGOOD = 1\n",
+            "numeric separators not recognized by Bazel 9",
+            "0xA_B",
+        ),
+        (
+            "BAD = R\"\\x41\"\nGOOD = 1\n",
+            "uppercase raw-string prefixes",
+            "R\"",
+        ),
+        (
+            "def broken():\n\treturn 1\nGOOD = 1\n",
+            "tabs used for Bazel indentation",
+            "\t",
+        ),
+        (
+            "GOOD = 1\n\t# Leading whitespace before a comment\n",
+            "tabs used for Bazel indentation",
+            "\t",
+        ),
+    ] {
+        // Each form parses as Python; the Bazel gate must independently
+        // reject it before another binding can contribute a checked type.
+        let parsed = parse_unchecked(
+            code,
+            ParseOptions::from(Mode::Module).with_target_version(PythonVersion::PY310),
+        );
+        let module = parsed
+            .try_into_module()
+            .ok_or(anyhow::anyhow!("shared parser did not parse: {code:?}"))?;
+        assert!(module.errors().is_empty(), "{code}: {:?}", module.errors());
+        let (db, root) = test_db(&[
+            ("MODULE.bazel", ""),
+            ("pkg/BUILD", ""),
+            ("pkg/defs.bzl", code),
+        ])?;
+        let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+        let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+        let failure = opaque(admit_bazel_source(&db, source))?;
+        assert!(
+            matches!(failure.reason(), BazelAdmissionError::BazelSyntax(found) if *found == reason),
+            "{code}: {:?}",
+            failure.reason()
+        );
+        assert_eq!(failure.file(), file);
+        assert_eq!(
+            failure.range().map(|range| range.start().to_usize()),
+            code.find(site),
+            "{code}"
+        );
+        let diagnostic = failure.diagnostic().ok_or(anyhow::anyhow!(
+            "missing Bazel syntax diagnostic for {code}"
+        ))?;
+        assert_eq!(diagnostic.id(), DiagnosticId::InvalidSyntax);
+        assert_eq!(diagnostic.range(), failure.range());
+    }
+    Ok(())
+}
+
+#[test]
+fn admits_bazel_9_raw_strings_escapes_and_nonindentation_tabs() -> anyhow::Result<()> {
+    for code in [
+        "VALUE = r\"\\x41\"\nGOOD = 1\n",
+        "VALUE = r\"quoted\\\"\"\nGOOD = 1\n",
+        "VALUE = r\"one\\\n two\"\nGOOD = 1\n",
+        "VALUE = \"\\\\x41\"\nGOOD = 1\n",
+        "VALUE = \"\\n\\07\"\nGOOD = 1\n",
+        "VALUE = 0xAB\nGOOD = 1\n",
+        "VALUE = 1 #\tComment contents\nGOOD = 1\n",
+        "VALUE = 1 # \\x41 is comment text\nGOOD = 1\n",
+        "VALUE = \"\"\"one\n\tinside a string\n\"\"\"\nGOOD = 1\n",
+        "VALUE = \"\"\"one\ntwo\"\"\"\t# trailing comment\nGOOD = 1\n",
+        "VALUE = \"\"\"one\r\ntwo\"\"\"\t# trailing comment\r\nGOOD = 1\r\n",
+        "VALUE = (\n\t1\n)\nGOOD = 1\n",
+        "VALUE = 1\\\n\t+ 2\nGOOD = 1\n",
+    ] {
+        let (db, root) = test_db(&[
+            ("MODULE.bazel", ""),
+            ("pkg/BUILD", ""),
+            ("pkg/defs.bzl", code),
+        ])?;
+        let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+        let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+        assert_eq!(
+            admitted(admit_bazel_source(&db, source))?.suite().len(),
+            2,
+            "{code}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn docstring_trailing_tabs_leave_the_whole_source_ready() -> anyhow::Result<()> {
+    for code in [
+        "\"\"\"Module docs\"\"\"\t# trailing comment\nGOOD = 1\n",
+        "\"\"\"Module docs\nsecond line\"\"\"\t# trailing comment\nGOOD = 1\n",
+    ] {
+        let (db, root) = test_db(&[
+            ("MODULE.bazel", ""),
+            ("pkg/BUILD", ""),
+            ("pkg/defs.bzl", code),
+        ])?;
+        let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+        let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+        assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 2);
+        assert!(
+            matches!(preflight_bazel_source(&db, source), BazelPreflight::Ready),
+            "{code}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn lexical_changes_revalidate_the_same_bazel_source_key() -> anyhow::Result<()> {
+    let (mut db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", "GOOD = 1\n"),
+    ])?;
+    let path = root.join("pkg/defs.bzl");
+    let file = system_path_to_file(&db, &path)?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root.clone()), file);
+    assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 1);
+
+    db.write_file(&path, "BAD = 1_0\nGOOD = 1\n")?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root.clone()), file);
+    let failure = opaque(admit_bazel_source(&db, source))?;
+    assert!(matches!(
+        failure.reason(),
+        BazelAdmissionError::BazelSyntax("numeric separators not recognized by Bazel 9")
+    ));
+
+    db.write_file(&path, "GOOD = 1\n")?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 1);
     Ok(())
 }
 
