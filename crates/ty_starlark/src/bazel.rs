@@ -252,6 +252,14 @@ fn has_parent_component(path: &SystemPath) -> bool {
         .any(|component| component.as_str() == "..")
 }
 
+/// Select the nearest marked main repository containing the current directory.
+/// An explicit CLI workspace may instead choose a different marked root.
+pub fn find_bazel_repository(db: &dyn Db, cwd: &SystemPath) -> Option<SystemPathBuf> {
+    cwd.ancestors()
+        .find(|directory| is_repository_root(db, directory))
+        .map(SystemPath::to_path_buf)
+}
+
 fn is_repository_root(db: &dyn Db, directory: &SystemPath) -> bool {
     ["MODULE.bazel", "REPO.bazel", "WORKSPACE.bazel", "WORKSPACE"]
         .into_iter()

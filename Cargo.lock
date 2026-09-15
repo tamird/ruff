@@ -4252,6 +4252,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sty"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ruff_db",
+ "ruff_source_file",
+ "ruff_text_size",
+ "salsa",
+ "tempfile",
+ "ty_starlark",
+]
+
+[[package]]
 name = "supports-hyperlinks"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
