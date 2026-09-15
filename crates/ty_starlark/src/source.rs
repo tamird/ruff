@@ -25,6 +25,12 @@ pub struct BazelSource<'db> {
 
 impl get_size2::GetSize for BazelSource<'_> {}
 
+impl BazelSource<'_> {
+    pub(crate) fn selected_file(self, db: &dyn Db) -> File {
+        *self.file(db)
+    }
+}
+
 /// A full parse accepted within this admission gate's supported syntax subset.
 /// A later checker must still validate loads, exports, and host type options.
 #[derive(Debug, get_size2::GetSize)]
@@ -33,7 +39,8 @@ pub struct AdmittedBazelSource {
 }
 
 impl AdmittedBazelSource {
-    pub fn suite(&self) -> &[Stmt] {
+    /// Raw syntax stays within the crate until whole-file preflight succeeds.
+    pub(crate) fn suite(&self) -> &[Stmt] {
         self.parsed.suite()
     }
 }
@@ -46,7 +53,7 @@ pub enum BazelSourceAdmission {
 }
 
 /// The first concrete reason an entire Bazel `.bzl` source cannot be checked.
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, get_size2::GetSize)]
 pub struct BazelAdmissionFailure {
     file: File,
     range: Option<TextRange>,
@@ -83,7 +90,7 @@ impl BazelAdmissionFailure {
     }
 }
 
-#[derive(Debug, get_size2::GetSize, thiserror::Error)]
+#[derive(Clone, Debug, get_size2::GetSize, thiserror::Error)]
 pub enum BazelAdmissionError {
     #[error("cannot select this Bazel .bzl source: {0}")]
     InvalidSource(BazelLoadError),
