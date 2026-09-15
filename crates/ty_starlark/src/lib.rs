@@ -8,6 +8,7 @@ pub mod loads;
 pub mod overlay;
 pub mod preflight;
 pub mod source;
+pub mod star;
 pub mod stub;
 
 #[cfg(test)]
