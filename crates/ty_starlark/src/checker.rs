@@ -2,9 +2,11 @@
 //!
 //! The source preflight owns whole-file admission. This module only infers
 //! results justified by the initialized file and bodies of its own functions.
-//! A sibling stub or an explicit host profile is required for parameter types.
+//! A separate stub proof can constrain call arguments, but all results here
+//! remain backed by the runtime source and its own defaults.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use ruff_db::Db;
 use ruff_db::files::File;
@@ -90,6 +92,18 @@ pub enum BazelScalar {
     Unknown,
 }
 
+impl fmt::Display for BazelScalar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BazelScalar::Int => f.write_str("int"),
+            BazelScalar::Str => f.write_str("str"),
+            BazelScalar::Bool => f.write_str("bool"),
+            BazelScalar::None => f.write_str("None"),
+            BazelScalar::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
 #[derive(Debug, get_size2::GetSize)]
 pub struct BazelFunction {
     parameters: Box<[BazelParameter]>,
@@ -144,7 +158,7 @@ impl BazelParameter {
     }
 }
 
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, get_size2::GetSize)]
 pub struct BazelCheckProblem {
     file: File,
     range: TextRange,
@@ -170,7 +184,7 @@ impl BazelCheckProblem {
     }
 }
 
-#[derive(Debug, get_size2::GetSize, thiserror::Error)]
+#[derive(Clone, Debug, get_size2::GetSize, thiserror::Error)]
 pub enum BazelCheckError {
     #[error(
         "function '{callee}' accepts {minimum} to {maximum} positional arguments, got {actual}"
@@ -205,6 +219,104 @@ pub fn summarize_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelChec
 struct BodyValue {
     scalar: BazelScalar,
     may_fail: bool,
+}
+
+/// A checked stub can constrain callers without substituting a declared
+/// result for a source-backed result.
+#[derive(Clone, Debug)]
+pub(crate) struct BazelExpectedParameter {
+    pub(crate) scalar: BazelScalar,
+    pub(crate) file: File,
+    pub(crate) range: TextRange,
+}
+
+#[derive(Debug)]
+pub(crate) struct BazelExpectedFunction {
+    pub(crate) name: String,
+    pub(crate) parameters: Box<[BazelExpectedParameter]>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BazelTypedMismatch {
+    pub(crate) callee: String,
+    pub(crate) actual: BazelScalar,
+    pub(crate) expected: BazelScalar,
+    pub(crate) source_file: File,
+    pub(crate) source_range: TextRange,
+    pub(crate) stub_file: File,
+    pub(crate) stub_range: TextRange,
+}
+
+/// Inspect declaration shapes without evaluating any function result.
+pub(crate) struct BazelSourceMatcher<'source> {
+    builder: ModuleBuilder<'source>,
+}
+
+pub(crate) struct BazelFunctionProver<'source> {
+    builder: ModuleBuilder<'source>,
+}
+
+pub(crate) struct BazelBodyProof {
+    pub(crate) result: BazelScalar,
+    pub(crate) may_fail: bool,
+    pub(crate) exhausted_at: Option<TextRange>,
+    pub(crate) mismatch: Option<BazelTypedMismatch>,
+}
+
+impl<'source> BazelSourceMatcher<'source> {
+    pub(crate) fn new(
+        db: &'source dyn Db,
+        source: BazelSource<'_>,
+    ) -> Result<Self, BazelPreflightFailure> {
+        // Even a Ready source can become opaque during whole-file scalar
+        // analysis. No reusable prover may bypass that second gate.
+        if let BazelCheckedSource::Opaque(failure) = summarize_bazel_source(db, source) {
+            return Err(failure.clone());
+        }
+        let suite = preflighted_suite(db, source)?;
+        let builder = ModuleBuilder::new(source.selected_file(db), suite)?;
+        Ok(Self { builder })
+    }
+
+    /// Syntax from this getter is accessible only after full source preflight.
+    pub(crate) fn function(&self, name: &str) -> Option<&'source ast::StmtFunctionDef> {
+        self.builder.functions.get(name).copied()
+    }
+
+    pub(crate) fn default_scalar(&self, expression: &Expr) -> Option<BazelScalar> {
+        eager_scalar(expression, &self.builder.scalars)
+    }
+
+    /// The caller has matched every stub declaration to this source first.
+    /// No function result exists yet, so profiles precede all context caches.
+    pub(crate) fn into_prover(
+        self,
+        expected: Vec<BazelExpectedFunction>,
+    ) -> BazelFunctionProver<'source> {
+        let mut builder = self.builder;
+        builder.expected_calls = expected
+            .into_iter()
+            .map(|function| (function.name, function.parameters))
+            .collect();
+        BazelFunctionProver { builder }
+    }
+}
+
+impl<'source> BazelFunctionProver<'source> {
+    pub(crate) fn function(&self, name: &str) -> Option<&'source ast::StmtFunctionDef> {
+        self.builder.functions.get(name).copied()
+    }
+
+    pub(crate) fn prove(&mut self, name: &str, inputs: &[BazelScalar]) -> Option<BazelBodyProof> {
+        let function = self.function(name)?;
+        let result = self.builder.function_result(function.name.as_str(), inputs);
+        Some(BazelBodyProof {
+            result: result.scalar,
+            may_fail: result.may_fail,
+            exhausted_at: self.builder.exhausted_at,
+            mismatch: self.builder.typed_mismatch.clone(),
+        })
+    }
 }
 
 impl BodyValue {
@@ -242,6 +354,8 @@ struct ModuleBuilder<'source> {
     active_functions: HashSet<&'source str>,
     invalid_call_sites: HashSet<TextRange>,
     exhausted_at: Option<TextRange>,
+    expected_calls: HashMap<String, Box<[BazelExpectedParameter]>>,
+    typed_mismatch: Option<BazelTypedMismatch>,
     problems: Vec<BazelCheckProblem>,
 }
 
@@ -299,6 +413,8 @@ impl<'source> ModuleBuilder<'source> {
             active_functions: HashSet::new(),
             invalid_call_sites: HashSet::new(),
             exhausted_at: None,
+            expected_calls: HashMap::new(),
+            typed_mismatch: None,
             problems: Vec::new(),
         })
     }
@@ -465,6 +581,30 @@ impl<'source> ModuleBuilder<'source> {
                     };
                     inputs.push(default);
                 }
+                if let Some(expected) = self.expected_calls.get(callee.id.as_str())
+                    && let Some((index, (input, parameter))) = inputs
+                        .iter()
+                        .zip(expected.iter())
+                        .enumerate()
+                        .find(|(_, (input, parameter))| **input != parameter.scalar)
+                {
+                    let source_range = call
+                        .arguments
+                        .args
+                        .get(index)
+                        .map_or(call.range(), Ranged::range);
+                    let mismatch = BazelTypedMismatch {
+                        callee: callee.id.to_string(),
+                        actual: *input,
+                        expected: parameter.scalar,
+                        source_file: self.file,
+                        source_range,
+                        stub_file: parameter.file,
+                        stub_range: parameter.range,
+                    };
+                    self.typed_mismatch.get_or_insert(mismatch);
+                    return BodyValue::invalid_call();
+                }
                 let result = self.function_result(callee.id.as_str(), &inputs);
                 may_fail |= result.may_fail;
                 BodyValue {
@@ -490,6 +630,8 @@ impl<'source> ModuleBuilder<'source> {
             active_functions: _,
             invalid_call_sites: _,
             exhausted_at: _,
+            expected_calls: _,
+            typed_mismatch: _,
             mut problems,
         } = self;
         let mut exports = Vec::new();

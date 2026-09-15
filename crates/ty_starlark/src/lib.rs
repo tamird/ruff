@@ -2,6 +2,7 @@
 
 pub mod bazel;
 pub mod checker;
+pub mod overlay;
 pub mod preflight;
 pub mod source;
 pub mod stub;
