@@ -14,7 +14,7 @@ use ruff_text_size::{Ranged, TextRange};
 use crate::checker::{
     BazelCheckProblem, BazelCheckedSource, BazelExpectedFunction, BazelExpectedParameter,
     BazelExport, BazelExportKind, BazelFunction, BazelFunctionProver, BazelModuleSummary,
-    BazelScalar, BazelSourceMatcher, summarize_bazel_source,
+    BazelScalar, BazelSourceMatcher, BazelUsageReport, summarize_bazel_source,
 };
 use crate::preflight::BazelPreflightFailure;
 use crate::source::BazelSource;
@@ -37,6 +37,7 @@ pub struct BazelVerifiedModule {
     stub_file: Option<File>,
     exports: Box<[BazelVerifiedExport]>,
     problems: Box<[BazelCheckProblem]>,
+    typed_problems: Box<[BazelTypedCallProblem]>,
 }
 
 impl BazelVerifiedModule {
@@ -61,6 +62,55 @@ impl BazelVerifiedModule {
     pub fn problems(&self) -> &[BazelCheckProblem] {
         &self.problems
     }
+
+    /// Known incorrect scalar calls in every reachable source function body.
+    /// An Unknown argument remains unproved but is not a type diagnostic.
+    /// Function-valued names also remain Unknown in this primitive profile.
+    pub fn typed_problems(&self) -> &[BazelTypedCallProblem] {
+        &self.typed_problems
+    }
+}
+
+/// The source argument is primary; the sibling stub annotation is related.
+#[derive(Debug, get_size2::GetSize)]
+pub struct BazelTypedCallProblem {
+    file: File,
+    range: TextRange,
+    related_file: File,
+    related_range: TextRange,
+    reason: BazelTypedCallError,
+}
+
+impl BazelTypedCallProblem {
+    pub fn file(&self) -> File {
+        self.file
+    }
+
+    pub fn range(&self) -> TextRange {
+        self.range
+    }
+
+    pub fn related_file(&self) -> File {
+        self.related_file
+    }
+
+    pub fn related_range(&self) -> TextRange {
+        self.related_range
+    }
+
+    pub fn reason(&self) -> &BazelTypedCallError {
+        &self.reason
+    }
+}
+
+#[derive(Debug, get_size2::GetSize, thiserror::Error)]
+pub enum BazelTypedCallError {
+    #[error("function '{callee}' can receive {actual} here; expected {expected}")]
+    InvalidArgumentType {
+        callee: String,
+        actual: BazelScalar,
+        expected: BazelScalar,
+    },
 }
 
 #[derive(Debug, get_size2::GetSize)]
@@ -122,6 +172,8 @@ impl BazelVerifiedFunction {
         self.stub_result_range
     }
 
+    /// A runtime failure or an unsafe typed call prevents trusting this
+    /// source-only result; an unsafe call need not crash the Bazel host.
     pub fn body_may_fail(&self) -> bool {
         self.body_may_fail
     }
@@ -278,7 +330,7 @@ pub fn verify_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelVerifie
         }
     };
     let Some(declarations) = declarations else {
-        return BazelVerifiedSource::Checked(verified_module(summary, None));
+        return BazelVerifiedSource::Checked(verified_module(summary, None, None));
     };
     let matcher = match BazelSourceMatcher::new(db, source) {
         Ok(matcher) => matcher,
@@ -330,12 +382,24 @@ pub fn verify_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelVerifie
             return BazelVerifiedSource::Opaque(failure);
         }
     }
-    BazelVerifiedSource::Checked(verified_module(summary, Some(declarations)))
+    let usage = match prover.check_all_bodies() {
+        Ok(usage) => usage,
+        Err(range) => {
+            return BazelVerifiedSource::Opaque(failed(
+                source.selected_file(db),
+                range,
+                None,
+                BazelVerificationError::AnalysisLimit,
+            ));
+        }
+    };
+    BazelVerifiedSource::Checked(verified_module(summary, Some(declarations), Some(&usage)))
 }
 
 fn verified_module(
     summary: &BazelModuleSummary,
     declarations: Option<&BazelStubDeclarations>,
+    usage: Option<&BazelUsageReport>,
 ) -> BazelVerifiedModule {
     let stub_file = declarations.map(BazelStubDeclarations::file);
     let stub_functions: Option<HashMap<_, _>> = declarations.map(|stub| {
@@ -355,6 +419,9 @@ fn verified_module(
                         .as_ref()
                         .and_then(|functions| functions.get(export.name()))
                         .copied();
+                    let unsafe_source_only = declaration.is_none()
+                        && usage
+                            .is_some_and(|usage| usage.unsafe_functions.contains(export.name()));
                     let parameters = function
                         .parameters()
                         .iter()
@@ -374,14 +441,18 @@ fn verified_module(
                         .collect();
                     BazelVerifiedExportKind::Function(BazelVerifiedFunction {
                         parameters,
-                        result: declaration.map_or(function.result(), BazelStubFunction::result),
+                        result: if unsafe_source_only {
+                            BazelScalar::Unknown
+                        } else {
+                            declaration.map_or(function.result(), BazelStubFunction::result)
+                        },
                         stub_file: if declaration.is_some() {
                             stub_file
                         } else {
                             None
                         },
                         stub_result_range: declaration.map(BazelStubFunction::result_range),
-                        body_may_fail: function.body_may_fail(),
+                        body_may_fail: function.body_may_fail() || unsafe_source_only,
                     })
                 }
             };
@@ -398,6 +469,21 @@ fn verified_module(
         stub_file,
         exports,
         problems: summary.problems().to_vec().into_boxed_slice(),
+        typed_problems: usage
+            .into_iter()
+            .flat_map(|usage| &usage.problems)
+            .map(|problem| BazelTypedCallProblem {
+                file: problem.source_file,
+                range: problem.source_range,
+                related_file: problem.stub_file,
+                related_range: problem.stub_range,
+                reason: BazelTypedCallError::InvalidArgumentType {
+                    callee: problem.callee.clone(),
+                    actual: problem.actual,
+                    expected: problem.expected,
+                },
+            })
+            .collect(),
     }
 }
 

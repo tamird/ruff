@@ -10,8 +10,9 @@ use crate::source::BazelSource;
 use crate::testing::test_db;
 
 use super::{
-    BazelVerificationError, BazelVerificationFailure, BazelVerifiedExport, BazelVerifiedExportKind,
-    BazelVerifiedFunction, BazelVerifiedModule, BazelVerifiedSource, verify_bazel_source,
+    BazelTypedCallError, BazelVerificationError, BazelVerificationFailure, BazelVerifiedExport,
+    BazelVerifiedExportKind, BazelVerifiedFunction, BazelVerifiedModule, BazelVerifiedSource,
+    verify_bazel_source,
 };
 
 fn checked(result: &BazelVerifiedSource) -> anyhow::Result<&BazelVerifiedModule> {
@@ -421,6 +422,221 @@ fn unproved_function_value_argument_never_justifies_a_stubbed_return() -> anyhow
             .ok_or(anyhow::anyhow!("helper annotation"))?
             + 3
     );
+    Ok(())
+}
+
+#[test]
+fn unused_source_only_body_reports_every_known_wrong_scalar_argument() -> anyhow::Result<()> {
+    let runtime = "GOOD = 1\ndef keep(left, right):\n    return 1\ndef public():\n    return 1\ndef rogue():\n    return keep(\"s\", False)\n";
+    let stub = "def keep(left: int, right: str) -> int: ...\ndef public() -> int: ...\n";
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", runtime),
+        ("pkg/defs.bzl.pyi", stub),
+    ])?;
+    let source_file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let stub_file = system_path_to_file(&db, root.join("pkg/defs.bzl.pyi"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), source_file);
+    let module = checked(verify_bazel_source(&db, source))?;
+    assert!(module.problems().is_empty());
+    assert_eq!(module.typed_problems().len(), 2);
+    for (problem, (source_text, actual, expected, annotation)) in
+        module.typed_problems().iter().zip([
+            ("\"s\"", BazelScalar::Str, BazelScalar::Int, "left: int"),
+            ("False", BazelScalar::Bool, BazelScalar::Str, "right: str"),
+        ])
+    {
+        assert_eq!(problem.file(), source_file);
+        assert_eq!(
+            problem.range().start().to_usize(),
+            runtime
+                .find(source_text)
+                .ok_or(anyhow::anyhow!("source argument"))?
+        );
+        assert_eq!(problem.related_file(), stub_file);
+        assert_eq!(
+            problem.related_range().start().to_usize(),
+            stub.find(annotation)
+                .ok_or(anyhow::anyhow!("stub annotation"))?
+                + annotation
+                    .find(':')
+                    .ok_or(anyhow::anyhow!("annotation colon"))?
+                + 2
+        );
+        assert!(matches!(
+            problem.reason(),
+            BazelTypedCallError::InvalidArgumentType {
+                callee,
+                actual: got,
+                expected: required,
+            } if callee == "keep" && *got == actual && *required == expected
+        ));
+    }
+    assert!(matches!(
+        module.export("GOOD").map(BazelVerifiedExport::kind),
+        Some(BazelVerifiedExportKind::Scalar(BazelScalar::Int))
+    ));
+    assert_eq!(function(module, "public")?.result(), BazelScalar::Int);
+    assert_eq!(function(module, "keep")?.result(), BazelScalar::Int);
+    assert_eq!(function(module, "rogue")?.result(), BazelScalar::Unknown);
+    assert!(function(module, "rogue")?.body_may_fail());
+    assert_eq!(function(module, "rogue")?.stub_file(), None);
+
+    let BazelCheckedSource::Checked(summary) = summarize_bazel_source(&db, source) else {
+        anyhow::bail!("unannotated source unexpectedly opaque")
+    };
+    let Some(BazelExportKind::Function(rogue)) = summary
+        .export("rogue")
+        .map(crate::checker::BazelExport::kind)
+    else {
+        anyhow::bail!("source-only rogue missing")
+    };
+    assert_eq!(rogue.result(), BazelScalar::Int);
+    Ok(())
+}
+
+#[test]
+fn separate_reachable_calls_keep_both_typed_problems() -> anyhow::Result<()> {
+    let runtime = "GOOD = 1\ndef keep(value):\n    return 1\ndef rogue():\n    first = keep(\"s\")\n    second = keep(False)\n    return 1\n";
+    let stub = "def keep(value: int) -> int: ...\n";
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", runtime),
+        ("pkg/defs.bzl.pyi", stub),
+    ])?;
+    let source_file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let stub_file = system_path_to_file(&db, root.join("pkg/defs.bzl.pyi"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), source_file);
+    let module = checked(verify_bazel_source(&db, source))?;
+    assert!(module.problems().is_empty());
+    assert_eq!(module.typed_problems().len(), 2);
+    for (problem, (argument, actual)) in module
+        .typed_problems()
+        .iter()
+        .zip([("\"s\"", BazelScalar::Str), ("False", BazelScalar::Bool)])
+    {
+        assert_eq!(problem.file(), source_file);
+        assert_eq!(
+            problem.range().start().to_usize(),
+            runtime
+                .find(argument)
+                .ok_or(anyhow::anyhow!("bad argument"))?
+        );
+        assert_eq!(problem.related_file(), stub_file);
+        assert_eq!(
+            problem.related_range().start().to_usize(),
+            stub.find("value: int")
+                .ok_or(anyhow::anyhow!("annotation"))?
+                + 7
+        );
+        assert!(matches!(
+            problem.reason(),
+            BazelTypedCallError::InvalidArgumentType {
+                actual: got,
+                expected: BazelScalar::Int,
+                ..
+            } if *got == actual
+        ));
+    }
+    assert_eq!(function(module, "rogue")?.result(), BazelScalar::Unknown);
+    assert!(function(module, "rogue")?.body_may_fail());
+    assert_eq!(function(module, "keep")?.result(), BazelScalar::Int);
+    assert!(matches!(
+        module.export("GOOD").map(BazelVerifiedExport::kind),
+        Some(BazelVerifiedExportKind::Scalar(BazelScalar::Int))
+    ));
+    Ok(())
+}
+
+#[test]
+fn specialized_callers_report_distinct_wrong_kinds_once() -> anyhow::Result<()> {
+    let runtime = "GOOD = 1\ndef helper(value):\n    return 1\ndef relay(value):\n    return helper(value)\ndef bad_a():\n    return relay(\"s\")\ndef bad_b():\n    return relay(\"s\")\ndef bad_bool():\n    return relay(False)\ndef good():\n    return relay(1)\ndef callback():\n    return 1\ndef unmodeled():\n    return helper(callback)\n";
+    let stub = "def helper(value: int) -> int: ...\n";
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", runtime),
+        ("pkg/defs.bzl.pyi", stub),
+    ])?;
+    let source_file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let stub_file = system_path_to_file(&db, root.join("pkg/defs.bzl.pyi"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), source_file);
+    let module = checked(verify_bazel_source(&db, source))?;
+    assert_eq!(module.typed_problems().len(), 2);
+    for (problem, actual) in module
+        .typed_problems()
+        .iter()
+        .zip([BazelScalar::Str, BazelScalar::Bool])
+    {
+        assert_eq!(problem.file(), source_file);
+        assert_eq!(
+            problem.range().start().to_usize(),
+            runtime
+                .rfind("helper(value)")
+                .ok_or(anyhow::anyhow!("relay call"))?
+                + 7
+        );
+        assert_eq!(problem.related_file(), stub_file);
+        assert_eq!(
+            problem.related_range().start().to_usize(),
+            stub.find("value: int")
+                .ok_or(anyhow::anyhow!("annotation"))?
+                + 7
+        );
+        assert!(matches!(
+            problem.reason(),
+            BazelTypedCallError::InvalidArgumentType {
+                actual: got,
+                expected: BazelScalar::Int,
+                ..
+            } if *got == actual
+        ));
+        assert!(problem.reason().to_string().contains("can receive"));
+    }
+    for name in ["relay", "bad_a", "bad_b", "bad_bool", "unmodeled"] {
+        assert_eq!(
+            function(module, name)?.result(),
+            BazelScalar::Unknown,
+            "{name}"
+        );
+        assert!(function(module, name)?.body_may_fail(), "{name}");
+    }
+    assert_eq!(function(module, "good")?.result(), BazelScalar::Int);
+    assert!(!function(module, "good")?.body_may_fail());
+    assert_eq!(function(module, "helper")?.result(), BazelScalar::Int);
+    assert!(matches!(
+        module.export("GOOD").map(BazelVerifiedExport::kind),
+        Some(BazelVerifiedExportKind::Scalar(BazelScalar::Int))
+    ));
+    Ok(())
+}
+
+#[test]
+fn invalid_caller_does_not_check_typed_callee_under_the_wrong_input() -> anyhow::Result<()> {
+    let runtime = "def inner(value):\n    return 1\ndef typed(value):\n    return inner(value)\ndef rogue():\n    return typed(\"s\")\n";
+    let stub = "def inner(value: int) -> int: ...\ndef typed(value: int) -> int: ...\n";
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", runtime),
+        ("pkg/defs.bzl.pyi", stub),
+    ])?;
+    let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+    let module = checked(verify_bazel_source(&db, source))?;
+    assert_eq!(module.typed_problems().len(), 1);
+    assert_eq!(
+        module.typed_problems()[0].range().start().to_usize(),
+        runtime
+            .rfind("\"s\"")
+            .ok_or(anyhow::anyhow!("rogue input"))?
+    );
+    assert_eq!(function(module, "inner")?.result(), BazelScalar::Int);
+    assert_eq!(function(module, "typed")?.result(), BazelScalar::Int);
+    assert_eq!(function(module, "rogue")?.result(), BazelScalar::Unknown);
+    assert!(function(module, "rogue")?.body_may_fail());
     Ok(())
 }
 

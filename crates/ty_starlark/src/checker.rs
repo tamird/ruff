@@ -219,6 +219,7 @@ pub fn summarize_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelChec
 struct BodyValue {
     scalar: BazelScalar,
     may_fail: bool,
+    typed_hazard: bool,
 }
 
 /// A checked stub can constrain callers without substituting a declared
@@ -247,13 +248,25 @@ pub(crate) struct BazelTypedMismatch {
     pub(crate) stub_range: TextRange,
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct BazelUsageSite {
+    source_file: File,
+    source_range: TextRange,
+    stub_file: File,
+    stub_range: TextRange,
+    actual: BazelScalar,
+    expected: BazelScalar,
+}
+
 /// Inspect declaration shapes without evaluating any function result.
 pub(crate) struct BazelSourceMatcher<'source> {
     builder: ModuleBuilder<'source>,
+    suite: &'source [Stmt],
 }
 
 pub(crate) struct BazelFunctionProver<'source> {
     builder: ModuleBuilder<'source>,
+    suite: &'source [Stmt],
 }
 
 pub(crate) struct BazelBodyProof {
@@ -261,6 +274,19 @@ pub(crate) struct BazelBodyProof {
     pub(crate) may_fail: bool,
     pub(crate) exhausted_at: Option<TextRange>,
     pub(crate) mismatch: Option<BazelTypedMismatch>,
+}
+
+/// Known mismatches and source-only functions whose typed calls are unsafe.
+pub(crate) struct BazelUsageReport {
+    pub(crate) problems: Box<[BazelTypedMismatch]>,
+    pub(crate) unsafe_functions: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BazelCallMode {
+    #[default]
+    Proof,
+    Usage,
 }
 
 impl<'source> BazelSourceMatcher<'source> {
@@ -275,7 +301,7 @@ impl<'source> BazelSourceMatcher<'source> {
         }
         let suite = preflighted_suite(db, source)?;
         let builder = ModuleBuilder::new(source.selected_file(db), suite)?;
-        Ok(Self { builder })
+        Ok(Self { builder, suite })
     }
 
     /// Syntax from this getter is accessible only after full source preflight.
@@ -298,7 +324,10 @@ impl<'source> BazelSourceMatcher<'source> {
             .into_iter()
             .map(|function| (function.name, function.parameters))
             .collect();
-        BazelFunctionProver { builder }
+        BazelFunctionProver {
+            builder,
+            suite: self.suite,
+        }
     }
 }
 
@@ -317,6 +346,34 @@ impl<'source> BazelFunctionProver<'source> {
             mismatch: self.builder.typed_mismatch.clone(),
         })
     }
+
+    /// After declared returns are proved, recheck every body in source order.
+    /// Unknown inputs remain indeterminate for diagnostics but can taint an
+    /// unconstrained source-only export. Proof and usage have separate caches.
+    pub(crate) fn check_all_bodies(mut self) -> Result<BazelUsageReport, TextRange> {
+        self.builder.mode = BazelCallMode::Usage;
+        self.builder.results.clear();
+        self.builder.specialized_contexts = 0;
+        self.builder.exhausted_at = None;
+        self.builder.typed_mismatch = None;
+        for statement in self.suite {
+            if let Stmt::FunctionDef(function) = statement {
+                let inputs = vec![BazelScalar::Unknown; function.parameters.args.len()];
+                self.builder
+                    .function_result(function.name.as_str(), &inputs);
+                if let Some(range) = self.builder.exhausted_at {
+                    return Err(range);
+                }
+            }
+        }
+        self.builder
+            .typed_usage
+            .sort_by_key(|problem| problem.source_range.start());
+        Ok(BazelUsageReport {
+            problems: self.builder.typed_usage.into_boxed_slice(),
+            unsafe_functions: self.builder.unsafe_functions,
+        })
+    }
 }
 
 impl BodyValue {
@@ -324,6 +381,7 @@ impl BodyValue {
         Self {
             scalar,
             may_fail: false,
+            typed_hazard: false,
         }
     }
 
@@ -331,6 +389,7 @@ impl BodyValue {
         Self {
             scalar: BazelScalar::Unknown,
             may_fail: true,
+            typed_hazard: false,
         }
     }
 }
@@ -355,7 +414,11 @@ struct ModuleBuilder<'source> {
     invalid_call_sites: HashSet<TextRange>,
     exhausted_at: Option<TextRange>,
     expected_calls: HashMap<String, Box<[BazelExpectedParameter]>>,
+    mode: BazelCallMode,
     typed_mismatch: Option<BazelTypedMismatch>,
+    typed_usage_sites: HashSet<BazelUsageSite>,
+    typed_usage: Vec<BazelTypedMismatch>,
+    unsafe_functions: HashSet<String>,
     problems: Vec<BazelCheckProblem>,
 }
 
@@ -414,7 +477,11 @@ impl<'source> ModuleBuilder<'source> {
             invalid_call_sites: HashSet::new(),
             exhausted_at: None,
             expected_calls: HashMap::new(),
+            mode: BazelCallMode::Proof,
             typed_mismatch: None,
+            typed_usage_sites: HashSet::new(),
+            typed_usage: Vec::new(),
+            unsafe_functions: HashSet::new(),
             problems: Vec::new(),
         })
     }
@@ -475,6 +542,7 @@ impl<'source> ModuleBuilder<'source> {
         }
 
         let mut may_fail = false;
+        let mut typed_hazard = false;
         let mut scalar = BazelScalar::None;
         for statement in &function.body {
             match statement {
@@ -485,6 +553,7 @@ impl<'source> ModuleBuilder<'source> {
                     };
                     let value = self.body_expr(&assign.value, &locals);
                     may_fail |= value.may_fail;
+                    typed_hazard |= value.typed_hazard;
                     locals.insert(name.id.as_str(), value.scalar);
                 }
                 Stmt::Return(return_stmt) => {
@@ -495,6 +564,7 @@ impl<'source> ModuleBuilder<'source> {
                             self.body_expr(expression, &locals)
                         });
                     may_fail |= value.may_fail;
+                    typed_hazard |= value.typed_hazard;
                     scalar = value.scalar;
                     break;
                 }
@@ -506,13 +576,17 @@ impl<'source> ModuleBuilder<'source> {
             }
         }
         let result = BodyValue {
-            scalar: if may_fail {
+            scalar: if may_fail || typed_hazard {
                 BazelScalar::Unknown
             } else {
                 scalar
             },
-            may_fail,
+            may_fail: may_fail || typed_hazard,
+            typed_hazard,
         };
+        if typed_hazard && self.mode == BazelCallMode::Usage {
+            self.unsafe_functions.insert(name.to_string());
+        }
         self.active_functions.remove(name);
         self.results.insert(context, result);
         result
@@ -537,10 +611,12 @@ impl<'source> ModuleBuilder<'source> {
             Expr::Call(call) => {
                 // Each argument is evaluated even when the callee ignores it.
                 let mut may_fail = false;
+                let mut typed_hazard = false;
                 let mut inputs = Vec::with_capacity(call.arguments.args.len());
                 for argument in &call.arguments.args {
                     let input = self.body_expr(argument, locals);
                     may_fail |= input.may_fail;
+                    typed_hazard |= input.typed_hazard;
                     inputs.push(input.scalar);
                 }
                 let Expr::Name(callee) = call.func.as_ref() else {
@@ -581,39 +657,70 @@ impl<'source> ModuleBuilder<'source> {
                     };
                     inputs.push(default);
                 }
-                if let Some(expected) = self.expected_calls.get(callee.id.as_str())
-                    && let Some((index, (input, parameter))) = inputs
-                        .iter()
-                        .zip(expected.iter())
-                        .enumerate()
-                        .find(|(_, (input, parameter))| **input != parameter.scalar)
-                {
-                    let source_range = call
-                        .arguments
-                        .args
-                        .get(index)
-                        .map_or(call.range(), Ranged::range);
-                    let mismatch = BazelTypedMismatch {
-                        callee: callee.id.to_string(),
-                        actual: *input,
-                        expected: parameter.scalar,
-                        source_file: self.file,
-                        source_range,
-                        stub_file: parameter.file,
-                        stub_range: parameter.range,
-                    };
-                    self.typed_mismatch.get_or_insert(mismatch);
-                    return BodyValue::invalid_call();
+                if let Some(expected) = self.expected_calls.get(callee.id.as_str()) {
+                    // All expected shapes were matched against runtime arity
+                    // before the profile was installed. Omitted defaults use
+                    // their actual source value in `inputs` above.
+                    for (index, (input, parameter)) in
+                        inputs.iter().zip(expected.iter()).enumerate()
+                    {
+                        if *input == parameter.scalar {
+                            continue;
+                        }
+                        let source_range = call
+                            .arguments
+                            .args
+                            .get(index)
+                            .map_or(call.range(), Ranged::range);
+                        let mismatch = BazelTypedMismatch {
+                            callee: callee.id.to_string(),
+                            actual: *input,
+                            expected: parameter.scalar,
+                            source_file: self.file,
+                            source_range,
+                            stub_file: parameter.file,
+                            stub_range: parameter.range,
+                        };
+                        if self.mode == BazelCallMode::Proof {
+                            self.typed_mismatch.get_or_insert(mismatch);
+                            return BodyValue::invalid_call();
+                        }
+                        typed_hazard = true;
+                        if *input != BazelScalar::Unknown
+                            && self.typed_usage_sites.insert(BazelUsageSite {
+                                source_file: mismatch.source_file,
+                                source_range: mismatch.source_range,
+                                stub_file: mismatch.stub_file,
+                                stub_range: mismatch.stub_range,
+                                actual: mismatch.actual,
+                                expected: mismatch.expected,
+                            })
+                        {
+                            self.typed_usage.push(mismatch);
+                        }
+                    }
+                    if typed_hazard {
+                        // A declared function's body is only proved under
+                        // its parameter kinds. Do not inspect it under an
+                        // invalid or indeterminate input in usage mode.
+                        return BodyValue {
+                            scalar: BazelScalar::Unknown,
+                            may_fail: true,
+                            typed_hazard: true,
+                        };
+                    }
                 }
                 let result = self.function_result(callee.id.as_str(), &inputs);
                 may_fail |= result.may_fail;
+                typed_hazard |= result.typed_hazard;
                 BodyValue {
-                    scalar: if may_fail {
+                    scalar: if may_fail || typed_hazard {
                         BazelScalar::Unknown
                     } else {
                         result.scalar
                     },
-                    may_fail,
+                    may_fail: may_fail || typed_hazard,
+                    typed_hazard,
                 }
             }
             _ => BodyValue::invalid_call(),
@@ -631,7 +738,11 @@ impl<'source> ModuleBuilder<'source> {
             invalid_call_sites: _,
             exhausted_at: _,
             expected_calls: _,
+            mode: _,
             typed_mismatch: _,
+            typed_usage_sites: _,
+            typed_usage: _,
+            unsafe_functions: _,
             mut problems,
         } = self;
         let mut exports = Vec::new();
