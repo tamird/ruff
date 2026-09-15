@@ -2,10 +2,12 @@ use ruff_db::Db;
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::system::{SystemPath, SystemPathBuf};
 
-/// The caller-selected main repository for Bazel `.bzl` loads.
+use crate::source::BazelSource;
+
+/// The caller-selected main repository for Bazel `.bzl` sources.
 ///
-/// The root must be absolute and contain a Bazel repository marker. Resolution
-/// checks the marker and the importer's ownership before interpreting a label.
+/// The root must be absolute, contain no parent traversal, and have a Bazel
+/// repository marker. Loads also check the importer's repository and package.
 #[salsa::interned(heap_size = ruff_memory_usage::heap_size)]
 pub struct BazelRepository<'db> {
     #[returns(ref)]
@@ -14,22 +16,9 @@ pub struct BazelRepository<'db> {
 
 impl get_size2::GetSize for BazelRepository<'_> {}
 
-/// A Bazel source file and its optional, ty-only type stub.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BazelLoadedFile {
-    pub source: File,
-    pub stub: Option<File>,
-}
-
-impl BazelLoadedFile {
-    pub fn type_file(self) -> File {
-        self.stub.unwrap_or(self.source)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize, thiserror::Error)]
 pub enum BazelLoadError {
-    #[error("selected root is not a Bazel repository")]
+    #[error("selected root is not a valid marked Bazel repository")]
     InvalidRepository,
     #[error("the importing file is outside the selected Bazel repository")]
     ImporterOutsideRepository,
@@ -37,17 +26,25 @@ pub enum BazelLoadError {
     InvalidImporter,
     #[error("the importing file is outside a Bazel package")]
     ImporterOutsidePackage,
+    #[error("relative .bzl label needs a package directory")]
+    MissingRelativeDirectory,
+    #[error("relative target directory contains parent traversal")]
+    RelativeTargetParentTraversal,
+    #[error("the relative target directory is outside the selected Bazel repository")]
+    RelativeTargetOutsideRepository,
+    #[error("the relative target directory has no BUILD file")]
+    RelativeTargetOutsidePackage,
     #[error("external repository labels are not supported")]
     UnsupportedRepository,
-    #[error("invalid Bazel load label")]
+    #[error("invalid Bazel .bzl label")]
     InvalidLabel,
-    #[error("the load target package has no BUILD file")]
+    #[error("the .bzl target package has no BUILD file")]
     UnknownTargetPackage,
-    #[error("the load target belongs to another Bazel repository")]
+    #[error("the .bzl target belongs to another Bazel repository")]
     RepositoryBoundary,
-    #[error("the load target crosses a Bazel package boundary")]
+    #[error("the .bzl target crosses a Bazel package boundary")]
     PackageBoundary,
-    #[error("the loaded .bzl source file does not exist")]
+    #[error("the .bzl source file does not exist")]
     NotFound,
 }
 
@@ -55,6 +52,15 @@ pub enum BazelLoadError {
 struct BazelLoad<'db> {
     repository: BazelRepository<'db>,
     importing_file: File,
+    #[returns(ref)]
+    label: String,
+}
+
+#[salsa::interned(heap_size = ruff_memory_usage::heap_size)]
+struct BazelTarget<'db> {
+    repository: BazelRepository<'db>,
+    #[returns(ref)]
+    relative_directory: Option<SystemPathBuf>,
     #[returns(ref)]
     label: String,
 }
@@ -68,26 +74,61 @@ struct BazelLoad<'db> {
 /// resolver's scope.
 /// Callers must validate `.bzl` load visibility and exported bindings before
 /// trusting declarations from the returned source file.
-pub fn resolve_bazel_load(
-    db: &dyn Db,
-    repository: BazelRepository<'_>,
+pub fn resolve_bazel_load<'db>(
+    db: &'db dyn Db,
+    repository: BazelRepository<'db>,
     importing_file: File,
     label: &str,
-) -> Result<BazelLoadedFile, BazelLoadError> {
+) -> Result<BazelSource<'db>, BazelLoadError> {
     let load = BazelLoad::new(db, repository, importing_file, label);
-    resolve_bazel_load_query(db, load)
+    let file = resolve_bazel_load_query(db, load)?;
+    Ok(BazelSource::new(db, repository, file))
+}
+
+/// Select a main-repository `.bzl` source without an importing file.
+///
+/// Absolute `//` and `@@//` labels use only the selected marked repository.
+/// Relative `:` labels require a BUILD file in the supplied directory itself,
+/// as Bazel [target patterns] use the current directory. A source load's
+/// relative label instead uses its importing source's owning BUILD package.
+/// The returned source is the runtime `.bzl`; only source-first verification
+/// may interpret an optional Ty-only sibling `.bzl.pyi` stub.
+///
+/// [target patterns]: https://bazel.build/versions/9.0.0/run/build
+pub fn resolve_bazel_target<'db>(
+    db: &'db dyn Db,
+    repository: BazelRepository<'db>,
+    relative_directory: Option<&SystemPath>,
+    label: &str,
+) -> Result<BazelSource<'db>, BazelLoadError> {
+    let relative_directory = if label.starts_with(':') {
+        relative_directory.map(SystemPath::to_path_buf)
+    } else {
+        None
+    };
+    let target = BazelTarget::new(db, repository, relative_directory, label);
+    let file = resolve_bazel_target_query(db, target)?;
+    Ok(BazelSource::new(db, repository, file))
 }
 
 #[salsa::tracked(returns(clone))]
-fn resolve_bazel_load_query(
-    db: &dyn Db,
-    load: BazelLoad<'_>,
-) -> Result<BazelLoadedFile, BazelLoadError> {
+fn resolve_bazel_load_query(db: &dyn Db, load: BazelLoad<'_>) -> Result<File, BazelLoadError> {
     let importing_package =
         validate_bazel_source(db, *load.repository(db), *load.importing_file(db))?;
-    let root = load.repository(db).root(db);
+    let relative_directory = load.label(db).starts_with(':').then_some(importing_package);
+    let target = BazelTarget::new(db, *load.repository(db), relative_directory, load.label(db));
+    resolve_bazel_target_query(db, target)
+}
 
-    let label = load.label(db);
+#[salsa::tracked(returns(clone))]
+fn resolve_bazel_target_query(
+    db: &dyn Db,
+    selection: BazelTarget<'_>,
+) -> Result<File, BazelLoadError> {
+    let repository = *selection.repository(db);
+    validate_bazel_repository(db, repository)?;
+    let root = repository.root(db);
+    let label = selection.label(db);
     let (package_root, target) = if let Some(absolute) = label
         .strip_prefix("//")
         .or_else(|| label.strip_prefix("@@//"))
@@ -101,11 +142,30 @@ fn resolve_bazel_load_query(
         (root.join(package), target)
     } else if label.starts_with('@') {
         return Err(BazelLoadError::UnsupportedRepository);
-    } else if let Some(target) = label.strip_prefix(':') {
-        if !is_valid_target(target) {
+    } else if let Some(name) = label.strip_prefix(':') {
+        if !is_valid_target(name) {
             return Err(BazelLoadError::InvalidLabel);
         }
-        (importing_package, target)
+        let directory = selection
+            .relative_directory(db)
+            .as_ref()
+            .ok_or(BazelLoadError::MissingRelativeDirectory)?;
+        if has_parent_component(directory) {
+            return Err(BazelLoadError::RelativeTargetParentTraversal);
+        }
+        if !directory.is_absolute()
+            || !directory.starts_with(root)
+            || directory
+                .ancestors()
+                .find(|ancestor| is_repository_root(db, ancestor))
+                != Some(root.as_path())
+        {
+            return Err(BazelLoadError::RelativeTargetOutsideRepository);
+        }
+        if !is_package(db, directory) {
+            return Err(BazelLoadError::RelativeTargetOutsidePackage);
+        }
+        (directory.clone(), name)
     } else {
         return Err(BazelLoadError::InvalidLabel);
     };
@@ -127,10 +187,18 @@ fn resolve_bazel_load_query(
         return Err(BazelLoadError::PackageBoundary);
     }
 
-    let source = system_path_to_file(db, &source_path).map_err(|_| BazelLoadError::NotFound)?;
-    let stub_path = SystemPathBuf::from(format!("{}.pyi", source_path.as_str()));
-    let stub = system_path_to_file(db, &stub_path).ok();
-    Ok(BazelLoadedFile { source, stub })
+    system_path_to_file(db, &source_path).map_err(|_| BazelLoadError::NotFound)
+}
+
+fn validate_bazel_repository(
+    db: &dyn Db,
+    repository: BazelRepository<'_>,
+) -> Result<(), BazelLoadError> {
+    let root = repository.root(db);
+    if !root.is_absolute() || has_parent_component(root) || !is_repository_root(db, root) {
+        return Err(BazelLoadError::InvalidRepository);
+    }
+    Ok(())
 }
 
 /// Validate the selected repository and a `.bzl` file's owning BUILD package.
@@ -140,10 +208,8 @@ pub(crate) fn validate_bazel_source(
     repository: BazelRepository<'_>,
     file: File,
 ) -> Result<SystemPathBuf, BazelLoadError> {
+    validate_bazel_repository(db, repository)?;
     let root = repository.root(db);
-    if !root.as_path().is_absolute() || !is_repository_root(db, root) {
-        return Err(BazelLoadError::InvalidRepository);
-    }
 
     let importing_path = file
         .path(db)
@@ -152,7 +218,8 @@ pub(crate) fn validate_bazel_source(
     if importing_path.extension() != Some("bzl") {
         return Err(BazelLoadError::InvalidImporter);
     }
-    if !importing_path.starts_with(root)
+    if has_parent_component(importing_path)
+        || !importing_path.starts_with(root)
         || find_ancestor(db, importing_path, None, is_repository_root).as_deref()
             != Some(root.as_path())
     {
@@ -178,6 +245,11 @@ fn find_ancestor(
         }
         directory = directory.parent()?;
     }
+}
+
+fn has_parent_component(path: &SystemPath) -> bool {
+    path.components()
+        .any(|component| component.as_str() == "..")
 }
 
 fn is_repository_root(db: &dyn Db, directory: &SystemPath) -> bool {
