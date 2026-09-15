@@ -22,7 +22,7 @@ pub enum BazelPreflight {
 }
 
 /// The first reason this entire source cannot contribute checked exports.
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, get_size2::GetSize)]
 pub struct BazelPreflightFailure {
     file: File,
     range: Option<TextRange>,
@@ -30,6 +30,22 @@ pub struct BazelPreflightFailure {
 }
 
 impl BazelPreflightFailure {
+    fn from_admission(file: File, failure: &BazelAdmissionFailure) -> Self {
+        Self {
+            file,
+            range: failure.range(),
+            reason: BazelPreflightError::Admission(failure.clone()),
+        }
+    }
+
+    pub(crate) fn unsupported(file: File, range: TextRange, form: &'static str) -> Self {
+        Self {
+            file,
+            range: Some(range),
+            reason: BazelPreflightError::Unsupported(form),
+        }
+    }
+
     pub fn file(&self) -> File {
         self.file
     }
@@ -52,7 +68,7 @@ impl BazelPreflightFailure {
     }
 }
 
-#[derive(Debug, get_size2::GetSize, thiserror::Error)]
+#[derive(Clone, Debug, get_size2::GetSize, thiserror::Error)]
 pub enum BazelPreflightError {
     #[error("the selected Bazel source cannot be admitted")]
     Admission(BazelAdmissionFailure),
@@ -84,11 +100,7 @@ pub fn preflight_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelPref
     let suite = match admit_bazel_source(db, source) {
         BazelSourceAdmission::Admitted(source) => source.suite(),
         BazelSourceAdmission::Opaque(failure) => {
-            return BazelPreflight::Opaque(BazelPreflightFailure {
-                file,
-                range: failure.range(),
-                reason: BazelPreflightError::Admission(failure.clone()),
-            });
+            return BazelPreflight::Opaque(BazelPreflightFailure::from_admission(file, failure));
         }
     };
     match Names::new(suite).check_module(suite) {
@@ -98,6 +110,26 @@ pub fn preflight_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelPref
             range: Some(problem.range),
             reason: problem.reason,
         }),
+    }
+}
+
+/// The only AST entry point for the scalar checker: admit the entire source
+/// only after its names and eager initializers have passed preflight.
+pub(crate) fn preflighted_suite<'db>(
+    db: &'db dyn Db,
+    source: BazelSource<'_>,
+) -> Result<&'db [Stmt], BazelPreflightFailure> {
+    match preflight_bazel_source(db, source) {
+        BazelPreflight::Opaque(failure) => Err(failure.clone()),
+        BazelPreflight::Ready => match admit_bazel_source(db, source) {
+            BazelSourceAdmission::Admitted(admitted) => Ok(admitted.suite()),
+            // Even if these queries were separately invalidated, do not
+            // expose syntax from a source whose admission has since failed.
+            BazelSourceAdmission::Opaque(failure) => Err(BazelPreflightFailure::from_admission(
+                source.selected_file(db),
+                failure,
+            )),
+        },
     }
 }
 
