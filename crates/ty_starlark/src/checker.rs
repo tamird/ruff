@@ -13,7 +13,8 @@ use ruff_db::files::File;
 use ruff_python_ast::{self as ast, Expr, Number, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 
-use crate::preflight::{BazelPreflightFailure, preflighted_suite};
+use crate::imports::{BazelResolvedFunction, BazelResolvedImports, BazelResolvedValue};
+use crate::preflight::{BazelPreflightFailure, preflighted_import_suite, preflighted_suite};
 use crate::source::BazelSource;
 
 /// An opaque source has no checked exports, regardless of apparent bindings.
@@ -210,8 +211,29 @@ pub fn summarize_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelChec
         Ok(suite) => suite,
         Err(failure) => return BazelCheckedSource::Opaque(failure),
     };
-    let file = source.selected_file(db);
-    match ModuleBuilder::new(file, suite) {
+    summarize_suite(source.selected_file(db), suite, None)
+}
+
+/// Graph checked file-block bindings use the same source-owned scalar engine.
+/// The public source-only query still returns Opaque for every Pending load.
+pub(crate) fn summarize_verified_imports<'db>(
+    db: &'db dyn Db,
+    source: BazelSource<'db>,
+    imports: &BazelResolvedImports<'db>,
+) -> BazelCheckedSource {
+    let suite = match preflighted_import_suite(db, source, imports) {
+        Ok(suite) => suite,
+        Err(failure) => return BazelCheckedSource::Opaque(failure),
+    };
+    summarize_suite(source.selected_file(db), suite, Some(imports))
+}
+
+fn summarize_suite<'source>(
+    file: File,
+    suite: &'source [Stmt],
+    imports: Option<&'source BazelResolvedImports<'_>>,
+) -> BazelCheckedSource {
+    match ModuleBuilder::new(file, suite, imports) {
         Ok(mut builder) => match builder.validate_calls(suite) {
             Ok(()) => BazelCheckedSource::Checked(builder.finish(suite)),
             Err(failure) => BazelCheckedSource::Opaque(failure),
@@ -226,6 +248,7 @@ struct BodyValue {
     scalar: BazelScalar,
     may_fail: bool,
     typed_hazard: bool,
+    uncertain_import: bool,
 }
 
 /// A checked stub can constrain callers without substituting a declared
@@ -306,7 +329,30 @@ impl<'source> BazelSourceMatcher<'source> {
             return Err(failure.clone());
         }
         let suite = preflighted_suite(db, source)?;
-        let builder = ModuleBuilder::new(source.selected_file(db), suite)?;
+        let builder = ModuleBuilder::new(source.selected_file(db), suite, None)?;
+        Ok(Self { builder, suite })
+    }
+
+    /// A graph summary grants access to imported syntax only after that
+    /// source has passed the same full-file scalar and name validation.
+    pub(crate) fn new_resolved<'repo>(
+        db: &'repo dyn Db,
+        source: BazelSource<'repo>,
+        imports: &'source BazelResolvedImports<'repo>,
+        summary: &BazelModuleSummary,
+    ) -> Result<Self, BazelPreflightFailure>
+    where
+        'repo: 'source,
+    {
+        let file = source.selected_file(db);
+        if summary.file() != file {
+            return Err(BazelPreflightFailure::unresolved(
+                file,
+                imports.first_range(),
+            ));
+        }
+        let suite = preflighted_import_suite(db, source, imports)?;
+        let builder = ModuleBuilder::new(file, suite, Some(imports))?;
         Ok(Self { builder, suite })
     }
 
@@ -326,6 +372,7 @@ impl<'source> BazelSourceMatcher<'source> {
         expected: Vec<BazelExpectedFunction>,
     ) -> BazelFunctionProver<'source> {
         let mut builder = self.builder;
+        builder.imported_types_ready = true;
         builder.expected_calls = expected
             .into_iter()
             .map(|function| (function.name, function.parameters))
@@ -388,6 +435,7 @@ impl BodyValue {
             scalar,
             may_fail: false,
             typed_hazard: false,
+            uncertain_import: false,
         }
     }
 
@@ -396,6 +444,7 @@ impl BodyValue {
             scalar: BazelScalar::Unknown,
             may_fail: true,
             typed_hazard: false,
+            uncertain_import: false,
         }
     }
 }
@@ -414,6 +463,8 @@ struct ModuleBuilder<'source> {
     file: File,
     scalars: HashMap<&'source str, BazelScalar>,
     functions: HashMap<&'source str, &'source ast::StmtFunctionDef>,
+    imported_functions: HashMap<&'source str, &'source BazelResolvedFunction>,
+    imported_types_ready: bool,
     results: HashMap<CallContext<'source>, BodyValue>,
     specialized_contexts: usize,
     active_functions: HashSet<&'source str>,
@@ -429,9 +480,24 @@ struct ModuleBuilder<'source> {
 }
 
 impl<'source> ModuleBuilder<'source> {
-    fn new(file: File, suite: &'source [Stmt]) -> Result<Self, BazelPreflightFailure> {
+    fn new(
+        file: File,
+        suite: &'source [Stmt],
+        imports: Option<&'source BazelResolvedImports<'_>>,
+    ) -> Result<Self, BazelPreflightFailure> {
         let mut scalars = HashMap::new();
         let mut functions = HashMap::new();
+        let mut imported_functions = HashMap::new();
+        for binding in imports.iter().flat_map(|imports| imports.bindings()) {
+            match binding.value() {
+                BazelResolvedValue::Scalar(scalar) => {
+                    scalars.insert(binding.local_name(), *scalar);
+                }
+                BazelResolvedValue::Function(function) => {
+                    imported_functions.insert(binding.local_name(), function);
+                }
+            }
+        }
         for (index, statement) in suite.iter().enumerate() {
             match statement {
                 Stmt::Assign(assign) => {
@@ -454,6 +520,10 @@ impl<'source> ModuleBuilder<'source> {
                 Stmt::FunctionDef(function) => {
                     functions.insert(function.name.as_str(), function);
                 }
+                Stmt::Expr(expr)
+                    if let Expr::Call(call) = expr.value.as_ref()
+                        && imports
+                            .is_some_and(|imports| imports.load_at(call.range()).is_some()) => {}
                 Stmt::Expr(_) => {
                     if index != 0 {
                         return Err(BazelPreflightFailure::unsupported(
@@ -477,6 +547,8 @@ impl<'source> ModuleBuilder<'source> {
             file,
             scalars,
             functions,
+            imported_functions,
+            imported_types_ready: false,
             results: HashMap::new(),
             specialized_contexts: 0,
             active_functions: HashSet::new(),
@@ -549,6 +621,7 @@ impl<'source> ModuleBuilder<'source> {
 
         let mut may_fail = false;
         let mut typed_hazard = false;
+        let mut uncertain_import = false;
         let mut scalar = BazelScalar::None;
         for statement in &function.body {
             match statement {
@@ -560,6 +633,7 @@ impl<'source> ModuleBuilder<'source> {
                     let value = self.body_expr(&assign.value, &locals);
                     may_fail |= value.may_fail;
                     typed_hazard |= value.typed_hazard;
+                    uncertain_import |= value.uncertain_import;
                     locals.insert(name.id.as_str(), value.scalar);
                 }
                 Stmt::Return(return_stmt) => {
@@ -571,6 +645,7 @@ impl<'source> ModuleBuilder<'source> {
                         });
                     may_fail |= value.may_fail;
                     typed_hazard |= value.typed_hazard;
+                    uncertain_import |= value.uncertain_import;
                     scalar = value.scalar;
                     break;
                 }
@@ -582,13 +657,14 @@ impl<'source> ModuleBuilder<'source> {
             }
         }
         let result = BodyValue {
-            scalar: if may_fail || typed_hazard {
+            scalar: if may_fail || typed_hazard || uncertain_import {
                 BazelScalar::Unknown
             } else {
                 scalar
             },
             may_fail: may_fail || typed_hazard,
             typed_hazard,
+            uncertain_import,
         };
         if typed_hazard && self.mode == BazelCallMode::Usage {
             self.unsafe_functions.insert(name.to_string());
@@ -618,33 +694,54 @@ impl<'source> ModuleBuilder<'source> {
                 // Each argument is evaluated even when the callee ignores it.
                 let mut may_fail = false;
                 let mut typed_hazard = false;
+                let mut uncertain_import = false;
                 let mut inputs = Vec::with_capacity(call.arguments.args.len());
                 for argument in &call.arguments.args {
                     let input = self.body_expr(argument, locals);
                     may_fail |= input.may_fail;
                     typed_hazard |= input.typed_hazard;
+                    uncertain_import |= input.uncertain_import;
                     inputs.push(input.scalar);
                 }
                 let Expr::Name(callee) = call.func.as_ref() else {
                     return BodyValue::invalid_call();
                 };
-                let Some(function) = self.functions.get(callee.id.as_str()).copied() else {
-                    return BodyValue::invalid_call();
-                };
-                let parameters = &function.parameters.args;
-                let minimum = parameters
-                    .iter()
-                    .filter(|parameter| parameter.default().is_none())
-                    .count();
-                let maximum = parameters.len();
+                let local = self.functions.get(callee.id.as_str()).copied();
+                let imported = self.imported_functions.get(callee.id.as_str()).copied();
+                let (minimum, maximum, declaration_file, declaration_range) =
+                    if let Some(function) = local {
+                        let parameters = &function.parameters.args;
+                        (
+                            parameters
+                                .iter()
+                                .filter(|parameter| parameter.default().is_none())
+                                .count(),
+                            parameters.len(),
+                            self.file,
+                            function.name.range(),
+                        )
+                    } else if let Some(function) = imported {
+                        (
+                            function
+                                .parameters()
+                                .iter()
+                                .filter(|parameter| !parameter.has_default())
+                                .count(),
+                            function.parameters().len(),
+                            function.source_file(),
+                            function.source_range(),
+                        )
+                    } else {
+                        return BodyValue::invalid_call();
+                    };
                 let actual = call.arguments.args.len();
                 if actual < minimum || actual > maximum {
                     if self.invalid_call_sites.insert(call.range()) {
                         self.problems.push(BazelCheckProblem {
                             file: self.file,
                             range: call.range(),
-                            declaration_file: self.file,
-                            declaration_range: function.name.range(),
+                            declaration_file,
+                            declaration_range,
                             reason: BazelCheckError::InvalidArity {
                                 callee: callee.id.to_string(),
                                 minimum,
@@ -655,83 +752,165 @@ impl<'source> ModuleBuilder<'source> {
                     }
                     return BodyValue::invalid_call();
                 }
-                for parameter in parameters.iter().skip(actual) {
-                    let Some(default) = parameter.default() else {
-                        return BodyValue::invalid_call();
-                    };
-                    let Some(default) = eager_scalar(default, &self.scalars) else {
-                        return BodyValue::invalid_call();
-                    };
-                    inputs.push(default);
+                if let Some(function) = local {
+                    for parameter in function.parameters.args.iter().skip(actual) {
+                        let Some(default) = parameter.default() else {
+                            return BodyValue::invalid_call();
+                        };
+                        let Some(default) = eager_scalar(default, &self.scalars) else {
+                            return BodyValue::invalid_call();
+                        };
+                        inputs.push(default);
+                    }
                 }
-                if let Some(expected) = self.expected_calls.get(callee.id.as_str()) {
+                if let Some(expected) = self.expected_calls.get(callee.id.as_str()).cloned() {
                     // All expected shapes were matched against runtime arity
                     // before the profile was installed. Omitted defaults use
                     // their actual source value in `inputs` above.
                     for (index, (input, parameter)) in
                         inputs.iter().zip(expected.iter()).enumerate()
                     {
-                        if *input == parameter.scalar {
+                        let source_range = call
+                            .arguments
+                            .args
+                            .get(index)
+                            .map_or(call.range(), Ranged::range);
+                        if self.check_typed_input(
+                            callee.id.as_str(),
+                            source_range,
+                            *input,
+                            parameter.scalar,
+                            parameter.file,
+                            parameter.range,
+                        ) {
+                            if self.mode == BazelCallMode::Proof {
+                                return BodyValue::invalid_call();
+                            }
+                            typed_hazard = true;
+                        }
+                    }
+                }
+                if let Some(function) = imported {
+                    for (index, (input, parameter)) in
+                        inputs.iter().zip(function.parameters().iter()).enumerate()
+                    {
+                        let Some(stub_file) = parameter.stub_file() else {
                             continue;
+                        };
+                        if *input == parameter.scalar() {
+                            continue;
+                        }
+                        if !self.imported_types_ready {
+                            // A generic runtime summary has no declaration
+                            // for the caller's input. It cannot claim the
+                            // target's stubbed result, but the call is not
+                            // unconditionally a runtime failure.
+                            return BodyValue {
+                                scalar: BazelScalar::Unknown,
+                                may_fail: may_fail || function.body_may_fail(),
+                                typed_hazard,
+                                uncertain_import: true,
+                            };
                         }
                         let source_range = call
                             .arguments
                             .args
                             .get(index)
                             .map_or(call.range(), Ranged::range);
-                        let mismatch = BazelTypedMismatch {
-                            callee: callee.id.to_string(),
-                            actual: *input,
-                            expected: parameter.scalar,
-                            source_file: self.file,
-                            source_range,
-                            stub_file: parameter.file,
-                            stub_range: parameter.range,
-                        };
-                        if self.mode == BazelCallMode::Proof {
-                            self.typed_mismatch.get_or_insert(mismatch);
+                        let Some(stub_range) = parameter.stub_range() else {
                             return BodyValue::invalid_call();
-                        }
-                        typed_hazard = true;
-                        if *input != BazelScalar::Unknown
-                            && self.typed_usage_sites.insert(BazelUsageSite {
-                                source_file: mismatch.source_file,
-                                source_range: mismatch.source_range,
-                                stub_file: mismatch.stub_file,
-                                stub_range: mismatch.stub_range,
-                                actual: mismatch.actual,
-                                expected: mismatch.expected,
-                            })
-                        {
-                            self.typed_usage.push(mismatch);
-                        }
-                    }
-                    if typed_hazard {
-                        // A declared function's body is only proved under
-                        // its parameter kinds. Do not inspect it under an
-                        // invalid or indeterminate input in usage mode.
-                        return BodyValue {
-                            scalar: BazelScalar::Unknown,
-                            may_fail: true,
-                            typed_hazard: true,
                         };
+                        if self.check_typed_input(
+                            callee.id.as_str(),
+                            source_range,
+                            *input,
+                            parameter.scalar(),
+                            stub_file,
+                            stub_range,
+                        ) {
+                            if self.mode == BazelCallMode::Proof {
+                                return BodyValue::invalid_call();
+                            }
+                            typed_hazard = true;
+                        }
                     }
                 }
-                let result = self.function_result(callee.id.as_str(), &inputs);
+                if typed_hazard {
+                    // A declared result cannot be trusted after an invalid
+                    // or indeterminate typed argument, including imports.
+                    return BodyValue {
+                        scalar: BazelScalar::Unknown,
+                        may_fail: true,
+                        typed_hazard: true,
+                        uncertain_import,
+                    };
+                }
+                let result = if let Some(function) = imported {
+                    BodyValue {
+                        scalar: function.result(),
+                        may_fail: function.body_may_fail(),
+                        typed_hazard: false,
+                        uncertain_import: false,
+                    }
+                } else {
+                    self.function_result(callee.id.as_str(), &inputs)
+                };
                 may_fail |= result.may_fail;
                 typed_hazard |= result.typed_hazard;
+                uncertain_import |= result.uncertain_import;
                 BodyValue {
-                    scalar: if may_fail || typed_hazard {
+                    scalar: if may_fail || typed_hazard || uncertain_import {
                         BazelScalar::Unknown
                     } else {
                         result.scalar
                     },
                     may_fail: may_fail || typed_hazard,
                     typed_hazard,
+                    uncertain_import,
                 }
             }
             _ => BodyValue::invalid_call(),
         }
+    }
+
+    fn check_typed_input(
+        &mut self,
+        callee: &str,
+        source_range: TextRange,
+        actual: BazelScalar,
+        expected: BazelScalar,
+        stub_file: File,
+        stub_range: TextRange,
+    ) -> bool {
+        if actual == expected || expected == BazelScalar::Unknown {
+            return false;
+        }
+        let mismatch = BazelTypedMismatch {
+            callee: callee.to_string(),
+            actual,
+            expected,
+            source_file: self.file,
+            source_range,
+            stub_file,
+            stub_range,
+        };
+        if self.mode == BazelCallMode::Proof {
+            self.typed_mismatch.get_or_insert(mismatch);
+            return true;
+        }
+        if actual != BazelScalar::Unknown
+            && self.typed_usage_sites.insert(BazelUsageSite {
+                source_file: mismatch.source_file,
+                source_range: mismatch.source_range,
+                stub_file: mismatch.stub_file,
+                stub_range: mismatch.stub_range,
+                actual: mismatch.actual,
+                expected: mismatch.expected,
+            })
+        {
+            self.typed_usage.push(mismatch);
+        }
+        true
     }
 
     fn finish(self, suite: &'source [Stmt]) -> BazelModuleSummary {
@@ -739,6 +918,8 @@ impl<'source> ModuleBuilder<'source> {
             file,
             scalars,
             functions: _,
+            imported_functions: _,
+            imported_types_ready: _,
             results,
             specialized_contexts: _,
             active_functions: _,

@@ -177,6 +177,13 @@ pub fn admit_bazel_stub(db: &dyn Db, source: BazelSource<'_>) -> BazelStubAdmiss
         }
         BazelPreflight::Ready => {}
     }
+    parse_bazel_stub_sibling(db, source_file)
+}
+
+/// Parse sibling syntax only. The source-only admission query and graph-aware
+/// verifier must each check the current runtime before trusting declarations.
+pub(crate) fn parse_bazel_stub_sibling(db: &dyn Db, source_file: File) -> BazelStubAdmission {
+    let source_path = source_file.path(db).as_system_path();
     let Some(source_path) = source_path else {
         // The source validator normally rejects virtual and vendored files.
         return BazelStubAdmission::Opaque(BazelStubFailure {

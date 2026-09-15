@@ -2,6 +2,8 @@
 
 pub mod bazel;
 pub mod checker;
+pub mod graph;
+mod imports;
 pub mod loads;
 pub mod overlay;
 pub mod preflight;

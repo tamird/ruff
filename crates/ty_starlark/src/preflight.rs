@@ -12,6 +12,7 @@ use ruff_db::files::File;
 use ruff_python_ast::{self as ast, Expr, Number, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 
+use crate::imports::{BazelResolvedImports, BazelResolvedValue};
 use crate::loads::{
     BazelCandidateLoad, BazelLoadPlan, BazelLoadPlanError, BazelLoadPlanFailure, plan_bazel_loads,
 };
@@ -54,6 +55,14 @@ impl BazelPreflightFailure {
             file,
             range: Some(range),
             reason: BazelPreflightError::AnalysisLimit,
+        }
+    }
+
+    pub(crate) fn unresolved(file: File, range: Option<TextRange>) -> Self {
+        Self {
+            file,
+            range,
+            reason: BazelPreflightError::UnresolvedLoad,
         }
     }
 
@@ -141,7 +150,7 @@ pub fn preflight_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelPref
             });
         }
     }
-    match Names::new(suite).check_module(suite) {
+    match Names::new(suite, None).check_module(suite, None) {
         Ok(()) => BazelPreflight::Ready,
         Err(problem) => BazelPreflight::Opaque(BazelPreflightFailure {
             file,
@@ -171,6 +180,49 @@ pub(crate) fn preflighted_suite<'db>(
     }
 }
 
+/// Reuse the whole-source name gate with file-block imports whose label,
+/// source export, selected repository and target have already been checked.
+/// This private route never changes the Pending result of the public query.
+pub(crate) fn preflighted_import_suite<'db>(
+    db: &'db dyn Db,
+    source: BazelSource<'db>,
+    imports: &BazelResolvedImports<'db>,
+) -> Result<&'db [Stmt], BazelPreflightFailure> {
+    let file = source.selected_file(db);
+    let suite = match admit_bazel_source(db, source) {
+        BazelSourceAdmission::Admitted(admitted) => admitted.suite(),
+        BazelSourceAdmission::Opaque(failure) => {
+            return Err(BazelPreflightFailure::from_admission(file, failure));
+        }
+    };
+    let plan = plan_bazel_loads(db, source);
+    if let BazelLoadPlan::Opaque(failure) = plan {
+        return Err(BazelPreflightFailure {
+            file: failure.file(),
+            range: failure.range(),
+            reason: BazelPreflightError::LoadPlan(Box::new(failure.clone())),
+        });
+    }
+    if !imports.matches_source(db, source) || !imports.matches_plan(plan) {
+        return Err(BazelPreflightFailure {
+            file,
+            range: match plan {
+                BazelLoadPlan::Pending(loads) => loads.first().map(BazelCandidateLoad::range),
+                _ => imports.first_range(),
+            },
+            reason: BazelPreflightError::UnresolvedLoad,
+        });
+    }
+    Names::new(suite, Some(imports))
+        .check_module(suite, Some(imports))
+        .map_err(|problem| BazelPreflightFailure {
+            file,
+            range: Some(problem.range),
+            reason: problem.reason,
+        })?;
+    Ok(suite)
+}
+
 struct Problem {
     range: TextRange,
     reason: BazelPreflightError,
@@ -196,7 +248,7 @@ struct Names<'source> {
 impl<'source> Names<'source> {
     /// Module bindings cover the entire file before inspecting function bodies.
     /// <https://github.com/bazelbuild/starlark/blob/master/spec.md>
-    fn new(suite: &'source [Stmt]) -> Self {
+    fn new(suite: &'source [Stmt], imports: Option<&'source BazelResolvedImports<'_>>) -> Self {
         let mut module_bindings = HashSet::new();
         let mut module_functions = HashSet::new();
         for statement in suite {
@@ -213,6 +265,12 @@ impl<'source> Names<'source> {
                 _ => {}
             }
         }
+        for import in imports.iter().flat_map(|imports| imports.bindings()) {
+            module_bindings.insert(import.local_name());
+            if matches!(import.value(), BazelResolvedValue::Function(_)) {
+                module_functions.insert(import.local_name());
+            }
+        }
         Self {
             module_bindings,
             module_functions,
@@ -221,7 +279,11 @@ impl<'source> Names<'source> {
         }
     }
 
-    fn check_module(mut self, suite: &'source [Stmt]) -> Result<(), Problem> {
+    fn check_module(
+        mut self,
+        suite: &'source [Stmt],
+        imports: Option<&'source BazelResolvedImports<'_>>,
+    ) -> Result<(), Problem> {
         for (index, statement) in suite.iter().enumerate() {
             match statement {
                 Stmt::Assign(assign) => {
@@ -252,6 +314,18 @@ impl<'source> Names<'source> {
                     self.initialized.insert(function.name.as_str());
                 }
                 Stmt::Expr(expr) if index == 0 && is_docstring(statement) => {}
+                Stmt::Expr(expr)
+                    if let Expr::Call(call) = expr.value.as_ref()
+                        && let Some(bindings) =
+                            imports.and_then(|imports| imports.load_at(call.range())) =>
+                {
+                    for binding in bindings {
+                        self.initialized.insert(binding.local_name());
+                        if matches!(binding.value(), BazelResolvedValue::Scalar(_)) {
+                            self.initialized_scalars.insert(binding.local_name());
+                        }
+                    }
+                }
                 Stmt::Pass(_) => {}
                 Stmt::Expr(_) => {
                     return Err(Problem::unsupported(

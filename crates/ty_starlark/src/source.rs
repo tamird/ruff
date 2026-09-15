@@ -26,7 +26,11 @@ pub struct BazelSource<'db> {
 
 impl get_size2::GetSize for BazelSource<'_> {}
 
-impl BazelSource<'_> {
+impl<'db> BazelSource<'db> {
+    pub(crate) fn selected_repository(self, db: &'db dyn Db) -> BazelRepository<'db> {
+        *self.repository(db)
+    }
+
     pub(crate) fn selected_file(self, db: &dyn Db) -> File {
         *self.file(db)
     }

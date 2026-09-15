@@ -15,12 +15,14 @@ use crate::checker::{
     BazelCheckProblem, BazelCheckedSource, BazelExpectedFunction, BazelExpectedParameter,
     BazelExport, BazelExportKind, BazelFunction, BazelFunctionProver, BazelModuleSummary,
     BazelScalar, BazelSourceMatcher, BazelUsageReport, summarize_bazel_source,
+    summarize_verified_imports,
 };
+use crate::imports::BazelResolvedImports;
 use crate::preflight::BazelPreflightFailure;
 use crate::source::BazelSource;
 use crate::stub::{
     BazelStubAdmission, BazelStubDeclarations, BazelStubFailure, BazelStubFunction,
-    BazelStubParameter, admit_bazel_stub,
+    BazelStubParameter, admit_bazel_stub, parse_bazel_stub_sibling,
 };
 
 /// A checked runtime may have an absent stub. A failed present stub is opaque.
@@ -31,7 +33,7 @@ pub enum BazelVerifiedSource {
 }
 
 /// The source file is always authoritative, even for an annotated export.
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, get_size2::GetSize)]
 pub struct BazelVerifiedModule {
     source_file: File,
     stub_file: Option<File>,
@@ -72,7 +74,7 @@ impl BazelVerifiedModule {
 }
 
 /// The source argument is primary; the sibling stub annotation is related.
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, get_size2::GetSize)]
 pub struct BazelTypedCallProblem {
     file: File,
     range: TextRange,
@@ -103,7 +105,7 @@ impl BazelTypedCallProblem {
     }
 }
 
-#[derive(Debug, get_size2::GetSize, thiserror::Error)]
+#[derive(Clone, Debug, get_size2::GetSize, thiserror::Error)]
 pub enum BazelTypedCallError {
     #[error("function '{callee}' can receive {actual} here; expected {expected}")]
     InvalidArgumentType {
@@ -113,7 +115,7 @@ pub enum BazelTypedCallError {
     },
 }
 
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, get_size2::GetSize)]
 pub struct BazelVerifiedExport {
     name: String,
     source_file: File,
@@ -139,13 +141,13 @@ impl BazelVerifiedExport {
     }
 }
 
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, get_size2::GetSize)]
 pub enum BazelVerifiedExportKind {
     Scalar(BazelScalar),
     Function(BazelVerifiedFunction),
 }
 
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, get_size2::GetSize)]
 pub struct BazelVerifiedFunction {
     parameters: Box<[BazelVerifiedParameter]>,
     result: BazelScalar,
@@ -179,7 +181,7 @@ impl BazelVerifiedFunction {
     }
 }
 
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, get_size2::GetSize)]
 pub struct BazelVerifiedParameter {
     name: String,
     source_range: TextRange,
@@ -305,17 +307,56 @@ pub enum BazelVerificationError {
 pub fn verify_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelVerifiedSource {
     let summary = match summarize_bazel_source(db, source) {
         BazelCheckedSource::Checked(summary) => summary,
-        BazelCheckedSource::Opaque(failure) => {
-            return BazelVerifiedSource::Opaque(BazelVerificationFailure {
-                file: Some(failure.file()),
-                range: failure.range(),
-                related_file: None,
-                related_range: None,
-                reason: BazelVerificationError::Source(Box::new(failure.clone())),
-            });
-        }
+        BazelCheckedSource::Opaque(failure) => return source_opaque(failure.clone()),
     };
     let admission = admit_bazel_stub(db, source);
+    verify_checked_source(
+        summary,
+        admission,
+        source.selected_file(db),
+        || BazelSourceMatcher::new(db, source),
+        false,
+    )
+}
+
+/// Reuse the source-first stub matcher and usage pass with graph-checked
+/// file-block names. No supplied summary can bypass current source preflight.
+pub(crate) fn verify_resolved_importer<'db>(
+    db: &'db dyn Db,
+    source: BazelSource<'db>,
+    imports: &BazelResolvedImports<'db>,
+) -> BazelVerifiedSource {
+    let summary = match summarize_verified_imports(db, source, imports) {
+        BazelCheckedSource::Checked(summary) => summary,
+        BazelCheckedSource::Opaque(failure) => return source_opaque(failure),
+    };
+    let admission = parse_bazel_stub_sibling(db, source.selected_file(db));
+    verify_checked_source(
+        &summary,
+        &admission,
+        source.selected_file(db),
+        || BazelSourceMatcher::new_resolved(db, source, imports, &summary),
+        true,
+    )
+}
+
+fn source_opaque(failure: BazelPreflightFailure) -> BazelVerifiedSource {
+    BazelVerifiedSource::Opaque(BazelVerificationFailure {
+        file: Some(failure.file()),
+        range: failure.range(),
+        related_file: None,
+        related_range: None,
+        reason: BazelVerificationError::Source(Box::new(failure)),
+    })
+}
+
+fn verify_checked_source<'source>(
+    summary: &BazelModuleSummary,
+    admission: &BazelStubAdmission,
+    source_file: File,
+    make_matcher: impl FnOnce() -> Result<BazelSourceMatcher<'source>, BazelPreflightFailure>,
+    scan_without_stub: bool,
+) -> BazelVerifiedSource {
     let declarations = match admission {
         BazelStubAdmission::Absent => None,
         BazelStubAdmission::Admitted(declarations) => Some(declarations),
@@ -329,20 +370,12 @@ pub fn verify_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelVerifie
             });
         }
     };
-    let Some(declarations) = declarations else {
+    if declarations.is_none() && !scan_without_stub {
         return BazelVerifiedSource::Checked(verified_module(summary, None, None));
-    };
-    let matcher = match BazelSourceMatcher::new(db, source) {
+    }
+    let matcher = match make_matcher() {
         Ok(matcher) => matcher,
-        Err(failure) => {
-            return BazelVerifiedSource::Opaque(BazelVerificationFailure {
-                file: Some(failure.file()),
-                range: failure.range(),
-                related_file: None,
-                related_range: None,
-                reason: BazelVerificationError::Source(Box::new(failure)),
-            });
-        }
+        Err(failure) => return source_opaque(failure),
     };
     // The source and stub have already rejected duplicate names. Index their
     // resident exports once instead of rescanning for every declaration.
@@ -352,20 +385,23 @@ pub fn verify_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelVerifie
         .map(|export| (export.name(), export))
         .collect();
     let mut matched = Vec::new();
-    for declaration in declarations.functions() {
-        match match_function(&exports, declarations.file(), declaration, &matcher) {
-            Ok(function) => matched.push(function),
-            Err(failure) => return BazelVerifiedSource::Opaque(failure),
+    if let Some(declarations) = declarations {
+        for declaration in declarations.functions() {
+            match match_function(&exports, declarations.file(), declaration, &matcher) {
+                Ok(function) => matched.push(function),
+                Err(failure) => return BazelVerifiedSource::Opaque(failure),
+            }
         }
     }
     // Only fully matched public source functions may constrain a call. The
     // matcher has not evaluated a body, so no stale result predates this map.
-    let expected = matched
-        .iter()
-        .map(|matched| matched.declaration)
-        .map(|function| BazelExpectedFunction {
-            name: function.name().to_string(),
-            parameters: function
+    let expected = declarations
+        .into_iter()
+        .flat_map(|declarations| matched.iter().map(move |matched| (declarations, matched)))
+        .map(|(declarations, matched)| BazelExpectedFunction {
+            name: matched.declaration.name().to_string(),
+            parameters: matched
+                .declaration
                 .parameters()
                 .iter()
                 .map(|parameter| BazelExpectedParameter {
@@ -377,23 +413,25 @@ pub fn verify_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelVerifie
         })
         .collect();
     let mut prover = matcher.into_prover(expected);
-    for function in &matched {
-        if let Err(failure) = prove_function(function, declarations.file(), &mut prover) {
-            return BazelVerifiedSource::Opaque(failure);
+    if let Some(declarations) = declarations {
+        for function in &matched {
+            if let Err(failure) = prove_function(function, declarations.file(), &mut prover) {
+                return BazelVerifiedSource::Opaque(failure);
+            }
         }
     }
     let usage = match prover.check_all_bodies() {
         Ok(usage) => usage,
         Err(range) => {
             return BazelVerifiedSource::Opaque(failed(
-                source.selected_file(db),
+                source_file,
                 range,
                 None,
                 BazelVerificationError::AnalysisLimit,
             ));
         }
     };
-    BazelVerifiedSource::Checked(verified_module(summary, Some(declarations), Some(&usage)))
+    BazelVerifiedSource::Checked(verified_module(summary, declarations, Some(&usage)))
 }
 
 fn verified_module(
