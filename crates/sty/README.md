@@ -27,9 +27,9 @@ parser also marks valid Starlark forms outside the shared Python parser
 subset opaque. Unsupported source semantics and uncheckable stubs are
 opaque, and opaque sources cause a nonzero exit.
 
-For a `.star` file, supply a host implementing `--sty-graph-v2` and
-`--sty-check-v1`.
-This works from any directory without a Bazel marker or BUILD file.
+For a `.star` file, supply a host implementing `--sty-graph-v3` and
+`--sty-check-v1`. This works from any directory without a Bazel marker
+or BUILD file.
 `//pkg:file.star` is a Bazel selector; `//abs/path.star` is an absolute
 file path. A host built with Bazel needs its own runfiles manifest in
 the process environment when launched outside Bazel:
@@ -43,15 +43,16 @@ RUNFILES_MANIFEST_FILE=/abs/bin/deploy_star.runfiles_manifest \
   /abs/deploy.star
 ```
 
-Sty first invokes `--sty-graph-v2 --source ABS` with each named
+Sty first invokes `--sty-graph-v3 --source ABS` with each named
 `--input NAME=ABS`. The host parses the captured UTF-8 source, resolves
-custom loads, and returns direct aliases, declarative record forms, and
-the native `field` and `struct` intrinsic facts. Sty requires recognized
-record semantics and both attested intrinsic behaviors. It checks
-source-declared primitive, nominal record, union, and list fields against
+custom loads, and returns direct aliases, declarative record forms,
+native `field` and `struct` intrinsic facts, and an inventory of host
+functions. Sty requires recognized record semantics and well-formed
+intrinsic and host function facts. It checks source-declared primitive,
+nominal record, union, and list fields against
 known arguments in the root and loaded modules, including dead top level
 `if` arms. It reports an argument source span and the related field
-type span on a known mismatch. With the attested v2 `field` intrinsic,
+type span on a known mismatch. With the attested `field` intrinsic,
 Sty reads the first positional type expression in a source declaration
 such as `record(value=field(int, default=7))`. Positional defaults
 work the same way. Unknown type expressions and shadowed native names
@@ -61,20 +62,20 @@ Sty also follows source `struct` members that refer to known record
 constructors or other proven `struct` bindings, including through
 resolved loads. Members computed at runtime stay unproved. The native
 checker validates field defaults and missing required fields. For a
-validated v2 graph, Sty also follows stable source `def` bindings and
+validated v3 graph, Sty also follows stable source `def` bindings and
 checks their known regular positional and named parameter annotations,
 including functions exported through `struct` and resolved loads. A
 known return annotation can supply a type when the call supplies every
 named or positional parameter. Typed `def` semantics come from the
-host's Starlark language and native annotation checks; the v2 intrinsic
+host's Starlark language and native annotation checks; the intrinsic
 facts attest `field` and `struct` only. Parameter defaults, requiredness,
 computed attributes, and unrecognized type aliases remain the host's
 responsibility or unproved. Sty checks known calls inside direct source
 function bodies using stable final module bindings while excluding
-function parameters and local names. It skips
-nested functions, lambdas, and comprehensions until their scope can be
-established. The shared Python parser may mark valid host Starlark
-syntax opaque. A clear bounded source pass invokes
+function parameters and local names. Nested functions, lambdas, and
+comprehensions await their own proven scope. This source pass still
+leaves host-native arguments unproved. The shared Python parser may
+mark valid host Starlark syntax opaque. A clear bounded source pass invokes
 `--sty-check-v1` with the same source and inputs. The host still owns
 its parser, loader, native annotation checks, and runtime checks.
 Native v1 rereads files, so keep sources and catalogs stable across

@@ -59,8 +59,8 @@ fn star_graph_json(
 ) -> anyhow::Result<String> {
     let path = utf8_path(path)?;
     let graph = serde_json::json!({
-        "version": "sty-star-graph-v2",
-        "profile": "example-star-host-v2",
+        "version": "sty-star-graph-v3",
+        "profile": "example-star-host-v3",
         "root": {"path": path, "source": source, "loads": loads},
         "modules": modules,
         "special_forms": [
@@ -77,6 +77,16 @@ fn star_graph_json(
         "intrinsics": [
             {"name": "field", "kind": "field_first_type_optional_default"},
             {"name": "struct", "kind": "struct_named_members"}
+        ],
+        "host_functions": [
+            {
+                "name": "example_host_native",
+                "params": [
+                    {"name": "value", "mode": "pos_or_named", "required": true, "type": "str"}
+                ],
+                "returns": "str",
+                "availability": "any_module"
+            }
         ]
     });
     Ok(serde_json::to_string(&graph)?)
@@ -92,7 +102,7 @@ fn host_fixture(fixture: &Fixture) -> anyhow::Result<PathBuf> {
             "#!/bin/sh\n",
             "printf '%s\\n' \"$@\" >> \"$STY_TEST_ARGV_LOG\"\n",
             "printf 'manifest:%s\\n' \"$RUNFILES_MANIFEST_FILE\" >> \"$STY_TEST_ARGV_LOG\"\n",
-            "if [ \"$1\" = '--sty-graph-v2' ]; then\n",
+            "if [ \"$1\" = '--sty-graph-v3' ]; then\n",
             "  if [ \"${STY_TEST_GRAPH_EXIT:-0}\" -ne 0 ]; then\n",
             "    printf 'graph producer failed\\n' >&2\n",
             "    exit \"$STY_TEST_GRAPH_EXIT\"\n",
@@ -394,7 +404,7 @@ fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<(
     );
     assert_eq!(
         fs::read_to_string(log)?,
-        format!("--sty-graph-v2\n{arguments}--sty-check-v1\n{arguments}")
+        format!("--sty-graph-v3\n{arguments}--sty-check-v1\n{arguments}")
     );
 
     let double_slash_source = format!("/{}", source_path.display());
@@ -416,7 +426,7 @@ fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<(
     assert_eq!(
         fs::read_to_string(double_log)?,
         format!(
-            "--sty-graph-v2\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n--sty-check-v1\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n"
+            "--sty-graph-v3\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n--sty-check-v1\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n"
         )
     );
     Ok(())
@@ -480,7 +490,7 @@ fn host_graph_yields_a_sty_owned_dead_branch_error_from_captured_text() -> anyho
     assert_eq!(
         fs::read_to_string(&log)?,
         format!(
-            "--sty-graph-v2\n--source\n{}\nmanifest:\n",
+            "--sty-graph-v3\n--source\n{}\nmanifest:\n",
             root_path.display()
         )
     );
@@ -508,7 +518,7 @@ fn host_graph_yields_a_sty_owned_dead_branch_error_from_captured_text() -> anyho
 
 #[cfg(unix)]
 #[test]
-fn host_v2_field_error_uses_the_captured_argument_and_type_spans() -> anyhow::Result<()> {
+fn host_v3_field_error_uses_the_captured_argument_and_type_spans() -> anyhow::Result<()> {
     let fixture = Fixture::unmarked()?;
     let checker = host_fixture(&fixture)?;
     let path = fixture.path("root.star");
@@ -550,14 +560,14 @@ fn host_v2_field_error_uses_the_captured_argument_and_type_spans() -> anyhow::Re
     );
     assert_eq!(
         fs::read_to_string(&log)?,
-        format!("--sty-graph-v2\n--source\n{}\nmanifest:\n", path.display())
+        format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
     );
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn host_v2_struct_member_error_keeps_loaded_source_locations() -> anyhow::Result<()> {
+fn host_v3_struct_member_error_keeps_loaded_source_locations() -> anyhow::Result<()> {
     let fixture = Fixture::unmarked()?;
     let checker = host_fixture(&fixture)?;
     let root_path = fixture.path("root.star");
@@ -622,7 +632,7 @@ fn host_v2_struct_member_error_keeps_loaded_source_locations() -> anyhow::Result
     assert_eq!(
         fs::read_to_string(&log)?,
         format!(
-            "--sty-graph-v2\n--source\n{}\nmanifest:\n",
+            "--sty-graph-v3\n--source\n{}\nmanifest:\n",
             root_path.display()
         )
     );
@@ -631,7 +641,7 @@ fn host_v2_struct_member_error_keeps_loaded_source_locations() -> anyhow::Result
 
 #[cfg(unix)]
 #[test]
-fn host_v2_source_function_error_names_its_parameter_annotation() -> anyhow::Result<()> {
+fn host_v3_source_function_error_names_its_parameter_annotation() -> anyhow::Result<()> {
     let fixture = Fixture::unmarked()?;
     let checker = host_fixture(&fixture)?;
     let path = fixture.path("root.star");
@@ -672,14 +682,14 @@ fn host_v2_source_function_error_names_its_parameter_annotation() -> anyhow::Res
     );
     assert_eq!(
         fs::read_to_string(&log)?,
-        format!("--sty-graph-v2\n--source\n{}\nmanifest:\n", path.display())
+        format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
     );
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn host_v2_deferred_call_keeps_the_captured_root_and_loaded_annotation_spans() -> anyhow::Result<()>
+fn host_v3_deferred_call_keeps_the_captured_root_and_loaded_annotation_spans() -> anyhow::Result<()>
 {
     let fixture = Fixture::unmarked()?;
     let checker = host_fixture(&fixture)?;
@@ -748,7 +758,7 @@ fn host_v2_deferred_call_keeps_the_captured_root_and_loaded_annotation_spans() -
     assert_eq!(
         fs::read_to_string(&log)?,
         format!(
-            "--sty-graph-v2\n--source\n{}\nmanifest:\n",
+            "--sty-graph-v3\n--source\n{}\nmanifest:\n",
             root_path.display()
         )
     );
@@ -806,7 +816,7 @@ fn malformed_host_graph_exits_two_and_producer_failure_relays_its_status() -> an
 
 #[cfg(unix)]
 #[test]
-fn host_v2_intrinsics_must_be_present_and_supported() -> anyhow::Result<()> {
+fn host_v3_intrinsics_must_be_present_and_supported() -> anyhow::Result<()> {
     let fixture = Fixture::unmarked()?;
     fixture.write("root.star", "VALUE = 1\n")?;
     let root_path = fixture.path("root.star");
@@ -823,6 +833,7 @@ fn host_v2_intrinsics_must_be_present_and_supported() -> anyhow::Result<()> {
         "duplicate intrinsic",
         "unknown intrinsic entry",
         "wrong graph version",
+        "v2 graph downgrade",
     ] {
         let mut changed = original.clone();
         match drift {
@@ -843,6 +854,9 @@ fn host_v2_intrinsics_must_be_present_and_supported() -> anyhow::Result<()> {
             }
             "wrong graph version" => {
                 changed["version"] = "sty-star-graph-v1".into();
+            }
+            "v2 graph downgrade" => {
+                changed["version"] = "sty-star-graph-v2".into();
             }
             _ => anyhow::bail!("unknown fixture drift {drift}"),
         }
@@ -865,6 +879,106 @@ fn host_v2_intrinsics_must_be_present_and_supported() -> anyhow::Result<()> {
             fs::read_to_string(&log)?.matches("--sty-check-v1").count(),
             0,
             "{drift}: native check accepted invalid graph facts"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn host_v3_inventory_requires_present_and_valid_native_signature_facts() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    fixture.write("root.star", "VALUE = 1\n")?;
+    let root_path = fixture.path("root.star");
+    let graph_file = fixture.path("graph.json");
+    let log = fixture.path("host-argv.txt");
+    let checker = host_fixture(&fixture)?;
+    let checker_name = utf8_path(&checker)?;
+    let root_name = utf8_path(&root_path)?;
+    let graph = star_graph_json(&root_path, "VALUE = 1\n", &[], &[])?;
+    let original: serde_json::Value = serde_json::from_str(&graph)?;
+
+    let mut empty = original.clone();
+    empty["host_functions"] = serde_json::json!([]);
+    fixture.write("graph.json", &serde_json::to_string(&empty)?)?;
+    let clear = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", &graph_file)
+        .args(["check", "--host-checker", checker_name, root_name])
+        .output()?;
+    assert_eq!(clear.status.code(), Some(37), "{}", stderr(&clear));
+    assert_eq!(
+        fs::read_to_string(&log)?.matches("--sty-check-v1").count(),
+        1
+    );
+
+    for drift in [
+        "missing inventory",
+        "null inventory",
+        "missing params",
+        "unknown function entry",
+        "unknown param entry",
+        "duplicate function",
+        "unknown parameter mode",
+        "unknown parameter type",
+        "unknown return type",
+        "unknown availability",
+    ] {
+        let mut changed = original.clone();
+        match drift {
+            "missing inventory" => {
+                let object = changed
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("graph fixture is not an object"))?;
+                object.remove("host_functions");
+            }
+            "null inventory" => changed["host_functions"] = serde_json::Value::Null,
+            "missing params" => {
+                let object = changed["host_functions"][0]
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("function fixture is not an object"))?;
+                object.remove("params");
+            }
+            "unknown function entry" => changed["host_functions"][0]["extra"] = true.into(),
+            "unknown param entry" => {
+                changed["host_functions"][0]["params"][0]["extra"] = true.into();
+            }
+            "duplicate function" => {
+                let function = changed["host_functions"][0].clone();
+                changed["host_functions"] = serde_json::json!([function.clone(), function]);
+            }
+            "unknown parameter mode" => {
+                changed["host_functions"][0]["params"][0]["mode"] = "flexible".into();
+            }
+            "unknown parameter type" => {
+                changed["host_functions"][0]["params"][0]["type"] = "record".into();
+            }
+            "unknown return type" => changed["host_functions"][0]["returns"] = "record".into(),
+            "unknown availability" => {
+                changed["host_functions"][0]["availability"] = "global".into();
+            }
+            _ => anyhow::bail!("unexpected inventory drift {drift}"),
+        }
+        fixture.write("graph.json", &serde_json::to_string(&changed)?)?;
+        fs::write(&log, "")?;
+        let output = Command::new(env!("CARGO_BIN_EXE_sty"))
+            .current_dir(fixture.root.path())
+            .env("STY_TEST_ARGV_LOG", &log)
+            .env("STY_TEST_GRAPH", &graph_file)
+            .args(["check", "--host-checker", checker_name, root_name])
+            .output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{drift}: {}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty(), "{drift}: source JSON leaked");
+        assert_eq!(
+            fs::read_to_string(&log)?.matches("--sty-check-v1").count(),
+            0,
+            "{drift}: native check accepted malformed host facts"
         );
     }
     Ok(())

@@ -1,8 +1,8 @@
 //! A bounded static source check for host-owned typed `.star` graphs.
 //!
 //! The host captures exact source text and resolves direct loads with its
-//! parser. This pass checks source-declared record fields whose types and
-//! arguments can be established from the graph. Other Starlark forms remain
+//! parser. This pass checks source-declared record fields and annotated
+//! function calls whose types can be established from the graph. Other forms
 //! unproved; an analyzed graph is never a full type proof.
 
 use std::collections::hash_map::Entry;
@@ -66,6 +66,24 @@ pub struct StarHostProfile {
     pub name: String,
     pub special_forms: Box<[StarSpecialForm]>,
     pub intrinsics: Box<[StarIntrinsic]>,
+    pub host_functions: Box<[StarHostFunction]>,
+}
+
+/// Producer-attested native callable signature and its evaluator availability.
+#[derive(Debug)]
+pub struct StarHostFunction {
+    pub name: String,
+    pub params: Box<[StarHostParam]>,
+    pub returns: String,
+    pub availability: String,
+}
+
+#[derive(Debug)]
+pub struct StarHostParam {
+    pub name: String,
+    pub mode: String,
+    pub required: bool,
+    pub ty: String,
 }
 
 /// Caller must also run the host's native check on the captured invocation.
@@ -393,6 +411,7 @@ impl StarBinding {
 
 const GRAPH_VERSION_V1: &str = "sty-star-graph-v1";
 const GRAPH_VERSION_V2: &str = "sty-star-graph-v2";
+const GRAPH_VERSION_V3: &str = "sty-star-graph-v3";
 
 #[derive(Clone, Copy)]
 enum RecordForm {
@@ -646,14 +665,18 @@ fn supported_forms<'profile>(
         name,
         special_forms,
         intrinsics,
+        host_functions,
     } = profile;
     match version {
         GRAPH_VERSION_V1 => {
-            if !intrinsics.is_empty() {
+            if !intrinsics.is_empty() || !host_functions.is_empty() {
                 return None;
             }
         }
-        GRAPH_VERSION_V2 => {
+        GRAPH_VERSION_V2 | GRAPH_VERSION_V3 => {
+            if version == GRAPH_VERSION_V2 && !host_functions.is_empty() {
+                return None;
+            }
             if intrinsics.len() != 2 {
                 return None;
             }
@@ -698,12 +721,76 @@ fn supported_forms<'profile>(
             }
         }
     }
+    if version == GRAPH_VERSION_V3 && !supported_host_functions(host_functions, &forms) {
+        return None;
+    }
     Some(StarSupportedForms {
         record_forms: forms,
-        field_attested: version == GRAPH_VERSION_V2,
-        struct_attested: version == GRAPH_VERSION_V2,
-        source_functions: version == GRAPH_VERSION_V2,
+        field_attested: version != GRAPH_VERSION_V1,
+        struct_attested: version != GRAPH_VERSION_V1,
+        source_functions: version != GRAPH_VERSION_V1,
     })
+}
+
+fn supported_host_functions(
+    functions: &[StarHostFunction],
+    forms: &HashMap<&str, RecordForm>,
+) -> bool {
+    let mut names = HashSet::new();
+    for function in functions {
+        let StarHostFunction {
+            name,
+            params,
+            returns,
+            availability,
+        } = function;
+        if name.is_empty()
+            || forms.contains_key(name.as_str())
+            || matches!(name.as_str(), "field" | "struct")
+            || !names.insert(name.as_str())
+            || !supported_host_type(returns)
+            || !matches!(
+                availability.as_str(),
+                "any_module" | "loaded_module_initialization"
+            )
+        {
+            return false;
+        }
+        let mut parameters = HashSet::new();
+        let mut previous_mode = 0;
+        let mut optional_positional = false;
+        for param in params {
+            let StarHostParam {
+                name,
+                mode,
+                required,
+                ty,
+            } = param;
+            let mode = match mode.as_str() {
+                "pos_only" => 0,
+                "pos_or_named" => 1,
+                "named_only" => 2,
+                _ => return false,
+            };
+            if name.is_empty()
+                || !parameters.insert(name.as_str())
+                || mode < previous_mode
+                || !supported_host_type(ty)
+                || mode != 2 && optional_positional && *required
+            {
+                return false;
+            }
+            if mode != 2 && !*required {
+                optional_positional = true;
+            }
+            previous_mode = mode;
+        }
+    }
+    true
+}
+
+fn supported_host_type(ty: &str) -> bool {
+    matches!(ty, "any" | "bool" | "int" | "str" | "callable" | "unknown")
 }
 
 fn parse_star_source(source: &StarSource) -> Result<ParsedStarSource<'_>, StarFailure> {

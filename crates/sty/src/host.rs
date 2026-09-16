@@ -14,9 +14,9 @@ use ruff_source_file::LineIndex;
 use ruff_text_size::{TextRange, TextSize};
 use serde::Deserialize;
 use ty_starlark::star::{
-    StarAnalysis, StarCheck, StarDirectLoad, StarFailure, StarFailureReason, StarHostProfile,
-    StarIntrinsic, StarLoadBinding, StarModule, StarResolvedGraph, StarSource, StarSpecialForm,
-    check_star_graph,
+    StarAnalysis, StarCheck, StarDirectLoad, StarFailure, StarFailureReason, StarHostFunction,
+    StarHostParam, StarHostProfile, StarIntrinsic, StarLoadBinding, StarModule, StarResolvedGraph,
+    StarSource, StarSpecialForm, check_star_graph,
 };
 
 use super::{CheckCommand, StyDb, absolute_host_path, is_star_path};
@@ -26,7 +26,7 @@ pub(super) fn run_host(cwd: &SystemPath, checker: &PathBuf, options: &CheckComma
     // The graph's stdout contains complete source snapshots. Capture it for
     // analysis, inherit stderr, and never print the JSON on parse failures.
     let output = invocation
-        .command(checker, "--sty-graph-v2")
+        .command(checker, "--sty-graph-v3")
         .stderr(Stdio::inherit())
         .output()
         .with_context(|| format!("cannot start host graph producer {}", checker.display()))?;
@@ -155,6 +155,7 @@ struct CapturedGraph {
     modules: Vec<CapturedModule>,
     special_forms: Vec<CapturedSpecialForm>,
     intrinsics: Vec<CapturedIntrinsic>,
+    host_functions: Option<Vec<CapturedHostFunction>>,
 }
 
 #[derive(Deserialize)]
@@ -206,6 +207,25 @@ struct CapturedIntrinsic {
     kind: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapturedHostFunction {
+    name: String,
+    params: Vec<CapturedHostParam>,
+    returns: String,
+    availability: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapturedHostParam {
+    name: String,
+    mode: String,
+    required: bool,
+    #[serde(rename = "type")]
+    ty: String,
+}
+
 impl CapturedGraph {
     fn into_star_graph(self, db: &dyn Db, selected: &SystemPath) -> Result<StarResolvedGraph> {
         let CapturedGraph {
@@ -215,7 +235,15 @@ impl CapturedGraph {
             modules,
             special_forms,
             intrinsics,
+            host_functions,
         } = self;
+        if version != "sty-star-graph-v3" {
+            return Err(anyhow!(
+                "host --sty-graph-v3 returned graph version {version:?}"
+            ));
+        }
+        let host_functions = host_functions
+            .ok_or_else(|| anyhow!("host graph v3 omitted host_functions inventory"))?;
         let CapturedSource {
             path,
             source,
@@ -262,12 +290,47 @@ impl CapturedGraph {
                 StarIntrinsic { name, kind }
             })
             .collect();
+        let host_functions = host_functions
+            .into_iter()
+            .map(|function| {
+                let CapturedHostFunction {
+                    name,
+                    params,
+                    returns,
+                    availability,
+                } = function;
+                let params = params
+                    .into_iter()
+                    .map(|param| {
+                        let CapturedHostParam {
+                            name,
+                            mode,
+                            required,
+                            ty,
+                        } = param;
+                        StarHostParam {
+                            name,
+                            mode,
+                            required,
+                            ty,
+                        }
+                    })
+                    .collect();
+                StarHostFunction {
+                    name,
+                    params,
+                    returns,
+                    availability,
+                }
+            })
+            .collect();
         Ok(StarResolvedGraph {
             version,
             profile: StarHostProfile {
                 name: profile,
                 special_forms: forms,
                 intrinsics,
+                host_functions,
             },
             root,
             modules: resolved_modules.into_boxed_slice(),

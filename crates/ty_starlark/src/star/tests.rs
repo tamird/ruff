@@ -5,9 +5,9 @@ use ruff_text_size::{TextRange, TextSize};
 use crate::testing::{TestDb, test_db};
 
 use super::{
-    StarAnalysis, StarCheck, StarDirectLoad, StarFailureReason, StarHostProfile, StarIntrinsic,
-    StarKnownType, StarLoadBinding, StarModule, StarPrimitive, StarResolvedGraph, StarSource,
-    StarSpecialForm, check_star_graph,
+    StarAnalysis, StarCheck, StarDirectLoad, StarFailureReason, StarHostFunction, StarHostParam,
+    StarHostProfile, StarIntrinsic, StarKnownType, StarLoadBinding, StarModule, StarPrimitive,
+    StarResolvedGraph, StarSource, StarSpecialForm, check_star_graph,
 };
 
 const LABEL: &str = "//example:limits.star";
@@ -44,6 +44,7 @@ fn profile() -> StarHostProfile {
             },
         ]),
         intrinsics: Box::new([]),
+        host_functions: Box::new([]),
     }
 }
 
@@ -61,6 +62,31 @@ fn v2_profile() -> StarHostProfile {
         },
     ]);
     host
+}
+
+fn v3_profile() -> StarHostProfile {
+    let mut host = v2_profile();
+    host.name = "example-star-host-v3".to_string();
+    host.host_functions = Box::new([example_host_function("host_encode")]);
+    host
+}
+
+fn example_host_function(name: &str) -> StarHostFunction {
+    StarHostFunction {
+        name: name.to_string(),
+        params: Box::new([example_host_param("value", "pos_or_named", true)]),
+        returns: "str".to_string(),
+        availability: "any_module".to_string(),
+    }
+}
+
+fn example_host_param(name: &str, mode: &str, required: bool) -> StarHostParam {
+    StarHostParam {
+        name: name.to_string(),
+        mode: mode.to_string(),
+        required,
+        ty: "str".to_string(),
+    }
 }
 
 fn case(root_source: &str, module_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)> {
@@ -157,8 +183,91 @@ fn v2_requires_recognized_forms_and_intrinsic_facts() -> anyhow::Result<()> {
     graph.profile = v2_profile();
     graph.version = "sty-star-graph-v1".to_string();
     profile_failure(&graph)?;
-    graph.version = "sty-star-graph-v3".to_string();
+    graph.version = "sty-star-graph-v2".to_string();
+    graph.profile.host_functions = v3_profile().host_functions;
     profile_failure(&graph)?;
+    graph.version = "sty-star-graph-v4".to_string();
+    profile_failure(&graph)?;
+    Ok(())
+}
+
+#[test]
+fn v3_accepts_an_attested_empty_host_inventory_and_retains_source_checks() -> anyhow::Result<()> {
+    let source = "def choose(flag: bool):\n    pass\nchoose(flag=\"wrong\")\n";
+    let (_db, mut graph) = v2_root_only(source)?;
+    graph.version = "sty-star-graph-v3".to_string();
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert_eq!(analysis.checked_arguments(), 1);
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("empty native inventory lost source def checking: {analysis:?}");
+    };
+    assert_eq!(problem.related_label(), "parameter annotated");
+    assert_eq!(slice(source, problem.related_range()), Some("bool"));
+    Ok(())
+}
+
+#[test]
+fn v3_requires_well_formed_portable_host_function_signatures() -> anyhow::Result<()> {
+    let source = "VALUE = 1\n";
+    let (_db, mut graph) = v2_root_only(source)?;
+    graph.version = "sty-star-graph-v3".to_string();
+    graph.profile = v3_profile();
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty());
+
+    for drift in [
+        "empty function name",
+        "form name collision",
+        "intrinsic name collision",
+        "duplicate function",
+        "unknown return type",
+        "unknown availability",
+        "empty parameter name",
+        "duplicate parameter",
+        "unknown parameter mode",
+        "unknown parameter type",
+        "unsorted parameter modes",
+        "required positional after optional",
+    ] {
+        graph.profile = v3_profile();
+        let function = &mut graph.profile.host_functions[0];
+        match drift {
+            "empty function name" => function.name.clear(),
+            "form name collision" => function.name = "record".to_string(),
+            "intrinsic name collision" => function.name = "field".to_string(),
+            "duplicate function" => {
+                graph.profile.host_functions = Box::new([
+                    example_host_function("same_native"),
+                    example_host_function("same_native"),
+                ]);
+            }
+            "unknown return type" => function.returns = "dynamic_object".to_string(),
+            "unknown availability" => function.availability = "always".to_string(),
+            "empty parameter name" => function.params[0].name.clear(),
+            "duplicate parameter" => {
+                function.params = Box::new([
+                    example_host_param("value", "pos_or_named", true),
+                    example_host_param("value", "named_only", false),
+                ]);
+            }
+            "unknown parameter mode" => function.params[0].mode = "auto".to_string(),
+            "unknown parameter type" => function.params[0].ty = "dynamic_object".to_string(),
+            "unsorted parameter modes" => {
+                function.params = Box::new([
+                    example_host_param("option", "named_only", false),
+                    example_host_param("value", "pos_or_named", true),
+                ]);
+            }
+            "required positional after optional" => {
+                function.params = Box::new([
+                    example_host_param("first", "pos_only", false),
+                    example_host_param("second", "pos_or_named", true),
+                ]);
+            }
+            _ => anyhow::bail!("unexpected host signature drift {drift}"),
+        }
+        profile_failure(&graph).with_context(|| drift)?;
+    }
     Ok(())
 }
 
