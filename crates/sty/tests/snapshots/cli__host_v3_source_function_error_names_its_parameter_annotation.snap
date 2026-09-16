@@ -2,11 +2,18 @@
 source: crates/sty/tests/cli.rs
 expression: "stderr(&output).replace(utf8_path(fixture.root.path())?, \"[ROOT]\")"
 ---
-error[invalid-argument-type]: choose parameter multiarch, expected bool, got str
- --> [ROOT]/root.star:3:18
+error[invalid-argument-type]: Argument to function `choose` is incorrect
+ --> [ROOT]/root.star:3:8
   |
 1 | def choose(multiarch: bool):
-  |                       ---- parameter annotated at
 2 |     pass
 3 | choose(multiarch="wrong")
-  |                  ^^^^^^^
+  |        ^^^^^^^^^^^^^^^^^ Expected `bool`, found `Literal["wrong"]`
+info: Function defined here
+ --> [ROOT]/root.star:1:5
+  |
+1 | def choose(multiarch: bool):
+  |     ^^^^^^ --------------- Parameter declared here
+2 |     pass
+3 | choose(multiarch="wrong")
+  |

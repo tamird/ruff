@@ -1,5 +1,6 @@
 //! Host-specific Starlark source resolution and syntax admission.
 
+mod analysis;
 pub mod bazel;
 pub mod checker;
 pub mod graph;

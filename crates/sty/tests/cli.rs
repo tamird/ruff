@@ -539,7 +539,7 @@ fn host_graph_yields_a_sty_owned_dead_branch_error_from_captured_text() -> anyho
     let diagnostic = stderr(&output);
     assert!(diagnostic.contains("root.star:3:"), "{diagnostic}");
     assert!(
-        diagnostic.contains("LimitConfig.max_connections, expected int, got str"),
+        diagnostic.contains("invalid-argument-type") && diagnostic.contains("max_connections"),
         "{diagnostic}"
     );
     assert!(diagnostic.contains("limits.star:3:"), "{diagnostic}");

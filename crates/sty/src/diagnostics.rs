@@ -133,6 +133,10 @@ pub(crate) fn star_diagnostics(
     graph: &StarResolvedGraph,
     check: &StarCheck,
 ) -> Result<Vec<Diagnostic>> {
+    let failure = match check {
+        StarCheck::Checked(checked) => return Ok(checked.clone()),
+        StarCheck::Opaque(failure) => failure,
+    };
     let mut sources: HashMap<File, (&str, Option<SourceFile>)> = HashMap::new();
     for source in
         std::iter::once(&graph.root).chain(graph.modules.iter().map(|module| &module.source))
@@ -169,58 +173,24 @@ pub(crate) fn star_diagnostics(
         Ok(Span::from(captured.clone()).with_optional_range(range))
     };
     let mut diagnostics = Vec::new();
-    match check {
-        StarCheck::Partial(analysis) => {
-            for problem in analysis.problems() {
-                let primary = span(problem.file(), Some(problem.range()))?;
-                let related = span(problem.related_file(), Some(problem.related_range()))?;
-                let mut diagnostic = diagnostic("invalid-argument-type", problem, primary);
-                diagnostic.annotate(
-                    Annotation::secondary(related)
-                        .message(format!("{} at", problem.related_label())),
-                );
-                diagnostics.push(diagnostic);
-            }
-            for problem in analysis.native_problems() {
-                let primary = span(problem.file(), Some(problem.range()))?;
-                let mut diagnostic = diagnostic("invalid-argument-type", problem, primary);
-                diagnostic.info(format!("host signature: {}", problem.signature()));
-                diagnostics.push(diagnostic);
-            }
-            for problem in analysis.native_call_problems() {
-                let primary = span(problem.file(), Some(problem.range()))?;
-                let mut diagnostic = diagnostic("invalid-call", problem, primary);
-                diagnostic.info(format!("host signature: {}", problem.signature()));
-                diagnostics.push(diagnostic);
-            }
-            for problem in analysis.native_availability_problems() {
-                let primary = span(problem.file(), Some(problem.range()))?;
-                let mut diagnostic = diagnostic("unavailable-host-function", problem, primary);
-                diagnostic.info(format!("host availability: {}", problem.availability()));
-                diagnostics.push(diagnostic);
-            }
-        }
-        StarCheck::Opaque(failure) => {
-            let primary = span(failure.file(), failure.range())?;
-            diagnostics.push(diagnostic(
-                "unsupported-starlark",
-                failure.reason(),
-                primary.clone(),
-            ));
-            if graph.root.file != failure.file() {
-                let root = span(graph.root.file, None)?;
-                let mut blocked = diagnostic(
-                    "unsupported-starlark",
-                    format!(
-                        "cannot check the .star root because a loaded source is opaque: {}",
-                        failure.reason()
-                    ),
-                    root,
-                );
-                blocked.annotate(Annotation::secondary(primary).message("loaded source is opaque"));
-                diagnostics.push(blocked);
-            }
-        }
+    let primary = span(failure.file(), failure.range())?;
+    diagnostics.push(diagnostic(
+        "unsupported-starlark",
+        failure.reason(),
+        primary.clone(),
+    ));
+    if graph.root.file != failure.file() {
+        let root = span(graph.root.file, None)?;
+        let mut blocked = diagnostic(
+            "unsupported-starlark",
+            format!(
+                "cannot check the .star root because a loaded source is opaque: {}",
+                failure.reason()
+            ),
+            root,
+        );
+        blocked.annotate(Annotation::secondary(primary).message("loaded source is opaque"));
+        diagnostics.push(blocked);
     }
     Ok(diagnostics)
 }

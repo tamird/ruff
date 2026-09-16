@@ -2,17 +2,19 @@
 source: crates/sty/tests/cli.rs
 expression: "stderr(&output).replace(utf8_path(fixture.root.path())?, \"[ROOT]\")"
 ---
-error[invalid-argument-type]: api.submit.flag, expected bool, got str
- --> [ROOT]/root.star:3:21
+error[invalid-argument-type]: Argument to class `Api` is incorrect
+ --> [ROOT]/root.star:3:16
   |
 1 | load("//example:api.star", "api")
 2 | def check():
 3 |     api.submit(flag="wrong")
-  |                     ^^^^^^^
-  |
- ::: [ROOT]/api.star:1:19
+  |                ^^^^^^^^^^^^ Expected `bool`, found `Literal["wrong"]`
+info: Callable defined here
+ --> [ROOT]/api.star:1:7
   |
 1 | Api = record(flag=bool)
-  |                   ---- field declared at
+  |       ^^^^^^^^^^^^----^
+  |                   |
+  |                   Parameter declared here
 2 | api = struct(submit=Api)
   |

@@ -34,7 +34,7 @@ pub(super) fn run_host(cwd: &SystemPath, checker: &PathBuf, options: &CheckComma
         .context("host graph returned invalid versioned JSON")?;
     let db = StyDb::new(cwd);
     let graph = captured.into_star_graph(&db, &invocation.source)?;
-    let outcome = check_star_graph(&graph);
+    let outcome = check_star_graph(&db, &graph)?;
     let diagnostics = diagnostics::star_diagnostics(&db, &graph, &outcome)?;
     diagnostics::report(&db, &diagnostics)?;
     if let StarCheck::Opaque(failure) = &outcome {

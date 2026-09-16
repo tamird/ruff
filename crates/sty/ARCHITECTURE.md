@@ -2,12 +2,14 @@
 
 ## Status and target
 
-Sty currently shares Ruff's parser, source infrastructure, and diagnostics.
-Its Bazel and hosted `.star` analyzers still implement separate type systems.
-The target is to replace those analyzers with Ty inference, with explicit
-Starlark frontend inputs. Ty now accepts logical Starlark modules and resolved
-loads and checks their annotated functions through its existing inference.
-Sty's production frontends still need to migrate to that semantic boundary.
+Hosted `.star` graphs use Ty's inference for types, scopes, calls, records,
+and diagnostics. Their frontend validates captured sources and host facts,
+then creates explicit Starlark semantic inputs. The former hosted type
+model, argument mapper, and proof counters have been removed.
+
+The Bazel frontend still uses its scalar analyzer. Its remaining migration
+requires external function annotations; see the Bazel declarations section
+below.
 
 Success means removing the replaced inference, signature, and assignability
 code. A second implementation behind a backend switch would add maintenance
@@ -77,37 +79,34 @@ proves that Ty's existing argument and return checks distinguish `bool`
 from `int` when their builtin classes are unrelated, while normal Python
 programs retain their inheritance relationship.
 
-Builtin declarations alone do not establish Starlark semantics. Ty's
-[binary expression inference](../ty_python_semantic/src/types/infer/builder/binary_expressions.rs)
-also converts Boolean literals to integers directly. Audit and isolate
-such operations, Python implicit globals, annotation evaluation, and scope
-rules before admitting their Starlark forms. Keep unsupported forms explicit
-throughout migration.
+`ProgramLanguage` selects the operations whose Python behavior cannot be
+expressed by declarations alone: Boolean literal arithmetic and equality,
+float widening, string iteration, `type()` results, and fixed tuple type
+expressions. Python programs retain their existing behavior. The embedded
+builtin module's `__all__` declares the globals visible to Starlark source;
+internal type lookups can still use its supporting declarations.
 
 ## Native functions and records
 
-Native signatures fit existing `Parameter`, `Parameters`, `Signature`, and
-`Type::single_callable` representations. Parameter modes and requiredness
-come from validated host facts. Use regular callable types so attribute
-access does not add Python receiver binding. Host availability is a separate
-contextual rule; a callable signature cannot establish when execution is
-allowed.
+Native signatures use existing `Parameter`, `Parameters`, and `Signature`
+representations. Parameter modes and requiredness come from validated host
+facts. Their semantic values retain the declaration identity through aliases
+and unions without adding Python receiver binding. Host availability is a
+separate contextual rule; a callable signature cannot establish when
+execution is allowed.
 
-Records need explicit synthesized nominal-class metadata: declaration
-identity, instance fields, constructor parameters, and source provenance.
-The existing
-[`DynamicClassLiteral`](../ty_python_semantic/src/types/class/dynamic_literal.rs)
-provides nominal machinery, but its current members are Python class
-attributes and its definition anchor interprets `type(...)` syntax. Those
-assumptions must be separated before using it for records.
+`DynamicClassLiteral` carries synthesized nominal metadata for records:
+fields, defaults, declaration identity, and source provenance. Its shared
+constructor-signature query serves both calls and conversion to a callable.
+The return instance is constructed from the class identity when queried,
+avoiding a self-reference in the metadata. Struct fields use the same
+instance-member representation; function values do not acquire receivers.
 
-One constructor-signature query should serve both constructor checking and
-conversion to a callable. Construct its return instance from the class
-identity when queried, avoiding a self-reference in the interned metadata.
-Keep callable-valued fields as ordinary instance values and retain related
-field declaration spans. Reuse Ty unions and assignability after these
-representations exist. Do not encode records as tuples or structural maps:
-their identity, members, and subtype relationships differ.
+The captured graph is checked in an in-memory database with embedded
+Starlark builtin declarations. Physical source snapshots share parser keys;
+logical modules retain separate semantic identities. Before the database
+is dropped, every diagnostic annotation and subdiagnostic annotation is
+converted to an owned source snapshot. No database file handle escapes.
 
 ## Bazel declarations
 
@@ -117,10 +116,10 @@ contract. External annotations must supply types to signature construction,
 body parameters, and return checking, with declaration spans in the stub.
 Simply resolving a load to the stub would bypass the runtime-body check.
 
-Ty's ordinary unannotated source signatures currently use an unknown return type.
-The migration must account for Bazel's current source-derived return
-summaries and specialization explicitly, including recursion and failing
-bodies. Do not silently trade those checks for trusted stub returns.
+Unannotated functions use Ty's ordinary inference. In particular, their
+parameters and return values can remain unknown. Callers do not specialize
+helper bodies; `.bzl.pyi` annotations supply the missing constraints. Those
+annotations must also check source bodies, defaults, and reassignments.
 
 ## Diagnostics and editor integration
 
@@ -130,8 +129,9 @@ Both frontends now produce `ruff_db::Diagnostic` through
 same diagnostics to LSP. The old CLI reporters and editor snapshot renderer
 have been removed.
 
-Before routing native Ty diagnostics into Sty, extend the LSP conversion
-to preserve located subdiagnostics as well as secondary annotations. Keep
+The LSP conversion preserves located subdiagnostics and secondary annotations.
+Embedded builtin declarations have display-only names; their annotations
+appear as text when no editor location exists. Keep
 document synchronization and host-worker scheduling separate from semantic
 analysis. Sharing Ty's entire Python project server is not a prerequisite
 for sharing its analysis.
@@ -150,7 +150,7 @@ for sharing its analysis.
 1. Route the hosted frontend through that path and remove `StarKnownType`,
     `type_accepts`, source-function signatures, native argument mapping, and
     the replaced analysis in [`star.rs`](../ty_starlark/src/star.rs).
-1. Supply Bazel external declarations and source summaries to the same
+1. Supply Bazel external declarations to the same
     engine. Remove the replaced inference in
     [`checker.rs`](../ty_starlark/src/checker.rs),
     [`imports.rs`](../ty_starlark/src/imports.rs), and

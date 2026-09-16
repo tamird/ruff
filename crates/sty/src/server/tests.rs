@@ -243,15 +243,12 @@ fn configured_star_checks_frozen_root_and_loaded_editor_sources() {
     server.open("root.star", root_source, 1);
     let first = server.published("root.star");
     assert_eq!(first.version, Some(1));
-    assert!(
-        has_error(&first.diagnostics, "expected int, got str"),
-        "{first:?}"
-    );
-    assert!(has_error(&first.diagnostics, "host signature"), "{first:?}");
+    assert!(has_error(&first.diagnostics, "Expected `int`"), "{first:?}");
+    assert!(has_error(&first.diagnostics, "Host signature"), "{first:?}");
     let record = first
         .diagnostics
         .iter()
-        .find(|diagnostic| has_error(std::slice::from_ref(diagnostic), "expected int, got str"))
+        .find(|diagnostic| has_error(std::slice::from_ref(diagnostic), "Expected `int`"))
         .unwrap();
     assert_eq!(record.range.start.line, 2);
     assert_eq!(
@@ -296,14 +293,11 @@ fn configured_star_checks_frozen_root_and_loaded_editor_sources() {
     let loaded = server.published("limits.star");
     assert_eq!(loaded.version, Some(3));
     assert!(
-        has_error(&loaded.diagnostics, "expected int, got str"),
+        has_error(&loaded.diagnostics, "Expected `int`"),
         "{loaded:?}"
     );
     let root = server.published("root.star");
-    assert!(
-        has_error(&root.diagnostics, "expected int, got str"),
-        "{root:?}"
-    );
+    assert!(has_error(&root.diagnostics, "Expected `int`"), "{root:?}");
     let overlays: serde_json::Value =
         serde_json::from_slice(&fs::read(server.path("captured.json")).unwrap()).unwrap();
     assert_eq!(overlays["sources"].as_array().unwrap().len(), 2);
@@ -325,14 +319,47 @@ fn configured_star_checks_frozen_root_and_loaded_editor_sources() {
     assert_eq!(restored.version, None);
     assert!(restored.diagnostics.is_empty(), "{restored:?}");
     let root = server.published("root.star");
-    assert!(
-        has_error(&root.diagnostics, "expected int, got str"),
-        "{root:?}"
-    );
+    assert!(has_error(&root.diagnostics, "Expected `int`"), "{root:?}");
     let overlays: serde_json::Value =
         serde_json::from_slice(&fs::read(server.path("captured.json")).unwrap()).unwrap();
     assert_eq!(overlays["sources"].as_array().unwrap().len(), 1);
     assert_eq!(overlays["sources"][0]["source"], root_source);
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_star_projects_function_and_builtin_declarations() {
+    let server = TestServer::with_options(host_settings);
+    let source = "def take(value: int) -> int:\n    return value\ntake(\"wrong\")\nlen(1)\n";
+    server.write("root.star", source);
+    let graph = star_graph(&server.path("root.star"), source, None);
+    server.write("graph.json", &serde_json::to_string(&graph).unwrap());
+    server.open("root.star", source, 1);
+    let result = server.published("root.star");
+    assert_eq!(result.diagnostics.len(), 2, "{result:?}");
+    let function = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.range.start.line == 2)
+        .unwrap();
+    let related = function.related_information.as_ref().unwrap();
+    assert!(
+        related
+            .iter()
+            .any(|note| note.location.uri == server.uri("root.star")
+                && note.location.range.start.line == 0),
+        "{function:?}"
+    );
+    let builtin = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.range.start.line == 3)
+        .unwrap();
+    assert!(
+        has_error(std::slice::from_ref(builtin), "builtins.pyi:"),
+        "{builtin:?}"
+    );
+    assert!(builtin.related_information.is_none(), "{builtin:?}");
 }
 
 #[cfg(unix)]
@@ -417,7 +444,7 @@ fn mismatched_open_loaded_snapshot_fails_without_partial_type_claims() {
     server.open("root.star", source, 1);
     assert!(has_error(
         &server.published("root.star").diagnostics,
-        "expected int, got str"
+        "Expected `int`"
     ));
     server.open(
         "limits.star",
@@ -433,7 +460,7 @@ fn mismatched_open_loaded_snapshot_fails_without_partial_type_claims() {
     let root = server.published("root.star");
     assert_eq!(root.diagnostics.len(), 1, "{root:?}");
     assert!(has_error(&root.diagnostics, "snapshot differs"), "{root:?}");
-    assert!(!has_error(&root.diagnostics, "expected int, got str"));
+    assert!(!has_error(&root.diagnostics, "Expected `int`"));
     server.no_pending_publication();
 }
 
@@ -469,7 +496,7 @@ fn stale_host_graph_completion_never_publishes_an_old_editor_version() {
     let publication = server.published("root.star");
     assert_eq!(publication.version, Some(2), "{publication:?}");
     assert!(
-        has_error(&publication.diagnostics, "expected int, got str"),
+        has_error(&publication.diagnostics, "Expected `int`"),
         "{publication:?}"
     );
     server.no_pending_publication();
@@ -532,10 +559,7 @@ fn an_unrelated_oversized_open_star_does_not_break_the_root_check() {
     );
     server.open("root.star", source, 3);
     let root = server.published("root.star");
-    assert!(
-        has_error(&root.diagnostics, "expected int, got str"),
-        "{root:?}"
-    );
+    assert!(has_error(&root.diagnostics, "Expected `int`"), "{root:?}");
     let unrelated = server.published("unrelated.star");
     assert!(
         has_error(&unrelated.diagnostics, "configured host roots did not load"),

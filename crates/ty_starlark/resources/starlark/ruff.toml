@@ -1,0 +1,8 @@
+extend = "../../../../pyproject.toml"
+target-version = "py312"
+
+[lint]
+# These declarations model Starlark: numeric types do not widen implicitly,
+# constructors are not subclassable, and runtime type values are assignments.
+# The embedded typing module owns Callable; collections only provides iterators.
+extend-ignore = ["PYI026", "PYI034", "PYI041", "UP035"]

@@ -2,10 +2,18 @@
 source: crates/sty/tests/cli.rs
 expression: "stderr(&output).replace(utf8_path(fixture.root.path())?, \"[ROOT]\")"
 ---
-error[invalid-argument-type]: Config.value, expected int, got str
- --> [ROOT]/root.star:2:14
+error[invalid-argument-type]: Argument to class `Config` is incorrect
+ --> [ROOT]/root.star:2:8
   |
 1 | Config = record(value=field(int, default=7))
-  |                             --- field declared at
 2 | Config(value="bad")
-  |              ^^^^^
+  |        ^^^^^^^^^^^ Expected `int`, found `Literal["bad"]`
+info: Callable defined here
+ --> [ROOT]/root.star:1:10
+  |
+1 | Config = record(value=field(int, default=7))
+  |          ^^^^^^^^^^^^^^^^^^^---^^^^^^^^^^^^^
+  |                             |
+  |                             Parameter declared here
+2 | Config(value="bad")
+  |

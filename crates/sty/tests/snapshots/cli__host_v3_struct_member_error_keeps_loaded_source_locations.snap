@@ -2,16 +2,18 @@
 source: crates/sty/tests/cli.rs
 expression: "stderr(&output).replace(utf8_path(fixture.root.path())?, \"[ROOT]\")"
 ---
-error[invalid-argument-type]: images.repository.name, expected str, got int
- --> [ROOT]/root.star:2:24
+error[invalid-argument-type]: Argument to class `Repository` is incorrect
+ --> [ROOT]/root.star:2:19
   |
 1 | load("//example:images.star", "images")
 2 | images.repository(name=7)
-  |                        ^
-  |
- ::: [ROOT]/images.star:1:26
+  |                   ^^^^^^ Expected `str`, found `Literal[7]`
+info: Callable defined here
+ --> [ROOT]/images.star:1:14
   |
 1 | Repository = record(name=str)
-  |                          --- field declared at
+  |              ^^^^^^^^^^^^---^
+  |                          |
+  |                          Parameter declared here
 2 | images = struct(repository=Repository)
   |

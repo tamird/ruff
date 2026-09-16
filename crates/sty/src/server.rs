@@ -707,8 +707,7 @@ fn setup_diagnostic(message: String) -> Diagnostic {
     }
 }
 
-/// Project Sty's primary and secondary annotations and text-only notes into
-/// the editor protocol. Located subdiagnostics are not emitted by Sty.
+/// Project shared diagnostics, including declaration locations and nested notes.
 fn lsp_diagnostic(
     db: &StyDb,
     documents: &HashMap<SystemPathBuf, OpenDocument>,
@@ -718,20 +717,54 @@ fn lsp_diagnostic(
     let primary = diagnostic
         .primary_span()
         .ok_or_else(|| anyhow!("Sty diagnostic has no source"))?;
-    let location = span_location(db, documents, &primary, encoding)?;
+    let location = span_location(db, documents, &primary, encoding)?
+        .ok_or_else(|| anyhow!("Sty diagnostic has no navigable primary source"))?;
     let mut message = diagnostic.concise_message().to_string();
-    for sub in diagnostic.sub_diagnostics() {
-        if sub.primary_annotation().is_none() {
-            write!(message, "\n\n{}: {}", sub.severity(), sub.concise_message())?;
+    let mut related = Vec::new();
+    let mut append = |span: Option<&Span>, text: String| -> Result<()> {
+        let location = match span {
+            Some(span) => span_location(db, documents, span, encoding)?,
+            None => None,
+        };
+        if let Some(location) = location {
+            related.push(DiagnosticRelatedInformation {
+                location,
+                message: text,
+            });
+        } else {
+            write!(message, "\n\n{text}")?;
+            if let Some(span) = span
+                && let UnifiedFile::Ruff(source) = span.file()
+            {
+                write!(message, " ({name}", name = source.name())?;
+                if let Some(range) = span.range() {
+                    let position = source_position(
+                        source.source_text(),
+                        source.index(),
+                        range.start(),
+                        encoding,
+                    )?;
+                    write!(message, ":{}", position.line + 1)?;
+                }
+                message.push(')');
+            }
+        }
+        Ok(())
+    };
+    for annotation in diagnostic.secondary_annotations() {
+        if let Some(text) = annotation.get_message() {
+            append(Some(annotation.get_span()), text.to_string())?;
         }
     }
-    let mut related = Vec::new();
-    for annotation in diagnostic.secondary_annotations() {
-        if let Some(message) = annotation.get_message() {
-            related.push(DiagnosticRelatedInformation {
-                location: span_location(db, documents, annotation.get_span(), encoding)?,
-                message: message.to_string(),
-            });
+    for sub in diagnostic.sub_diagnostics() {
+        append(
+            sub.primary_span_ref(),
+            format!("{}: {}", sub.severity(), sub.concise_message()),
+        )?;
+        for annotation in sub.secondary_annotations() {
+            if let Some(text) = annotation.get_message() {
+                append(Some(annotation.get_span()), text.to_string())?;
+            }
         }
     }
     let severity = match diagnostic.severity() {
@@ -759,7 +792,7 @@ fn span_location(
     documents: &HashMap<SystemPathBuf, OpenDocument>,
     span: &Span,
     encoding: Encoding,
-) -> Result<Location> {
+) -> Result<Option<Location>> {
     let (uri, range) = match span.file() {
         UnifiedFile::Ty(file) => {
             let uri = file_uri(db, *file, documents)?;
@@ -774,6 +807,12 @@ fn span_location(
         }
         UnifiedFile::Ruff(source) => {
             let path = SystemPath::new(source.name());
+            if !path.is_absolute() {
+                if let Some(range) = span.range() {
+                    text_range(source.source_text(), source.index(), range, encoding)?;
+                }
+                return Ok(None);
+            }
             let document = documents.get(path).or_else(|| {
                 let physical = path.as_std_path().canonicalize().ok()?;
                 documents.iter().find_map(|(path, document)| {
@@ -798,7 +837,7 @@ fn span_location(
             (uri, range)
         }
     };
-    Ok(Location { uri, range })
+    Ok(Some(Location { uri, range }))
 }
 
 fn text_range(

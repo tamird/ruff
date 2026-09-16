@@ -97,68 +97,42 @@ Sty first invokes `--sty-graph-v3 --source ABS` with each named
 custom loads, and returns direct aliases, declarative record forms,
 native `field` and `struct` intrinsic facts, and an inventory of host
 functions. Sty requires recognized record semantics and well-formed
-intrinsic and host function facts. It checks source-declared primitive,
-nominal record, union, and list fields against
-known arguments in the root and loaded modules, including dead top level
-`if` arms. It reports an argument source span and the related field
-type span on a known mismatch. With the attested `field` intrinsic,
-Sty reads the first positional type expression in a source declaration
-such as `record(value=field(int, default=7))`. Positional defaults
-work the same way. Unknown type expressions and shadowed native names
-stay unproved.
+intrinsic and host function facts.
 
-Sty also follows source `struct` members that refer to known record
-constructors or other proven `struct` bindings, including through
-resolved loads. Members computed at runtime stay unproved. Sty does not
-prove field defaults or missing required fields.
+Admitted graphs use Ty's semantic engine. It checks annotated function
+bodies and returns, positional and named arguments, defaults, required
+parameters, and calls in unreachable code. Resolved loads retain their
+original aliases and source locations. An explicit assignment can
+reexport a loaded binding; a bare load does not reexport it.
 
-When a top level name has one assignment, Sty can carry a scalar value
-or proven nominal record instance through a load, alias, or direct
-function body. An instance supplies an argument type but never an
-annotation type. Mutable lists and arbitrary computed or catalog values
-stay unproved.
+Records have nominal identity per logical module and declaration.
+Constructors, instance fields, and related diagnostic locations share
+the same field definitions. `field(int, default=7)` supplies a type and
+optional default, both of which are checked. Unions, lists, and fixed
+tuple annotations use Ty's type operations. `struct` preserves known
+members, including functions and record constructors, without adding
+Python method receiver binding.
 
-For a validated v3 graph, Sty also follows stable source `def` bindings and
-checks their known regular positional and named parameter annotations,
-including functions exported through `struct` and resolved loads. A
-known return annotation can supply a type when the call supplies every
-named or positional parameter and every established parameter type
-matches a known argument. A nominal record result requires complete
-known field declarations and compatible named arguments for every
-field. Sty checks source `def` calls using known annotations; it does
-not check return statements in a function body against its return
-annotation. The intrinsic facts attest `field` and `struct` only.
-Parameter defaults, requiredness, computed attributes, and
-unrecognized type aliases stay unproved when analyzing source
-function call arguments.
-Sty checks known calls inside direct source
-function defaults in eager source order, then checks direct function
-bodies using stable final module bindings while excluding function
-parameters and local names. Nested functions, lambdas, and
-comprehensions await their own proven scope. With v3 host function facts,
-Sty also checks known scalar and callable arguments of direct native
-global calls. It uses the host's ordered positional and named modes,
-required parameters, and evaluator availability before proving a call.
-A typed native return can supply an argument type when the call has a
-valid parameter mapping and no known wrong inputs. Native returns of
-`any` or `unknown`, computed callbacks, and shadowed names stay unproved.
-A direct unshadowed native call in the source root is an error when
-the host attests that its function requires loaded module initialization.
-Sty shows the captured callee span and textual host availability. A
-loaded deferred function might execute during initialization or later,
-so its availability stays unproved. A known native mismatch shows the
-captured argument span and a textual host signature; the graph has no
-native declaration source span. Definite native call shape errors,
-including a missing required parameter and a positional argument for
-a named-only parameter, use the captured call or argument span and the
-same host signature. Starred and dynamic keyword arguments have no
-stable mapping and stay unproved. The shared Python parser may
-mark valid host Starlark syntax opaque. The host's native checker can
-separately validate annotations, record construction, and data-dependent
-execution. For OpenAI deployment sources, use the deployment host's
-existing `--check --spec ABS --data NAME=ABS` command when those checks
-are required; it evaluates top-level code and may read catalogs. A
-clear Sty result does not imply a clear native host result.
+Builtin declarations describe the supported Starlark operations.
+Boolean and integer types are distinct, float annotations require
+floats, strings require `.elems()` for iteration, and `type(value)`
+returns a string. Internal declaration helpers are hidden from source
+lookup. Unknown values and unannotated return types limit precision.
+Source variadic annotations describe the collected tuple or dictionary.
+Correlated unions of those aggregate types are not supported; Sty reports
+the unsupported annotation instead of checking arguments independently.
+
+Native calls use the host's declared parameter modes, requiredness,
+argument types, and return types. Diagnostics include the host
+signature. Calls from the source root are rejected when a native
+requires loaded module initialization. A loaded function body might
+execute during initialization or later, so that availability remains
+unknown; its argument types are still checked.
+
+Sty reads the captured graph without evaluating deployment code or
+reading catalogs. The shared Python parser can reject Starlark syntax
+outside its supported overlap. The host's runtime checks and
+validation of data-dependent behavior remain separate operations.
 
 Relative source and input paths become absolute from the current
 directory; already absolute paths keep their spelling. The host
@@ -170,5 +144,5 @@ Bazel checks return 0 when clear, 1 for checked problems or opaque
 sources, and 2 for invalid invocation or label selection. `.star`
 returns 1 for a known source type problem or an opaque source, and 2
 for malformed graph facts or Sty setup errors. A failed graph process
-relays the host exit code. A clear `.star` source pass returns 0 even
-when separate native annotation or data-dependent host checks would fail.
+relays the host exit code. Unknown values can prevent a static diagnosis;
+runtime validation remains the host's responsibility.

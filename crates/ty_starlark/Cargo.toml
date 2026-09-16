@@ -19,16 +19,20 @@ ruff_db = { workspace = true }
 ruff_memory_usage = { workspace = true }
 ruff_python_ast = { workspace = true, features = ["get-size"] }
 ruff_python_parser = { workspace = true }
+ruff_source_file = { workspace = true }
 ruff_text_size = { workspace = true, features = ["get-size"] }
 
+ty_module_resolver = { workspace = true }
+ty_python_core = { workspace = true }
+ty_python_semantic = { workspace = true }
+
+anyhow = { workspace = true }
 get-size2 = { workspace = true }
 salsa = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 ruff_db = { workspace = true, features = ["testing"] }
-
-anyhow = { workspace = true }
 
 [lints]
 workspace = true

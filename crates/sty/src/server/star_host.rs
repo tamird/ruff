@@ -437,7 +437,7 @@ pub(super) fn check_completion(
                 .to_str()
                 .ok_or_else(|| anyhow!("invalid host root path"))?;
             let graph = captured.into_star_graph(db, SystemPath::new(selected))?;
-            let result = check_star_graph(&graph);
+            let result = check_star_graph(db, &graph)?;
             let problems = star_diagnostics(db, &graph, &result)?;
             let mut graph_diagnostics: HashMap<Uri, Vec<Diagnostic>> = HashMap::new();
             for problem in &problems {
