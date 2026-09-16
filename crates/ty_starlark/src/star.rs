@@ -364,6 +364,11 @@ enum RecordForm {
     WithValidator,
 }
 
+struct StarSupportedForms<'profile> {
+    record_forms: HashMap<&'profile str, RecordForm>,
+    field_attested: bool,
+}
+
 /// Check a host-resolved snapshot without parsing `.star` as Bazel `.bzl`.
 ///
 /// The host's actual parser, loader, and native checker are separate required
@@ -379,7 +384,6 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
     let Some(forms) = supported_forms(version, profile) else {
         return StarCheck::Opaque(StarFailure::at(root.file, None, StarFailureReason::Profile));
     };
-
     // A physical File identifies one captured source for owning spans. The
     // same path may be exposed by multiple logical module IDs, but differing
     // snapshots would make the later source location ambiguous.
@@ -594,7 +598,7 @@ fn validate_load_dag(
 fn supported_forms<'profile>(
     version: &str,
     profile: &'profile StarHostProfile,
-) -> Option<HashMap<&'profile str, RecordForm>> {
+) -> Option<StarSupportedForms<'profile>> {
     let StarHostProfile {
         name,
         special_forms,
@@ -651,7 +655,10 @@ fn supported_forms<'profile>(
             }
         }
     }
-    Some(forms)
+    Some(StarSupportedForms {
+        record_forms: forms,
+        field_attested: version == GRAPH_VERSION_V2,
+    })
 }
 
 fn parse_star_source(source: &StarSource) -> Result<ParsedStarSource<'_>, StarFailure> {
@@ -835,7 +842,7 @@ impl<'source> Visitor<'source> for ModuleWrites {
 fn source_bindings(
     parsed: &ParsedStarSource<'_>,
     module: &StarRecordModule,
-    forms: &HashMap<&str, RecordForm>,
+    forms: &StarSupportedForms<'_>,
     mut visible: HashMap<String, StarBinding>,
 ) -> HashMap<String, StarBinding> {
     let mut preceding_callables = HashSet::new();
@@ -898,17 +905,21 @@ fn record_declaration(
     module: &StarRecordModule,
     name: &str,
     call: &ast::ExprCall,
-    forms: &HashMap<&str, RecordForm>,
+    forms: &StarSupportedForms<'_>,
     visible: &HashMap<String, StarBinding>,
     preceding_callables: &HashSet<&str>,
 ) -> Option<StarConstructor> {
+    let StarSupportedForms {
+        record_forms,
+        field_attested,
+    } = forms;
     let Expr::Name(callee) = call.func.as_ref() else {
         return None;
     };
     if !parsed.is_host_global(callee.id.as_str()) {
         return None;
     }
-    let expected_args = match forms.get(callee.id.as_str()) {
+    let expected_args = match record_forms.get(callee.id.as_str()) {
         Some(RecordForm::Builtin) => 0,
         Some(RecordForm::WithValidator) => 1,
         None => return None,
@@ -938,16 +949,19 @@ fn record_declaration(
         if !seen_fields.insert(name.as_str()) {
             return None;
         }
-        let Some(ty) = type_expression(parsed, visible, &keyword.value) else {
-            continue;
+        let (ty, range) = match type_expression(parsed, visible, &keyword.value) {
+            Some(ty) => (ty, keyword.value.range()),
+            None => {
+                if !field_attested {
+                    continue;
+                }
+                let Some(field) = intrinsic_field_type(parsed, visible, &keyword.value) else {
+                    continue;
+                };
+                field
+            }
         };
-        fields.insert(
-            name.as_str().to_string(),
-            StarField {
-                ty,
-                range: keyword.value.range(),
-            },
-        );
+        fields.insert(name.as_str().to_string(), StarField { ty, range });
     }
     Some(StarConstructor {
         file: parsed.source.file,
@@ -958,6 +972,48 @@ fn record_declaration(
         }),
         fields,
     })
+}
+
+fn intrinsic_field_type(
+    parsed: &ParsedStarSource<'_>,
+    visible: &HashMap<String, StarBinding>,
+    expression: &Expr,
+) -> Option<(StarKnownType, TextRange)> {
+    let Expr::Call(call) = expression else {
+        return None;
+    };
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id != "field" || !parsed.is_host_global("field") {
+        return None;
+    }
+    if call.arguments.args.iter().any(Expr::is_starred_expr) {
+        return None;
+    }
+    let (annotation, positional_default) = match call.arguments.args.as_ref() {
+        [annotation] => (annotation, false),
+        [annotation, _default] => (annotation, true),
+        _ => return None,
+    };
+    let named_default = match call.arguments.keywords.as_ref() {
+        [] => false,
+        [keyword] => {
+            let name = keyword.arg.as_ref()?;
+            if name.as_str() != "default" {
+                return None;
+            }
+            true
+        }
+        _ => return None,
+    };
+    if positional_default && named_default {
+        return None;
+    }
+    // Native field compiles this type and checks any supplied default.
+    // The default's value and requiredness remain the host's responsibility.
+    let ty = type_expression(parsed, visible, annotation)?;
+    Some((ty, annotation.range()))
 }
 
 fn type_expression(

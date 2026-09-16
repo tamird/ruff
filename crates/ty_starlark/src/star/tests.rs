@@ -162,6 +162,138 @@ fn v2_requires_recognized_forms_and_intrinsic_facts() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn v2_field_type_expressions_prove_primitive_union_and_nominal_lists() -> anyhow::Result<()> {
+    let source = concat!(
+        "Left = record(code=int)\n",
+        "Right = record(code=int)\n",
+        "Config = record(\n",
+        "    count=field(int, default=0),\n",
+        "    flag=field(bool, False),\n",
+        "    maybe=field(Left | None, default=None),\n",
+        "    items=field(list[Left]),\n",
+        "    unknown=field(Missing, default=make_value()),\n",
+        ")\n",
+        "if False:\n",
+        "    Config(count=\"wrong\", flag=\"wrong\", maybe=Right(code=1), items=[Right(code=1)], unknown=\"wrong\")\n",
+        "Config(count=1, flag=True, maybe=None, items=[Left(code=1)])\n",
+    );
+    let (_db, graph) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert_eq!(analysis.checked_arguments(), 11);
+    assert_eq!(analysis.unproved_arguments(), 1);
+    let [count, flag, maybe, items] = analysis.problems() else {
+        anyhow::bail!("expected four field mismatches: {analysis:?}");
+    };
+    for (problem, field, related, expected, actual) in [
+        (count, "count", "int", "int", "str"),
+        (flag, "flag", "bool", "bool", "str"),
+        (maybe, "maybe", "Left | None", "Left | None", "Right"),
+        (items, "items", "list[Left]", "list[Left]", "list[Right]"),
+    ] {
+        assert_eq!(problem.file(), graph.root.file);
+        assert_eq!(problem.related_file(), graph.root.file);
+        assert_eq!(problem.field(), field);
+        assert_eq!(slice(source, problem.related_range()), Some(related));
+        assert_eq!(problem.expected().to_string(), expected);
+        assert_eq!(problem.actual().to_string(), actual);
+    }
+    assert_eq!(slice(source, count.range()), Some("\"wrong\""));
+    assert_eq!(slice(source, maybe.range()), Some("Right(code=1)"));
+    assert_eq!(slice(source, items.range()), Some("[Right(code=1)]"));
+    Ok(())
+}
+
+#[test]
+fn v2_field_annotation_resolves_a_loaded_nominal_record() -> anyhow::Result<()> {
+    let source = format!(
+        "load(\"{LABEL}\", \"Left\", \"Right\")\nConfig = record(value=field(Left))\nConfig(value=Right(code=1))\n"
+    );
+    let module_source = "Left = record(code=int)\nRight = record(code=int)\n";
+    let (_db, mut graph) = case(&source, module_source)?;
+    graph.version = "sty-star-graph-v2".to_string();
+    graph.profile = v2_profile();
+    graph.root.loads[0].bindings = Box::new([
+        StarLoadBinding {
+            local: "Left".to_string(),
+            source: "Left".to_string(),
+        },
+        StarLoadBinding {
+            local: "Right".to_string(),
+            source: "Right".to_string(),
+        },
+    ]);
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert_eq!(analysis.checked_arguments(), 2);
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected a mismatched loaded nominal record: {analysis:?}");
+    };
+    assert_eq!(problem.file(), graph.root.file);
+    assert_eq!(problem.related_file(), graph.root.file);
+    assert_eq!(slice(&source, problem.range()), Some("Right(code=1)"));
+    assert_eq!(slice(&source, problem.related_range()), Some("Left"));
+    assert_eq!(problem.expected().to_string(), "Left");
+    assert_eq!(problem.actual().to_string(), "Right");
+    Ok(())
+}
+
+#[test]
+fn native_field_proof_requires_v2_and_leaves_unknown_values_unproved() -> anyhow::Result<()> {
+    let source = concat!(
+        "Config = record(value=field(int, default=make_value()))\n",
+        "Config(value=make_value())\n",
+        "Config(value=\"wrong\")\n",
+    );
+    let (_db, v1) = root_only(source)?;
+    let analysis = analyzed(check_star_graph(&v1))?;
+    assert!(analysis.problems().is_empty());
+    assert_eq!(analysis.checked_arguments(), 0);
+    assert_eq!(analysis.unproved_arguments(), 2);
+
+    let (_db, v2) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&v2))?;
+    assert_eq!(analysis.checked_arguments(), 1);
+    assert_eq!(analysis.unproved_arguments(), 1);
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected the known string mismatch: {analysis:?}");
+    };
+    assert_eq!(slice(source, problem.range()), Some("\"wrong\""));
+    assert_eq!(slice(source, problem.related_range()), Some("int"));
+    Ok(())
+}
+
+#[test]
+fn shadowed_or_unrecognized_field_calls_do_not_prove_annotations() -> anyhow::Result<()> {
+    for source in [
+        "field = 0\nConfig = record(value=field(int))\nConfig(value=\"wrong\")\n",
+        "Config = record(value=field(int))\nfield = 0\nConfig(value=\"wrong\")\n",
+        "def field(typ):\n    pass\nConfig = record(value=field(int))\nConfig(value=\"wrong\")\n",
+        "Config = record(value=field(int, unexpected=0))\nConfig(value=\"wrong\")\n",
+        "Config = record(value=field(int, 0, default=0))\nConfig(value=\"wrong\")\n",
+        "Config = record(value=field(Missing))\nConfig(value=\"wrong\")\n",
+    ] {
+        let (_db, graph) = v2_root_only(source)?;
+        let analysis = analyzed(check_star_graph(&graph))?;
+        assert!(analysis.problems().is_empty(), "{source}: {analysis:?}");
+        assert_eq!(analysis.checked_arguments(), 0, "{source}");
+        assert_eq!(analysis.unproved_arguments(), 1, "{source}");
+    }
+
+    let source = format!(
+        "load(\"{LABEL}\", \"field\")\nConfig = record(value=field(int))\nConfig(value=\"wrong\")\n"
+    );
+    let (_db, mut graph) = case(&source, "field = record(value=int)\n")?;
+    graph.version = "sty-star-graph-v2".to_string();
+    graph.profile = v2_profile();
+    graph.root.loads[0].bindings[0].local = "field".to_string();
+    graph.root.loads[0].bindings[0].source = "field".to_string();
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty());
+    assert_eq!(analysis.checked_arguments(), 0);
+    assert_eq!(analysis.unproved_arguments(), 1);
+    Ok(())
+}
+
 fn analyzed(result: StarCheck) -> anyhow::Result<StarAnalysis> {
     match result {
         StarCheck::Partial(analysis) => Ok(analysis),

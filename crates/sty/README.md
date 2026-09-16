@@ -51,12 +51,16 @@ record semantics and both attested intrinsic behaviors. It checks
 source-declared primitive, nominal record, union, and list fields against
 known arguments in the root and loaded modules, including dead top level
 `if` arms. It reports an argument source span and the related field
-declaration span on a known mismatch.
+type span on a known mismatch. With the attested v2 `field` intrinsic,
+Sty reads the first positional type expression in a source declaration
+such as `record(value=field(int, default=7))`. Positional defaults
+work the same way. Unknown type expressions and shadowed native names
+stay unproved.
 
-`field(TYPE, default=...)` declarations, `struct` members, attributes,
-callback and function bodies, and values computed at runtime remain
-unproved. The shared Python parser may also mark a valid host
-Starlark form opaque. A clear bounded source pass must then invoke
+The native checker validates field defaults and missing required fields.
+`struct` members, attributes, callback and function bodies, and values
+computed at runtime remain unproved. The shared Python parser may mark
+valid host Starlark syntax opaque. A clear bounded source pass invokes
 `--sty-check-v1` with the same source and inputs. The host still owns
 its parser, loader, native annotation checks, and runtime checks.
 Native v1 rereads files, so keep sources and catalogs stable across
