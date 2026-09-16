@@ -70,6 +70,7 @@ const RUNTIME_CHECKABLE_DOCS_URL: &str =
 pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&AMBIGUOUS_PROTOCOL_MEMBER);
     registry.register_lint(&CALL_NON_CALLABLE);
+    registry.register_lint(&UNAVAILABLE_HOST_FUNCTION);
     registry.register_lint(&CALL_TOP_CALLABLE);
     registry.register_lint(&POSSIBLY_MISSING_IMPLICIT_CALL);
     registry.register_lint(&INVALID_DATACLASS_OVERRIDE);
@@ -207,6 +208,23 @@ declare_lint! {
         summary: "detects experimental syntax",
         status: LintStatus::stable("0.0.50"),
         default_level: Level::Warn,
+    }
+}
+
+declare_lint! {
+    /// ## What it does
+    /// Reports calls to host functions that are unavailable in the current Starlark module.
+    ///
+    /// ## Why is this bad?
+    /// Some hosts expose functions that can only run while initializing a loaded module.
+    /// Calling them from the invocation's source root fails even when argument types match.
+    ///
+    /// A call in a loaded function body has an unknown execution context; this rule does
+    /// not claim that such a call is available or unavailable.
+    pub(crate) static UNAVAILABLE_HOST_FUNCTION = {
+        summary: "detects host calls unavailable in the current Starlark module",
+        status: LintStatus::stable("0.0.82"),
+        default_level: Level::Error,
     }
 }
 

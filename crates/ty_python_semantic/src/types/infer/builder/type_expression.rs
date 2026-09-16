@@ -1680,6 +1680,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 self.infer_parameterized_special_form_type_expression(subscript, special_form)
             }
             Type::KnownInstance(known_instance) => match known_instance {
+                KnownInstanceType::StarlarkGlobal(_) => {
+                    if !self.in_string_annotation() {
+                        self.infer_expression(slice, TypeContext::default());
+                    }
+                    if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
+                        builder.into_diagnostic("Host functions cannot be specialized");
+                    }
+                    Type::unknown()
+                }
                 KnownInstanceType::SubscriptedProtocol(_) => {
                     if !self.in_string_annotation() {
                         self.infer_expression(slice, TypeContext::default());

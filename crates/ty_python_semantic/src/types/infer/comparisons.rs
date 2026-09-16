@@ -411,6 +411,9 @@ impl<'db> Type<'db> {
                             .unwrap_or_else(|| KnownClass::MethodWrapperType.to_instance(db, env)),
                     )
                 }
+                Type::KnownInstance(KnownInstanceType::StarlarkGlobal(_)) => {
+                    UpcastResult::unstable(ty)
+                }
                 Type::KnownInstance(
                     KnownInstanceType::SubscriptedProtocol(_)
                     | KnownInstanceType::SubscriptedGeneric(_)

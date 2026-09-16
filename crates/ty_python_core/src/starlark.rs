@@ -22,6 +22,12 @@ pub struct StarlarkModule {
     pub name: Name,
     #[returns(ref)]
     pub loads: Box<[StarlarkLoad]>,
+
+    #[returns(copy)]
+    pub environment: Option<StarlarkEnvironment>,
+
+    #[returns(copy)]
+    pub role: StarlarkModuleRole,
 }
 
 impl get_size2::GetSize for StarlarkModule {}
@@ -33,6 +39,71 @@ impl StarlarkModule {
             .find(|load| load.range == range)
             .map(|load| load.module)
     }
+}
+
+/// Whether a module is the invocation's source root or a loaded dependency.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub enum StarlarkModuleRole {
+    Root,
+    Loaded,
+}
+
+/// Host declarations shared by the modules in an invocation.
+///
+/// The frontend validates and attests these declarations. Types remain portable;
+/// semantic queries resolve primitive types against the consuming program.
+#[salsa::input(debug)]
+pub struct StarlarkEnvironment {
+    #[returns(ref)]
+    pub globals: Box<[StarlarkGlobalDeclaration]>,
+}
+
+impl get_size2::GetSize for StarlarkEnvironment {}
+
+#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub struct StarlarkGlobalDeclaration {
+    pub name: Name,
+    pub kind: StarlarkGlobalKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub enum StarlarkGlobalKind {
+    Native {
+        parameters: Box<[StarlarkParameter]>,
+        return_type: StarlarkType,
+        availability: StarlarkAvailability,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub struct StarlarkParameter {
+    pub name: Name,
+    pub mode: StarlarkParameterMode,
+    pub ty: StarlarkType,
+    pub required: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub enum StarlarkParameterMode {
+    PositionalOnly,
+    PositionalOrKeyword,
+    KeywordOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub enum StarlarkType {
+    Any,
+    Bool,
+    Int,
+    Str,
+    Callable,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub enum StarlarkAvailability {
+    AnyModule,
+    LoadedModuleInitialization,
 }
 
 /// A load resolved by the frontend, anchored to its original call expression.

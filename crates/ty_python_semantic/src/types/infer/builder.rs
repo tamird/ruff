@@ -173,6 +173,7 @@ mod new_class;
 mod paramspec_validation;
 mod post_inference;
 mod redundant_conditions;
+mod starlark;
 mod subscript;
 mod type_call;
 mod type_expression;
@@ -9088,6 +9089,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             func,
             arguments,
         } = call_expression;
+
+        self.check_starlark_availability(func, callable_type);
 
         // Semantic indexing recognizes only bare empty constructor calls. Confirm that the name
         // still resolves to the corresponding builtin before using later collection constraints.

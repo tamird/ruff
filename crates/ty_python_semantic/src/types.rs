@@ -167,6 +167,7 @@ mod relation_error;
 mod set_theoretic;
 mod signatures;
 mod special_form;
+pub(crate) mod starlark;
 mod string_annotation;
 mod subclass_of;
 #[cfg(test)]
@@ -6317,6 +6318,14 @@ impl<'db> Type<'db> {
                     .into()
             }
 
+            Type::KnownInstance(KnownInstanceType::StarlarkGlobal(global)) => {
+                CallableBinding::from_overloads(
+                    self,
+                    global.callable(db).signatures(db).iter().cloned(),
+                )
+                .into()
+            }
+
             Type::TypeVar(bound_typevar) => {
                 match bound_typevar.require_bound_or_constraints(db, env) {
                     TypeVarBoundOrConstraints::UpperBound(bound) => {
@@ -8206,6 +8215,12 @@ impl<'db> Type<'db> {
             }),
 
             Type::KnownInstance(known_instance) => match known_instance {
+                KnownInstanceType::StarlarkGlobal(_) => Err(InvalidTypeExpressionError {
+                    invalid_expressions: smallvec_inline![InvalidTypeExpression::InvalidType(
+                        *self, scope_id
+                    )],
+                    fallback_type: Type::unknown(),
+                }),
                 KnownInstanceType::TypeAliasType(alias) => Ok(Type::TypeAlias(*alias)),
                 KnownInstanceType::NewType(newtype) => Ok(Type::NewTypeInstance(*newtype)),
                 KnownInstanceType::TypeVar(typevar) => {
@@ -9519,6 +9534,7 @@ impl<'db> Type<'db> {
             }
 
             Type::KnownInstance(known_instance) => match known_instance {
+                KnownInstanceType::StarlarkGlobal(_) => {}
                 KnownInstanceType::UnionType(instance) => {
                     if let Ok(union_type) = instance.union_type(db) {
                         union_type.find_legacy_typevars_impl(
@@ -9711,6 +9727,9 @@ impl<'db> Type<'db> {
             Type::SpecialForm(special_form) => {
                 Type::string_literal(db, special_form.to_compact_string())
             }
+            Type::KnownInstance(KnownInstanceType::StarlarkGlobal(_)) => {
+                KnownClass::Str.to_instance(db, env)
+            }
             Type::KnownInstance(known_instance) => {
                 Type::string_literal(db, known_instance.repr(db, env).to_compact_string())
             }
@@ -9749,6 +9768,9 @@ impl<'db> Type<'db> {
                 _ => KnownClass::Str.to_instance(db, env),
             },
             Type::SpecialForm(special_form) => Type::string_literal(db, &*special_form.to_string()),
+            Type::KnownInstance(KnownInstanceType::StarlarkGlobal(_)) => {
+                KnownClass::Str.to_instance(db, env)
+            }
             Type::KnownInstance(known_instance) => {
                 Type::string_literal(db, known_instance.repr(db, env).to_compact_string())
             }

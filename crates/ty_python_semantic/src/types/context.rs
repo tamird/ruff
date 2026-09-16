@@ -582,6 +582,7 @@ pub(super) struct LintDiagnosticGuardBuilder<'db, 'ctx> {
     source: LintSource,
     primary_range: TextRange,
     message_override: Option<(String, String)>,
+    additional_info: Option<String>,
 }
 
 impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
@@ -661,6 +662,7 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
             source,
             primary_range: range,
             message_override: None,
+            additional_info: None,
         })
     }
 
@@ -692,6 +694,9 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
             diag.info(info);
             message
         });
+        if let Some(info) = self.additional_info {
+            diag.info(info);
+        }
         diag.set_documentation_url(Some(self.id.documentation_url()));
         LintDiagnosticGuard {
             ctx: self.ctx,
@@ -706,6 +711,11 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
     /// message, or as an info sub-diagnostic otherwise.
     pub(super) fn with_message_override(mut self, message: String, info: &str) -> Self {
         self.message_override = Some((message, info.to_string()));
+        self
+    }
+
+    pub(super) fn with_info(mut self, info: String) -> Self {
+        self.additional_info = Some(info);
         self
     }
 }

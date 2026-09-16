@@ -3708,6 +3708,13 @@ impl<'db> FmtDetailed<'db> for DisplayKnownInstanceRepr<'_, 'db> {
                 }
             }
             KnownInstanceType::Deprecated(_) => f.write_str("warnings.deprecated"),
+            KnownInstanceType::StarlarkGlobal(global) => {
+                if let Some(declaration) = global.declaration(db) {
+                    f.write_str(&declaration.name)
+                } else {
+                    f.write_str("Unknown")
+                }
+            }
             KnownInstanceType::Field(field) => {
                 f.with_type(ty).write_str("dataclasses.Field")?;
 

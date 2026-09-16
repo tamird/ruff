@@ -101,6 +101,7 @@ struct CallDiagnosticContext<'context, 'overrides, 'db, 'ast> {
     context: &'context InferContext<'db, 'ast>,
     overrides: Option<&'context CallDiagnosticOverride<'overrides>>,
     argument_index_offset: usize,
+    host_callable: Option<crate::types::starlark::StarlarkGlobal<'db>>,
 }
 
 impl<'db> CallDiagnosticContext<'_, '_, 'db, '_> {
@@ -111,6 +112,22 @@ impl<'db> CallDiagnosticContext<'_, '_, 'db, '_> {
     ) -> Option<LintDiagnosticGuardBuilder<'env, 'db>> {
         let lint = self.overrides.map_or(lint, |overrides| overrides.lint);
         self.context.report_lint(lint, ranged).map(|builder| {
+            let builder = if let Some(global) = self.host_callable
+                && let Some(declaration) = global.declaration(self.db())
+                && let Some(signature) = global
+                    .callable(self.db())
+                    .signatures(self.db())
+                    .iter()
+                    .next()
+            {
+                builder.with_info(format!(
+                    "Host signature: {}{}",
+                    declaration.name,
+                    signature.display(self.db(), self.program_environment())
+                ))
+            } else {
+                builder
+            };
             if let Some(overrides) = self.overrides {
                 builder.with_message_override(overrides.message.clone(), overrides.info)
             } else {
@@ -1514,6 +1531,7 @@ impl<'db> Bindings<'db> {
                 context,
                 overrides: None,
                 argument_index_offset: 0,
+                host_callable: None,
             },
             node,
         );
@@ -1530,6 +1548,7 @@ impl<'db> Bindings<'db> {
                 context,
                 overrides: Some(overrides),
                 argument_index_offset: 0,
+                host_callable: None,
             },
             node,
         );
@@ -8672,6 +8691,12 @@ impl<'db> CallableDescription<'db> {
         }
 
         match callable_type {
+            Type::KnownInstance(KnownInstanceType::StarlarkGlobal(global)) => {
+                Some(CallableDescription {
+                    name: Cow::Borrowed(global.declaration(db)?.name.as_str()),
+                    kind: Some("host function"),
+                })
+            }
             Type::FunctionLiteral(function) => Some(CallableDescription {
                 kind: Some(if function.name(db) == "__new__" {
                     "constructor"
@@ -9177,6 +9202,15 @@ impl<'db> BindingError<'db> {
         matching_overload: Option<&MatchingOverloadLiteral<'_>>,
         source_parameter_index_offset: usize,
     ) {
+        let context = &CallDiagnosticContext {
+            context: context.context,
+            overrides: context.overrides,
+            argument_index_offset: context.argument_index_offset,
+            host_callable: match callable_ty {
+                Type::KnownInstance(KnownInstanceType::StarlarkGlobal(global)) => Some(global),
+                _ => None,
+            },
+        };
         let db = context.db();
         let env = context.program_environment();
         let callable_kind = match callable_ty {
@@ -9670,6 +9704,7 @@ impl<'db> BindingError<'db> {
                     context: context.context,
                     overrides: context.overrides,
                     argument_index_offset: error.argument_index_offset,
+                    host_callable: None,
                 };
                 error.bindings.report_diagnostics_impl(&context, node);
             }

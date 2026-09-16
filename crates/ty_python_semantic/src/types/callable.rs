@@ -292,6 +292,10 @@ impl<'db> Type<'db> {
                 wrapper.callables(db, env)
             }
 
+            Type::KnownInstance(KnownInstanceType::StarlarkGlobal(global)) => {
+                Some(CallableTypes::one(global.callable(db)))
+            }
+
             Type::Intersection(intersection) => intersection
                 .finite_alternative_union(db, env)
                 .and_then(|alternatives| {

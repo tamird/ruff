@@ -650,6 +650,9 @@ pub(crate) fn implicit_builtins_symbol<'db>(
     file: ProgramFile<'db>,
     symbol: &str,
 ) -> PlaceAndQualifiers<'db> {
+    if let Some(global) = crate::types::starlark::StarlarkGlobal::lookup(db, file, symbol) {
+        return Place::declared(global).into();
+    }
     let env = ProgramEnvironment::from_file(file);
     builtins_symbol_impl(db, &env, symbol, BuiltinVisibility::runtime(db, file))
         .map(|(_, symbol)| symbol)
@@ -665,6 +668,9 @@ pub(crate) fn implicit_builtins_symbol_scope<'db>(
     file: ProgramFile<'db>,
     symbol: &str,
 ) -> Option<ScopeId<'db>> {
+    if crate::types::starlark::StarlarkGlobal::lookup(db, file, symbol).is_some() {
+        return None;
+    }
     let env = ProgramEnvironment::from_file(file);
     builtins_symbol_impl(db, &env, symbol, BuiltinVisibility::runtime(db, file))
         .map(|(scope, _)| scope)

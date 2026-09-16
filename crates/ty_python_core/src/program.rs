@@ -12,18 +12,63 @@ use crate::ProgramFile;
 // Re-export the misconfiguration strategy types from ty_module_resolver.
 pub use ty_module_resolver::{FallibleStrategy, MisconfigurationStrategy, UseDefaultStrategy};
 
-#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
+#[salsa::interned(debug, constructor=new_internal, heap_size=ruff_memory_usage::heap_size)]
 pub struct Program<'db> {
     #[returns(ref)]
     pub python_platform: PythonPlatform,
 
     #[returns(copy)]
     pub resolver_environment: ResolverEnvironment<'db>,
+
+    #[returns(copy)]
+    pub language: ProgramLanguage,
+}
+
+/// Runtime semantics used by type operations, including operations on builtin types.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize)]
+pub enum ProgramLanguage {
+    Python,
+    Starlark,
 }
 
 impl get_size2::GetSize for Program<'_> {}
 
 impl<'db> Program<'db> {
+    pub fn new(
+        db: &'db dyn Db,
+        python_platform: &PythonPlatform,
+        resolver_environment: ResolverEnvironment<'db>,
+    ) -> Self {
+        Self::new_internal(
+            db,
+            python_platform,
+            resolver_environment,
+            ProgramLanguage::Python,
+        )
+    }
+
+    pub fn new_starlark(
+        db: &'db dyn Db,
+        python_platform: &PythonPlatform,
+        resolver_environment: ResolverEnvironment<'db>,
+    ) -> Self {
+        Self::new_internal(
+            db,
+            python_platform,
+            resolver_environment,
+            ProgramLanguage::Starlark,
+        )
+    }
+
+    pub fn from_starlark_settings(db: &'db dyn Db, settings: &ProgramSettings) -> Self {
+        let program = Self::from_settings(db, settings);
+        Self::new_starlark(
+            db,
+            program.python_platform(db),
+            program.resolver_environment(db),
+        )
+    }
+
     /// Creates a program from settings whose search roots have already been registered.
     pub fn from_settings(db: &'db dyn Db, settings: &ProgramSettings) -> Self {
         let ProgramSettings {

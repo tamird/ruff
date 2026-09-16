@@ -3479,6 +3479,13 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                 })
             }),
 
+            // Host declaration identity does not attest runtime object identity:
+            // two registered names can refer to the same native function.
+            (
+                Type::KnownInstance(KnownInstanceType::StarlarkGlobal(_)),
+                Type::KnownInstance(KnownInstanceType::StarlarkGlobal(_)),
+            ) => self.never(),
+
             // These types are disjoint whenever their represented objects differ.
             (
                 // `LiteralString` can represent different strings and is handled above.

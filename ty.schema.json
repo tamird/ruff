@@ -1474,6 +1474,16 @@
             }
           ]
         },
+        "unavailable-host-function": {
+          "title": "detects host calls unavailable in the current Starlark module",
+          "description": "## What it does\nReports calls to host functions that are unavailable in the current Starlark module.\n\n## Why is this bad?\nSome hosts expose functions that can only run while initializing a loaded module.\nCalling them from the invocation's source root fails even when argument types match.\n\nA call in a loaded function body has an unknown execution context; this rule does\nnot claim that such a call is available or unavailable.",
+          "default": "error",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/Level"
+            }
+          ]
+        },
         "unavailable-implicit-super-arguments": {
           "title": "detects invalid `super()` calls where implicit arguments are unavailable.",
           "description": "## What it does\n\nDetects invalid `super()` calls where implicit arguments like the enclosing class or first method\nargument are unavailable.\n\n## Why is this bad?\n\nWhen `super()` is used without arguments, Python tries to find two things: the nearest enclosing\nclass and the first argument of the immediately enclosing function (typically self or cls). If\neither of these is missing, the call will fail at runtime with a `RuntimeError`.\n\n## Examples\n\n```python\n# no enclosing class or function found\nsuper()  # error\n\n\ndef func():\n    # no enclosing class or first argument exists\n    super()  # error\n\n\nclass A:\n    # no enclosing function to provide the first argument\n    f = super()  # error\n\n    def method(self):\n        def nested():\n            # first argument does not exist in this nested function\n            super()  # error\n\n        # first argument does not exist in this lambda\n        lambda: super()  # error\n\n        # argument is not available in generator expression\n        (super() for _ in range(10))  # error\n\n        super()  # okay! both enclosing class and first argument are available\n```\n\n## References\n\n- [Python documentation: super()](https://docs.python.org/3/library/functions.html#super)",
