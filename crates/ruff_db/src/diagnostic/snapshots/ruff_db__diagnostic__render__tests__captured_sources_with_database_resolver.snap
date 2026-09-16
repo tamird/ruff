@@ -1,0 +1,14 @@
+---
+source: crates/ruff_db/src/diagnostic/render.rs
+expression: concrete
+---
+error[invalid-argument-type]: expected int, got str
+ --> root.star:1:9
+  |
+1 | value = "bad"
+  |         ^^^^^
+  |
+ ::: lib.star:1:8
+  |
+1 | value: int
+  |        --- declared here

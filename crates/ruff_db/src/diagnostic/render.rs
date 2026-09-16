@@ -838,14 +838,16 @@ where
                 .as_notebook()
                 .map(Notebook::index)
                 .cloned(),
-            UnifiedFile::Ruff(_) => unimplemented!("Expected an interned ty file"),
+            // SourceFile spans contain text but no notebook metadata. Ruff's
+            // emitter supplies that mapping when rendering notebook cells.
+            UnifiedFile::Ruff(_) => None,
         }
     }
 
     fn is_notebook(&self, file: &UnifiedFile) -> bool {
         match file {
             UnifiedFile::Ty(file) => self.input(*file).text.as_notebook().is_some(),
-            UnifiedFile::Ruff(_) => unimplemented!("Expected an interned ty file"),
+            UnifiedFile::Ruff(_) => false,
         }
     }
 
@@ -874,14 +876,14 @@ impl FileResolver for &dyn Db {
                 .as_notebook()
                 .map(Notebook::index)
                 .cloned(),
-            UnifiedFile::Ruff(_) => unimplemented!("Expected an interned ty file"),
+            UnifiedFile::Ruff(_) => None,
         }
     }
 
     fn is_notebook(&self, file: &UnifiedFile) -> bool {
         match file {
             UnifiedFile::Ty(file) => self.input(*file).text.as_notebook().is_some(),
-            UnifiedFile::Ruff(_) => unimplemented!("Expected an interned ty file"),
+            UnifiedFile::Ruff(_) => false,
         }
     }
 
@@ -1126,8 +1128,8 @@ impl FileResolver for DummyFileResolver {
 
 #[cfg(test)]
 mod tests {
-
     use ruff_diagnostics::{Applicability, Edit, Fix};
+    use ruff_source_file::SourceFileBuilder;
 
     use crate::diagnostic::{
         Annotation, DiagnosticId, IntoDiagnosticMessage, SecondaryCode, Severity, Span,
@@ -1199,6 +1201,34 @@ watermelon
 ΦΦΦΦΦΦΦΦΦΦΦΦ
 λλλλλλλλλλλλ
 ";
+
+    #[test]
+    fn captured_sources_with_database_resolver() -> crate::system::Result<()> {
+        let mut db = TestDb::new();
+        db.write_file("/root.star", "disk contents\n")?;
+        let source = SourceFileBuilder::new("/root.star", "value = \"bad\"\n").finish();
+        let declaration = SourceFileBuilder::new("/lib.star", "value: int\n").finish();
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticId::lint("invalid-argument-type"),
+            Severity::Error,
+            "expected int, got str",
+        );
+        diagnostic.annotate(Annotation::primary(
+            Span::from(source).with_range(TextRange::new(8.into(), 13.into())),
+        ));
+        diagnostic.annotate(
+            Annotation::secondary(
+                Span::from(declaration).with_range(TextRange::new(7.into(), 10.into())),
+            )
+            .message("declared here"),
+        );
+        let config = DisplayDiagnosticConfig::new("ty");
+        let concrete = diagnostic.display(&db, &config).to_string();
+        let erased: &dyn Db = &db;
+        assert_eq!(concrete, diagnostic.display(&erased, &config).to_string());
+        insta::assert_snapshot!(concrete);
+        Ok(())
+    }
 
     #[test]
     fn basic() {
