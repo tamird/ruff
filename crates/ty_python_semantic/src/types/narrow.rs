@@ -4548,10 +4548,10 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 let class_info_ty = inference.expression_type(second_arg);
 
                 if self.env.is_starlark(db) && function == ClassInfoConstraintFunction::IsInstance {
-                    // A runtime type expression can contain gradual or abstract type
-                    // objects. Its inferred type bounds successful matches, but failure
-                    // does not exclude every value represented by that bound.
-                    if !is_positive {
+                    // A known class excludes its instances after a failed check. An
+                    // abstract type object or a choice of class values only bounds
+                    // successful matches: failure need not exclude the entire bound.
+                    if !is_positive && !matches!(class_info_ty, Type::ClassLiteral(_)) {
                         return None;
                     }
                     let constraint = class_info_ty
@@ -4561,7 +4561,11 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                     let constraint = constraint.top_materialization(db, &self.env);
                     return Some(NarrowingConstraints::from_iter([(
                         place,
-                        NarrowingConstraint::intersection(constraint),
+                        NarrowingConstraint::intersection(constraint.negate_if(
+                            db,
+                            &self.env,
+                            !is_positive,
+                        )),
                     )]));
                 }
 

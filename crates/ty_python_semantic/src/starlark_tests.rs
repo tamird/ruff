@@ -245,6 +245,52 @@ fn starlark_isinstance_uses_type_expressions_and_positive_constraints() -> anyho
 }
 
 #[test]
+fn starlark_isinstance_excludes_only_known_classes() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/typeshed/stdlib/builtins.pyi",
+            indoc! {r#"
+            class object: ...
+            class type:
+                def __or__(self, other: object, /) -> object: ...
+            class int: ...
+            class bool: ...
+            class str: ...
+            def isinstance(value: object, types: object, /) -> bool: ...
+        "#},
+        )
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+            First = record(value=int)
+            Second = record(value=str)
+            Third = record(value=bool)
+            def last(value: First | Second | Third) -> Third:
+                if isinstance(value, First):
+                    return Third(value=True)
+                elif isinstance(value, Second):
+                    return Third(value=False)
+                else:
+                    return value
+            def uncertain(value: First | Second | Third, condition: bool) -> Third:
+                target = First if condition else Second
+                if isinstance(value, target):
+                    return Third(value=True)
+                return value
+        "#},
+        )
+        .build()?;
+    let root = host_module(&mut db, "/src/root.star", record_globals())?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        ["invalid-return-type"],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn starlark_variadic_annotations_describe_collected_arguments() -> anyhow::Result<()> {
     let db = builder()
         .with_file(
@@ -902,7 +948,7 @@ fn loaded_records_keep_logical_identity_and_field_provenance() -> anyhow::Result
             diagnostics[1]
                 .sub_diagnostics()
                 .iter()
-                .flat_map(|sub| sub.annotations()),
+                .flat_map(ruff_db::diagnostic::SubDiagnostic::annotations),
         )
         .any(|annotation| {
             let span = annotation.get_span();
