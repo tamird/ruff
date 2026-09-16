@@ -1,6 +1,6 @@
 //! A diagnostics-only Starlark language server.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -193,7 +193,7 @@ impl Server {
                 if self.shutdown {
                     return Ok(false);
                 }
-                self.handle_notification(notification)?;
+                self.apply_notification(notification)?;
             }
             ServerMessage::Response(_) => {}
         }
@@ -215,6 +215,7 @@ impl Server {
                     },
                 );
                 File::sync_path(&mut self.db, &path);
+                self.needs_bazel_check |= is_bazel_relevant(&path);
                 self.documents.insert(
                     path,
                     OpenDocument {
@@ -223,7 +224,6 @@ impl Server {
                         revision,
                     },
                 );
-                self.needs_bazel_check = true;
             }
             "textDocument/didChange" => {
                 let params: DidChangeTextDocumentParams = serde_json::from_value(params)?;
@@ -241,15 +241,15 @@ impl Server {
                     .ok_or_else(|| anyhow!("change for unopened document {path}"))?;
                 let text = apply_changes(previous.text, params.content_changes, self.encoding)?;
                 let revision = self.next_revision();
-                self.system.open(path.clone(), OpenText { text, revision });
-                File::sync_path(&mut self.db, &path);
                 let document = self
                     .documents
                     .get_mut(&path)
-                    .expect("open document checked above");
+                    .ok_or_else(|| anyhow!("change for unopened document {path}"))?;
                 document.version = params.text_document.version;
                 document.revision = revision;
-                self.needs_bazel_check = true;
+                self.system.open(path.clone(), OpenText { text, revision });
+                File::sync_path(&mut self.db, &path);
+                self.needs_bazel_check |= is_bazel_relevant(&path);
             }
             "textDocument/didClose" => {
                 let params: DidCloseTextDocumentParams = serde_json::from_value(params)?;
@@ -257,21 +257,21 @@ impl Server {
                 self.documents.remove(&path);
                 self.system.close(&path);
                 File::sync_path(&mut self.db, &path);
-                self.needs_bazel_check = true;
+                self.needs_bazel_check |= is_bazel_relevant(&path);
             }
             "textDocument/didSave" => {
                 let params: DidSaveTextDocumentParams = serde_json::from_value(params)?;
                 let path = uri_path(&params.text_document.uri)?;
                 File::sync_path(&mut self.db, &path);
-                self.needs_bazel_check = true;
+                self.needs_bazel_check |= is_bazel_relevant(&path);
             }
             "workspace/didChangeWatchedFiles" => {
                 let params: DidChangeWatchedFilesParams = serde_json::from_value(params)?;
                 for event in params.changes {
                     let path = uri_path(&event.uri)?;
                     File::sync_path(&mut self.db, &path);
+                    self.needs_bazel_check |= is_bazel_relevant(&path);
                 }
-                self.needs_bazel_check = true;
             }
             _ => {}
         }
@@ -283,15 +283,37 @@ impl Server {
         self.revision
     }
 
+    fn apply_notification(&mut self, notification: lsp_server::Notification) -> Result<()> {
+        let method = notification.method.clone();
+        if let Err(error) = self.handle_notification(notification) {
+            self.connection.sender.send(ServerMessage::Notification(
+                lsp_server::Notification::new(
+                    "window/logMessage".into(),
+                    serde_json::json!({
+                        "type": 1,
+                        "message": format!("Sty rejected {method}: {error:#}"),
+                    }),
+                ),
+            ))?;
+        }
+        Ok(())
+    }
+
     fn drain_editor_notifications(&mut self) -> Result<()> {
+        if self.shutdown || !self.pending.is_empty() {
+            return Ok(());
+        }
         while let Ok(message) = self.connection.receiver.try_recv() {
             match message {
                 ServerMessage::Notification(notification)
                     if notification.method != ExitNotification::METHOD.as_str() =>
                 {
-                    self.handle_notification(notification)?;
+                    self.apply_notification(notification)?;
                 }
-                other => self.pending.push_back(other),
+                other => {
+                    self.pending.push_back(other);
+                    break;
+                }
             }
         }
         Ok(())
@@ -305,16 +327,14 @@ impl Server {
             let mut by_uri: HashMap<Uri, Vec<Diagnostic>> = HashMap::new();
             let mut documents: Vec<_> = self.documents.iter().collect();
             documents.sort_by_key(|(path, _)| *path);
+            let mut groups: BTreeMap<SystemPathBuf, Vec<BazelSource<'_>>> = BTreeMap::new();
             for (path, document) in documents {
                 if !is_bazel_source(path) {
                     continue;
                 }
                 by_uri.entry(document.uri.clone()).or_default();
-                let problems = match select_bazel_file(&self.db, path) {
-                    Ok(source) => match check_bazel_graph(&self.db, &[source]) {
-                        Ok(graph) => bazel_problems(&graph),
-                        Err(failure) => vec![SourceProblem::opaque(&failure)],
-                    },
+                match select_bazel_file(&self.db, path) {
+                    Ok((root, source)) => groups.entry(root).or_default().push(source),
                     Err(error) => {
                         by_uri
                             .entry(document.uri.clone())
@@ -322,10 +342,17 @@ impl Server {
                             .push(setup_diagnostic(format!("{error:#}")));
                         continue;
                     }
+                }
+            }
+            for sources in groups.values() {
+                let problems = match check_bazel_graph(&self.db, sources) {
+                    Ok(graph) => bazel_problems(&graph),
+                    Err(failure) => vec![SourceProblem::opaque(&failure)],
                 };
                 for problem in problems {
-                    let uri = file_uri(&self.db, problem.file)?;
-                    let diagnostic = bazel_diagnostic(&self.db, &problem, self.encoding)?;
+                    let uri = file_uri(&self.db, problem.file, &self.documents)?;
+                    let diagnostic =
+                        bazel_diagnostic(&self.db, &self.documents, &problem, self.encoding)?;
                     let items = by_uri.entry(uri).or_default();
                     if !items.contains(&diagnostic) {
                         items.push(diagnostic);
@@ -374,7 +401,25 @@ fn is_bazel_source(path: &SystemPath) -> bool {
     path.extension() == Some("bzl") || path.as_str().ends_with(".bzl.pyi")
 }
 
-fn select_bazel_file<'db>(db: &'db StyDb, path: &SystemPath) -> Result<BazelSource<'db>> {
+fn is_bazel_relevant(path: &SystemPath) -> bool {
+    is_bazel_source(path)
+        || matches!(
+            path.file_name(),
+            Some(
+                "BUILD"
+                    | "BUILD.bazel"
+                    | "MODULE.bazel"
+                    | "REPO.bazel"
+                    | "WORKSPACE"
+                    | "WORKSPACE.bazel"
+            )
+        )
+}
+
+fn select_bazel_file<'db>(
+    db: &'db StyDb,
+    path: &SystemPath,
+) -> Result<(SystemPathBuf, BazelSource<'db>)> {
     let source = if path.as_str().ends_with(".bzl.pyi") {
         let source = path
             .as_str()
@@ -392,7 +437,10 @@ fn select_bazel_file<'db>(db: &'db StyDb, path: &SystemPath) -> Result<BazelSour
     db.files().try_add_root(db, &root, FileRootKind::Project);
     let file = system_path_to_file(db, source)
         .with_context(|| format!("cannot select Bazel source {source}"))?;
-    Ok(BazelSource::new(db, BazelRepository::new(db, root), file))
+    Ok((
+        root.clone(),
+        BazelSource::new(db, BazelRepository::new(db, root), file),
+    ))
 }
 
 fn uri_path(uri: &Uri) -> Result<SystemPathBuf> {
@@ -403,11 +451,18 @@ fn uri_path(uri: &Uri) -> Result<SystemPathBuf> {
         .map_err(|path| anyhow!("Sty source path is not UTF-8: {path:?}"))
 }
 
-fn file_uri(db: &StyDb, file: File) -> Result<Uri> {
+fn file_uri(
+    db: &StyDb,
+    file: File,
+    documents: &HashMap<SystemPathBuf, OpenDocument>,
+) -> Result<Uri> {
     let path = file
         .path(db)
         .as_system_path()
         .ok_or_else(|| anyhow!("Sty problem has no source path"))?;
+    if let Some(document) = documents.get(path) {
+        return Ok(document.uri.clone());
+    }
     Uri::from_file_path(path.as_std_path())
         .map_err(|()| anyhow!("cannot represent Sty source URI {path}"))
 }
@@ -422,7 +477,12 @@ fn setup_diagnostic(message: String) -> Diagnostic {
     }
 }
 
-fn bazel_diagnostic(db: &StyDb, problem: &SourceProblem, encoding: Encoding) -> Result<Diagnostic> {
+fn bazel_diagnostic(
+    db: &StyDb,
+    documents: &HashMap<SystemPathBuf, OpenDocument>,
+    problem: &SourceProblem,
+    encoding: Encoding,
+) -> Result<Diagnostic> {
     let mut diagnostic = setup_diagnostic(problem.message.clone());
     if let Some(range) = problem.range {
         diagnostic.range = source_range(db, problem.file, range, encoding)?;
@@ -430,7 +490,7 @@ fn bazel_diagnostic(db: &StyDb, problem: &SourceProblem, encoding: Encoding) -> 
     if let Some(related) = &problem.related {
         if let Some(range) = related.range {
             let location = Location {
-                uri: file_uri(db, related.file)?,
+                uri: file_uri(db, related.file, documents)?,
                 range: source_range(db, related.file, range, encoding)?,
             };
             diagnostic.related_information = Some(vec![DiagnosticRelatedInformation {

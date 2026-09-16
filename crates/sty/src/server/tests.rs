@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ struct TestServer {
     root: tempfile::TempDir,
     connection: Connection,
     thread: Option<JoinHandle<()>>,
+    request_id: AtomicI32,
 }
 
 impl TestServer {
@@ -26,6 +28,7 @@ impl TestServer {
             root,
             connection,
             thread: Some(thread),
+            request_id: AtomicI32::new(10),
         };
         harness
             .connection
@@ -104,7 +107,10 @@ impl TestServer {
     }
 
     fn published(&self, relative: &str) -> PublishDiagnosticsParams {
-        let uri = self.uri(relative);
+        self.published_uri(&self.uri(relative))
+    }
+
+    fn published_uri(&self, uri: &Uri) -> PublishDiagnosticsParams {
         for _ in 0..16 {
             let message = self
                 .connection
@@ -117,21 +123,52 @@ impl TestServer {
             assert_eq!(notification.method, "textDocument/publishDiagnostics");
             let publication: PublishDiagnosticsParams =
                 serde_json::from_value(notification.params).unwrap();
-            if publication.uri == uri {
+            if &publication.uri == uri {
                 return publication;
             }
         }
         panic!("no diagnostics for {uri}");
     }
 
-    fn no_pending_publication(&self) {
+    fn logged_error(&self, expected: &str) {
+        let message = self
+            .connection
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let Message::Notification(notification) = message else {
+            panic!("expected editor log message, got {message:?}");
+        };
+        assert_eq!(notification.method, "window/logMessage");
+        assert_eq!(notification.params["type"], 1);
         assert!(
-            self.connection
-                .receiver
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "duplicate diagnostic publish"
+            notification.params["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected)
         );
+    }
+
+    fn no_pending_publication(&self) {
+        let id = RequestId::from(self.request_id.fetch_add(1, Ordering::Relaxed));
+        self.connection
+            .sender
+            .send(Message::Request(Request {
+                id: id.clone(),
+                method: "sty/test/barrier".into(),
+                params: serde_json::Value::Null,
+            }))
+            .unwrap();
+        let message = self
+            .connection
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let Message::Response(response) = message else {
+            panic!("unexpected diagnostic publication before the protocol barrier: {message:?}");
+        };
+        assert_eq!(response.id, id);
+        assert!(response.response_result.is_err());
     }
 }
 
@@ -352,4 +389,143 @@ fn utf16_incremental_change_replaces_the_intended_bytes() {
     )
     .unwrap();
     assert_eq!(changed, "A😀XC\n");
+}
+
+#[test]
+fn bad_editor_notifications_log_an_error_and_preserve_following_edits() {
+    let server = TestServer::new();
+    server.write("MODULE.bazel", "");
+    server.write("pkg/BUILD", "");
+    server.write("pkg/entry.bzl", "GOOD = 1\n");
+    server.open("pkg/entry.bzl", "GOOD = 1\n", 1);
+    assert!(server.published("pkg/entry.bzl").diagnostics.is_empty());
+
+    server.change(
+        "pkg/unknown.bzl",
+        2,
+        &serde_json::json!([{"text":"GOOD = 2\n"}]),
+    );
+    server.logged_error("change for unopened document");
+    server.notify("textDocument/didOpen", serde_json::json!({
+        "textDocument":{"uri":"https://example.com/source.bzl","languageId":"starlark","version":1,"text":"GOOD = 2\n"}
+    }));
+    server.logged_error("Sty checks only file URIs");
+    server.change("pkg/entry.bzl", 2, &serde_json::json!([{
+        "range":{"start":{"line":1,"character":0},"end":{"line":0,"character":0}},"text":"BROKEN = 1\n"
+    }]));
+    server.logged_error("inverted source range");
+    server.no_pending_publication();
+
+    server.change(
+        "pkg/entry.bzl",
+        2,
+        &serde_json::json!([{
+            "text":"def foo(value):\n    return value\ndef bad():\n    return foo(1, 2)\n"
+        }]),
+    );
+    let publication = server.published("pkg/entry.bzl");
+    assert_eq!(publication.version, Some(2));
+    assert!(has_error(
+        &publication.diagnostics,
+        "expects 1 positional argument"
+    ));
+    server.no_pending_publication();
+}
+
+#[test]
+fn opened_percent_encoded_uri_owns_the_versioned_source_diagnostic() {
+    let server = TestServer::new();
+    server.write("MODULE.bazel", "");
+    server.write("pkg/BUILD", "");
+    server.write("pkg/entry.bzl", "GOOD = 1\n");
+    let original = server.uri("pkg/entry.bzl");
+    let alternate = Uri::parse(&original.as_str().replace("entry.bzl", "%65ntry.bzl")).unwrap();
+    assert_ne!(alternate, original);
+    server.notify(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument":{"uri":alternate,"languageId":"starlark","version":7,
+                "text":"def foo(value):\n    return value\ndef bad():\n    return foo(1, 2)\n"}
+        }),
+    );
+    let publication = server.published_uri(&alternate);
+    assert_eq!(publication.uri, alternate);
+    assert_eq!(publication.version, Some(7));
+    assert!(has_error(
+        &publication.diagnostics,
+        "expects 1 positional argument"
+    ));
+    server.no_pending_publication();
+}
+
+#[test]
+fn simultaneous_sources_in_nested_repositories_keep_independent_graphs() {
+    let server = TestServer::new();
+    server.write("MODULE.bazel", "");
+    server.write("pkg/BUILD", "");
+    server.write(
+        "pkg/outer.bzl",
+        "def foo(value):\n    return value\ndef bad():\n    return foo(1, 2)\n",
+    );
+    server.write("nested/MODULE.bazel", "");
+    server.write("nested/pkg/BUILD", "");
+    server.write("nested/pkg/inner.bzl", "GOOD = 1\n");
+    server.open(
+        "pkg/outer.bzl",
+        "def foo(value):\n    return value\ndef bad():\n    return foo(1, 2)\n",
+        1,
+    );
+    assert!(has_error(
+        &server.published("pkg/outer.bzl").diagnostics,
+        "expects 1 positional argument"
+    ));
+    server.open("nested/pkg/inner.bzl", "GOOD = 1\n", 1);
+    assert!(
+        server
+            .published("nested/pkg/inner.bzl")
+            .diagnostics
+            .is_empty()
+    );
+    assert!(has_error(
+        &server.published("pkg/outer.bzl").diagnostics,
+        "expects 1 positional argument"
+    ));
+    server.no_pending_publication();
+}
+
+#[test]
+fn shutdown_prevents_queued_edits_from_mutating_the_source() {
+    let server = TestServer::new();
+    server.write("MODULE.bazel", "");
+    server.write("pkg/BUILD", "");
+    server.write("pkg/entry.bzl", "GOOD = 1\n");
+    server.open("pkg/entry.bzl", "GOOD = 1\n", 1);
+    assert!(server.published("pkg/entry.bzl").diagnostics.is_empty());
+    server
+        .connection
+        .sender
+        .send(Message::Request(Request {
+            id: RequestId::from(2),
+            method: "shutdown".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    server.change(
+        "pkg/entry.bzl",
+        2,
+        &serde_json::json!([{
+            "text":"def foo(value):\n    return value\ndef bad():\n    return foo(1, 2)\n"
+        }]),
+    );
+    let response = server
+        .connection
+        .receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let Message::Response(response) = response else {
+        panic!("expected shutdown response, got {response:?}");
+    };
+    assert_eq!(response.id, RequestId::from(2));
+    assert!(response.response_result.is_ok());
+    server.no_pending_publication();
 }
