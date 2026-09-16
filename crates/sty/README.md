@@ -27,6 +27,11 @@ parser also marks valid Starlark forms outside the shared Python parser
 subset opaque. Unsupported source semantics and uncheckable stubs are
 opaque, and opaque sources cause a nonzero exit.
 
+Command diagnostics use Ruff's renderer, with source snippets, diagnostic
+codes, and related declarations. The editor uses the same diagnostics and
+codes. Host source snippets and editor ranges refer to the captured source
+text, including unsaved changes.
+
 `sty server` checks open `.bzl` and sibling `.bzl.pyi` files in a marked
 repository without Sty configuration. It uses unsaved editor text and
 rechecks importers when an opened load, BUILD file, or repository marker

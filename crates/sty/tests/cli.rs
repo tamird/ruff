@@ -323,24 +323,7 @@ fn full_graph_errors_include_source_stub_and_distinct_actual_argument_kinds() ->
         &["check", "//consumer:entry.bzl", "//consumer:other.bzl"],
     )?;
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    let errors = stderr(&output);
-    assert!(
-        errors.contains("consumer/entry.bzl:4:19: error: function 'helper' can receive str"),
-        "{errors}"
-    );
-    assert!(
-        errors.contains("consumer/entry.bzl:4:19: error: function 'helper' can receive bool"),
-        "{errors}"
-    );
-    assert_eq!(errors.matches("can receive").count(), 2);
-    assert!(errors.contains("declared at"));
-    assert!(errors.contains("shared/defs.bzl.pyi:1:"), "{errors}");
-    assert!(errors.contains("consumer/other.bzl:3:12:"), "{errors}");
-    assert!(
-        errors.contains("expects 1 positional argument, got 2"),
-        "{errors}"
-    );
-    assert!(errors.contains("shared/defs.bzl:1:"), "{errors}");
+    insta::assert_snapshot!(stderr(&output));
     Ok(())
 }
 
@@ -356,15 +339,7 @@ fn parser_limit_and_duplicate_loads_fail_with_concrete_reason_and_related_span()
     )?;
     let limited = Fixture::run(fixture.root.path(), &["check", "//pkg:limited.bzl"])?;
     assert_eq!(limited.status.code(), Some(1));
-    let limited_error = stderr(&limited);
-    assert!(
-        limited_error.contains("shared Python parser cannot check"),
-        "{limited_error}"
-    );
-    assert!(
-        limited_error.contains("pkg/limited.bzl:1:"),
-        "{limited_error}"
-    );
+    insta::assert_snapshot!("parser_limit", stderr(&limited));
 
     fixture.write(
         "pkg/duplicate.bzl",
@@ -372,23 +347,7 @@ fn parser_limit_and_duplicate_loads_fail_with_concrete_reason_and_related_span()
     )?;
     let duplicate = Fixture::run(fixture.root.path(), &["check", "//pkg:duplicate.bzl"])?;
     assert_eq!(duplicate.status.code(), Some(1));
-    let duplicate_error = stderr(&duplicate);
-    assert!(
-        duplicate_error.contains("load binds local name 'GOOD' more than once"),
-        "{duplicate_error}"
-    );
-    assert!(
-        duplicate_error.contains("pkg/duplicate.bzl:2:"),
-        "{duplicate_error}"
-    );
-    assert!(
-        duplicate_error.contains("first bound at"),
-        "{duplicate_error}"
-    );
-    assert!(
-        duplicate_error.contains("pkg/duplicate.bzl:1:"),
-        "{duplicate_error}"
-    );
+    insta::assert_snapshot!("duplicate_load", stderr(&duplicate));
     Ok(())
 }
 
@@ -636,25 +595,7 @@ fn host_v3_field_error_uses_the_captured_argument_and_type_spans() -> anyhow::Re
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stdout.is_empty(), "source JSON leaked");
-    let (_, argument_line) = source
-        .split_once('\n')
-        .ok_or_else(|| anyhow::anyhow!("field test lacks an argument line"))?;
-    let primary_column = argument_line
-        .find("\"bad\"")
-        .ok_or_else(|| anyhow::anyhow!("field test lacks an argument"))?
-        + 1;
-    let related_column = source
-        .find("int")
-        .ok_or_else(|| anyhow::anyhow!("field test lacks a type"))?
-        + 1;
-    assert_eq!(
-        stderr(&output),
-        format!(
-            "{}:2:{primary_column}: error: Config.value, expected int, got str\n  field declared at {}:1:{related_column}\n",
-            path.display(),
-            path.display(),
-        )
-    );
+    insta::assert_snapshot!(stderr(&output).replace(utf8_path(fixture.root.path())?, "[ROOT]"));
     assert_eq!(
         fs::read_to_string(&log)?,
         format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
@@ -707,25 +648,7 @@ fn host_v3_struct_member_error_keeps_loaded_source_locations() -> anyhow::Result
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stdout.is_empty(), "source JSON leaked");
-    let (_, argument_line) = root_source
-        .split_once('\n')
-        .ok_or_else(|| anyhow::anyhow!("struct test lacks an argument line"))?;
-    let primary_column = argument_line
-        .find('7')
-        .ok_or_else(|| anyhow::anyhow!("struct test lacks an argument"))?
-        + 1;
-    let related_column = module_source
-        .find("str")
-        .ok_or_else(|| anyhow::anyhow!("struct test lacks a field type"))?
-        + 1;
-    assert_eq!(
-        stderr(&output),
-        format!(
-            "{}:2:{primary_column}: error: images.repository.name, expected str, got int\n  field declared at {}:1:{related_column}\n",
-            root_path.display(),
-            module_path.display(),
-        )
-    );
+    insta::assert_snapshot!(stderr(&output).replace(utf8_path(fixture.root.path())?, "[ROOT]"));
     assert_eq!(
         fs::read_to_string(&log)?,
         format!(
@@ -757,26 +680,7 @@ fn host_v3_source_function_error_names_its_parameter_annotation() -> anyhow::Res
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stdout.is_empty(), "source JSON leaked");
-    let primary_column = source
-        .lines()
-        .nth(2)
-        .and_then(|line| line.find("\"wrong\""))
-        .ok_or_else(|| anyhow::anyhow!("source function test lacks call argument"))?
-        + 1;
-    let related_column = source
-        .lines()
-        .next()
-        .and_then(|line| line.find("bool"))
-        .ok_or_else(|| anyhow::anyhow!("source function test lacks annotation"))?
-        + 1;
-    assert_eq!(
-        stderr(&output),
-        format!(
-            "{}:3:{primary_column}: error: choose parameter multiarch, expected bool, got str\n  parameter annotated at {}:1:{related_column}\n",
-            path.display(),
-            path.display(),
-        )
-    );
+    insta::assert_snapshot!(stderr(&output).replace(utf8_path(fixture.root.path())?, "[ROOT]"));
     assert_eq!(
         fs::read_to_string(&log)?,
         format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
@@ -805,19 +709,7 @@ fn host_v3_native_error_uses_captured_argument_and_attested_signature() -> anyho
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stdout.is_empty(), "source JSON leaked");
-    let primary_column = source
-        .lines()
-        .nth(1)
-        .and_then(|line| line.find('7'))
-        .ok_or_else(|| anyhow::anyhow!("native test lacks a call argument"))?
-        + 1;
-    assert_eq!(
-        stderr(&output),
-        format!(
-            "{}:2:{primary_column}: error: example_host_native parameter value, expected str, got int\n  host signature: example_host_native(value: str) -> str\n",
-            path.display(),
-        )
-    );
+    insta::assert_snapshot!(stderr(&output).replace(utf8_path(fixture.root.path())?, "[ROOT]"));
     assert_eq!(
         fs::read_to_string(&log)?,
         format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
@@ -852,19 +744,7 @@ fn host_v3_root_only_availability_uses_captured_call_and_attested_fact() -> anyh
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stdout.is_empty(), "source JSON leaked");
-    let call_column = source
-        .lines()
-        .nth(1)
-        .and_then(|line| line.find("example_host_native"))
-        .ok_or_else(|| anyhow::anyhow!("availability test lacks the native call"))?
-        + 1;
-    assert_eq!(
-        stderr(&output),
-        format!(
-            "{}:2:{call_column}: error: example_host_native is unavailable from the source root\n  host availability: loaded_module_initialization\n",
-            path.display(),
-        )
-    );
+    insta::assert_snapshot!(stderr(&output).replace(utf8_path(fixture.root.path())?, "[ROOT]"));
     assert_eq!(
         fs::read_to_string(&log)?,
         format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
@@ -899,28 +779,7 @@ fn host_v3_native_shape_errors_use_call_and_argument_source_spans() -> anyhow::R
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stdout.is_empty(), "source JSON leaked");
-    let call_column = source
-        .lines()
-        .nth(1)
-        .and_then(|line| line.find("example_host_native()"))
-        .ok_or_else(|| anyhow::anyhow!("shape test lacks call"))?
-        + 1;
-    let argument_column = source
-        .lines()
-        .nth(2)
-        .and_then(|line| line.rfind('7'))
-        .ok_or_else(|| anyhow::anyhow!("shape test lacks extra argument"))?
-        + 1;
-    let signature =
-        "  host signature: example_host_native(value: any, *, sort_keys: bool (optional)) -> str\n";
-    assert_eq!(
-        stderr(&output),
-        format!(
-            "{}:2:{call_column}: error: example_host_native missing required parameter value\n{signature}{}:3:{argument_column}: error: example_host_native parameter sort_keys requires a named argument\n{signature}",
-            path.display(),
-            path.display(),
-        )
-    );
+    insta::assert_snapshot!(stderr(&output).replace(utf8_path(fixture.root.path())?, "[ROOT]"));
     assert_eq!(
         fs::read_to_string(&log)?,
         format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
@@ -956,19 +815,7 @@ fn host_v3_dead_function_default_reports_eager_native_call_span() -> anyhow::Res
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stdout.is_empty(), "source JSON leaked");
-    let column = source
-        .lines()
-        .nth(1)
-        .and_then(|line| line.find('7'))
-        .ok_or_else(|| anyhow::anyhow!("function default lacks native input"))?
-        + 1;
-    assert_eq!(
-        stderr(&output),
-        format!(
-            "{}:2:{column}: error: example_host_native parameter value, expected str, got int\n  host signature: example_host_native(value: str) -> str\n",
-            path.display()
-        )
-    );
+    insta::assert_snapshot!(stderr(&output).replace(utf8_path(fixture.root.path())?, "[ROOT]"));
     assert_eq!(
         fs::read_to_string(&log)?,
         format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
@@ -1024,26 +871,7 @@ fn host_v3_deferred_call_keeps_the_captured_root_and_loaded_annotation_spans() -
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stdout.is_empty(), "source JSON leaked");
-    let primary_column = root_source
-        .lines()
-        .nth(2)
-        .and_then(|line| line.find("\"wrong\""))
-        .ok_or_else(|| anyhow::anyhow!("deferred test lacks argument"))?
-        + 1;
-    let related_column = module_source
-        .lines()
-        .next()
-        .and_then(|line| line.find("bool"))
-        .ok_or_else(|| anyhow::anyhow!("deferred test lacks annotation"))?
-        + 1;
-    assert_eq!(
-        stderr(&output),
-        format!(
-            "{}:3:{primary_column}: error: api.submit.flag, expected bool, got str\n  field declared at {}:1:{related_column}\n",
-            root_path.display(),
-            module_path.display(),
-        )
-    );
+    insta::assert_snapshot!(stderr(&output).replace(utf8_path(fixture.root.path())?, "[ROOT]"));
     assert_eq!(
         fs::read_to_string(&log)?,
         format!(

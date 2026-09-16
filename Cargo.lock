@@ -4259,6 +4259,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "gen-lsp-types",
+ "insta",
  "lsp-server",
  "ruff_db",
  "ruff_notebook",

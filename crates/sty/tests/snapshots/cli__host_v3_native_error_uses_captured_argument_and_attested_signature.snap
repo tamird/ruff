@@ -1,0 +1,11 @@
+---
+source: crates/sty/tests/cli.rs
+expression: "stderr(&output).replace(utf8_path(fixture.root.path())?, \"[ROOT]\")"
+---
+error[invalid-argument-type]: example_host_native parameter value, expected str, got int
+ --> [ROOT]/root.star:2:31
+  |
+1 | if False:
+2 |     example_host_native(value=7)
+  |                               ^
+info: host signature: example_host_native(value: str) -> str

@@ -1,0 +1,22 @@
+---
+source: crates/sty/tests/cli.rs
+expression: "stderr(&output).replace(utf8_path(fixture.root.path())?, \"[ROOT]\")"
+---
+error[invalid-call]: example_host_native missing required parameter value
+ --> [ROOT]/root.star:2:5
+  |
+1 | if False:
+2 |     example_host_native()
+  |     ^^^^^^^^^^^^^^^^^^^^^
+3 |     example_host_native(1, 7)
+  |
+info: host signature: example_host_native(value: any, *, sort_keys: bool (optional)) -> str
+
+error[invalid-call]: example_host_native parameter sort_keys requires a named argument
+ --> [ROOT]/root.star:3:28
+  |
+1 | if False:
+2 |     example_host_native()
+3 |     example_host_native(1, 7)
+  |                            ^
+info: host signature: example_host_native(value: any, *, sort_keys: bool (optional)) -> str

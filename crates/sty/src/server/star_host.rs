@@ -13,18 +13,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam::channel::{self, Receiver, Sender, TrySendError};
-use lsp_types::{Diagnostic, DiagnosticRelatedInformation, Location, Range, Uri};
-use ruff_db::files::File;
+use lsp_types::{Diagnostic, Uri};
 use ruff_db::system::SystemPath;
-use ruff_source_file::LineIndex;
-use ruff_text_size::TextRange;
 use serde::Deserialize;
-use ty_starlark::star::{StarAnalysis, StarCheck, StarResolvedGraph, check_star_graph};
+use ty_starlark::star::check_star_graph;
 
 use crate::StyDb;
+use crate::diagnostics::star_diagnostics;
 use crate::host::CapturedGraph;
 
-use super::{Encoding, OpenDocument, setup_diagnostic, source_position};
+use super::{Encoding, OpenDocument, lsp_diagnostic, setup_diagnostic};
 
 const GRAPH_LIMIT: usize = 64 * 1024 * 1024;
 const STDERR_LIMIT: usize = 1024 * 1024;
@@ -439,16 +437,13 @@ pub(super) fn check_completion(
                 .to_str()
                 .ok_or_else(|| anyhow!("invalid host root path"))?;
             let graph = captured.into_star_graph(db, SystemPath::new(selected))?;
-            let snapshots = SourceSnapshots::new(db, &graph, &open)?;
             let result = check_star_graph(&graph);
-            let mut graph_diagnostics = HashMap::new();
-            add_star_diagnostics(
-                &mut graph_diagnostics,
-                &snapshots,
-                graph.root.file,
-                result,
-                encoding,
-            )?;
+            let problems = star_diagnostics(db, &graph, &result)?;
+            let mut graph_diagnostics: HashMap<Uri, Vec<Diagnostic>> = HashMap::new();
+            for problem in &problems {
+                let (uri, diagnostic) = lsp_diagnostic(db, documents, problem, encoding)?;
+                graph_diagnostics.entry(uri).or_default().push(diagnostic);
+            }
             Ok((observed, graph_diagnostics))
         });
         match result {
@@ -503,189 +498,6 @@ pub(super) fn check_completion(
 fn canonical(path: &Path) -> Result<PathBuf> {
     path.canonicalize()
         .with_context(|| format!("cannot find physical host source {}", path.display()))
-}
-
-struct SourceSnapshot<'a> {
-    uri: Uri,
-    text: &'a str,
-    index: LineIndex,
-}
-
-struct SourceSnapshots<'a> {
-    sources: HashMap<File, SourceSnapshot<'a>>,
-}
-
-impl<'a> SourceSnapshots<'a> {
-    fn new(
-        db: &StyDb,
-        graph: &'a StarResolvedGraph,
-        open: &HashMap<PathBuf, &OpenDocument>,
-    ) -> Result<Self> {
-        let mut sources = HashMap::new();
-        for source in
-            std::iter::once(&graph.root).chain(graph.modules.iter().map(|module| &module.source))
-        {
-            let path = source.file.path(db);
-            let path = path
-                .as_system_path()
-                .ok_or_else(|| anyhow!("host snapshot has no physical source path"))?;
-            let editor_uri = canonical(path.as_std_path())
-                .ok()
-                .and_then(|path| open.get(&path).map(|document| document.uri.clone()));
-            let uri = match editor_uri {
-                Some(uri) => uri,
-                None => Uri::from_file_path(path.as_std_path())
-                    .map_err(|()| anyhow!("cannot represent host source URI {path}"))?,
-            };
-            let snapshot = SourceSnapshot {
-                uri,
-                text: &source.text,
-                index: LineIndex::from_source_text(&source.text),
-            };
-            if let Some(existing) = sources.insert(source.file, snapshot) {
-                if existing.text != source.text {
-                    return Err(anyhow!(
-                        "host supplied conflicting source snapshots for {path}"
-                    ));
-                }
-            }
-        }
-        Ok(Self { sources })
-    }
-
-    fn location(&self, file: File, range: TextRange, encoding: Encoding) -> Result<Location> {
-        let source = self
-            .sources
-            .get(&file)
-            .ok_or_else(|| anyhow!("host source graph omitted a diagnostic source"))?;
-        if source
-            .text
-            .get(range.start().to_usize()..range.end().to_usize())
-            .is_none()
-        {
-            return Err(anyhow!(
-                "host source graph supplied an invalid diagnostic span"
-            ));
-        }
-        Ok(Location {
-            uri: source.uri.clone(),
-            range: Range::new(
-                source_position(source.text, &source.index, range.start(), encoding)?,
-                source_position(source.text, &source.index, range.end(), encoding)?,
-            ),
-        })
-    }
-
-    fn uri(&self, file: File) -> Result<Uri> {
-        self.sources
-            .get(&file)
-            .map(|snapshot| snapshot.uri.clone())
-            .ok_or_else(|| anyhow!("host source graph omitted a diagnostic source"))
-    }
-}
-
-fn add_star_diagnostics(
-    diagnostics: &mut HashMap<Uri, Vec<Diagnostic>>,
-    snapshots: &SourceSnapshots,
-    root: File,
-    check: StarCheck,
-    encoding: Encoding,
-) -> Result<()> {
-    match check {
-        StarCheck::Partial(analysis) => add_analysis(diagnostics, snapshots, &analysis, encoding),
-        StarCheck::Opaque(failure) => {
-            let mut diagnostic = setup_diagnostic(failure.reason().to_string());
-            let location = if let Some(range) = failure.range() {
-                let location = snapshots.location(failure.file(), range, encoding)?;
-                diagnostic.range = location.range;
-                location
-            } else {
-                Location {
-                    uri: snapshots.uri(failure.file())?,
-                    range: diagnostic.range,
-                }
-            };
-            diagnostics
-                .entry(location.uri.clone())
-                .or_default()
-                .push(diagnostic);
-            if root != failure.file() {
-                let mut blocked = setup_diagnostic(format!(
-                    "cannot check the .star root because a loaded source is opaque: {}",
-                    failure.reason()
-                ));
-                blocked.related_information = Some(vec![DiagnosticRelatedInformation {
-                    location,
-                    message: "loaded source is opaque".into(),
-                }]);
-                diagnostics
-                    .entry(snapshots.uri(root)?)
-                    .or_default()
-                    .push(blocked);
-            }
-            Ok(())
-        }
-    }
-}
-
-fn add_analysis(
-    diagnostics: &mut HashMap<Uri, Vec<Diagnostic>>,
-    snapshots: &SourceSnapshots,
-    analysis: &StarAnalysis,
-    encoding: Encoding,
-) -> Result<()> {
-    for problem in analysis.problems() {
-        let location = snapshots.location(problem.file(), problem.range(), encoding)?;
-        let related =
-            snapshots.location(problem.related_file(), problem.related_range(), encoding)?;
-        let mut diagnostic = setup_diagnostic(problem.to_string());
-        diagnostic.range = location.range;
-        diagnostic.related_information = Some(vec![DiagnosticRelatedInformation {
-            location: related,
-            message: format!("{} at", problem.related_label()),
-        }]);
-        diagnostics
-            .entry(location.uri)
-            .or_default()
-            .push(diagnostic);
-    }
-    for problem in analysis.native_problems() {
-        let location = snapshots.location(problem.file(), problem.range(), encoding)?;
-        let mut diagnostic = setup_diagnostic(format!(
-            "{problem} (host signature: {})",
-            problem.signature()
-        ));
-        diagnostic.range = location.range;
-        diagnostics
-            .entry(location.uri)
-            .or_default()
-            .push(diagnostic);
-    }
-    for problem in analysis.native_call_problems() {
-        let location = snapshots.location(problem.file(), problem.range(), encoding)?;
-        let mut diagnostic = setup_diagnostic(format!(
-            "{problem} (host signature: {})",
-            problem.signature()
-        ));
-        diagnostic.range = location.range;
-        diagnostics
-            .entry(location.uri)
-            .or_default()
-            .push(diagnostic);
-    }
-    for problem in analysis.native_availability_problems() {
-        let location = snapshots.location(problem.file(), problem.range(), encoding)?;
-        let mut diagnostic = setup_diagnostic(format!(
-            "{problem} (host availability: {})",
-            problem.availability()
-        ));
-        diagnostic.range = location.range;
-        diagnostics
-            .entry(location.uri)
-            .or_default()
-            .push(diagnostic);
-    }
-    Ok(())
 }
 
 #[cfg(all(test, unix))]

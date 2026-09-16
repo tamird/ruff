@@ -1,6 +1,5 @@
 //! Standalone Bazel `.bzl` and host-owned `.star` checking.
 
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,22 +7,19 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use ruff_db::Db;
-use ruff_db::files::{File, FileRootKind, Files};
-use ruff_db::source::{SourceText, source_text};
+use ruff_db::files::{FileRootKind, Files};
 use ruff_db::system::{OsSystem, System, SystemPath, SystemPathBuf};
 use ruff_db::vendored::VendoredFileSystem;
-use ruff_source_file::LineIndex;
-use ruff_text_size::TextRange;
 use ty_starlark::bazel::{BazelRepository, find_bazel_repository, resolve_bazel_target};
-use ty_starlark::graph::{BazelCheckedGraph, check_bazel_graph};
+use ty_starlark::graph::check_bazel_graph;
 use ty_starlark::source::BazelSource;
 
+mod diagnostics;
 mod editor_system;
 mod host;
-mod problems;
 mod server;
 
-use problems::{bazel_problems, graph_message};
+use diagnostics::{bazel_diagnostics, graph_message};
 
 #[salsa::db]
 #[derive(Clone)]
@@ -190,9 +186,9 @@ fn run_bazel(cwd: &SystemPath, options: CheckCommand) -> Result<bool> {
             graph_message(failure.reason())
         )
     })?;
-    Reporter::new(&db)
-        .report(&graph)
-        .context("cannot write Sty diagnostics")
+    let diagnostics = bazel_diagnostics(&graph);
+    diagnostics::report(&db, &diagnostics).context("cannot write Sty diagnostics")?;
+    Ok(diagnostics.is_empty())
 }
 
 fn absolute_cwd() -> Result<SystemPathBuf> {
@@ -202,59 +198,4 @@ fn absolute_cwd() -> Result<SystemPathBuf> {
         .context("cannot resolve current directory")?;
     SystemPathBuf::from_path_buf(path)
         .map_err(|path| anyhow!("current directory is not UTF-8: {path:?}"))
-}
-
-struct Reporter<'db> {
-    db: &'db dyn Db,
-    lines: HashMap<File, (SourceText, LineIndex)>,
-}
-
-impl<'db> Reporter<'db> {
-    fn new(db: &'db dyn Db) -> Self {
-        Self {
-            db,
-            lines: HashMap::new(),
-        }
-    }
-
-    fn report(&mut self, graph: &BazelCheckedGraph) -> io::Result<bool> {
-        let stderr = io::stderr();
-        let mut output = stderr.lock();
-        let problems = bazel_problems(graph);
-        for problem in &problems {
-            writeln!(
-                output,
-                "{}: error: {}",
-                self.location(problem.file, problem.range),
-                problem.message
-            )?;
-            if let Some(related) = &problem.related {
-                writeln!(
-                    output,
-                    "  {} {}",
-                    related.label,
-                    self.location(related.file, related.range)
-                )?;
-            }
-        }
-        Ok(problems.is_empty())
-    }
-
-    fn location(&mut self, file: File, range: Option<TextRange>) -> String {
-        let path = file.path(self.db).to_string();
-        let Some(range) = range else {
-            return path;
-        };
-        let (text, index) = self.lines.entry(file).or_insert_with(|| {
-            let text = source_text(self.db, file);
-            let index = LineIndex::from_source_text(text.as_str());
-            (text, index)
-        });
-        if text.read_error().is_none() && range.start().to_usize() <= text.as_str().len() {
-            let position = index.line_column(range.start(), text.as_str());
-            format!("{path}:{}:{}", position.line.get(), position.column.get())
-        } else {
-            format!("{path}:byte{}", range.start().to_usize())
-        }
-    }
 }

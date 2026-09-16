@@ -1,0 +1,11 @@
+---
+source: crates/sty/tests/cli.rs
+expression: stderr(&limited)
+---
+error[unsupported-starlark]: the shared Python parser cannot check this Starlark source: Positional argument cannot follow keyword argument at byte range 40..46
+ --> pkg/limited.bzl:1:41
+  |
+1 | load(":defs.bzl", "GOOD", alias="GOOD", "LATE")
+  |                                         ^^^^^^
+2 | ALSO = 1
+  |

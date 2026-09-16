@@ -254,6 +254,10 @@ fn configured_star_checks_frozen_root_and_loaded_editor_sources() {
         .find(|diagnostic| has_error(std::slice::from_ref(diagnostic), "expected int, got str"))
         .unwrap();
     assert_eq!(record.range.start.line, 2);
+    assert_eq!(
+        record.code,
+        Some(lsp_types::Code::String("invalid-argument-type".into()))
+    );
     let third_line = root_source.lines().nth(2).unwrap();
     assert_eq!(
         record.range.end.character,
@@ -642,6 +646,10 @@ fn unsaved_bazel_source_reports_utf16_and_related_uri_then_restores_disk() {
     assert_eq!(publication.version, Some(1));
     assert_eq!(publication.diagnostics.len(), 1, "{publication:?}");
     let error = &publication.diagnostics[0];
+    assert_eq!(
+        error.code,
+        Some(lsp_types::Code::String("invalid-argument-count".into()))
+    );
     assert!(
         has_error(&publication.diagnostics, "expects 1 positional argument"),
         "{publication:?}"

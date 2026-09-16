@@ -1,6 +1,7 @@
 //! A diagnostics-only Starlark language server.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -16,6 +17,7 @@ use lsp_types::{
     TextDocumentSyncOptions, Uri,
 };
 use ruff_db::Db as _;
+use ruff_db::diagnostic::{Diagnostic as SourceDiagnostic, Severity, Span, UnifiedFile};
 use ruff_db::files::{File, FileRootKind, system_path_to_file};
 use ruff_db::source::{line_index, source_text};
 use ruff_db::system::{SystemPath, SystemPathBuf};
@@ -26,8 +28,8 @@ use ty_starlark::graph::check_bazel_graph;
 use ty_starlark::source::BazelSource;
 
 use crate::StyDb;
+use crate::diagnostics::{bazel_diagnostics, bazel_failure};
 use crate::editor_system::{EditorSystem, OpenText};
-use crate::problems::{SourceProblem, bazel_problems};
 
 mod star_host;
 
@@ -424,13 +426,12 @@ impl Server {
             }
             for sources in groups.values() {
                 let problems = match check_bazel_graph(&self.db, sources) {
-                    Ok(graph) => bazel_problems(&graph),
-                    Err(failure) => vec![SourceProblem::opaque(&failure)],
+                    Ok(graph) => bazel_diagnostics(&graph),
+                    Err(failure) => vec![bazel_failure(&failure)],
                 };
                 for problem in problems {
-                    let uri = file_uri(&self.db, problem.file, &self.documents)?;
-                    let diagnostic =
-                        bazel_diagnostic(&self.db, &self.documents, &problem, self.encoding)?;
+                    let (uri, diagnostic) =
+                        lsp_diagnostic(&self.db, &self.documents, &problem, self.encoding)?;
                     let items = by_uri.entry(uri).or_default();
                     if !items.contains(&diagnostic) {
                         items.push(diagnostic);
@@ -706,42 +707,113 @@ fn setup_diagnostic(message: String) -> Diagnostic {
     }
 }
 
-fn bazel_diagnostic(
+/// Project Sty's primary and secondary annotations and text-only notes into
+/// the editor protocol. Located subdiagnostics are not emitted by Sty.
+fn lsp_diagnostic(
     db: &StyDb,
     documents: &HashMap<SystemPathBuf, OpenDocument>,
-    problem: &SourceProblem,
+    diagnostic: &SourceDiagnostic,
     encoding: Encoding,
-) -> Result<Diagnostic> {
-    let mut diagnostic = setup_diagnostic(problem.message.clone());
-    if let Some(range) = problem.range {
-        diagnostic.range = source_range(db, problem.file, range, encoding)?;
-    }
-    if let Some(related) = &problem.related {
-        if let Some(range) = related.range {
-            let location = Location {
-                uri: file_uri(db, related.file, documents)?,
-                range: source_range(db, related.file, range, encoding)?,
-            };
-            diagnostic.related_information = Some(vec![DiagnosticRelatedInformation {
-                location,
-                message: related.label.into(),
-            }]);
+) -> Result<(Uri, Diagnostic)> {
+    let primary = diagnostic
+        .primary_span()
+        .ok_or_else(|| anyhow!("Sty diagnostic has no source"))?;
+    let location = span_location(db, documents, &primary, encoding)?;
+    let mut message = diagnostic.concise_message().to_string();
+    for sub in diagnostic.sub_diagnostics() {
+        if sub.primary_annotation().is_none() {
+            write!(message, "\n\n{}: {}", sub.severity(), sub.concise_message())?;
         }
     }
-    Ok(diagnostic)
+    let mut related = Vec::new();
+    for annotation in diagnostic.secondary_annotations() {
+        if let Some(message) = annotation.get_message() {
+            related.push(DiagnosticRelatedInformation {
+                location: span_location(db, documents, annotation.get_span(), encoding)?,
+                message: message.to_string(),
+            });
+        }
+    }
+    let severity = match diagnostic.severity() {
+        Severity::Info => DiagnosticSeverity::Information,
+        Severity::Warning => DiagnosticSeverity::Warning,
+        Severity::Error => DiagnosticSeverity::Error,
+        Severity::Fatal => DiagnosticSeverity::Error,
+    };
+    Ok((
+        location.uri,
+        Diagnostic {
+            range: location.range,
+            severity: Some(severity),
+            code: Some(lsp_types::Code::String(diagnostic.id().to_string())),
+            source: Some("sty".into()),
+            message: lsp_types::Message::String(message),
+            related_information: (!related.is_empty()).then_some(related),
+            ..Diagnostic::default()
+        },
+    ))
 }
 
-fn source_range(db: &StyDb, file: File, range: TextRange, encoding: Encoding) -> Result<Range> {
-    let source = source_text(db, file);
-    let text = source.as_str();
+fn span_location(
+    db: &StyDb,
+    documents: &HashMap<SystemPathBuf, OpenDocument>,
+    span: &Span,
+    encoding: Encoding,
+) -> Result<Location> {
+    let (uri, range) = match span.file() {
+        UnifiedFile::Ty(file) => {
+            let uri = file_uri(db, *file, documents)?;
+            let range = if let Some(range) = span.range() {
+                let source = source_text(db, *file);
+                let index = line_index(db, *file);
+                text_range(source.as_str(), &index, range, encoding)?
+            } else {
+                Range::default()
+            };
+            (uri, range)
+        }
+        UnifiedFile::Ruff(source) => {
+            let path = SystemPath::new(source.name());
+            let document = documents.get(path).or_else(|| {
+                let physical = path.as_std_path().canonicalize().ok()?;
+                documents.iter().find_map(|(path, document)| {
+                    path.as_std_path()
+                        .canonicalize()
+                        .ok()
+                        .filter(|path| path == &physical)
+                        .map(|_| document)
+                })
+            });
+            let uri = if let Some(document) = document {
+                document.uri.clone()
+            } else {
+                Uri::from_file_path(path.as_std_path())
+                    .map_err(|()| anyhow!("cannot represent Sty source URI {path}"))?
+            };
+            let range = if let Some(range) = span.range() {
+                text_range(source.source_text(), source.index(), range, encoding)?
+            } else {
+                Range::default()
+            };
+            (uri, range)
+        }
+    };
+    Ok(Location { uri, range })
+}
+
+fn text_range(
+    text: &str,
+    index: &LineIndex,
+    range: TextRange,
+    encoding: Encoding,
+) -> Result<Range> {
     let bytes = range.start().to_usize()..range.end().to_usize();
     if text.get(bytes).is_none() {
-        return Err(anyhow!("Sty source range is outside {}", file.path(db)));
+        return Err(anyhow!("Sty diagnostic span is outside its source"));
     }
-    let index = line_index(db, file);
     Ok(Range::new(
-        source_position(text, &index, range.start(), encoding)?,
-        source_position(text, &index, range.end(), encoding)?,
+        source_position(text, index, range.start(), encoding)?,
+        source_position(text, index, range.end(), encoding)?,
     ))
 }
 

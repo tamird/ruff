@@ -1,0 +1,17 @@
+---
+source: crates/sty/tests/cli.rs
+expression: "stderr(&output).replace(utf8_path(fixture.root.path())?, \"[ROOT]\")"
+---
+error[invalid-argument-type]: images.repository.name, expected str, got int
+ --> [ROOT]/root.star:2:24
+  |
+1 | load("//example:images.star", "images")
+2 | images.repository(name=7)
+  |                        ^
+  |
+ ::: [ROOT]/images.star:1:26
+  |
+1 | Repository = record(name=str)
+  |                          --- field declared at
+2 | images = struct(repository=Repository)
+  |

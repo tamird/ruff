@@ -1,0 +1,13 @@
+---
+source: crates/sty/tests/cli.rs
+expression: stderr(&duplicate)
+---
+error[unsupported-starlark]: load binds local name 'GOOD' more than once
+ --> pkg/duplicate.bzl:2:19
+  |
+1 | load(":defs.bzl", "GOOD")
+  |                   ------ first bound at
+2 | load(":defs.bzl", "GOOD")
+  |                   ^^^^^^
+3 | COPIED = GOOD
+  |

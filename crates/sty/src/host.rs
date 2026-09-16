@@ -1,25 +1,22 @@
 //! The versioned process boundary for host-owned `.star` sources.
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command as ChildCommand, Stdio};
 
 use anyhow::{Context, Result, anyhow};
 use ruff_db::Db;
-use ruff_db::files::{File, system_path_to_file};
+use ruff_db::files::system_path_to_file;
 use ruff_db::system::{SystemPath, SystemPathBuf};
-use ruff_source_file::LineIndex;
 use ruff_text_size::{TextRange, TextSize};
 use serde::Deserialize;
 use ty_starlark::star::{
-    StarAnalysis, StarCheck, StarDirectLoad, StarFailure, StarFailureReason, StarHostFunction,
-    StarHostParam, StarHostProfile, StarIntrinsic, StarLoadBinding, StarModule, StarResolvedGraph,
-    StarSource, StarSpecialForm, check_star_graph,
+    StarCheck, StarDirectLoad, StarFailureReason, StarHostFunction, StarHostParam, StarHostProfile,
+    StarIntrinsic, StarLoadBinding, StarModule, StarResolvedGraph, StarSource, StarSpecialForm,
+    check_star_graph,
 };
 
 use super::{CheckCommand, StyDb, absolute_host_path, is_star_path};
+use crate::diagnostics;
 
 pub(super) fn run_host(cwd: &SystemPath, checker: &PathBuf, options: &CheckCommand) -> Result<i32> {
     let invocation = HostInvocation::new(cwd, options)?;
@@ -38,26 +35,17 @@ pub(super) fn run_host(cwd: &SystemPath, checker: &PathBuf, options: &CheckComma
     let db = StyDb::new(cwd);
     let graph = captured.into_star_graph(&db, &invocation.source)?;
     let outcome = check_star_graph(&graph);
-    let reporter = SnapshotReporter::new(&db, &graph);
-    match outcome {
-        StarCheck::Partial(analysis) => {
-            reporter.report_problems(&analysis)?;
-            if !analysis.problems().is_empty()
-                || !analysis.native_problems().is_empty()
-                || !analysis.native_call_problems().is_empty()
-                || !analysis.native_availability_problems().is_empty()
-            {
-                return Ok(1);
-            }
-        }
-        StarCheck::Opaque(failure) => {
-            reporter.report_failure(&failure)?;
-            return Ok(if is_graph_identity_failure(failure.reason()) {
-                2
-            } else {
-                1
-            });
-        }
+    let diagnostics = diagnostics::star_diagnostics(&db, &graph, &outcome)?;
+    diagnostics::report(&db, &diagnostics)?;
+    if let StarCheck::Opaque(failure) = &outcome {
+        return Ok(if is_graph_identity_failure(failure.reason()) {
+            2
+        } else {
+            1
+        });
+    }
+    if !diagnostics.is_empty() {
+        return Ok(1);
     }
 
     // The v3 graph already contains the source snapshots and host facts used
@@ -399,95 +387,4 @@ fn captured_source(
         text,
         loads: resolved_loads.into_boxed_slice(),
     })
-}
-
-struct SnapshotReporter<'db, 'graph> {
-    db: &'db dyn Db,
-    lines: HashMap<File, (&'graph str, LineIndex)>,
-}
-
-impl<'db, 'graph> SnapshotReporter<'db, 'graph> {
-    fn new(db: &'db dyn Db, graph: &'graph StarResolvedGraph) -> Self {
-        let StarResolvedGraph {
-            version: _,
-            profile: _,
-            root,
-            modules,
-        } = graph;
-        let mut lines = HashMap::new();
-        for source in std::iter::once(root).chain(modules.iter().map(|module| &module.source)) {
-            match lines.entry(source.file) {
-                Entry::Occupied(_) => {
-                    // check_star_graph rejects differing text for this File
-                    // before exposing any source range from either snapshot.
-                }
-                Entry::Vacant(entry) => {
-                    let text = source.text.as_str();
-                    entry.insert((text, LineIndex::from_source_text(text)));
-                }
-            }
-        }
-        Self { db, lines }
-    }
-
-    fn report_problems(&self, analysis: &StarAnalysis) -> Result<()> {
-        let stderr = io::stderr();
-        let mut output = stderr.lock();
-        for problem in analysis.problems() {
-            let primary = self.location(problem.file(), Some(problem.range()))?;
-            writeln!(output, "{primary}: error: {problem}")?;
-            let declaration =
-                self.location(problem.related_file(), Some(problem.related_range()))?;
-            writeln!(output, "  {} at {declaration}", problem.related_label())?;
-        }
-        for problem in analysis.native_problems() {
-            let primary = self.location(problem.file(), Some(problem.range()))?;
-            writeln!(output, "{primary}: error: {problem}")?;
-            writeln!(output, "  host signature: {}", problem.signature())?;
-        }
-        for problem in analysis.native_call_problems() {
-            let primary = self.location(problem.file(), Some(problem.range()))?;
-            writeln!(output, "{primary}: error: {problem}")?;
-            writeln!(output, "  host signature: {}", problem.signature())?;
-        }
-        for problem in analysis.native_availability_problems() {
-            let primary = self.location(problem.file(), Some(problem.range()))?;
-            writeln!(output, "{primary}: error: {problem}")?;
-            writeln!(output, "  host availability: {}", problem.availability())?;
-        }
-        Ok(())
-    }
-
-    fn report_failure(&self, failure: &StarFailure) -> Result<()> {
-        let primary = self.location(failure.file(), failure.range())?;
-        writeln!(
-            io::stderr().lock(),
-            "{primary}: error: {}",
-            failure.reason()
-        )?;
-        Ok(())
-    }
-
-    fn location(&self, file: File, range: Option<TextRange>) -> Result<String> {
-        let SnapshotReporter { db, lines } = self;
-        let path = file.path(*db).to_string();
-        let Some(range) = range else {
-            return Ok(path);
-        };
-        let (text, index) = lines
-            .get(&file)
-            .ok_or_else(|| anyhow!("captured .star source has no text for {path}"))?;
-        let bytes = range.start().to_usize()..range.end().to_usize();
-        if text.get(bytes).is_none() {
-            return Err(anyhow!(
-                "captured .star source has an invalid UTF-8 diagnostic span in {path}: {range:?}"
-            ));
-        }
-        let position = index.line_column(range.start(), text);
-        Ok(format!(
-            "{path}:{}:{}",
-            position.line.get(),
-            position.column.get()
-        ))
-    }
 }
