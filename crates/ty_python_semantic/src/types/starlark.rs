@@ -195,6 +195,49 @@ fn resolve_type<'db>(
     }
 }
 
+/// Project an aggregate source annotation into Ty's existing unpacked tuple
+/// parameter representation. This applies only to Starlark source functions;
+/// Python declarations of host functions retain Python parameter conventions.
+pub(super) fn variadic_positional_annotation<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    annotation: Type<'db>,
+) -> Option<Type<'db>> {
+    let annotation = annotation.resolve_type_alias(db);
+    if annotation.is_dynamic() || annotation.exact_tuple_instance_spec(db).is_some() {
+        Some(annotation)
+    } else if annotation.is_object() {
+        Some(Type::homogeneous_tuple(db, env, Type::unknown()))
+    } else {
+        None
+    }
+}
+
+/// Project a dictionary aggregate into the value type consumed by ordinary
+/// keyword binding. Correlated unions of dictionaries cannot be projected this
+/// way: independently accepting either value type would lose the correlation.
+pub(super) fn variadic_keyword_annotation<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    annotation: Type<'db>,
+) -> Option<Type<'db>> {
+    let annotation = annotation.resolve_type_alias(db);
+    if annotation.is_dynamic() {
+        return Some(annotation);
+    }
+    if annotation.is_object() {
+        return Some(Type::unknown());
+    }
+    let specialization = annotation.known_specialization(db, env, KnownClass::Dict)?;
+    let [key, value] = specialization.types(db) else {
+        return None;
+    };
+    KnownClass::Str
+        .to_instance(db, env)
+        .is_assignable_to(db, env, *key)
+        .then_some(*value)
+}
+
 #[cfg(test)]
 mod tests {
     use ruff_python_ast::name::Name;

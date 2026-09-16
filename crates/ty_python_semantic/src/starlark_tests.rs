@@ -245,6 +245,113 @@ fn starlark_isinstance_uses_type_expressions_and_positive_constraints() -> anyho
 }
 
 #[test]
+fn starlark_variadic_annotations_describe_collected_arguments() -> anyhow::Result<()> {
+    let db = builder()
+        .with_file(
+            "/typeshed/stdlib/builtins.pyi",
+            indoc! {r#"
+            class object: ...
+            class type: ...
+            class int: ...
+            class bool: ...
+            class str: ...
+            class tuple[T]:
+                def __getitem__(self, index: int, /) -> T: ...
+            class dict[K, V]:
+                def __getitem__(self, key: K, /) -> V: ...
+            def host_values(*values: str) -> str: ...
+        "#},
+        )
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+            def strings(*values: tuple[str, ...]) -> tuple[str, ...]:
+                return values
+            strings("one", "two")
+            strings(1)
+            def exact(*values: tuple[int, str]) -> str:
+                return values[1]
+            exact(1, "ok")
+            exact(1)
+            exact(1, "ok", 3)
+            exact("wrong", 1)
+            Keywords = dict[str, int]
+            def keywords(**values: Keywords) -> dict[str, int]:
+                return values
+            keywords(one=1, two=2)
+            keywords(one="wrong")
+            def empty(*values: ()):
+                return values
+            empty()
+            empty(1)
+            host_values("one", "two")
+            host_values(1)
+        "#},
+        )
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    let diagnostics = host_check(&db, root);
+    let mut actual = codes(&diagnostics);
+    actual.sort();
+    assert_eq!(
+        actual,
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "missing-argument",
+            "too-many-positional-arguments",
+            "too-many-positional-arguments"
+        ],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn starlark_variadic_annotations_report_unsupported_aggregate_forms() -> anyhow::Result<()> {
+    let db = builder()
+        .with_file(
+            "/typeshed/stdlib/builtins.pyi",
+            indoc! {r#"
+            class object: ...
+            class type:
+                def __or__(self, other: object, /) -> object: ...
+            class int: ...
+            class bool: ...
+            class str: ...
+            class tuple[T]: ...
+            class dict[K, V]: ...
+        "#},
+        )
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+            def scalar_args(*values: str):
+                return values
+            def scalar_kwargs(**values: int):
+                return values
+            def correlated(**values: dict[str, int] | dict[str, str]):
+                return values
+            def broad(*values: object, **keywords: object):
+                return values
+            broad(1, "two", value=3)
+        "#},
+        )
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        ["invalid-type-form"; 3],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn starlark_boolean_operations_do_not_use_integer_fast_paths() -> anyhow::Result<()> {
     let registry = crate::default_lint_registry();
     let mut rules = RuleSelection::from_registry(registry);

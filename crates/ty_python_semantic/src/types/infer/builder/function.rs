@@ -1131,7 +1131,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     /// Set initial declared/inferred types for a `*args` variadic positional parameter.
     ///
-    /// The annotated type is implicitly wrapped in a homogeneous tuple.
+    /// Python annotates individual arguments, so its annotated type is wrapped
+    /// in a homogeneous tuple. Starlark source annotates the collected tuple.
     ///
     /// See [`infer_parameter_definition`] doc comment for some relevant observations about scopes.
     ///
@@ -1145,6 +1146,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         if let Some(annotation) = parameter.annotation() {
             let annotated_type = self.file_expression_type(annotation);
+            if self.program_file().is_starlark(db) {
+                if crate::types::starlark::variadic_positional_annotation(
+                    db,
+                    self.program_environment(),
+                    annotated_type,
+                )
+                .is_none()
+                    && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                {
+                    builder.into_diagnostic("Unsupported Starlark `*args` annotation: expected a tuple type or a gradual aggregate type");
+                }
+                self.add_declaration_with_binding(
+                    parameter.into(),
+                    definition,
+                    &DeclaredAndInferredType::are_the_same_type(annotated_type),
+                );
+                return;
+            }
             let has_unpacked_annotation = self
                 .file_type_expression_flags(annotation)
                 .contains(TypeExpressionFlags::UNPACK);
@@ -1264,7 +1283,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     /// Set initial declared/inferred types for a `**kwargs` keyword-variadic parameter.
     ///
-    /// The annotated type is implicitly wrapped in a string-keyed dictionary.
+    /// Python annotates individual keyword values, so its annotated type is
+    /// wrapped in a string-keyed dictionary. Starlark source annotates that
+    /// collected dictionary directly.
     ///
     /// See [`infer_parameter_definition`] doc comment for some relevant observations about scopes.
     ///
@@ -1279,6 +1300,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         if let Some(annotation) = parameter.annotation() {
             let annotated_type = self.file_expression_type(annotation);
+            if self.program_file().is_starlark(db) {
+                if crate::types::starlark::variadic_keyword_annotation(db, env, annotated_type)
+                    .is_none()
+                    && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                {
+                    builder.into_diagnostic("Unsupported Starlark `**kwargs` annotation: expected a dictionary with string keys or a gradual aggregate type");
+                }
+                self.add_declaration_with_binding(
+                    parameter.into(),
+                    definition,
+                    &DeclaredAndInferredType::are_the_same_type(annotated_type),
+                );
+                return;
+            }
             let ty = if let Type::TypeVar(typevar) = annotated_type
                 && typevar.is_paramspec(db)
             {

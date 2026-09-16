@@ -5750,7 +5750,7 @@ impl<'db> Parameter<'db> {
         let index = semantic_index(db, function_definition.program_file(db));
         let definition = Some(index.expect_single_definition(parameter));
 
-        let (annotated_type, inferred_annotation, annotation_flags, has_starred_annotation) =
+        let (mut annotated_type, inferred_annotation, annotation_flags, mut has_starred_annotation) =
             if let Some(annotation) = parameter.annotation() {
                 (
                     function_signature_expression_type(db, function_definition, annotation),
@@ -5761,6 +5761,23 @@ impl<'db> Parameter<'db> {
             } else {
                 (Type::unknown(), true, TypeExpressionFlags::empty(), false)
             };
+        if function_definition.program_file(db).is_starlark(db) && !inferred_annotation {
+            let env = ProgramEnvironment::from_definition(function_definition);
+            match &kind {
+                ParameterKind::Variadic { name: _ } => {
+                    annotated_type =
+                        super::starlark::variadic_positional_annotation(db, &env, annotated_type)
+                            .unwrap_or_else(Type::unknown);
+                    has_starred_annotation = true;
+                }
+                ParameterKind::KeywordVariadic { name: _ } => {
+                    annotated_type =
+                        super::starlark::variadic_keyword_annotation(db, &env, annotated_type)
+                            .unwrap_or_else(Type::unknown);
+                }
+                _ => {}
+            }
+        }
         let has_unpacked_variadic_annotation = matches!(&kind, ParameterKind::Variadic { .. })
             && annotation_flags.contains(TypeExpressionFlags::UNPACK);
         let is_unpacked_typed_dict_kwargs = matches!(&kind, ParameterKind::KeywordVariadic { .. })
