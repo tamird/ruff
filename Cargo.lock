@@ -4257,6 +4257,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossbeam",
  "gen-lsp-types",
  "lsp-server",
  "ruff_db",

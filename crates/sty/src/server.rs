@@ -29,6 +29,8 @@ use crate::StyDb;
 use crate::editor_system::{EditorSystem, OpenText};
 use crate::problems::{SourceProblem, bazel_problems};
 
+mod star_host;
+
 #[cfg(test)]
 mod tests;
 
@@ -90,19 +92,22 @@ struct Server {
     system: EditorSystem,
     documents: HashMap<SystemPathBuf, OpenDocument>,
     published: HashSet<Uri>,
+    published_host: HashSet<Uri>,
+    host_sources: Vec<star_host::HostSource>,
+    host: Option<star_host::HostWorker>,
     pending: VecDeque<ServerMessage>,
     encoding: Encoding,
     revision: u64,
+    host_revision: u64,
     shutdown: bool,
     needs_bazel_check: bool,
+    needs_host_check: bool,
 }
 
 pub(crate) fn run_stdio(cwd: &SystemPath) -> Result<()> {
     let (connection, io_threads) = Connection::stdio();
-    let result = run_connection(connection, cwd);
-    let io_result = io_threads.join();
-    result?;
-    io_result.context("Sty language server I/O failed")
+    run_connection(connection, cwd)?;
+    io_threads.join().context("Sty language server I/O failed")
 }
 
 fn run_connection(connection: Connection, cwd: &SystemPath) -> Result<()> {
@@ -110,6 +115,43 @@ fn run_connection(connection: Connection, cwd: &SystemPath) -> Result<()> {
     let params: InitializeParams =
         serde_json::from_value(params).context("invalid LSP initialize request")?;
     let encoding = Encoding::negotiate(&params.capabilities);
+    let host_settings = match star_host::HostSettings::parse(params.initialization_options) {
+        Ok(settings) => settings,
+        Err(error) => {
+            connection
+                .sender
+                .send(ServerMessage::Response(Response::new_err(
+                    id,
+                    ErrorCode::InvalidParams as i32,
+                    format!("invalid Sty server configuration: {error:#}"),
+                )))?;
+            // Respond immediately, then wait for client exit or EOF so the
+            // stdio reader ends and the I/O threads can safely be joined.
+            while let Ok(message) = connection.receiver.recv() {
+                match message {
+                    ServerMessage::Notification(notification)
+                        if notification.method == ExitNotification::METHOD.as_str() =>
+                    {
+                        break;
+                    }
+                    ServerMessage::Request(Request { id, method, .. }) => {
+                        let response = if method == ShutdownRequest::METHOD.as_str() {
+                            Response::new_ok(id, serde_json::Value::Null)
+                        } else {
+                            Response::new_err(
+                                id,
+                                ErrorCode::MethodNotFound as i32,
+                                "Sty could not initialize with the supplied hostSources".into(),
+                            )
+                        };
+                        connection.sender.send(ServerMessage::Response(response))?;
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
+    };
     let capabilities = ServerCapabilities {
         position_encoding: Some(encoding.kind()),
         text_document_sync: Some(
@@ -129,17 +171,23 @@ fn run_connection(connection: Connection, cwd: &SystemPath) -> Result<()> {
 
     let system = EditorSystem::new(cwd);
     let db = StyDb::with_system(Arc::new(system.clone()));
+    let host = (!host_settings.host_sources.is_empty()).then(star_host::HostWorker::new);
     Server {
         connection,
         db,
         system,
         documents: HashMap::new(),
         published: HashSet::new(),
+        published_host: HashSet::new(),
+        host_sources: host_settings.host_sources,
+        host,
         pending: VecDeque::new(),
         encoding,
         revision: 0,
+        host_revision: 0,
         shutdown: false,
         needs_bazel_check: false,
+        needs_host_check: false,
     }
     .run()
 }
@@ -147,13 +195,28 @@ fn run_connection(connection: Connection, cwd: &SystemPath) -> Result<()> {
 impl Server {
     fn run(mut self) -> Result<()> {
         loop {
-            let message = if let Some(message) = self.pending.pop_front() {
-                message
-            } else {
-                match self.connection.receiver.recv() {
-                    Ok(message) => message,
-                    Err(_) => return Ok(()),
+            let (message, completed) = if let Some(message) = self.pending.pop_front() {
+                (Some(message), None)
+            } else if let Some(finished) = self.host.as_ref().map(|host| host.finished.clone()) {
+                crossbeam::channel::select! {
+                    recv(self.connection.receiver) -> incoming => (incoming.ok(), None),
+                    recv(finished) -> result => (None, Some(result.context("Sty host graph worker stopped")?)),
                 }
+            } else {
+                (self.connection.receiver.recv().ok(), None)
+            };
+            if let Some(completed) = completed {
+                self.finish_host(&completed)?;
+                if self.needs_bazel_check && !self.shutdown {
+                    self.publish_bazel()?;
+                }
+                if self.needs_host_check && !self.shutdown {
+                    self.request_host()?;
+                }
+                continue;
+            }
+            let Some(message) = message else {
+                return Ok(());
             };
             if self.handle_message(message)? {
                 return Ok(());
@@ -161,6 +224,9 @@ impl Server {
             self.drain_editor_notifications()?;
             if self.needs_bazel_check {
                 self.publish_bazel()?;
+            }
+            if self.needs_host_check && !self.shutdown {
+                self.request_host()?;
             }
         }
     }
@@ -216,6 +282,7 @@ impl Server {
                 );
                 File::sync_path(&mut self.db, &path);
                 self.needs_bazel_check |= is_bazel_relevant(&path);
+                self.mark_host_change(&path);
                 self.documents.insert(
                     path,
                     OpenDocument {
@@ -250,6 +317,7 @@ impl Server {
                 self.system.open(path.clone(), OpenText { text, revision });
                 File::sync_path(&mut self.db, &path);
                 self.needs_bazel_check |= is_bazel_relevant(&path);
+                self.mark_host_change(&path);
             }
             "textDocument/didClose" => {
                 let params: DidCloseTextDocumentParams = serde_json::from_value(params)?;
@@ -258,12 +326,14 @@ impl Server {
                 self.system.close(&path);
                 File::sync_path(&mut self.db, &path);
                 self.needs_bazel_check |= is_bazel_relevant(&path);
+                self.mark_host_change(&path);
             }
             "textDocument/didSave" => {
                 let params: DidSaveTextDocumentParams = serde_json::from_value(params)?;
                 let path = uri_path(&params.text_document.uri)?;
                 File::sync_path(&mut self.db, &path);
                 self.needs_bazel_check |= is_bazel_relevant(&path);
+                self.mark_host_change(&path);
             }
             "workspace/didChangeWatchedFiles" => {
                 let params: DidChangeWatchedFilesParams = serde_json::from_value(params)?;
@@ -271,6 +341,7 @@ impl Server {
                     let path = uri_path(&event.uri)?;
                     File::sync_path(&mut self.db, &path);
                     self.needs_bazel_check |= is_bazel_relevant(&path);
+                    self.mark_host_change(&path);
                 }
             }
             _ => {}
@@ -281,6 +352,13 @@ impl Server {
     fn next_revision(&mut self) -> u64 {
         self.revision += 1;
         self.revision
+    }
+
+    fn mark_host_change(&mut self, path: &SystemPath) {
+        if path.extension() == Some("star") {
+            self.host_revision += 1;
+            self.needs_host_check = true;
+        }
     }
 
     fn apply_notification(&mut self, notification: lsp_server::Notification) -> Result<()> {
@@ -365,36 +443,187 @@ impl Server {
             if self.needs_bazel_check {
                 continue;
             }
-            let next_published: HashSet<Uri> = by_uri.keys().cloned().collect();
-            let publication_uris: HashSet<Uri> = self
-                .published
-                .drain()
-                .chain(next_published.iter().cloned())
-                .collect();
-            let mut publication_uris: Vec<Uri> = publication_uris.into_iter().collect();
-            publication_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-            for uri in publication_uris {
-                let items = by_uri.remove(&uri).unwrap_or_default();
-                let version = self
-                    .documents
-                    .values()
-                    .find(|document| document.uri == uri)
-                    .map(|document| document.version);
-                self.connection.sender.send(ServerMessage::Notification(
-                    lsp_server::Notification::new(
-                        PublishDiagnosticsNotification::METHOD.into(),
-                        PublishDiagnosticsParams {
-                            uri: uri.clone(),
-                            diagnostics: items,
-                            version,
-                        },
-                    ),
-                ))?;
-            }
-            self.published = next_published;
+            send_publications(
+                &self.connection,
+                &self.documents,
+                &mut self.published,
+                by_uri,
+            )?;
             return Ok(());
         }
     }
+
+    fn request_host(&mut self) -> Result<()> {
+        self.needs_host_check = false;
+        let Some(worker) = &self.host else {
+            let by_uri = self
+                .documents
+                .iter()
+                .filter(|(path, _)| path.extension() == Some("star"))
+                .map(|(_, document)| {
+                    (
+                        document.uri.clone(),
+                        vec![setup_diagnostic(
+                            "configure hostSources in Sty server initialization options to check this .star source"
+                                .into(),
+                        )],
+                    )
+                })
+                .collect();
+            return send_publications(
+                &self.connection,
+                &self.documents,
+                &mut self.published_host,
+                by_uri,
+            );
+        };
+        let mut overlays = Vec::new();
+        let mut versions = Vec::new();
+        let mut physical_uris = HashMap::new();
+        let mut alias_conflict = None;
+        let mut overlay_bytes = 0usize;
+        let mut documents: Vec<_> = self.documents.iter().collect();
+        documents.sort_by(|(left, _), (right, _)| {
+            let is_root = |path: &SystemPathBuf| {
+                self.host_sources
+                    .iter()
+                    .any(|source| source.root == path.as_std_path())
+            };
+            (!is_root(left), left).cmp(&(!is_root(right), right))
+        });
+        for (path, document) in documents {
+            if path.extension() != Some("star") {
+                continue;
+            }
+            versions.push((path.as_std_path().to_path_buf(), document.version));
+            if !path.as_std_path().exists() {
+                continue;
+            }
+            let physical_path = match path.as_std_path().canonicalize() {
+                Ok(path) => path,
+                Err(error) => {
+                    alias_conflict =
+                        Some(format!("cannot locate opened host source {path}: {error}"));
+                    continue;
+                }
+            };
+            if physical_uris
+                .insert(physical_path.clone(), document.uri.clone())
+                .is_some()
+            {
+                alias_conflict = Some(format!(
+                    "opened host sources alias the same physical file {}: close one of the duplicate editor paths",
+                    physical_path.display()
+                ));
+            }
+            let Some(text) = self.system.text(path) else {
+                alias_conflict = Some(format!("opened host source {path} has no editor text"));
+                continue;
+            };
+            if text.text.len() > 2 * 1024 * 1024 {
+                // If the host actually loads this opened file, the snapshot
+                // attestation below reports the missing overlay as a failure.
+                continue;
+            }
+            let encoded = serde_json::to_vec(&text.text)?;
+            let bytes = encoded.len() + physical_path.as_os_str().len() + 32;
+            if overlay_bytes.saturating_add(bytes) > 30 * 1024 * 1024 {
+                // An actually loaded omitted source fails snapshot attestation.
+                continue;
+            }
+            overlay_bytes += bytes;
+            overlays.push(star_host::HostOverlay {
+                path: physical_path,
+                text: text.text,
+            });
+        }
+        if let Some(error) = alias_conflict {
+            let by_uri = self
+                .documents
+                .iter()
+                .filter(|(path, _)| path.extension() == Some("star"))
+                .map(|(_, document)| (document.uri.clone(), vec![setup_diagnostic(error.clone())]))
+                .collect();
+            return send_publications(
+                &self.connection,
+                &self.documents,
+                &mut self.published_host,
+                by_uri,
+            );
+        }
+        worker.request(star_host::HostJob {
+            revision: self.host_revision,
+            sources: self.host_sources.clone(),
+            overlays,
+            versions,
+        })
+    }
+
+    fn finish_host(&mut self, completion: &star_host::HostCompletion) -> Result<()> {
+        self.drain_editor_notifications()?;
+        if self.shutdown || self.host_revision != completion.job.revision {
+            return Ok(());
+        }
+        for (path, version) in &completion.job.versions {
+            let path = SystemPath::new(
+                path.to_str()
+                    .ok_or_else(|| anyhow!("host editor path is not UTF-8"))?,
+            );
+            if self
+                .documents
+                .get(path)
+                .is_none_or(|document| document.version != *version)
+            {
+                return Ok(());
+            }
+        }
+        let diagnostics =
+            star_host::check_completion(&self.db, &self.documents, completion, self.encoding);
+        self.drain_editor_notifications()?;
+        if self.shutdown || self.host_revision != completion.job.revision {
+            return Ok(());
+        }
+        send_publications(
+            &self.connection,
+            &self.documents,
+            &mut self.published_host,
+            diagnostics,
+        )
+    }
+}
+
+fn send_publications(
+    connection: &Connection,
+    documents: &HashMap<SystemPathBuf, OpenDocument>,
+    published: &mut HashSet<Uri>,
+    mut by_uri: HashMap<Uri, Vec<Diagnostic>>,
+) -> Result<()> {
+    let next: HashSet<Uri> = by_uri.keys().cloned().collect();
+    let mut uris: Vec<Uri> = published
+        .drain()
+        .chain(next.iter().cloned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for uri in uris {
+        let version = documents
+            .values()
+            .find(|document| document.uri == uri)
+            .map(|document| document.version);
+        connection
+            .sender
+            .send(ServerMessage::Notification(lsp_server::Notification::new(
+                PublishDiagnosticsNotification::METHOD.into(),
+                PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: by_uri.remove(&uri).unwrap_or_default(),
+                    version,
+                },
+            )))?;
+    }
+    *published = next;
+    Ok(())
 }
 
 fn is_bazel_source(path: &SystemPath) -> bool {

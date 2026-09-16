@@ -2,6 +2,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
 use tempfile::TempDir;
 
 struct Fixture {
@@ -49,6 +58,97 @@ fn stderr(output: &Output) -> String {
 fn utf8_path(path: &Path) -> anyhow::Result<&str> {
     path.to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF8 fixture source path: {path:?}"))
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_stdio_editor_config_responds_before_client_exit_and_then_exits() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .arg("server")
+        .current_dir(fixture.root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let initialize = serde_json::json!({
+        "jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+            "capabilities":{}, "initializationOptions":{"hostSources":[{
+                "root":"relative.star", "checker":"/absolute/host-producer"
+            }]}
+        }
+    });
+    let bytes = serde_json::to_vec(&initialize)?;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes())?;
+    child.stdin.as_mut().unwrap().write_all(&bytes)?;
+    child.stdin.as_mut().unwrap().flush()?;
+
+    let stdout = child.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        let mut length = String::new();
+        stdout.read_line(&mut length).unwrap();
+        let size: usize = length
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut separator = String::new();
+        stdout.read_line(&mut separator).unwrap();
+        assert_eq!(separator, "\r\n");
+        let mut body = vec![0; size];
+        stdout.read_exact(&mut body).unwrap();
+        send.send(serde_json::from_slice::<serde_json::Value>(&body).unwrap())
+            .unwrap();
+    });
+    let response = match receive.recv_timeout(Duration::from_secs(3)) {
+        Ok(response) => response,
+        Err(error) => {
+            child.kill()?;
+            child.wait()?;
+            panic!("Sty did not send an initialize error while stdin was open: {error}");
+        }
+    };
+    reader.join().unwrap();
+    assert_eq!(response["id"], 1);
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("absolute UTF-8 path")
+    );
+    assert!(child.try_wait()?.is_none(), "Sty exited before client exit");
+
+    let exit = serde_json::json!({"jsonrpc":"2.0", "method":"exit", "params":null});
+    let bytes = serde_json::to_vec(&exit)?;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes())?;
+    child.stdin.as_mut().unwrap().write_all(&bytes)?;
+    child.stdin.as_mut().unwrap().flush()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        if Instant::now() > deadline {
+            child.kill()?;
+            child.wait()?;
+            panic!("Sty did not exit after the client's exit notification");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 fn star_graph_json(

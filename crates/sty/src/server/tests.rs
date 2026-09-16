@@ -1,8 +1,13 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
@@ -18,7 +23,12 @@ struct TestServer {
 
 impl TestServer {
     fn new() -> Self {
+        Self::with_options(|_| serde_json::json!({}))
+    }
+
+    fn with_options(options: impl FnOnce(&Path) -> serde_json::Value) -> Self {
         let root = tempfile::tempdir().unwrap();
+        let settings = options(root.path());
         let path = root.path().to_str().unwrap().to_owned();
         let (server, connection) = Connection::memory();
         let thread = thread::spawn(move || {
@@ -36,7 +46,7 @@ impl TestServer {
             .send(Message::Request(Request {
                 id: RequestId::from(1),
                 method: "initialize".into(),
-                params: serde_json::json!({"capabilities": {}}),
+                params: serde_json::json!({"capabilities": {}, "initializationOptions": settings}),
             }))
             .unwrap();
         let response = harness
@@ -195,6 +205,423 @@ fn has_error(diagnostics: &[Diagnostic], message: &str) -> bool {
     diagnostics.iter().any(
         |item| matches!(&item.message, lsp_types::Message::String(text) if text.contains(message)),
     )
+}
+
+#[test]
+fn unconfigured_star_open_reports_missing_host_setup() {
+    let server = TestServer::new();
+    server.write("deploy.star", "GOOD = 1\n");
+    server.open("deploy.star", "GOOD = 1\n", 7);
+    let result = server.published("deploy.star");
+    assert_eq!(result.version, Some(7));
+    assert!(
+        has_error(&result.diagnostics, "configure hostSources"),
+        "{result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_star_checks_frozen_root_and_loaded_editor_sources() {
+    let server = TestServer::with_options(host_settings);
+    let root_source = concat!(
+        "load(\"//example:limits.star\", \"LimitConfig\")\n",
+        "if False:\n",
+        "    LimitConfig(max_connections=\"😀\")\n",
+        "    example_host_native(1)\n",
+    );
+    let declaration = "def validate(value):\n    pass\nLimitConfig = wrapper_record(validate, max_connections=int)\n";
+    let loaded_source = format!("{declaration}LimitConfig(max_connections=\"wrong\")\n");
+    server.write("root.star", "GOOD = 1\n");
+    server.write("limits.star", declaration);
+    let graph = star_graph(
+        &server.path("root.star"),
+        root_source,
+        Some((&server.path("limits.star"), declaration)),
+    );
+    server.write("graph.json", &serde_json::to_string(&graph).unwrap());
+    server.open("root.star", root_source, 1);
+    let first = server.published("root.star");
+    assert_eq!(first.version, Some(1));
+    assert!(
+        has_error(&first.diagnostics, "expected int, got str"),
+        "{first:?}"
+    );
+    assert!(has_error(&first.diagnostics, "host signature"), "{first:?}");
+    let record = first
+        .diagnostics
+        .iter()
+        .find(|diagnostic| has_error(std::slice::from_ref(diagnostic), "expected int, got str"))
+        .unwrap();
+    assert_eq!(record.range.start.line, 2);
+    let third_line = root_source.lines().nth(2).unwrap();
+    assert_eq!(
+        record.range.end.character,
+        u32::try_from(third_line.strip_suffix(')').unwrap().encode_utf16().count()).unwrap()
+    );
+    assert!(record.range.end.character < u32::try_from(third_line.len()).unwrap());
+    let related = record.related_information.as_ref().unwrap();
+    assert_eq!(related[0].location.uri, server.uri("limits.star"));
+    assert_eq!(related[0].location.range.start.line, 2);
+    let overlays: serde_json::Value =
+        serde_json::from_slice(&fs::read(server.path("captured.json")).unwrap()).unwrap();
+    assert_eq!(overlays["version"], "sty-star-overlays-v1");
+    assert_eq!(overlays["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        overlays["sources"][0]["path"],
+        server
+            .path("root.star")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    assert_eq!(overlays["sources"][0]["source"], root_source);
+    assert_eq!(
+        fs::read_to_string(server.path("root.star")).unwrap(),
+        "GOOD = 1\n"
+    );
+
+    let graph = star_graph(
+        &server.path("root.star"),
+        root_source,
+        Some((&server.path("limits.star"), &loaded_source)),
+    );
+    server.write("graph.json", &serde_json::to_string(&graph).unwrap());
+    server.open("limits.star", &loaded_source, 3);
+    let loaded = server.published("limits.star");
+    assert_eq!(loaded.version, Some(3));
+    assert!(
+        has_error(&loaded.diagnostics, "expected int, got str"),
+        "{loaded:?}"
+    );
+    let root = server.published("root.star");
+    assert!(
+        has_error(&root.diagnostics, "expected int, got str"),
+        "{root:?}"
+    );
+    let overlays: serde_json::Value =
+        serde_json::from_slice(&fs::read(server.path("captured.json")).unwrap()).unwrap();
+    assert_eq!(overlays["sources"].as_array().unwrap().len(), 2);
+    assert_eq!(overlays["sources"][0]["source"], root_source);
+    assert_eq!(overlays["sources"][1]["source"], loaded_source);
+    assert_eq!(
+        fs::read_to_string(server.path("limits.star")).unwrap(),
+        declaration
+    );
+
+    let graph = star_graph(
+        &server.path("root.star"),
+        root_source,
+        Some((&server.path("limits.star"), declaration)),
+    );
+    server.write("graph.json", &serde_json::to_string(&graph).unwrap());
+    server.close("limits.star");
+    let restored = server.published("limits.star");
+    assert_eq!(restored.version, None);
+    assert!(restored.diagnostics.is_empty(), "{restored:?}");
+    let root = server.published("root.star");
+    assert!(
+        has_error(&root.diagnostics, "expected int, got str"),
+        "{root:?}"
+    );
+    let overlays: serde_json::Value =
+        serde_json::from_slice(&fs::read(server.path("captured.json")).unwrap()).unwrap();
+    assert_eq!(overlays["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(overlays["sources"][0]["source"], root_source);
+}
+
+#[cfg(unix)]
+#[test]
+fn opaque_loaded_star_blocks_an_open_root_with_related_file_uri() {
+    let server = TestServer::with_options(host_settings);
+    let source = "load(\"//example:limits.star\", \"LimitConfig\")\nGOOD = 1\n";
+    let invalid = "def broken(:\n";
+    server.write("root.star", source);
+    server.write("limits.star", invalid);
+    server.write(
+        "graph.json",
+        &serde_json::to_string(&star_graph(
+            &server.path("root.star"),
+            source,
+            Some((&server.path("limits.star"), invalid)),
+        ))
+        .unwrap(),
+    );
+    server.open("root.star", source, 4);
+    let loaded = server.published("limits.star");
+    assert!(has_error(&loaded.diagnostics, "parser"), "{loaded:?}");
+    let root = server.published("root.star");
+    assert_eq!(root.version, Some(4));
+    assert!(
+        has_error(&root.diagnostics, "loaded source is opaque"),
+        "{root:?}"
+    );
+    assert_eq!(
+        root.diagnostics[0].related_information.as_ref().unwrap()[0]
+            .location
+            .uri,
+        server.uri("limits.star")
+    );
+    server.no_pending_publication();
+}
+
+#[cfg(unix)]
+#[test]
+fn loaded_star_alone_sees_the_concrete_host_failure() {
+    let server = TestServer::with_options(host_settings);
+    server.write("root.star", "GOOD = 1\n");
+    server.write("limits.star", "GOOD = 1\n");
+    fs::write(
+        server.path("host-checker"),
+        "#!/bin/sh\necho 'private loader failed' >&2\nexit 47\n",
+    )
+    .unwrap();
+    server.open("limits.star", "GOOD = 1\n", 9);
+    let loaded = server.published("limits.star");
+    assert_eq!(loaded.version, Some(9));
+    assert!(
+        has_error(&loaded.diagnostics, "private loader failed"),
+        "{loaded:?}"
+    );
+    let root = server.published("root.star");
+    assert_eq!(root.version, None);
+    assert!(
+        has_error(&root.diagnostics, "private loader failed"),
+        "{root:?}"
+    );
+    server.no_pending_publication();
+}
+
+#[cfg(unix)]
+#[test]
+fn mismatched_open_loaded_snapshot_fails_without_partial_type_claims() {
+    let server = TestServer::with_options(host_settings);
+    let source = "load(\"//example:limits.star\", \"LimitConfig\")\nLimitConfig(max_connections=\"wrong\")\n";
+    let declaration = "LimitConfig = record(max_connections=int)\n";
+    server.write("root.star", source);
+    server.write("limits.star", declaration);
+    server.write(
+        "graph.json",
+        &serde_json::to_string(&star_graph(
+            &server.path("root.star"),
+            source,
+            Some((&server.path("limits.star"), declaration)),
+        ))
+        .unwrap(),
+    );
+    server.open("root.star", source, 1);
+    assert!(has_error(
+        &server.published("root.star").diagnostics,
+        "expected int, got str"
+    ));
+    server.open(
+        "limits.star",
+        "LimitConfig = record(max_connections=str)\n",
+        2,
+    );
+    let loaded = server.published("limits.star");
+    assert_eq!(loaded.version, Some(2));
+    assert!(
+        has_error(&loaded.diagnostics, "snapshot differs"),
+        "{loaded:?}"
+    );
+    let root = server.published("root.star");
+    assert_eq!(root.diagnostics.len(), 1, "{root:?}");
+    assert!(has_error(&root.diagnostics, "snapshot differs"), "{root:?}");
+    assert!(!has_error(&root.diagnostics, "expected int, got str"));
+    server.no_pending_publication();
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_host_graph_completion_never_publishes_an_old_editor_version() {
+    let server = TestServer::with_options(|root| {
+        let mut settings = host_settings(root);
+        settings["hostSources"][0]["inputs"]["started"] = serde_json::json!(root.join("started"));
+        settings["hostSources"][0]["inputs"]["release"] = serde_json::json!(root.join("release"));
+        settings
+    });
+    let latest =
+        "LimitConfig = record(max_connections=int)\nLimitConfig(max_connections=\"wrong\")\n";
+    server.write("root.star", "GOOD = 1\n");
+    server.write(
+        "graph.json",
+        &serde_json::to_string(&star_graph(&server.path("root.star"), latest, None)).unwrap(),
+    );
+    server.open("root.star", "GOOD = 1\n", 1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !server.path("started").exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let started = server.path("started").exists();
+    if !started {
+        server.write("release", "");
+    }
+    assert!(started, "producer was not started");
+    server.change("root.star", 2, &serde_json::json!([{"text":latest}]));
+    server.no_pending_publication();
+    server.write("release", "");
+    let publication = server.published("root.star");
+    assert_eq!(publication.version, Some(2), "{publication:?}");
+    assert!(
+        has_error(&publication.diagnostics, "expected int, got str"),
+        "{publication:?}"
+    );
+    server.no_pending_publication();
+}
+
+#[cfg(unix)]
+#[test]
+fn two_open_aliases_report_setup_even_if_one_text_exceeds_the_host_limit() {
+    let server = TestServer::with_options(host_settings);
+    server.write("root.star", "GOOD = 1\n");
+    server.write(
+        "graph.json",
+        &serde_json::to_string(&star_graph(&server.path("root.star"), "GOOD = 1\n", None)).unwrap(),
+    );
+    symlink(server.path("root.star"), server.path("alias.star")).unwrap();
+    server.open("root.star", &"X".repeat(2 * 1024 * 1024 + 1), 1);
+    let first = server.published("root.star");
+    assert!(
+        has_error(&first.diagnostics, "no frozen editor overlay"),
+        "{first:?}"
+    );
+    fs::remove_file(server.path("captured.json")).unwrap();
+
+    server.open("alias.star", "GOOD = 2\n", 4);
+    let alias = server.published("alias.star");
+    assert_eq!(alias.version, Some(4));
+    assert!(
+        has_error(&alias.diagnostics, "alias the same physical file"),
+        "{alias:?}"
+    );
+    let root = server.published("root.star");
+    assert!(
+        has_error(&root.diagnostics, "alias the same physical file"),
+        "{root:?}"
+    );
+    assert!(
+        !server.path("captured.json").exists(),
+        "duplicate aliases started a host process"
+    );
+    server.no_pending_publication();
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unrelated_oversized_open_star_does_not_break_the_root_check() {
+    let server = TestServer::with_options(host_settings);
+    let source =
+        "LimitConfig = record(max_connections=int)\nLimitConfig(max_connections=\"wrong\")\n";
+    server.write("root.star", "GOOD = 1\n");
+    server.write("unrelated.star", "GOOD = 1\n");
+    server.write(
+        "graph.json",
+        &serde_json::to_string(&star_graph(&server.path("root.star"), source, None)).unwrap(),
+    );
+    server.open("unrelated.star", &"X".repeat(2 * 1024 * 1024 + 1), 2);
+    let unrelated = server.published("unrelated.star");
+    assert!(
+        has_error(&unrelated.diagnostics, "configured host roots did not load"),
+        "{unrelated:?}"
+    );
+    server.open("root.star", source, 3);
+    let root = server.published("root.star");
+    assert!(
+        has_error(&root.diagnostics, "expected int, got str"),
+        "{root:?}"
+    );
+    let unrelated = server.published("unrelated.star");
+    assert!(
+        has_error(&unrelated.diagnostics, "configured host roots did not load"),
+        "{unrelated:?}"
+    );
+    let overlays: serde_json::Value =
+        serde_json::from_slice(&fs::read(server.path("captured.json")).unwrap()).unwrap();
+    assert_eq!(overlays["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(overlays["sources"][0]["source"], source);
+    server.no_pending_publication();
+}
+
+#[cfg(unix)]
+fn host_settings(root: &Path) -> serde_json::Value {
+    let checker = root.join("host-checker");
+    fs::write(
+        &checker,
+        concat!(
+            "#!/bin/sh\n",
+            "[ \"$1\" = '--sty-graph-v3' ] || exit 41\n",
+            "GRAPH='' CAPTURE='' DELAY='' OVERLAY=0\n",
+            "while [ \"$#\" -gt 0 ]; do\n",
+            "  case \"$1\" in\n",
+            "    --sty-graph-v3) shift;;\n",
+            "    --source) SOURCE=\"$2\"; shift 2;;\n",
+            "    --sty-overlays-stdin) OVERLAY=1; shift;;\n",
+            "    --input) case \"$2\" in\n",
+            "      graph=*) GRAPH=\"${2#graph=}\";;\n",
+            "      capture=*) CAPTURE=\"${2#capture=}\";;\n",
+            "      delay=*) DELAY=\"${2#delay=}\";;\n",
+            "      started=*) STARTED=\"${2#started=}\";;\n",
+            "      release=*) RELEASE=\"${2#release=}\";;\n",
+            "      *) exit 42;;\n",
+            "    esac; shift 2;;\n",
+            "    *) exit 43;;\n",
+            "  esac\n",
+            "done\n",
+            "[ \"$OVERLAY\" -eq 1 ] || { echo 'no overlay interface' >&2; exit 44; }\n",
+            "[ -z \"$STARTED\" ] || printf 'started' > \"$STARTED\"\n",
+            "[ -z \"$RELEASE\" ] || while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done\n",
+            "[ -z \"$DELAY\" ] || sleep \"$(cat \"$DELAY\")\"\n",
+            "cat > \"$CAPTURE\" || exit 45\n",
+            "cat \"$GRAPH\" || exit 46\n",
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&checker).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&checker, permissions).unwrap();
+    serde_json::json!({"hostSources": [{
+        "root": root.join("root.star"), "checker": checker,
+        "inputs": {"graph":root.join("graph.json"), "capture":root.join("captured.json")}
+    }]})
+}
+
+#[cfg(unix)]
+fn star_graph(root: &Path, text: &str, loaded: Option<(&Path, &str)>) -> serde_json::Value {
+    let (loads, modules) = if let Some((path, source)) = loaded {
+        let literal = "\"//example:limits.star\"";
+        let start = text.find(literal).unwrap();
+        (
+            vec![serde_json::json!({
+                "module_id":"//example:limits.star", "start":start, "end":start+literal.len(),
+                "symbols":[{"local":"LimitConfig", "source":"LimitConfig"}]
+            })],
+            vec![serde_json::json!({
+                "id":"//example:limits.star", "path":path, "source":source, "loads":[]
+            })],
+        )
+    } else {
+        (vec![], vec![])
+    };
+    serde_json::json!({
+        "version":"sty-star-graph-v3", "profile":"example-star-host-v3",
+        "root":{"path":root, "source":text, "loads":loads}, "modules":modules,
+        "special_forms":[
+            {"name":"record", "kind":"builtin_record", "validator":"none",
+                "field_types":"named_keyword_type_expressions"},
+            {"name":"wrapper_record", "kind":"record_with_validator",
+                "validator":"first_positional_callable",
+                "field_types":"named_keyword_type_expressions"}
+        ],
+        "intrinsics":[
+            {"name":"field", "kind":"field_first_type_optional_default"},
+            {"name":"struct", "kind":"struct_named_members"}
+        ],
+        "host_functions":[{"name":"example_host_native","params":[
+            {"name":"value", "mode":"pos_or_named", "required":true, "type":"str"}
+        ],"returns":"str", "availability":"any_module"}]
+    })
 }
 
 #[test]

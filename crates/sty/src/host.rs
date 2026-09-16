@@ -147,7 +147,7 @@ impl HostInvocation {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CapturedGraph {
+pub(super) struct CapturedGraph {
     version: String,
     profile: String,
     root: CapturedSource,
@@ -226,7 +226,19 @@ struct CapturedHostParam {
 }
 
 impl CapturedGraph {
-    fn into_star_graph(self, db: &dyn Db, selected: &SystemPath) -> Result<StarResolvedGraph> {
+    pub(super) fn sources(&self) -> impl Iterator<Item = (&str, &str)> {
+        std::iter::once((self.root.path.as_str(), self.root.source.as_str())).chain(
+            self.modules
+                .iter()
+                .map(|module| (module.path.as_str(), module.source.as_str())),
+        )
+    }
+
+    pub(super) fn into_star_graph(
+        self,
+        db: &dyn Db,
+        selected: &SystemPath,
+    ) -> Result<StarResolvedGraph> {
         let CapturedGraph {
             version,
             profile,

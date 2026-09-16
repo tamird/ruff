@@ -35,6 +35,39 @@ their Bazel loads. If an opened file uses a different symlink path,
 the importer may instead read that source from disk; its diagnostics
 can then be stale relative to the unsaved editor text.
 
+Register `/abs/ruff/target/debug/sty server` as a stdio LSP command for
+`.bzl`, `.bzl.pyi`, and `.star` filetypes. Sty currently publishes
+diagnostics and related source locations; it does not provide hover,
+completion, or navigation. Opened and changed buffers recheck directly.
+The client may also send `workspace/didChangeWatchedFiles` for changes
+on disk; Sty does not register file-watch patterns itself, so configure
+external file watches in the editor when needed.
+
+For `.star`, pass the host and selected source roots in the editor's
+LSP initialization options. A loaded `.star` file opened alone is
+checked through the configured root's private loader. For example:
+
+```json
+{
+  "hostSources": [
+    {
+      "root": "/abs/monorepo/service/manage/deploy.star",
+      "checker": "/abs/bin/project/deploy_star/deploy_star",
+      "runfilesManifest": "/abs/bin/project/deploy_star/deploy_star.runfiles_manifest",
+      "inputs": {}
+    }
+  ]
+}
+```
+
+Use absolute paths for roots, checker, manifest, and any named input
+paths. A host must implement `--sty-graph-v3 --sty-overlays-stdin` and
+the `sty-star-overlays-v1` stdin protocol to check unsaved buffers.
+The host's loader locates physically existing sources and resolves its
+private loads; Sty checks captured text and host facts without running
+native checks or deployment evaluation. An opened `.star` without a
+configured host root receives a setup diagnostic.
+
 For a `.star` file, supply a host implementing `--sty-graph-v3`. This
 works from any directory without a Bazel marker or BUILD file.
 `//pkg:file.star` is a Bazel selector; `//abs/path.star` is an absolute
