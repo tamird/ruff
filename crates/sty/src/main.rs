@@ -14,20 +14,13 @@ use ruff_db::vendored::VendoredFileSystem;
 use ruff_source_file::LineIndex;
 use ruff_text_size::TextRange;
 use ty_starlark::bazel::{BazelRepository, find_bazel_repository, resolve_bazel_target};
-use ty_starlark::checker::{BazelCheckError, BazelCheckProblem};
-use ty_starlark::graph::{
-    BazelCheckedGraph, BazelGraphError, BazelGraphFailure, BazelGraphOutcome,
-    BazelResolvedImportError, check_bazel_graph,
-};
-use ty_starlark::loads::{BazelLoadPlanError, BazelLoadPlanFailure};
-use ty_starlark::overlay::{
-    BazelTypedCallProblem, BazelVerificationError, BazelVerificationFailure,
-};
-use ty_starlark::preflight::BazelPreflightError;
+use ty_starlark::graph::{BazelCheckedGraph, check_bazel_graph};
 use ty_starlark::source::BazelSource;
-use ty_starlark::stub::BazelStubError;
 
 mod host;
+mod problems;
+
+use problems::{bazel_problems, graph_message};
 
 #[salsa::db]
 #[derive(Clone)]
@@ -211,96 +204,24 @@ impl<'db> Reporter<'db> {
     fn report(&mut self, graph: &BazelCheckedGraph) -> io::Result<bool> {
         let stderr = io::stderr();
         let mut output = stderr.lock();
-        let mut success = true;
-        for node in graph.nodes() {
-            match node.outcome() {
-                BazelGraphOutcome::Checked(module) => {
-                    for problem in module.problems() {
-                        success = false;
-                        self.arity(&mut output, problem)?;
-                    }
-                    for problem in module.typed_problems() {
-                        success = false;
-                        self.typed(&mut output, problem)?;
-                    }
-                }
-                BazelGraphOutcome::Opaque(failure) => {
-                    success = false;
-                    self.opaque(&mut output, failure)?;
-                }
-            }
-        }
-        Ok(success)
-    }
-
-    fn arity(&mut self, output: &mut impl Write, problem: &BazelCheckProblem) -> io::Result<()> {
-        let location = self.location(problem.file(), Some(problem.range()));
-        let description = match problem.reason() {
-            BazelCheckError::InvalidArity {
-                callee,
-                minimum,
-                maximum,
-                actual,
-            } if minimum == maximum => {
-                let noun = if *minimum == 1 {
-                    "argument"
-                } else {
-                    "arguments"
-                };
-                format!("function '{callee}' expects {minimum} positional {noun}, got {actual}")
-            }
-            other @ BazelCheckError::InvalidArity { .. } => other.to_string(),
-        };
-        writeln!(output, "{location}: error: {description}")?;
-        writeln!(
-            output,
-            "  declared at {}",
-            self.location(
-                problem.declaration_file(),
-                Some(problem.declaration_range())
-            )
-        )
-    }
-
-    fn typed(
-        &mut self,
-        output: &mut impl Write,
-        problem: &BazelTypedCallProblem,
-    ) -> io::Result<()> {
-        writeln!(
-            output,
-            "{}: error: {}",
-            self.location(problem.file(), Some(problem.range())),
-            problem.reason()
-        )?;
-        writeln!(
-            output,
-            "  declared at {}",
-            self.location(problem.related_file(), Some(problem.related_range()))
-        )
-    }
-
-    fn opaque(&mut self, output: &mut impl Write, failure: &BazelGraphFailure) -> io::Result<()> {
-        writeln!(
-            output,
-            "{}: error: {}",
-            self.location(failure.file(), failure.range()),
-            graph_message(failure.reason())
-        )?;
-        if let Some(file) = failure.related_file() {
+        let problems = bazel_problems(graph);
+        for problem in &problems {
             writeln!(
                 output,
-                "  related: {}",
-                self.location(file, failure.related_range())
+                "{}: error: {}",
+                self.location(problem.file, problem.range),
+                problem.message
             )?;
-        } else if let Some(range) = related_load_range(failure.reason()) {
-            writeln!(
-                output,
-                "  first bound at {}",
-                self.location(failure.file(), Some(range))
-            )?;
+            if let Some(related) = &problem.related {
+                writeln!(
+                    output,
+                    "  {} {}",
+                    related.label,
+                    self.location(related.file, related.range)
+                )?;
+            }
         }
-        Ok(())
+        Ok(problems.is_empty())
     }
 
     fn location(&mut self, file: File, range: Option<TextRange>) -> String {
@@ -319,64 +240,5 @@ impl<'db> Reporter<'db> {
         } else {
             format!("{path}:byte{}", range.start().to_usize())
         }
-    }
-}
-
-fn related_load_range(reason: &BazelGraphError) -> Option<TextRange> {
-    match reason {
-        BazelGraphError::LoadPlan(plan) => plan.related_range(),
-        BazelGraphError::Import(failure) => match failure.reason() {
-            BazelResolvedImportError::Plan(plan) => plan.related_range(),
-            _ => None,
-        },
-        BazelGraphError::Source(failure) => match failure.reason() {
-            BazelVerificationError::Source(preflight) => match preflight.reason() {
-                BazelPreflightError::LoadPlan(plan) => plan.related_range(),
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn graph_message(reason: &BazelGraphError) -> String {
-    match reason {
-        BazelGraphError::LoadPlan(plan) => load_message(plan),
-        BazelGraphError::Import(failure) => match failure.reason() {
-            BazelResolvedImportError::Plan(plan) => load_message(plan),
-            BazelResolvedImportError::TargetOpaque(verification) => {
-                verification_message(verification)
-            }
-            other => other.to_string(),
-        },
-        BazelGraphError::Source(failure) => verification_message(failure),
-        other => other.to_string(),
-    }
-}
-
-fn load_message(failure: &BazelLoadPlanFailure) -> String {
-    match failure.reason() {
-        BazelLoadPlanError::Admission(admission) => admission.reason().to_string(),
-        other => other.to_string(),
-    }
-}
-
-fn verification_message(failure: &BazelVerificationFailure) -> String {
-    match failure.reason() {
-        BazelVerificationError::Source(preflight) => match preflight.reason() {
-            BazelPreflightError::Admission(admission) => admission.reason().to_string(),
-            BazelPreflightError::LoadPlan(plan) => load_message(plan),
-            other => other.to_string(),
-        },
-        BazelVerificationError::Stub(stub) => match stub.reason() {
-            BazelStubError::Source(preflight) => preflight.reason().to_string(),
-            other => {
-                let message = other.to_string();
-                stub.path()
-                    .map_or(message.clone(), |path| format!("{message}: {path}"))
-            }
-        },
-        other => other.to_string(),
     }
 }
