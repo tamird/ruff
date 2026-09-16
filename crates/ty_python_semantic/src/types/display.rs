@@ -814,7 +814,9 @@ pub(super) fn qualified_name_components_from_scope(
         }
     }
 
-    if let Some(module) = file_to_module(db, file.resolver_file(db)) {
+    if let Some(module) = file.starlark_module(db) {
+        name_parts.push(module.name(db).to_string());
+    } else if let Some(module) = file_to_module(db, file.resolver_file(db)) {
         let module_name = module.name(db);
         name_parts.push(module_name.as_str().to_string());
     }

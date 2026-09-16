@@ -98,6 +98,7 @@ fn lexical_name_path_component_for_leaf(
             };
             name.id.clone()
         }
+        DefinitionKind::StarlarkLoad(_) => return Err(()),
         DefinitionKind::TypeAlias(_)
         | DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)

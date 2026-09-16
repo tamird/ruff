@@ -63,6 +63,7 @@ use crate::scope::{
     FileScopeId, NodeWithScopeKey, NodeWithScopeKind, NodeWithScopeRef, Scope, ScopeId, ScopeKind,
     ScopeLaziness,
 };
+use crate::starlark::{load_bindings, load_call};
 use crate::statement::StatementInner;
 use crate::symbol::{ScopedSymbolId, Symbol};
 use crate::unpack::{Unpack, UnpackKind, UnpackPosition, UnpackValue};
@@ -5464,6 +5465,19 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 range: _,
                 node_index: _,
             }) => {
+                if self.in_module_scope()
+                    && self.file.is_starlark(self.db)
+                    && let Some(call) = load_call(value)
+                {
+                    for binding in load_bindings(call) {
+                        let symbol = self.add_symbol(binding.local_name());
+                        self.add_definition(
+                            symbol.into(),
+                            DefinitionNodeRef::StarlarkLoad { call, binding },
+                        );
+                    }
+                    return;
+                }
                 if self.in_module_scope() {
                     if let Some(expr) = dunder_all_extend_argument(value) {
                         self.add_standalone_expression(expr);

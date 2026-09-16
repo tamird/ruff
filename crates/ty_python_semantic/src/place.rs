@@ -567,13 +567,7 @@ pub(crate) fn imported_symbol<'db>(
             }
         });
 
-        symbol_impl(
-            db,
-            global_scope(db, file),
-            name,
-            requires_explicit_reexport,
-            ConsideredDefinitions::EndOfScope,
-        )
+        exported_symbol(db, file, name, requires_explicit_reexport)
     })
     .unwrap_or_default()
     .or_fall_back_to(db, env, || {
@@ -603,6 +597,23 @@ pub(crate) fn imported_symbol<'db>(
                 .member_lookup_with_policy(db, env, name, MemberLookupPolicy::NO_GETATTR_LOOKUP),
         }
     })
+}
+
+/// Looks up explicit definitions after module initialization, without Python
+/// module attributes or `__getattr__` fallback.
+pub(crate) fn exported_symbol<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    name: &str,
+    requires_explicit_reexport: RequiresExplicitReExport,
+) -> PlaceAndQualifiers<'db> {
+    symbol_impl(
+        db,
+        global_scope(db, file),
+        name,
+        requires_explicit_reexport,
+        ConsideredDefinitions::EndOfScope,
+    )
 }
 
 /// Lookup the type of `symbol` in the builtins namespace.
@@ -636,10 +647,11 @@ pub(crate) fn builtins_symbol<'db>(
 /// ```
 pub(crate) fn implicit_builtins_symbol<'db>(
     db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
+    file: ProgramFile<'db>,
     symbol: &str,
 ) -> PlaceAndQualifiers<'db> {
-    builtins_symbol_impl(db, env, symbol, BuiltinVisibility::RuntimeOnly)
+    let env = ProgramEnvironment::from_file(file);
+    builtins_symbol_impl(db, &env, symbol, BuiltinVisibility::runtime(db, file))
         .map(|(_, symbol)| symbol)
         .unwrap_or_default()
 }
@@ -650,16 +662,30 @@ pub(crate) fn implicit_builtins_symbol<'db>(
 /// resolve a private typing-only helper that type inference considers undefined.
 pub(crate) fn implicit_builtins_symbol_scope<'db>(
     db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
+    file: ProgramFile<'db>,
     symbol: &str,
 ) -> Option<ScopeId<'db>> {
-    builtins_symbol_impl(db, env, symbol, BuiltinVisibility::RuntimeOnly).map(|(scope, _)| scope)
+    let env = ProgramEnvironment::from_file(file);
+    builtins_symbol_impl(db, &env, symbol, BuiltinVisibility::runtime(db, file))
+        .map(|(scope, _)| scope)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BuiltinVisibility {
     All,
     RuntimeOnly,
+    /// Explicit runtime declarations, without Python's implicit module globals.
+    Starlark,
+}
+
+impl BuiltinVisibility {
+    fn runtime(db: &dyn Db, file: ProgramFile<'_>) -> Self {
+        if file.is_starlark(db) {
+            Self::Starlark
+        } else {
+            Self::RuntimeOnly
+        }
+    }
 }
 
 /// Resolves project-level builtins before standard builtins and optionally hides typing-only names.
@@ -685,6 +711,9 @@ fn builtins_symbol_impl<'db>(
             ConsideredDefinitions::EndOfScope,
         )
         .or_fall_back_to(db, env, || {
+            if matches!(visibility, BuiltinVisibility::Starlark) {
+                return Place::Undefined.into();
+            }
             // We're looking up in the builtins namespace and not the module, so we should
             // do the normal lookup in `types.ModuleType` and not the special one as in
             // `imported_symbol`.
@@ -692,7 +721,7 @@ fn builtins_symbol_impl<'db>(
         });
         found_symbol.ignore_possibly_undefined()?;
 
-        if matches!(visibility, BuiltinVisibility::RuntimeOnly)
+        if !matches!(visibility, BuiltinVisibility::All)
             && let Place::Defined(defined) = found_symbol.place
             && let Some(definition) = defined.provenance.definition()
             && !may_exist_at_runtime(db, definition)
@@ -798,6 +827,7 @@ pub(super) fn place_from_bindings<'db>(
         bindings_with_constraints,
         RequiresExplicitReExport::No,
         None,
+        BindingReachability::Reachable,
     )
 }
 
@@ -813,7 +843,32 @@ pub(super) fn place_from_bindings_with_reachability_cache<'db>(
         bindings_with_constraints,
         RequiresExplicitReExport::No,
         Some(reachability_cache),
+        BindingReachability::Reachable,
     )
+}
+
+/// Keeps lexical binding types when checking an unreachable Starlark expression.
+/// Reachable expressions and module exports continue to use control flow and
+/// narrowing; this policy applies only within the unreachable region itself.
+pub(super) fn place_from_bindings_in_unreachable_code<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    bindings: BindingWithConstraintsIterator<'_, 'db>,
+) -> PlaceWithDefinition<'db> {
+    place_from_bindings_impl(
+        db,
+        env,
+        bindings,
+        RequiresExplicitReExport::No,
+        None,
+        BindingReachability::All,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum BindingReachability {
+    Reachable,
+    All,
 }
 
 /// Build a declared type from a [`DeclarationsIterator`].
@@ -1158,9 +1213,16 @@ pub(crate) fn place_by_id<'db>(
     // inferred type, without unioning with `Unknown`, because it cannot be modified.
     if let Some(qualifiers) = declared.is_bare_final() {
         let bindings = all_considered_bindings();
-        return place_from_bindings_impl(db, &env, bindings, requires_explicit_reexport, None)
-            .place
-            .with_qualifiers(qualifiers);
+        return place_from_bindings_impl(
+            db,
+            &env,
+            bindings,
+            requires_explicit_reexport,
+            None,
+            BindingReachability::Reachable,
+        )
+        .place
+        .with_qualifiers(qualifiers);
     }
 
     match declared {
@@ -1178,8 +1240,15 @@ pub(crate) fn place_by_id<'db>(
             qualifiers,
         } if qualifiers.contains(TypeQualifiers::CLASS_VAR) => {
             let bindings = all_considered_bindings();
-            match place_from_bindings_impl(db, &env, bindings, requires_explicit_reexport, None)
-                .place
+            match place_from_bindings_impl(
+                db,
+                &env,
+                bindings,
+                requires_explicit_reexport,
+                None,
+                BindingReachability::Reachable,
+            )
+            .place
             {
                 Place::Defined(DefinedPlace {
                     ty: inferred,
@@ -1228,8 +1297,14 @@ pub(crate) fn place_by_id<'db>(
         } => {
             let bindings = all_considered_bindings();
             let boundness_analysis = bindings.boundness_analysis();
-            let inferred =
-                place_from_bindings_impl(db, &env, bindings, requires_explicit_reexport, None);
+            let inferred = place_from_bindings_impl(
+                db,
+                &env,
+                bindings,
+                requires_explicit_reexport,
+                None,
+                BindingReachability::Reachable,
+            );
 
             let place = match inferred.place {
                 // Place is possibly undeclared and definitely unbound
@@ -1274,9 +1349,15 @@ pub(crate) fn place_by_id<'db>(
         } => {
             let bindings = all_considered_bindings();
             let boundness_analysis = bindings.boundness_analysis();
-            let mut inferred =
-                place_from_bindings_impl(db, &env, bindings, requires_explicit_reexport, None)
-                    .place;
+            let mut inferred = place_from_bindings_impl(
+                db,
+                &env,
+                bindings,
+                requires_explicit_reexport,
+                None,
+                BindingReachability::Reachable,
+            )
+            .place;
 
             if boundness_analysis == BoundnessAnalysis::AssumeBound {
                 if let Place::Defined(defined) = inferred {
@@ -1671,6 +1752,7 @@ fn place_from_bindings_impl<'db>(
     bindings_with_constraints: BindingWithConstraintsIterator<'_, 'db>,
     requires_explicit_reexport: RequiresExplicitReExport,
     reachability_cache: Option<&ReachabilityEvaluationCache<'db>>,
+    reachability: BindingReachability,
 ) -> PlaceWithDefinition<'db> {
     let predicates = bindings_with_constraints.predicates();
     let reachability_constraints = bindings_with_constraints.reachability_constraints();
@@ -1750,13 +1832,16 @@ fn place_from_bindings_impl<'db>(
                 return None;
             }
 
-            let static_reachability = evaluate_reachability_with_cache(
-                db,
-                reachability_cache,
-                reachability_constraints,
-                predicates,
-                reachability_constraint,
-            );
+            let static_reachability = match reachability {
+                BindingReachability::Reachable => evaluate_reachability_with_cache(
+                    db,
+                    reachability_cache,
+                    reachability_constraints,
+                    predicates,
+                    reachability_constraint,
+                ),
+                BindingReachability::All => Truthiness::AlwaysTrue,
+            };
 
             if static_reachability.is_always_false() {
                 // If the static reachability evaluates to false, the binding is either not reachable
@@ -1836,7 +1921,11 @@ fn place_from_bindings_impl<'db>(
             first_definition.get_or_insert(binding);
             provenance = provenance.or(Provenance::SingleDefinition(binding));
             let binding_ty = binding_type(db, binding);
-            let narrowed = match narrowing_constraint.constraint() {
+            let constraint = match reachability {
+                BindingReachability::Reachable => narrowing_constraint.constraint(),
+                BindingReachability::All => ScopedNarrowingConstraint::ALWAYS_TRUE,
+            };
+            let narrowed = match constraint {
                 ScopedNarrowingConstraint::ALWAYS_TRUE => binding_ty,
                 ScopedNarrowingConstraint::ALWAYS_FALSE => Type::Never,
                 constraint => narrowing_projector
@@ -2199,6 +2288,9 @@ fn is_reexported(db: &dyn Db, definition: Definition<'_>) -> bool {
     if definition.is_reexported(db) {
         return true;
     }
+    if definition.program_file(db).is_starlark(db) {
+        return false;
+    }
     // At this point, the definition should either be an `import` or `from ... import` statement.
     // This is because the default value of `is_reexported` is `true` for any other kind of
     // definition.
@@ -2345,6 +2437,9 @@ pub(crate) mod implicit_globals {
         file: ProgramFile<'db>,
         name: &str,
     ) -> PlaceAndQualifiers<'db> {
+        if file.is_starlark(db) {
+            return Place::Undefined.into();
+        }
         let env = ProgramEnvironment::from_file(file);
         match name {
             // We special-case `__file__` here because we know that for an internal implicit global

@@ -67,6 +67,9 @@ mod subscript;
 mod suppression;
 pub mod types;
 
+#[cfg(test)]
+mod starlark_tests;
+
 mod diagnostic;
 #[cfg(feature = "testing")]
 pub mod pull_types;

@@ -18,6 +18,7 @@ use crate::node_key::NodeKey;
 use crate::place::ScopedPlaceId;
 use crate::predicate::PatternPredicate;
 use crate::scope::{FileScopeId, ScopeId};
+use crate::starlark::StarlarkLoadBinding;
 use crate::symbol::ScopedSymbolId;
 use crate::unpack::{Unpack, UnpackPosition};
 use crate::use_def::BindingWithConstraintsIterator;
@@ -340,6 +341,10 @@ impl<'db> DefinitionState<'db> {
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum DefinitionNodeRef<'ast, 'db> {
+    StarlarkLoad {
+        call: &'ast ast::ExprCall,
+        binding: StarlarkLoadBinding<'ast>,
+    },
     Import(ImportDefinitionNodeRef<'ast>),
     ImportFrom(ImportFromDefinitionNodeRef<'ast>),
     ImportFromSubmodule(ImportFromSubmoduleDefinitionNodeRef<'ast>),
@@ -640,6 +645,13 @@ pub(crate) struct MatchPatternDefinitionNodeRef<'ast, 'db> {
 impl<'db> DefinitionNodeRef<'_, 'db> {
     pub(super) fn into_owned(self, parsed: &ParsedModuleRef) -> DefinitionKind<'db> {
         match self {
+            DefinitionNodeRef::StarlarkLoad { call, binding } => {
+                DefinitionKind::StarlarkLoad(StarlarkLoadDefinitionKind {
+                    call: AstNodeRef::new(parsed, call),
+                    name: AstNodeRef::new(parsed, binding.name),
+                    target_range: binding.target_range(),
+                })
+            }
             DefinitionNodeRef::Import(ImportDefinitionNodeRef {
                 node,
                 alias_index,
@@ -811,6 +823,9 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
 
     pub(super) fn key(self) -> DefinitionNodeKey {
         match self {
+            Self::StarlarkLoad { call: _, binding } => {
+                DefinitionNodeKey(NodeKey::from_node(binding.name))
+            }
             Self::Import(ImportDefinitionNodeRef {
                 node,
                 alias_index,
@@ -926,6 +941,7 @@ impl DefinitionCategory {
 /// for an in-depth explanation of why this is necessary.
 #[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub enum DefinitionKind<'db> {
+    StarlarkLoad(StarlarkLoadDefinitionKind),
     Import(ImportDefinitionKind),
     ImportFrom(ImportFromDefinitionKind),
     ImportFromSubmodule(ImportFromSubmoduleDefinitionKind),
@@ -953,9 +969,19 @@ pub enum DefinitionKind<'db> {
     NestedBindings(Box<NestedBindingsDefinitionKind>),
 }
 
+/// An admitted load binding, retaining its source instead of synthesizing a
+/// Python import. Resolution is supplied by the containing Starlark module.
+#[derive(Clone, Debug, get_size2::GetSize)]
+pub struct StarlarkLoadDefinitionKind {
+    pub call: AstNodeRef<ast::ExprCall>,
+    pub name: AstNodeRef<ast::ExprStringLiteral>,
+    pub target_range: TextRange,
+}
+
 impl<'db> DefinitionKind<'db> {
     pub(crate) fn is_reexported(&self) -> bool {
         match self {
+            DefinitionKind::StarlarkLoad(_) => false,
             DefinitionKind::Import(import) => import.is_reexported(),
             DefinitionKind::ImportFrom(import) => import.is_reexported(),
             DefinitionKind::ImportFromSubmodule(_) => true,
@@ -1025,6 +1051,7 @@ impl<'db> DefinitionKind<'db> {
     /// [`ast::ExprName`], [`ast::Identifier`], [`ast::ExprAttribute`] or [`ast::ExprSubscript`] but could also be other nodes.
     pub fn target_range(&self, module: &ParsedModuleRef) -> TextRange {
         match self {
+            DefinitionKind::StarlarkLoad(load) => load.target_range,
             DefinitionKind::Import(import) => import.alias(module).range(),
             DefinitionKind::ImportFrom(import) => import.alias(module).range(),
             DefinitionKind::ImportFromSubmodule(import) => import.target_range(module),
@@ -1075,6 +1102,7 @@ impl<'db> DefinitionKind<'db> {
     /// Returns the [`TextRange`] of the entire definition.
     pub fn full_range(&self, module: &ParsedModuleRef) -> TextRange {
         match self {
+            DefinitionKind::StarlarkLoad(load) => load.call.node(module).range(),
             DefinitionKind::Import(import) => import.alias(module).range(),
             DefinitionKind::ImportFrom(import) => import.alias(module).range(),
             DefinitionKind::ImportFromSubmodule(import) => import.module(module).range(),
@@ -1129,6 +1157,7 @@ impl<'db> DefinitionKind<'db> {
 
     pub fn category(&self, in_stub: bool, module: &ParsedModuleRef) -> DefinitionCategory {
         match self {
+            DefinitionKind::StarlarkLoad(_) => DefinitionCategory::Binding,
             // functions, classes, and imports always bind, and we consider them declarations
             DefinitionKind::Function(_)
             | DefinitionKind::Class(_)
@@ -1796,6 +1825,12 @@ impl From<&ast::ExprSubscript> for DefinitionNodeKey {
 
 impl From<&ast::ExprNamed> for DefinitionNodeKey {
     fn from(node: &ast::ExprNamed) -> Self {
+        Self(NodeKey::from_node(node))
+    }
+}
+
+impl From<&ast::ExprStringLiteral> for DefinitionNodeKey {
+    fn from(node: &ast::ExprStringLiteral) -> Self {
         Self(NodeKey::from_node(node))
     }
 }

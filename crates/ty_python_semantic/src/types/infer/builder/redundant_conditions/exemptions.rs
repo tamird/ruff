@@ -578,6 +578,7 @@ fn definition_contains_special_cased_condition<'db>(
     }
 
     let source_expression = match definition_kind {
+        DefinitionKind::StarlarkLoad(_) => None,
         DefinitionKind::Assignment(assignment) => Some(assignment.value(&module)),
         DefinitionKind::AnnotatedAssignment(assignment) => assignment.value(&module),
         DefinitionKind::NamedExpression(named) => Some(&*named.node(&module).value),

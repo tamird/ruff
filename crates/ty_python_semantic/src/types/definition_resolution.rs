@@ -173,8 +173,7 @@ pub(crate) fn definitions_for_name<'db>(
     if !definitions.is_empty() {
         return definitions;
     }
-    let env = ProgramEnvironment::from_scope(scope);
-    implicit_builtins_symbol_scope(db, &env, name)
+    implicit_builtins_symbol_scope(db, scope.program_file(db), name)
         .map(|scope| definitions_for_builtin(db, scope, name))
         .unwrap_or_default()
 }

@@ -649,7 +649,8 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
         // Suppress diagnostics in unreachable code. This checks both whether
         // the scope itself is unreachable and whether the specific statement or
         // expression containing this diagnostic is unreachable.
-        if !ctx.is_range_reachable(range) {
+        // Starlark checks function bodies and calls even when they cannot run.
+        if !ctx.program_file().is_starlark(ctx.db()) && !ctx.is_range_reachable(range) {
             return None;
         }
 

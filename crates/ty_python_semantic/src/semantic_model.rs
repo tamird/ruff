@@ -119,7 +119,7 @@ impl<'db> SemanticModel<'db> {
         }
 
         let env = self.program_environment();
-        implicit_builtins_symbol_scope(self.db, &env, name)
+        implicit_builtins_symbol_scope(self.db, self.program_file(), name)
             .is_some_and(|scope| Some(scope) == builtins_module_scope(self.db, &env))
     }
 

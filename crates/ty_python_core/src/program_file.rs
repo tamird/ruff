@@ -3,9 +3,9 @@ use ruff_db::files::File;
 use ruff_python_ast::PythonVersion;
 use ty_module_resolver::{ResolverEnvironment, ResolverFile};
 
-use crate::{Db, program::Program};
+use crate::{Db, program::Program, starlark::StarlarkModule};
 
-/// A file interpreted within a particular Python program.
+/// A file interpreted within a particular program.
 ///
 /// The same file can participate in multiple programs, each with different Python versions, search
 /// paths, or other settings that affect type inference.
@@ -48,6 +48,10 @@ use crate::{Db, program::Program};
 /// This allows programs with the same Python version to share parsed syntax, and programs with
 /// equivalent resolver environments to share module resolution, while keeping type inference
 /// isolated.
+///
+/// Starlark frontends can additionally attach a logical module identity. Two
+/// module instances can share their parser key without sharing definitions or
+/// nominal types.
 #[salsa::interned(
     debug,
     constructor = new_internal,
@@ -61,6 +65,10 @@ pub struct ProgramFile<'db> {
 
     #[returns(copy)]
     pub program: Program<'db>,
+
+    /// Host module identity, separate from the physical parser key.
+    #[returns(copy)]
+    pub starlark_module: Option<StarlarkModule>,
 }
 
 impl get_size2::GetSize for ProgramFile<'_> {}
@@ -68,7 +76,17 @@ impl get_size2::GetSize for ProgramFile<'_> {}
 impl<'db> ProgramFile<'db> {
     pub fn new(db: &'db dyn Db, file: File, program: Program<'db>) -> Self {
         let python_file = PythonFile::new(db, file, program.python_version(db));
-        Self::new_internal(db, python_file, program)
+        Self::new_internal(db, python_file, program, None)
+    }
+
+    /// Interprets an admitted Starlark module with the program's builtin stubs.
+    pub fn new_starlark(db: &'db dyn Db, module: StarlarkModule, program: Program<'db>) -> Self {
+        let python_file = PythonFile::new(db, module.file(db), program.python_version(db));
+        Self::new_internal(db, python_file, program, Some(module))
+    }
+
+    pub fn is_starlark(self, db: &'db dyn Db) -> bool {
+        self.starlark_module(db).is_some()
     }
 
     /// Returns the physical file represented by this program file.

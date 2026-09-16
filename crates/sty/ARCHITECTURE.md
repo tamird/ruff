@@ -5,8 +5,9 @@
 Sty currently shares Ruff's parser, source infrastructure, and diagnostics.
 Its Bazel and hosted `.star` analyzers still implement separate type systems.
 The target is to replace those analyzers with Ty inference, with explicit
-Starlark frontend inputs. This document describes that migration; it does
-not describe semantic sharing that already exists.
+Starlark frontend inputs. Ty now accepts logical Starlark modules and resolved
+loads and checks their annotated functions through its existing inference.
+Sty's production frontends still need to migrate to that semantic boundary.
 
 Success means removing the replaced inference, signature, and assignability
 code. A second implementation behind a backend switch would add maintenance
@@ -35,11 +36,13 @@ can expose the same captured text under two logical module IDs. Records
 declared in those modules must remain nominally distinct. Conversely,
 repeated loads of one logical module must share its declarations.
 
-[`ProgramFile`](../ty_python_core/src/program_file.rs) currently combines a
-physical file with a program. Extend that semantic identity to represent
-logical module instances before migrating records. Keep original source
-paths and ranges for diagnostics. Parsing can share identical snapshots;
-definitions must use semantic module identity.
+[`StarlarkModule`](../ty_python_core/src/starlark.rs) is a tracked input that
+identifies a logical module and supplies its resolved load edges.
+[`ProgramFile`](../ty_python_core/src/program_file.rs) includes that identity
+alongside the physical parser key and program. Parsing shares identical
+sources while definitions remain separate for distinct logical modules.
+The physical file stays fixed for each module instance; its contents and
+resolved edges can be updated through tracked inputs.
 
 Captured source, resolved edges, and host declarations must enter the
 database as tracked inputs. Updating a loaded source or changing an edge
@@ -49,17 +52,23 @@ must not share semantic results merely because their paths match.
 
 ## Loads and builtins
 
-Represent each admitted `load` binding as a definition at its original
-string or alias span, with the resolved target module and exported name.
+Each admitted `load` binding is a definition at its original string or alias
+span, with the resolved target module and exported name.
 The frontend supplies resolution; the semantic engine must not reinterpret
 Bazel labels as Python imports. Handle the load statement as definitions
 instead of inferring an ordinary call to a global named `load`.
 
-Ty's [`imported_symbol`](../ty_python_semantic/src/place.rs) already looks
-up definitions at the end of module initialization. Separate that explicit
-export lookup from its Python implicit-member fallback when the Starlark
-consumer is introduced. Starlark export visibility remains frontend policy.
-Preserve aliases, shadowing, rebinding, and declaration provenance.
+Ty's Python imports and Starlark loads share the explicit end-of-module
+lookup in [`exported_symbol`](../ty_python_semantic/src/place.rs). Python's
+implicit module attributes remain in its import fallback. Starlark loads
+do not reexport imported bindings; an explicit assignment can reexport a
+value. Host label resolution and private-name visibility remain frontend
+policy. Aliases and local rebinding use the shared scope and definition maps.
+
+Starlark calls in unreachable code are checked using lexical binding types
+without the unreachable region's narrowing. Live uses and module exports
+retain the usual control-flow analysis. This keeps a dead assignment from
+changing an exported type while still checking calls inside that branch.
 
 Use program-specific builtin declarations through the existing custom
 standard-library mechanism. The

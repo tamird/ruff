@@ -55,6 +55,7 @@ pub mod rank;
 mod re_exports;
 pub mod reachability_constraints;
 pub mod scope;
+pub mod starlark;
 pub mod statement;
 pub mod symbol;
 pub mod unpack;

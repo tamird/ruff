@@ -1764,6 +1764,7 @@ fn assignment_declaration_annotation<'db>(
         };
 
     let (annotation, declaration_kind) = match declaration_definition_kind {
+        DefinitionKind::StarlarkLoad(_) => None,
         DefinitionKind::AnnotatedAssignment(assignment) => Some((
             assignment.annotation(context.module()),
             DeclarationKind::Regular,
@@ -1830,6 +1831,7 @@ fn assignment_value_node<'db, 'ast>(
     definition_kind: &DefinitionKind<'db>,
 ) -> Option<&'ast ast::Expr> {
     match definition_kind {
+        DefinitionKind::StarlarkLoad(_) => None,
         DefinitionKind::Assignment(assignment) if let Some(unpack) = assignment.unpack() => {
             let module = context.module();
             let value = assignment.value(module);

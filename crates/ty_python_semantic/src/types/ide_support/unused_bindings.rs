@@ -16,6 +16,7 @@ use ty_python_core::{ProgramFile, SemanticIndex, semantic_index};
 /// unused-binding diagnostics.
 fn should_consider_definition(kind: &DefinitionKind<'_>) -> bool {
     match kind {
+        DefinitionKind::StarlarkLoad(_) => false,
         DefinitionKind::NamedExpression(_)
         | DefinitionKind::Assignment(_)
         | DefinitionKind::AnnotatedAssignment(_)

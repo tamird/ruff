@@ -8,7 +8,10 @@ use ty_module_resolver::{
 use crate::{
     TypeQualifiers, add_inferred_python_version_hint_to_diagnostic,
     dependency::{DependencyProjectKind, missing_direct_dependency},
-    place::{DefinedPlace, Definedness, Place, PlaceAndQualifiers, TypeOrigin},
+    place::{
+        DefinedPlace, Definedness, Place, PlaceAndQualifiers, RequiresExplicitReExport, TypeOrigin,
+        exported_symbol,
+    },
     types::{
         ModuleLiteralType, Type, TypeAndQualifiers,
         diagnostic::{
@@ -20,9 +23,53 @@ use crate::{
         infer_definition_types,
     },
 };
-use ty_python_core::definition::Definition;
+use ty_python_core::ProgramFile;
+use ty_python_core::definition::{Definition, StarlarkLoadDefinitionKind};
 
 impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
+    pub(super) fn infer_starlark_load_definition(
+        &mut self,
+        load: &StarlarkLoadDefinitionKind,
+        definition: Definition<'db>,
+    ) {
+        let db = self.db();
+        let name = load.name.node(self.module());
+        let target = self
+            .program_file()
+            .starlark_module(db)
+            .and_then(|module| module.resolve_load(db, load.call.node(self.module()).range()));
+        let exported = target
+            .map(|module| {
+                let file = ProgramFile::new_starlark(db, module, self.program_file().program(db));
+                exported_symbol(db, file, name.value.to_str(), RequiresExplicitReExport::Yes).place
+            })
+            .unwrap_or(Place::Undefined);
+        if let Place::Defined(defined) = exported
+            && defined.definedness == Definedness::PossiblyUndefined
+            && let Some(builder) = self
+                .context
+                .report_lint(&POSSIBLY_MISSING_IMPORT, load.target_range)
+        {
+            builder.into_diagnostic(format_args!(
+                "Loaded member `{}` may be missing",
+                name.value.to_str()
+            ));
+        }
+        let ty = exported.ignore_possibly_undefined();
+        self.add_binding(name.into(), definition)
+            .insert(self, ty.unwrap_or_else(Type::unknown));
+        if ty.is_none()
+            && let Some(builder) = self
+                .context
+                .report_lint(&UNRESOLVED_IMPORT, load.target_range)
+        {
+            builder.into_diagnostic(format_args!(
+                "Cannot load `{}` from the resolved Starlark module",
+                name.value.to_str()
+            ));
+        }
+    }
+
     pub(super) fn infer_import_statement(&mut self, import: &ast::StmtImport) {
         let ast::StmtImport {
             names,

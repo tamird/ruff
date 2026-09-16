@@ -1294,6 +1294,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             DefinitionKind::Import(import) => {
                 self.infer_import_definition(import.alias(self.module()), definition);
             }
+            DefinitionKind::StarlarkLoad(load) => {
+                self.infer_starlark_load_definition(load, definition);
+            }
             DefinitionKind::ImportFrom(import_from) => {
                 self.infer_import_from_definition(
                     import_from.import(self.module()),
@@ -1564,7 +1567,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         // Fall back to implicit module globals for (possibly) unbound names
-        if !place_and_quals.place.is_definitely_bound()
+        if !self.program_file().is_starlark(db)
+            && !place_and_quals.place.is_definitely_bound()
             && let PlaceExprRef::Symbol(symbol) = place
         {
             let symbol_id = place_id.expect_symbol();
@@ -2139,6 +2143,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 value,
             }) = statement
             {
+                if self.program_file().is_starlark(db)
+                    && ty_python_core::starlark::load_call(value).is_some()
+                {
+                    continue;
+                }
                 let ty = self.expression_type(value);
                 if ty.is_awaitable(self.db()) && !self.is_known_function_call(value) {
                     if let Some(builder) =
@@ -2165,6 +2174,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 node_index: _,
                 value,
             }) => {
+                if self.program_file().is_starlark(self.db())
+                    && let Some(call) = ty_python_core::starlark::load_call(value)
+                    && self.scope().file_scope_id(self.db()).is_global()
+                {
+                    for binding in ty_python_core::starlark::load_bindings(call) {
+                        self.infer_definition(binding.name);
+                    }
+                    return;
+                }
                 // If this is a call expression, we would have added an `IsNonTerminalCall`
                 // constraint, meaning this will be a standalone expression.
                 self.infer_maybe_standalone_expression(value, TypeContext::default());
@@ -10338,6 +10356,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut place = PlaceAndQualifiers::from(Place::Undefined);
         let mut failure = None;
         let mut checked_deprecated = false;
+        let include_unreachable = self.program_file().is_starlark(self.db())
+            && !self.context.is_range_reachable(expr_ref.range());
 
         while let Some(step) = resolution.next() {
             match step {
@@ -10359,6 +10379,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             resolution.place_expr(),
                             source,
                             narrowing_constraints,
+                            include_unreachable,
                         )
                     });
                     if place.place.is_definitely_bound() {
@@ -10390,7 +10411,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             place
         };
 
-        let constraint_keys = resolution.into_constraints();
+        let constraint_keys = if include_unreachable {
+            Vec::new()
+        } else {
+            resolution.into_constraints()
+        };
 
         (place, constraint_keys)
     }
@@ -10400,6 +10425,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         place_expr: PlaceExprRef,
         source: PlaceLoadSource<'db>,
         narrowing_constraints: &[(FileScopeId, ConstraintKey)],
+        include_unreachable: bool,
     ) -> PlaceAndQualifiers<'db> {
         let db = self.db();
         let env = self.program_environment();
@@ -10407,12 +10433,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let place = match source.kind {
             PlaceLoadSourceKind::Bindings(bindings) => {
-                let mut place = place_from_bindings_with_reachability_cache(
-                    db,
-                    env,
-                    bindings,
-                    self.reachability_cache(),
-                )
+                let mut place = if include_unreachable {
+                    crate::place::place_from_bindings_in_unreachable_code(db, env, bindings)
+                } else {
+                    place_from_bindings_with_reachability_cache(
+                        db,
+                        env,
+                        bindings,
+                        self.reachability_cache(),
+                    )
+                }
                 .place;
 
                 // Compatibility policy: ty historically treats a possibly-bound module snapshot
@@ -10455,13 +10485,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     if Some(self.scope()) == builtins_module_scope(db, env) {
                         Place::Undefined.into()
                     } else {
-                        implicit_builtins_symbol(db, env, &name)
+                        implicit_builtins_symbol(db, self.program_file(), &name)
                     }
                 }
             },
         };
 
-        if narrowing_constraints.is_empty() {
+        if include_unreachable || narrowing_constraints.is_empty() {
             place
         } else {
             place.map_type(|ty| {

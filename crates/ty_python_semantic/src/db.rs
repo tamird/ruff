@@ -234,6 +234,7 @@ pub(crate) mod tests {
         files: Vec<(&'a str, &'a str)>,
         /// Whether module resolution should include packages from the synthetic virtual environment.
         third_party_packages: bool,
+        custom_typeshed: Option<SystemPathBuf>,
         rule_selection: Option<RuleSelection>,
     }
 
@@ -245,6 +246,7 @@ pub(crate) mod tests {
                 src_roots: vec![SystemPathBuf::from("/src")],
                 files: vec![],
                 third_party_packages: false,
+                custom_typeshed: None,
                 rule_selection: None,
             }
         }
@@ -261,6 +263,11 @@ pub(crate) mod tests {
 
         pub(crate) fn with_src_roots(mut self, src_roots: Vec<SystemPathBuf>) -> Self {
             self.src_roots = src_roots;
+            self
+        }
+
+        pub(crate) fn with_custom_typeshed(mut self, path: SystemPathBuf) -> Self {
+            self.custom_typeshed = Some(path);
             self
         }
 
@@ -307,7 +314,7 @@ pub(crate) mod tests {
             db.write_files(self.files)
                 .context("Failed to write test files")?;
 
-            let search_path_settings = if self.third_party_packages {
+            let mut search_path_settings = if self.third_party_packages {
                 SearchPathSettings {
                     src_roots: self.src_roots,
                     site_packages_paths: vec![site_packages],
@@ -316,6 +323,7 @@ pub(crate) mod tests {
             } else {
                 SearchPathSettings::new(self.src_roots)
             };
+            search_path_settings.custom_typeshed = self.custom_typeshed;
 
             let program_settings = ProgramSettings {
                 python_version: PythonVersionWithSource {

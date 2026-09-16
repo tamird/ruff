@@ -75,7 +75,8 @@ pub fn definitions_for_name<'db>(
     }
 
     // If we didn't find any definitions in scopes, fallback to builtins
-    let Some(builtins_scope) = implicit_builtins_symbol_scope(db, &env, name_str) else {
+    let Some(builtins_scope) = implicit_builtins_symbol_scope(db, model.program_file(), name_str)
+    else {
         return vec![];
     };
     // Special cases for `float` and `complex` in type annotation positions.
