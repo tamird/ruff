@@ -344,13 +344,15 @@ struct StarConstructor {
 enum StarBinding {
     Constructor(StarConstructor),
     Alias(StarKnownType),
+    Struct(HashMap<String, StarBinding>),
 }
 
 impl StarBinding {
-    fn annotation_type(&self) -> &StarKnownType {
+    fn annotation_type(&self) -> Option<&StarKnownType> {
         match self {
-            Self::Constructor(constructor) => &constructor.ty,
-            Self::Alias(ty) => ty,
+            Self::Constructor(constructor) => Some(&constructor.ty),
+            Self::Alias(ty) => Some(ty),
+            Self::Struct(_) => None,
         }
     }
 }
@@ -367,6 +369,7 @@ enum RecordForm {
 struct StarSupportedForms<'profile> {
     record_forms: HashMap<&'profile str, RecordForm>,
     field_attested: bool,
+    struct_attested: bool,
 }
 
 /// Check a host-resolved snapshot without parsing `.star` as Bazel `.bzl`.
@@ -658,6 +661,7 @@ fn supported_forms<'profile>(
     Some(StarSupportedForms {
         record_forms: forms,
         field_attested: version == GRAPH_VERSION_V2,
+        struct_attested: version == GRAPH_VERSION_V2,
     })
 }
 
@@ -884,10 +888,13 @@ fn source_bindings(
                 &visible,
                 &preceding_callables,
             )
-            .map(StarBinding::Constructor),
-            Expr::Name(name) => visible.get(name.id.as_str()).cloned().or_else(|| {
-                type_expression(parsed, &visible, &assign.value).map(StarBinding::Alias)
-            }),
+            .map(StarBinding::Constructor)
+            .or_else(|| struct_declaration(parsed, call, forms, &visible)),
+            Expr::Name(_) | Expr::Attribute(_) => binding_in_scope(&assign.value, &visible)
+                .cloned()
+                .or_else(|| {
+                    type_expression(parsed, &visible, &assign.value).map(StarBinding::Alias)
+                }),
             expression => type_expression(parsed, &visible, expression).map(StarBinding::Alias),
         };
         if let Some(declaration) = declaration {
@@ -898,6 +905,71 @@ fn source_bindings(
     // v1 does not attest whether load aliases themselves are reexported.
     // Explicit declarations can retain an imported type's identity.
     exports
+}
+
+fn struct_declaration(
+    parsed: &ParsedStarSource<'_>,
+    call: &ast::ExprCall,
+    forms: &StarSupportedForms<'_>,
+    visible: &HashMap<String, StarBinding>,
+) -> Option<StarBinding> {
+    let StarSupportedForms {
+        record_forms: _,
+        field_attested: _,
+        struct_attested,
+    } = forms;
+    if !struct_attested || !parsed.is_host_global("struct") {
+        return None;
+    }
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id != "struct" || !call.arguments.args.is_empty() {
+        return None;
+    }
+    let mut members = HashMap::new();
+    let mut seen = HashSet::new();
+    for keyword in &call.arguments.keywords {
+        let name = keyword.arg.as_ref()?;
+        if !seen.insert(name.as_str()) {
+            return None;
+        }
+        let binding = binding_in_scope(&keyword.value, visible)
+            .cloned()
+            .or_else(|| type_expression(parsed, visible, &keyword.value).map(StarBinding::Alias));
+        if let Some(binding) = binding {
+            members.insert(name.as_str().to_string(), binding);
+        }
+    }
+    Some(StarBinding::Struct(members))
+}
+
+fn binding_in_scope<'scope>(
+    expression: &Expr,
+    visible: &'scope HashMap<String, StarBinding>,
+) -> Option<&'scope StarBinding> {
+    match expression {
+        Expr::Name(name) => visible.get(name.id.as_str()),
+        Expr::Attribute(attribute) => {
+            let parent = binding_in_scope(&attribute.value, visible)?;
+            let StarBinding::Struct(members) = parent else {
+                return None;
+            };
+            members.get(attribute.attr.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn binding_name(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Name(name) => Some(name.id.to_string()),
+        Expr::Attribute(attribute) => {
+            let parent = binding_name(&attribute.value)?;
+            Some(format!("{parent}.{}", attribute.attr))
+        }
+        _ => None,
+    }
 }
 
 fn record_declaration(
@@ -912,6 +984,7 @@ fn record_declaration(
     let StarSupportedForms {
         record_forms,
         field_attested,
+        struct_attested: _,
     } = forms;
     let Expr::Name(callee) = call.func.as_ref() else {
         return None;
@@ -1025,7 +1098,7 @@ fn type_expression(
         Expr::Name(name) => {
             let name = name.id.as_str();
             if let Some(binding) = visible.get(name) {
-                return Some(binding.annotation_type().clone());
+                return binding.annotation_type().cloned();
             }
             if !parsed.is_host_global(name) {
                 return None;
@@ -1137,8 +1210,9 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
             _ => {}
         }
         if let Expr::Call(call) = expression
-            && let Expr::Name(name) = call.func.as_ref()
-            && let Some(StarBinding::Constructor(constructor)) = self.visible.get(name.id.as_str())
+            && let Some(StarBinding::Constructor(constructor)) =
+                binding_in_scope(&call.func, &self.visible)
+            && let Some(name) = binding_name(&call.func)
         {
             for keyword in &call.arguments.keywords {
                 let Some(field_name) = &keyword.arg else {
@@ -1160,7 +1234,7 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
                         range: keyword.value.range(),
                         related_file: constructor.file,
                         related_range: field.range,
-                        constructor: name.id.to_string(),
+                        constructor: name.clone(),
                         field: field_name.to_string(),
                         expected: field.ty.clone(),
                         actual,
@@ -1183,10 +1257,7 @@ fn argument_type(
         Expr::BooleanLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::Bool)),
         Expr::NoneLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::None)),
         Expr::Call(call) => {
-            let Expr::Name(callee) = call.func.as_ref() else {
-                return None;
-            };
-            let Some(StarBinding::Constructor(constructor)) = visible.get(callee.id.as_str())
+            let Some(StarBinding::Constructor(constructor)) = binding_in_scope(&call.func, visible)
             else {
                 return None;
             };

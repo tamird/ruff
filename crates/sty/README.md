@@ -57,10 +57,13 @@ such as `record(value=field(int, default=7))`. Positional defaults
 work the same way. Unknown type expressions and shadowed native names
 stay unproved.
 
-The native checker validates field defaults and missing required fields.
-`struct` members, attributes, callback and function bodies, and values
-computed at runtime remain unproved. The shared Python parser may mark
-valid host Starlark syntax opaque. A clear bounded source pass invokes
+Sty also follows source `struct` members that refer to known record
+constructors or other proven `struct` bindings, including through
+resolved loads. Members computed at runtime stay unproved. The native
+checker validates field defaults and missing required fields. Other
+attributes, callbacks, function bodies, and runtime values remain
+unproved. The shared Python parser may mark valid host Starlark syntax
+opaque. A clear bounded source pass invokes
 `--sty-check-v1` with the same source and inputs. The host still owns
 its parser, loader, native annotation checks, and runtime checks.
 Native v1 rereads files, so keep sources and catalogs stable across

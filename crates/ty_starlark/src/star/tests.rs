@@ -294,6 +294,105 @@ fn shadowed_or_unrecognized_field_calls_do_not_prove_annotations() -> anyhow::Re
     Ok(())
 }
 
+#[test]
+fn attested_struct_members_resolve_record_calls_and_explicit_aliases() -> anyhow::Result<()> {
+    let source = concat!(
+        "Repository = record(name=str)\n",
+        "images = struct(repository=Repository, computed=make_value())\n",
+        "repository = images.repository\n",
+        "nested = struct(images=images)\n",
+        "images.repository(name=7)\n",
+        "repository(name=7)\n",
+        "nested.images.repository(name=7)\n",
+        "images.computed(name=7)\n",
+    );
+    let (_db, v1) = root_only(source)?;
+    let analysis = analyzed(check_star_graph(&v1))?;
+    assert!(analysis.problems().is_empty());
+    assert_eq!(analysis.checked_arguments(), 0);
+
+    let (_db, v2) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&v2))?;
+    assert_eq!(analysis.checked_arguments(), 3);
+    let [direct, alias, nested] = analysis.problems() else {
+        anyhow::bail!("expected three proven struct member calls: {analysis:?}");
+    };
+    for (problem, constructor) in [
+        (direct, "images.repository"),
+        (alias, "repository"),
+        (nested, "nested.images.repository"),
+    ] {
+        assert_eq!(problem.constructor(), constructor);
+        assert_eq!(problem.field(), "name");
+        assert_eq!(problem.file(), v2.root.file);
+        assert_eq!(problem.related_file(), v2.root.file);
+        assert_eq!(slice(source, problem.range()), Some("7"));
+        assert_eq!(slice(source, problem.related_range()), Some("str"));
+    }
+    Ok(())
+}
+
+#[test]
+fn loaded_struct_keeps_module_field_locations() -> anyhow::Result<()> {
+    let root_source = format!("load(\"{LABEL}\", \"images\")\nimages.repository(name=7)\n");
+    let module_source = "Repository = record(name=str)\nimages = struct(repository=Repository)\n";
+    let (_db, mut graph) = case(&root_source, module_source)?;
+    graph.version = "sty-star-graph-v2".to_string();
+    graph.profile = v2_profile();
+    graph.root.loads[0].bindings[0].local = "images".to_string();
+    graph.root.loads[0].bindings[0].source = "images".to_string();
+    let (root_file, module_file) = files(&graph)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected loaded struct member mismatch: {analysis:?}");
+    };
+    assert_eq!(analysis.checked_arguments(), 1);
+    assert_eq!(problem.file(), root_file);
+    assert_eq!(problem.related_file(), module_file);
+    assert_eq!(problem.constructor(), "images.repository");
+    assert_eq!(slice(&root_source, problem.range()), Some("7"));
+    assert_eq!(slice(module_source, problem.related_range()), Some("str"));
+    Ok(())
+}
+
+#[test]
+fn struct_members_follow_source_order_and_decline_unproved_sources() -> anyhow::Result<()> {
+    let source = concat!(
+        "Repository = record(name=str)\n",
+        "images.repository(name=7)\n",
+        "images = struct(repository=Repository)\n",
+        "images.repository(name=7)\n",
+    );
+    let (_db, graph) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert_eq!(analysis.checked_arguments(), 1);
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected only the call following the struct binding: {analysis:?}");
+    };
+    assert_eq!(slice(source, problem.range()), Some("7"));
+    let second_call = source
+        .rfind("images.repository(name=7)")
+        .ok_or_else(|| anyhow::anyhow!("source-order test lacks the second call"))?;
+    assert_eq!(
+        problem.range().start().to_usize(),
+        second_call + "images.repository(name=".len(),
+    );
+
+    for source in [
+        "Repository = record(name=str)\nstruct = missing\nimages = struct(repository=Repository)\nimages.repository(name=7)\n",
+        "Repository = record(name=str)\nimages = struct(Repository, repository=Repository)\nimages.repository(name=7)\n",
+        "Repository = record(name=str)\nimages = struct(repository=Repository, **extra)\nimages.repository(name=7)\n",
+        "Repository = record(name=str)\nimages = struct(repository=make_value())\nimages.repository(name=7)\n",
+        "Repository = record(name=str)\nimages = struct(repository=Repository)\nimages = struct(repository=make_value())\nimages.repository(name=7)\n",
+    ] {
+        let (_db, graph) = v2_root_only(source)?;
+        let analysis = analyzed(check_star_graph(&graph))?;
+        assert!(analysis.problems().is_empty(), "{source}: {analysis:?}");
+        assert_eq!(analysis.checked_arguments(), 0, "{source}");
+    }
+    Ok(())
+}
+
 fn analyzed(result: StarCheck) -> anyhow::Result<StarAnalysis> {
     match result {
         StarCheck::Partial(analysis) => Ok(analysis),

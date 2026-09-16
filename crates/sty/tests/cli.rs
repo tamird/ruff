@@ -557,6 +557,80 @@ fn host_v2_field_error_uses_the_captured_argument_and_type_spans() -> anyhow::Re
 
 #[cfg(unix)]
 #[test]
+fn host_v2_struct_member_error_keeps_loaded_source_locations() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    let checker = host_fixture(&fixture)?;
+    let root_path = fixture.path("root.star");
+    let module_path = fixture.path("images.star");
+    let module_id = "//example:images.star";
+    let label = format!("\"{module_id}\"");
+    let root_source = format!("load({label}, \"images\")\nimages.repository(name=7)\n");
+    let module_source = "Repository = record(name=str)\nimages = struct(repository=Repository)\n";
+    fixture.write("root.star", "GOOD = 1\n")?;
+    fixture.write("images.star", module_source)?;
+    let start = root_source
+        .find(&label)
+        .ok_or_else(|| anyhow::anyhow!("struct test lacks a load label"))?;
+    let start = u32::try_from(start)?;
+    let end = start + u32::try_from(label.len())?;
+    let module_name = utf8_path(&module_path)?;
+    let graph = star_graph_json(
+        &root_path,
+        &root_source,
+        &[serde_json::json!({
+            "module_id": module_id, "start": start, "end": end,
+            "symbols": [{"local": "images", "source": "images"}]
+        })],
+        &[serde_json::json!({
+            "id": module_id, "path": module_name,
+            "source": module_source, "loads": []
+        })],
+    )?;
+    fixture.write("graph.json", &graph)?;
+    let graph_file = fixture.path("graph.json");
+    let log = fixture.path("host-argv.txt");
+    let checker_name = utf8_path(&checker)?;
+    let root_name = utf8_path(&root_path)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", &graph_file)
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .args(["check", "--host-checker", checker_name, root_name])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(output.stdout.is_empty(), "source JSON leaked");
+    let (_, argument_line) = root_source
+        .split_once('\n')
+        .ok_or_else(|| anyhow::anyhow!("struct test lacks an argument line"))?;
+    let primary_column = argument_line
+        .find('7')
+        .ok_or_else(|| anyhow::anyhow!("struct test lacks an argument"))?
+        + 1;
+    let related_column = module_source
+        .find("str")
+        .ok_or_else(|| anyhow::anyhow!("struct test lacks a field type"))?
+        + 1;
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "{}:2:{primary_column}: error: images.repository.name, expected str, got int\n  field declared at {}:1:{related_column}\n",
+            root_path.display(),
+            module_path.display(),
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(&log)?,
+        format!(
+            "--sty-graph-v2\n--source\n{}\nmanifest:\n",
+            root_path.display()
+        )
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn malformed_host_graph_exits_two_and_producer_failure_relays_its_status() -> anyhow::Result<()> {
     let fixture = Fixture::unmarked()?;
     fixture.write("root.star", "VALUE = 1\n")?;
