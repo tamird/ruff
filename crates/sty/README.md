@@ -1,6 +1,9 @@
 # Sty
 
 Sty is an unpublished workspace command for a bounded Starlark check.
+See [the architecture and migration plan](ARCHITECTURE.md) for ownership
+boundaries and the planned reuse of Ty's semantic analysis.
+
 Build it once from the Ruff checkout:
 
 ```sh
