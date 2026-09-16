@@ -89,6 +89,31 @@ fn example_host_param(name: &str, mode: &str, required: bool) -> StarHostParam {
     }
 }
 
+fn native_profile() -> StarHostProfile {
+    let mut host = v3_profile();
+    let mut encode = example_host_function("host_encode");
+    let mut value = example_host_param("value", "pos_or_named", true);
+    value.ty = "any".to_string();
+    let mut sort_keys = example_host_param("sort_keys", "named_only", false);
+    sort_keys.ty = "bool".to_string();
+    encode.params = Box::new([value, sort_keys]);
+    let hash = example_host_function("host_hash");
+    let mut catalog = example_host_function("host_catalog");
+    let mut decoder = example_host_param("decoder", "named_only", true);
+    decoder.ty = "callable".to_string();
+    catalog.params = Box::new([example_host_param("name", "pos_or_named", true), decoder]);
+    catalog.returns = "any".to_string();
+    catalog.availability = "loaded_module_initialization".to_string();
+    let mut modes = example_host_function("host_modes");
+    let mut count = example_host_param("count", "pos_or_named", true);
+    count.ty = "int".to_string();
+    let mut enabled = example_host_param("enabled", "named_only", false);
+    enabled.ty = "bool".to_string();
+    modes.params = Box::new([example_host_param("base", "pos_only", true), count, enabled]);
+    host.host_functions = Box::new([encode, hash, catalog, modes]);
+    host
+}
+
 fn case(root_source: &str, module_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)> {
     let (db, root) = test_db(&[("root.star", root_source), ("limits.star", module_source)])?;
     let root_file = system_path_to_file(&db, root.join("root.star"))?;
@@ -143,6 +168,13 @@ fn v2_root_only(root_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)
     let (db, mut graph) = root_only(root_source)?;
     graph.version = "sty-star-graph-v2".to_string();
     graph.profile = v2_profile();
+    Ok((db, graph))
+}
+
+fn v3_root_only(root_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)> {
+    let (db, mut graph) = v2_root_only(root_source)?;
+    graph.version = "sty-star-graph-v3".to_string();
+    graph.profile = native_profile();
     Ok((db, graph))
 }
 
@@ -268,6 +300,178 @@ fn v3_requires_well_formed_portable_host_function_signatures() -> anyhow::Result
         }
         profile_failure(&graph).with_context(|| drift)?;
     }
+    Ok(())
+}
+
+#[test]
+fn v3_checks_native_scalars_and_infers_only_valid_nested_returns() -> anyhow::Result<()> {
+    let source = concat!(
+        "Config = record(label=str, count=int)\n",
+        "if False:\n",
+        "    host_hash(value=7)\n",
+        "    host_encode(value=unknown(), sort_keys=7)\n",
+        "    host_modes(\"ok\", count=7, enabled=\"wrong\")\n",
+        "    Config(count=host_hash(\"ok\"))\n",
+        "    Config(label=host_hash(host_encode(value=unknown(), sort_keys=True)))\n",
+        "    Config(label=host_hash(7))\n",
+        "    Config(label=host_hash(host_encode(value=unknown(), sort_keys=\"wrong\")))\n",
+        "    Config(label=host_encode(value=unknown()))\n",
+    );
+    let (_db, graph) = v3_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [field] = analysis.problems() else {
+        anyhow::bail!("known native return should prove one wrong field: {analysis:?}");
+    };
+    assert_eq!(field.field(), "count");
+    assert_eq!(field.expected().to_string(), "int");
+    assert_eq!(field.actual().to_string(), "str");
+    assert_eq!(slice(source, field.range()), Some("host_hash(\"ok\")"));
+    let [hash, sort_keys, modes, nested_hash, nested_sort_keys] = analysis.native_problems() else {
+        anyhow::bail!("expected only independently proven native errors: {analysis:?}");
+    };
+    for (problem, source_span, message, signature) in [
+        (
+            hash,
+            "7",
+            "host_hash parameter value, expected str, got int",
+            "host_hash(value: str) -> str",
+        ),
+        (
+            sort_keys,
+            "7",
+            "host_encode parameter sort_keys, expected bool, got int",
+            "host_encode(value: any, *, sort_keys: bool (optional)) -> str",
+        ),
+        (
+            modes,
+            "\"wrong\"",
+            "host_modes parameter enabled, expected bool, got str",
+            "host_modes(base: str, /, count: int, *, enabled: bool (optional)) -> str",
+        ),
+        (
+            nested_hash,
+            "7",
+            "host_hash parameter value, expected str, got int",
+            "host_hash(value: str) -> str",
+        ),
+        (
+            nested_sort_keys,
+            "\"wrong\"",
+            "host_encode parameter sort_keys, expected bool, got str",
+            "host_encode(value: any, *, sort_keys: bool (optional)) -> str",
+        ),
+    ] {
+        assert_eq!(problem.file(), graph.root.file);
+        assert_eq!(slice(source, problem.range()), Some(source_span));
+        assert_eq!(problem.to_string(), message);
+        assert_eq!(problem.signature(), signature);
+    }
+    assert!(analysis.checked_arguments() >= 9);
+    assert!(analysis.unproved_arguments() >= 2);
+    Ok(())
+}
+
+#[test]
+fn v3_native_calls_abstain_when_parameter_mapping_is_unproved() -> anyhow::Result<()> {
+    let source = concat!(
+        "Config = record(value=int)\n",
+        "if False:\n",
+        "    Config(value=host_hash())\n",
+        "    Config(value=host_encode(1, True))\n",
+        "    Config(value=host_encode(value=1, extra=True))\n",
+        "    Config(value=host_hash(*values))\n",
+        "    Config(value=host_modes(base=\"ok\", count=7))\n",
+    );
+    let (_db, graph) = v3_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
+    assert!(analysis.native_problems().is_empty(), "{analysis:?}");
+    assert!(analysis.unproved_arguments() >= 6);
+    Ok(())
+}
+
+#[test]
+fn v3_catalog_proof_requires_eager_loaded_module_and_known_callback() -> anyhow::Result<()> {
+    let root_source = format!(
+        "load(\"{LABEL}\", \"LimitConfig\")\nif False:\n    host_catalog(name=7, decoder=unknown())\n    LimitConfig(value=True)\n"
+    );
+    let module_source = concat!(
+        "LimitConfig = record(value=bool)\n",
+        "def decode(value):\n    pass\n",
+        "host_catalog(name=\"ready\", decoder=decode)\n",
+        "host_catalog(name=7, decoder=decode)\n",
+        "host_catalog(name=\"ready\", decoder=unknown())\n",
+        "LimitConfig(value=host_catalog(name=\"ready\", decoder=decode))\n",
+        "def delayed():\n    host_catalog(name=7, decoder=decode)\n    host_hash(7)\n",
+    );
+    let (_db, mut graph) = case(&root_source, module_source)?;
+    graph.version = "sty-star-graph-v3".to_string();
+    graph.profile = native_profile();
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
+    let [problem, deferred_hash] = analysis.native_problems() else {
+        anyhow::bail!("only available loaded calls have proven native inputs: {analysis:?}");
+    };
+    assert_eq!(problem.file(), graph.modules[0].source.file);
+    assert_eq!(slice(module_source, problem.range()), Some("7"));
+    assert_eq!(
+        problem.to_string(),
+        "host_catalog parameter name, expected str, got int"
+    );
+    assert_eq!(
+        problem.signature(),
+        "host_catalog(name: str, *, decoder: callable) -> any"
+    );
+    assert_eq!(deferred_hash.file(), graph.modules[0].source.file);
+    assert_eq!(slice(module_source, deferred_hash.range()), Some("7"));
+    assert_eq!(
+        deferred_hash.to_string(),
+        "host_hash parameter value, expected str, got int"
+    );
+    assert!(analysis.unproved_arguments() >= 2);
+    Ok(())
+}
+
+#[test]
+fn v3_native_globals_require_stable_module_and_lexical_bindings() -> anyhow::Result<()> {
+    let source = concat!(
+        "def parameter(host_hash):\n    host_hash(7)\n",
+        "def local():\n    host_hash = unknown()\n    host_hash(7)\n",
+        "def unshadowed():\n    host_encode(value=\"ok\", sort_keys=7)\n",
+        "if False:\n    host_hash(7)\n",
+    );
+    let (_db, graph) = v3_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [hash, encode] = analysis.native_problems() else {
+        anyhow::bail!("lexically shadowed native calls were checked: {analysis:?}");
+    };
+    assert_eq!(slice(source, encode.range()), Some("7"));
+    assert_eq!(slice(source, hash.range()), Some("7"));
+    assert_eq!(
+        encode.to_string(),
+        "host_encode parameter sort_keys, expected bool, got int"
+    );
+    assert_eq!(
+        hash.to_string(),
+        "host_hash parameter value, expected str, got int"
+    );
+
+    let source = "host_hash(7)\nhost_hash = unknown()\nhost_hash(7)\n";
+    let (_db, graph) = v3_root_only(source)?;
+    assert!(
+        analyzed(check_star_graph(&graph))?
+            .native_problems()
+            .is_empty(),
+        "unstable module binding was treated as native"
+    );
+    let source = format!("load(\"{LABEL}\", host_hash=\"LimitConfig\")\nhost_hash(value=7)\n");
+    let (_db, mut graph) = case(&source, "LimitConfig = record(value=int)\n")?;
+    graph.root.loads[0].bindings[0].local = "host_hash".to_string();
+    graph.version = "sty-star-graph-v3".to_string();
+    graph.profile = native_profile();
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.native_problems().is_empty(), "{analysis:?}");
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
     Ok(())
 }
 

@@ -73,8 +73,16 @@ computed attributes, and unrecognized type aliases remain the host's
 responsibility or unproved. Sty checks known calls inside direct source
 function bodies using stable final module bindings while excluding
 function parameters and local names. Nested functions, lambdas, and
-comprehensions await their own proven scope. This source pass still
-leaves host-native arguments unproved. The shared Python parser may
+comprehensions await their own proven scope. With v3 host function facts,
+Sty also checks known scalar and callable arguments of direct native
+global calls. It uses the host's ordered positional and named modes,
+required parameters, and evaluator availability before proving a call.
+A typed native return can supply an argument type when the call has a
+valid parameter mapping and no known wrong inputs. Native returns of
+`any` or `unknown`, computed callbacks, shadowed names, and calls outside
+their attested evaluator remain unproved. A known native mismatch shows
+the captured argument span and a textual host signature; the graph has
+no native declaration source span. The shared Python parser may
 mark valid host Starlark syntax opaque. A clear bounded source pass invokes
 `--sty-check-v1` with the same source and inputs. The host still owns
 its parser, loader, native annotation checks, and runtime checks.

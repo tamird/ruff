@@ -1,9 +1,10 @@
 //! A bounded static source check for host-owned typed `.star` graphs.
 //!
 //! The host captures exact source text and resolves direct loads with its
-//! parser. This pass checks source-declared record fields and annotated
-//! function calls whose types can be established from the graph. Other forms
-//! unproved; an analyzed graph is never a full type proof.
+//! parser. This pass checks source-declared record fields, annotated source
+//! functions, and attested native calls whose types can be established from
+//! the graph. Other forms remain unproved; an analyzed graph is never a full
+//! type proof.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -103,10 +104,11 @@ pub enum StarCheck {
     Opaque(StarFailure),
 }
 
-/// Proves known source record fields and stable annotated source parameters.
+/// Proves known source fields, source parameters, and attested native parameters.
 #[derive(Debug)]
 pub struct StarAnalysis {
     problems: Box<[StarTypeProblem]>,
+    native_problems: Box<[StarNativeTypeProblem]>,
     checked_arguments: usize,
     unproved_arguments: usize,
 }
@@ -116,15 +118,19 @@ impl StarAnalysis {
         &self.problems
     }
 
-    /// Known keyword fields of record calls and known regular positional or
-    /// named arguments of stable annotated source functions, including errors.
+    pub fn native_problems(&self) -> &[StarNativeTypeProblem] {
+        &self.native_problems
+    }
+
+    /// Known source fields, annotated source parameters, and attested native
+    /// parameters, including errors.
     pub fn checked_arguments(&self) -> usize {
         self.checked_arguments
     }
 
-    /// Unproved keyword fields of record calls and supplied arguments of
-    /// stable annotated source functions. Calls without established source
-    /// signatures and unmodeled closure bodies are not counted.
+    /// Supplied arguments of recognized calls without established argument
+    /// types or a provable parameter mapping. Calls without a recognized
+    /// signature and unmodeled closure bodies are not counted.
     pub fn unproved_arguments(&self) -> usize {
         self.unproved_arguments
     }
@@ -293,6 +299,43 @@ impl std::fmt::Display for StarTypeProblem {
     }
 }
 
+/// A native contract has no source declaration in the captured graph.
+#[derive(Debug)]
+pub struct StarNativeTypeProblem {
+    file: File,
+    range: TextRange,
+    function: String,
+    parameter: String,
+    expected: StarKnownType,
+    actual: StarKnownType,
+    signature: String,
+}
+
+impl StarNativeTypeProblem {
+    pub fn file(&self) -> File {
+        self.file
+    }
+
+    pub fn range(&self) -> TextRange {
+        self.range
+    }
+
+    /// A textual contract from producer-attested parameter facts.
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+}
+
+impl std::fmt::Display for StarNativeTypeProblem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} parameter {}, expected {}, got {}",
+            self.function, self.parameter, self.expected, self.actual
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct StarFailure {
     file: File,
@@ -421,6 +464,7 @@ enum RecordForm {
 
 struct StarSupportedForms<'profile> {
     record_forms: HashMap<&'profile str, RecordForm>,
+    host_functions: HashMap<&'profile str, &'profile StarHostFunction>,
     field_attested: bool,
     struct_attested: bool,
     source_functions: bool,
@@ -540,12 +584,14 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
     };
     let root_exports = source_bindings(&parsed_root, &StarRecordModule::Root, &forms, root_imports);
     let mut problems = Vec::new();
+    let mut native_problems = Vec::new();
     let mut checked_arguments = 0;
     let mut unproved_arguments = 0;
-    for (parsed, declarations) in parsed_modules
+    for (parsed, declarations, loaded_module) in parsed_modules
         .iter()
         .zip(&exports)
-        .chain(std::iter::once((&parsed_root, &root_exports)))
+        .map(|(parsed, declarations)| (parsed, declarations, true))
+        .chain(std::iter::once((&parsed_root, &root_exports, false)))
     {
         let visible = match imported_bindings(parsed, &exports, &by_id) {
             Ok(visible) => visible,
@@ -557,9 +603,12 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
             declarations,
             writes: &parsed.writes,
             loaded_names: &parsed.loaded_names,
+            host_functions: &forms.host_functions,
             local_names: HashSet::new(),
+            loaded_module,
             deferred: false,
             problems: Vec::new(),
+            native_problems: Vec::new(),
             checked_arguments: 0,
             unproved_arguments: 0,
         };
@@ -568,11 +617,13 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
             scanner.scan_deferred_bodies(parsed.suite());
         }
         problems.extend(scanner.problems);
+        native_problems.extend(scanner.native_problems);
         checked_arguments += scanner.checked_arguments;
         unproved_arguments += scanner.unproved_arguments;
     }
     StarCheck::Partial(StarAnalysis {
         problems: problems.into_boxed_slice(),
+        native_problems: native_problems.into_boxed_slice(),
         checked_arguments,
         unproved_arguments,
     })
@@ -726,6 +777,10 @@ fn supported_forms<'profile>(
     }
     Some(StarSupportedForms {
         record_forms: forms,
+        host_functions: host_functions
+            .iter()
+            .map(|function| (function.name.as_str(), function))
+            .collect(),
         field_attested: version != GRAPH_VERSION_V1,
         struct_attested: version != GRAPH_VERSION_V1,
         source_functions: version != GRAPH_VERSION_V1,
@@ -1050,6 +1105,7 @@ fn struct_declaration(
 ) -> Option<StarBinding> {
     let StarSupportedForms {
         record_forms: _,
+        host_functions: _,
         field_attested: _,
         struct_attested,
         source_functions: _,
@@ -1167,6 +1223,7 @@ fn record_declaration(
 ) -> Option<StarConstructor> {
     let StarSupportedForms {
         record_forms,
+        host_functions: _,
         field_attested,
         struct_attested: _,
         source_functions: _,
@@ -1346,20 +1403,23 @@ fn type_union(
     StarKnownType::Union(alternatives.into_boxed_slice())
 }
 
-struct CallScanner<'types> {
+struct CallScanner<'types, 'profile> {
     file: File,
     visible: HashMap<String, StarBinding>,
     declarations: &'types HashMap<String, StarBinding>,
     writes: &'types HashMap<String, usize>,
     loaded_names: &'types HashSet<String>,
+    host_functions: &'types HashMap<&'profile str, &'profile StarHostFunction>,
     local_names: HashSet<String>,
+    loaded_module: bool,
     deferred: bool,
     problems: Vec<StarTypeProblem>,
+    native_problems: Vec<StarNativeTypeProblem>,
     checked_arguments: usize,
     unproved_arguments: usize,
 }
 
-impl<'source> Visitor<'source> for CallScanner<'_> {
+impl<'source> Visitor<'source> for CallScanner<'_, '_> {
     fn visit_stmt(&mut self, statement: &'source Stmt) {
         match statement {
             // The eager pass scans top-level code and top-level `if` arms.
@@ -1426,7 +1486,9 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
                     self.unproved_arguments += 1;
                     continue;
                 };
-                let Some(actual) = argument_type(&keyword.value, &self.visible) else {
+                let Some(actual) =
+                    argument_type(&keyword.value, &self.visible, &self.native_scope())
+                else {
                     self.unproved_arguments += 1;
                     continue;
                 };
@@ -1455,11 +1517,21 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
             let function = function.clone();
             self.check_function_call(call, &function, &name);
         }
+        if let Expr::Call(call) = expression {
+            let native = self.native_scope();
+            if let Some(function) = native.function(&call.func) {
+                let result =
+                    native_call_type_analysis(self.file, call, function, &self.visible, &native);
+                self.checked_arguments += result.checked_arguments;
+                self.unproved_arguments += result.unproved_arguments;
+                self.native_problems.extend(result.problems);
+            }
+        }
         ast::visitor::walk_expr(self, expression);
     }
 }
 
-impl CallScanner<'_> {
+impl CallScanner<'_, '_> {
     fn scan_deferred_bodies(&mut self, suite: &[Stmt]) {
         let final_visible = self.visible.clone();
         for statement in suite {
@@ -1479,14 +1551,18 @@ impl CallScanner<'_> {
                 declarations: self.declarations,
                 writes: self.writes,
                 loaded_names: self.loaded_names,
+                host_functions: self.host_functions,
                 local_names: writes.names,
+                loaded_module: self.loaded_module,
                 deferred: true,
                 problems: Vec::new(),
+                native_problems: Vec::new(),
                 checked_arguments: 0,
                 unproved_arguments: 0,
             };
             scanner.visit_body(&function.body);
             self.problems.extend(scanner.problems);
+            self.native_problems.extend(scanner.native_problems);
             self.checked_arguments += scanner.checked_arguments;
             self.unproved_arguments += scanner.unproved_arguments;
         }
@@ -1494,6 +1570,16 @@ impl CallScanner<'_> {
 
     fn callee_is_unshadowed(&self, expression: &Expr) -> bool {
         callee_root_name(expression).is_some_and(|name| !self.local_names.contains(name))
+    }
+
+    fn native_scope(&self) -> NativeScope<'_, '_> {
+        NativeScope {
+            functions: self.host_functions,
+            writes: self.writes,
+            loaded_names: self.loaded_names,
+            local_names: &self.local_names,
+            loaded_initialization: self.loaded_module && !self.deferred,
+        }
     }
 
     fn check_function_call(&mut self, call: &ast::ExprCall, function: &StarFunction, name: &str) {
@@ -1546,7 +1632,7 @@ impl CallScanner<'_> {
             self.unproved_arguments += 1;
             return;
         };
-        let Some(actual) = argument_type(expression, &self.visible) else {
+        let Some(actual) = argument_type(expression, &self.visible, &self.native_scope()) else {
             self.unproved_arguments += 1;
             return;
         };
@@ -1653,9 +1739,166 @@ fn function_call_shape_known(call: &ast::ExprCall, function: &StarFunction) -> b
     true
 }
 
+struct NativeScope<'scope, 'profile> {
+    functions: &'scope HashMap<&'profile str, &'profile StarHostFunction>,
+    writes: &'scope HashMap<String, usize>,
+    loaded_names: &'scope HashSet<String>,
+    local_names: &'scope HashSet<String>,
+    loaded_initialization: bool,
+}
+
+impl<'profile> NativeScope<'_, 'profile> {
+    fn function(&self, expression: &Expr) -> Option<&'profile StarHostFunction> {
+        let Expr::Name(name) = expression else {
+            return None;
+        };
+        let name = name.id.as_str();
+        if self.writes.contains_key(name)
+            || self.loaded_names.contains(name)
+            || self.local_names.contains(name)
+        {
+            return None;
+        }
+        let function = self.functions.get(name).copied()?;
+        if function.availability == "loaded_module_initialization" && !self.loaded_initialization {
+            return None;
+        }
+        Some(function)
+    }
+}
+
+/// Map only a call whose native parameter bindings are determined by the
+/// attested positional and keyword modes, including required parameters.
+fn native_call_mapping<'arg, 'profile>(
+    call: &'arg ast::ExprCall,
+    function: &'profile StarHostFunction,
+) -> Option<Vec<(&'arg Expr, &'profile StarHostParam)>> {
+    let arguments = &call.arguments;
+    let mut positional = function
+        .params
+        .iter()
+        .filter(|param| param.mode != "named_only");
+    let mut mapped = Vec::with_capacity(arguments.args.len() + arguments.keywords.len());
+    let mut seen = HashSet::new();
+    for expression in &arguments.args {
+        if expression.is_starred_expr() {
+            return None;
+        }
+        let param = positional.next()?;
+        seen.insert(param.name.as_str());
+        mapped.push((expression, param));
+    }
+    for keyword in &arguments.keywords {
+        let name = keyword.arg.as_ref()?;
+        let param = function
+            .params
+            .iter()
+            .find(|param| param.name == name.as_str() && param.mode != "pos_only")?;
+        if !seen.insert(param.name.as_str()) {
+            return None;
+        }
+        mapped.push((&keyword.value, param));
+    }
+    if function
+        .params
+        .iter()
+        .any(|param| param.required && !seen.contains(param.name.as_str()))
+    {
+        return None;
+    }
+    Some(mapped)
+}
+
+fn known_host_type(ty: &str) -> Option<StarKnownType> {
+    match ty {
+        "int" => Some(StarKnownType::Primitive(StarPrimitive::Int)),
+        "str" => Some(StarKnownType::Primitive(StarPrimitive::Str)),
+        "bool" => Some(StarKnownType::Primitive(StarPrimitive::Bool)),
+        "callable" => Some(StarKnownType::Callable),
+        // `any` permits every value; `unknown` attests no portable type.
+        "any" | "unknown" => None,
+        _ => unreachable!("host type was validated before native analysis"),
+    }
+}
+
+fn host_signature(function: &StarHostFunction) -> String {
+    let mut parts = Vec::with_capacity(function.params.len() + 2);
+    let mut positional_only = false;
+    let mut named_only = false;
+    for param in &function.params {
+        if param.mode != "pos_only" && positional_only {
+            parts.push("/".to_string());
+            positional_only = false;
+        }
+        if param.mode == "named_only" && !named_only {
+            parts.push("*".to_string());
+            named_only = true;
+        }
+        let optional = if param.required { "" } else { " (optional)" };
+        parts.push(format!("{}: {}{optional}", param.name, param.ty));
+        if param.mode == "pos_only" {
+            positional_only = true;
+        }
+    }
+    if positional_only {
+        parts.push("/".to_string());
+    }
+    format!(
+        "{}({}) -> {}",
+        function.name,
+        parts.join(", "),
+        function.returns
+    )
+}
+
+#[derive(Default)]
+struct NativeCallTypeAnalysis {
+    problems: Vec<StarNativeTypeProblem>,
+    checked_arguments: usize,
+    unproved_arguments: usize,
+}
+
+fn native_call_type_analysis(
+    file: File,
+    call: &ast::ExprCall,
+    function: &StarHostFunction,
+    visible: &HashMap<String, StarBinding>,
+    native: &NativeScope<'_, '_>,
+) -> NativeCallTypeAnalysis {
+    let mut result = NativeCallTypeAnalysis::default();
+    let Some(mapped) = native_call_mapping(call, function) else {
+        result.unproved_arguments = call.arguments.args.len() + call.arguments.keywords.len();
+        return result;
+    };
+    for (expression, param) in mapped {
+        let Some(expected) = known_host_type(&param.ty) else {
+            result.unproved_arguments += 1;
+            continue;
+        };
+        let Some(actual) = argument_type(expression, visible, native) else {
+            result.unproved_arguments += 1;
+            continue;
+        };
+        result.checked_arguments += 1;
+        if !type_accepts(&expected, &actual) {
+            result.problems.push(StarNativeTypeProblem {
+                file,
+                range: expression.range(),
+                function: function.name.clone(),
+                parameter: param.name.clone(),
+                expected,
+                actual,
+                signature: host_signature(function),
+            });
+        }
+    }
+    result
+}
+
 fn argument_type(
     expression: &Expr,
     visible: &HashMap<String, StarBinding>,
+    native: &NativeScope<'_, '_>,
 ) -> Option<StarKnownType> {
     match expression {
         Expr::NumberLiteral(number) => matches!(number.value, Number::Int(_))
@@ -1670,30 +1913,43 @@ fn argument_type(
             Some(StarKnownType::Callable)
         }
         Expr::Call(call) => {
-            let binding = binding_in_scope(&call.func, visible)?;
-            match binding {
-                StarBinding::Constructor(constructor) => Some(constructor.ty.clone()),
-                StarBinding::Function(function) => {
-                    if !function_call_shape_known(call, function)
-                        || call.arguments.args.len() + call.arguments.keywords.len()
-                            != function.parameters.len()
-                    {
-                        return None;
+            if let Some(binding) = binding_in_scope(&call.func, visible) {
+                return match binding {
+                    StarBinding::Constructor(constructor) => Some(constructor.ty.clone()),
+                    StarBinding::Function(function) => {
+                        if !function_call_shape_known(call, function)
+                            || call.arguments.args.len() + call.arguments.keywords.len()
+                                != function.parameters.len()
+                        {
+                            return None;
+                        }
+                        let returns = function.returns.as_ref()?;
+                        Some(returns.ty.clone())
                     }
-                    let returns = function.returns.as_ref()?;
-                    Some(returns.ty.clone())
-                }
-                StarBinding::Alias(_) => None,
-                StarBinding::Struct(_) => None,
+                    StarBinding::Alias(_) | StarBinding::Struct(_) => None,
+                };
             }
+            let function = native.function(&call.func)?;
+            let mapped = native_call_mapping(call, function)?;
+            for (expression, param) in mapped {
+                if let Some(expected) = known_host_type(&param.ty)
+                    && let Some(actual) = argument_type(expression, visible, native)
+                    && !type_accepts(&expected, &actual)
+                {
+                    // A call rejected by its known native parameter type
+                    // cannot supply a value of the declared return type.
+                    return None;
+                }
+            }
+            known_host_type(&function.returns)
         }
         Expr::List(list) => {
             let mut elements = list.elts.iter();
             let first = elements.next()?;
-            let first = argument_type(first, visible)?;
+            let first = argument_type(first, visible, native)?;
             let mut types = Vec::new();
             for element in elements {
-                let actual = argument_type(element, visible)?;
+                let actual = argument_type(element, visible, native)?;
                 types.push(actual);
             }
             let element = type_union(first, types);
