@@ -35,13 +35,15 @@ file path. A host built with Bazel needs its own runfiles manifest in
 the process environment when launched outside Bazel:
 
 ```sh
-RUNFILES_MANIFEST_FILE=/abs/bin/deploy_star.runfiles_manifest \
+RUNFILES_MANIFEST_FILE=/abs/bin/starlark_host.runfiles_manifest \
   /abs/ruff/target/debug/sty check \
-  --host-checker /abs/bin/deploy_star \
-  --input cloud_locations=/abs/locations.json \
-  --input engine_clusters=/abs/clusters.json \
+  --host-checker /abs/bin/starlark_host \
+  --input catalog=/abs/catalog.json \
   /abs/deploy.star
 ```
+
+The host decides which named inputs to accept; supply further
+`--input NAME=ABS` pairs when its invocation requires them.
 
 Sty first invokes `--sty-graph-v3 --source ABS` with each named
 `--input NAME=ABS`. The host parses the captured UTF-8 source, resolves
