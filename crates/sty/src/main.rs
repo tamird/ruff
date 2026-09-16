@@ -1,4 +1,4 @@
-//! Standalone Bazel `.bzl` and host-resolved `.star` checking.
+//! Standalone Bazel `.bzl`/BUILD and host-resolved `.star` checking.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -69,7 +69,7 @@ impl salsa::Database for StyDb {}
 #[derive(Parser)]
 #[command(
     name = "sty",
-    about = "Check Bazel .bzl or host-resolved .star sources"
+    about = "Check Bazel .bzl/BUILD or host-resolved .star sources"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -78,7 +78,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check main-repository `.bzl` labels or one `.star` with its host.
+    /// Check main-repository `.bzl`/BUILD labels or one `.star` with its host.
     Check(CheckCommand),
     /// Serve editor diagnostics for Starlark files.
     Server,

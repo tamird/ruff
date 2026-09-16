@@ -1,4 +1,4 @@
-//! Admission and unresolved labels for leading Bazel `.bzl` loads.
+//! Admission and unresolved labels for Bazel `.bzl` and BUILD loads.
 //!
 //! This plan validates binders and records labels without following imports. A
 //! pending plan must be resolved before semantic analysis.
@@ -11,7 +11,7 @@ use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 
 use crate::source::{
-    BazelAdmissionFailure, BazelSource, BazelSourceAdmission, admit_bazel_source,
+    BazelAdmissionFailure, BazelSource, BazelSourceAdmission, BazelSourceKind, admit_bazel_source,
     is_bazel_9_identifier, visit_target_names,
 };
 
@@ -122,6 +122,7 @@ pub enum BazelLoadPlanError {
 #[salsa::tracked(returns(ref), no_eq, heap_size=ruff_memory_usage::heap_size, lru=200)]
 pub fn plan_bazel_loads(db: &dyn Db, source: BazelSource<'_>) -> BazelLoadPlan {
     let file = source.selected_file(db);
+    let extension = source.kind(db) == BazelSourceKind::Extension;
     let suite = match admit_bazel_source(db, source) {
         BazelSourceAdmission::Admitted(admitted) => admitted.suite(),
         BazelSourceAdmission::Opaque(failure) => {
@@ -157,6 +158,11 @@ pub fn plan_bazel_loads(db: &dyn Db, source: BazelSource<'_>) -> BazelLoadPlan {
     let mut aliases = HashMap::new();
     let mut loads = Vec::with_capacity(calls.len());
     for call in calls {
+        if !extension {
+            // BUILD permits rebinding between load statements, but a single
+            // load cannot assign the same local name twice.
+            aliases.clear();
+        }
         let Some(Expr::StringLiteral(module)) = call.arguments.args.first() else {
             return BazelLoadPlan::Opaque(BazelLoadPlanFailure::at(
                 file,
@@ -212,7 +218,7 @@ pub fn plan_bazel_loads(db: &dyn Db, source: BazelSource<'_>) -> BazelLoadPlan {
                     BazelLoadPlanError::InvalidLocalName(local_name.to_string()),
                 ));
             }
-            if globals.contains(local_name) {
+            if extension && globals.contains(local_name) {
                 return BazelLoadPlan::Opaque(BazelLoadPlanFailure::at(
                     file,
                     local_range,

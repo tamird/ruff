@@ -64,6 +64,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let declaration = global.declaration(db)?;
         let StarlarkGlobalDeclaration { name: _, kind } = declaration;
         match kind {
+            StarlarkGlobalKind::Builtin { symbol: _ } => None,
             StarlarkGlobalKind::Native {
                 parameters: _,
                 return_type: _,

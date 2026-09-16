@@ -1,8 +1,9 @@
 # Shared Starlark analysis
 
-Bazel `.bzl` and hosted `.star` sources use Ty's semantic engine. The
-frontends admit syntax, resolve loads, and provide declarations; Ty owns
-inference, argument binding, assignability, and body checking.
+Bazel `.bzl` files, BUILD files, and hosted `.star` sources use Ty's semantic
+engine. The frontends admit syntax, resolve loads, and provide
+declarations; Ty owns inference, argument binding, assignability, and
+body checking.
 
 ## Ownership
 
@@ -114,6 +115,16 @@ default, reassignment, and return checks consume those annotations. Loads still
 resolve to source definitions. Semantic errors stay attached to the offending
 source; they do not turn the whole load graph into an opaque module.
 
+BUILD files are selected by exact package labels and share the load graph
+with `.bzl` dependencies. Loads may target only `.bzl` sources. Each module
+has its own builtin environment: `select` is visible in both source kinds,
+while `glob`, `package`, `exports_files`, `filegroup`, and `genrule` are
+direct globals only in BUILD files. These functions use precise declarations
+in [`bazel.pyi`](../ty_starlark/resources/starlark/bazel.pyi). The declarations
+are not exported from the general Starlark builtin inventory; Ty resolves
+them by name only through the selected source environment. No companion
+declarations apply to BUILD files.
+
 Syntax, label, companion, and cycle failures prevent dependent modules from
 being analyzed. Independent admitted modules remain checkable.
 
@@ -137,10 +148,12 @@ and host-worker scheduling, independently of Ty's Python project server.
 
 ## MVP limits
 
-The Bazel frontend selects files in one main repository, not arbitrary Bazel
-build targets or external repositories. Its builtin inventory is a subset of
-Bazel's language environment; Bazel rule, provider, and repository APIs are
-not yet declared. The shared Python parser also rejects some valid Starlark
+The Bazel frontend selects BUILD files and `.bzl` sources in one main
+repository, not arbitrary Bazel build targets or external repositories.
+Its builtin inventory is a subset of Bazel's language environment;
+other native rules, `.bzl` native methods, provider, and repository APIs
+are not yet declared.
+The shared Python parser also rejects some valid Starlark
 forms, including positional symbols after named aliases in `load`.
 
 The server publishes diagnostics and related locations. It does not yet

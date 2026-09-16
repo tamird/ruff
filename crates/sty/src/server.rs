@@ -627,7 +627,9 @@ fn send_publications(
 }
 
 fn is_bazel_source(path: &SystemPath) -> bool {
-    path.extension() == Some("bzl") || path.as_str().ends_with(".bzl.pyi")
+    matches!(path.file_name(), Some("BUILD" | "BUILD.bazel"))
+        || path.extension() == Some("bzl")
+        || path.as_str().ends_with(".bzl.pyi")
 }
 
 fn is_bazel_relevant(path: &SystemPath) -> bool {

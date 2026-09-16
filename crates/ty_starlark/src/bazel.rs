@@ -4,7 +4,7 @@ use ruff_db::system::{SystemPath, SystemPathBuf};
 
 use crate::source::BazelSource;
 
-/// The caller-selected main repository for Bazel `.bzl` sources.
+/// The caller-selected main repository for Bazel `.bzl` and BUILD sources.
 ///
 /// The root must be absolute, contain no parent traversal, and have a Bazel
 /// repository marker. Loads also check the importer's repository and package.
@@ -22,11 +22,13 @@ pub enum BazelLoadError {
     InvalidRepository,
     #[error("the importing file is outside the selected Bazel repository")]
     ImporterOutsideRepository,
-    #[error("the importing file is not a .bzl source")]
+    #[error("the importing file is neither a .bzl source nor an active BUILD file")]
     InvalidImporter,
+    #[error("BUILD is shadowed by BUILD.bazel in its package")]
+    InactiveBuildFile,
     #[error("the importing file is outside a Bazel package")]
     ImporterOutsidePackage,
-    #[error("relative .bzl label needs a package directory")]
+    #[error("relative Bazel source label needs a package directory")]
     MissingRelativeDirectory,
     #[error("relative target directory contains parent traversal")]
     RelativeTargetParentTraversal,
@@ -36,15 +38,15 @@ pub enum BazelLoadError {
     RelativeTargetOutsidePackage,
     #[error("external repository labels are not supported")]
     UnsupportedRepository,
-    #[error("invalid Bazel .bzl label")]
+    #[error("invalid Bazel source label")]
     InvalidLabel,
-    #[error("the .bzl target package has no BUILD file")]
+    #[error("the selected target package has no BUILD file")]
     UnknownTargetPackage,
-    #[error("the .bzl target belongs to another Bazel repository")]
+    #[error("the selected target belongs to another Bazel repository")]
     RepositoryBoundary,
-    #[error("the .bzl target crosses a Bazel package boundary")]
+    #[error("the selected target crosses a Bazel package boundary")]
     PackageBoundary,
-    #[error("the .bzl source file does not exist")]
+    #[error("the selected source file does not exist")]
     NotFound,
 }
 
@@ -63,6 +65,7 @@ struct BazelTarget<'db> {
     relative_directory: Option<SystemPathBuf>,
     #[returns(ref)]
     label: String,
+    allow_build: bool,
 }
 
 /// Resolve a `.bzl` load in the selected main Bazel repository.
@@ -85,13 +88,14 @@ pub fn resolve_bazel_load<'db>(
     Ok(BazelSource::new(db, repository, file))
 }
 
-/// Select a main-repository `.bzl` source without an importing file.
+/// Select a main-repository `.bzl` or active BUILD file without an importer.
 ///
 /// Absolute `//` and `@@//` labels use only the selected marked repository.
 /// Relative `:` labels require a BUILD file in the supplied directory itself,
 /// as Bazel [target patterns] use the current directory. A source load's
 /// relative label instead uses its importing source's owning BUILD package.
-/// The returned source is the runtime `.bzl`; only source-first verification
+/// Selected BUILD files must be the active package marker; their loads still
+/// resolve only to `.bzl` sources. Only source-first verification of `.bzl`
 /// may interpret an optional Ty-only sibling `.bzl.pyi` stub.
 ///
 /// [target patterns]: https://bazel.build/versions/9.0.0/run/build
@@ -106,7 +110,7 @@ pub fn resolve_bazel_target<'db>(
     } else {
         None
     };
-    let target = BazelTarget::new(db, repository, relative_directory, label);
+    let target = BazelTarget::new(db, repository, relative_directory, label, true);
     let file = resolve_bazel_target_query(db, target)?;
     Ok(BazelSource::new(db, repository, file))
 }
@@ -116,7 +120,13 @@ fn resolve_bazel_load_query(db: &dyn Db, load: BazelLoad<'_>) -> Result<File, Ba
     let importing_package =
         validate_bazel_source(db, *load.repository(db), *load.importing_file(db))?;
     let relative_directory = load.label(db).starts_with(':').then_some(importing_package);
-    let target = BazelTarget::new(db, *load.repository(db), relative_directory, load.label(db));
+    let target = BazelTarget::new(
+        db,
+        *load.repository(db),
+        relative_directory,
+        load.label(db),
+        false,
+    );
     resolve_bazel_target_query(db, target)
 }
 
@@ -136,14 +146,14 @@ fn resolve_bazel_target_query(
         let (package, target) = absolute
             .split_once(':')
             .ok_or(BazelLoadError::InvalidLabel)?;
-        if !is_valid_package(package) || !is_valid_target(target) {
+        if !is_valid_package(package) || !is_valid_target(target, *selection.allow_build(db)) {
             return Err(BazelLoadError::InvalidLabel);
         }
         (root.join(package), target)
     } else if label.starts_with('@') {
         return Err(BazelLoadError::UnsupportedRepository);
     } else if let Some(name) = label.strip_prefix(':') {
-        if !is_valid_target(name) {
+        if !is_valid_target(name, *selection.allow_build(db)) {
             return Err(BazelLoadError::InvalidLabel);
         }
         let directory = selection
@@ -187,7 +197,11 @@ fn resolve_bazel_target_query(
         return Err(BazelLoadError::PackageBoundary);
     }
 
-    system_path_to_file(db, &source_path).map_err(|_| BazelLoadError::NotFound)
+    let file = system_path_to_file(db, &source_path).map_err(|_| BazelLoadError::NotFound)?;
+    if *selection.allow_build(db) && matches!(target, "BUILD" | "BUILD.bazel") {
+        validate_bazel_source(db, repository, file)?;
+    }
+    Ok(file)
 }
 
 fn validate_bazel_repository(
@@ -201,7 +215,7 @@ fn validate_bazel_repository(
     Ok(())
 }
 
-/// Validate the selected repository and a `.bzl` file's owning BUILD package.
+/// Validate the selected repository and a source's owning BUILD package.
 /// A source reached via `load()` and one selected directly have the same owner.
 pub(crate) fn validate_bazel_source(
     db: &dyn Db,
@@ -215,7 +229,8 @@ pub(crate) fn validate_bazel_source(
         .path(db)
         .as_system_path()
         .ok_or(BazelLoadError::ImporterOutsideRepository)?;
-    if importing_path.extension() != Some("bzl") {
+    let build = matches!(importing_path.file_name(), Some("BUILD" | "BUILD.bazel"));
+    if !build && importing_path.extension() != Some("bzl") {
         return Err(BazelLoadError::InvalidImporter);
     }
     if has_parent_component(importing_path)
@@ -225,8 +240,17 @@ pub(crate) fn validate_bazel_source(
     {
         return Err(BazelLoadError::ImporterOutsideRepository);
     }
-    find_ancestor(db, importing_path, Some(root), is_package)
-        .ok_or(BazelLoadError::ImporterOutsidePackage)
+    let package = find_ancestor(db, importing_path, Some(root), is_package)
+        .ok_or(BazelLoadError::ImporterOutsidePackage)?;
+    if build && importing_path.parent() != Some(package.as_path()) {
+        return Err(BazelLoadError::ImporterOutsidePackage);
+    }
+    if importing_path.file_name() == Some("BUILD")
+        && system_path_to_file(db, package.join("BUILD.bazel")).is_ok()
+    {
+        return Err(BazelLoadError::InactiveBuildFile);
+    }
+    Ok(package)
 }
 
 fn find_ancestor(
@@ -276,9 +300,9 @@ fn is_package(db: &dyn Db, directory: &SystemPath) -> bool {
     clippy::case_sensitive_file_extension_comparisons,
     reason = "Bazel requires the exact lowercase .bzl suffix"
 )]
-fn is_valid_target(target: &str) -> bool {
+fn is_valid_target(target: &str, allow_build: bool) -> bool {
     !target.contains(':')
-        && target.ends_with(".bzl")
+        && (target.ends_with(".bzl") || (allow_build && matches!(target, "BUILD" | "BUILD.bazel")))
         && is_valid_relative_path(target, false)
         && target
             .bytes()

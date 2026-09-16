@@ -11,21 +11,24 @@ cargo build -p sty --locked
 ```
 
 Run the built executable from a marked Bazel main repository. The direct
-`:entry.bzl` example runs from the target package directory with BUILD:
+`:BUILD.bazel` example runs from the target package directory with
+BUILD.bazel:
 
 ```sh
 cd /abs/repo
-/abs/ruff/target/debug/sty check //pkg:entry.bzl //shared:defs.bzl
+/abs/ruff/target/debug/sty check //pkg:BUILD.bazel //shared:defs.bzl
 cd pkg
-/abs/ruff/target/debug/sty check :entry.bzl
+/abs/ruff/target/debug/sty check :BUILD.bazel
 /abs/ruff/target/debug/sty check --workspace /abs/repo //pkg:entry.bzl
 ```
 
 Sty selects the nearest Bazel repository marker unless `--workspace`
-chooses another marked root. A direct `:entry.bzl` label requires a BUILD
-file in the exact current directory. Runtime sources use `.bzl`; Ty-only
-primitive signatures may live in the matching sibling `.bzl.pyi`. Sty
-checks every selected source and its load dependencies. Its bounded
+chooses another marked root. A direct `:entry.bzl` or `:BUILD.bazel`
+label requires a BUILD file in the exact current directory. A package
+with both `BUILD` and `BUILD.bazel` uses `BUILD.bazel`; Sty rejects
+selection of the inactive `BUILD`. Loaded sources must use `.bzl`;
+Ty-only primitive signatures may live in the matching sibling `.bzl.pyi`.
+Sty checks every selected source and its load dependencies. Its bounded
 parser also marks valid Starlark forms outside the shared Python parser
 subset opaque. Unsupported source semantics and uncheckable stubs are
 opaque, and opaque sources cause a nonzero exit.
@@ -34,27 +37,33 @@ Both frontends use Ty's ordinary inference. Unannotated parameters and return
 values can remain unknown; callers do not specialize helper bodies. A matching
 `.bzl.pyi` supplies `int`, `str`, `bool`, or `None` annotations to public source
 functions with positional-or-keyword parameters. Sty checks the original
-bodies, defaults, reassignments, and calls against those declarations. The
-Bazel builtin inventory is incomplete; Bazel rule and provider APIs are not
-yet declared.
+bodies, defaults, reassignments, and calls against those declarations.
+BUILD files have typed `glob`, `select`, `package`, `exports_files`,
+`filegroup`, and `genrule` calls. `.bzl` files share `select`, while the
+other listed globals are only available directly in BUILD files. The
+BUILD builtin inventory is bounded; other native rules, `native` methods
+in `.bzl` files, label values as configuration keys, and Bazel's package
+evaluation are not yet checked.
 
 Command diagnostics use Ruff's renderer, with source snippets, diagnostic
 codes, and related declarations. The editor uses the same diagnostics and
 codes. Host source snippets and editor ranges refer to the captured source
 text, including unsaved changes.
 
-`sty server` checks open `.bzl` and sibling `.bzl.pyi` files in a marked
-repository without Sty configuration. It uses unsaved editor text and
-rechecks importers when an opened load, BUILD file, or repository marker
-changes. Open loaded files through the same repository path used by
-their Bazel loads. If an opened file uses a different symlink path,
+`sty server` checks open `BUILD`, `BUILD.bazel`, `.bzl`, and sibling
+`.bzl.pyi` files in a marked repository without Sty configuration.
+It uses unsaved editor text and rechecks importers when an opened load,
+BUILD file, or repository marker changes. Open loaded files through the
+same repository path used by their Bazel loads. If an opened file uses
+a different symlink path,
 the importer may instead read that source from disk; its diagnostics
 can then be stale relative to the unsaved editor text.
 
 Register `/abs/ruff/target/debug/sty server` as a stdio LSP command for
-`.bzl`, `.bzl.pyi`, and `.star` filetypes. Sty currently publishes
-diagnostics and related source locations; it does not provide hover,
-completion, or navigation. Opened and changed buffers recheck directly.
+`BUILD`, `BUILD.bazel`, `.bzl`, `.bzl.pyi`, and `.star` filetypes.
+Sty currently publishes diagnostics and related source locations; it
+does not provide hover, completion, or navigation. Opened and changed
+buffers recheck directly.
 The client may also send `workspace/didChangeWatchedFiles` for changes
 on disk; Sty does not register file-watch patterns itself, so configure
 external file watches in the editor when needed.

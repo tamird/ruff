@@ -291,6 +291,27 @@ fn nearest_nested_marker_or_explicit_workspace_owns_selected_targets() -> anyhow
 }
 
 #[test]
+fn build_labels_check_the_active_package_source() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write("pkg/BUILD", "filegroup(name=\"old\")\n")?;
+    fixture.write(
+        "pkg/BUILD.bazel",
+        "filegroup(name=\"active\", srcs=glob([\"*.bzl\"]))\n",
+    )?;
+    let selected = Fixture::run(fixture.root.path(), &["check", "//pkg:BUILD.bazel"])?;
+    assert!(selected.status.success(), "{}", stderr(&selected));
+    let inactive = Fixture::run(fixture.root.path(), &["check", "//pkg:BUILD"])?;
+    assert_eq!(inactive.status.code(), Some(2));
+    assert!(stderr(&inactive).contains("shadowed by BUILD.bazel"));
+
+    fixture.write("pkg/BUILD.bazel", "filegroup(name=1)\n")?;
+    let invalid = Fixture::run(&fixture.path("pkg"), &["check", ":BUILD.bazel"])?;
+    assert_eq!(invalid.status.code(), Some(1), "{}", stderr(&invalid));
+    assert!(stderr(&invalid).contains("invalid-argument-type"));
+    Ok(())
+}
+
+#[test]
 fn full_graph_errors_include_source_stub_and_distinct_actual_argument_kinds() -> anyhow::Result<()>
 {
     let fixture = Fixture::new()?;

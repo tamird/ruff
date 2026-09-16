@@ -48,6 +48,67 @@ fn admits_entire_plain_bazel_source_without_python_project() -> anyhow::Result<(
 }
 
 #[test]
+fn build_files_have_their_own_top_level_and_call_syntax() -> anyhow::Result<()> {
+    let (mut db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD.bazel", ""),
+        ("pkg/defs.bzl", ""),
+    ])?;
+    let build_path = root.join("pkg/BUILD.bazel");
+    let file = system_path_to_file(&db, &build_path)?;
+    db.write_file(
+        &build_path,
+        "load(\":defs.bzl\", \"rule\")\nfilegroup(name=\"lib\", srcs=[f for f in [\"x\"] if f])\n",
+    )?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root.clone()), file);
+    assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 2);
+    db.write_file(
+        &build_path,
+        "VALUE = 1\nload(\":defs.bzl\", \"rule\")\nVALUE = 2\n",
+    )?;
+    let source = BazelSource::new(&db, BazelRepository::new(&db, root.clone()), file);
+    assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 3);
+    for (text, reason) in [
+        (
+            "def f():\n    pass\n",
+            "function declarations in BUILD files",
+        ),
+        (
+            "f = lambda value: value\n",
+            "lambda expressions in BUILD files",
+        ),
+        ("filegroup(*[])\n", "expanded call arguments in BUILD files"),
+        (
+            "filegroup(**{})\n",
+            "expanded call arguments in BUILD files",
+        ),
+        ("if True:\n    print(1)\n", "top-level if statements"),
+        (
+            "for value in []:\n    print(value)\n",
+            "top-level for statements",
+        ),
+    ] {
+        db.write_file(&build_path, text)?;
+        let source = BazelSource::new(&db, BazelRepository::new(&db, root.clone()), file);
+        assert!(
+            matches!(
+                opaque(admit_bazel_source(&db, source))?.reason(),
+                BazelAdmissionError::BazelSyntax(actual) if *actual == reason
+            ),
+            "{text}"
+        );
+    }
+    db.write_file(root.join("pkg/defs.bzl"), "def f():\n    print(*[1])\n")?;
+    let extension_file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+    let extension = BazelSource::new(&db, BazelRepository::new(&db, root), extension_file);
+    assert_eq!(
+        admitted(admit_bazel_source(&db, extension))?.suite().len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn rejects_annotations_in_the_stable_bazel_profile() -> anyhow::Result<()> {
     let (db, root) = test_db(&[
         ("MODULE.bazel", ""),

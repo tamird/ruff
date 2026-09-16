@@ -112,3 +112,91 @@ class range:
     @_overload
     def __getitem__(self, index: slice, /) -> range: ...
     def __contains__(self, value: object, /) -> bool: ...
+
+# Bazel globals are selected per file by the frontend, not listed in __all__.
+# https://bazel.build/versions/9.0.0/rules/lib/globals/build
+# https://bazel.build/versions/9.0.0/reference/be/general
+_BazelLabels = list[str] | tuple[str, ...]
+
+class _BazelSelector[T]:
+    def __add__(self, other: T | _BazelSelector[T], /) -> _BazelSelector[T]: ...
+    def __radd__(self, other: T, /) -> _BazelSelector[T]: ...
+
+_BazelConfigurableLabels = (
+    _BazelLabels | _BazelSelector[list[str]] | _BazelSelector[tuple[str, ...]]
+)
+_BazelConfigurableString = str | _BazelSelector[str]
+_BazelConfigurableBool = bool | _BazelSelector[bool]
+
+def _bazel_glob(
+    include: _BazelLabels = ...,
+    exclude: _BazelLabels = ...,
+    exclude_directories: int = 1,
+    allow_empty: bool = ...,
+) -> list[str]: ...
+def _bazel_select[T](
+    x: dict[str, T], /, no_match_error: str = ""
+) -> _BazelSelector[T]: ...
+def _bazel_package(
+    *,
+    default_deprecation: str = "",
+    default_package_metadata: _BazelLabels = ...,
+    default_applicable_licenses: _BazelLabels = ...,
+    default_testonly: bool = False,
+    default_visibility: _BazelLabels = ...,
+    features: _BazelLabels = ...,
+) -> None: ...
+def _bazel_exports_files(
+    srcs: _BazelLabels,
+    visibility: _BazelLabels | None = None,
+    licenses: _BazelLabels | None = None,
+) -> None: ...
+def _bazel_filegroup(
+    *,
+    name: str,
+    srcs: _BazelConfigurableLabels = ...,
+    data: _BazelConfigurableLabels = ...,
+    aspect_hints: _BazelLabels = ...,
+    compatible_with: _BazelLabels = ...,
+    deprecation: str = "",
+    features: _BazelLabels = ...,
+    licenses: _BazelLabels = ...,
+    output_group: _BazelConfigurableString = "",
+    package_metadata: _BazelLabels = ...,
+    restricted_to: _BazelLabels = ...,
+    visibility: _BazelLabels = ...,
+    tags: _BazelLabels = ...,
+    target_compatible_with: _BazelLabels = ...,
+    testonly: bool = False,
+) -> None: ...
+def _bazel_genrule(
+    *,
+    name: str,
+    outs: _BazelLabels,
+    srcs: _BazelConfigurableLabels = ...,
+    tools: _BazelConfigurableLabels = ...,
+    aspect_hints: _BazelLabels = ...,
+    cmd: _BazelConfigurableString = "",
+    cmd_bash: _BazelConfigurableString = "",
+    cmd_bat: _BazelConfigurableString = "",
+    cmd_ps: _BazelConfigurableString = "",
+    compatible_with: _BazelLabels = ...,
+    deprecation: str = "",
+    exec_compatible_with: _BazelLabels = ...,
+    exec_group_compatible_with: dict[str, _BazelLabels] = ...,
+    exec_properties: dict[str, str] = ...,
+    message: _BazelConfigurableString = "",
+    local: _BazelConfigurableBool = False,
+    executable: bool = False,
+    features: _BazelLabels = ...,
+    licenses: _BazelLabels = ...,
+    output_licenses: _BazelLabels = ...,
+    output_to_bindir: bool = False,
+    package_metadata: _BazelLabels = ...,
+    restricted_to: _BazelLabels = ...,
+    visibility: _BazelLabels = ...,
+    tags: _BazelLabels = ...,
+    target_compatible_with: _BazelLabels = ...,
+    testonly: bool = False,
+    toolchains: _BazelLabels = ...,
+) -> None: ...

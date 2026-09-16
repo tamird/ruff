@@ -33,21 +33,40 @@ pub struct StarlarkGlobal<'db> {
 
 impl get_size2::GetSize for StarlarkGlobal<'_> {}
 
+pub(crate) enum StarlarkGlobalLookup<'db> {
+    Value(Type<'db>),
+    Builtin(Name),
+}
+
 #[salsa::tracked]
 impl<'db> StarlarkGlobal<'db> {
     pub(crate) fn declaration(self, db: &'db dyn Db) -> Option<&'db StarlarkGlobalDeclaration> {
         self.environment(db).globals(db).get(self.index(db))
     }
 
-    pub(crate) fn lookup(db: &'db dyn Db, file: ProgramFile<'db>, name: &str) -> Option<Type<'db>> {
+    pub(crate) fn lookup(
+        db: &'db dyn Db,
+        file: ProgramFile<'db>,
+        name: &str,
+    ) -> Option<StarlarkGlobalLookup<'db>> {
         let environment = file.starlark_module(db)?.environment(db)?;
         let index = environment
             .globals(db)
             .iter()
             .position(|global| global.name == name)?;
-        Some(Type::KnownInstance(KnownInstanceType::StarlarkGlobal(
-            Self::new(db, environment, index, file.program(db)),
-        )))
+        match &environment.globals(db)[index].kind {
+            StarlarkGlobalKind::Builtin { symbol } => {
+                Some(StarlarkGlobalLookup::Builtin(symbol.clone()))
+            }
+            _ => Some(StarlarkGlobalLookup::Value(Type::KnownInstance(
+                KnownInstanceType::StarlarkGlobal(Self::new(
+                    db,
+                    environment,
+                    index,
+                    file.program(db),
+                )),
+            ))),
+        }
     }
 
     #[salsa::tracked(returns(copy))]
@@ -58,6 +77,7 @@ impl<'db> StarlarkGlobal<'db> {
         };
         let StarlarkGlobalDeclaration { name: _, kind } = declaration;
         let signature = match kind {
+            StarlarkGlobalKind::Builtin { symbol: _ } => Signature::unknown(),
             StarlarkGlobalKind::Record => Signature::new(
                 Parameters::standard([Parameter::keyword_variadic(Name::new("fields"))
                     .with_annotated_type(Type::any())]),

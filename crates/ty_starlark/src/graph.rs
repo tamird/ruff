@@ -19,7 +19,7 @@ use ty_python_core::starlark::{
 use crate::analysis::{AnalysisDb, StarlarkProfile};
 use crate::bazel::{BazelLoadError, resolve_bazel_load};
 use crate::loads::{BazelLoadPlan, BazelLoadPlanError, BazelLoadPlanFailure, plan_bazel_loads};
-use crate::source::BazelSource;
+use crate::source::{BazelSource, BazelSourceKind};
 use crate::stub::{
     BazelStubAdmission, BazelStubDeclarations, BazelStubError, BazelStubFailure, admit_bazel_stub,
 };
@@ -109,7 +109,7 @@ impl std::error::Error for BazelGraphFailure {}
 
 #[derive(Clone, Debug, thiserror::Error)]
 enum BazelGraphError {
-    #[error("selected .bzl sources belong to different main repositories")]
+    #[error("selected Bazel sources belong to different main repositories")]
     MixedRepositories,
     #[error("the Bazel load plan is opaque")]
     LoadPlan(Box<BazelLoadPlanFailure>),
@@ -233,7 +233,7 @@ pub fn check_bazel_graph<'db>(
                 }
             }
         }
-        if failure.is_none() {
+        if failure.is_none() && source.kind(db) == BazelSourceKind::Extension {
             match admit_bazel_stub(db, source) {
                 BazelStubAdmission::Absent => {}
                 BazelStubAdmission::Admitted(declarations) => {
@@ -349,13 +349,19 @@ pub fn check_bazel_graph<'db>(
         }
         inputs.push((index, file, annotations));
     }
-    let environment = StarlarkEnvironment::new(
+    let struct_global = StarlarkGlobalDeclaration {
+        name: Name::new("struct"),
+        kind: StarlarkGlobalKind::Struct,
+    };
+    let extension_environment = StarlarkEnvironment::new(
         &analysis,
-        Box::new([StarlarkGlobalDeclaration {
-            name: Name::new("struct"),
-            kind: StarlarkGlobalKind::Struct,
-        }]),
+        Box::new([struct_global, bazel_builtin("select")]),
     );
+    let mut build_globals = vec![bazel_builtin("select")];
+    for name in ["glob", "package", "exports_files", "filegroup", "genrule"] {
+        build_globals.push(bazel_builtin(name));
+    }
+    let build_environment = StarlarkEnvironment::new(&analysis, build_globals.into_boxed_slice());
     let mut modules = vec![None; pending.len()];
     for (index, file, annotations) in inputs {
         let node = &pending[index];
@@ -370,7 +376,10 @@ pub fn check_bazel_graph<'db>(
             Name::new(node.file.path(db).as_str()),
             Box::default(),
             annotations,
-            Some(environment),
+            Some(match node.source.kind(db) {
+                BazelSourceKind::Build => build_environment,
+                BazelSourceKind::Extension => extension_environment,
+            }),
             role,
         ));
     }
@@ -429,6 +438,15 @@ pub fn check_bazel_graph<'db>(
         .map_err(|error| BazelGraphFailure::analysis(first_file, &error))?;
     checked.extend(admission);
     Ok(checked)
+}
+
+fn bazel_builtin(name: &str) -> StarlarkGlobalDeclaration {
+    StarlarkGlobalDeclaration {
+        name: Name::new(name),
+        kind: StarlarkGlobalKind::Builtin {
+            symbol: Name::new(format!("_bazel_{name}")),
+        },
+    }
 }
 
 fn peel_nodes(

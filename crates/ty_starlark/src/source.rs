@@ -1,4 +1,4 @@
-//! Admission of Bazel `.bzl` source through Ruff's shared Python parser.
+//! Admission of Bazel `.bzl` and BUILD source through Ruff's shared Python parser.
 //!
 //! Starlark and Python have different grammars. The checker may inspect a
 //! parsed source only when this module has admitted the entire file.
@@ -36,6 +36,21 @@ impl<'db> BazelSource<'db> {
     pub(crate) fn selected_file(self, db: &dyn Db) -> File {
         *self.file(db)
     }
+
+    pub(crate) fn kind(self, db: &dyn Db) -> BazelSourceKind {
+        match self.selected_file(db).path(db).as_str() {
+            path if path.ends_with("/BUILD") || path.ends_with("/BUILD.bazel") => {
+                BazelSourceKind::Build
+            }
+            _ => BazelSourceKind::Extension,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BazelSourceKind {
+    Build,
+    Extension,
 }
 
 /// A full parse accepted within this admission gate's supported syntax subset.
@@ -99,19 +114,19 @@ impl BazelAdmissionFailure {
 
 #[derive(Clone, Debug, get_size2::GetSize, thiserror::Error)]
 pub enum BazelAdmissionError {
-    #[error("cannot select this Bazel .bzl source: {0}")]
+    #[error("cannot select this Bazel source: {0}")]
     InvalidSource(BazelLoadError),
-    #[error("cannot read this Bazel .bzl source: {0}")]
+    #[error("cannot read this Bazel source: {0}")]
     Read(SourceTextError),
     #[error("the shared Python parser cannot check this Starlark source: {0}")]
     PythonParser(ParseError),
     #[error("the shared Python parser cannot check this Starlark source: {0}")]
     PythonVersion(UnsupportedSyntaxError),
-    #[error("Bazel .bzl files do not support {0}")]
+    #[error("this Bazel source does not support {0}")]
     BazelSyntax(&'static str),
 }
 
-/// Parse and admit the whole selected `.bzl` source, or expose only its failure.
+/// Parse and admit the whole selected Bazel source, or expose only its failure.
 ///
 /// Admission does not follow loads or assert that the Python parser accepts all
 /// valid Starlark source. Syntax rejection is a safety decision independent of
@@ -173,7 +188,7 @@ pub fn admit_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelSourceAd
         });
     }
 
-    let mut syntax = BazelSyntax::new(text.as_str());
+    let mut syntax = BazelSyntax::new(text.as_str(), source.kind(db));
     syntax.visit_body(parsed.suite());
     syntax.reject_invalid_indentation();
     if let Some((range, description)) = syntax.first_failure {
@@ -197,6 +212,7 @@ pub fn admit_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelSourceAd
 /// <https://github.com/bazelbuild/bazel/blob/9.0.0/src/main/java/net/starlark/java/syntax/Lexer.java>.
 struct BazelSyntax<'source> {
     text: &'source str,
+    kind: BazelSourceKind,
     first_failure: Option<(TextRange, &'static str)>,
     string_ranges: Vec<TextRange>,
     statement_depth: usize,
@@ -211,9 +227,10 @@ struct BazelSyntax<'source> {
 }
 
 impl<'source> BazelSyntax<'source> {
-    fn new(text: &'source str) -> Self {
+    fn new(text: &'source str, kind: BazelSourceKind) -> Self {
         Self {
             text,
+            kind,
             first_failure: None,
             string_ranges: Vec::new(),
             statement_depth: 0,
@@ -237,7 +254,7 @@ impl<'source> BazelSyntax<'source> {
     }
 
     fn bind_global(&mut self, name: &ast::name::Name, range: TextRange) {
-        if !self.globals.insert(name.clone()) {
+        if !self.globals.insert(name.clone()) && self.kind == BazelSourceKind::Extension {
             self.reject(range, "duplicate module bindings");
         }
     }
@@ -252,6 +269,14 @@ impl<'source> BazelSyntax<'source> {
         let mut starred = false;
         let mut keywords = false;
         for argument in call.arguments.iter_source_order() {
+            let expanded = match argument {
+                ast::ArgOrKeyword::Arg(Expr::Starred(_)) => true,
+                ast::ArgOrKeyword::Arg(_) => false,
+                ast::ArgOrKeyword::Keyword(keyword) => keyword.arg.is_none(),
+            };
+            if self.kind == BazelSourceKind::Build && expanded {
+                self.reject(argument.range(), "expanded call arguments in BUILD files");
+            }
             let invalid = match argument {
                 ast::ArgOrKeyword::Arg(Expr::Starred(argument)) => {
                     self.starred_arguments.insert(argument.range());
@@ -454,7 +479,7 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
                 && let Expr::Name(name) = call.func.as_ref()
                 && name.id == "load"
             {
-                if !self.allow_load {
+                if self.kind == BazelSourceKind::Extension && !self.allow_load {
                     self.reject(
                         call.range(),
                         "load statements after other top-level statements",
@@ -520,7 +545,9 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
                         self.reject(parameter.name().range(), "rebinding the reserved load name");
                     }
                 }
-                if function.is_async {
+                if self.kind == BazelSourceKind::Build {
+                    Some("function declarations in BUILD files")
+                } else if function.is_async {
                     Some("async functions")
                 } else if !function.decorator_list.is_empty() {
                     Some("decorated functions")
@@ -596,6 +623,9 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
                 }
             }
             Expr::Lambda(lambda) => {
+                if self.kind == BazelSourceKind::Build {
+                    self.reject(lambda.range(), "lambda expressions in BUILD files");
+                }
                 if let Some(parameters) = &lambda.parameters
                     && self.ends_with_comma(parameters.range())
                 {

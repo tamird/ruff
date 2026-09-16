@@ -349,6 +349,164 @@ def stop():
 }
 
 #[test]
+fn build_globals_check_loaded_rules_and_keep_container_types() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        (
+            "pkg/BUILD",
+            concat!(
+                "load(\":defs.bzl\", \"custom_rule\")\n",
+                "package(default_visibility=[\"//visibility:public\"])\n",
+                "filegroup(name=\"files\", srcs=glob([\"*.cc\"]), tags=[\"manual\"])\n",
+                "filegroup(name=\"configured\", srcs=select({\"//conditions:default\": [\"x.cc\"]}), output_group=select({\"//conditions:default\": \"headers\"}))\n",
+                "filegroup(name=\"tuple\", srcs=select({\"//conditions:default\": (\"x.cc\",)}))\n",
+                "genrule(name=\"made\", outs=[\"out\"], cmd=select({\"//conditions:default\": \"touch $@\"}), exec_properties={\"pool\": \"cpu\"})\n",
+                "exports_files([\"resource.txt\"])\n",
+                "custom_rule(name=\"valid\")\n",
+                "FIRST = glob([\"*.cc\"])[0]\n",
+            ),
+        ),
+        ("pkg/defs.bzl", "def custom_rule(name):\n    return name\n"),
+        (
+            "pkg/defs.bzl.pyi",
+            "def custom_rule(name: str) -> str: ...\n",
+        ),
+    ])?;
+    let diagnostics = graph_for(&db, &root, &["pkg/BUILD"])?;
+    assert!(diagnostics.is_empty(), "{}", rendered(&db, &diagnostics));
+    Ok(())
+}
+
+#[test]
+fn build_globals_and_loads_report_invalid_calls() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        (
+            "pkg/BUILD.bazel",
+            concat!(
+                "load(\":defs.bzl\", \"custom_rule\")\n",
+                "custom_rule(name=1)\n",
+                "package(default_testonly=\"yes\")\n",
+                "filegroup(name=\"bad\", srcs=glob([1]))\n",
+                "genrule(name=\"made\", outs=[\"out\"], cmd=1)\n",
+                "genrule(name=\"bad-select\", outs=[\"out2\"], cmd=select({\"//conditions:default\": [\"not a command\"]}))\n",
+                "filegroup(name=\"bad-group\", output_group=select({\"//conditions:default\": 2}))\n",
+            ),
+        ),
+        ("pkg/defs.bzl", "def custom_rule(name):\n    return name\n"),
+        (
+            "pkg/defs.bzl.pyi",
+            "def custom_rule(name: str) -> str: ...\n",
+        ),
+    ])?;
+    let diagnostics = graph_for(&db, &root, &["pkg/BUILD.bazel"])?;
+    assert_eq!(
+        codes(&diagnostics),
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type",
+        ],
+        "{}",
+        rendered(&db, &diagnostics)
+    );
+    Ok(())
+}
+
+#[test]
+fn select_is_shared_but_build_rules_are_only_available_in_build_files() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        (
+            "pkg/defs.bzl",
+            concat!(
+                "SETTINGS = select({\"//conditions:default\": [\"lib.cc\"]})\n",
+                "MISSING = glob([\"*.cc\"])\n",
+            ),
+        ),
+    ])?;
+    let diagnostics = graph_for(&db, &root, &["pkg/defs.bzl"])?;
+    assert_eq!(
+        codes(&diagnostics),
+        ["unresolved-reference"],
+        "{}",
+        rendered(&db, &diagnostics)
+    );
+    Ok(())
+}
+
+#[test]
+fn build_does_not_inherit_bzl_only_struct() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", "VALUE = struct()\n"),
+        ("pkg/defs.bzl", "VALUE = struct()\n"),
+    ])?;
+    let diagnostics = graph_for(&db, &root, &["pkg/BUILD", "pkg/defs.bzl"])?;
+    assert_eq!(
+        codes(&diagnostics),
+        ["unresolved-reference"],
+        "{}",
+        rendered(&db, &diagnostics)
+    );
+    Ok(())
+}
+
+#[test]
+fn build_loads_after_assignments_and_top_level_rebinding_are_valid() -> anyhow::Result<()> {
+    let (mut db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        (
+            "pkg/BUILD",
+            concat!(
+                "VALUE = 1\n",
+                "custom_rule = 1\n",
+                "load(\":defs.bzl\", \"custom_rule\")\n",
+                "custom_rule(name=\"valid\")\n",
+                "VALUE = 2\n",
+            ),
+        ),
+        ("pkg/defs.bzl", "def custom_rule(name):\n    return name\n"),
+        (
+            "pkg/defs.bzl.pyi",
+            "def custom_rule(name: str) -> str: ...\n",
+        ),
+    ])?;
+    let diagnostics = graph_for(&db, &root, &["pkg/BUILD"])?;
+    assert!(diagnostics.is_empty(), "{}", rendered(&db, &diagnostics));
+    db.write_file(
+        root.join("pkg/BUILD"),
+        "load(\":defs.bzl\", \"custom_rule\")\ncustom_rule = 1\ncustom_rule(name=\"invalid\")\n",
+    )?;
+    let diagnostics = graph_for(&db, &root, &["pkg/BUILD"])?;
+    assert_eq!(
+        codes(&diagnostics),
+        ["call-non-callable"],
+        "{}",
+        rendered(&db, &diagnostics)
+    );
+    db.write_file(
+        root.join("pkg/BUILD"),
+        concat!(
+            "load(\":defs.bzl\", \"custom_rule\")\n",
+            "load(\":other.bzl\", custom_rule=\"second_rule\")\n",
+            "custom_rule(name=\"valid\")\n",
+        ),
+    )?;
+    db.write_file(
+        root.join("pkg/other.bzl"),
+        "def second_rule(name):\n    return name\n",
+    )?;
+    let diagnostics = graph_for(&db, &root, &["pkg/BUILD"])?;
+    assert!(diagnostics.is_empty(), "{}", rendered(&db, &diagnostics));
+    Ok(())
+}
+
+#[test]
 fn bazel_rejects_hosted_only_calls_and_type_operations() -> anyhow::Result<()> {
     for source in [
         "range()",

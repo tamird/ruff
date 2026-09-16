@@ -711,6 +711,29 @@ fn unsaved_bazel_source_reports_utf16_and_related_uri_then_restores_disk() {
 }
 
 #[test]
+fn open_build_file_uses_unsaved_source_and_build_builtins() {
+    let server = TestServer::new();
+    server.write("MODULE.bazel", "");
+    let disk = "filegroup(name=\"ok\", srcs=glob([\"*.cc\"]))\n";
+    server.write("pkg/BUILD.bazel", disk);
+    server.open("pkg/BUILD.bazel", "filegroup(name=1)\n", 1);
+    let invalid = server.published("pkg/BUILD.bazel");
+    assert_eq!(invalid.version, Some(1));
+    assert!(
+        invalid.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == Some(lsp_types::Code::String("invalid-argument-type".into()))
+        }),
+        "{invalid:?}"
+    );
+    server.change("pkg/BUILD.bazel", 2, &serde_json::json!([{"text":disk}]));
+    let valid = server.published("pkg/BUILD.bazel");
+    assert_eq!(valid.version, Some(2));
+    assert!(valid.diagnostics.is_empty(), "{valid:?}");
+    server.close("pkg/BUILD.bazel");
+    assert!(server.published("pkg/BUILD.bazel").diagnostics.is_empty());
+}
+
+#[test]
 fn unsaved_loaded_file_and_stub_recheck_importer_and_close_restores_disk() {
     let server = TestServer::new();
     server.write("MODULE.bazel", "");

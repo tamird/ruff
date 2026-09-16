@@ -7,6 +7,50 @@ use crate::testing::test_db;
 use super::{BazelLoadError, BazelRepository, resolve_bazel_load, resolve_bazel_target};
 
 #[test]
+fn selects_active_build_files_without_allowing_loads_of_build_files() -> anyhow::Result<()> {
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("pkg/BUILD", ""),
+        ("pkg/defs.bzl", ""),
+        ("new/BUILD", ""),
+        ("new/BUILD.bazel", ""),
+    ])?;
+    let repository = BazelRepository::new(&db, root.clone());
+    let importer = system_path_to_file(&db, root.join("pkg/BUILD"))?;
+    for (directory, label, path) in [
+        (Some(root.join("pkg")), ":BUILD", "pkg/BUILD"),
+        (None, "//pkg:BUILD", "pkg/BUILD"),
+        (None, "@@//new:BUILD.bazel", "new/BUILD.bazel"),
+    ] {
+        let source = resolve_bazel_target(&db, repository, directory.as_deref(), label)?;
+        assert_eq!(source.selected_file(&db).path(&db), &root.join(path));
+    }
+    assert_eq!(
+        resolve_bazel_target(&db, repository, None, "//new:BUILD").err(),
+        Some(BazelLoadError::InactiveBuildFile)
+    );
+    assert_eq!(
+        resolve_bazel_load(&db, repository, importer, ":BUILD").err(),
+        Some(BazelLoadError::InvalidLabel)
+    );
+    assert_eq!(
+        resolve_bazel_load(&db, repository, importer, "//new:BUILD.bazel").err(),
+        Some(BazelLoadError::InvalidLabel)
+    );
+    assert_eq!(
+        resolve_bazel_target(&db, repository, None, "//pkg:BUILD/sub").err(),
+        Some(BazelLoadError::InvalidLabel)
+    );
+    assert_eq!(
+        resolve_bazel_load(&db, repository, importer, ":defs.bzl")?
+            .selected_file(&db)
+            .path(&db),
+        &root.join("pkg/defs.bzl")
+    );
+    Ok(())
+}
+
+#[test]
 fn resolves_named_packages_and_runtime_sources() -> anyhow::Result<()> {
     let (db, root) = test_db(&[
         ("MODULE.bazel", ""),

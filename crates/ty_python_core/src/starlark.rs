@@ -99,6 +99,11 @@ pub struct StarlarkGlobalDeclaration {
 
 #[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
 pub enum StarlarkGlobalKind {
+    /// A file-specific name backed by an embedded builtin declaration.
+    /// The declaration is intentionally absent from Starlark `__all__`.
+    Builtin {
+        symbol: Name,
+    },
     Native {
         parameters: Box<[StarlarkParameter]>,
         return_type: StarlarkType,
