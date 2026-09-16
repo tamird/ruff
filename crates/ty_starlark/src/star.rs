@@ -556,8 +556,6 @@ impl StarBinding {
     }
 }
 
-const GRAPH_VERSION_V1: &str = "sty-star-graph-v1";
-const GRAPH_VERSION_V2: &str = "sty-star-graph-v2";
 const GRAPH_VERSION_V3: &str = "sty-star-graph-v3";
 
 #[derive(Clone, Copy)]
@@ -569,9 +567,6 @@ enum RecordForm {
 struct StarSupportedForms<'profile> {
     record_forms: HashMap<&'profile str, RecordForm>,
     host_functions: HashMap<&'profile str, &'profile StarHostFunction>,
-    field_attested: bool,
-    struct_attested: bool,
-    source_functions: bool,
 }
 
 /// Check a host-resolved snapshot without parsing `.star` as Bazel `.bzl`.
@@ -722,9 +717,7 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
             unproved_arguments: 0,
         };
         scanner.visit_body(parsed.suite());
-        if forms.source_functions {
-            scanner.scan_deferred_bodies(parsed.suite());
-        }
+        scanner.scan_deferred_bodies(parsed.suite());
         problems.extend(scanner.problems);
         native_problems.extend(scanner.native_problems);
         native_call_problems.extend(scanner.native_call_problems);
@@ -831,33 +824,19 @@ fn supported_forms<'profile>(
         intrinsics,
         host_functions,
     } = profile;
-    match version {
-        GRAPH_VERSION_V1 => {
-            if !intrinsics.is_empty() || !host_functions.is_empty() {
-                return None;
-            }
+    if version != GRAPH_VERSION_V3 || intrinsics.len() != 2 {
+        return None;
+    }
+    let mut found = HashSet::new();
+    for intrinsic in intrinsics {
+        let StarIntrinsic { name, kind } = intrinsic;
+        if !matches!(
+            (name.as_str(), kind.as_str()),
+            ("field", "field_first_type_optional_default") | ("struct", "struct_named_members")
+        ) || !found.insert(name.as_str())
+        {
+            return None;
         }
-        GRAPH_VERSION_V2 | GRAPH_VERSION_V3 => {
-            if version == GRAPH_VERSION_V2 && !host_functions.is_empty() {
-                return None;
-            }
-            if intrinsics.len() != 2 {
-                return None;
-            }
-            let mut found = HashSet::new();
-            for intrinsic in intrinsics {
-                let StarIntrinsic { name, kind } = intrinsic;
-                if !matches!(
-                    (name.as_str(), kind.as_str()),
-                    ("field", "field_first_type_optional_default")
-                        | ("struct", "struct_named_members")
-                ) || !found.insert(name.as_str())
-                {
-                    return None;
-                }
-            }
-        }
-        _ => return None,
     }
     if name.is_empty() || special_forms.is_empty() {
         return None;
@@ -885,7 +864,7 @@ fn supported_forms<'profile>(
             }
         }
     }
-    if version == GRAPH_VERSION_V3 && !supported_host_functions(host_functions, &forms) {
+    if !supported_host_functions(host_functions, &forms) {
         return None;
     }
     Some(StarSupportedForms {
@@ -894,9 +873,6 @@ fn supported_forms<'profile>(
             .iter()
             .map(|function| (function.name.as_str(), function))
             .collect(),
-        field_attested: version != GRAPH_VERSION_V1,
-        struct_attested: version != GRAPH_VERSION_V1,
-        source_functions: version != GRAPH_VERSION_V1,
     })
 }
 
@@ -1164,9 +1140,7 @@ fn source_bindings(
                     && !parsed.loaded_names.contains(name)
                 {
                     preceding_callables.insert(name);
-                    if forms.source_functions
-                        && let Some(function) = function_declaration(parsed, function, &visible)
-                    {
+                    if let Some(function) = function_declaration(parsed, function, &visible) {
                         let binding = StarBinding::Function(function);
                         visible.insert(name.to_string(), binding.clone());
                         exports.insert(name.to_string(), binding);
@@ -1200,7 +1174,7 @@ fn source_bindings(
                 &preceding_callables,
             )
             .map(StarBinding::Constructor)
-            .or_else(|| struct_declaration(parsed, call, forms, &visible))
+            .or_else(|| struct_declaration(parsed, call, &visible))
             .or_else(|| source_value_binding(&assign.value, &visible, &native)),
             Expr::Name(_) | Expr::Attribute(_) => binding_in_scope(&assign.value, &visible)
                 .cloned()
@@ -1218,8 +1192,8 @@ fn source_bindings(
             exports.insert(name.to_string(), declaration);
         }
     }
-    // v1 does not attest whether load aliases themselves are reexported.
-    // Explicit declarations can retain an imported type's identity.
+    // A bare loaded alias is not reexported. Explicit declarations can
+    // retain an imported type's identity.
     exports
 }
 
@@ -1236,17 +1210,9 @@ fn source_value_binding(
 fn struct_declaration(
     parsed: &ParsedStarSource<'_>,
     call: &ast::ExprCall,
-    forms: &StarSupportedForms<'_>,
     visible: &HashMap<String, StarBinding>,
 ) -> Option<StarBinding> {
-    let StarSupportedForms {
-        record_forms: _,
-        host_functions: _,
-        field_attested: _,
-        struct_attested,
-        source_functions: _,
-    } = forms;
-    if !struct_attested || !parsed.is_host_global("struct") {
+    if !parsed.is_host_global("struct") {
         return None;
     }
     let Expr::Name(callee) = call.func.as_ref() else {
@@ -1360,9 +1326,6 @@ fn record_declaration(
     let StarSupportedForms {
         record_forms,
         host_functions: _,
-        field_attested,
-        struct_attested: _,
-        source_functions: _,
     } = forms;
     let Expr::Name(callee) = call.func.as_ref() else {
         return None;
@@ -1403,9 +1366,6 @@ fn record_declaration(
         let (ty, range) = match type_expression(parsed, visible, &keyword.value) {
             Some(ty) => (ty, keyword.value.range()),
             None => {
-                if !field_attested {
-                    continue;
-                }
                 let Some(field) = intrinsic_field_type(parsed, visible, &keyword.value) else {
                     continue;
                 };

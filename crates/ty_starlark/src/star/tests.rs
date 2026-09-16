@@ -28,7 +28,7 @@ fn slice(text: &str, range: TextRange) -> Option<&str> {
 
 fn profile() -> StarHostProfile {
     StarHostProfile {
-        name: "example-star-host-v1".to_string(),
+        name: "example-star-host-v3".to_string(),
         special_forms: Box::new([
             StarSpecialForm {
                 name: "record".to_string(),
@@ -43,30 +43,22 @@ fn profile() -> StarHostProfile {
                 field_types: "named_keyword_type_expressions".to_string(),
             },
         ]),
-        intrinsics: Box::new([]),
+        intrinsics: Box::new([
+            StarIntrinsic {
+                name: "field".to_string(),
+                kind: "field_first_type_optional_default".to_string(),
+            },
+            StarIntrinsic {
+                name: "struct".to_string(),
+                kind: "struct_named_members".to_string(),
+            },
+        ]),
         host_functions: Box::new([]),
     }
 }
 
-fn v2_profile() -> StarHostProfile {
-    let mut host = profile();
-    host.name = "example-star-host-v2".to_string();
-    host.intrinsics = Box::new([
-        StarIntrinsic {
-            name: "field".to_string(),
-            kind: "field_first_type_optional_default".to_string(),
-        },
-        StarIntrinsic {
-            name: "struct".to_string(),
-            kind: "struct_named_members".to_string(),
-        },
-    ]);
-    host
-}
-
 fn v3_profile() -> StarHostProfile {
-    let mut host = v2_profile();
-    host.name = "example-star-host-v3".to_string();
+    let mut host = profile();
     host.host_functions = Box::new([example_host_function("host_encode")]);
     host
 }
@@ -120,7 +112,7 @@ fn case(root_source: &str, module_source: &str) -> anyhow::Result<(TestDb, StarR
     let module_file = system_path_to_file(&db, root.join("limits.star"))?;
     let label_range = span(root_source, &format!("\"{LABEL}\""))?;
     let graph = StarResolvedGraph {
-        version: "sty-star-graph-v1".to_string(),
+        version: "sty-star-graph-v3".to_string(),
         profile: profile(),
         root: StarSource {
             file: root_file,
@@ -152,7 +144,7 @@ fn root_only(root_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)> {
     Ok((
         db,
         StarResolvedGraph {
-            version: "sty-star-graph-v1".to_string(),
+            version: "sty-star-graph-v3".to_string(),
             profile: profile(),
             root: StarSource {
                 file,
@@ -164,16 +156,8 @@ fn root_only(root_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)> {
     ))
 }
 
-fn v2_root_only(root_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)> {
-    let (db, mut graph) = root_only(root_source)?;
-    graph.version = "sty-star-graph-v2".to_string();
-    graph.profile = v2_profile();
-    Ok((db, graph))
-}
-
 fn v3_root_only(root_source: &str) -> anyhow::Result<(TestDb, StarResolvedGraph)> {
-    let (db, mut graph) = v2_root_only(root_source)?;
-    graph.version = "sty-star-graph-v3".to_string();
+    let (db, mut graph) = root_only(root_source)?;
     graph.profile = native_profile();
     Ok((db, graph))
 }
@@ -188,35 +172,34 @@ fn profile_failure(graph: &StarResolvedGraph) -> anyhow::Result<()> {
 }
 
 #[test]
-fn v2_requires_recognized_forms_and_intrinsic_facts() -> anyhow::Result<()> {
+fn v3_requires_recognized_forms_and_intrinsic_facts() -> anyhow::Result<()> {
     let source = "Config = record(value=int)\nConfig(value=\"wrong\")\n";
-    let (_db, mut graph) = v2_root_only(source)?;
+    let (_db, mut graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert_eq!(analysis.checked_arguments(), 1);
     assert_eq!(analysis.problems().len(), 1);
 
     graph.profile.name.clear();
     profile_failure(&graph)?;
-    graph.profile = v2_profile();
+    graph.profile = profile();
     graph.profile.intrinsics[0].kind = "field_accepts_any_type".to_string();
     profile_failure(&graph)?;
-    graph.profile = v2_profile();
+    graph.profile = profile();
     graph.profile.intrinsics[1].name = "field".to_string();
     profile_failure(&graph)?;
-    graph.profile = v2_profile();
+    graph.profile = profile();
     graph.profile.intrinsics = Box::new([]);
     profile_failure(&graph)?;
-    graph.profile = v2_profile();
+    graph.profile = profile();
     graph.profile.special_forms[1].field_types = "arbitrary_python_keyword".to_string();
     profile_failure(&graph)?;
-    graph.profile = v2_profile();
+    graph.profile = profile();
     graph.profile.special_forms[1].name = "record".to_string();
     profile_failure(&graph)?;
-    graph.profile = v2_profile();
+    graph.profile = profile();
     graph.version = "sty-star-graph-v1".to_string();
     profile_failure(&graph)?;
     graph.version = "sty-star-graph-v2".to_string();
-    graph.profile.host_functions = v3_profile().host_functions;
     profile_failure(&graph)?;
     graph.version = "sty-star-graph-v4".to_string();
     profile_failure(&graph)?;
@@ -226,8 +209,7 @@ fn v2_requires_recognized_forms_and_intrinsic_facts() -> anyhow::Result<()> {
 #[test]
 fn v3_accepts_an_attested_empty_host_inventory_and_retains_source_checks() -> anyhow::Result<()> {
     let source = "def choose(flag: bool):\n    pass\nchoose(flag=\"wrong\")\n";
-    let (_db, mut graph) = v2_root_only(source)?;
-    graph.version = "sty-star-graph-v3".to_string();
+    let (_db, graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert_eq!(analysis.checked_arguments(), 1);
     let [problem] = analysis.problems() else {
@@ -241,8 +223,7 @@ fn v3_accepts_an_attested_empty_host_inventory_and_retains_source_checks() -> an
 #[test]
 fn v3_requires_well_formed_portable_host_function_signatures() -> anyhow::Result<()> {
     let source = "VALUE = 1\n";
-    let (_db, mut graph) = v2_root_only(source)?;
-    graph.version = "sty-star-graph-v3".to_string();
+    let (_db, mut graph) = root_only(source)?;
     graph.profile = v3_profile();
     let analysis = analyzed(check_star_graph(&graph))?;
     assert!(analysis.problems().is_empty());
@@ -707,7 +688,7 @@ fn v3_loaded_function_defaults_have_loaded_initialization_availability() -> anyh
 }
 
 #[test]
-fn v2_field_type_expressions_prove_primitive_union_and_nominal_lists() -> anyhow::Result<()> {
+fn field_type_expressions_prove_primitive_union_and_nominal_lists() -> anyhow::Result<()> {
     let source = concat!(
         "Left = record(code=int)\n",
         "Right = record(code=int)\n",
@@ -722,7 +703,7 @@ fn v2_field_type_expressions_prove_primitive_union_and_nominal_lists() -> anyhow
         "    Config(count=\"wrong\", flag=\"wrong\", maybe=Right(code=1), items=[Right(code=1)], unknown=\"wrong\")\n",
         "Config(count=1, flag=True, maybe=None, items=[Left(code=1)])\n",
     );
-    let (_db, graph) = v2_root_only(source)?;
+    let (_db, graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert_eq!(analysis.checked_arguments(), 11);
     assert_eq!(analysis.unproved_arguments(), 1);
@@ -749,14 +730,12 @@ fn v2_field_type_expressions_prove_primitive_union_and_nominal_lists() -> anyhow
 }
 
 #[test]
-fn v2_field_annotation_resolves_a_loaded_nominal_record() -> anyhow::Result<()> {
+fn field_annotation_resolves_a_loaded_nominal_record() -> anyhow::Result<()> {
     let source = format!(
         "load(\"{LABEL}\", \"Left\", \"Right\")\nConfig = record(value=field(Left))\nConfig(value=Right(code=1))\n"
     );
     let module_source = "Left = record(code=int)\nRight = record(code=int)\n";
     let (_db, mut graph) = case(&source, module_source)?;
-    graph.version = "sty-star-graph-v2".to_string();
-    graph.profile = v2_profile();
     graph.root.loads[0].bindings = Box::new([
         StarLoadBinding {
             local: "Left".to_string(),
@@ -782,20 +761,14 @@ fn v2_field_annotation_resolves_a_loaded_nominal_record() -> anyhow::Result<()> 
 }
 
 #[test]
-fn native_field_proof_requires_v2_and_leaves_unknown_values_unproved() -> anyhow::Result<()> {
+fn native_field_proof_leaves_unknown_values_unproved() -> anyhow::Result<()> {
     let source = concat!(
         "Config = record(value=field(int, default=make_value()))\n",
         "Config(value=make_value())\n",
         "Config(value=\"wrong\")\n",
     );
-    let (_db, v1) = root_only(source)?;
-    let analysis = analyzed(check_star_graph(&v1))?;
-    assert!(analysis.problems().is_empty());
-    assert_eq!(analysis.checked_arguments(), 0);
-    assert_eq!(analysis.unproved_arguments(), 2);
-
-    let (_db, v2) = v2_root_only(source)?;
-    let analysis = analyzed(check_star_graph(&v2))?;
+    let (_db, graph) = root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
     assert_eq!(analysis.checked_arguments(), 1);
     assert_eq!(analysis.unproved_arguments(), 1);
     let [problem] = analysis.problems() else {
@@ -816,7 +789,7 @@ fn shadowed_or_unrecognized_field_calls_do_not_prove_annotations() -> anyhow::Re
         "Config = record(value=field(int, 0, default=0))\nConfig(value=\"wrong\")\n",
         "Config = record(value=field(Missing))\nConfig(value=\"wrong\")\n",
     ] {
-        let (_db, graph) = v2_root_only(source)?;
+        let (_db, graph) = root_only(source)?;
         let analysis = analyzed(check_star_graph(&graph))?;
         assert!(analysis.problems().is_empty(), "{source}: {analysis:?}");
         assert_eq!(analysis.checked_arguments(), 0, "{source}");
@@ -827,8 +800,6 @@ fn shadowed_or_unrecognized_field_calls_do_not_prove_annotations() -> anyhow::Re
         "load(\"{LABEL}\", \"field\")\nConfig = record(value=field(int))\nConfig(value=\"wrong\")\n"
     );
     let (_db, mut graph) = case(&source, "field = record(value=int)\n")?;
-    graph.version = "sty-star-graph-v2".to_string();
-    graph.profile = v2_profile();
     graph.root.loads[0].bindings[0].local = "field".to_string();
     graph.root.loads[0].bindings[0].source = "field".to_string();
     let analysis = analyzed(check_star_graph(&graph))?;
@@ -850,13 +821,8 @@ fn attested_struct_members_resolve_record_calls_and_explicit_aliases() -> anyhow
         "nested.images.repository(name=7)\n",
         "images.computed(name=7)\n",
     );
-    let (_db, v1) = root_only(source)?;
-    let analysis = analyzed(check_star_graph(&v1))?;
-    assert!(analysis.problems().is_empty());
-    assert_eq!(analysis.checked_arguments(), 0);
-
-    let (_db, v2) = v2_root_only(source)?;
-    let analysis = analyzed(check_star_graph(&v2))?;
+    let (_db, graph) = root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
     assert_eq!(analysis.checked_arguments(), 3);
     let [direct, alias, nested] = analysis.problems() else {
         anyhow::bail!("expected three proven struct member calls: {analysis:?}");
@@ -868,8 +834,8 @@ fn attested_struct_members_resolve_record_calls_and_explicit_aliases() -> anyhow
     ] {
         assert_eq!(problem.constructor(), constructor);
         assert_eq!(problem.field(), "name");
-        assert_eq!(problem.file(), v2.root.file);
-        assert_eq!(problem.related_file(), v2.root.file);
+        assert_eq!(problem.file(), graph.root.file);
+        assert_eq!(problem.related_file(), graph.root.file);
         assert_eq!(slice(source, problem.range()), Some("7"));
         assert_eq!(slice(source, problem.related_range()), Some("str"));
     }
@@ -881,8 +847,6 @@ fn loaded_struct_keeps_module_field_locations() -> anyhow::Result<()> {
     let root_source = format!("load(\"{LABEL}\", \"images\")\nimages.repository(name=7)\n");
     let module_source = "Repository = record(name=str)\nimages = struct(repository=Repository)\n";
     let (_db, mut graph) = case(&root_source, module_source)?;
-    graph.version = "sty-star-graph-v2".to_string();
-    graph.profile = v2_profile();
     graph.root.loads[0].bindings[0].local = "images".to_string();
     graph.root.loads[0].bindings[0].source = "images".to_string();
     let (root_file, module_file) = files(&graph)?;
@@ -907,7 +871,7 @@ fn struct_members_follow_source_order_and_decline_unproved_sources() -> anyhow::
         "images = struct(repository=Repository)\n",
         "images.repository(name=7)\n",
     );
-    let (_db, graph) = v2_root_only(source)?;
+    let (_db, graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert_eq!(analysis.checked_arguments(), 1);
     let [problem] = analysis.problems() else {
@@ -929,7 +893,7 @@ fn struct_members_follow_source_order_and_decline_unproved_sources() -> anyhow::
         "Repository = record(name=str)\nimages = struct(repository=make_value())\nimages.repository(name=7)\n",
         "Repository = record(name=str)\nimages = struct(repository=Repository)\nimages = struct(repository=make_value())\nimages.repository(name=7)\n",
     ] {
-        let (_db, graph) = v2_root_only(source)?;
+        let (_db, graph) = root_only(source)?;
         let analysis = analyzed(check_star_graph(&graph))?;
         assert!(analysis.problems().is_empty(), "{source}: {analysis:?}");
         assert_eq!(analysis.checked_arguments(), 0, "{source}");
@@ -938,19 +902,14 @@ fn struct_members_follow_source_order_and_decline_unproved_sources() -> anyhow::
 }
 
 #[test]
-fn v2_source_function_checks_known_positional_and_named_annotations() -> anyhow::Result<()> {
+fn source_function_checks_known_positional_and_named_annotations() -> anyhow::Result<()> {
     let source = concat!(
         "def choose(flag: bool, count: int, name: str | None):\n",
         "    pass\n",
         "choose(\"wrong\", count=\"wrong\", name=7)\n",
     );
-    let (_db, v1) = root_only(source)?;
-    let analysis = analyzed(check_star_graph(&v1))?;
-    assert!(analysis.problems().is_empty());
-    assert_eq!(analysis.checked_arguments(), 0);
-
-    let (_db, v2) = v2_root_only(source)?;
-    let analysis = analyzed(check_star_graph(&v2))?;
+    let (_db, graph) = root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
     assert_eq!(analysis.checked_arguments(), 3);
     let [flag, count, name] = analysis.problems() else {
         anyhow::bail!("expected three annotated parameter mismatches: {analysis:?}");
@@ -963,7 +922,7 @@ fn v2_source_function_checks_known_positional_and_named_annotations() -> anyhow:
         assert_eq!(problem.constructor(), "choose");
         assert_eq!(problem.field(), parameter);
         assert_eq!(problem.related_label(), "parameter annotated");
-        assert_eq!(problem.related_file(), v2.root.file);
+        assert_eq!(problem.related_file(), graph.root.file);
         assert_eq!(slice(source, problem.related_range()), Some(annotation));
         assert_eq!(problem.expected().to_string(), expected);
         assert_eq!(problem.actual().to_string(), actual);
@@ -978,7 +937,7 @@ fn v2_source_function_checks_known_positional_and_named_annotations() -> anyhow:
 }
 
 #[test]
-fn v2_loaded_struct_function_checks_known_nominal_union_and_list_arguments() -> anyhow::Result<()> {
+fn loaded_struct_function_checks_known_nominal_union_and_list_arguments() -> anyhow::Result<()> {
     let root_source = format!(
         "load(\"{LABEL}\", \"api\")\napi.submit(flag=\"bad\", owner=api.make_right(), items=[api.make_right()])\n"
     );
@@ -992,8 +951,6 @@ fn v2_loaded_struct_function_checks_known_nominal_union_and_list_arguments() -> 
         "api = struct(submit=_submit, make_right=make_right)\n",
     );
     let (_db, mut graph) = case(&root_source, module_source)?;
-    graph.version = "sty-star-graph-v2".to_string();
-    graph.profile = v2_profile();
     graph.root.loads[0].bindings[0].local = "api".to_string();
     graph.root.loads[0].bindings[0].source = "api".to_string();
     let (root_file, module_file) = files(&graph)?;
@@ -1040,7 +997,7 @@ fn source_function_calls_accept_known_scalar_nominal_union_and_list_values() -> 
         "    pass\n",
         "submit(owner=make_left(), items=[make_left(), None], flag=True, count=1, name=\"ok\", callback=make_left)\n",
     );
-    let (_db, graph) = v2_root_only(source)?;
+    let (_db, graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert!(analysis.problems().is_empty(), "{analysis:?}");
     assert_eq!(analysis.checked_arguments(), 6);
@@ -1057,7 +1014,7 @@ fn source_function_signatures_follow_order_and_leave_unknown_annotations_unprove
         "    pass\n",
         "check(flag=\"bad\")\n",
     );
-    let (_db, graph) = v2_root_only(source)?;
+    let (_db, graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert_eq!(analysis.checked_arguments(), 1);
     let [problem] = analysis.problems() else {
@@ -1078,7 +1035,7 @@ fn source_function_signatures_follow_order_and_leave_unknown_annotations_unprove
         "def check(flag: bool):\n    pass\ncheck(flag=\"bad\", flag_again=7)\n",
         "def check(flag: bool):\n    pass\ncheck(\"bad\", flag=7)\n",
     ] {
-        let (_db, graph) = v2_root_only(source)?;
+        let (_db, graph) = root_only(source)?;
         let analysis = analyzed(check_star_graph(&graph))?;
         assert!(analysis.problems().is_empty(), "{source}: {analysis:?}");
         assert_eq!(analysis.checked_arguments(), 0, "{source}");
@@ -1096,7 +1053,7 @@ fn source_functions_with_unknown_returns_do_not_supply_nominal_precision() -> an
         "    pass\n",
         "take(item=unknown())\n",
     );
-    let (_db, graph) = v2_root_only(source)?;
+    let (_db, graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert!(analysis.problems().is_empty());
     assert_eq!(analysis.checked_arguments(), 0);
@@ -1117,7 +1074,7 @@ fn malformed_source_function_calls_do_not_establish_known_return_types() -> anyh
         "take(item=make_right(*unknown))\n",
         "take(item=make_right())\n",
     );
-    let (_db, graph) = v2_root_only(source)?;
+    let (_db, graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert!(analysis.problems().is_empty());
     assert_eq!(analysis.checked_arguments(), 1);
@@ -1141,7 +1098,7 @@ fn constructor_results_require_complete_known_fields_and_valid_inputs() -> anyho
         "    take(item=Left(value=1))\n",
         "    take(item=Right(value=1))\n",
     );
-    let (_db, graph) = v2_root_only(source)?;
+    let (_db, graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     let [wrong_inner, wrong_nominal] = analysis.problems() else {
         anyhow::bail!("invalid nested constructors produced extra errors: {analysis:?}");
@@ -1167,7 +1124,7 @@ fn source_return_annotations_abstain_on_known_wrong_or_unknown_inputs() -> anyho
         "    Config(value=produce(flag=unknown()))\n",
         "    Config(value=produce(flag=True))\n",
     );
-    let (_db, graph) = v2_root_only(source)?;
+    let (_db, graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     let [wrong_input, valid_return_wrong_field] = analysis.problems() else {
         anyhow::bail!("invalid function inputs seeded a false return: {analysis:?}");
@@ -1235,7 +1192,7 @@ fn record_instances_are_values_and_never_annotation_type_aliases() -> anyhow::Re
         "    take(repository=repository_alias)\n",
         "    Unknown(item=7)\n",
     );
-    let (_db, graph) = v2_root_only(source)?;
+    let (_db, graph) = root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert!(analysis.problems().is_empty(), "{analysis:?}");
     assert_eq!(analysis.unproved_arguments(), 1);
@@ -1257,7 +1214,7 @@ fn record_instances_are_values_and_never_annotation_type_aliases() -> anyhow::Re
             0,
         ),
     ] {
-        let (_db, graph) = v2_root_only(source)?;
+        let (_db, graph) = root_only(source)?;
         let analysis = analyzed(check_star_graph(&graph))?;
         assert!(
             analysis
@@ -1307,8 +1264,8 @@ fn loaded_record_values_flow_through_struct_and_deferred_root_calls() -> anyhow:
     let images_file = system_path_to_file(&db, root.join("images.star"))?;
     let workloads_file = system_path_to_file(&db, root.join("workloads.star"))?;
     let graph = StarResolvedGraph {
-        version: "sty-star-graph-v2".to_string(),
-        profile: v2_profile(),
+        version: "sty-star-graph-v3".to_string(),
+        profile: profile(),
         root: StarSource {
             file: root_file,
             text: root_source.clone(),
@@ -1393,12 +1350,6 @@ fn deferred_source_functions_check_stable_loads_without_borrowing_local_names() 
     let (_db, mut graph) = case(&root_source, module_source)?;
     graph.root.loads[0].bindings[0].local = "api".to_string();
     graph.root.loads[0].bindings[0].source = "api".to_string();
-    let v1 = analyzed(check_star_graph(&graph))?;
-    assert_eq!(v1.checked_arguments(), 0);
-    assert!(v1.problems().is_empty());
-
-    graph.version = "sty-star-graph-v2".to_string();
-    graph.profile = v2_profile();
     let (root_file, module_file) = files(&graph)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert_eq!(analysis.checked_arguments(), 2);
@@ -1433,8 +1384,6 @@ fn deferred_resources_use_loaded_source_function_annotations_with_unknown_contex
         "workloads = struct(deployment=_deployment)\n",
     );
     let (_db, mut graph) = case(&root_source, module_source)?;
-    graph.version = "sty-star-graph-v2".to_string();
-    graph.profile = v2_profile();
     graph.root.loads[0].bindings[0].local = "workloads".to_string();
     graph.root.loads[0].bindings[0].source = "workloads".to_string();
     let (root_file, module_file) = files(&graph)?;
@@ -1454,8 +1403,6 @@ fn deferred_resources_use_loaded_source_function_annotations_with_unknown_contex
 
     let positive = root_source.replace("cpu=7", "cpu=\"1\"");
     let (_db, mut graph) = case(&positive, module_source)?;
-    graph.version = "sty-star-graph-v2".to_string();
-    graph.profile = v2_profile();
     graph.root.loads[0].bindings[0].local = "workloads".to_string();
     graph.root.loads[0].bindings[0].source = "workloads".to_string();
     let analysis = analyzed(check_star_graph(&graph))?;
@@ -1531,7 +1478,7 @@ fn reports_dead_branch_mismatch_in_a_loaded_module_with_owning_files() -> anyhow
     let limits_file = system_path_to_file(&db, root.join("limits.star"))?;
     let usage_file = system_path_to_file(&db, root.join("usage.star"))?;
     let graph = StarResolvedGraph {
-        version: "sty-star-graph-v1".to_string(),
+        version: "sty-star-graph-v3".to_string(),
         profile: profile(),
         root: StarSource {
             file: root_file,
@@ -1730,7 +1677,7 @@ fn different_load_ids_keep_distinct_nominal_types_for_one_physical_file() -> any
     let root_file = system_path_to_file(&db, root.join("root.star"))?;
     let shared_file = system_path_to_file(&db, root.join("shared.star"))?;
     let graph = StarResolvedGraph {
-        version: "sty-star-graph-v1".to_string(),
+        version: "sty-star-graph-v3".to_string(),
         profile: profile(),
         root: StarSource {
             file: root_file,
@@ -1829,7 +1776,7 @@ fn transitive_import_keeps_the_original_record_identity_and_type_alias() -> anyh
     let base_file = system_path_to_file(&db, root.join("base.star"))?;
     let alias_file = system_path_to_file(&db, root.join("alias.star"))?;
     let graph = StarResolvedGraph {
-        version: "sty-star-graph-v1".to_string(),
+        version: "sty-star-graph-v3".to_string(),
         profile: profile(),
         root: StarSource {
             file: root_file,
@@ -1905,7 +1852,7 @@ fn bare_loaded_binding_is_not_reexported_without_a_host_attestation() -> anyhow:
     let base_file = system_path_to_file(&db, root.join("base.star"))?;
     let alias_file = system_path_to_file(&db, root.join("alias.star"))?;
     let graph = StarResolvedGraph {
-        version: "sty-star-graph-v1".to_string(),
+        version: "sty-star-graph-v3".to_string(),
         profile: profile(),
         root: StarSource {
             file: root_file,
@@ -1971,7 +1918,9 @@ fn nominal_constructor_names_in_deferred_lexical_scopes_are_unproved() -> anyhow
     ]);
     let analysis = analyzed(check_star_graph(&graph))?;
     assert!(analysis.problems().is_empty(), "{analysis:?}");
-    assert_eq!(analysis.checked_arguments(), 0);
+    // The deferred pass can check the nested Right constructor; its
+    // parameter named Envelope still shadows the loaded outer constructor.
+    assert_eq!(analysis.checked_arguments(), 1);
     Ok(())
 }
 
