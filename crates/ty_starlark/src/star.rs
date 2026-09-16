@@ -480,6 +480,7 @@ struct StarConstructor {
     file: File,
     ty: StarKnownType,
     fields: HashMap<String, StarField>,
+    complete_fields: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1351,6 +1352,7 @@ fn record_declaration(
             declaration: call.range(),
             name: name.to_string(),
         }),
+        complete_fields: fields.len() == seen_fields.len(),
         fields,
     })
 }
@@ -1819,6 +1821,71 @@ fn function_call_shape_known(call: &ast::ExprCall, function: &StarFunction) -> b
     true
 }
 
+fn constructor_result_type(
+    call: &ast::ExprCall,
+    constructor: &StarConstructor,
+    visible: &HashMap<String, StarBinding>,
+    native: &NativeScope<'_, '_>,
+) -> Option<StarKnownType> {
+    // Requiredness and defaults of record fields are owned by the host.
+    // Requiring every proved field avoids inventing an instance for a
+    // constructor call that may fail before returning any record.
+    if !constructor.complete_fields
+        || !call.arguments.args.is_empty()
+        || call.arguments.keywords.len() != constructor.fields.len()
+    {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    for keyword in &call.arguments.keywords {
+        let name = keyword.arg.as_ref()?.as_str();
+        if !seen.insert(name) {
+            return None;
+        }
+        let field = constructor.fields.get(name)?;
+        let actual = argument_type(&keyword.value, visible, native)?;
+        if !type_accepts(&field.ty, &actual) {
+            return None;
+        }
+    }
+    Some(constructor.ty.clone())
+}
+
+fn function_result_type(
+    call: &ast::ExprCall,
+    function: &StarFunction,
+    visible: &HashMap<String, StarBinding>,
+    native: &NativeScope<'_, '_>,
+) -> Option<StarKnownType> {
+    if !function_call_shape_known(call, function)
+        || call.arguments.args.len() + call.arguments.keywords.len() != function.parameters.len()
+    {
+        return None;
+    }
+    for (expression, parameter) in call.arguments.args.iter().zip(&function.parameters) {
+        if let Some(annotation) = &parameter.annotation {
+            let actual = argument_type(expression, visible, native)?;
+            if !type_accepts(&annotation.ty, &actual) {
+                return None;
+            }
+        }
+    }
+    for keyword in &call.arguments.keywords {
+        let name = keyword.arg.as_ref()?.as_str();
+        let parameter = function
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == name)?;
+        if let Some(annotation) = &parameter.annotation {
+            let actual = argument_type(&keyword.value, visible, native)?;
+            if !type_accepts(&annotation.ty, &actual) {
+                return None;
+            }
+        }
+    }
+    Some(function.returns.as_ref()?.ty.clone())
+}
+
 struct NativeScope<'scope, 'profile> {
     functions: &'scope HashMap<&'profile str, &'profile StarHostFunction>,
     writes: &'scope HashMap<String, usize>,
@@ -2061,16 +2128,11 @@ fn argument_type(
         Expr::Call(call) => {
             if let Some(binding) = binding_in_scope(&call.func, visible) {
                 return match binding {
-                    StarBinding::Constructor(constructor) => Some(constructor.ty.clone()),
+                    StarBinding::Constructor(constructor) => {
+                        constructor_result_type(call, constructor, visible, native)
+                    }
                     StarBinding::Function(function) => {
-                        if !function_call_shape_known(call, function)
-                            || call.arguments.args.len() + call.arguments.keywords.len()
-                                != function.parameters.len()
-                        {
-                            return None;
-                        }
-                        let returns = function.returns.as_ref()?;
-                        Some(returns.ty.clone())
+                        function_result_type(call, function, visible, native)
                     }
                     StarBinding::Alias(_) | StarBinding::Struct(_) => None,
                 };

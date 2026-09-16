@@ -1036,6 +1036,67 @@ fn malformed_source_function_calls_do_not_establish_known_return_types() -> anyh
 }
 
 #[test]
+fn constructor_results_require_complete_known_fields_and_valid_inputs() -> anyhow::Result<()> {
+    let source = concat!(
+        "Left = record(value=int)\n",
+        "Right = record(value=int)\n",
+        "Incomplete = record(value=Missing)\n",
+        "def take(item: Left):\n    pass\n",
+        "if False:\n",
+        "    take(item=Left(value=\"bad\"))\n",
+        "    take(item=Left(value=unknown()))\n",
+        "    take(item=Left())\n",
+        "    take(item=Left(value=1, extra=True))\n",
+        "    take(item=Incomplete(value=1))\n",
+        "    take(item=Left(value=1))\n",
+        "    take(item=Right(value=1))\n",
+    );
+    let (_db, graph) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [wrong_inner, wrong_nominal] = analysis.problems() else {
+        anyhow::bail!("invalid nested constructors produced extra errors: {analysis:?}");
+    };
+    assert_eq!(wrong_inner.constructor(), "Left");
+    assert_eq!(wrong_inner.field(), "value");
+    assert_eq!(slice(source, wrong_inner.range()), Some("\"bad\""));
+    assert_eq!(wrong_nominal.constructor(), "take");
+    assert_eq!(wrong_nominal.field(), "item");
+    assert_eq!(slice(source, wrong_nominal.range()), Some("Right(value=1)"));
+    assert_eq!(wrong_nominal.related_label(), "parameter annotated");
+    assert!(analysis.unproved_arguments() >= 5);
+    Ok(())
+}
+
+#[test]
+fn source_return_annotations_abstain_on_known_wrong_or_unknown_inputs() -> anyhow::Result<()> {
+    let source = concat!(
+        "Config = record(value=int)\n",
+        "def produce(flag: bool) -> str:\n    return \"ok\"\n",
+        "if False:\n",
+        "    Config(value=produce(flag=\"bad\"))\n",
+        "    Config(value=produce(flag=unknown()))\n",
+        "    Config(value=produce(flag=True))\n",
+    );
+    let (_db, graph) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [wrong_input, valid_return_wrong_field] = analysis.problems() else {
+        anyhow::bail!("invalid function inputs seeded a false return: {analysis:?}");
+    };
+    assert_eq!(wrong_input.constructor(), "produce");
+    assert_eq!(wrong_input.field(), "flag");
+    assert_eq!(wrong_input.related_label(), "parameter annotated");
+    assert_eq!(slice(source, wrong_input.range()), Some("\"bad\""));
+    assert_eq!(valid_return_wrong_field.constructor(), "Config");
+    assert_eq!(valid_return_wrong_field.field(), "value");
+    assert_eq!(
+        slice(source, valid_return_wrong_field.range()),
+        Some("produce(flag=True)")
+    );
+    assert!(analysis.unproved_arguments() >= 2);
+    Ok(())
+}
+
+#[test]
 fn deferred_source_functions_check_stable_loads_without_borrowing_local_names() -> anyhow::Result<()>
 {
     let root_source = format!(

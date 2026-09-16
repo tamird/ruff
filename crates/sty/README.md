@@ -66,7 +66,10 @@ validated v3 graph, Sty also follows stable source `def` bindings and
 checks their known regular positional and named parameter annotations,
 including functions exported through `struct` and resolved loads. A
 known return annotation can supply a type when the call supplies every
-named or positional parameter. Typed `def` semantics come from the
+named or positional parameter and every established parameter type
+matches a known argument. A nominal record result requires complete
+known field declarations and compatible named arguments for every
+field. Typed `def` semantics come from the
 host's Starlark language and native annotation checks; the intrinsic
 facts attest `field` and `struct` only. Parameter defaults, requiredness,
 computed attributes, and unrecognized type aliases remain the host's
