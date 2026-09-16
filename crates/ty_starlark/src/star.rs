@@ -85,7 +85,7 @@ pub enum StarCheck {
     Opaque(StarFailure),
 }
 
-/// Only source-backed constructor arguments with known types are proved.
+/// Proves known source record fields and stable annotated source parameters.
 #[derive(Debug)]
 pub struct StarAnalysis {
     problems: Box<[StarTypeProblem]>,
@@ -98,14 +98,15 @@ impl StarAnalysis {
         &self.problems
     }
 
-    /// Keyword arguments of recognized record calls with known field and
-    /// argument types, including mismatches.
+    /// Known keyword fields of record calls and known regular positional or
+    /// named arguments of stable annotated source functions, including errors.
     pub fn checked_arguments(&self) -> usize {
         self.checked_arguments
     }
 
-    /// Unproved keyword arguments of those recognized record calls.
-    /// Other calls, declarations, and deferred bodies are not counted.
+    /// Unproved keyword fields of record calls and supplied arguments of
+    /// stable annotated source functions. Calls without established source
+    /// signatures and deferred bodies are not counted.
     pub fn unproved_arguments(&self) -> usize {
         self.unproved_arguments
     }
@@ -140,6 +141,7 @@ pub enum StarKnownType {
     Record(StarRecordId),
     Union(Box<[StarKnownType]>),
     List(Box<StarKnownType>),
+    Callable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,6 +181,7 @@ impl std::fmt::Display for StarKnownType {
                 Ok(())
             }
             Self::List(element) => write!(formatter, "list[{element}]"),
+            Self::Callable => formatter.write_str("callable"),
         }
     }
 }
@@ -192,8 +195,15 @@ pub struct StarTypeProblem {
     related_range: TextRange,
     constructor: String,
     field: String,
+    kind: StarTypeProblemKind,
     expected: StarKnownType,
     actual: StarKnownType,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StarTypeProblemKind {
+    RecordField,
+    FunctionParameter,
 }
 
 impl StarTypeProblem {
@@ -221,6 +231,14 @@ impl StarTypeProblem {
         &self.field
     }
 
+    /// Secondary annotation label for the declaration owning this type.
+    pub fn related_label(&self) -> &'static str {
+        match self.kind {
+            StarTypeProblemKind::RecordField => "field declared",
+            StarTypeProblemKind::FunctionParameter => "parameter annotated",
+        }
+    }
+
     pub fn expected(&self) -> &StarKnownType {
         &self.expected
     }
@@ -232,6 +250,12 @@ impl StarTypeProblem {
 
 impl std::fmt::Display for StarTypeProblem {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let subject = match self.kind {
+            StarTypeProblemKind::RecordField => format!("{}.{}", self.constructor, self.field),
+            StarTypeProblemKind::FunctionParameter => {
+                format!("{} parameter {}", self.constructor, self.field)
+            }
+        };
         if let (StarKnownType::Record(expected), StarKnownType::Record(actual)) =
             (&self.expected, &self.actual)
             && expected.name == actual.name
@@ -239,19 +263,14 @@ impl std::fmt::Display for StarTypeProblem {
         {
             return write!(
                 formatter,
-                "{}.{}, expected {} ({}), got {} ({})",
-                self.constructor,
-                self.field,
-                expected.name,
-                expected.module,
-                actual.name,
-                actual.module
+                "{}, expected {} ({}), got {} ({})",
+                subject, expected.name, expected.module, actual.name, actual.module
             );
         }
         write!(
             formatter,
-            "{}.{}, expected {}, got {}",
-            self.constructor, self.field, self.expected, self.actual
+            "{}, expected {}, got {}",
+            subject, self.expected, self.actual
         )
     }
 }
@@ -341,10 +360,24 @@ struct StarConstructor {
 }
 
 #[derive(Clone, Debug)]
+struct StarFunction {
+    file: File,
+    parameters: Box<[StarParameter]>,
+    returns: Option<StarField>,
+}
+
+#[derive(Clone, Debug)]
+struct StarParameter {
+    name: String,
+    annotation: Option<StarField>,
+}
+
+#[derive(Clone, Debug)]
 enum StarBinding {
     Constructor(StarConstructor),
     Alias(StarKnownType),
     Struct(HashMap<String, StarBinding>),
+    Function(StarFunction),
 }
 
 impl StarBinding {
@@ -353,6 +386,7 @@ impl StarBinding {
             Self::Constructor(constructor) => Some(&constructor.ty),
             Self::Alias(ty) => Some(ty),
             Self::Struct(_) => None,
+            Self::Function(_) => None,
         }
     }
 }
@@ -370,6 +404,7 @@ struct StarSupportedForms<'profile> {
     record_forms: HashMap<&'profile str, RecordForm>,
     field_attested: bool,
     struct_attested: bool,
+    source_functions: bool,
 }
 
 /// Check a host-resolved snapshot without parsing `.star` as Bazel `.bzl`.
@@ -662,6 +697,7 @@ fn supported_forms<'profile>(
         record_forms: forms,
         field_attested: version == GRAPH_VERSION_V2,
         struct_attested: version == GRAPH_VERSION_V2,
+        source_functions: version == GRAPH_VERSION_V2,
     })
 }
 
@@ -860,6 +896,13 @@ fn source_bindings(
                     && !parsed.loaded_names.contains(name)
                 {
                     preceding_callables.insert(name);
+                    if forms.source_functions
+                        && let Some(function) = function_declaration(parsed, function, &visible)
+                    {
+                        let binding = StarBinding::Function(function);
+                        visible.insert(name.to_string(), binding.clone());
+                        exports.insert(name.to_string(), binding);
+                    }
                 }
                 continue;
             }
@@ -917,6 +960,7 @@ fn struct_declaration(
         record_forms: _,
         field_attested: _,
         struct_attested,
+        source_functions: _,
     } = forms;
     if !struct_attested || !parsed.is_host_global("struct") {
         return None;
@@ -942,6 +986,54 @@ fn struct_declaration(
         }
     }
     Some(StarBinding::Struct(members))
+}
+
+fn function_declaration(
+    parsed: &ParsedStarSource<'_>,
+    function: &ast::StmtFunctionDef,
+    visible: &HashMap<String, StarBinding>,
+) -> Option<StarFunction> {
+    let parameters = &function.parameters;
+    if function.is_async
+        || function.type_params.is_some()
+        || !parameters.posonlyargs.is_empty()
+        || parameters.vararg.is_some()
+        || !parameters.kwonlyargs.is_empty()
+        || parameters.kwarg.is_some()
+    {
+        return None;
+    }
+    let mut parsed_parameters = Vec::with_capacity(parameters.args.len());
+    let mut seen = HashSet::new();
+    for parameter in &parameters.args {
+        let name = parameter.name().as_str();
+        if !seen.insert(name) {
+            return None;
+        }
+        let annotation = parameter.annotation().and_then(|expression| {
+            let ty = type_expression(parsed, visible, expression)?;
+            Some(StarField {
+                ty,
+                range: expression.range(),
+            })
+        });
+        parsed_parameters.push(StarParameter {
+            name: name.to_string(),
+            annotation,
+        });
+    }
+    let returns = function.returns.as_deref().and_then(|expression| {
+        let ty = type_expression(parsed, visible, expression)?;
+        Some(StarField {
+            ty,
+            range: expression.range(),
+        })
+    });
+    Some(StarFunction {
+        file: parsed.source.file,
+        parameters: parsed_parameters.into_boxed_slice(),
+        returns,
+    })
 }
 
 fn binding_in_scope<'scope>(
@@ -985,6 +1077,7 @@ fn record_declaration(
         record_forms,
         field_attested,
         struct_attested: _,
+        source_functions: _,
     } = forms;
     let Expr::Name(callee) = call.func.as_ref() else {
         return None;
@@ -1178,7 +1271,16 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
             // This first slice scans eager top-level code and every top-level
             // `if` arm, including dead branches. Function locals and closure
             // values need a separate lexical context before trusting names.
-            Stmt::FunctionDef(_) => {}
+            Stmt::FunctionDef(function) => {
+                let name = function.name.as_str();
+                if self.writes.get(name) == Some(&1)
+                    && !self.loaded_names.contains(name)
+                    && let Some(StarBinding::Function(binding)) = self.declarations.get(name)
+                {
+                    self.visible
+                        .insert(name.to_string(), StarBinding::Function(binding.clone()));
+                }
+            }
             Stmt::ClassDef(_) => {}
             Stmt::Assign(assign) => {
                 ast::visitor::walk_stmt(self, statement);
@@ -1236,14 +1338,120 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
                         related_range: field.range,
                         constructor: name.clone(),
                         field: field_name.to_string(),
+                        kind: StarTypeProblemKind::RecordField,
                         expected: field.ty.clone(),
                         actual,
                     });
                 }
             }
         }
+        if let Expr::Call(call) = expression
+            && let Some(StarBinding::Function(function)) =
+                binding_in_scope(&call.func, &self.visible)
+            && let Some(name) = binding_name(&call.func)
+        {
+            let function = function.clone();
+            self.check_function_call(call, &function, &name);
+        }
         ast::visitor::walk_expr(self, expression);
     }
+}
+
+impl CallScanner<'_> {
+    fn check_function_call(&mut self, call: &ast::ExprCall, function: &StarFunction, name: &str) {
+        let StarFunction {
+            file,
+            parameters,
+            returns: _,
+        } = function;
+        if parameters
+            .iter()
+            .all(|parameter| parameter.annotation.is_none())
+        {
+            return;
+        }
+        let arguments = &call.arguments;
+        if !function_call_shape_known(call, function) {
+            self.unproved_arguments += arguments.args.len() + arguments.keywords.len();
+            return;
+        }
+        for (argument, parameter) in arguments.args.iter().zip(parameters) {
+            self.check_function_argument(argument, parameter, *file, name);
+        }
+        for keyword in &arguments.keywords {
+            let Some(keyword_name) = keyword.arg.as_ref() else {
+                continue;
+            };
+            let Some(parameter) = parameters
+                .iter()
+                .find(|parameter| parameter.name == keyword_name.as_str())
+            else {
+                continue;
+            };
+            self.check_function_argument(&keyword.value, parameter, *file, name);
+        }
+    }
+
+    fn check_function_argument(
+        &mut self,
+        expression: &Expr,
+        parameter: &StarParameter,
+        related_file: File,
+        function_name: &str,
+    ) {
+        let StarParameter { name, annotation } = parameter;
+        let Some(StarField {
+            ty: expected,
+            range,
+        }) = annotation
+        else {
+            self.unproved_arguments += 1;
+            return;
+        };
+        let Some(actual) = argument_type(expression, &self.visible) else {
+            self.unproved_arguments += 1;
+            return;
+        };
+        self.checked_arguments += 1;
+        if !type_accepts(expected, &actual) {
+            self.problems.push(StarTypeProblem {
+                file: self.file,
+                range: expression.range(),
+                related_file,
+                related_range: *range,
+                constructor: function_name.to_string(),
+                field: name.clone(),
+                kind: StarTypeProblemKind::FunctionParameter,
+                expected: expected.clone(),
+                actual,
+            });
+        }
+    }
+}
+
+fn function_call_shape_known(call: &ast::ExprCall, function: &StarFunction) -> bool {
+    let arguments = &call.arguments;
+    let parameters = &function.parameters;
+    if arguments.args.len() > parameters.len() || arguments.args.iter().any(Expr::is_starred_expr) {
+        return false;
+    }
+    let mut seen = HashSet::new();
+    for parameter in parameters.iter().take(arguments.args.len()) {
+        seen.insert(parameter.name.as_str());
+    }
+    for keyword in &arguments.keywords {
+        let Some(name) = keyword.arg.as_ref() else {
+            return false;
+        };
+        if !parameters
+            .iter()
+            .any(|parameter| parameter.name == name.as_str())
+            || !seen.insert(name.as_str())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn argument_type(
@@ -1256,12 +1464,29 @@ fn argument_type(
         Expr::StringLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::Str)),
         Expr::BooleanLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::Bool)),
         Expr::NoneLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::None)),
-        Expr::Call(call) => {
-            let Some(StarBinding::Constructor(constructor)) = binding_in_scope(&call.func, visible)
-            else {
+        Expr::Name(_) | Expr::Attribute(_) => {
+            let StarBinding::Function(_) = binding_in_scope(expression, visible)? else {
                 return None;
             };
-            Some(constructor.ty.clone())
+            Some(StarKnownType::Callable)
+        }
+        Expr::Call(call) => {
+            let binding = binding_in_scope(&call.func, visible)?;
+            match binding {
+                StarBinding::Constructor(constructor) => Some(constructor.ty.clone()),
+                StarBinding::Function(function) => {
+                    if !function_call_shape_known(call, function)
+                        || call.arguments.args.len() + call.arguments.keywords.len()
+                            != function.parameters.len()
+                    {
+                        return None;
+                    }
+                    let returns = function.returns.as_ref()?;
+                    Some(returns.ty.clone())
+                }
+                StarBinding::Alias(_) => None,
+                StarBinding::Struct(_) => None,
+            }
         }
         Expr::List(list) => {
             let mut elements = list.elts.iter();
@@ -1296,6 +1521,7 @@ fn type_accepts(expected: &StarKnownType, actual: &StarKnownType) -> bool {
         StarKnownType::List(element) => {
             matches!(actual, StarKnownType::List(actual) if type_accepts(element, actual))
         }
+        StarKnownType::Callable => matches!(actual, StarKnownType::Callable),
     }
 }
 

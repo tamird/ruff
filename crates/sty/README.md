@@ -60,10 +60,18 @@ stay unproved.
 Sty also follows source `struct` members that refer to known record
 constructors or other proven `struct` bindings, including through
 resolved loads. Members computed at runtime stay unproved. The native
-checker validates field defaults and missing required fields. Other
-attributes, callbacks, function bodies, and runtime values remain
-unproved. The shared Python parser may mark valid host Starlark syntax
-opaque. A clear bounded source pass invokes
+checker validates field defaults and missing required fields. For a
+validated v2 graph, Sty also follows stable source `def` bindings and
+checks their known regular positional and named parameter annotations,
+including functions exported through `struct` and resolved loads. A
+known return annotation can supply a type when the call supplies every
+named or positional parameter. Typed `def` semantics come from the
+host's Starlark language and native annotation checks; the v2 intrinsic
+facts attest `field` and `struct` only. Parameter defaults, requiredness,
+computed attributes, unrecognized type aliases, and deferred function
+bodies remain the host's responsibility or unproved. The shared Python
+parser may mark valid host Starlark syntax opaque. A clear bounded
+source pass invokes
 `--sty-check-v1` with the same source and inputs. The host still owns
 its parser, loader, native annotation checks, and runtime checks.
 Native v1 rereads files, so keep sources and catalogs stable across

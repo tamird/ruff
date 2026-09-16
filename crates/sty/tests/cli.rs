@@ -631,6 +631,54 @@ fn host_v2_struct_member_error_keeps_loaded_source_locations() -> anyhow::Result
 
 #[cfg(unix)]
 #[test]
+fn host_v2_source_function_error_names_its_parameter_annotation() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    let checker = host_fixture(&fixture)?;
+    let path = fixture.path("root.star");
+    let source = "def choose(multiarch: bool):\n    pass\nchoose(multiarch=\"wrong\")\n";
+    fixture.write("root.star", "GOOD = 1\n")?;
+    fixture.write("graph.json", &star_graph_json(&path, source, &[], &[])?)?;
+    let log = fixture.path("host-argv.txt");
+    let checker_name = utf8_path(&checker)?;
+    let root_name = utf8_path(&path)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", fixture.path("graph.json"))
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .args(["check", "--host-checker", checker_name, root_name])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(output.stdout.is_empty(), "source JSON leaked");
+    let primary_column = source
+        .lines()
+        .nth(2)
+        .and_then(|line| line.find("\"wrong\""))
+        .ok_or_else(|| anyhow::anyhow!("source function test lacks call argument"))?
+        + 1;
+    let related_column = source
+        .lines()
+        .next()
+        .and_then(|line| line.find("bool"))
+        .ok_or_else(|| anyhow::anyhow!("source function test lacks annotation"))?
+        + 1;
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "{}:3:{primary_column}: error: choose parameter multiarch, expected bool, got str\n  parameter annotated at {}:1:{related_column}\n",
+            path.display(),
+            path.display(),
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(&log)?,
+        format!("--sty-graph-v2\n--source\n{}\nmanifest:\n", path.display())
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn malformed_host_graph_exits_two_and_producer_failure_relays_its_status() -> anyhow::Result<()> {
     let fixture = Fixture::unmarked()?;
     fixture.write("root.star", "VALUE = 1\n")?;

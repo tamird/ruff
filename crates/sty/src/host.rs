@@ -364,7 +364,7 @@ impl<'db, 'graph> SnapshotReporter<'db, 'graph> {
             writeln!(output, "{primary}: error: {problem}")?;
             let declaration =
                 self.location(problem.related_file(), Some(problem.related_range()))?;
-            writeln!(output, "  field declared at {declaration}")?;
+            writeln!(output, "  {} at {declaration}", problem.related_label())?;
         }
         Ok(())
     }

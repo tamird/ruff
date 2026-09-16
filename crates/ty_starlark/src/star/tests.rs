@@ -393,6 +393,194 @@ fn struct_members_follow_source_order_and_decline_unproved_sources() -> anyhow::
     Ok(())
 }
 
+#[test]
+fn v2_source_function_checks_known_positional_and_named_annotations() -> anyhow::Result<()> {
+    let source = concat!(
+        "def choose(flag: bool, count: int, name: str | None):\n",
+        "    pass\n",
+        "choose(\"wrong\", count=\"wrong\", name=7)\n",
+    );
+    let (_db, v1) = root_only(source)?;
+    let analysis = analyzed(check_star_graph(&v1))?;
+    assert!(analysis.problems().is_empty());
+    assert_eq!(analysis.checked_arguments(), 0);
+
+    let (_db, v2) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&v2))?;
+    assert_eq!(analysis.checked_arguments(), 3);
+    let [flag, count, name] = analysis.problems() else {
+        anyhow::bail!("expected three annotated parameter mismatches: {analysis:?}");
+    };
+    for (problem, parameter, annotation, expected, actual) in [
+        (flag, "flag", "bool", "bool", "str"),
+        (count, "count", "int", "int", "str"),
+        (name, "name", "str | None", "str | None", "int"),
+    ] {
+        assert_eq!(problem.constructor(), "choose");
+        assert_eq!(problem.field(), parameter);
+        assert_eq!(problem.related_label(), "parameter annotated");
+        assert_eq!(problem.related_file(), v2.root.file);
+        assert_eq!(slice(source, problem.related_range()), Some(annotation));
+        assert_eq!(problem.expected().to_string(), expected);
+        assert_eq!(problem.actual().to_string(), actual);
+    }
+    assert_eq!(slice(source, flag.range()), Some("\"wrong\""));
+    assert_eq!(slice(source, name.range()), Some("7"));
+    assert_eq!(
+        flag.to_string(),
+        "choose parameter flag, expected bool, got str"
+    );
+    Ok(())
+}
+
+#[test]
+fn v2_loaded_struct_function_checks_known_nominal_union_and_list_arguments() -> anyhow::Result<()> {
+    let root_source = format!(
+        "load(\"{LABEL}\", \"api\")\napi.submit(flag=\"bad\", owner=api.make_right(), items=[api.make_right()])\n"
+    );
+    let module_source = concat!(
+        "Left = record(code=int)\n",
+        "Right = record(code=int)\n",
+        "def make_right() -> Right:\n",
+        "    return Right(code=1)\n",
+        "def _submit(flag: bool, owner: Left, items: list[Left | None]):\n",
+        "    pass\n",
+        "api = struct(submit=_submit, make_right=make_right)\n",
+    );
+    let (_db, mut graph) = case(&root_source, module_source)?;
+    graph.version = "sty-star-graph-v2".to_string();
+    graph.profile = v2_profile();
+    graph.root.loads[0].bindings[0].local = "api".to_string();
+    graph.root.loads[0].bindings[0].source = "api".to_string();
+    let (root_file, module_file) = files(&graph)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert_eq!(analysis.checked_arguments(), 3);
+    let [flag, owner, items] = analysis.problems() else {
+        anyhow::bail!("expected three loaded function mismatches: {analysis:?}");
+    };
+    for (problem, parameter, annotation, expected, actual) in [
+        (flag, "flag", "bool", "bool", "str"),
+        (owner, "owner", "Left", "Left", "Right"),
+        (
+            items,
+            "items",
+            "list[Left | None]",
+            "list[Left | None]",
+            "list[Right]",
+        ),
+    ] {
+        assert_eq!(problem.file(), root_file);
+        assert_eq!(problem.related_file(), module_file);
+        assert_eq!(problem.constructor(), "api.submit");
+        assert_eq!(problem.field(), parameter);
+        assert_eq!(
+            slice(module_source, problem.related_range()),
+            Some(annotation)
+        );
+        assert_eq!(problem.expected().to_string(), expected);
+        assert_eq!(problem.actual().to_string(), actual);
+    }
+    assert_eq!(slice(&root_source, flag.range()), Some("\"bad\""));
+    assert_eq!(slice(&root_source, owner.range()), Some("api.make_right()"));
+    Ok(())
+}
+
+#[test]
+fn source_function_calls_accept_known_scalar_nominal_union_and_list_values() -> anyhow::Result<()> {
+    let source = concat!(
+        "Left = record(value=int)\n",
+        "ResourceBuilder = typing.Callable[[int], Left]\n",
+        "def make_left() -> Left:\n",
+        "    return Left(value=1)\n",
+        "def submit(owner: Left | None, items: list[Left | None], flag: bool, count: int, name: str, callback: ResourceBuilder):\n",
+        "    pass\n",
+        "submit(owner=make_left(), items=[make_left(), None], flag=True, count=1, name=\"ok\", callback=make_left)\n",
+    );
+    let (_db, graph) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
+    assert_eq!(analysis.checked_arguments(), 5);
+    assert_eq!(analysis.unproved_arguments(), 1);
+    Ok(())
+}
+
+#[test]
+fn source_function_signatures_follow_order_and_leave_unknown_annotations_unproved()
+-> anyhow::Result<()> {
+    let source = concat!(
+        "check(flag=\"bad\")\n",
+        "def check(flag: bool):\n",
+        "    pass\n",
+        "check(flag=\"bad\")\n",
+    );
+    let (_db, graph) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert_eq!(analysis.checked_arguments(), 1);
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected only the call following the function definition: {analysis:?}");
+    };
+    let second_call = source
+        .rfind("check(flag=\"bad\")")
+        .ok_or_else(|| anyhow::anyhow!("source-order test lacks the later call"))?;
+    assert_eq!(
+        problem.range().start().to_usize(),
+        second_call + "check(flag=".len()
+    );
+
+    for source in [
+        "def check(flag: bool):\n    pass\ncheck = missing\ncheck(flag=\"bad\")\n",
+        "def check(flag: Missing):\n    pass\ncheck(flag=7)\n",
+        "def check(*values: int):\n    pass\ncheck(\"bad\")\n",
+        "def check(flag: bool):\n    pass\ncheck(flag=\"bad\", flag_again=7)\n",
+        "def check(flag: bool):\n    pass\ncheck(\"bad\", flag=7)\n",
+    ] {
+        let (_db, graph) = v2_root_only(source)?;
+        let analysis = analyzed(check_star_graph(&graph))?;
+        assert!(analysis.problems().is_empty(), "{source}: {analysis:?}");
+        assert_eq!(analysis.checked_arguments(), 0, "{source}");
+    }
+    Ok(())
+}
+
+#[test]
+fn source_functions_with_unknown_returns_do_not_supply_nominal_precision() -> anyhow::Result<()> {
+    let source = concat!(
+        "Known = record(value=int)\n",
+        "def unknown() -> Missing:\n",
+        "    return 7\n",
+        "def take(item: Known):\n",
+        "    pass\n",
+        "take(item=unknown())\n",
+    );
+    let (_db, graph) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty());
+    assert_eq!(analysis.checked_arguments(), 0);
+    assert_eq!(analysis.unproved_arguments(), 1);
+    Ok(())
+}
+
+#[test]
+fn malformed_source_function_calls_do_not_establish_known_return_types() -> anyhow::Result<()> {
+    let source = concat!(
+        "Left = record(value=int)\n",
+        "Right = record(value=int)\n",
+        "def make_right(flag: bool) -> Right:\n",
+        "    return Right(value=1)\n",
+        "def take(item: Left):\n",
+        "    pass\n",
+        "take(item=make_right(unexpected=7))\n",
+        "take(item=make_right(*unknown))\n",
+        "take(item=make_right())\n",
+    );
+    let (_db, graph) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty());
+    assert_eq!(analysis.checked_arguments(), 0);
+    assert_eq!(analysis.unproved_arguments(), 5);
+    Ok(())
+}
+
 fn analyzed(result: StarCheck) -> anyhow::Result<StarAnalysis> {
     match result {
         StarCheck::Partial(analysis) => Ok(analysis),
