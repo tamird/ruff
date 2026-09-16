@@ -86,7 +86,7 @@ struct CheckCommand {
     #[arg(long, value_name = "ROOT")]
     workspace: Option<PathBuf>,
 
-    /// Executable host providing a source graph and native `.star` check.
+    /// Executable host providing a versioned `.star` source graph.
     #[arg(long, value_name = "EXE")]
     host_checker: Option<PathBuf>,
 

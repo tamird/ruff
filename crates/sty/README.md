@@ -27,9 +27,8 @@ parser also marks valid Starlark forms outside the shared Python parser
 subset opaque. Unsupported source semantics and uncheckable stubs are
 opaque, and opaque sources cause a nonzero exit.
 
-For a `.star` file, supply a host implementing `--sty-graph-v3` and
-`--sty-check-v1`. This works from any directory without a Bazel marker
-or BUILD file.
+For a `.star` file, supply a host implementing `--sty-graph-v3`. This
+works from any directory without a Bazel marker or BUILD file.
 `//pkg:file.star` is a Bazel selector; `//abs/path.star` is an absolute
 file path. A host built with Bazel needs its own runfiles manifest in
 the process environment when launched outside Bazel:
@@ -38,12 +37,11 @@ the process environment when launched outside Bazel:
 RUNFILES_MANIFEST_FILE=/abs/bin/starlark_host.runfiles_manifest \
   /abs/ruff/target/debug/sty check \
   --host-checker /abs/bin/starlark_host \
-  --input catalog=/abs/catalog.json \
   /abs/deploy.star
 ```
 
 The host decides which named inputs to accept; supply further
-`--input NAME=ABS` pairs when its invocation requires them.
+`--input NAME=ABS` pairs only when its graph invocation requires them.
 
 Sty first invokes `--sty-graph-v3 --source ABS` with each named
 `--input NAME=ABS`. The host parses the captured UTF-8 source, resolves
@@ -62,8 +60,8 @@ stay unproved.
 
 Sty also follows source `struct` members that refer to known record
 constructors or other proven `struct` bindings, including through
-resolved loads. Members computed at runtime stay unproved. The native
-checker validates field defaults and missing required fields.
+resolved loads. Members computed at runtime stay unproved. Sty does not
+prove field defaults or missing required fields.
 
 When a top level name has one assignment, Sty can carry a scalar value
 or proven nominal record instance through a load, alias, or direct
@@ -78,11 +76,12 @@ known return annotation can supply a type when the call supplies every
 named or positional parameter and every established parameter type
 matches a known argument. A nominal record result requires complete
 known field declarations and compatible named arguments for every
-field. Typed `def` semantics come from the
-host's Starlark language and native annotation checks; the intrinsic
-facts attest `field` and `struct` only. Parameter defaults, requiredness,
-computed attributes, and unrecognized type aliases remain the host's
-responsibility or unproved when analyzing source function call arguments.
+field. Sty checks source `def` calls using known annotations; it does
+not check return statements in a function body against its return
+annotation. The intrinsic facts attest `field` and `struct` only.
+Parameter defaults, requiredness, computed attributes, and
+unrecognized type aliases stay unproved when analyzing source
+function call arguments.
 Sty checks known calls inside direct source
 function defaults in eager source order, then checks direct function
 bodies using stable final module bindings while excluding function
@@ -105,22 +104,22 @@ including a missing required parameter and a positional argument for
 a named-only parameter, use the captured call or argument span and the
 same host signature. Starred and dynamic keyword arguments have no
 stable mapping and stay unproved. The shared Python parser may
-mark valid host Starlark syntax opaque. A clear bounded source pass invokes
-`--sty-check-v1` with the same source and inputs. The host still owns
-its parser, loader, native annotation checks, and runtime checks.
-Native v1 rereads files, so keep sources and catalogs stable across
-the two invocations; it does not attest one shared source revision.
+mark valid host Starlark syntax opaque. The host's native checker can
+separately validate annotations, record construction, and data-dependent
+execution. For OpenAI deployment sources, use the deployment host's
+existing `--check --spec ABS --data NAME=ABS` command when those checks
+are required; it evaluates top-level code and may read catalogs. A
+clear Sty result does not imply a clear native host result.
 
 Relative source and input paths become absolute from the current
 directory; already absolute paths keep their spelling. The host
 decides when to read named inputs, and an unused input may remain
 unopened. Sty captures graph stdout privately and inherits graph
-stderr and the process environment. Native check stdout and stderr
-are inherited unchanged.
+stderr and the process environment.
 
 Bazel checks return 0 when clear, 1 for checked problems or opaque
 sources, and 2 for invalid invocation or label selection. `.star`
 returns 1 for a known source type problem or an opaque source, and 2
 for malformed graph facts or Sty setup errors. A failed graph process
-relays the host exit code, including its native parser error status.
-A clear Sty pass relays the subsequent native host check exit code.
+relays the host exit code. A clear `.star` source pass returns 0 even
+when separate native annotation or data-dependent host checks would fail.

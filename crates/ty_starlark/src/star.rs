@@ -87,8 +87,9 @@ pub struct StarHostParam {
     pub ty: String,
 }
 
-/// Caller must also run the host's native check on the captured invocation.
-/// A clear result from either check cannot prove arbitrary callbacks or data.
+/// Host-owned source and load snapshots for Sty's bounded static pass.
+/// A clear source pass cannot prove arbitrary callbacks or catalog data;
+/// callers can run the host's native checker separately when needed.
 #[derive(Debug)]
 pub struct StarResolvedGraph {
     pub version: String,
@@ -575,9 +576,10 @@ struct StarSupportedForms<'profile> {
 
 /// Check a host-resolved snapshot without parsing `.star` as Bazel `.bzl`.
 ///
-/// The host's actual parser, loader, and native checker are separate required
-/// checks. Unknown expressions and unmodeled statements provide no precision;
-/// `Partial` therefore never means the entire module has been type-proved.
+/// The host owns its parser, loader, and captured source snapshots. Its native
+/// annotation and runtime checks are separately callable. Unknown expressions
+/// and unmodeled statements provide no precision; `Partial` therefore never
+/// means the entire module has been type-proved.
 pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
     let StarResolvedGraph {
         version,

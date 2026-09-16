@@ -110,8 +110,7 @@ fn host_fixture(fixture: &Fixture) -> anyhow::Result<PathBuf> {
             "  cat \"$STY_TEST_GRAPH\"\n",
             "  exit 0\n",
             "fi\n",
-            "printf 'host stdout\\n'\n",
-            "printf 'host stderr\\n' >&2\n",
+            "printf 'unexpected host command\\n' >&2\n",
             "exit 37\n",
         ),
     )?;
@@ -366,7 +365,7 @@ fn host_usage_errors_before_bazel_repository_discovery() -> anyhow::Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<()> {
+fn host_graph_receives_exact_argv_env_and_source_path() -> anyhow::Result<()> {
     let fixture = Fixture::unmarked()?;
     fixture.write("@notes.star", "VALUE = 1\n")?;
     fixture.write("source/local module=west.star", "VALUE = 2\n")?;
@@ -394,9 +393,9 @@ fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<(
         .arg(missing_input)
         .arg("@notes.star")
         .output()?;
-    assert_eq!(output.status.code(), Some(37), "{}", stderr(&output));
-    assert_eq!(output.stdout, b"host stdout\n");
-    assert_eq!(output.stderr, b"host stderr\n");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
     let arguments = format!(
         "--source\n{}\n--input\n{named_input}\n--input\nunused={}\nmanifest:host-manifest.txt\n",
         source_path.display(),
@@ -404,7 +403,7 @@ fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<(
     );
     assert_eq!(
         fs::read_to_string(log)?,
-        format!("--sty-graph-v3\n{arguments}--sty-check-v1\n{arguments}")
+        format!("--sty-graph-v3\n{arguments}")
     );
 
     let double_slash_source = format!("/{}", source_path.display());
@@ -422,12 +421,10 @@ fn host_child_receives_exact_argv_env_output_and_exit_code() -> anyhow::Result<(
         .arg(&checker)
         .arg(&double_slash_source)
         .output()?;
-    assert_eq!(double.status.code(), Some(37), "{}", stderr(&double));
+    assert!(double.status.success(), "{}", stderr(&double));
     assert_eq!(
         fs::read_to_string(double_log)?,
-        format!(
-            "--sty-graph-v3\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n--sty-check-v1\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n"
-        )
+        format!("--sty-graph-v3\n--source\n{double_slash_source}\nmanifest:host-manifest.txt\n")
     );
     Ok(())
 }
@@ -510,8 +507,8 @@ fn host_graph_yields_a_sty_owned_dead_branch_error_from_captured_text() -> anyho
     assert_eq!(invalid.status.code(), Some(2), "{}", stderr(&invalid));
     assert!(stderr(&invalid).contains("parsed Starlark load differs"));
     assert_eq!(
-        fs::read_to_string(log)?.matches("--sty-check-v1").count(),
-        0
+        fs::read_to_string(log)?,
+        format!("--sty-graph-v3\n--source\n{root_name}\nmanifest:\n")
     );
     Ok(())
 }
@@ -983,11 +980,6 @@ fn malformed_host_graph_exits_two_and_producer_failure_relays_its_status() -> an
         malformed.stdout.is_empty(),
         "malformed JSON leaked to stdout"
     );
-    assert_eq!(
-        fs::read_to_string(&log)?.matches("--sty-check-v1").count(),
-        0
-    );
-
     fs::write(&log, "")?;
     let failed = Command::new(env!("CARGO_BIN_EXE_sty"))
         .current_dir(fixture.root.path())
@@ -1000,8 +992,8 @@ fn malformed_host_graph_exits_two_and_producer_failure_relays_its_status() -> an
     assert_eq!(failed.status.code(), Some(23), "{}", stderr(&failed));
     assert_eq!(failed.stderr, b"graph producer failed\n");
     assert_eq!(
-        fs::read_to_string(log)?.matches("--sty-check-v1").count(),
-        0
+        fs::read_to_string(log)?,
+        format!("--sty-graph-v3\n--source\n{root_name}\nmanifest:\n")
     );
     Ok(())
 }
@@ -1067,11 +1059,6 @@ fn host_v3_intrinsics_must_be_present_and_supported() -> anyhow::Result<()> {
             stderr(&output)
         );
         assert!(output.stdout.is_empty(), "{drift}: source JSON leaked");
-        assert_eq!(
-            fs::read_to_string(&log)?.matches("--sty-check-v1").count(),
-            0,
-            "{drift}: native check accepted invalid graph facts"
-        );
     }
     Ok(())
 }
@@ -1099,10 +1086,10 @@ fn host_v3_inventory_requires_present_and_valid_native_signature_facts() -> anyh
         .env("STY_TEST_GRAPH", &graph_file)
         .args(["check", "--host-checker", checker_name, root_name])
         .output()?;
-    assert_eq!(clear.status.code(), Some(37), "{}", stderr(&clear));
+    assert!(clear.status.success(), "{}", stderr(&clear));
     assert_eq!(
-        fs::read_to_string(&log)?.matches("--sty-check-v1").count(),
-        1
+        fs::read_to_string(&log)?,
+        format!("--sty-graph-v3\n--source\n{root_name}\nmanifest:\n")
     );
 
     for drift in [
@@ -1167,11 +1154,6 @@ fn host_v3_inventory_requires_present_and_valid_native_signature_facts() -> anyh
             stderr(&output)
         );
         assert!(output.stdout.is_empty(), "{drift}: source JSON leaked");
-        assert_eq!(
-            fs::read_to_string(&log)?.matches("--sty-check-v1").count(),
-            0,
-            "{drift}: native check accepted malformed host facts"
-        );
     }
     Ok(())
 }

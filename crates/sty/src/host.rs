@@ -60,15 +60,10 @@ pub(super) fn run_host(cwd: &SystemPath, checker: &PathBuf, options: &CheckComma
         }
     }
 
-    // A clear bounded source pass still requires the host's native parser,
-    // loader, annotation checks, and data-dependent runtime checks. Native
-    // v1 rereads files, so this process protocol does not attest a common
-    // filesystem revision across the two separate invocations.
-    let status = invocation
-        .command(checker, "--sty-check-v1")
-        .status()
-        .with_context(|| format!("cannot start host checker {}", checker.display()))?;
-    Ok(status.code().unwrap_or(1))
+    // The v3 graph already contains the source snapshots and host facts used
+    // by this bounded static pass. A native host check evaluates top-level
+    // code and may need catalogs; callers run it separately when required.
+    Ok(0)
 }
 
 fn is_graph_identity_failure(reason: &StarFailureReason) -> bool {
