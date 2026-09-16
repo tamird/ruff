@@ -1496,6 +1496,15 @@ impl<'source> Visitor<'source> for CallScanner<'_, '_> {
                 if self.deferred {
                     return;
                 }
+                // Starlark evaluates direct function defaults when the def
+                // statement executes. Check them in the enclosing eager
+                // scope, before this function name can be bound. Parameter
+                // annotations are type expressions, not value calls.
+                for parameter in function.parameters.iter_non_variadic_params() {
+                    if let Some(default) = parameter.default() {
+                        self.visit_expr(default);
+                    }
+                }
                 let name = function.name.as_str();
                 if self.writes.get(name) == Some(&1)
                     && !self.loaded_names.contains(name)

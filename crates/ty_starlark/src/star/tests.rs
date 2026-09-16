@@ -542,6 +542,81 @@ fn v3_native_globals_require_stable_module_and_lexical_bindings() -> anyhow::Res
 }
 
 #[test]
+fn v3_direct_function_defaults_run_in_eager_source_order() -> anyhow::Result<()> {
+    let source = concat!(
+        "Config = record(value=int)\n",
+        "def preceding(flag: bool):\n    pass\n",
+        "if False:\n",
+        "    def unused(field=Config(value=\"bad\"),",
+        " source=preceding(flag=\"bad\"), native=host_hash(7)):\n",
+        "        pass\n",
+    );
+    let (_db, graph) = v3_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [field, parameter] = analysis.problems() else {
+        anyhow::bail!("direct defaults should check known source calls: {analysis:?}");
+    };
+    assert_eq!(slice(source, field.range()), Some("\"bad\""));
+    assert_eq!(field.related_label(), "field declared");
+    assert_eq!(slice(source, parameter.range()), Some("\"bad\""));
+    assert_eq!(parameter.related_label(), "parameter annotated");
+    let [native] = analysis.native_problems() else {
+        anyhow::bail!("direct native default was skipped: {analysis:?}");
+    };
+    assert_eq!(slice(source, native.range()), Some("7"));
+    assert_eq!(native.file(), graph.root.file);
+    assert_eq!(
+        native.to_string(),
+        "host_hash parameter value, expected str, got int"
+    );
+
+    let source = "def host_hash(value=host_hash(7)):\n    pass\n";
+    let (_db, graph) = v3_root_only(source)?;
+    assert!(
+        analyzed(check_star_graph(&graph))?
+            .native_problems()
+            .is_empty(),
+        "this function's later binding cannot be used by its default"
+    );
+    let source = "def outer():\n    def nested(value=host_hash(7)):\n        pass\n";
+    let (_db, graph) = v3_root_only(source)?;
+    assert!(
+        analyzed(check_star_graph(&graph))?
+            .native_problems()
+            .is_empty(),
+        "nested deferred function defaults require their own scope"
+    );
+    Ok(())
+}
+
+#[test]
+fn v3_loaded_function_defaults_have_loaded_initialization_availability() -> anyhow::Result<()> {
+    let root_source = format!("load(\"{LABEL}\", \"LimitConfig\")\n");
+    let module_source = concat!(
+        "LimitConfig = record(value=int)\n",
+        "def decode(value):\n    pass\n",
+        "if False:\n",
+        "    def unused(value=host_catalog(name=7, decoder=decode)):\n",
+        "        pass\n",
+    );
+    let (_db, mut graph) = case(&root_source, module_source)?;
+    graph.version = "sty-star-graph-v3".to_string();
+    graph.profile = native_profile();
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
+    let [problem] = analysis.native_problems() else {
+        anyhow::bail!("loaded declaration default should check catalog: {analysis:?}");
+    };
+    assert_eq!(problem.file(), graph.modules[0].source.file);
+    assert_eq!(slice(module_source, problem.range()), Some("7"));
+    assert_eq!(
+        problem.to_string(),
+        "host_catalog parameter name, expected str, got int"
+    );
+    Ok(())
+}
+
+#[test]
 fn v2_field_type_expressions_prove_primitive_union_and_nominal_lists() -> anyhow::Result<()> {
     let source = concat!(
         "Left = record(code=int)\n",

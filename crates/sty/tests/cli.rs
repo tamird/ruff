@@ -786,6 +786,54 @@ fn host_v3_native_shape_errors_use_call_and_argument_source_spans() -> anyhow::R
 
 #[cfg(unix)]
 #[test]
+fn host_v3_dead_function_default_reports_eager_native_call_span() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    let checker = host_fixture(&fixture)?;
+    let path = fixture.path("root.star");
+    let source = concat!(
+        "if False:\n",
+        "    def unused(value=example_host_native(7)):\n",
+        "        pass\n",
+    );
+    fixture.write("root.star", "GOOD = 1\n")?;
+    fixture.write("graph.json", &star_graph_json(&path, source, &[], &[])?)?;
+    let log = fixture.path("host-argv.txt");
+    let output = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", fixture.path("graph.json"))
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .args([
+            "check",
+            "--host-checker",
+            utf8_path(&checker)?,
+            utf8_path(&path)?,
+        ])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(output.stdout.is_empty(), "source JSON leaked");
+    let column = source
+        .lines()
+        .nth(1)
+        .and_then(|line| line.find('7'))
+        .ok_or_else(|| anyhow::anyhow!("function default lacks native input"))?
+        + 1;
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "{}:2:{column}: error: example_host_native parameter value, expected str, got int\n  host signature: example_host_native(value: str) -> str\n",
+            path.display()
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(&log)?,
+        format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn host_v3_deferred_call_keeps_the_captured_root_and_loaded_annotation_spans() -> anyhow::Result<()>
 {
     let fixture = Fixture::unmarked()?;

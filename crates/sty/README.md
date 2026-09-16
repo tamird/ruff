@@ -70,9 +70,11 @@ named or positional parameter. Typed `def` semantics come from the
 host's Starlark language and native annotation checks; the intrinsic
 facts attest `field` and `struct` only. Parameter defaults, requiredness,
 computed attributes, and unrecognized type aliases remain the host's
-responsibility or unproved. Sty checks known calls inside direct source
-function bodies using stable final module bindings while excluding
-function parameters and local names. Nested functions, lambdas, and
+responsibility or unproved when analyzing source function call arguments.
+Sty checks known calls inside direct source
+function defaults in eager source order, then checks direct function
+bodies using stable final module bindings while excluding function
+parameters and local names. Nested functions, lambdas, and
 comprehensions await their own proven scope. With v3 host function facts,
 Sty also checks known scalar and callable arguments of direct native
 global calls. It uses the host's ordered positional and named modes,
