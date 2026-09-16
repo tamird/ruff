@@ -106,7 +106,7 @@ impl StarAnalysis {
 
     /// Unproved keyword fields of record calls and supplied arguments of
     /// stable annotated source functions. Calls without established source
-    /// signatures and deferred bodies are not counted.
+    /// signatures and unmodeled closure bodies are not counted.
     pub fn unproved_arguments(&self) -> usize {
         self.unproved_arguments
     }
@@ -538,11 +538,16 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
             declarations,
             writes: &parsed.writes,
             loaded_names: &parsed.loaded_names,
+            local_names: HashSet::new(),
+            deferred: false,
             problems: Vec::new(),
             checked_arguments: 0,
             unproved_arguments: 0,
         };
         scanner.visit_body(parsed.suite());
+        if forms.source_functions {
+            scanner.scan_deferred_bodies(parsed.suite());
+        }
         problems.extend(scanner.problems);
         checked_arguments += scanner.checked_arguments;
         unproved_arguments += scanner.unproved_arguments;
@@ -1260,6 +1265,8 @@ struct CallScanner<'types> {
     declarations: &'types HashMap<String, StarBinding>,
     writes: &'types HashMap<String, usize>,
     loaded_names: &'types HashSet<String>,
+    local_names: HashSet<String>,
+    deferred: bool,
     problems: Vec<StarTypeProblem>,
     checked_arguments: usize,
     unproved_arguments: usize,
@@ -1268,10 +1275,13 @@ struct CallScanner<'types> {
 impl<'source> Visitor<'source> for CallScanner<'_> {
     fn visit_stmt(&mut self, statement: &'source Stmt) {
         match statement {
-            // This first slice scans eager top-level code and every top-level
-            // `if` arm, including dead branches. Function locals and closure
-            // values need a separate lexical context before trusting names.
+            // The eager pass scans top-level code and top-level `if` arms.
+            // The deferred pass scans direct function bodies with their local
+            // names excluded; nested functions still need their own scope.
             Stmt::FunctionDef(function) => {
+                if self.deferred {
+                    return;
+                }
                 let name = function.name.as_str();
                 if self.writes.get(name) == Some(&1)
                     && !self.loaded_names.contains(name)
@@ -1284,6 +1294,9 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
             Stmt::ClassDef(_) => {}
             Stmt::Assign(assign) => {
                 ast::visitor::walk_stmt(self, statement);
+                if self.deferred {
+                    return;
+                }
                 let [Expr::Name(target)] = assign.targets.as_slice() else {
                     return;
                 };
@@ -1312,6 +1325,7 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
             _ => {}
         }
         if let Expr::Call(call) = expression
+            && self.callee_is_unshadowed(&call.func)
             && let Some(StarBinding::Constructor(constructor)) =
                 binding_in_scope(&call.func, &self.visible)
             && let Some(name) = binding_name(&call.func)
@@ -1346,6 +1360,7 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
             }
         }
         if let Expr::Call(call) = expression
+            && self.callee_is_unshadowed(&call.func)
             && let Some(StarBinding::Function(function)) =
                 binding_in_scope(&call.func, &self.visible)
             && let Some(name) = binding_name(&call.func)
@@ -1358,6 +1373,42 @@ impl<'source> Visitor<'source> for CallScanner<'_> {
 }
 
 impl CallScanner<'_> {
+    fn scan_deferred_bodies(&mut self, suite: &[Stmt]) {
+        let final_visible = self.visible.clone();
+        for statement in suite {
+            let Stmt::FunctionDef(function) = statement else {
+                continue;
+            };
+            let mut scope = final_visible.clone();
+            let mut writes = FunctionScopeWrites::default();
+            for parameter in &function.parameters {
+                writes.names.insert(parameter.name().as_str().to_string());
+            }
+            writes.visit_body(&function.body);
+            scope.retain(|name, _| !writes.names.contains(name));
+            let mut scanner = CallScanner {
+                file: self.file,
+                visible: scope,
+                declarations: self.declarations,
+                writes: self.writes,
+                loaded_names: self.loaded_names,
+                local_names: writes.names,
+                deferred: true,
+                problems: Vec::new(),
+                checked_arguments: 0,
+                unproved_arguments: 0,
+            };
+            scanner.visit_body(&function.body);
+            self.problems.extend(scanner.problems);
+            self.checked_arguments += scanner.checked_arguments;
+            self.unproved_arguments += scanner.unproved_arguments;
+        }
+    }
+
+    fn callee_is_unshadowed(&self, expression: &Expr) -> bool {
+        callee_root_name(expression).is_some_and(|name| !self.local_names.contains(name))
+    }
+
     fn check_function_call(&mut self, call: &ast::ExprCall, function: &StarFunction, name: &str) {
         let StarFunction {
             file,
@@ -1426,6 +1477,67 @@ impl CallScanner<'_> {
                 actual,
             });
         }
+    }
+}
+
+fn callee_root_name(expression: &Expr) -> Option<&str> {
+    match expression {
+        Expr::Name(name) => Some(name.id.as_str()),
+        Expr::Attribute(attribute) => callee_root_name(&attribute.value),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct FunctionScopeWrites {
+    names: HashSet<String>,
+}
+
+impl<'source> Visitor<'source> for FunctionScopeWrites {
+    fn visit_stmt(&mut self, statement: &'source Stmt) {
+        match statement {
+            Stmt::FunctionDef(function) => {
+                self.names.insert(function.name.as_str().to_string());
+            }
+            Stmt::ClassDef(class) => {
+                self.names.insert(class.name.as_str().to_string());
+            }
+            _ => ast::visitor::walk_stmt(self, statement),
+        }
+    }
+
+    fn visit_expr(&mut self, expression: &'source Expr) {
+        match expression {
+            // These bind their own names; their calls are also skipped by
+            // the deferred scanner until a separate closure scope exists.
+            Expr::Lambda(_)
+            | Expr::ListComp(_)
+            | Expr::SetComp(_)
+            | Expr::DictComp(_)
+            | Expr::Generator(_) => return,
+            Expr::Name(name) if name.ctx == ast::ExprContext::Store => {
+                self.names.insert(name.id.as_str().to_string());
+            }
+            _ => {}
+        }
+        ast::visitor::walk_expr(self, expression);
+    }
+
+    fn visit_except_handler(&mut self, except_handler: &'source ast::ExceptHandler) {
+        let ast::ExceptHandler::ExceptHandler(handler) = except_handler;
+        if let Some(name) = &handler.name {
+            self.names.insert(name.as_str().to_string());
+        }
+        ast::visitor::walk_except_handler(self, except_handler);
+    }
+
+    fn visit_alias(&mut self, alias: &'source ast::Alias) {
+        let name = alias
+            .asname
+            .as_ref()
+            .map_or(alias.name.as_str(), |name| name.as_str());
+        self.names
+            .insert(name.split('.').next().unwrap_or(name).to_string());
     }
 }
 

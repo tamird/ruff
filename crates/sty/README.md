@@ -68,10 +68,13 @@ known return annotation can supply a type when the call supplies every
 named or positional parameter. Typed `def` semantics come from the
 host's Starlark language and native annotation checks; the v2 intrinsic
 facts attest `field` and `struct` only. Parameter defaults, requiredness,
-computed attributes, unrecognized type aliases, and deferred function
-bodies remain the host's responsibility or unproved. The shared Python
-parser may mark valid host Starlark syntax opaque. A clear bounded
-source pass invokes
+computed attributes, and unrecognized type aliases remain the host's
+responsibility or unproved. Sty checks known calls inside direct source
+function bodies using stable final module bindings while excluding
+function parameters and local names. It skips
+nested functions, lambdas, and comprehensions until their scope can be
+established. The shared Python parser may mark valid host Starlark
+syntax opaque. A clear bounded source pass invokes
 `--sty-check-v1` with the same source and inputs. The host still owns
 its parser, loader, native annotation checks, and runtime checks.
 Native v1 rereads files, so keep sources and catalogs stable across

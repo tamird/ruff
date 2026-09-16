@@ -454,7 +454,7 @@ fn v2_loaded_struct_function_checks_known_nominal_union_and_list_arguments() -> 
     graph.root.loads[0].bindings[0].source = "api".to_string();
     let (root_file, module_file) = files(&graph)?;
     let analysis = analyzed(check_star_graph(&graph))?;
-    assert_eq!(analysis.checked_arguments(), 3);
+    assert_eq!(analysis.checked_arguments(), 4);
     let [flag, owner, items] = analysis.problems() else {
         anyhow::bail!("expected three loaded function mismatches: {analysis:?}");
     };
@@ -499,7 +499,7 @@ fn source_function_calls_accept_known_scalar_nominal_union_and_list_values() -> 
     let (_db, graph) = v2_root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert!(analysis.problems().is_empty(), "{analysis:?}");
-    assert_eq!(analysis.checked_arguments(), 5);
+    assert_eq!(analysis.checked_arguments(), 6);
     assert_eq!(analysis.unproved_arguments(), 1);
     Ok(())
 }
@@ -576,8 +576,94 @@ fn malformed_source_function_calls_do_not_establish_known_return_types() -> anyh
     let (_db, graph) = v2_root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert!(analysis.problems().is_empty());
-    assert_eq!(analysis.checked_arguments(), 0);
+    assert_eq!(analysis.checked_arguments(), 1);
     assert_eq!(analysis.unproved_arguments(), 5);
+    Ok(())
+}
+
+#[test]
+fn deferred_source_functions_check_stable_loads_without_borrowing_local_names() -> anyhow::Result<()>
+{
+    let root_source = format!(
+        "load(\"{LABEL}\", \"api\")\n\
+         def shadow_parameter(api):\n    api.submit(flag=\"wrong\")\n\
+         def shadow_local():\n    api.submit(flag=\"wrong\")\n    api = computed()\n\
+         def shadow_nested():\n    def api():\n        pass\n    api.submit(flag=\"wrong\")\n\
+         def live():\n    [api.submit(flag=\"wrong\") for api in values]\n    f = lambda api: api.submit(flag=\"wrong\")\n    api.submit(flag=\"wrong\")\n    api.submit(flag=True)\n"
+    );
+    let module_source = "Api = record(flag=bool)\napi = struct(submit=Api)\n";
+    let (_db, mut graph) = case(&root_source, module_source)?;
+    graph.root.loads[0].bindings[0].local = "api".to_string();
+    graph.root.loads[0].bindings[0].source = "api".to_string();
+    let v1 = analyzed(check_star_graph(&graph))?;
+    assert_eq!(v1.checked_arguments(), 0);
+    assert!(v1.problems().is_empty());
+
+    graph.version = "sty-star-graph-v2".to_string();
+    graph.profile = v2_profile();
+    let (root_file, module_file) = files(&graph)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert_eq!(analysis.checked_arguments(), 2);
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected only the stable deferred loaded call: {analysis:?}");
+    };
+    assert_eq!(problem.file(), root_file);
+    assert_eq!(problem.related_file(), module_file);
+    assert_eq!(problem.constructor(), "api.submit");
+    assert_eq!(problem.related_label(), "field declared");
+    assert_eq!(slice(module_source, problem.related_range()), Some("bool"));
+    let live_body = root_source
+        .split_once("def live():")
+        .ok_or_else(|| anyhow::anyhow!("deferred fixture lacks live function"))?
+        .1;
+    let start = root_source.len() - live_body.len();
+    assert!(problem.range().start().to_usize() >= start);
+    assert_eq!(slice(&root_source, problem.range()), Some("\"wrong\""));
+    Ok(())
+}
+
+#[test]
+fn deferred_resources_use_loaded_source_function_annotations_with_unknown_context()
+-> anyhow::Result<()> {
+    let root_source = format!(
+        "load(\"{LABEL}\", \"workloads\")\n\
+         def _resources(context: RenderContext):\n    workloads.deployment(context=context, cpu=7)\n"
+    );
+    let module_source = concat!(
+        "def _deployment(context: RenderContext, cpu: str):\n",
+        "    pass\n",
+        "workloads = struct(deployment=_deployment)\n",
+    );
+    let (_db, mut graph) = case(&root_source, module_source)?;
+    graph.version = "sty-star-graph-v2".to_string();
+    graph.profile = v2_profile();
+    graph.root.loads[0].bindings[0].local = "workloads".to_string();
+    graph.root.loads[0].bindings[0].source = "workloads".to_string();
+    let (root_file, module_file) = files(&graph)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert_eq!(analysis.checked_arguments(), 1);
+    assert_eq!(analysis.unproved_arguments(), 1);
+    let [problem] = analysis.problems() else {
+        anyhow::bail!("expected one deferred resources argument mismatch: {analysis:?}");
+    };
+    assert_eq!(problem.file(), root_file);
+    assert_eq!(problem.related_file(), module_file);
+    assert_eq!(problem.constructor(), "workloads.deployment");
+    assert_eq!(problem.field(), "cpu");
+    assert_eq!(problem.related_label(), "parameter annotated");
+    assert_eq!(slice(&root_source, problem.range()), Some("7"));
+    assert_eq!(slice(module_source, problem.related_range()), Some("str"));
+
+    let positive = root_source.replace("cpu=7", "cpu=\"1\"");
+    let (_db, mut graph) = case(&positive, module_source)?;
+    graph.version = "sty-star-graph-v2".to_string();
+    graph.profile = v2_profile();
+    graph.root.loads[0].bindings[0].local = "workloads".to_string();
+    graph.root.loads[0].bindings[0].source = "workloads".to_string();
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
+    assert_eq!(analysis.checked_arguments(), 1);
+    assert_eq!(analysis.unproved_arguments(), 1);
     Ok(())
 }
 

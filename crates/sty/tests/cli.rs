@@ -679,6 +679,84 @@ fn host_v2_source_function_error_names_its_parameter_annotation() -> anyhow::Res
 
 #[cfg(unix)]
 #[test]
+fn host_v2_deferred_call_keeps_the_captured_root_and_loaded_annotation_spans() -> anyhow::Result<()>
+{
+    let fixture = Fixture::unmarked()?;
+    let checker = host_fixture(&fixture)?;
+    let root_path = fixture.path("root.star");
+    let module_path = fixture.path("api.star");
+    let module_id = "//example:api.star";
+    let label = format!("\"{module_id}\"");
+    let root_source =
+        format!("load({label}, \"api\")\ndef check():\n    api.submit(flag=\"wrong\")\n");
+    let module_source = "Api = record(flag=bool)\napi = struct(submit=Api)\n";
+    fixture.write("root.star", "GOOD = 1\n")?;
+    fixture.write("api.star", module_source)?;
+    let start = root_source
+        .find(&label)
+        .ok_or_else(|| anyhow::anyhow!("deferred test lacks load label"))?;
+    let start = u32::try_from(start)?;
+    let end = start + u32::try_from(label.len())?;
+    let graph = star_graph_json(
+        &root_path,
+        &root_source,
+        &[serde_json::json!({
+            "module_id": module_id, "start": start, "end": end,
+            "symbols": [{"local": "api", "source": "api"}]
+        })],
+        &[serde_json::json!({
+            "id": module_id, "path": utf8_path(&module_path)?,
+            "source": module_source, "loads": []
+        })],
+    )?;
+    fixture.write("graph.json", &graph)?;
+    let log = fixture.path("host-argv.txt");
+    let output = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", fixture.path("graph.json"))
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .args([
+            "check",
+            "--host-checker",
+            utf8_path(&checker)?,
+            utf8_path(&root_path)?,
+        ])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(output.stdout.is_empty(), "source JSON leaked");
+    let primary_column = root_source
+        .lines()
+        .nth(2)
+        .and_then(|line| line.find("\"wrong\""))
+        .ok_or_else(|| anyhow::anyhow!("deferred test lacks argument"))?
+        + 1;
+    let related_column = module_source
+        .lines()
+        .next()
+        .and_then(|line| line.find("bool"))
+        .ok_or_else(|| anyhow::anyhow!("deferred test lacks annotation"))?
+        + 1;
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "{}:3:{primary_column}: error: api.submit.flag, expected bool, got str\n  field declared at {}:1:{related_column}\n",
+            root_path.display(),
+            module_path.display(),
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(&log)?,
+        format!(
+            "--sty-graph-v2\n--source\n{}\nmanifest:\n",
+            root_path.display()
+        )
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn malformed_host_graph_exits_two_and_producer_failure_relays_its_status() -> anyhow::Result<()> {
     let fixture = Fixture::unmarked()?;
     fixture.write("root.star", "VALUE = 1\n")?;
