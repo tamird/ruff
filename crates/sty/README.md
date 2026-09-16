@@ -82,7 +82,11 @@ valid parameter mapping and no known wrong inputs. Native returns of
 `any` or `unknown`, computed callbacks, shadowed names, and calls outside
 their attested evaluator remain unproved. A known native mismatch shows
 the captured argument span and a textual host signature; the graph has
-no native declaration source span. The shared Python parser may
+no native declaration source span. Definite native call shape errors,
+including a missing required parameter and a positional argument for
+a named-only parameter, use the captured call or argument span and the
+same host signature. Starred and dynamic keyword arguments have no
+stable mapping and stay unproved. The shared Python parser may
 mark valid host Starlark syntax opaque. A clear bounded source pass invokes
 `--sty-check-v1` with the same source and inputs. The host still owns
 its parser, loader, native annotation checks, and runtime checks.

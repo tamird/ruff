@@ -109,6 +109,7 @@ pub enum StarCheck {
 pub struct StarAnalysis {
     problems: Box<[StarTypeProblem]>,
     native_problems: Box<[StarNativeTypeProblem]>,
+    native_call_problems: Box<[StarNativeCallProblem]>,
     checked_arguments: usize,
     unproved_arguments: usize,
 }
@@ -120,6 +121,10 @@ impl StarAnalysis {
 
     pub fn native_problems(&self) -> &[StarNativeTypeProblem] {
         &self.native_problems
+    }
+
+    pub fn native_call_problems(&self) -> &[StarNativeCallProblem] {
+        &self.native_call_problems
     }
 
     /// Known source fields, annotated source parameters, and attested native
@@ -333,6 +338,63 @@ impl std::fmt::Display for StarNativeTypeProblem {
             "{} parameter {}, expected {}, got {}",
             self.function, self.parameter, self.expected, self.actual
         )
+    }
+}
+
+/// A native call's argument mapping contradicts its attested host contract.
+#[derive(Debug)]
+pub struct StarNativeCallProblem {
+    file: File,
+    range: TextRange,
+    function: String,
+    reason: StarNativeCallReason,
+    signature: String,
+}
+
+impl StarNativeCallProblem {
+    pub fn file(&self) -> File {
+        self.file
+    }
+
+    pub fn range(&self) -> TextRange {
+        self.range
+    }
+
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+}
+
+impl std::fmt::Display for StarNativeCallProblem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} {}", self.function, self.reason)
+    }
+}
+
+#[derive(Debug)]
+enum StarNativeCallReason {
+    ExcessPositional,
+    NamedOnly(String),
+    PositionalOnly(String),
+    UnknownNamed(String),
+    Duplicate(String),
+    Missing(String),
+}
+
+impl std::fmt::Display for StarNativeCallReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExcessPositional => formatter.write_str("received too many positional arguments"),
+            Self::NamedOnly(name) => {
+                write!(formatter, "parameter {name} requires a named argument")
+            }
+            Self::PositionalOnly(name) => {
+                write!(formatter, "parameter {name} requires a positional argument")
+            }
+            Self::UnknownNamed(name) => write!(formatter, "has no named parameter {name}"),
+            Self::Duplicate(name) => write!(formatter, "parameter {name} was passed twice"),
+            Self::Missing(name) => write!(formatter, "missing required parameter {name}"),
+        }
     }
 }
 
@@ -585,6 +647,7 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
     let root_exports = source_bindings(&parsed_root, &StarRecordModule::Root, &forms, root_imports);
     let mut problems = Vec::new();
     let mut native_problems = Vec::new();
+    let mut native_call_problems = Vec::new();
     let mut checked_arguments = 0;
     let mut unproved_arguments = 0;
     for (parsed, declarations, loaded_module) in parsed_modules
@@ -609,6 +672,7 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
             deferred: false,
             problems: Vec::new(),
             native_problems: Vec::new(),
+            native_call_problems: Vec::new(),
             checked_arguments: 0,
             unproved_arguments: 0,
         };
@@ -618,12 +682,14 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
         }
         problems.extend(scanner.problems);
         native_problems.extend(scanner.native_problems);
+        native_call_problems.extend(scanner.native_call_problems);
         checked_arguments += scanner.checked_arguments;
         unproved_arguments += scanner.unproved_arguments;
     }
     StarCheck::Partial(StarAnalysis {
         problems: problems.into_boxed_slice(),
         native_problems: native_problems.into_boxed_slice(),
+        native_call_problems: native_call_problems.into_boxed_slice(),
         checked_arguments,
         unproved_arguments,
     })
@@ -1415,6 +1481,7 @@ struct CallScanner<'types, 'profile> {
     deferred: bool,
     problems: Vec<StarTypeProblem>,
     native_problems: Vec<StarNativeTypeProblem>,
+    native_call_problems: Vec<StarNativeCallProblem>,
     checked_arguments: usize,
     unproved_arguments: usize,
 }
@@ -1525,6 +1592,7 @@ impl<'source> Visitor<'source> for CallScanner<'_, '_> {
                 self.checked_arguments += result.checked_arguments;
                 self.unproved_arguments += result.unproved_arguments;
                 self.native_problems.extend(result.problems);
+                self.native_call_problems.extend(result.call_problems);
             }
         }
         ast::visitor::walk_expr(self, expression);
@@ -1557,12 +1625,15 @@ impl CallScanner<'_, '_> {
                 deferred: true,
                 problems: Vec::new(),
                 native_problems: Vec::new(),
+                native_call_problems: Vec::new(),
                 checked_arguments: 0,
                 unproved_arguments: 0,
             };
             scanner.visit_body(&function.body);
             self.problems.extend(scanner.problems);
             self.native_problems.extend(scanner.native_problems);
+            self.native_call_problems
+                .extend(scanner.native_call_problems);
             self.checked_arguments += scanner.checked_arguments;
             self.unproved_arguments += scanner.unproved_arguments;
         }
@@ -1769,11 +1840,27 @@ impl<'profile> NativeScope<'_, 'profile> {
 
 /// Map only a call whose native parameter bindings are determined by the
 /// attested positional and keyword modes, including required parameters.
+enum NativeCallShape {
+    Unproved,
+    Invalid {
+        range: TextRange,
+        reason: StarNativeCallReason,
+    },
+}
+
 fn native_call_mapping<'arg, 'profile>(
     call: &'arg ast::ExprCall,
     function: &'profile StarHostFunction,
-) -> Option<Vec<(&'arg Expr, &'profile StarHostParam)>> {
+) -> Result<Vec<(&'arg Expr, &'profile StarHostParam)>, NativeCallShape> {
     let arguments = &call.arguments;
+    if arguments.args.iter().any(Expr::is_starred_expr)
+        || arguments
+            .keywords
+            .iter()
+            .any(|keyword| keyword.arg.is_none())
+    {
+        return Err(NativeCallShape::Unproved);
+    }
     let mut positional = function
         .params
         .iter()
@@ -1781,32 +1868,69 @@ fn native_call_mapping<'arg, 'profile>(
     let mut mapped = Vec::with_capacity(arguments.args.len() + arguments.keywords.len());
     let mut seen = HashSet::new();
     for expression in &arguments.args {
-        if expression.is_starred_expr() {
-            return None;
-        }
-        let param = positional.next()?;
+        let Some(param) = positional.next() else {
+            let reason = function
+                .params
+                .iter()
+                .find(|param| {
+                    param.mode == "named_only"
+                        && !arguments.keywords.iter().any(|keyword| {
+                            keyword
+                                .arg
+                                .as_ref()
+                                .is_some_and(|name| name.as_str() == param.name)
+                        })
+                })
+                .map_or(StarNativeCallReason::ExcessPositional, |param| {
+                    StarNativeCallReason::NamedOnly(param.name.clone())
+                });
+            return Err(NativeCallShape::Invalid {
+                range: expression.range(),
+                reason,
+            });
+        };
         seen.insert(param.name.as_str());
         mapped.push((expression, param));
     }
     for keyword in &arguments.keywords {
-        let name = keyword.arg.as_ref()?;
-        let param = function
+        let Some(name) = keyword.arg.as_ref() else {
+            return Err(NativeCallShape::Unproved);
+        };
+        let Some(param) = function
             .params
             .iter()
-            .find(|param| param.name == name.as_str() && param.mode != "pos_only")?;
+            .find(|param| param.name == name.as_str())
+        else {
+            return Err(NativeCallShape::Invalid {
+                range: keyword.range(),
+                reason: StarNativeCallReason::UnknownNamed(name.to_string()),
+            });
+        };
+        if param.mode == "pos_only" {
+            return Err(NativeCallShape::Invalid {
+                range: keyword.range(),
+                reason: StarNativeCallReason::PositionalOnly(param.name.clone()),
+            });
+        }
         if !seen.insert(param.name.as_str()) {
-            return None;
+            return Err(NativeCallShape::Invalid {
+                range: keyword.range(),
+                reason: StarNativeCallReason::Duplicate(param.name.clone()),
+            });
         }
         mapped.push((&keyword.value, param));
     }
-    if function
+    if let Some(param) = function
         .params
         .iter()
-        .any(|param| param.required && !seen.contains(param.name.as_str()))
+        .find(|param| param.required && !seen.contains(param.name.as_str()))
     {
-        return None;
+        return Err(NativeCallShape::Invalid {
+            range: call.range(),
+            reason: StarNativeCallReason::Missing(param.name.clone()),
+        });
     }
-    Some(mapped)
+    Ok(mapped)
 }
 
 fn known_host_type(ty: &str) -> Option<StarKnownType> {
@@ -1854,6 +1978,7 @@ fn host_signature(function: &StarHostFunction) -> String {
 #[derive(Default)]
 struct NativeCallTypeAnalysis {
     problems: Vec<StarNativeTypeProblem>,
+    call_problems: Vec<StarNativeCallProblem>,
     checked_arguments: usize,
     unproved_arguments: usize,
 }
@@ -1866,9 +1991,21 @@ fn native_call_type_analysis(
     native: &NativeScope<'_, '_>,
 ) -> NativeCallTypeAnalysis {
     let mut result = NativeCallTypeAnalysis::default();
-    let Some(mapped) = native_call_mapping(call, function) else {
-        result.unproved_arguments = call.arguments.args.len() + call.arguments.keywords.len();
-        return result;
+    let mapped = match native_call_mapping(call, function) {
+        Ok(mapped) => mapped,
+        Err(shape) => {
+            result.unproved_arguments = call.arguments.args.len() + call.arguments.keywords.len();
+            if let NativeCallShape::Invalid { range, reason } = shape {
+                result.call_problems.push(StarNativeCallProblem {
+                    file,
+                    range,
+                    function: function.name.clone(),
+                    reason,
+                    signature: host_signature(function),
+                });
+            }
+            return result;
+        }
     };
     for (expression, param) in mapped {
         let Some(expected) = known_host_type(&param.ty) else {
@@ -1930,7 +2067,7 @@ fn argument_type(
                 };
             }
             let function = native.function(&call.func)?;
-            let mapped = native_call_mapping(call, function)?;
+            let mapped = native_call_mapping(call, function).ok()?;
             for (expression, param) in mapped {
                 if let Some(expected) = known_host_type(&param.ty)
                     && let Some(actual) = argument_type(expression, visible, native)

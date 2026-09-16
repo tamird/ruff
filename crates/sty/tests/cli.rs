@@ -730,6 +730,62 @@ fn host_v3_native_error_uses_captured_argument_and_attested_signature() -> anyho
 
 #[cfg(unix)]
 #[test]
+fn host_v3_native_shape_errors_use_call_and_argument_source_spans() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    let checker = host_fixture(&fixture)?;
+    let path = fixture.path("root.star");
+    let source = "if False:\n    example_host_native()\n    example_host_native(1, 7)\n";
+    fixture.write("root.star", "GOOD = 1\n")?;
+    let mut graph: serde_json::Value =
+        serde_json::from_str(&star_graph_json(&path, source, &[], &[])?)?;
+    graph["host_functions"][0]["params"] = serde_json::json!([
+        {"name":"value", "mode":"pos_or_named", "required":true, "type":"any"},
+        {"name":"sort_keys", "mode":"named_only", "required":false, "type":"bool"}
+    ]);
+    fixture.write("graph.json", &serde_json::to_string(&graph)?)?;
+    let log = fixture.path("host-argv.txt");
+    let checker_name = utf8_path(&checker)?;
+    let root_name = utf8_path(&path)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", fixture.path("graph.json"))
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .args(["check", "--host-checker", checker_name, root_name])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(output.stdout.is_empty(), "source JSON leaked");
+    let call_column = source
+        .lines()
+        .nth(1)
+        .and_then(|line| line.find("example_host_native()"))
+        .ok_or_else(|| anyhow::anyhow!("shape test lacks call"))?
+        + 1;
+    let argument_column = source
+        .lines()
+        .nth(2)
+        .and_then(|line| line.rfind('7'))
+        .ok_or_else(|| anyhow::anyhow!("shape test lacks extra argument"))?
+        + 1;
+    let signature =
+        "  host signature: example_host_native(value: any, *, sort_keys: bool (optional)) -> str\n";
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "{}:2:{call_column}: error: example_host_native missing required parameter value\n{signature}{}:3:{argument_column}: error: example_host_native parameter sort_keys requires a named argument\n{signature}",
+            path.display(),
+            path.display(),
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(&log)?,
+        format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn host_v3_deferred_call_keeps_the_captured_root_and_loaded_annotation_spans() -> anyhow::Result<()>
 {
     let fixture = Fixture::unmarked()?;

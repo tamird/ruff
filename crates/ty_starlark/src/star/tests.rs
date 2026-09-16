@@ -372,7 +372,7 @@ fn v3_checks_native_scalars_and_infers_only_valid_nested_returns() -> anyhow::Re
 }
 
 #[test]
-fn v3_native_calls_abstain_when_parameter_mapping_is_unproved() -> anyhow::Result<()> {
+fn v3_native_shape_reports_only_attested_definite_argument_errors() -> anyhow::Result<()> {
     let source = concat!(
         "Config = record(value=int)\n",
         "if False:\n",
@@ -380,12 +380,78 @@ fn v3_native_calls_abstain_when_parameter_mapping_is_unproved() -> anyhow::Resul
         "    Config(value=host_encode(1, True))\n",
         "    Config(value=host_encode(value=1, extra=True))\n",
         "    Config(value=host_hash(*values))\n",
+        "    Config(value=host_hash(**values))\n",
         "    Config(value=host_modes(base=\"ok\", count=7))\n",
+        "    Config(value=host_hash(\"ok\", value=\"again\"))\n",
+        "    Config(value=host_hash(\"ok\", 9))\n",
+        "    Config(value=host_encode(1, 7, sort_keys=True))\n",
+        "    host_modes(\"ok\", count=7, enabled=True)\n",
     );
     let (_db, graph) = v3_root_only(source)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert!(analysis.problems().is_empty(), "{analysis:?}");
     assert!(analysis.native_problems().is_empty(), "{analysis:?}");
+    let [
+        missing,
+        named_only,
+        unknown,
+        positional_only,
+        duplicate,
+        excess,
+        named_supplied,
+    ] = analysis.native_call_problems()
+    else {
+        anyhow::bail!("expected each definite native call shape error: {analysis:?}");
+    };
+    for (problem, source_span, message, signature) in [
+        (
+            missing,
+            "host_hash()",
+            "host_hash missing required parameter value",
+            "host_hash(value: str) -> str",
+        ),
+        (
+            named_only,
+            "True",
+            "host_encode parameter sort_keys requires a named argument",
+            "host_encode(value: any, *, sort_keys: bool (optional)) -> str",
+        ),
+        (
+            unknown,
+            "extra=True",
+            "host_encode has no named parameter extra",
+            "host_encode(value: any, *, sort_keys: bool (optional)) -> str",
+        ),
+        (
+            positional_only,
+            "base=\"ok\"",
+            "host_modes parameter base requires a positional argument",
+            "host_modes(base: str, /, count: int, *, enabled: bool (optional)) -> str",
+        ),
+        (
+            duplicate,
+            "value=\"again\"",
+            "host_hash parameter value was passed twice",
+            "host_hash(value: str) -> str",
+        ),
+        (
+            excess,
+            "9",
+            "host_hash received too many positional arguments",
+            "host_hash(value: str) -> str",
+        ),
+        (
+            named_supplied,
+            "7",
+            "host_encode received too many positional arguments",
+            "host_encode(value: any, *, sort_keys: bool (optional)) -> str",
+        ),
+    ] {
+        assert_eq!(problem.file(), graph.root.file);
+        assert_eq!(slice(source, problem.range()), Some(source_span));
+        assert_eq!(problem.to_string(), message);
+        assert_eq!(problem.signature(), signature);
+    }
     assert!(analysis.unproved_arguments() >= 6);
     Ok(())
 }
