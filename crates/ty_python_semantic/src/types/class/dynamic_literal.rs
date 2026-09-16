@@ -1,5 +1,5 @@
 use crate::ProgramEnvironment;
-use ruff_db::{diagnostic::Span, parsed::parsed_module};
+use ruff_db::{diagnostic::Span, files::FileRange, parsed::parsed_module};
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::TextRange;
 
@@ -104,6 +104,9 @@ pub struct SynthesizedField<'db> {
     pub ty: Type<'db>,
     pub default: Option<Type<'db>>,
     pub origin: Span,
+    /// The field name at the declaration-producing call, distinct from its type annotation.
+    #[get_size(ignore)]
+    pub definition: FileRange,
 }
 
 /// Anchor for identifying a dynamic class literal.
@@ -511,6 +514,7 @@ impl<'db> DynamicClassLiteral<'db> {
                     ty,
                     default,
                     origin: _,
+                    definition: _,
                 } = field;
                 let parameter = Parameter::keyword_only(name.clone()).with_annotated_type(*ty);
                 match default {
@@ -661,6 +665,7 @@ impl<'db> DynamicClassLiteral<'db> {
                             ty,
                             default,
                             origin,
+                            definition,
                         } = field;
                         let normalize = |ty: Type<'db>| {
                             let normalized = ty.recursive_type_normalized_impl(db, env, div, true);
@@ -680,6 +685,7 @@ impl<'db> DynamicClassLiteral<'db> {
                             ty,
                             default,
                             origin: origin.clone(),
+                            definition: *definition,
                         })
                     })
                     .collect::<Option<Box<_>>>()?;

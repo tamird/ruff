@@ -6,7 +6,6 @@
 //! types, and documentation. It supports multiple signatures for union types
 //! and overloads.
 
-use crate::Db;
 use crate::FxIndexMap;
 use crate::docstring::Docstring;
 use crate::goto::docstring_for_call_definition;
@@ -19,6 +18,7 @@ use ruff_python_trivia::PythonWhitespace;
 use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextSize};
 use ty_python_core::ProgramFile;
+use ty_python_semantic::Db;
 use ty_python_semantic::SemanticModel;
 use ty_python_semantic::types::Type;
 use ty_python_semantic::types::ide_support::{

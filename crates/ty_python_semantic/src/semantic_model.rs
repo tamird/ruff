@@ -16,7 +16,9 @@ use ty_module_resolver::{
 
 use crate::Db;
 use crate::place::implicit_globals::all_implicit_module_globals;
-use crate::place::{builtins_module_scope, implicit_builtins_symbol_scope};
+use crate::place::{
+    builtins_module_scope, implicit_builtins_symbol, implicit_builtins_symbol_scope,
+};
 use crate::types::ide_support::{ImportAliasResolution, definition_for_name};
 use crate::types::list_members::{all_members, all_reachable_members};
 use crate::types::{
@@ -371,6 +373,34 @@ impl<'db> SemanticModel<'db> {
                 .into_iter()
                 .filter(|completion| !completion.is_type_check_only),
         );
+
+        if let Some(module) = program_file.starlark_module(db) {
+            // Enumerating a builtin module also exposes its internal declarations.
+            // Resolve suggestions through the same visibility policy as source names.
+            completions.retain_mut(|completion| {
+                if !completion.builtin {
+                    return true;
+                }
+                let ty = implicit_builtins_symbol(db, program_file, &completion.name)
+                    .place
+                    .ignore_possibly_undefined();
+                completion.ty = ty;
+                ty.is_some()
+            });
+            if let Some(environment) = module.environment(db) {
+                completions.extend(environment.globals(db).iter().filter_map(|global| {
+                    let ty = implicit_builtins_symbol(db, program_file, &global.name)
+                        .place
+                        .ignore_possibly_undefined()?;
+                    Some(Completion {
+                        name: CompactString::new(&global.name),
+                        ty: Some(ty),
+                        builtin: true,
+                        is_type_check_only: false,
+                    })
+                }));
+            }
+        }
 
         // The above can sometimes result in duplicates. Get rid of them.
         completions.sort_by(|c1, c2| c1.name.cmp(&c2.name));

@@ -30,10 +30,35 @@ use ty_python_semantic::{
 use crate::docstring::Docstring;
 use crate::goto::Definitions;
 use crate::symbols::QueryPattern;
-use crate::{Db, all_symbols, signature_help};
+use crate::{all_symbols, signature_help};
+use ty_project::Db as ProjectDb;
+use ty_python_semantic::Db;
 
 pub fn completion<'db>(
+    db: &'db dyn ProjectDb,
+    settings: &CompletionSettings,
+    capabilities: CompletionCapabilities,
+    file: ProgramFile<'db>,
+    offset: TextSize,
+) -> Vec<Completion<'db>> {
+    completion_impl(db, Some(db), settings, capabilities, file, offset)
+}
+
+/// Completes names and members using the supplied program, without searching
+/// a Python project or generating import edits.
+pub fn local_completion<'db>(
     db: &'db dyn Db,
+    settings: &CompletionSettings,
+    capabilities: CompletionCapabilities,
+    file: ProgramFile<'db>,
+    offset: TextSize,
+) -> Vec<Completion<'db>> {
+    completion_impl(db, None, settings, capabilities, file, offset)
+}
+
+fn completion_impl<'db>(
+    db: &'db dyn Db,
+    project: Option<&'db dyn ProjectDb>,
     settings: &CompletionSettings,
     capabilities: CompletionCapabilities,
     file: ProgramFile<'db>,
@@ -81,12 +106,17 @@ pub fn completion<'db>(
     match context.kind {
         ContextKind::Keywords(keywords) => {
             for &keyword in keywords {
+                if program_file.is_starlark(db) && matches!(keyword, ContextualKeyword::As) {
+                    continue;
+                }
                 completions
                     .add(CompletionBuilder::keyword(keyword.as_str()).context_specific(true));
             }
         }
         ContextKind::Import(ref import) => {
-            import.add_completions(db, program_file, &mut completions);
+            if !program_file.is_starlark(db) {
+                import.add_completions(db, program_file, &mut completions);
+            }
         }
         ContextKind::NonImport(ref non_import) => match non_import.target {
             CompletionTargetAst::ObjectDot { expr } => {
@@ -113,9 +143,12 @@ pub fn completion<'db>(
                     &context.cursor,
                     &mut completions,
                 );
-                if settings.auto_import {
+                if settings.auto_import
+                    && !program_file.is_starlark(db)
+                    && let Some(project) = project
+                {
                     add_unimported_completions(
-                        db,
+                        project,
                         program_file,
                         &parsed,
                         scoped,
@@ -2223,7 +2256,7 @@ pub(crate) struct ImportEdit {
 
 /// Get fixes that would resolve an unresolved reference
 pub(crate) fn unresolved_fixes<'db>(
-    db: &'db dyn Db,
+    db: &'db dyn ProjectDb,
     file: ProgramFile<'db>,
     parsed: &ParsedModuleRef,
     symbol: &str,
@@ -2290,6 +2323,9 @@ fn add_keyword_completions<'db>(
     // clear (to me, AG) if that's an issue or not. Since the builtin
     // completion has an actual type associated with it, we use that
     // instead of a keyword completion.
+    if completions.program_file.is_starlark(db) {
+        completions.add(CompletionBuilder::keyword("load"));
+    }
     let keywords = [
         "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del",
         "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is",
@@ -2297,6 +2333,27 @@ fn add_keyword_completions<'db>(
         "yield", "case", "match",
     ];
     for name in keywords {
+        if completions.program_file.is_starlark(db)
+            && !matches!(
+                name,
+                "and"
+                    | "break"
+                    | "continue"
+                    | "def"
+                    | "elif"
+                    | "else"
+                    | "for"
+                    | "if"
+                    | "in"
+                    | "lambda"
+                    | "not"
+                    | "or"
+                    | "pass"
+                    | "return"
+            )
+        {
+            continue;
+        }
         completions.add(CompletionBuilder::keyword(name));
     }
 }
@@ -2366,7 +2423,7 @@ fn add_string_literal_completions<'db>(
 /// The completions returned will auto-insert import statements
 /// when selected into `File`.
 fn add_unimported_completions<'db>(
-    db: &'db dyn Db,
+    db: &'db dyn ProjectDb,
     file: ProgramFile<'db>,
     parsed: &ParsedModuleRef,
     scoped: ScopedTarget<'_>,

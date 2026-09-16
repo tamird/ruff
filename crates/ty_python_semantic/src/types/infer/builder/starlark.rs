@@ -1,4 +1,5 @@
 use ruff_db::diagnostic::Span;
+use ruff_db::files::FileRange;
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::Ranged;
 use ty_python_core::starlark::{
@@ -174,6 +175,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 ty,
                 default,
                 origin,
+                definition: FileRange::new(self.file(), name.range()),
             });
         }
 

@@ -1,9 +1,12 @@
-use crate::goto::find_goto_target;
-use crate::{Db, NavigationTargets, RangedValue};
+use crate::goto::{Definitions, find_goto_target};
+use crate::{NavigationTargets, RangedValue};
 use ruff_db::files::FileRange;
 use ruff_db::parsed::parsed_module;
 use ruff_text_size::{Ranged, TextSize};
 use ty_python_core::ProgramFile;
+use ty_python_core::starlark::load_call;
+use ty_python_semantic::Db;
+use ty_python_semantic::types::ide_support::definitions_for_starlark_load;
 use ty_python_semantic::{ImportAliasResolution, SemanticModel};
 
 /// Navigate to the definition of a symbol.
@@ -19,6 +22,55 @@ pub fn goto_definition(
 ) -> Option<RangedValue<NavigationTargets>> {
     let module = parsed_module(db, file.python_file(db)).load(db);
     let model = SemanticModel::new(db, file);
+    if file.is_starlark(db) {
+        for statement in module.suite() {
+            let Some(call) = statement
+                .as_expr_stmt()
+                .and_then(|stmt| load_call(&stmt.value))
+            else {
+                continue;
+            };
+            if !call.range().contains_inclusive(offset) {
+                continue;
+            }
+            let selected = call
+                .arguments
+                .args
+                .iter()
+                .enumerate()
+                .find_map(|(index, argument)| {
+                    let literal = argument.as_string_literal_expr()?;
+                    literal.range().contains_inclusive(offset).then_some((
+                        literal.range(),
+                        (index != 0).then(|| literal.value.to_str()),
+                    ))
+                })
+                .or_else(|| {
+                    call.arguments.keywords.iter().find_map(|keyword| {
+                        let literal = keyword.value.as_string_literal_expr()?;
+                        let range = keyword
+                            .arg
+                            .as_ref()
+                            .filter(|arg| arg.range().contains_inclusive(offset))
+                            .map(Ranged::range)
+                            .or_else(|| {
+                                literal
+                                    .range()
+                                    .contains_inclusive(offset)
+                                    .then_some(literal.range())
+                            })?;
+                        Some((range, Some(literal.value.to_str())))
+                    })
+                });
+            if let Some((range, symbol)) = selected {
+                let definitions = definitions_for_starlark_load(&model, call, symbol);
+                return Some(RangedValue {
+                    range: FileRange::new(file.file(db), range),
+                    value: Definitions::new(definitions).into_navigation_targets(db),
+                });
+            }
+        }
+    }
     let goto_target = find_goto_target(&model, &module, offset)?;
     let definition_targets = goto_target
         .definitions(&model, ImportAliasResolution::ResolveAliases)?

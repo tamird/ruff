@@ -226,9 +226,25 @@ impl<'db> AllMembers<'db> {
                         ClassLiteral::Static(class_literal),
                     );
                 } else {
-                    // For dynamic classes, we can't enumerate instance members (requires body scope),
-                    // but we can still add synthetic members for dataclass-like classes.
-                    self.extend_with_synthetic_members(db, env, ty, class.class_literal(db));
+                    let literal = class.class_literal(db);
+                    if let ClassLiteral::Dynamic(dynamic) = literal
+                        && let Some(synthesized) = dynamic.synthesized(db)
+                    {
+                        for field in &synthesized.fields {
+                            if let Some(member_ty) = ty
+                                .member(db, env, &field.name)
+                                .place
+                                .ignore_possibly_undefined()
+                            {
+                                self.members.insert(Member {
+                                    name: field.name.clone(),
+                                    ty: member_ty,
+                                    is_type_check_only: false,
+                                });
+                            }
+                        }
+                    }
+                    self.extend_with_synthetic_members(db, env, ty, literal);
                 }
             }
 

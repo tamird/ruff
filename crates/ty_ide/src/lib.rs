@@ -27,6 +27,8 @@ mod rename;
 mod selection_range;
 mod semantic_tokens;
 mod signature_help;
+#[cfg(test)]
+mod starlark_tests;
 mod stub_mapping;
 mod symbols;
 mod type_hierarchy;
@@ -39,7 +41,7 @@ pub use call_hierarchy::{CallHierarchyItem, prepare_call_hierarchy};
 pub use code_action::{QuickFix, code_actions};
 pub use completion::{
     Completion, CompletionCapabilities, CompletionCommand, CompletionInsertTextFormat,
-    CompletionKind, CompletionSettings, completion,
+    CompletionKind, CompletionSettings, completion, local_completion,
 };
 pub use doc_highlights::document_highlights;
 pub use document_symbols::document_symbols;

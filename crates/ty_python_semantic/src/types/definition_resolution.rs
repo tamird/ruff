@@ -11,7 +11,7 @@ use itertools::Either;
 use ruff_db::files::FileRange;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
 use ty_module_resolver::{
     ImportingFile, ModuleName, resolve_module, resolve_module_for_import_from,
@@ -24,7 +24,8 @@ use ty_python_core::{
     ProgramFile, attribute_scopes, global_scope, place_table, semantic_index, use_def_map,
 };
 
-use crate::place::implicit_builtins_symbol_scope;
+use crate::place::definitions::DefinitionResolution;
+use crate::place::{RequiresExplicitReExport, exported_symbol, implicit_builtins_symbol_scope};
 use crate::types::{ClassBase, ClassLiteral, ClassType, SubclassOfInner, Type, binding_type};
 use crate::{Db, FxIndexSet, ProgramEnvironment, module_docstring};
 
@@ -384,6 +385,18 @@ pub(crate) fn definitions_for_attribute<'db>(
             continue;
         }
 
+        if let Type::NominalInstance(instance) = ty
+            && let ClassLiteral::Dynamic(class) = instance.class(db, env).class_literal(db)
+            && let Some(synthesized) = class.synthesized(db)
+            && let Some(field) = synthesized
+                .fields
+                .iter()
+                .find(|field| field.name == name_str)
+        {
+            resolved.push(ResolvedDefinition::FileWithRange(field.definition));
+            continue;
+        }
+
         // Prevent lookup on BoundSuper proxy object
         if matches!(ty, Type::BoundSuper(_)) {
             continue;
@@ -631,6 +644,23 @@ fn resolve_definition_recursive<'db>(
     let kind = definition.kind(db);
 
     match kind {
+        DefinitionKind::StarlarkLoad(load) => {
+            if alias_resolution == ImportAliasResolution::PreserveAliases {
+                return vec![ResolvedDefinition::Definition(definition)];
+            }
+            let file = definition.program_file(db);
+            let parsed = parsed_module(db, file.python_file(db)).load(db);
+            let name = load.name.node(&parsed).value.to_str();
+            let Some(module) = file
+                .starlark_module(db)
+                .and_then(|module| module.resolve_load(db, load.call.node(&parsed).range()))
+            else {
+                return Vec::new();
+            };
+            let target = ProgramFile::new_starlark(db, module, file.program(db));
+            starlark_export_definitions(db, target, name)
+        }
+
         DefinitionKind::Import(import_def) => {
             let file = definition.program_file(db);
             let module = parsed_module(db, file.python_file(db)).load(db);
@@ -712,6 +742,37 @@ fn resolve_definition_recursive<'db>(
         // For non-import definitions, return the definition as is
         _ => vec![ResolvedDefinition::Definition(definition)],
     }
+}
+
+/// Resolves only the final public bindings exported by a Starlark module.
+/// Loaded names are not implicitly re-exported, and Python module attributes
+/// are not part of a Starlark module's namespace.
+pub(crate) fn starlark_export_definitions<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    name: &str,
+) -> Vec<ResolvedDefinition<'db>> {
+    if name.starts_with('_')
+        || exported_symbol(db, file, name, RequiresExplicitReExport::Yes)
+            .place
+            .ignore_possibly_undefined()
+            .is_none()
+    {
+        return Vec::new();
+    }
+    let scope = global_scope(db, file);
+    let Some(symbol) = place_table(db, scope).symbol_id(name) else {
+        return Vec::new();
+    };
+    let bindings = use_def_map(db, scope).end_of_scope_symbol_bindings(symbol);
+    let definitions = DefinitionResolution::from_bindings(db, bindings);
+    definitions
+        .definitions()
+        .iter()
+        .copied()
+        .filter(|definition| definition.is_reexported(db))
+        .map(ResolvedDefinition::Definition)
+        .collect()
 }
 
 /// Helper function to resolve import definitions for `ImportFrom` and `StarImport` cases.

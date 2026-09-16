@@ -880,6 +880,17 @@ pub fn definitions_for_keyword_argument<'db>(
     let keyword_name_str = keyword_name.as_str();
 
     let mut resolved_definitions = Vec::new();
+    if let Type::ClassLiteral(ClassLiteral::Dynamic(class)) = func_type
+        && let Some(synthesized) = class.synthesized(db)
+        && synthesized.keyword_constructor
+        && let Some(field) = synthesized
+            .fields
+            .iter()
+            .find(|field| field.name == keyword_name_str)
+    {
+        resolved_definitions.push(ResolvedDefinition::FileWithRange(field.definition));
+        return resolved_definitions;
+    }
     let env = &model.program_environment();
 
     if let Some(callable_type) = func_type
@@ -900,6 +911,27 @@ pub fn definitions_for_keyword_argument<'db>(
     }
 
     resolved_definitions
+}
+
+/// Resolves a frontend-supplied Starlark load edge without Python module lookup.
+pub fn definitions_for_starlark_load<'db>(
+    model: &SemanticModel<'db>,
+    call: &ast::ExprCall,
+    symbol: Option<&str>,
+) -> Vec<ResolvedDefinition<'db>> {
+    let db = model.db();
+    let file = model.program_file();
+    let Some(module) = file
+        .starlark_module(db)
+        .and_then(|module| module.resolve_load(db, call.range()))
+    else {
+        return Vec::new();
+    };
+    let target = ProgramFile::new_starlark(db, module, file.program(db));
+    match symbol {
+        Some(name) => definition_resolution::starlark_export_definitions(db, target, name),
+        None => vec![ResolvedDefinition::Module(target)],
+    }
 }
 
 /// Find the definitions for a symbol imported via `from x import y as z` statement.
