@@ -158,6 +158,7 @@ pub fn check_star_graph(db: &dyn Db, graph: &StarResolvedGraph) -> anyhow::Resul
             file,
             Name::new(name),
             Box::default(),
+            Box::default(),
             Some(environment),
             role,
         ));

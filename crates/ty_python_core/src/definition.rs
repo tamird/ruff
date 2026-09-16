@@ -18,7 +18,7 @@ use crate::node_key::NodeKey;
 use crate::place::ScopedPlaceId;
 use crate::predicate::PatternPredicate;
 use crate::scope::{FileScopeId, ScopeId};
-use crate::starlark::StarlarkLoadBinding;
+use crate::starlark::{StarlarkAnnotation, StarlarkLoadBinding};
 use crate::symbol::ScopedSymbolId;
 use crate::unpack::{Unpack, UnpackPosition};
 use crate::use_def::BindingWithConstraintsIterator;
@@ -116,6 +116,52 @@ impl<'db> Definition<'db> {
 
     pub fn focus_range(self, db: &'db dyn Db, module: &ParsedModuleRef) -> FileRange {
         FileRange::new(self.file(db), self.kind(db).target_range(module))
+    }
+
+    /// The companion annotation for an otherwise unannotated source parameter
+    /// or function return. This only reads the AST and frontend inputs, so it is
+    /// also safe while constructing the semantic index.
+    pub fn starlark_annotation(
+        self,
+        db: &'db dyn Db,
+        module: &ParsedModuleRef,
+    ) -> Option<&'db StarlarkAnnotation> {
+        let starlark = self.program_file(db).starlark_module(db)?;
+        let annotations = starlark.annotations(db);
+        match self.kind(db) {
+            DefinitionKind::Function(function) => {
+                let function = function.node(module);
+                if function.returns.is_some() {
+                    return None;
+                }
+                let annotation = annotations
+                    .iter()
+                    .find(|annotation| annotation.function == function.range())?;
+                annotation.returns.as_ref()
+            }
+            DefinitionKind::Parameter(parameter) => {
+                if parameter.annotation(module).is_some() {
+                    return None;
+                }
+                let range = parameter.full_range(module);
+                annotations
+                    .iter()
+                    .flat_map(|function| function.parameters.iter())
+                    .find(|annotation| annotation.parameter == range)
+                    .map(|annotation| &annotation.annotation)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn category(self, db: &'db dyn Db, module: &ParsedModuleRef) -> DefinitionCategory {
+        if matches!(self.kind(db), DefinitionKind::Parameter(_))
+            && self.starlark_annotation(db, module).is_some()
+        {
+            DefinitionCategory::DeclarationAndBinding
+        } else {
+            self.kind(db).category(self.file(db).is_stub(db), module)
+        }
     }
 
     /// Returns the name of the item being defined, if applicable.
@@ -1155,7 +1201,7 @@ impl<'db> DefinitionKind<'db> {
         }
     }
 
-    pub fn category(&self, in_stub: bool, module: &ParsedModuleRef) -> DefinitionCategory {
+    fn category(&self, in_stub: bool, module: &ParsedModuleRef) -> DefinitionCategory {
         match self {
             DefinitionKind::StarlarkLoad(_) => DefinitionCategory::Binding,
             // functions, classes, and imports always bind, and we consider them declarations

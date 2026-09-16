@@ -1,7 +1,7 @@
 //! Host-resolved Starlark modules. Label resolution and syntax admission belong
 //! to the frontend; semantic queries consume these tracked inputs.
 
-use ruff_db::files::File;
+use ruff_db::files::{File, FileRange};
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::{Ranged, TextRange};
 
@@ -23,12 +23,43 @@ pub struct StarlarkModule {
     #[returns(ref)]
     pub loads: Box<[StarlarkLoad]>,
 
+    /// Companion declarations attached to original source functions. The
+    /// frontend validates correspondence with the source signature; annotations
+    /// never replace the source definition, defaults, or body.
+    #[returns(ref)]
+    pub annotations: Box<[StarlarkFunctionAnnotations]>,
+
     #[returns(copy)]
     pub environment: Option<StarlarkEnvironment>,
 
     #[returns(copy)]
     pub role: StarlarkModuleRole,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub struct StarlarkFunctionAnnotations {
+    /// The complete original source function, including its body.
+    pub function: TextRange,
+    pub parameters: Box<[StarlarkParameterAnnotation]>,
+    pub returns: Option<StarlarkAnnotation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub struct StarlarkParameterAnnotation {
+    /// The original source `Parameter` range, excluding any default value.
+    pub parameter: TextRange,
+    pub annotation: StarlarkAnnotation,
+}
+
+/// A portable type and its original declaration location. Companion stub
+/// annotations use Python's per-element convention for variadic parameters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StarlarkAnnotation {
+    pub ty: StarlarkType,
+    pub origin: FileRange,
+}
+
+impl get_size2::GetSize for StarlarkAnnotation {}
 
 impl get_size2::GetSize for StarlarkModule {}
 
@@ -97,6 +128,7 @@ pub enum StarlarkParameterMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize)]
 pub enum StarlarkType {
     Any,
+    None,
     Bool,
     Int,
     Str,

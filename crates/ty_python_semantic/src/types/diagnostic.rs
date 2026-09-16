@@ -1742,18 +1742,17 @@ enum DeclarationKind {
 }
 
 struct AssignmentDeclarationAnnotation {
-    range: TextRange,
+    span: Span,
     declaration_kind: DeclarationKind,
 }
 
 impl AssignmentDeclarationAnnotation {
     fn into_annotation(
         self,
-        context: &InferContext,
         target_type_display: impl fmt::Display,
         ordinary_message: impl fmt::Display,
     ) -> Annotation {
-        let annotation = context.secondary(self.range);
+        let annotation = Annotation::secondary(self.span);
 
         match self.declaration_kind {
             DeclarationKind::KeywordVariadicParameter => annotation.message(format_args!(
@@ -1774,6 +1773,14 @@ fn assignment_declaration_annotation<'db>(
     declaration: Option<Definition<'db>>,
 ) -> Option<AssignmentDeclarationAnnotation> {
     let db = context.db();
+    if let Some(annotation) =
+        declaration.and_then(|declaration| declaration.starlark_annotation(db, context.module()))
+    {
+        return Some(AssignmentDeclarationAnnotation {
+            span: Span::from(annotation.origin),
+            declaration_kind: DeclarationKind::Regular,
+        });
+    }
     let declaration_definition_kind =
         if matches!(definition_kind, DefinitionKind::AnnotatedAssignment(_)) {
             definition_kind
@@ -1832,7 +1839,7 @@ fn assignment_declaration_annotation<'db>(
     }?;
 
     Some(AssignmentDeclarationAnnotation {
-        range: annotation.range(),
+        span: context.span(annotation),
         declaration_kind,
     })
 }
@@ -2109,7 +2116,6 @@ pub(super) fn report_invalid_assignment<'db>(
         assignment_declaration_annotation(context, definition_kind, declaration)
     {
         diag.annotate(declaration_annotation.into_annotation(
-            context,
             target_ty.display_with(db, env, settings.clone()),
             "Declared type",
         ));
@@ -2225,7 +2231,6 @@ pub(super) fn report_unsound_assignment<'db>(
         assignment_declaration_annotation(context, definition_kind, declaration)
     {
         diagnostic.annotate(declaration_annotation.into_annotation(
-            context,
             &expected_display,
             format_args!("Expected a subtype of `{expected_display}` because of this annotation"),
         ));
@@ -2696,7 +2701,7 @@ pub(super) fn report_dynamic_function_decorator_return<'db>(
 pub(super) fn report_invalid_return_type(
     context: &InferContext,
     object_range: impl Ranged,
-    return_type_range: impl Ranged,
+    return_type_span: Span,
     expected_ty: Type,
     actual_ty: Type,
 ) {
@@ -2708,7 +2713,6 @@ pub(super) fn report_invalid_return_type(
     let env = &context.program_environment();
     let settings =
         DisplaySettings::from_possibly_ambiguous_types(db, env, [expected_ty, actual_ty]);
-    let return_type_span = context.span(return_type_range);
 
     let mut diag = builder.into_diagnostic("Return type does not match returned value");
     diag.set_primary_annotation_message(format_args!(
@@ -2730,7 +2734,7 @@ pub(super) fn report_invalid_return_type(
 pub(super) fn report_unsound_return_statement(
     context: &InferContext,
     object_range: impl Ranged,
-    return_type_range: impl Ranged,
+    return_type_span: Span,
     expected_ty: Type,
     actual_ty: Type,
 ) {
@@ -2761,9 +2765,11 @@ pub(super) fn report_unsound_return_statement(
         of `{expected_ty_display}`"
     ));
     diag.set_primary_annotation_message(format_args!("Inferred as `{actual_ty_display}`"));
-    diag.annotate(context.secondary(return_type_range).message(format_args!(
-        "Expected a subtype of `{expected_ty_display}` because of the return type",
-    )));
+    diag.annotate(
+        Annotation::secondary(return_type_span).message(format_args!(
+            "Expected a subtype of `{expected_ty_display}` because of the return type",
+        )),
+    );
 
     diag.info(format_args!(
         "`{actual_ty_display}` is assignable to `{expected_ty_display}`, \
@@ -2956,6 +2962,7 @@ pub(super) fn report_implicit_return_type(
     has_empty_body: bool,
     enclosing_class_of_method: Option<ClassType>,
     no_return: bool,
+    external_annotation: Option<Span>,
 ) {
     let db = context.db();
 
@@ -2988,7 +2995,10 @@ pub(super) fn report_implicit_return_type(
             expected_ty.display(db, env),
         ))
     };
-    if !has_empty_body {
+    if let Some(span) = external_annotation {
+        diagnostic.annotate(Annotation::secondary(span).message("Return type declared here"));
+    }
+    if !has_empty_body || context.program_file().is_starlark(db) {
         return;
     }
     diagnostic.info("Functions with empty bodies and non-`None` return types are only permitted:");

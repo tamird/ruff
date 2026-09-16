@@ -1,10 +1,12 @@
 //! Types for declarations attested by a Starlark host.
 
 use ruff_db::diagnostic::Span;
+use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
+use ty_python_core::definition::Definition;
 use ty_python_core::starlark::{
-    StarlarkEnvironment, StarlarkGlobalDeclaration, StarlarkGlobalKind, StarlarkParameter,
-    StarlarkParameterMode, StarlarkType,
+    StarlarkAnnotation, StarlarkEnvironment, StarlarkGlobalDeclaration, StarlarkGlobalKind,
+    StarlarkParameter, StarlarkParameterMode, StarlarkType,
 };
 use ty_python_core::{Program, ProgramFile};
 
@@ -180,13 +182,14 @@ impl<'db> StarlarkField<'db> {
     }
 }
 
-fn resolve_type<'db>(
+pub(super) fn resolve_type<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: StarlarkType,
 ) -> Type<'db> {
     match ty {
         StarlarkType::Any => Type::any(),
+        StarlarkType::None => Type::none(db, env),
         StarlarkType::Bool => KnownClass::Bool.to_instance(db, env),
         StarlarkType::Int => KnownClass::Int.to_instance(db, env),
         StarlarkType::Str => KnownClass::Str.to_instance(db, env),
@@ -236,6 +239,16 @@ pub(super) fn variadic_keyword_annotation<'db>(
         .to_instance(db, env)
         .is_assignable_to(db, env, *key)
         .then_some(*value)
+}
+
+/// Resolves companion metadata against the original source definition.
+pub(super) fn annotation<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> Option<&'db StarlarkAnnotation> {
+    definition.program_file(db).starlark_module(db)?;
+    let module = parsed_module(db, definition.python_file(db)).load(db);
+    definition.starlark_annotation(db, &module)
 }
 
 #[cfg(test)]

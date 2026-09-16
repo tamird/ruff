@@ -1518,12 +1518,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         binding: Definition<'db>,
     ) -> AddBinding<'db, 'a> {
         let db = self.db();
-        debug_assert!(
-            binding
-                .kind(db)
-                .category(self.context.in_stub(), self.module())
-                .is_binding()
-        );
+        debug_assert!(binding.category(db, self.module()).is_binding());
 
         let db = self.db();
         let file_scope_id = binding.file_scope(db);
@@ -1747,12 +1742,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         ty: TypeAndQualifiers<'db>,
     ) {
         let db = self.db();
-        debug_assert!(
-            declaration
-                .kind(self.db())
-                .category(self.context.in_stub(), self.module())
-                .is_declaration()
-        );
+        debug_assert!(declaration.category(db, self.module()).is_declaration());
         let use_def = self.index.use_def_map(declaration.file_scope(self.db()));
         let prior_bindings = use_def.bindings_at_definition(declaration);
         let env = self.program_environment();
@@ -1806,18 +1796,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         declared_and_inferred_ty: &DeclaredAndInferredType<'db>,
     ) {
         let db = self.db();
-        debug_assert!(
-            definition
-                .kind(self.db())
-                .category(self.context.in_stub(), self.module())
-                .is_binding()
-        );
-        debug_assert!(
-            definition
-                .kind(self.db())
-                .category(self.context.in_stub(), self.module())
-                .is_declaration()
-        );
+        debug_assert!(definition.category(db, self.module()).is_binding());
+        debug_assert!(definition.category(db, self.module()).is_declaration());
 
         let (declared_ty, inferred_ty) = match *declared_and_inferred_ty {
             DeclaredAndInferredType::AreTheSame(type_and_qualifiers) => {
@@ -4500,11 +4480,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if !target.is_name_expr() && !self.is_valid_receiver_annotation_target(target) {
             // Omit this definition from `self.declarations`; declaration lookup treats an absent
             // inferred declaration as rejected.
-            if !definition
-                .kind(self.db())
-                .category(self.in_stub(), self.module())
-                .is_binding()
-            {
+            if !definition.category(db, self.module()).is_binding() {
                 return;
             }
 

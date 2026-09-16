@@ -1631,7 +1631,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         previous_definitions: Option<PreviousDefinitions>,
     ) {
         let kind = definition.kind(self.db);
-        let category = kind.category(self.source_type.is_stub(), self.module);
+        let category = definition.category(self.db, self.module);
         match category {
             DefinitionCategory::Declaration => {
                 self.mark_place_declared(place);

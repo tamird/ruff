@@ -598,13 +598,8 @@ impl<'db> SemanticModel<'db> {
                 else {
                     return TypeQualifiers::empty();
                 };
-                let definition_file = definition.file(self.db);
                 let module = parsed_module(self.db, definition.python_file(self.db)).load(self.db);
-                if !definition
-                    .kind(self.db)
-                    .category(definition_file.is_stub(self.db), &module)
-                    .is_declaration()
-                {
+                if !definition.category(self.db, &module).is_declaration() {
                     return TypeQualifiers::empty();
                 }
                 let Some(declared) = inferred_declaration(self.db(), definition).declared() else {

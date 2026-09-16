@@ -849,6 +849,14 @@ impl<'db> Signature<'db> {
             .returns
             .as_ref()
             .map(|returns| function_signature_expression_type(db, definition, returns.as_ref()))
+            .or_else(|| {
+                let annotation = super::starlark::annotation(db, definition)?;
+                Some(super::starlark::resolve_type(
+                    db,
+                    &ProgramEnvironment::from_definition(definition),
+                    annotation.ty,
+                ))
+            })
             .unwrap_or_else(Type::unknown);
         let legacy_generic_context =
             GenericContext::from_function_params(db, definition, &parameters, return_ty);
@@ -5748,7 +5756,7 @@ impl<'db> Parameter<'db> {
         kind: ParameterKind<'db>,
     ) -> Self {
         let index = semantic_index(db, function_definition.program_file(db));
-        let definition = Some(index.expect_single_definition(parameter));
+        let definition = index.expect_single_definition(parameter);
 
         let (mut annotated_type, inferred_annotation, annotation_flags, mut has_starred_annotation) =
             if let Some(annotation) = parameter.annotation() {
@@ -5758,10 +5766,21 @@ impl<'db> Parameter<'db> {
                     function_signature_type_expression_flags(db, function_definition, annotation),
                     annotation.is_starred_expr(),
                 )
+            } else if let Some(annotation) = super::starlark::annotation(db, definition) {
+                (
+                    super::starlark::resolve_type(
+                        db,
+                        &ProgramEnvironment::from_definition(definition),
+                        annotation.ty,
+                    ),
+                    false,
+                    TypeExpressionFlags::empty(),
+                    false,
+                )
             } else {
                 (Type::unknown(), true, TypeExpressionFlags::empty(), false)
             };
-        if function_definition.program_file(db).is_starlark(db) && !inferred_annotation {
+        if function_definition.program_file(db).is_starlark(db) && parameter.annotation.is_some() {
             let env = ProgramEnvironment::from_definition(function_definition);
             match &kind {
                 ParameterKind::Variadic { name: _ } => {
@@ -5796,7 +5815,7 @@ impl<'db> Parameter<'db> {
         };
         Self {
             annotated_type,
-            definition,
+            definition: Some(definition),
             inferred_annotation,
             annotation_kind,
             source_parameter_index: None,

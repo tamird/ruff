@@ -3,8 +3,8 @@
 
 use indoc::indoc;
 use ruff_db::Db as _;
-use ruff_db::diagnostic::{Diagnostic, Severity, UnifiedFile};
-use ruff_db::files::system_path_to_file;
+use ruff_db::diagnostic::{Diagnostic, Severity, Span, SubDiagnostic, UnifiedFile};
+use ruff_db::files::{FileRange, system_path_to_file};
 use ruff_db::parsed::parsed_module;
 use ruff_db::system::DbWithWritableSystem;
 use ruff_python_ast::name::Name;
@@ -12,8 +12,9 @@ use ruff_text_size::Ranged;
 use salsa::Setter;
 use ty_python_core::program::{Program, ProgramSettings};
 use ty_python_core::starlark::{
-    StarlarkAvailability, StarlarkEnvironment, StarlarkGlobalDeclaration, StarlarkGlobalKind,
-    StarlarkLoad, StarlarkModule, StarlarkModuleRole, StarlarkParameter, StarlarkParameterMode,
+    StarlarkAnnotation, StarlarkAvailability, StarlarkEnvironment, StarlarkFunctionAnnotations,
+    StarlarkGlobalDeclaration, StarlarkGlobalKind, StarlarkLoad, StarlarkModule,
+    StarlarkModuleRole, StarlarkParameter, StarlarkParameterAnnotation, StarlarkParameterMode,
     StarlarkType, load_call,
 };
 use ty_python_core::{ProgramFile, TestProgramDb};
@@ -45,6 +46,7 @@ fn module(db: &TestDb, path: &str, name: &str) -> anyhow::Result<StarlarkModule>
         db,
         file,
         Name::new(name),
+        Box::default(),
         Box::default(),
         None,
         StarlarkModuleRole::Root,
@@ -1599,5 +1601,309 @@ fn unreachable_lookup_preserves_local_shadowing() -> anyhow::Result<()> {
     let edge = load(&db, root, dep);
     root.set_loads(&mut db).to(Box::new([edge]));
     assert_eq!(codes(&check(&db, root)), ["call-non-callable"; 2]);
+    Ok(())
+}
+
+/// Constructs the frontend input from the scalar companion declarations used by
+/// these fixtures. Production syntax admission and signature matching belong to
+/// the frontend, not semantic inference.
+fn companion_annotations(
+    db: &TestDb,
+    source: StarlarkModule,
+    stub_path: &str,
+) -> anyhow::Result<Box<[StarlarkFunctionAnnotations]>> {
+    let source = ProgramFile::new_starlark(db, source, db.program());
+    let source = parsed_module(db, source.python_file(db)).load(db);
+    let stub_file = system_path_to_file(db, stub_path)?;
+    let stub = ProgramFile::new(db, stub_file, db.program());
+    let stub = parsed_module(db, stub.python_file(db)).load(db);
+    let annotation = |expression: &ruff_python_ast::Expr| {
+        let ty = if expression.is_none_literal_expr() {
+            StarlarkType::None
+        } else {
+            match expression.as_name_expr().unwrap().id.as_str() {
+                "int" => StarlarkType::Int,
+                "str" => StarlarkType::Str,
+                "bool" => StarlarkType::Bool,
+                name => panic!("unsupported fixture annotation {name}"),
+            }
+        };
+        StarlarkAnnotation {
+            ty,
+            origin: FileRange::new(stub_file, expression.range()),
+        }
+    };
+    Ok(stub
+        .suite()
+        .iter()
+        .filter_map(|statement| statement.as_function_def_stmt())
+        .map(|declaration| {
+            let function = source
+                .suite()
+                .iter()
+                .filter_map(|statement| statement.as_function_def_stmt())
+                .find(|function| function.name.id == declaration.name.id)
+                .unwrap();
+            StarlarkFunctionAnnotations {
+                function: function.range(),
+                parameters: function
+                    .parameters
+                    .iter()
+                    .zip(declaration.parameters.iter())
+                    .filter_map(|(parameter, declared)| {
+                        Some(StarlarkParameterAnnotation {
+                            parameter: parameter.as_parameter().range(),
+                            annotation: annotation(declared.annotation()?),
+                        })
+                    })
+                    .collect(),
+                returns: declaration.returns.as_deref().map(annotation),
+            }
+        })
+        .collect())
+}
+
+#[test]
+fn companion_annotations_check_loaded_source_calls() -> anyhow::Result<()> {
+    let source =
+        "load(\":dep.bzl\", selected=\"take\")\nselected(1)\nselected(\"bad\")\nselected(True)\n";
+    let mut db = builder()
+        .with_file("/src/root.bzl", source)
+        .with_file("/src/dep.bzl", "def take(value):\n    return value\n")
+        .with_file("/src/dep.bzl.pyi", "def take(value: int) -> int: ...\n")
+        .build()?;
+    let root = module(&db, "/src/root.bzl", "root")?;
+    let dep = module(&db, "/src/dep.bzl", "dep")?;
+    let annotations = companion_annotations(&db, dep, "/src/dep.bzl.pyi")?;
+    let parameter_origin = annotations[0].parameters[0].annotation.origin;
+    dep.set_annotations(&mut db).to(annotations);
+    let edge = load(&db, root, dep);
+    root.set_loads(&mut db).to(Box::new([edge]));
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        ["invalid-argument-type"; 2],
+        "{diagnostics:?}"
+    );
+    for (diagnostic, bad) in diagnostics.iter().zip(["\"bad\"", "True"]) {
+        let span = diagnostic.primary_span().unwrap();
+        assert_eq!(span.file(), &UnifiedFile::Ty(root.file(&db)));
+        let range = span.range().unwrap();
+        assert_eq!(
+            &source[range.start().to_usize()..range.end().to_usize()],
+            bad
+        );
+        assert!(
+            diagnostic
+                .annotations()
+                .iter()
+                .any(|annotation| { annotation.get_span() == &Span::from(parameter_origin) }),
+            "{diagnostic:?}"
+        );
+        assert!(
+            diagnostic
+                .sub_diagnostics()
+                .iter()
+                .flat_map(SubDiagnostic::annotations)
+                .any(|annotation| {
+                    annotation.get_span().file() == &UnifiedFile::Ty(dep.file(&db))
+                }),
+            "source declaration navigation must be retained"
+        );
+    }
+    assert!(host_check(&db, dep).is_empty());
+    Ok(())
+}
+
+#[test]
+fn companion_annotations_constrain_bodies_and_preserve_origins() -> anyhow::Result<()> {
+    let source = indoc! {r#"
+        def wrong(value = "bad"):
+            value = "wrong"
+            return 1
+        def missing():
+            value = 1
+        def nothing():
+            return
+        def wrong_none():
+            return 1
+    "#};
+    let mut db = builder()
+        .with_file(
+            "/typeshed/stdlib/VERSIONS",
+            "builtins: 3.0-\n_typeshed: 3.0-\n",
+        )
+        .with_file("/typeshed/stdlib/_typeshed.pyi", "class NoneType: ...\n")
+        .with_file("/src/dep.bzl", source)
+        .with_file(
+            "/src/dep.bzl.pyi",
+            indoc! {"
+            def wrong(value: int = ...) -> str: ...
+            def missing() -> int: ...
+            def nothing() -> None: ...
+            def wrong_none() -> None: ...
+        "},
+        )
+        .build()?;
+    let dep = module(&db, "/src/dep.bzl", "dep")?;
+    let annotations = companion_annotations(&db, dep, "/src/dep.bzl.pyi")?;
+    dep.set_annotations(&mut db).to(annotations.clone());
+    let diagnostics = host_check(&db, dep);
+    assert_eq!(
+        codes(&diagnostics),
+        [
+            "invalid-parameter-default",
+            "invalid-assignment",
+            "invalid-return-type",
+            "invalid-return-type",
+            "invalid-return-type"
+        ],
+        "{diagnostics:?}"
+    );
+    let origins = [
+        annotations[0].parameters[0].annotation.origin,
+        annotations[0].parameters[0].annotation.origin,
+        annotations[0].returns.as_ref().unwrap().origin,
+        annotations[1].returns.as_ref().unwrap().origin,
+        annotations[3].returns.as_ref().unwrap().origin,
+    ];
+    for (diagnostic, origin) in diagnostics.iter().zip(origins) {
+        assert_eq!(
+            diagnostic.primary_span().unwrap().file(),
+            &UnifiedFile::Ty(dep.file(&db))
+        );
+        assert!(
+            diagnostic
+                .annotations()
+                .iter()
+                .any(|annotation| annotation.get_span() == &Span::from(origin)),
+            "{diagnostic:?}"
+        );
+    }
+    let range = diagnostics[3].primary_span().unwrap().range().unwrap();
+    assert_eq!(
+        &source[range.start().to_usize()..range.end().to_usize()],
+        "missing"
+    );
+    Ok(())
+}
+
+#[test]
+fn companion_annotation_updates_invalidate_declarations_and_calls() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/dep.bzl",
+            "def take(value):\n    value = \"changed\"\n    return value\ntake(1)\n",
+        )
+        .with_file("/src/dep.bzl.pyi", "def take(value: int) -> str: ...\n")
+        .build()?;
+    let dep = module(&db, "/src/dep.bzl", "dep")?;
+    assert!(host_check(&db, dep).is_empty());
+    let annotations = companion_annotations(&db, dep, "/src/dep.bzl.pyi")?;
+    dep.set_annotations(&mut db).to(annotations);
+    assert_eq!(
+        codes(&host_check(&db, dep)),
+        ["invalid-assignment", "invalid-return-type"]
+    );
+    db.write_file("/src/dep.bzl.pyi", "def take(value: str) -> str: ...\n")?;
+    let annotations = companion_annotations(&db, dep, "/src/dep.bzl.pyi")?;
+    dep.set_annotations(&mut db).to(annotations);
+    assert_eq!(codes(&host_check(&db, dep)), ["invalid-argument-type"]);
+    dep.set_annotations(&mut db).to(Box::default());
+    assert!(host_check(&db, dep).is_empty());
+    Ok(())
+}
+
+#[test]
+fn companion_annotations_belong_to_logical_modules() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/dep.bzl",
+            "def take(value):\n    return value\ntake(1)\n",
+        )
+        .with_file("/src/int.pyi", "def take(value: int) -> int: ...\n")
+        .with_file("/src/str.pyi", "def take(value: str) -> str: ...\n")
+        .build()?;
+    let ints = module(&db, "/src/dep.bzl", "ints")?;
+    let strings = module(&db, "/src/dep.bzl", "strings")?;
+    let annotations = companion_annotations(&db, ints, "/src/int.pyi")?;
+    ints.set_annotations(&mut db).to(annotations);
+    let annotations = companion_annotations(&db, strings, "/src/str.pyi")?;
+    strings.set_annotations(&mut db).to(annotations);
+    assert!(host_check(&db, ints).is_empty());
+    assert_eq!(codes(&host_check(&db, strings)), ["invalid-argument-type"]);
+    assert!(host_check(&db, ints).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_annotations_override_companion_annotations() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/dep.star",
+            "def take(value: str) -> str:\n    return value\ntake(1)\n",
+        )
+        .with_file("/src/dep.pyi", "def take(value: int) -> int: ...\n")
+        .build()?;
+    let dep = module(&db, "/src/dep.star", "dep")?;
+    let annotations = companion_annotations(&db, dep, "/src/dep.pyi")?;
+    dep.set_annotations(&mut db).to(annotations);
+    let diagnostics = host_check(&db, dep);
+    assert_eq!(
+        codes(&diagnostics),
+        ["invalid-argument-type"],
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics[0]
+            .annotations()
+            .iter()
+            .all(|annotation| annotation.get_span().file() == &UnifiedFile::Ty(dep.file(&db)))
+    );
+    Ok(())
+}
+
+#[test]
+fn companion_variadics_use_stub_element_annotations() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/dep.bzl",
+            indoc! {r#"
+            def positional(*values):
+                return values[0]
+            def keywords(**values):
+                return values["key"]
+            positional(1, 2)
+            positional("wrong")
+            keywords(key=True)
+            keywords(key="wrong")
+        "#},
+        )
+        .with_file(
+            "/src/dep.bzl.pyi",
+            indoc! {"
+            def positional(*values: int) -> int: ...
+            def keywords(**values: bool) -> bool: ...
+        "},
+        )
+        .build()?;
+    let dep = module(&db, "/src/dep.bzl", "dep")?;
+    let annotations = companion_annotations(&db, dep, "/src/dep.bzl.pyi")?;
+    dep.set_annotations(&mut db).to(annotations.clone());
+    let diagnostics = host_check(&db, dep);
+    assert_eq!(
+        codes(&diagnostics),
+        ["invalid-argument-type"; 2],
+        "{diagnostics:?}"
+    );
+    for (diagnostic, function) in diagnostics.iter().zip(annotations.iter()) {
+        let origin = function.parameters[0].annotation.origin;
+        assert!(
+            diagnostic
+                .annotations()
+                .iter()
+                .any(|annotation| annotation.get_span() == &Span::from(origin))
+        );
+    }
     Ok(())
 }

@@ -205,7 +205,7 @@ pub fn unused_bindings(db: &dyn Db, file: ProgramFile<'_>) -> Box<[UnusedBinding
                 continue;
             }
 
-            let category = kind.category(is_stub_file, &parsed);
+            let category = definition.category(db, &parsed);
             if matches!(category, DefinitionCategory::Declaration)
                 && (symbol.is_bound() || symbol.is_used())
             {

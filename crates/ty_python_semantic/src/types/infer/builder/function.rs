@@ -42,6 +42,7 @@ use ty_python_core::{
     scope::NodeWithScopeRef,
 };
 
+use ruff_db::diagnostic::{Annotation, Span};
 use ruff_python_ast as ast;
 use ruff_text_size::Ranged;
 
@@ -219,7 +220,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         self.infer_body(&function.body);
 
-        if let Some(returns) = function.returns.as_deref() {
+        let external_return = self
+            .index
+            .expect_single_definition(function)
+            .starlark_annotation(db, self.module());
+        if let Some(return_span) = function
+            .returns
+            .as_deref()
+            .map(|returns| self.context.span(returns))
+            .or_else(|| external_return.map(|annotation| Span::from(annotation.origin)))
+        {
+            let return_range = function
+                .returns
+                .as_deref()
+                .map_or(function.name.range(), Ranged::range);
             let has_empty_body = self.return_types_and_ranges.is_empty()
                 && function_body_kind(db, env, function, |expr| self.expression_type(expr))
                     == FunctionBodyKind::Stub;
@@ -276,7 +290,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 {
                     report_invalid_generator_function_return_type(
                         &self.context,
-                        returns.range(),
+                        return_range,
                         inferred_return,
                         declared_ty,
                     );
@@ -291,7 +305,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             report_invalid_return_type(
                                 &self.context,
                                 return_statement.range,
-                                returns.range(),
+                                return_span.clone(),
                                 expected_return_ty,
                                 return_statement.ty,
                             );
@@ -308,7 +322,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             report_unsound_return_statement(
                                 &self.context,
                                 return_statement.range,
-                                returns.range(),
+                                return_span.clone(),
                                 expected_return_ty,
                                 return_statement.ty,
                             );
@@ -323,11 +337,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         let no_return = self.return_types_and_ranges.is_empty();
                         report_implicit_return_type(
                             &self.context,
-                            returns.range(),
+                            return_range,
                             expected_return_ty,
                             false,
                             None,
                             no_return,
+                            external_return.map(|annotation| Span::from(annotation.origin)),
                         );
                     }
                 }
@@ -359,7 +374,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     report_invalid_return_type(
                         &self.context,
                         return_statement.range,
-                        returns.range(),
+                        return_span.clone(),
                         declared_ty,
                         return_statement.ty,
                     );
@@ -377,7 +392,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     report_unsound_return_statement(
                         &self.context,
                         return_statement.range,
-                        returns.range(),
+                        return_span.clone(),
                         declared_ty,
                         return_statement.ty,
                     );
@@ -391,11 +406,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let no_return = self.return_types_and_ranges.is_empty();
                 report_implicit_return_type(
                     &self.context,
-                    returns.range(),
+                    return_range,
                     declared_ty,
                     has_empty_body,
                     enclosing_class_context,
                     no_return,
+                    external_return.map(|annotation| Span::from(annotation.origin)),
                 );
             }
         }
@@ -542,7 +558,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             function_decorators,
             None,
             dataclass_transformer_params,
-            function.returns.is_some(),
+            function.returns.is_some()
+                || definition.starlark_annotation(db, self.module()).is_some(),
         );
         let function_literal = FunctionLiteral::new(db, overload_literal);
         let function_type = FunctionType::new(db, function_literal, None);
@@ -755,7 +772,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             };
             let annotation = param_with_default
                 .annotation()
-                .map(|annotation| function_signature_expression_type(db, definition, annotation));
+                .map(|annotation| function_signature_expression_type(db, definition, annotation))
+                .or_else(|| {
+                    let parameter = self
+                        .index
+                        .expect_single_definition(&param_with_default.parameter);
+                    let annotation = parameter.starlark_annotation(db, self.module())?;
+                    Some(crate::types::starlark::resolve_type(
+                        db,
+                        self.program_environment(),
+                        annotation.ty,
+                    ))
+                });
             self.infer_expression(default, TypeContext::new(annotation));
         }
 
@@ -1052,12 +1080,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let db = self.db();
 
         let default_expr = default.as_ref();
-        if let Some(annotation) = parameter.annotation.as_ref() {
-            let declared_ty = self.file_expression_type(annotation);
-
+        let external_annotation = definition.starlark_annotation(db, self.module());
+        let declared_ty = parameter
+            .annotation
+            .as_ref()
+            .map(|annotation| self.file_expression_type(annotation))
+            .or_else(|| {
+                external_annotation
+                    .map(|annotation| crate::types::starlark::resolve_type(db, env, annotation.ty))
+            });
+        if let Some(declared_ty) = declared_ty {
             // P.args and P.kwargs are only valid as annotations on *args and **kwargs,
             // not on regular parameters.
-            if let Type::TypeVar(typevar) = declared_ty
+            if let Some(annotation) = parameter.annotation.as_ref()
+                && let Type::TypeVar(typevar) = declared_ty
                 && typevar.is_paramspec(db)
                 && let Some(attr) = typevar.paramspec_attr(db)
             {
@@ -1099,12 +1135,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .context
                         .report_lint(&INVALID_PARAMETER_DEFAULT, parameter_with_default)
                     {
-                        builder.into_diagnostic(format_args!(
+                        let mut diagnostic = builder.into_diagnostic(format_args!(
                             "Default value of type `{}` is not assignable \
                              to annotated parameter type `{}`",
                             default_ty.display(db, env),
                             declared_ty.display(db, env)
                         ));
+                        if let Some(annotation) = external_annotation {
+                            diagnostic.annotate(
+                                Annotation::secondary(Span::from(annotation.origin))
+                                    .message("Parameter type declared here"),
+                            );
+                        }
                     }
                 }
             }
@@ -1214,6 +1256,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 _ => Type::homogeneous_tuple(db, self.program_environment(), annotated_type),
             };
 
+            self.add_declaration_with_binding(
+                parameter.into(),
+                definition,
+                &DeclaredAndInferredType::are_the_same_type(ty),
+            );
+        } else if let Some(annotation) = definition.starlark_annotation(db, self.module()) {
+            let ty =
+                crate::types::starlark::resolve_type(db, self.program_environment(), annotation.ty);
+            let ty = Type::homogeneous_tuple(db, self.program_environment(), ty);
             self.add_declaration_with_binding(
                 parameter.into(),
                 definition,
@@ -1368,6 +1419,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     &[KnownClass::Str.to_instance(db, env), annotated_type],
                 )
             };
+            self.add_declaration_with_binding(
+                parameter.into(),
+                definition,
+                &DeclaredAndInferredType::are_the_same_type(ty),
+            );
+        } else if let Some(annotation) = definition.starlark_annotation(db, self.module()) {
+            let ty = crate::types::starlark::resolve_type(db, env, annotation.ty);
+            let ty = KnownClass::Dict.to_specialized_instance(
+                db,
+                env,
+                &[KnownClass::Str.to_instance(db, env), ty],
+            );
             self.add_declaration_with_binding(
                 parameter.into(),
                 definition,

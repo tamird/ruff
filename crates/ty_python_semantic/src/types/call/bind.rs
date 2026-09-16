@@ -22,6 +22,7 @@ use ruff_python_ast::name::Name;
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec, smallvec_inline};
+use ty_python_core::definition::Definition;
 
 use self::constructor::{ConstructorBinding, ConstructorContext};
 use super::{Argument, CallArguments, CallError, CallErrorKind, InferContext, Signature, Type};
@@ -6419,6 +6420,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             {
                 specialization_errors.push(BindingError::InvalidArgumentType {
                     parameter: ParameterContext::new(parameter, parameter_index, false),
+                    parameter_definition: parameter.definition(),
                     argument_index: argument_indices.map(|(first, _)| first),
                     last_argument_index: argument_indices.map(|(_, last)| last),
                     expected_ty,
@@ -6758,6 +6760,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 && !parameter.is_variadic();
             self.errors.push(BindingError::InvalidArgumentType {
                 parameter: ParameterContext::new(parameter, parameter_index, positional),
+                parameter_definition: parameter.definition(),
                 argument_index: adjusted_argument_index,
                 last_argument_index: None,
                 expected_ty,
@@ -8916,6 +8919,8 @@ pub(crate) enum BindingError<'db> {
     /// parameter.
     InvalidArgumentType {
         parameter: ParameterContext,
+        /// The matched declaration, retained through signature expansion and forwarding.
+        parameter_definition: Option<Definition<'db>>,
         argument_index: Option<usize>,
         /// Last argument when this error describes all arguments matched to a variadic parameter.
         last_argument_index: Option<usize>,
@@ -9222,6 +9227,7 @@ impl<'db> BindingError<'db> {
         match self {
             Self::InvalidArgumentType {
                 parameter,
+                parameter_definition,
                 argument_index,
                 last_argument_index,
                 expected_ty,
@@ -9282,6 +9288,17 @@ impl<'db> BindingError<'db> {
 
                 let error_context = provided_ty.assignability_error_context(db, env, *expected_ty);
                 error_context.attach_to(db, env, &mut diag);
+
+                // Companion annotations constrain the original source parameter;
+                // retain its declaration navigation and show the stub separately.
+                if let Some(definition) = *parameter_definition
+                    && let Some(annotation) = crate::types::starlark::annotation(db, definition)
+                {
+                    diag.annotate(
+                        Annotation::secondary(Span::from(annotation.origin))
+                            .message("Parameter type declared here"),
+                    );
+                }
 
                 if let Some(parameter_source) = parameter_source {
                     let (name_span, parameter_span) =
