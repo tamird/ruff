@@ -3272,7 +3272,7 @@ impl<'db> Bindings<'db> {
                             }
                         }
 
-                        Some(KnownClass::Type) if overload_index == 0 => {
+                        Some(KnownClass::Type) if overload_index == 0 && !env.is_starlark(db) => {
                             if let [Some(arg)] = overload.parameter_types() {
                                 overload.set_return_type(arg.dunder_class(db, env));
                             }

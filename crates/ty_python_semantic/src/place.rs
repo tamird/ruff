@@ -680,7 +680,8 @@ pub(crate) fn implicit_builtins_symbol_scope<'db>(
 enum BuiltinVisibility {
     All,
     RuntimeOnly,
-    /// Explicit runtime declarations, without Python's implicit module globals.
+    /// Explicit runtime declarations, restricted by `__all__` when present, without Python's
+    /// implicit module globals. Internal builtin type lookups still use `All`.
     Starlark,
 }
 
@@ -708,6 +709,11 @@ fn builtins_symbol_impl<'db>(
     let resolver_environment = program.resolver_environment(db);
     let resolver = |module: Module<'db>| {
         let file = ProgramFile::new(db, module.file(db)?, program);
+        if visibility == BuiltinVisibility::Starlark
+            && dunder_all_names(db, file).is_some_and(|names| !names.contains(symbol))
+        {
+            return None;
+        }
         let scope = global_scope(db, file);
         let found_symbol = symbol_impl(
             db,

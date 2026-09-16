@@ -760,25 +760,25 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         LiteralValueTypeKind::Bool(b1),
                         LiteralValueTypeKind::Bool(b2),
                         ast::Operator::BitOr,
-                    ) => Some(Type::bool_literal(b1 | b2)),
+                    ) if !env.is_starlark(db) => Some(Type::bool_literal(b1 | b2)),
 
                     (
                         LiteralValueTypeKind::Bool(b1),
                         LiteralValueTypeKind::Bool(b2),
                         ast::Operator::BitAnd,
-                    ) => Some(Type::bool_literal(b1 & b2)),
+                    ) if !env.is_starlark(db) => Some(Type::bool_literal(b1 & b2)),
 
                     (
                         LiteralValueTypeKind::Bool(b1),
                         LiteralValueTypeKind::Bool(b2),
                         ast::Operator::BitXor,
-                    ) => Some(Type::bool_literal(b1 ^ b2)),
+                    ) if !env.is_starlark(db) => Some(Type::bool_literal(b1 ^ b2)),
 
                     (
                         LiteralValueTypeKind::Bool(b1),
                         LiteralValueTypeKind::Bool(_) | LiteralValueTypeKind::Int(_),
                         op,
-                    ) => self.infer_binary_expression_type(
+                    ) if !env.is_starlark(db) => self.infer_binary_expression_type(
                         node,
                         Type::int_literal(i64::from(b1)),
                         right_ty,
@@ -786,14 +786,17 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         state,
                     ),
 
-                    (LiteralValueTypeKind::Int(_), LiteralValueTypeKind::Bool(b2), op) => self
-                        .infer_binary_expression_type(
+                    (LiteralValueTypeKind::Int(_), LiteralValueTypeKind::Bool(b2), op)
+                        if !env.is_starlark(db) =>
+                    {
+                        self.infer_binary_expression_type(
                             node,
                             left_ty,
                             Type::int_literal(i64::from(b2)),
                             op,
                             state,
-                        ),
+                        )
+                    }
 
                     (
                         LiteralValueTypeKind::Int(n),
@@ -1070,6 +1073,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         left: Type<'db>,
     ) -> bool {
         let db = self.db();
+        if self.program_environment().is_starlark(db)
+            && (matches!(
+                left.as_literal_value_kind(),
+                Some(LiteralValueTypeKind::Bool(_))
+            ) || left
+                .as_nominal_instance()
+                .is_some_and(|instance| instance.known_class(db) == Some(KnownClass::Bool)))
+        {
+            return false;
+        }
         match left {
             Type::LiteralValue(literal)
                 if matches!(

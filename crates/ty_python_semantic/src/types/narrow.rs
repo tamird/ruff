@@ -8,7 +8,7 @@ use crate::reachability::{
 };
 use crate::subscript::PyIndex;
 use crate::types::function::KnownFunction;
-use crate::types::infer::{ExpressionInference, infer_same_file_expression_type};
+use crate::types::infer::{ExpressionInference, InferenceFlags, infer_same_file_expression_type};
 use crate::types::special_form::TypeQualifier;
 use crate::types::tuple::{TupleElement, TupleLength, TupleSpec, TupleSpecBuilder, TupleType};
 use crate::types::typed_dict::{TypedDictFieldBuilder, TypedDictSchema, TypedDictType};
@@ -4546,6 +4546,24 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 let function = function.into_classinfo_constraint_function()?;
 
                 let class_info_ty = inference.expression_type(second_arg);
+
+                if self.env.is_starlark(db) && function == ClassInfoConstraintFunction::IsInstance {
+                    // A runtime type expression can contain gradual or abstract type
+                    // objects. Its inferred type bounds successful matches, but failure
+                    // does not exclude every value represented by that bound.
+                    if !is_positive {
+                        return None;
+                    }
+                    let constraint = class_info_ty
+                        .in_type_expression(db, self.scope(), None, InferenceFlags::empty())
+                        .ok()?;
+                    // Gradual types must not erase facts already known about the value.
+                    let constraint = constraint.top_materialization(db, &self.env);
+                    return Some(NarrowingConstraints::from_iter([(
+                        place,
+                        NarrowingConstraint::intersection(constraint),
+                    )]));
+                }
 
                 let use_generic_filtering = is_positive
                     && !self

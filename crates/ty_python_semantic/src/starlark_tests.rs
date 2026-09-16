@@ -118,6 +118,400 @@ fn host_check(db: &TestDb, module: StarlarkModule) -> Vec<Diagnostic> {
     check_file_unwrap(db, ProgramFile::new_starlark(db, module, program))
 }
 
+#[test]
+fn starlark_builtin_exports_hide_internal_declarations() -> anyhow::Result<()> {
+    let source =
+        "object\nslice\n__all__\ndef take(value: int) -> int:\n    return value\ntake(1)\n";
+    let db = builder()
+        .with_file(
+            "/typeshed/stdlib/builtins.pyi",
+            indoc! {r#"
+                __all__ = ["int"]
+                class object: ...
+                class type: ...
+                class int: ...
+                class slice: ...
+            "#},
+        )
+        .with_file("/src/root.star", source)
+        .with_file("/src/root.py", source)
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    assert_eq!(codes(&host_check(&db, root)), ["unresolved-reference"; 3]);
+    let python = system_path_to_file(&db, "/src/root.py")?;
+    assert!(check_file_unwrap(&db, ProgramFile::new(&db, python, db.program())).is_empty());
+    Ok(())
+}
+
+#[test]
+fn starlark_annotations_do_not_parse_python_forward_references() -> anyhow::Result<()> {
+    let db = builder()
+        .with_file(
+            "/src/root.star",
+            "def take(value: \"int\") -> \"str\":\n    return \"ok\"\n",
+        )
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    assert_eq!(codes(&host_check(&db, root)), ["invalid-type-form"; 2]);
+    assert!(check(&db, root).is_empty());
+    Ok(())
+}
+
+#[test]
+fn starlark_type_annotations_allow_runtime_type_objects() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+        Item = record(value=int)
+        def factory() -> (type, struct):
+            return (Item, struct())
+        Result, namespace = factory()
+        Result(value=1)
+        Result.values()
+        def accepts(value: Result):
+            return value
+        def own_type(value: type) -> type:
+            return value
+        own_type(Item)
+        own_type(1)
+        def wrong() -> type:
+            return 1
+    "#},
+        )
+        .build()?;
+    let root = host_module(&mut db, "/src/root.star", record_globals())?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        ["invalid-argument-type", "invalid-return-type"],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn starlark_isinstance_uses_type_expressions_and_positive_constraints() -> anyhow::Result<()> {
+    let db = builder()
+        .with_file(
+            "/typeshed/stdlib/builtins.pyi",
+            indoc! {r#"
+            class object: ...
+            class type:
+                def __or__(self, other: object, /) -> object: ...
+            class int: ...
+            class bool: ...
+            class str: ...
+            class tuple[T]:
+                def __getitem__(self, index: int, /) -> T: ...
+            class list[T]:
+                def __getitem__(self, index: int, /) -> T: ...
+            def isinstance(value: object, types: object, /) -> bool: ...
+        "#},
+        )
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+            def pair(value: int | tuple[int, str]) -> str:
+                if isinstance(value, (int, str)):
+                    return value[1]
+                return "other"
+            def sequence(value: int | list[str]) -> str:
+                if isinstance(value, list[str]):
+                    return value[0]
+                return "other"
+            def unknown_type(value: int | str, target: type) -> int:
+                if isinstance(value, target):
+                    return value
+                return value
+            isinstance(1, 42)
+            isinstance(1, "int")
+        "#},
+        )
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        [
+            "invalid-return-type",
+            "invalid-return-type",
+            "invalid-type-form",
+            "invalid-type-form"
+        ],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn starlark_boolean_operations_do_not_use_integer_fast_paths() -> anyhow::Result<()> {
+    let registry = crate::default_lint_registry();
+    let mut rules = RuleSelection::from_registry(registry);
+    rules.enable(
+        registry.get("division-by-zero")?,
+        Severity::Error,
+        LintSource::File,
+    );
+    let db = builder()
+        .with_rule_selection(rules)
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+                True + 1
+                1 + True
+                True | False
+                True & False
+                True ^ False
+                +True
+                -True
+                ~True
+                True / 0
+                True < 1
+                1 >= False
+                False < True
+                1 + 2
+            "#},
+        )
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        vec!["unsupported-operator"; 11],
+        "{diagnostics:?}"
+    );
+    let python = check(&db, root);
+    assert_eq!(codes(&python), ["division-by-zero"], "{python:?}");
+    Ok(())
+}
+
+#[test]
+fn starlark_boolean_equality_keeps_integer_exports_distinct() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/root.star",
+            "load(\":dep.star\", \"value\")\ndef take(value: int):\n    pass\ntake(value)\n",
+        )
+        .with_file(
+            "/src/dep.star",
+            "value = 1\nif True == 1:\n    value = \"wrong\"\nif False != 0:\n    value = 2\n",
+        )
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    let dep = module(&db, "/src/dep.star", "dep")?;
+    let edge = load(&db, root, dep);
+    root.set_loads(&mut db).to(Box::new([edge]));
+    assert!(host_check(&db, root).is_empty());
+    assert_eq!(codes(&check(&db, root)), ["invalid-argument-type"]);
+    Ok(())
+}
+
+#[test]
+fn starlark_strings_have_no_sequence_iteration_fallback() -> anyhow::Result<()> {
+    let db = builder()
+        .with_file(
+            "/typeshed/stdlib/builtins.pyi",
+            indoc! {r#"
+                class object: ...
+                class type: ...
+                class int: ...
+                class bool: ...
+                class tuple: ...
+                class Iterator:
+                    def __iter__(self) -> Iterator: ...
+                    def __next__(self) -> str: ...
+                class str:
+                    def __getitem__(self, index: int) -> str: ...
+                    def elems(self) -> Iterator: ...
+            "#},
+        )
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+                for character in "abc":
+                    pass
+                def iterate(value: str):
+                    for character in value:
+                        pass
+                    for character in value.elems():
+                        pass
+                    return value[0]
+            "#},
+        )
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        ["not-iterable", "not-iterable"],
+        "{diagnostics:?}"
+    );
+    assert!(check(&db, root).is_empty());
+    Ok(())
+}
+
+#[test]
+fn starlark_type_calls_use_the_declared_string_result() -> anyhow::Result<()> {
+    let db = builder()
+        .with_file(
+            "/typeshed/stdlib/builtins.pyi",
+            indoc! {r#"
+                class object: ...
+                class int: ...
+                class bool: ...
+                class str: ...
+                class tuple: ...
+                class type:
+                    def __new__(cls, value: object, /) -> str: ...
+            "#},
+        )
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+                name = type(1)
+                def take(value: str):
+                    pass
+                take(name)
+                def name_of(value: object) -> str:
+                    return type(value)
+                type()
+                alias = type
+                take(alias(1))
+            "#},
+        )
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(codes(&diagnostics), ["missing-argument"], "{diagnostics:?}");
+    Ok(())
+}
+
+#[test]
+fn starlark_tuple_annotations_describe_fixed_tuples() -> anyhow::Result<()> {
+    let db = builder()
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+                def pair() -> (int, str):
+                    return (1, "ok")
+                def wrong() -> (int, str):
+                    return ("wrong", 1)
+                def empty() -> ():
+                    return ()
+            "#},
+        )
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        ["invalid-return-type"],
+        "{diagnostics:?}"
+    );
+    assert_eq!(codes(&check(&db, root)), vec!["invalid-type-form"; 3]);
+    Ok(())
+}
+
+#[test]
+fn starlark_float_annotations_and_promotion_preserve_exact_types() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/typeshed/stdlib/builtins.pyi",
+            indoc! {r#"
+                class object: ...
+                class type: ...
+                class int: ...
+                class bool: ...
+                class str: ...
+                class tuple: ...
+                class float:
+                    def __new__(cls, value: int | float, /) -> float: ...
+                class list[T]:
+                    def append(self, value: T) -> None: ...
+            "#},
+        )
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+                def take(value: float):
+                    pass
+                take(1)
+                take(float(1))
+                def wrong() -> float:
+                    return 1
+                values = [1.5]
+                values.append(1)
+                Item = record(value=float)
+                Item(value=1)
+                Item(value=float(1))
+            "#},
+        )
+        .build()?;
+    let root = host_module(
+        &mut db,
+        "/src/root.star",
+        Box::new([StarlarkGlobalDeclaration {
+            name: Name::new("record"),
+            kind: StarlarkGlobalKind::Record,
+        }]),
+    )?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        [
+            "invalid-argument-type",
+            "invalid-return-type",
+            "invalid-argument-type",
+            "invalid-argument-type"
+        ],
+        "{diagnostics:?}"
+    );
+    assert!(check(&db, root).is_empty());
+    Ok(())
+}
+
+#[test]
+fn starlark_iteration_recovers_the_known_union_element_type() -> anyhow::Result<()> {
+    let db = builder()
+        .with_file(
+            "/typeshed/stdlib/builtins.pyi",
+            indoc! {r#"
+                class object: ...
+                class type:
+                    def __or__(self, other: object, /) -> object: ...
+                class int: ...
+                class bool: ...
+                class tuple: ...
+                class str:
+                    def __getitem__(self, index: int) -> str: ...
+                class Iterator:
+                    def __iter__(self) -> Iterator: ...
+                    def __next__(self) -> str: ...
+            "#},
+        )
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+                def take(value: int):
+                    pass
+                def mixed(value: str | Iterator):
+                    for element in value:
+                        take(element)
+            "#},
+        )
+        .build()?;
+    let root = module(&db, "/src/root.star", "root")?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        ["not-iterable", "invalid-argument-type"],
+        "{diagnostics:?}"
+    );
+    assert_eq!(codes(&check(&db, root)), ["invalid-argument-type"]);
+    Ok(())
+}
+
 fn record_globals() -> Box<[StarlarkGlobalDeclaration]> {
     [
         ("record", StarlarkGlobalKind::Record),

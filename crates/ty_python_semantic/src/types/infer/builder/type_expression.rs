@@ -196,7 +196,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             ast::Expr::NoneLiteral(_literal) => Type::none(db, env),
 
             // https://typing.python.org/en/latest/spec/annotations.html#string-annotations
-            ast::Expr::StringLiteral(string) => self.infer_string_type_expression(string),
+            ast::Expr::StringLiteral(string) => {
+                if self.program_environment().is_starlark(db) {
+                    if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, string) {
+                        builder.into_diagnostic("Starlark type annotations cannot be strings");
+                    }
+                    Type::unknown()
+                } else {
+                    self.infer_string_type_expression(string)
+                }
+            }
 
             ast::Expr::Subscript(subscript) => {
                 let ast::ExprSubscript {
@@ -598,6 +607,10 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Tuple(tuple) => {
+                if env.is_starlark(db) {
+                    let ty = self.infer_tuple_expression(tuple, TypeContext::default());
+                    return self.infer_name_or_attribute_type_expression(ty, expression);
+                }
                 if tuple.parenthesized {
                     if !self.in_string_annotation() {
                         for element in tuple {

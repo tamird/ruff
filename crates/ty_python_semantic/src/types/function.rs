@@ -82,7 +82,9 @@ use crate::types::diagnostic::{
 };
 use crate::types::display::DisplaySettings;
 use crate::types::generics::{GenericContext, typing_self};
-use crate::types::infer::{infer_definition_types, nearest_enclosing_class, original_class_type};
+use crate::types::infer::{
+    InferenceFlags, infer_definition_types, nearest_enclosing_class, original_class_type,
+};
 use crate::types::known_instance::DeprecatedInstance;
 use crate::types::list_members::all_members;
 use crate::types::narrow::ClassInfoConstraintFunction;
@@ -3028,6 +3030,28 @@ impl KnownFunction {
                 let [Some(first_arg), Some(second_argument)] = parameter_types else {
                     return;
                 };
+
+                let env = context.program_environment();
+                if env.is_starlark(db) && self == KnownFunction::IsInstance {
+                    // Starlark accepts the same type expressions here as in annotations,
+                    // including parameterized containers and fixed tuples. Python's
+                    // classinfo validation and tuple-exhaustiveness rules do not apply.
+                    if let Err(error) = second_argument.in_type_expression(
+                        db,
+                        context.scope(),
+                        None,
+                        InferenceFlags::empty(),
+                    ) {
+                        let argument = call_expression
+                            .arguments
+                            .args
+                            .get(1)
+                            .unwrap_or(&call_expression.func);
+                        error.into_fallback_type(context, argument, InferenceFlags::empty());
+                    }
+                    overload.set_return_type(KnownClass::Bool.to_instance(db, env));
+                    return;
+                }
 
                 check_classinfo_in_isinstance(
                     db,

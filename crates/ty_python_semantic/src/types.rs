@@ -7253,20 +7253,21 @@ impl<'db> Type<'db> {
         // that would be called from `constructor_bindings` for better consistency, but that causes
         // some test failures deserving separate investigation.
         let known = class.known(db);
-        if matches!(
-            known,
-            Some(
-                KnownClass::Bool
-                    | KnownClass::Type
-                    | KnownClass::Object
-                    | KnownClass::FunctoolsPartial
-                    | KnownClass::Property
-                    | KnownClass::Super
-                    | KnownClass::TypeAliasType
-                    | KnownClass::ExtensionsTypeAliasType
-                    | KnownClass::Deprecated
+        if known == Some(KnownClass::Type) && !env.is_starlark(db)
+            || matches!(
+                known,
+                Some(
+                    KnownClass::Bool
+                        | KnownClass::Object
+                        | KnownClass::FunctoolsPartial
+                        | KnownClass::Property
+                        | KnownClass::Super
+                        | KnownClass::TypeAliasType
+                        | KnownClass::ExtensionsTypeAliasType
+                        | KnownClass::Deprecated
+                )
             )
-        ) {
+        {
             return fallback_bindings();
         }
 
@@ -8177,10 +8178,18 @@ impl<'db> Type<'db> {
             // https://typing.python.org/en/latest/spec/special-types.html#special-cases-for-float-and-complex
             Type::ClassLiteral(class) => {
                 let ty = match class.known(db) {
+                    Some(KnownClass::Type) => {
+                        if env.is_starlark(db) {
+                            SubclassOfType::subclass_of_unknown()
+                        } else {
+                            Type::instance(db, env, class.default_specialization(db))
+                        }
+                    }
                     Some(KnownClass::Complex) => KnownUnion::Complex.to_type(db, env),
                     Some(KnownClass::Float)
-                        if !inference_flags
-                            .contains(InferenceFlags::DISABLE_INT_FLOAT_SPECIAL_CASE) =>
+                        if !env.is_starlark(db)
+                            && !inference_flags
+                                .contains(InferenceFlags::DISABLE_INT_FLOAT_SPECIAL_CASE) =>
                     {
                         KnownUnion::Float.to_type(db, env)
                     }
@@ -8190,8 +8199,19 @@ impl<'db> Type<'db> {
             }
             Type::GenericAlias(alias) => Ok(Type::instance(db, env, ClassType::from(*alias))),
 
-            Type::SubclassOf(_)
-            | Type::EnumComplement(_)
+            Type::SubclassOf(subclass) => {
+                if env.is_starlark(db) {
+                    Ok(subclass.to_instance(db, env))
+                } else {
+                    Err(InvalidTypeExpressionError {
+                        invalid_expressions: smallvec_inline![InvalidTypeExpression::InvalidType(
+                            *self, scope_id
+                        )],
+                        fallback_type: Type::unknown(),
+                    })
+                }
+            }
+            Type::EnumComplement(_)
             | Type::LiteralValue(_)
             | Type::AlwaysTruthy
             | Type::AlwaysFalsy
@@ -9078,7 +9098,9 @@ impl<'db> Type<'db> {
             {
                 match instance.known_class(db) {
                     Some(KnownClass::Complex) => KnownUnion::Complex.to_type(db, visitor.env),
-                    Some(KnownClass::Float) => KnownUnion::Float.to_type(db, visitor.env),
+                    Some(KnownClass::Float) if !visitor.env.is_starlark(db) => {
+                        KnownUnion::Float.to_type(db, visitor.env)
+                    }
                     _ => instance.apply_type_mapping_impl(db, type_mapping, tcx, visitor),
                 }
             }

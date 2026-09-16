@@ -138,6 +138,9 @@ impl<'db> Type<'db> {
                         Some(Cow::Owned(spec))
                     }
                     LiteralValueTypeKind::String(string_literal_ty) => {
+                        if env.is_starlark(db) {
+                            return None;
+                        }
                         let string_literal = string_literal_ty.value(db);
                         let spec = if string_literal.len() < MAX_TUPLE_LENGTH {
                             TupleSpec::heterogeneous(
@@ -152,7 +155,11 @@ impl<'db> Type<'db> {
                     }
                     // N.B. This special case isn't strictly necessary, it's just an obvious optimization
                     LiteralValueTypeKind::LiteralString => {
-                        Some(Cow::Owned(TupleSpec::homogeneous(ty)))
+                        if env.is_starlark(db) {
+                            None
+                        } else {
+                            Some(Cow::Owned(TupleSpec::homogeneous(ty)))
+                        }
                     }
                     _ => None,
                 },
@@ -416,6 +423,11 @@ impl<'db> Type<'db> {
 
                 match try_call_dunder_next_on_iterator(iterator) {
                     Ok(dunder_next_return) => {
+                        if env.is_starlark(db) {
+                            return Err(IterationError::UnboundIterError {
+                                element_type: Some(dunder_next_return),
+                            });
+                        }
                         try_call_dunder_getitem()
                             .map(|dunder_getitem_return_type| {
                                 // If `__iter__` is possibly unbound,
@@ -459,13 +471,18 @@ impl<'db> Type<'db> {
             }
 
             // There's no `__iter__` method. Try `__getitem__` instead...
-            Err(CallDunderError::MethodNotAvailable) => try_call_dunder_getitem()
-                .map(|ty| Cow::Owned(TupleSpec::homogeneous(ty)))
-                .map_err(
-                    |dunder_getitem_error| IterationError::UnboundIterAndGetitemError {
-                        dunder_getitem_error,
-                    },
-                ),
+            Err(CallDunderError::MethodNotAvailable) => {
+                if env.is_starlark(db) {
+                    return Err(IterationError::UnboundIterError { element_type: None });
+                }
+                try_call_dunder_getitem()
+                    .map(|ty| Cow::Owned(TupleSpec::homogeneous(ty)))
+                    .map_err(
+                        |dunder_getitem_error| IterationError::UnboundIterAndGetitemError {
+                            dunder_getitem_error,
+                        },
+                    )
+            }
         }
     }
 }
@@ -515,6 +532,10 @@ pub(super) enum IterationError<'db> {
     UnboundIterAndGetitemError {
         dunder_getitem_error: CallDunderError<'db>,
     },
+
+    /// No iteration protocol is available, and this language has no sequence fallback.
+    /// A possible element type comes from the iterable alternatives of a union.
+    UnboundIterError { element_type: Option<Type<'db>> },
 
     /// The asynchronous iterable has no `__aiter__` method.
     UnboundAiterError,
@@ -610,6 +631,7 @@ impl<'db> IterationError<'db> {
                 dunder_getitem_error,
             } => dunder_getitem_error.return_type(db, env),
 
+            Self::UnboundIterError { element_type } => *element_type,
             Self::UnboundAiterError => None,
         }
     }
@@ -621,6 +643,7 @@ impl<'db> IterationError<'db> {
             Self::IterReturnsInvalidIterator { mode, .. } => *mode,
             Self::PossiblyUnboundIterAndGetitemError { .. }
             | Self::UnboundIterAndGetitemError { .. } => EvaluationMode::Sync,
+            Self::UnboundIterError { element_type: _ } => EvaluationMode::Sync,
             Self::UnboundAiterError => EvaluationMode::Async,
         }
     }
@@ -1060,6 +1083,16 @@ impl<'db> IterationError<'db> {
                 }
             },
 
+            IterationError::UnboundIterError { element_type } => {
+                if element_type.is_some() {
+                    reporter.may_not(
+                        "It may not have an `__iter__` method",
+                        ErrorContext::Disabled,
+                    );
+                } else {
+                    reporter.is_not("It has no `__iter__` method", ErrorContext::Disabled);
+                }
+            }
             IterationError::UnboundAiterError => {
                 reporter.is_not("It has no `__aiter__` method", ErrorContext::Disabled);
             }

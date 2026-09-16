@@ -101,6 +101,10 @@ impl<'db> ProgramEnvironment<'db> {
         program
     }
 
+    pub(crate) fn is_starlark(&self, db: &'db dyn Db) -> bool {
+        self.program(db).language(db) == ty_python_core::program::ProgramLanguage::Starlark
+    }
+
     /// Returns the Python version used by this operation.
     #[inline]
     pub(crate) fn python_version(&self, db: &'db dyn Db) -> PythonVersion {

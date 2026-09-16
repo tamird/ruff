@@ -1076,7 +1076,25 @@ fn infer_binary_type_comparison_inner<'db>(
                         }),
                     })
                 }
-                // Booleans are coded as integers (False = 0, True = 1)
+                (LiteralValueTypeKind::Int(_), LiteralValueTypeKind::Bool(_))
+                | (LiteralValueTypeKind::Bool(_), LiteralValueTypeKind::Int(_))
+                    if env.is_starlark(db) =>
+                {
+                    Some(match op {
+                        NonIdentityOperator::Rich(RichCompareOperator::Eq) => {
+                            Ok(Type::bool_literal(false))
+                        }
+                        NonIdentityOperator::Rich(RichCompareOperator::Ne) => {
+                            Ok(Type::bool_literal(true))
+                        }
+                        _ => Err(UnsupportedComparisonError {
+                            op: op.into(),
+                            left_ty: left,
+                            right_ty: right,
+                        }),
+                    })
+                }
+                // Python booleans are coded as integers (False = 0, True = 1)
                 (LiteralValueTypeKind::Int(n), LiteralValueTypeKind::Bool(b)) => Some(
                     infer_binary_type_comparison_inner(
                         context,

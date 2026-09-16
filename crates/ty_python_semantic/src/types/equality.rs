@@ -908,14 +908,19 @@ fn builtin_literals_equal_to<'db>(
     let builder = match literal {
         LiteralValueTypeKind::Int(value) => {
             let mut builder = UnionBuilder::new(db, env).add(literal_type);
-            if matches!(value.as_i64(), 0 | 1) {
+            if !env.is_starlark(db) && matches!(value.as_i64(), 0 | 1) {
                 builder = builder.add(Type::bool_literal(value.as_i64() == 1));
             }
             builder
         }
-        LiteralValueTypeKind::Bool(value) => UnionBuilder::new(db, env)
-            .add(literal_type)
-            .add(Type::int_literal(i64::from(value))),
+        LiteralValueTypeKind::Bool(value) => {
+            let builder = UnionBuilder::new(db, env).add(literal_type);
+            if env.is_starlark(db) {
+                builder
+            } else {
+                builder.add(Type::int_literal(i64::from(value)))
+            }
+        }
         LiteralValueTypeKind::String(_) | LiteralValueTypeKind::Bytes(_) => {
             UnionBuilder::new(db, env).add(literal_type)
         }
@@ -1847,7 +1852,12 @@ impl KnownComparisonSemantics {
         operator: ComparisonOperator,
     ) -> Option<Self> {
         match literal {
-            LiteralValueTypeKind::Int(_) | LiteralValueTypeKind::Bool(_) => Some(Self::Int),
+            LiteralValueTypeKind::Int(_) => Some(Self::Int),
+            LiteralValueTypeKind::Bool(_) => Some(if env.is_starlark(db) {
+                Self::Object
+            } else {
+                Self::Int
+            }),
             LiteralValueTypeKind::String(_) | LiteralValueTypeKind::LiteralString => {
                 Some(Self::Str)
             }
@@ -2031,7 +2041,7 @@ fn known_literal_equality<'db>(
         }
         (LiteralValueTypeKind::Int(left), LiteralValueTypeKind::Bool(right))
         | (LiteralValueTypeKind::Bool(right), LiteralValueTypeKind::Int(left)) => {
-            Some(left.as_i64() == i64::from(right))
+            Some(!env.is_starlark(db) && left.as_i64() == i64::from(right))
         }
         (LiteralValueTypeKind::String(left), LiteralValueTypeKind::String(right)) => {
             Some(left.value(db) == right.value(db))

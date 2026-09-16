@@ -3561,7 +3561,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             Some(KnownClass::NewType) => {
                                 self.infer_newtype_expression(target, call_expr, definition)
                             }
-                            Some(KnownClass::Type) => {
+                            Some(KnownClass::Type)
+                                if !self.program_environment().is_starlark(self.db()) =>
+                            {
                                 // Try to extract the dynamic class with definition.
                                 // This returns `None` if it's not a three-arg call to `type()`,
                                 // signalling that we must fall back to normal call inference.
@@ -9130,6 +9132,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Handle 3-argument `type(name, bases, dict)`.
         if let Type::ClassLiteral(class) = callable_type
             && class.is_known(self.db(), KnownClass::Type)
+            && !self.program_environment().is_starlark(self.db())
         {
             return self.infer_builtins_type_call(call_expression, None);
         }
@@ -11232,7 +11235,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             (ast::UnaryOp::UAdd, Type::LiteralValue(literal)) => match literal.kind() {
                 LiteralValueTypeKind::Int(value) => Type::int_literal(value.as_i64()),
-                LiteralValueTypeKind::Bool(value) => Type::int_literal(i64::from(value)),
+                LiteralValueTypeKind::Bool(value) if !env.is_starlark(db) => {
+                    Type::int_literal(i64::from(value))
+                }
                 _ => fallback_unary_expression_type(),
             },
 
@@ -11242,13 +11247,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .checked_neg()
                     .map(Type::int_literal)
                     .unwrap_or_else(|| KnownClass::Int.to_instance(db, env)),
-                LiteralValueTypeKind::Bool(value) => Type::int_literal(-i64::from(value)),
+                LiteralValueTypeKind::Bool(value) if !env.is_starlark(db) => {
+                    Type::int_literal(-i64::from(value))
+                }
                 _ => fallback_unary_expression_type(),
             },
 
             (ast::UnaryOp::Invert, Type::LiteralValue(literal)) => match literal.kind() {
                 LiteralValueTypeKind::Int(value) => Type::int_literal(!value.as_i64()),
-                LiteralValueTypeKind::Bool(value) => {
+                LiteralValueTypeKind::Bool(value) if !env.is_starlark(db) => {
                     // `~bool` is currently deprecated in typeshed. Technically we should
                     // similarly check for deprecation of dunder methods on all our literal
                     // type fast paths, but we choose not to pay that extra cost, since it is
