@@ -110,6 +110,7 @@ pub struct StarAnalysis {
     problems: Box<[StarTypeProblem]>,
     native_problems: Box<[StarNativeTypeProblem]>,
     native_call_problems: Box<[StarNativeCallProblem]>,
+    native_availability_problems: Box<[StarNativeAvailabilityProblem]>,
     checked_arguments: usize,
     unproved_arguments: usize,
 }
@@ -125,6 +126,10 @@ impl StarAnalysis {
 
     pub fn native_call_problems(&self) -> &[StarNativeCallProblem] {
         &self.native_call_problems
+    }
+
+    pub fn native_availability_problems(&self) -> &[StarNativeAvailabilityProblem] {
+        &self.native_availability_problems
     }
 
     /// Known source fields, annotated source parameters, and attested native
@@ -368,6 +373,39 @@ impl StarNativeCallProblem {
 impl std::fmt::Display for StarNativeCallProblem {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{} {}", self.function, self.reason)
+    }
+}
+
+/// The host attests that a native global needs loaded module initialization.
+#[derive(Debug)]
+pub struct StarNativeAvailabilityProblem {
+    file: File,
+    range: TextRange,
+    function: String,
+    availability: String,
+}
+
+impl StarNativeAvailabilityProblem {
+    pub fn file(&self) -> File {
+        self.file
+    }
+
+    pub fn range(&self) -> TextRange {
+        self.range
+    }
+
+    pub fn availability(&self) -> &str {
+        &self.availability
+    }
+}
+
+impl std::fmt::Display for StarNativeAvailabilityProblem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} is unavailable from the source root",
+            self.function
+        )
     }
 }
 
@@ -651,6 +689,7 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
     let mut problems = Vec::new();
     let mut native_problems = Vec::new();
     let mut native_call_problems = Vec::new();
+    let mut native_availability_problems = Vec::new();
     let mut checked_arguments = 0;
     let mut unproved_arguments = 0;
     for (parsed, declarations, loaded_module) in parsed_modules
@@ -676,6 +715,7 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
             problems: Vec::new(),
             native_problems: Vec::new(),
             native_call_problems: Vec::new(),
+            native_availability_problems: Vec::new(),
             checked_arguments: 0,
             unproved_arguments: 0,
         };
@@ -686,6 +726,7 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
         problems.extend(scanner.problems);
         native_problems.extend(scanner.native_problems);
         native_call_problems.extend(scanner.native_call_problems);
+        native_availability_problems.extend(scanner.native_availability_problems);
         checked_arguments += scanner.checked_arguments;
         unproved_arguments += scanner.unproved_arguments;
     }
@@ -693,6 +734,7 @@ pub fn check_star_graph(graph: &StarResolvedGraph) -> StarCheck {
         problems: problems.into_boxed_slice(),
         native_problems: native_problems.into_boxed_slice(),
         native_call_problems: native_call_problems.into_boxed_slice(),
+        native_availability_problems: native_availability_problems.into_boxed_slice(),
         checked_arguments,
         unproved_arguments,
     })
@@ -1509,6 +1551,7 @@ struct CallScanner<'types, 'profile> {
     problems: Vec<StarTypeProblem>,
     native_problems: Vec<StarNativeTypeProblem>,
     native_call_problems: Vec<StarNativeCallProblem>,
+    native_availability_problems: Vec<StarNativeAvailabilityProblem>,
     checked_arguments: usize,
     unproved_arguments: usize,
 }
@@ -1622,6 +1665,19 @@ impl<'source> Visitor<'source> for CallScanner<'_, '_> {
         }
         if let Expr::Call(call) = expression {
             let native = self.native_scope();
+            let unavailable = if let Some(function) = native.attested_function(&call.func)
+                && function.availability == "loaded_module_initialization"
+                && !self.loaded_module
+            {
+                Some(StarNativeAvailabilityProblem {
+                    file: self.file,
+                    range: call.func.range(),
+                    function: function.name.clone(),
+                    availability: function.availability.clone(),
+                })
+            } else {
+                None
+            };
             if let Some(function) = native.function(&call.func) {
                 let result =
                     native_call_type_analysis(self.file, call, function, &self.visible, &native);
@@ -1629,6 +1685,9 @@ impl<'source> Visitor<'source> for CallScanner<'_, '_> {
                 self.unproved_arguments += result.unproved_arguments;
                 self.native_problems.extend(result.problems);
                 self.native_call_problems.extend(result.call_problems);
+            }
+            if let Some(problem) = unavailable {
+                self.native_availability_problems.push(problem);
             }
         }
         ast::visitor::walk_expr(self, expression);
@@ -1662,6 +1721,7 @@ impl CallScanner<'_, '_> {
                 problems: Vec::new(),
                 native_problems: Vec::new(),
                 native_call_problems: Vec::new(),
+                native_availability_problems: Vec::new(),
                 checked_arguments: 0,
                 unproved_arguments: 0,
             };
@@ -1670,6 +1730,8 @@ impl CallScanner<'_, '_> {
             self.native_problems.extend(scanner.native_problems);
             self.native_call_problems
                 .extend(scanner.native_call_problems);
+            self.native_availability_problems
+                .extend(scanner.native_availability_problems);
             self.checked_arguments += scanner.checked_arguments;
             self.unproved_arguments += scanner.unproved_arguments;
         }
@@ -1921,6 +1983,14 @@ struct NativeScope<'scope, 'profile> {
 
 impl<'profile> NativeScope<'_, 'profile> {
     fn function(&self, expression: &Expr) -> Option<&'profile StarHostFunction> {
+        let function = self.attested_function(expression)?;
+        if function.availability == "loaded_module_initialization" && !self.loaded_initialization {
+            return None;
+        }
+        Some(function)
+    }
+
+    fn attested_function(&self, expression: &Expr) -> Option<&'profile StarHostFunction> {
         let Expr::Name(name) = expression else {
             return None;
         };
@@ -1931,11 +2001,7 @@ impl<'profile> NativeScope<'_, 'profile> {
         {
             return None;
         }
-        let function = self.functions.get(name).copied()?;
-        if function.availability == "loaded_module_initialization" && !self.loaded_initialization {
-            return None;
-        }
-        Some(function)
+        self.functions.get(name).copied()
     }
 }
 

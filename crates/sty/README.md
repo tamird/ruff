@@ -91,10 +91,14 @@ global calls. It uses the host's ordered positional and named modes,
 required parameters, and evaluator availability before proving a call.
 A typed native return can supply an argument type when the call has a
 valid parameter mapping and no known wrong inputs. Native returns of
-`any` or `unknown`, computed callbacks, shadowed names, and calls outside
-their attested evaluator remain unproved. A known native mismatch shows
-the captured argument span and a textual host signature; the graph has
-no native declaration source span. Definite native call shape errors,
+`any` or `unknown`, computed callbacks, and shadowed names stay unproved.
+A direct unshadowed native call in the source root is an error when
+the host attests that its function requires loaded module initialization.
+Sty shows the captured callee span and textual host availability. A
+loaded deferred function might execute during initialization or later,
+so its availability stays unproved. A known native mismatch shows the
+captured argument span and a textual host signature; the graph has no
+native declaration source span. Definite native call shape errors,
 including a missing required parameter and a positional argument for
 a named-only parameter, use the captured call or argument span and the
 same host signature. Starred and dynamic keyword arguments have no

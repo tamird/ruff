@@ -730,6 +730,53 @@ fn host_v3_native_error_uses_captured_argument_and_attested_signature() -> anyho
 
 #[cfg(unix)]
 #[test]
+fn host_v3_root_only_availability_uses_captured_call_and_attested_fact() -> anyhow::Result<()> {
+    let fixture = Fixture::unmarked()?;
+    let checker = host_fixture(&fixture)?;
+    let path = fixture.path("root.star");
+    let source = "if False:\n    example_host_native(value=\"ready\")\n";
+    fixture.write("root.star", "GOOD = 1\n")?;
+    let mut graph: serde_json::Value =
+        serde_json::from_str(&star_graph_json(&path, source, &[], &[])?)?;
+    graph["host_functions"][0]["availability"] = "loaded_module_initialization".into();
+    fixture.write("graph.json", &serde_json::to_string(&graph)?)?;
+    let log = fixture.path("host-argv.txt");
+    let output = Command::new(env!("CARGO_BIN_EXE_sty"))
+        .current_dir(fixture.root.path())
+        .env("STY_TEST_ARGV_LOG", &log)
+        .env("STY_TEST_GRAPH", fixture.path("graph.json"))
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .args([
+            "check",
+            "--host-checker",
+            utf8_path(&checker)?,
+            utf8_path(&path)?,
+        ])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(output.stdout.is_empty(), "source JSON leaked");
+    let call_column = source
+        .lines()
+        .nth(1)
+        .and_then(|line| line.find("example_host_native"))
+        .ok_or_else(|| anyhow::anyhow!("availability test lacks the native call"))?
+        + 1;
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "{}:2:{call_column}: error: example_host_native is unavailable from the source root\n  host availability: loaded_module_initialization\n",
+            path.display(),
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(&log)?,
+        format!("--sty-graph-v3\n--source\n{}\nmanifest:\n", path.display())
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn host_v3_native_shape_errors_use_call_and_argument_source_spans() -> anyhow::Result<()> {
     let fixture = Fixture::unmarked()?;
     let checker = host_fixture(&fixture)?;

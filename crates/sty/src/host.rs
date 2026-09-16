@@ -45,6 +45,7 @@ pub(super) fn run_host(cwd: &SystemPath, checker: &PathBuf, options: &CheckComma
             if !analysis.problems().is_empty()
                 || !analysis.native_problems().is_empty()
                 || !analysis.native_call_problems().is_empty()
+                || !analysis.native_availability_problems().is_empty()
             {
                 return Ok(1);
             }
@@ -441,6 +442,11 @@ impl<'db, 'graph> SnapshotReporter<'db, 'graph> {
             let primary = self.location(problem.file(), Some(problem.range()))?;
             writeln!(output, "{primary}: error: {problem}")?;
             writeln!(output, "  host signature: {}", problem.signature())?;
+        }
+        for problem in analysis.native_availability_problems() {
+            let primary = self.location(problem.file(), Some(problem.range()))?;
+            writeln!(output, "{primary}: error: {problem}")?;
+            writeln!(output, "  host availability: {}", problem.availability())?;
         }
         Ok(())
     }

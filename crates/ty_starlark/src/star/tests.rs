@@ -495,6 +495,96 @@ fn v3_catalog_proof_requires_eager_loaded_module_and_known_callback() -> anyhow:
         "host_hash parameter value, expected str, got int"
     );
     assert!(analysis.unproved_arguments() >= 2);
+    let [unavailable] = analysis.native_availability_problems() else {
+        anyhow::bail!("the dead root catalog call was not proven unavailable: {analysis:?}");
+    };
+    assert_eq!(unavailable.file(), graph.root.file);
+    assert_eq!(
+        slice(&root_source, unavailable.range()),
+        Some("host_catalog")
+    );
+    assert_eq!(
+        unavailable.to_string(),
+        "host_catalog is unavailable from the source root"
+    );
+    assert_eq!(unavailable.availability(), "loaded_module_initialization");
+    Ok(())
+}
+
+#[test]
+fn v3_catalog_availability_rejects_root_defaults_and_direct_bodies_only() -> anyhow::Result<()> {
+    let root_source = format!(
+        "load(\"{LABEL}\", \"LimitConfig\")\n{}",
+        concat!(
+            "if False:\n",
+            "    host_catalog(name=\"ready\", decoder=unknown())\n",
+            "    def dead(value=host_catalog(name=\"ready\", decoder=unknown())):\n",
+            "        pass\n",
+            "def delayed():\n",
+            "    host_catalog(name=\"ready\", decoder=unknown())\n",
+            "def shadow(host_catalog):\n",
+            "    host_catalog(name=\"ready\", decoder=unknown())\n",
+            "def closure():\n",
+            "    thunk = lambda: host_catalog(name=\"ready\", decoder=unknown())\n",
+        )
+    );
+    let module_source = concat!(
+        "LimitConfig = record(value=bool)\n",
+        "if False:\n",
+        "    host_catalog(name=\"ready\", decoder=unknown())\n",
+        "    def dead(value=host_catalog(name=\"ready\", decoder=unknown())):\n",
+        "        pass\n",
+        "def delayed():\n",
+        "    host_catalog(name=\"ready\", decoder=unknown())\n",
+    );
+    let (_db, mut graph) = case(&root_source, module_source)?;
+    graph.version = "sty-star-graph-v3".to_string();
+    graph.profile = native_profile();
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
+    assert!(analysis.native_problems().is_empty(), "{analysis:?}");
+    assert!(analysis.native_call_problems().is_empty(), "{analysis:?}");
+    let [dead_root, dead_default, deferred_root] = analysis.native_availability_problems() else {
+        anyhow::bail!("only direct root calls have impossible evaluator: {analysis:?}");
+    };
+    for problem in [dead_root, dead_default, deferred_root] {
+        assert_eq!(problem.file(), graph.root.file);
+        assert_eq!(slice(&root_source, problem.range()), Some("host_catalog"));
+        assert_eq!(problem.availability(), "loaded_module_initialization");
+        assert_eq!(
+            problem.to_string(),
+            "host_catalog is unavailable from the source root"
+        );
+    }
+
+    let source = concat!(
+        "if False:\n",
+        "    host_catalog(name=\"ready\", decoder=unknown())\n",
+        "host_catalog = unknown()\n",
+        "def shadow(host_catalog):\n",
+        "    host_catalog(name=\"ready\", decoder=unknown())\n",
+    );
+    let (_db, graph) = v3_root_only(source)?;
+    assert!(
+        analyzed(check_star_graph(&graph))?
+            .native_availability_problems()
+            .is_empty(),
+        "a module write cannot retain the attested native global"
+    );
+
+    let source = format!(
+        "load(\"{LABEL}\", host_catalog=\"LimitConfig\")\nif False:\n    host_catalog(value=True)\n"
+    );
+    let (_db, mut graph) = case(&source, "LimitConfig = record(value=bool)\n")?;
+    graph.root.loads[0].bindings[0].local = "host_catalog".to_string();
+    graph.version = "sty-star-graph-v3".to_string();
+    graph.profile = native_profile();
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
+    assert!(
+        analysis.native_availability_problems().is_empty(),
+        "a resolved load alias cannot refer to the native global"
+    );
     Ok(())
 }
 
