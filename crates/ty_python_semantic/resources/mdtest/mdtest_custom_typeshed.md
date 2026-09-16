@@ -113,3 +113,58 @@ def reveal_type(obj, /): ...
 ```py
 reveal_type(())  # revealed: tuple
 ```
+
+## Literal assignability follows custom builtin inheritance
+
+Literal argument and return types use the builtin classes of their program. This custom standard
+library makes `bool` and `int` unrelated, as in Starlark. The source exercises only annotations,
+function calls, and returns that share Python syntax; it does not establish broader Starlark
+support.
+
+```toml
+[environment]
+typeshed = "/typeshed"
+```
+
+`/typeshed/stdlib/builtins.pyi`:
+
+```pyi
+class object: ...
+class type: ...
+class int: ...
+class bool: ...
+class str: ...
+class tuple: ...
+```
+
+`source.py`:
+
+```py
+def take(value: int) -> int:
+    return "wrong"  # error: 12 [invalid-return-type]
+
+def boolean_return() -> int:
+    return True  # error: 12 [invalid-return-type]
+
+def valid_return() -> bool:
+    return True
+
+take("wrong")  # error: 6 [invalid-argument-type]
+take(True)  # error: 6 [invalid-argument-type]
+take(1)
+```
+
+## Standard builtin inheritance remains available
+
+The same source path in a program using the standard builtin definitions retains Python's
+`bool`-to-`int` assignability.
+
+`source.py`:
+
+```py
+def take(value: int) -> int:
+    return True
+
+take(True)
+take(1)
+```
