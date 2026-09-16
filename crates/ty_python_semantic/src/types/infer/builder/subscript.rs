@@ -202,6 +202,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             ctx: _,
         } = subscript;
 
+        // Generic declarations describe instances even in hosts whose constructor
+        // values cannot be subscripted. Check runtime operations before either
+        // narrowing or generic specialization, including unions of constructors.
+        if env.is_starlark(db) && self.program_file().is_starlark(db) {
+            let unsupported_class = |ty: Type<'db>| {
+                matches!(ty, Type::ClassLiteral(_))
+                    && ty.class_member(db, env, "__getitem__").is_undefined()
+                    && ty.member(db, env, "__class_getitem__").is_undefined()
+            };
+            let unsupported = match value_ty {
+                Type::Union(union) => union.elements(db).iter().copied().any(unsupported_class),
+                _ => unsupported_class(value_ty),
+            };
+            if unsupported {
+                self.infer_expression(slice, TypeContext::default());
+                report_not_subscriptable(&self.context, subscript, value_ty, "__class_getitem__");
+                return Err(Type::unknown());
+            }
+        }
+
         self.store_typed_dict_key_expected_type(slice, value_ty);
 
         let mut constraint_keys = vec![];

@@ -926,6 +926,17 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 ),
                 ast::Operator::BitOr,
             ) => {
+                // Starlark hosts choose whether type values support runtime unions.
+                // Internal Python stubs still use unions to declare their signatures.
+                if env.is_starlark(db)
+                    && self.program_file().is_starlark(db)
+                    && KnownClass::Type
+                        .to_instance(db, env)
+                        .class_member(db, env, "__or__")
+                        .is_undefined()
+                {
+                    return None;
+                }
                 if left_ty.is_equivalent_to(db, env, right_ty) {
                     Some(left_ty)
                 } else {
@@ -956,6 +967,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 | Type::SpecialForm(..),
                 ast::Operator::BitOr,
             ) if instance.has_known_class(db, KnownClass::NoneType) => {
+                if env.is_starlark(db)
+                    && self.program_file().is_starlark(db)
+                    && KnownClass::Type
+                        .to_instance(db, env)
+                        .class_member(db, env, "__or__")
+                        .is_undefined()
+                {
+                    return None;
+                }
                 Some(UnionTypeInstance::from_value_expression_types(
                     db,
                     [left_ty, right_ty],
