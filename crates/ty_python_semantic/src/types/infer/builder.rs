@@ -9550,6 +9550,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         };
 
+        if let Type::KnownInstance(KnownInstanceType::StarlarkGlobal(global)) = callable_type
+            && let Some(result) = self.infer_starlark_call_result(call_expression, global)
+        {
+            return result;
+        }
+
         // Explicit function references already report implementation deprecations.
         // Other calls reference an object or class, not the implicitly invoked method.
         let is_function_reference = matches!(

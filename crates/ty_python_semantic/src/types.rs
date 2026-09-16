@@ -7215,6 +7215,11 @@ impl<'db> Type<'db> {
         }
 
         let class_literal = class.class_literal(db);
+        if let ClassLiteral::Dynamic(class) = class_literal
+            && let Some(signature) = class.synthesized_constructor(db)
+        {
+            return Binding::single(self, signature).into();
+        }
         let class_generic_context = class_literal.generic_context(db);
 
         // Keep bespoke constructor behavior for cases that don't map cleanly to `__new__`/`__init__`.
@@ -8215,7 +8220,24 @@ impl<'db> Type<'db> {
             }),
 
             Type::KnownInstance(known_instance) => match known_instance {
-                KnownInstanceType::StarlarkGlobal(_) => Err(InvalidTypeExpressionError {
+                KnownInstanceType::StarlarkGlobal(global) => {
+                    if global.declaration(db).is_some_and(|declaration| {
+                        matches!(
+                            declaration.kind,
+                            ty_python_core::starlark::StarlarkGlobalKind::Struct
+                        )
+                    }) {
+                        Ok(Type::unknown())
+                    } else {
+                        Err(InvalidTypeExpressionError {
+                            invalid_expressions: smallvec_inline![
+                                InvalidTypeExpression::InvalidType(*self, scope_id)
+                            ],
+                            fallback_type: Type::unknown(),
+                        })
+                    }
+                }
+                KnownInstanceType::StarlarkField(_) => Err(InvalidTypeExpressionError {
                     invalid_expressions: smallvec_inline![InvalidTypeExpression::InvalidType(
                         *self, scope_id
                     )],
@@ -8382,6 +8404,54 @@ impl<'db> Type<'db> {
             Type::Dynamic(_) | Type::Divergent(_) => Ok(*self),
 
             Type::NominalInstance(instance) => match instance.known_class(db) {
+                Some(KnownClass::Tuple) => {
+                    if env.program(db).language(db)
+                        != ty_python_core::program::ProgramLanguage::Starlark
+                    {
+                        return Err(InvalidTypeExpressionError {
+                            invalid_expressions: smallvec_inline![
+                                InvalidTypeExpression::InvalidType(*self, scope_id)
+                            ],
+                            fallback_type: Type::unknown(),
+                        });
+                    }
+                    let Some(tuple) = instance.tuple_spec(db, env) else {
+                        return Ok(Type::unknown());
+                    };
+                    if tuple.as_fixed_length().is_none() {
+                        return Ok(Type::unknown());
+                    }
+                    let mut invalid_expressions = smallvec::SmallVec::default();
+                    let elements = tuple
+                        .fixed_elements()
+                        .map(|element| {
+                            match element.in_type_expression_impl(
+                                db,
+                                scope_id,
+                                typevar_binding_context,
+                                inference_flags,
+                            ) {
+                                Ok(element) => element,
+                                Err(InvalidTypeExpressionError {
+                                    fallback_type,
+                                    invalid_expressions: errors,
+                                }) => {
+                                    invalid_expressions.extend(errors);
+                                    fallback_type
+                                }
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let tuple = Type::heterogeneous_tuple(db, env, elements);
+                    if invalid_expressions.is_empty() {
+                        Ok(tuple)
+                    } else {
+                        Err(InvalidTypeExpressionError {
+                            fallback_type: tuple,
+                            invalid_expressions,
+                        })
+                    }
+                }
                 Some(KnownClass::NoneType) => Ok(Type::none(db, env)),
                 // TODO: Emit an invalid-type-form diagnostic and recover to `Unknown` for
                 // unrecognized `TypeVar` and `TypeVarTuple` instances.
@@ -9535,6 +9605,24 @@ impl<'db> Type<'db> {
 
             Type::KnownInstance(known_instance) => match known_instance {
                 KnownInstanceType::StarlarkGlobal(_) => {}
+                KnownInstanceType::StarlarkField(field) => {
+                    field.annotation(db).find_legacy_typevars_impl(
+                        db,
+                        env,
+                        binding_context,
+                        typevars,
+                        visitor,
+                    );
+                    if let Some(default) = field.default(db) {
+                        default.find_legacy_typevars_impl(
+                            db,
+                            env,
+                            binding_context,
+                            typevars,
+                            visitor,
+                        );
+                    }
+                }
                 KnownInstanceType::UnionType(instance) => {
                     if let Ok(union_type) = instance.union_type(db) {
                         union_type.find_legacy_typevars_impl(
@@ -9730,6 +9818,9 @@ impl<'db> Type<'db> {
             Type::KnownInstance(KnownInstanceType::StarlarkGlobal(_)) => {
                 KnownClass::Str.to_instance(db, env)
             }
+            Type::KnownInstance(KnownInstanceType::StarlarkField(_)) => {
+                KnownClass::Str.to_instance(db, env)
+            }
             Type::KnownInstance(known_instance) => {
                 Type::string_literal(db, known_instance.repr(db, env).to_compact_string())
             }
@@ -9769,6 +9860,9 @@ impl<'db> Type<'db> {
             },
             Type::SpecialForm(special_form) => Type::string_literal(db, &*special_form.to_string()),
             Type::KnownInstance(KnownInstanceType::StarlarkGlobal(_)) => {
+                KnownClass::Str.to_instance(db, env)
+            }
+            Type::KnownInstance(KnownInstanceType::StarlarkField(_)) => {
                 KnownClass::Str.to_instance(db, env)
             }
             Type::KnownInstance(known_instance) => {
@@ -9949,6 +10043,9 @@ impl<'db> Type<'db> {
         parameter_index: Option<usize>,
     ) -> Option<(Span, Span)> {
         match self {
+            Type::ClassLiteral(ClassLiteral::Dynamic(class)) => {
+                class.synthesized_parameter_span(db, parameter_index)
+            }
             Type::FunctionLiteral(function) => Some(function.parameter_span(db, parameter_index)),
             Type::BoundMethod(bound_method) => Some(
                 bound_method

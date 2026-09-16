@@ -232,6 +232,7 @@ impl<'db> ClassBase<'db> {
 
             Type::KnownInstance(known_instance) => match known_instance {
                 KnownInstanceType::StarlarkGlobal(_) => None,
+                KnownInstanceType::StarlarkField(_) => None,
                 KnownInstanceType::SubscriptedGeneric(_) => Some(Self::Generic),
                 KnownInstanceType::SubscriptedProtocol(_) => Some(Self::Protocol),
                 // A class inheriting from a newtype would make intuitive sense, but newtype

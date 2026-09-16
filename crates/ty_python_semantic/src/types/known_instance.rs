@@ -16,7 +16,7 @@ use crate::{
         function::FunctionDecorators,
         generics::{Specialization, walk_generic_context},
         newtype::NewType,
-        starlark::StarlarkGlobal,
+        starlark::{StarlarkField, StarlarkGlobal},
         typevar::TypeVarInstance,
         variance::VarianceInferable,
         visitor,
@@ -210,6 +210,8 @@ impl<'db> MethodWrapper<'db> {
 pub enum KnownInstanceType<'db> {
     /// A callable declaration supplied by the Starlark host.
     StarlarkGlobal(StarlarkGlobal<'db>),
+    /// A typed field descriptor supplied to a host record declaration.
+    StarlarkField(StarlarkField<'db>),
     /// The type of `Protocol[T]`, `Protocol[U, S]`, etc -- usually only found in a class's bases list.
     ///
     /// Note that unsubscripted `Protocol` is represented by [`super::SpecialFormType::Protocol`], not this type.
@@ -298,6 +300,12 @@ pub(super) fn walk_known_instance_type<'db, V: visitor::TypeVisitor<'db> + ?Size
 ) {
     match known_instance {
         KnownInstanceType::StarlarkGlobal(_) => {}
+        KnownInstanceType::StarlarkField(field) => {
+            visitor.visit_type(db, field.annotation(db));
+            if let Some(default) = field.default(db) {
+                visitor.visit_type(db, default);
+            }
+        }
         KnownInstanceType::SubscriptedProtocol(context)
         | KnownInstanceType::SubscriptedGeneric(context) => {
             walk_generic_context(db, context, visitor);
@@ -394,6 +402,9 @@ impl<'db> KnownInstanceType<'db> {
         match self {
             // Nothing to normalize
             Self::StarlarkGlobal(global) => Some(Self::StarlarkGlobal(global)),
+            Self::StarlarkField(field) => field
+                .recursive_type_normalized_impl(db, env, div, nested)
+                .map(Self::StarlarkField),
             Self::SubscriptedProtocol(context) => Some(Self::SubscriptedProtocol(context)),
             Self::SubscriptedGeneric(context) => Some(Self::SubscriptedGeneric(context)),
             Self::Deprecated(deprecated) => Some(Self::Deprecated(deprecated)),
@@ -449,6 +460,7 @@ impl<'db> KnownInstanceType<'db> {
     pub(super) fn class(self, db: &'db dyn Db) -> KnownClass {
         match self {
             Self::StarlarkGlobal(_) => KnownClass::Object,
+            Self::StarlarkField(_) => KnownClass::Object,
             Self::SubscriptedProtocol(_) | Self::SubscriptedGeneric(_) => KnownClass::SpecialForm,
             Self::TypeVar(typevar_instance) if typevar_instance.is_paramspec(db) => {
                 KnownClass::ParamSpec
@@ -576,6 +588,9 @@ impl<'db> KnownInstanceType<'db> {
     ) -> Type<'db> {
         match self {
             KnownInstanceType::StarlarkGlobal(_) => Type::KnownInstance(self),
+            KnownInstanceType::StarlarkField(field) => Type::KnownInstance(Self::StarlarkField(
+                field.apply_type_mapping_impl(db, type_mapping, tcx, visitor),
+            )),
             KnownInstanceType::TypeVar(typevar) => match type_mapping {
                 TypeMapping::BindLegacyTypevars(binding_context) => {
                     Type::TypeVar(BoundTypeVarInstance::new(

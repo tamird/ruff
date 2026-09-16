@@ -3486,6 +3486,12 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                 Type::KnownInstance(KnownInstanceType::StarlarkGlobal(_)),
             ) => self.never(),
 
+            // Field descriptors retain source provenance, not runtime identity.
+            (
+                Type::KnownInstance(KnownInstanceType::StarlarkField(_)),
+                Type::KnownInstance(KnownInstanceType::StarlarkField(_)),
+            ) => self.never(),
+
             // These types are disjoint whenever their represented objects differ.
             (
                 // `LiteralString` can represent different strings and is handled above.

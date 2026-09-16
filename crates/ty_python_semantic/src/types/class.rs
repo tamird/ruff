@@ -2,7 +2,8 @@ use crate::ProgramEnvironment;
 use std::fmt::Write;
 
 pub(crate) use self::dynamic_literal::{
-    DynamicClassAnchor, DynamicClassLiteral, DynamicMetaclassConflict, dynamic_class_bases_argument,
+    DynamicClassAnchor, DynamicClassLiteral, DynamicMetaclassConflict, SynthesizedClass,
+    SynthesizedField, dynamic_class_bases_argument,
 };
 pub(super) use self::enum_literal::{DynamicEnumAnchor, DynamicEnumLiteral, EnumSpec};
 use self::implicit_attributes::{AugmentedBindings, ImplicitAttribute};
@@ -2371,6 +2372,11 @@ impl<'db> ClassType<'db> {
         db: &'db dyn Db,
         receiver: Type<'db>,
     ) -> CallableTypes<'db> {
+        if let ClassLiteral::Dynamic(class) = self.class_literal(db)
+            && let Some(signature) = class.synthesized_constructor(db)
+        {
+            return CallableTypes::one(CallableType::single(db, signature));
+        }
         let env = &ProgramEnvironment::from_file(self.class_literal(db).program_file(db));
         // TODO: This mimics a lot of the logic in Type::try_call_from_constructor. Can we
         // consolidate the two? Can we invoke a class by upcasting the class into a Callable, and

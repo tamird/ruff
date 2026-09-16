@@ -73,6 +73,10 @@ pub enum StarlarkGlobalKind {
         return_type: StarlarkType,
         availability: StarlarkAvailability,
     },
+    Record,
+    RecordWithValidator,
+    Field,
+    Struct,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]

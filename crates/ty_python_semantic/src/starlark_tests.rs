@@ -118,6 +118,341 @@ fn host_check(db: &TestDb, module: StarlarkModule) -> Vec<Diagnostic> {
     check_file_unwrap(db, ProgramFile::new_starlark(db, module, program))
 }
 
+fn record_globals() -> Box<[StarlarkGlobalDeclaration]> {
+    [
+        ("record", StarlarkGlobalKind::Record),
+        (
+            "record_with_validator",
+            StarlarkGlobalKind::RecordWithValidator,
+        ),
+        ("field", StarlarkGlobalKind::Field),
+        ("struct", StarlarkGlobalKind::Struct),
+    ]
+    .map(|(name, kind)| StarlarkGlobalDeclaration {
+        name: Name::new(name),
+        kind,
+    })
+    .into()
+}
+
+#[test]
+fn records_share_constructor_binding_and_field_types() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+        Item = record(value=int, title=field(str, default="untitled"))
+        good = Item(value=1)
+        Item(value="bad")
+        Item(value=True)
+        Item()
+        Item(1)
+        Item(value=1, extra=2)
+        def field_value() -> int:
+            return good.value
+        def wrong_field_value() -> int:
+            return good.title
+        def wrong_instance() -> Item:
+            return 1
+    "#},
+        )
+        .build()?;
+    let module = host_module(&mut db, "/src/root.star", record_globals())?;
+    let diagnostics = host_check(&db, module);
+    let mut actual = codes(&diagnostics);
+    actual.sort();
+    assert_eq!(
+        actual,
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-return-type",
+            "invalid-return-type",
+            "missing-argument",
+            "missing-argument",
+            "too-many-positional-arguments",
+            "unknown-argument"
+        ],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn record_defaults_and_nominal_identity_are_checked() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+        Bad = record(value=field(int, "bad"))
+        First = record(value=int)
+        Second = record(value=int)
+        def accept(value: First) -> First:
+            return value
+        accept(First(value=1))
+        accept(Second(value=1))
+        def wrong() -> Second:
+            return First(value=1)
+    "#},
+        )
+        .build()?;
+    let module = host_module(&mut db, "/src/root.star", record_globals())?;
+    let diagnostics = host_check(&db, module);
+    let mut actual = codes(&diagnostics);
+    actual.sort();
+    assert_eq!(
+        actual,
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-return-type"
+        ],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn struct_fields_retain_functions_constructors_and_special_forms() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+        def identity(value: int) -> int:
+            return value
+        Item = record(value=int)
+        namespace = struct(call=identity, item=Item, forms=struct(record=record, field=field))
+        namespace.call(1)
+        namespace.call("bad")
+        namespace.item(value="bad")
+        Other = namespace.forms.record(value=namespace.forms.field(str, "ok"))
+        Other()
+        Other(value=1)
+        def field_value() -> int:
+            return namespace.item(value=1).value
+    "#},
+        )
+        .build()?;
+    let module = host_module(&mut db, "/src/root.star", record_globals())?;
+    let diagnostics = host_check(&db, module);
+    assert_eq!(
+        codes(&diagnostics),
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type"
+        ],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn record_special_forms_follow_lexical_resolution() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+        make = record
+        descriptor = field
+        Item = make(value=descriptor(int, 1))
+        Item(value="bad")
+        def shadow(record: int) -> int:
+            return record
+        def local_shadow():
+            record = struct
+            return record(value=1)
+        def validate(value):
+            return value
+        Validated = record_with_validator(validate, value=int)
+        Validated(value="bad")
+        record_with_validator(1, value=int)
+    "#},
+        )
+        .build()?;
+    let module = host_module(&mut db, "/src/root.star", record_globals())?;
+    let diagnostics = host_check(&db, module);
+    assert_eq!(
+        codes(&diagnostics),
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type"
+        ],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn record_union_fields_and_unknown_shapes_remain_partial() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+        Item = record(value=int | str, metadata=struct)
+        Item(value=1, metadata=struct())
+        Item(value="ok", metadata=1)
+        Item(value=True, metadata=struct())
+        def dynamic(fields) -> type:
+            return record(**fields)
+        def accepts_struct(value: struct):
+            return value
+    "#},
+        )
+        .build()?;
+    let module = host_module(&mut db, "/src/root.star", record_globals())?;
+    let diagnostics = host_check(&db, module);
+    assert_eq!(
+        codes(&diagnostics),
+        ["invalid-argument-type"],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn record_tuple_fields_describe_fixed_element_types() -> anyhow::Result<()> {
+    let mut db = builder()
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+        Item = record(value=(int, str))
+        Item(value=(1, "ok"))
+        Item(value=1)
+        Item(value=("bad", 1))
+        Empty = record(value=())
+        Empty(value=())
+        Empty(value=(1,))
+    "#},
+        )
+        .build()?;
+    let module = host_module(&mut db, "/src/root.star", record_globals())?;
+    let diagnostics = host_check(&db, module);
+    assert_eq!(
+        codes(&diagnostics),
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type"
+        ],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn loaded_records_keep_logical_identity_and_field_provenance() -> anyhow::Result<()> {
+    let source = "Item = record(value=int)\n";
+    let mut db = builder()
+        .with_file("/src/dep.star", source)
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+            load(":first", First="Item")
+            load(":second", Second="Item")
+            def accepts(value: First):
+                return value
+            accepts(First(value=1))
+            accepts(Second(value=1))
+            First(value="wrong")
+        "#},
+        )
+        .build()?;
+    let root = host_module(&mut db, "/src/root.star", record_globals())?;
+    let first = module(&db, "/src/dep.star", "first")?;
+    let second = module(&db, "/src/dep.star", "second")?;
+    let environment = root.environment(&db);
+    first.set_environment(&mut db).to(environment);
+    second.set_environment(&mut db).to(environment);
+    let root_file = ProgramFile::new_starlark(&db, root, db.program());
+    let parsed = parsed_module(&db, root_file.python_file(&db)).load(&db);
+    let edges = parsed
+        .suite()
+        .iter()
+        .filter_map(|statement| statement.as_expr_stmt())
+        .filter_map(|statement| load_call(&statement.value))
+        .zip([first, second])
+        .map(|(call, module)| StarlarkLoad {
+            range: call.range(),
+            module,
+        })
+        .collect::<Box<[_]>>();
+    root.set_loads(&mut db).to(edges);
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        ["invalid-argument-type", "invalid-argument-type"],
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics[0]
+            .annotations()
+            .iter()
+            .filter_map(|annotation| annotation.get_message())
+            .any(|message| message.contains("first.Item") && message.contains("second.Item")),
+        "{:?}",
+        diagnostics[0]
+    );
+    let field_origin = diagnostics[1]
+        .annotations()
+        .iter()
+        .chain(
+            diagnostics[1]
+                .sub_diagnostics()
+                .iter()
+                .flat_map(|sub| sub.annotations()),
+        )
+        .any(|annotation| {
+            let span = annotation.get_span();
+            span.file() == &UnifiedFile::Ty(first.file(&db))
+                && span.range().is_some_and(|range| {
+                    &source[range.start().to_usize()..range.end().to_usize()] == "int"
+                })
+        });
+    assert!(field_origin, "{:?}", diagnostics[1]);
+
+    db.write_file("/src/dep.star", "Item = record(value=str)\n")?;
+    let diagnostics = host_check(&db, root);
+    assert_eq!(
+        codes(&diagnostics),
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-argument-type"
+        ],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn record_constructors_convert_to_regular_callables() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/root.star",
+            indoc! {r#"
+        from typing import Callable
+        Item = record(value=int)
+        def accepts(maker: Callable[..., Item]):
+            return maker(value=1)
+        accepts(Item)
+        def wrong() -> int:
+            return 1
+        accepts(wrong)
+    "#},
+        )
+        .build()?;
+    let module = host_module(&mut db, "/src/root.star", record_globals())?;
+    let diagnostics = host_check(&db, module);
+    assert_eq!(
+        codes(&diagnostics),
+        ["invalid-argument-type"],
+        "{diagnostics:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn native_aliases_use_regular_argument_and_return_checks() -> anyhow::Result<()> {
     let mut db = builder()

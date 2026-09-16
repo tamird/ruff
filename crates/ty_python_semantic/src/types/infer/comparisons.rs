@@ -414,6 +414,9 @@ impl<'db> Type<'db> {
                 Type::KnownInstance(KnownInstanceType::StarlarkGlobal(_)) => {
                     UpcastResult::unstable(ty)
                 }
+                Type::KnownInstance(KnownInstanceType::StarlarkField(_)) => {
+                    UpcastResult::unstable(ty)
+                }
                 Type::KnownInstance(
                     KnownInstanceType::SubscriptedProtocol(_)
                     | KnownInstanceType::SubscriptedGeneric(_)

@@ -8,7 +8,7 @@ use crate::{
     place::{Place, PlaceAndQualifiers},
     types::{
         ClassBase, ClassLiteral, ClassType, DataclassParams, KnownClass, MemberLookupPolicy,
-        SubclassOfType, Type,
+        Parameter, Parameters, Signature, SubclassOfType, Type,
         class::{
             ClassMemberResult, ClassMetaclass, CodeGeneratorKind, DisjointBase,
             DynamicClassHeaderAnchor, DynamicClassScopeOffset, InstanceMemberResult, MroLookup,
@@ -21,7 +21,11 @@ use crate::{
 };
 use ty_python_core::{definition::Definition, scope::ScopeId};
 
-/// A class created dynamically via a three-argument `type()` or `types.new_class()` call.
+/// A class created by a declaration-producing call.
+///
+/// Python's three-argument `type()` and `types.new_class()` populate a class
+/// namespace. Host declarations can instead synthesize instance fields and a
+/// keyword constructor, with the same nominal identity and member lookup.
 ///
 /// For example:
 /// ```python
@@ -53,7 +57,7 @@ use ty_python_core::{definition::Definition, scope::ScopeId};
 ///   provides stable identity that only changes when the scope itself changes.
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
 pub struct DynamicClassLiteral<'db> {
-    /// The name of the class (from the first argument).
+    /// The name of the class, from the call or its assigned declaration.
     #[returns(ref)]
     pub name: Name,
 
@@ -81,6 +85,25 @@ pub struct DynamicClassLiteral<'db> {
     /// or passed to `dataclass()` as a function.
     #[returns(copy)]
     pub dataclass_params: Option<DataclassParams<'db>>,
+
+    /// Instance storage synthesized by a declaration-producing call. These
+    /// fields are separate from the class namespace and never bind receivers.
+    #[returns(ref)]
+    pub synthesized: Option<SynthesizedClass<'db>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub struct SynthesizedClass<'db> {
+    pub fields: Box<[SynthesizedField<'db>]>,
+    pub keyword_constructor: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub struct SynthesizedField<'db> {
+    pub name: Name,
+    pub ty: Type<'db>,
+    pub default: Option<Type<'db>>,
+    pub origin: Span,
 }
 
 /// Anchor for identifying a dynamic class literal.
@@ -195,6 +218,9 @@ impl<'db> DynamicClassLiteral<'db> {
     ///
     /// Returns `[Unknown]` if the bases iterable is variable-length.
     pub(crate) fn explicit_bases(self, db: &'db dyn Db) -> &'db [Type<'db>] {
+        if self.synthesized(db).is_some() {
+            return &[];
+        }
         /// Inner cached function for deferred inference of bases.
         /// Only called for assigned calls where inference was deferred.
         #[salsa::tracked(returns(deref), cycle_initial=|_, _, _| Box::default(), heap_size=ruff_memory_usage::heap_size)]
@@ -458,9 +484,59 @@ impl<'db> DynamicClassLiteral<'db> {
     /// Look up an instance member defined directly on this class (not inherited).
     ///
     /// Namespace entries are class attributes, not values stored directly on instances.
-    #[expect(clippy::unused_self)]
-    pub(super) fn own_instance_member(self, _db: &'db dyn Db, _name: &str) -> Member<'db> {
-        Member::unbound()
+    pub(super) fn own_instance_member(self, db: &'db dyn Db, name: &str) -> Member<'db> {
+        self.synthesized(db)
+            .as_ref()
+            .and_then(|synthesized| synthesized.fields.iter().find(|field| field.name == name))
+            .map_or_else(Member::unbound, |field| Member {
+                inner: Place::declared(field.ty).with_qualifiers(TypeQualifiers::FINAL),
+            })
+    }
+
+    /// The same signature drives direct construction and conversion to Callable.
+    #[salsa::tracked(returns(clone), heap_size=ruff_memory_usage::heap_size)]
+    pub(crate) fn synthesized_constructor(self, db: &'db dyn Db) -> Option<Signature<'db>> {
+        let SynthesizedClass {
+            fields,
+            keyword_constructor,
+        } = self.synthesized(db).as_ref()?;
+        if !keyword_constructor {
+            return None;
+        }
+        let parameters = fields
+            .iter()
+            .map(|field| {
+                let SynthesizedField {
+                    name,
+                    ty,
+                    default,
+                    origin: _,
+                } = field;
+                let parameter = Parameter::keyword_only(name.clone()).with_annotated_type(*ty);
+                match default {
+                    Some(default) => parameter.with_default_type(*default),
+                    None => parameter,
+                }
+            })
+            .collect::<Vec<_>>();
+        let env = ProgramEnvironment::from_scope(self.scope(db));
+        Some(Signature::new(
+            Parameters::standard(parameters),
+            ClassLiteral::Dynamic(self).to_non_generic_instance(db, &env),
+        ))
+    }
+
+    pub(crate) fn synthesized_parameter_span(
+        self,
+        db: &'db dyn Db,
+        index: Option<usize>,
+    ) -> Option<(Span, Span)> {
+        let synthesized = self.synthesized(db).as_ref()?;
+        let header = self.header_span(db);
+        let parameter = index
+            .and_then(|index| synthesized.fields.get(index))
+            .map_or_else(|| header.clone(), |field| field.origin.clone());
+        Some((header, parameter))
     }
 
     /// Try to compute the MRO for this dynamic class.
@@ -541,6 +617,7 @@ impl<'db> DynamicClassLiteral<'db> {
             self.members(db),
             self.has_dynamic_namespace(db),
             dataclass_params,
+            self.synthesized(db),
         )
     }
 }
@@ -571,6 +648,49 @@ impl<'db> DynamicClassLiteral<'db> {
             None => None,
         };
 
+        let synthesized = match self.synthesized(db) {
+            Some(SynthesizedClass {
+                fields,
+                keyword_constructor,
+            }) => {
+                let fields = fields
+                    .iter()
+                    .map(|field| {
+                        let SynthesizedField {
+                            name,
+                            ty,
+                            default,
+                            origin,
+                        } = field;
+                        let normalize = |ty: Type<'db>| {
+                            let normalized = ty.recursive_type_normalized_impl(db, env, div, true);
+                            if nested {
+                                normalized
+                            } else {
+                                Some(normalized.unwrap_or(div))
+                            }
+                        };
+                        let ty = normalize(*ty)?;
+                        let default = match default {
+                            Some(default) => Some(normalize(*default)?),
+                            None => None,
+                        };
+                        Some(SynthesizedField {
+                            name: name.clone(),
+                            ty,
+                            default,
+                            origin: origin.clone(),
+                        })
+                    })
+                    .collect::<Option<Box<_>>>()?;
+                Some(SynthesizedClass {
+                    fields,
+                    keyword_constructor: *keyword_constructor,
+                })
+            }
+            None => None,
+        };
+
         Some(Self::new(
             db,
             self.name(db),
@@ -578,6 +698,7 @@ impl<'db> DynamicClassLiteral<'db> {
             members,
             self.has_dynamic_namespace(db),
             dataclass_params,
+            synthesized,
         ))
     }
 }

@@ -3715,6 +3715,9 @@ impl<'db> FmtDetailed<'db> for DisplayKnownInstanceRepr<'_, 'db> {
                     f.write_str("Unknown")
                 }
             }
+            KnownInstanceType::StarlarkField(field) => {
+                write!(f, "field[{}]", field.annotation(db).display(db, self.env))
+            }
             KnownInstanceType::Field(field) => {
                 f.with_type(ty).write_str("dataclasses.Field")?;
 

@@ -1689,6 +1689,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     }
                     Type::unknown()
                 }
+                KnownInstanceType::StarlarkField(_) => {
+                    if !self.in_string_annotation() {
+                        self.infer_expression(slice, TypeContext::default());
+                    }
+                    if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
+                        builder.into_diagnostic("Field descriptors cannot be specialized");
+                    }
+                    Type::unknown()
+                }
                 KnownInstanceType::SubscriptedProtocol(_) => {
                     if !self.in_string_annotation() {
                         self.infer_expression(slice, TypeContext::default());

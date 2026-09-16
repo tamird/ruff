@@ -1,5 +1,7 @@
 //! Types for declarations attested by a Starlark host.
 
+use ruff_db::diagnostic::Span;
+use ruff_python_ast::name::Name;
 use ty_python_core::starlark::{
     StarlarkEnvironment, StarlarkGlobalDeclaration, StarlarkGlobalKind, StarlarkParameter,
     StarlarkParameterMode, StarlarkType,
@@ -8,7 +10,10 @@ use ty_python_core::{Program, ProgramFile};
 
 use crate::{Db, ProgramEnvironment};
 
-use super::{CallableType, KnownClass, KnownInstanceType, Parameter, Parameters, Signature, Type};
+use super::{
+    ApplyTypeMappingVisitor, CallableType, KnownClass, KnownInstanceType, Parameter, Parameters,
+    Signature, SubclassOfType, Type, TypeContext, TypeMapping,
+};
 
 /// A host declaration retains its identity through aliases and ordinary call binding.
 ///
@@ -51,6 +56,35 @@ impl<'db> StarlarkGlobal<'db> {
         };
         let StarlarkGlobalDeclaration { name: _, kind } = declaration;
         let signature = match kind {
+            StarlarkGlobalKind::Record => Signature::new(
+                Parameters::standard([Parameter::keyword_variadic(Name::new("fields"))
+                    .with_annotated_type(Type::any())]),
+                SubclassOfType::subclass_of_unknown(),
+            ),
+            StarlarkGlobalKind::RecordWithValidator => Signature::new(
+                Parameters::standard([
+                    Parameter::positional_only(Some(Name::new("validator")))
+                        .with_annotated_type(Type::single_callable(db, Signature::unknown())),
+                    Parameter::keyword_variadic(Name::new("fields"))
+                        .with_annotated_type(Type::any()),
+                ]),
+                SubclassOfType::subclass_of_unknown(),
+            ),
+            StarlarkGlobalKind::Field => Signature::new(
+                Parameters::standard([
+                    Parameter::positional_only(Some(Name::new("type")))
+                        .with_annotated_type(Type::any()),
+                    Parameter::positional_or_keyword(Name::new("default"))
+                        .with_annotated_type(Type::any())
+                        .with_default_type(Type::unknown()),
+                ]),
+                Type::unknown(),
+            ),
+            StarlarkGlobalKind::Struct => Signature::new(
+                Parameters::standard([Parameter::keyword_variadic(Name::new("fields"))
+                    .with_annotated_type(Type::any())]),
+                Type::unknown(),
+            ),
             StarlarkGlobalKind::Native {
                 parameters,
                 return_type,
@@ -92,6 +126,57 @@ impl<'db> StarlarkGlobal<'db> {
             }
         };
         CallableType::single(db, signature)
+    }
+}
+
+/// The typed descriptor returned by the host's `field(type, default)` form.
+#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
+pub struct StarlarkField<'db> {
+    #[returns(copy)]
+    pub annotation: Type<'db>,
+    #[returns(copy)]
+    pub default: Option<Type<'db>>,
+    #[returns(ref)]
+    pub origin: Span,
+}
+
+impl get_size2::GetSize for StarlarkField<'_> {}
+
+impl<'db> StarlarkField<'db> {
+    pub(super) fn recursive_type_normalized_impl(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        div: Type<'db>,
+        nested: bool,
+    ) -> Option<Self> {
+        let normalize = |ty: Type<'db>| {
+            let ty = ty.recursive_type_normalized_impl(db, env, div, true);
+            if nested { ty } else { Some(ty.unwrap_or(div)) }
+        };
+        let annotation = normalize(self.annotation(db))?;
+        let default = match self.default(db) {
+            Some(default) => Some(normalize(default)?),
+            None => None,
+        };
+        Some(Self::new(db, annotation, default, self.origin(db)))
+    }
+
+    pub(super) fn apply_type_mapping_impl(
+        self,
+        db: &'db dyn Db,
+        mapping: &TypeMapping<'_, 'db>,
+        tcx: TypeContext<'db>,
+        visitor: &ApplyTypeMappingVisitor<'_, 'db>,
+    ) -> Self {
+        Self::new(
+            db,
+            self.annotation(db)
+                .apply_type_mapping_impl(db, mapping, tcx, visitor),
+            self.default(db)
+                .map(|ty| ty.apply_type_mapping_impl(db, mapping, tcx, visitor)),
+            self.origin(db),
+        )
     }
 }
 
