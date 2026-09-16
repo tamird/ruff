@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
@@ -17,8 +18,10 @@ use ty_starlark::bazel::{BazelRepository, find_bazel_repository, resolve_bazel_t
 use ty_starlark::graph::{BazelCheckedGraph, check_bazel_graph};
 use ty_starlark::source::BazelSource;
 
+mod editor_system;
 mod host;
 mod problems;
+mod server;
 
 use problems::{bazel_problems, graph_message};
 
@@ -27,7 +30,7 @@ use problems::{bazel_problems, graph_message};
 struct StyDb {
     storage: salsa::Storage<Self>,
     files: Files,
-    system: OsSystem,
+    system: Arc<dyn System>,
     vendored: VendoredFileSystem,
 }
 
@@ -36,7 +39,16 @@ impl StyDb {
         Self {
             storage: salsa::Storage::default(),
             files: Files::default(),
-            system: OsSystem::new(cwd),
+            system: Arc::new(OsSystem::new(cwd)),
+            vendored: VendoredFileSystem::default(),
+        }
+    }
+
+    fn with_system(system: Arc<dyn System>) -> Self {
+        Self {
+            storage: salsa::Storage::default(),
+            files: Files::default(),
+            system,
             vendored: VendoredFileSystem::default(),
         }
     }
@@ -49,7 +61,7 @@ impl Db for StyDb {
     }
 
     fn system(&self) -> &dyn System {
-        &self.system
+        &*self.system
     }
 
     fn vendored(&self) -> &VendoredFileSystem {
@@ -71,6 +83,8 @@ struct Cli {
 enum Command {
     /// Check main-repository `.bzl` labels or one `.star` with its host.
     Check(CheckCommand),
+    /// Serve editor diagnostics for Starlark files.
+    Server,
 }
 
 #[derive(Args)]
@@ -104,10 +118,12 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
-    let Cli {
-        command: Command::Check(options),
-    } = Cli::parse();
+    let Cli { command } = Cli::parse();
     let cwd = absolute_cwd()?;
+    let Command::Check(options) = command else {
+        server::run_stdio(&cwd)?;
+        return Ok(0);
+    };
     if let Some(checker) = options.host_checker.as_ref() {
         return host::run_host(&cwd, checker, &options);
     }

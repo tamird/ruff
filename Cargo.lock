@@ -4257,7 +4257,10 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "gen-lsp-types",
+ "lsp-server",
  "ruff_db",
+ "ruff_notebook",
  "ruff_source_file",
  "ruff_text_size",
  "salsa",

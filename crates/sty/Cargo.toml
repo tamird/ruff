@@ -14,11 +14,14 @@ license.workspace = true
 [dependencies]
 ty_starlark = { workspace = true }
 ruff_db = { workspace = true, features = ["os"] }
+ruff_notebook = { workspace = true }
 ruff_source_file = { workspace = true }
 ruff_text_size = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }
+lsp-server = { workspace = true }
+lsp-types = { workspace = true }
 salsa = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
