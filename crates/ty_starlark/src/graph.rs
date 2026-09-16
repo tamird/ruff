@@ -1,81 +1,34 @@
-//! Source-first checks across the selected main Bazel repository.
-//!
-//! Discover runtime sources once, then check targets before importers. Cycles
-//! never enter recursive Salsa queries, and an opaque target cannot supply a
-//! typed file-block binding even when it has a Ty-only sibling stub.
+//! Bazel load discovery and admission followed by shared Ty analysis.
 
-use std::collections::{HashMap, VecDeque, hash_map::Entry};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 
 use ruff_db::Db;
-use ruff_db::files::File;
-use ruff_text_size::TextRange;
-
-use crate::bazel::{BazelLoadError, resolve_bazel_load};
-use crate::imports::bind_resolved_imports_with;
-pub use crate::imports::{BazelResolvedImportError, BazelResolvedImportFailure};
-use crate::loads::{BazelLoadPlan, BazelLoadPlanFailure, plan_bazel_loads};
-use crate::overlay::{
-    BazelVerificationFailure, BazelVerifiedModule, BazelVerifiedSource, verify_bazel_source,
-    verify_resolved_importer,
+use ruff_db::diagnostic::{Annotation, Diagnostic, DiagnosticId, Severity, Span};
+use ruff_db::files::{File, FileRange};
+use ruff_db::source::source_text;
+use ruff_python_ast::name::Name;
+use ruff_source_file::SourceFileBuilder;
+use ruff_text_size::{Ranged, TextRange};
+use salsa::Setter;
+use ty_python_core::ProgramFile;
+use ty_python_core::starlark::{
+    StarlarkEnvironment, StarlarkGlobalDeclaration, StarlarkGlobalKind, StarlarkLoad,
+    StarlarkModule, StarlarkModuleRole,
 };
+
+use crate::analysis::{AnalysisDb, StarlarkProfile};
+use crate::bazel::{BazelLoadError, resolve_bazel_load};
+use crate::loads::{BazelLoadPlan, BazelLoadPlanError, BazelLoadPlanFailure, plan_bazel_loads};
 use crate::source::BazelSource;
+use crate::stub::{
+    BazelStubAdmission, BazelStubDeclarations, BazelStubError, BazelStubFailure, admit_bazel_stub,
+};
 
-/// One invocation can check several selected `.bzl` sources in one repository.
-/// Discovered dependencies are included so their original problems are visible.
-#[derive(Debug)]
-pub struct BazelCheckedGraph {
-    selected: Box<[File]>,
-    nodes: Box<[BazelGraphNode]>,
-    index: HashMap<File, usize>,
-}
-
-impl BazelCheckedGraph {
-    pub fn selected(&self) -> &[File] {
-        &self.selected
-    }
-
-    pub fn nodes(&self) -> &[BazelGraphNode] {
-        &self.nodes
-    }
-
-    pub fn node(&self, file: File) -> Option<&BazelGraphNode> {
-        self.index
-            .get(&file)
-            .and_then(|index| self.nodes.get(*index))
-    }
-}
-
-#[derive(Debug)]
-pub struct BazelGraphNode {
-    file: File,
-    outcome: BazelGraphOutcome,
-}
-
-impl BazelGraphNode {
-    pub fn file(&self) -> File {
-        self.file
-    }
-
-    pub fn outcome(&self) -> &BazelGraphOutcome {
-        &self.outcome
-    }
-}
-
-#[derive(Debug)]
-pub enum BazelGraphOutcome {
-    Checked(BazelVerifiedModule),
-    Opaque(BazelGraphFailure),
-}
-
-/// The importer owns its own load error; a failed target remains separately
-/// available at `BazelCheckedGraph::node` without copying an entire failure
-/// chain for every dependent file.
-#[derive(Clone, Debug, get_size2::GetSize)]
+#[derive(Clone, Debug)]
 pub struct BazelGraphFailure {
     file: File,
     range: Option<TextRange>,
-    related_file: Option<File>,
-    related_range: Option<TextRange>,
+    related: Option<(File, Option<TextRange>)>,
     reason: BazelGraphError,
 }
 
@@ -84,53 +37,78 @@ impl BazelGraphFailure {
         Self {
             file,
             range,
-            related_file: None,
-            related_range: None,
+            related: None,
             reason,
         }
     }
 
     fn related(mut self, file: File, range: Option<TextRange>) -> Self {
-        self.related_file = Some(file);
-        self.related_range = range;
+        self.related = Some((file, range));
         self
     }
 
-    fn verification(runtime_file: File, failure: &BazelVerificationFailure) -> Self {
-        let mut result = Self::at(
-            failure.file().unwrap_or(runtime_file),
-            failure.range(),
-            BazelGraphError::Source(Box::new(failure.clone())),
-        );
-        if let Some(file) = failure.related_file() {
-            result = result.related(file, failure.related_range());
+    fn analysis(file: File, error: &anyhow::Error) -> Self {
+        Self::at(file, None, BazelGraphError::Analysis(error.to_string()))
+    }
+
+    fn message(&self) -> String {
+        match &self.reason {
+            BazelGraphError::LoadPlan(failure) => match failure.reason() {
+                BazelLoadPlanError::Admission(admission) => admission.reason().to_string(),
+                reason => reason.to_string(),
+            },
+            BazelGraphError::Stub(failure) => match failure.reason() {
+                BazelStubError::Source(admission) => admission.reason().to_string(),
+                reason => {
+                    let message = reason.to_string();
+                    if failure.file().is_none()
+                        && let Some(path) = failure.path()
+                    {
+                        format!("{message}: {path}")
+                    } else {
+                        message
+                    }
+                }
+            },
+            reason => reason.to_string(),
         }
-        result
     }
 
-    pub fn file(&self) -> File {
-        self.file
-    }
-
-    pub fn range(&self) -> Option<TextRange> {
-        self.range
-    }
-
-    pub fn related_file(&self) -> Option<File> {
-        self.related_file
-    }
-
-    pub fn related_range(&self) -> Option<TextRange> {
-        self.related_range
-    }
-
-    pub fn reason(&self) -> &BazelGraphError {
-        &self.reason
+    pub fn diagnostic(&self) -> Diagnostic {
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticId::lint("unsupported-starlark"),
+            Severity::Error,
+            self.message(),
+        );
+        diagnostic.annotate(Annotation::primary(
+            Span::from(self.file).with_optional_range(self.range),
+        ));
+        if let Some((file, range)) = self.related {
+            diagnostic.annotate(
+                Annotation::secondary(Span::from(file).with_optional_range(range))
+                    .message("related source"),
+            );
+        } else if let BazelGraphError::LoadPlan(failure) = &self.reason
+            && let Some(range) = failure.related_range()
+        {
+            diagnostic.annotate(
+                Annotation::secondary(Span::from(self.file).with_range(range))
+                    .message("first bound at"),
+            );
+        }
+        diagnostic
     }
 }
 
-#[derive(Clone, Debug, get_size2::GetSize, thiserror::Error)]
-pub enum BazelGraphError {
+impl std::fmt::Display for BazelGraphFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+impl std::error::Error for BazelGraphFailure {}
+
+#[derive(Clone, Debug, thiserror::Error)]
+enum BazelGraphError {
     #[error("selected .bzl sources belong to different main repositories")]
     MixedRepositories,
     #[error("the Bazel load plan is opaque")]
@@ -138,42 +116,40 @@ pub enum BazelGraphError {
     #[error("cannot resolve the Bazel load target: {0}")]
     Resolution(BazelLoadError),
     #[error("the loaded runtime target is opaque")]
-    Dependency(File),
-    #[error("the checked Bazel load cannot bind a public runtime export")]
-    Import(Box<BazelResolvedImportFailure>),
-    #[error("the selected Bazel runtime source is opaque")]
-    Source(Box<BazelVerificationFailure>),
+    Dependency,
+    #[error("the sibling .bzl.pyi declaration cannot be applied")]
+    Stub(Box<BazelStubFailure>),
     #[error("Bazel load graph contains a cycle")]
     Cycle,
+    #[error("cannot prepare Starlark analysis: {0}")]
+    Analysis(String),
 }
 
 struct PendingGraphNode<'db> {
-    source: BazelSource<'db>,
     file: File,
+    source: BazelSource<'db>,
     edges: Vec<BazelGraphEdge>,
+    declarations: Option<&'db BazelStubDeclarations>,
     failure: Option<BazelGraphFailure>,
 }
 
 struct BazelGraphEdge {
     target: usize,
+    range: TextRange,
     label_range: TextRange,
 }
 
-/// Resolve repository-local loads and verify whole-source exports once per
-/// runtime File in this immutable DB read. Ruff's tracked source, `FileStatus`,
-/// package and marker queries are read anew on each graph invocation, so
-/// source/BUILD/stub edits are observed by the next check in the same DB.
+/// All source, sibling-stub, package and repository reads use the outer database's
+/// tracked filesystem. Each invocation checks a captured graph; diagnostics from
+/// Ty own their snapshots before its analysis database is released.
 pub fn check_bazel_graph<'db>(
     db: &'db dyn Db,
     selections: &[BazelSource<'db>],
-) -> Result<BazelCheckedGraph, BazelGraphFailure> {
+) -> Result<Vec<Diagnostic>, BazelGraphFailure> {
     let Some(first) = selections.first() else {
-        return Ok(BazelCheckedGraph {
-            selected: Box::new([]),
-            nodes: Box::new([]),
-            index: HashMap::new(),
-        });
+        return Ok(Vec::new());
     };
+    let first_file = first.selected_file(db);
     let repository = first.selected_repository(db);
     for source in selections.iter().skip(1) {
         if source.selected_repository(db) != repository {
@@ -184,7 +160,7 @@ pub fn check_bazel_graph<'db>(
             ));
         }
     }
-    let selected: Box<_> = selections
+    let selected: HashSet<_> = selections
         .iter()
         .map(|source| source.selected_file(db))
         .collect();
@@ -199,12 +175,12 @@ pub fn check_bazel_graph<'db>(
                 source: *source,
                 file,
                 edges: Vec::new(),
+                declarations: None,
                 failure: None,
             });
             discover.push_back(pending.len() - 1);
         }
     }
-
     while let Some(node_index) = discover.pop_front() {
         let file = pending[node_index].file;
         let source = pending[node_index].source;
@@ -229,7 +205,6 @@ pub fn check_bazel_graph<'db>(
                                 Some(load.label_range()),
                                 BazelGraphError::Resolution(error),
                             ));
-                            edges.clear();
                             break;
                         }
                     };
@@ -243,6 +218,7 @@ pub fn check_bazel_graph<'db>(
                                 source: target,
                                 file: target_file,
                                 edges: Vec::new(),
+                                declarations: None,
                                 failure: None,
                             });
                             discover.push_back(next);
@@ -251,10 +227,33 @@ pub fn check_bazel_graph<'db>(
                     };
                     edges.push(BazelGraphEdge {
                         target: target_index,
+                        range: load.range(),
                         label_range: load.label_range(),
                     });
                 }
             }
+        }
+        if failure.is_none() {
+            match admit_bazel_stub(db, source) {
+                BazelStubAdmission::Absent => {}
+                BazelStubAdmission::Admitted(declarations) => {
+                    pending[node_index].declarations = Some(declarations);
+                }
+                BazelStubAdmission::Opaque(problem) => {
+                    let mut error = BazelGraphFailure::at(
+                        problem.file().unwrap_or(file),
+                        problem.range(),
+                        BazelGraphError::Stub(Box::new(problem.clone())),
+                    );
+                    if let Some(related) = problem.related() {
+                        error = error.related(related.file(), Some(related.range()));
+                    }
+                    failure = Some(error);
+                }
+            }
+        }
+        if failure.is_some() {
+            edges.clear();
         }
         pending[node_index].edges = edges;
         pending[node_index].failure = failure;
@@ -267,37 +266,36 @@ pub fn check_bazel_graph<'db>(
             reverse[edge.target].push(importer);
         }
     }
-    let mut outcomes: Vec<Option<BazelGraphOutcome>> = (0..pending.len()).map(|_| None).collect();
+    let mut outcomes: Vec<Option<Result<(), BazelGraphFailure>>> =
+        (0..pending.len()).map(|_| None).collect();
     let mut ready: VecDeque<_> = unresolved
         .iter()
         .enumerate()
         .filter_map(|(index, remaining)| (*remaining == 0).then_some(index))
         .collect();
-    peel_checked_nodes(
-        db,
+    peel_nodes(
         &pending,
         &reverse,
         &mut unresolved,
         &mut outcomes,
         &mut ready,
     );
-
     if outcomes.iter().any(Option::is_none) {
         let membership = cycle_membership(&pending, &reverse, &outcomes);
         for (node_index, component) in membership.iter().enumerate() {
             let Some(component) = component else {
                 continue;
             };
-            let file = pending[node_index].file;
-            let range = pending[node_index]
+            let node = &pending[node_index];
+            let range = node
                 .edges
                 .iter()
                 .find(|edge| membership[edge.target] == Some(*component))
                 .map(|edge| edge.label_range);
             complete_node(
                 node_index,
-                BazelGraphOutcome::Opaque(BazelGraphFailure::at(
-                    file,
+                Err(BazelGraphFailure::at(
+                    node.file,
                     range,
                     BazelGraphError::Cycle,
                 )),
@@ -307,8 +305,7 @@ pub fn check_bazel_graph<'db>(
                 &mut ready,
             );
         }
-        peel_checked_nodes(
-            db,
+        peel_nodes(
             &pending,
             &reverse,
             &mut unresolved,
@@ -317,51 +314,168 @@ pub fn check_bazel_graph<'db>(
         );
     }
 
-    let nodes = pending
-        .into_iter()
-        .zip(outcomes)
-        .map(|(node, outcome)| BazelGraphNode {
-            file: node.file,
-            outcome: outcome.unwrap_or_else(|| {
-                // A failed SCC classification may only reduce precision.
-                BazelGraphOutcome::Opaque(BazelGraphFailure::at(
+    let mut analysis = AnalysisDb::new(StarlarkProfile::Bazel)
+        .map_err(|error| BazelGraphFailure::analysis(first_file, &error))?;
+    let mut inputs = Vec::new();
+    for (index, node) in pending.iter().enumerate() {
+        if !matches!(outcomes[index], Some(Ok(()))) {
+            continue;
+        }
+        let source = source_text(db, node.file);
+        let file = analysis
+            .add_source(
+                SourceFileBuilder::new(node.file.path(db).as_str(), source.as_str()).finish(),
+            )
+            .map_err(|error| BazelGraphFailure::analysis(node.file, &error))?;
+        let mut annotations = Box::default();
+        if let Some(declarations) = node.declarations {
+            let original = declarations.file();
+            let text = source_text(db, original);
+            let stub = analysis
+                .add_source(
+                    SourceFileBuilder::new(original.path(db).as_str(), text.as_str()).finish(),
+                )
+                .map_err(|error| BazelGraphFailure::analysis(original, &error))?;
+            annotations = declarations.annotations().to_vec().into_boxed_slice();
+            for function in &mut annotations {
+                for parameter in &mut function.parameters {
+                    parameter.annotation.origin =
+                        FileRange::new(stub, parameter.annotation.origin.range());
+                }
+                if let Some(annotation) = &mut function.returns {
+                    annotation.origin = FileRange::new(stub, annotation.origin.range());
+                }
+            }
+        }
+        inputs.push((index, file, annotations));
+    }
+    let environment = StarlarkEnvironment::new(
+        &analysis,
+        Box::new([StarlarkGlobalDeclaration {
+            name: Name::new("struct"),
+            kind: StarlarkGlobalKind::Struct,
+        }]),
+    );
+    let mut modules = vec![None; pending.len()];
+    for (index, file, annotations) in inputs {
+        let node = &pending[index];
+        let role = if selected.contains(&node.file) {
+            StarlarkModuleRole::Root
+        } else {
+            StarlarkModuleRole::Loaded
+        };
+        modules[index] = Some(StarlarkModule::new(
+            &analysis,
+            file,
+            Name::new(node.file.path(db).as_str()),
+            Box::default(),
+            annotations,
+            Some(environment),
+            role,
+        ));
+    }
+    for (index, module) in modules.iter().enumerate() {
+        let Some(module) = module else {
+            continue;
+        };
+        let loads = pending[index]
+            .edges
+            .iter()
+            .map(|edge| {
+                let target = modules[edge.target].ok_or_else(|| {
+                    BazelGraphFailure::analysis(
+                        pending[index].file,
+                        &anyhow::anyhow!("admitted load has no semantic module"),
+                    )
+                })?;
+                Ok(StarlarkLoad {
+                    range: edge.range,
+                    module: target,
+                })
+            })
+            .collect::<Result<_, BazelGraphFailure>>()?;
+        module.set_loads(&mut analysis).to(loads);
+    }
+    let program = analysis.program();
+    let mut checked = Vec::new();
+    let mut admission = Vec::new();
+    for (index, node) in pending.iter().enumerate() {
+        match &outcomes[index] {
+            Some(Ok(())) => {
+                let module = modules[index].ok_or_else(|| {
+                    BazelGraphFailure::analysis(
+                        node.file,
+                        &anyhow::anyhow!("admitted source has no semantic module"),
+                    )
+                })?;
+                checked.extend(ty_python_semantic::check_file_unwrap(
+                    &analysis,
+                    ProgramFile::new_starlark(&analysis, module, program),
+                ));
+            }
+            Some(Err(failure)) => admission.push(failure.diagnostic()),
+            None => {
+                return Err(BazelGraphFailure::analysis(
                     node.file,
-                    node.edges.first().map(|edge| edge.label_range),
-                    BazelGraphError::Cycle,
-                ))
-            }),
-        })
-        .collect();
-    Ok(BazelCheckedGraph {
-        selected,
-        nodes,
-        index,
-    })
+                    &anyhow::anyhow!("load graph admission did not complete"),
+                ));
+            }
+        }
+    }
+    // Only semantic annotations belong to the inner database. Admission errors
+    // still refer to outer files, so freeze semantic results before combining them.
+    analysis
+        .freeze(&mut checked)
+        .map_err(|error| BazelGraphFailure::analysis(first_file, &error))?;
+    checked.extend(admission);
+    Ok(checked)
 }
 
-fn peel_checked_nodes(
-    db: &dyn Db,
+fn peel_nodes(
     pending: &[PendingGraphNode<'_>],
     reverse: &[Vec<usize>],
     unresolved: &mut [usize],
-    outcomes: &mut [Option<BazelGraphOutcome>],
+    outcomes: &mut [Option<Result<(), BazelGraphFailure>>],
     ready: &mut VecDeque<usize>,
 ) {
-    while let Some(node_index) = ready.pop_front() {
-        if outcomes[node_index].is_some() {
+    while let Some(index) = ready.pop_front() {
+        if outcomes[index].is_some() {
             continue;
         }
-        let outcome = check_node(db, &pending[node_index], pending, outcomes);
-        complete_node(node_index, outcome, reverse, unresolved, outcomes, ready);
+        let node = &pending[index];
+        let mut failure = node.failure.clone();
+        if failure.is_none() {
+            for edge in &node.edges {
+                if let Some(Err(problem)) = &outcomes[edge.target] {
+                    failure = Some(
+                        BazelGraphFailure::at(
+                            node.file,
+                            Some(edge.label_range),
+                            BazelGraphError::Dependency,
+                        )
+                        .related(problem.file, problem.range),
+                    );
+                    break;
+                }
+            }
+        }
+        complete_node(
+            index,
+            failure.map_or(Ok(()), Err),
+            reverse,
+            unresolved,
+            outcomes,
+            ready,
+        );
     }
 }
 
 fn complete_node(
     index: usize,
-    outcome: BazelGraphOutcome,
+    outcome: Result<(), BazelGraphFailure>,
     reverse: &[Vec<usize>],
     unresolved: &mut [usize],
-    outcomes: &mut [Option<BazelGraphOutcome>],
+    outcomes: &mut [Option<Result<(), BazelGraphFailure>>],
     ready: &mut VecDeque<usize>,
 ) {
     outcomes[index] = Some(outcome);
@@ -373,79 +487,12 @@ fn complete_node(
     }
 }
 
-fn check_node<'db>(
-    db: &'db dyn Db,
-    node: &PendingGraphNode<'db>,
-    pending: &[PendingGraphNode<'db>],
-    outcomes: &[Option<BazelGraphOutcome>],
-) -> BazelGraphOutcome {
-    let file = node.file;
-    if let Some(failure) = &node.failure {
-        return BazelGraphOutcome::Opaque(failure.clone());
-    }
-    if node.edges.is_empty() {
-        return match verify_bazel_source(db, node.source) {
-            BazelVerifiedSource::Checked(module) => BazelGraphOutcome::Checked(module.clone()),
-            BazelVerifiedSource::Opaque(failure) => {
-                BazelGraphOutcome::Opaque(BazelGraphFailure::verification(file, failure))
-            }
-        };
-    }
-    for edge in &node.edges {
-        if let Some(BazelGraphOutcome::Opaque(failure)) = outcomes[edge.target].as_ref() {
-            return BazelGraphOutcome::Opaque(
-                BazelGraphFailure::at(
-                    file,
-                    Some(edge.label_range),
-                    BazelGraphError::Dependency(pending[edge.target].file),
-                )
-                .related(failure.file(), failure.range()),
-            );
-        }
-    }
-    let checked: HashMap<_, _> = node
-        .edges
-        .iter()
-        .filter_map(|edge| match &outcomes[edge.target] {
-            Some(BazelGraphOutcome::Checked(module)) => Some((pending[edge.target].file, module)),
-            _ => None,
-        })
-        .collect();
-    let imports = match bind_resolved_imports_with(db, node.source, |source| {
-        checked
-            .get(&source.selected_file(db))
-            .copied()
-            .ok_or(BazelResolvedImportError::UnverifiedTarget)
-    }) {
-        Ok(imports) => imports,
-        Err(failure) => {
-            return BazelGraphOutcome::Opaque(
-                BazelGraphFailure::at(
-                    failure.file(),
-                    failure.range(),
-                    BazelGraphError::Import(Box::new(failure.clone())),
-                )
-                .related(
-                    failure.related_file().unwrap_or(file),
-                    failure.related_range(),
-                ),
-            );
-        }
-    };
-    match verify_resolved_importer(db, node.source, &imports) {
-        BazelVerifiedSource::Checked(module) => BazelGraphOutcome::Checked(module),
-        BazelVerifiedSource::Opaque(failure) => {
-            BazelGraphOutcome::Opaque(BazelGraphFailure::verification(file, &failure))
-        }
-    }
-}
-
 /// Iterative Kosaraju pass over residual nodes. Only actual SCCs become
 /// cycles; the Kahn peel then marks their importers as opaque dependencies.
 fn cycle_membership(
     pending: &[PendingGraphNode<'_>],
     reverse: &[Vec<usize>],
-    outcomes: &[Option<BazelGraphOutcome>],
+    outcomes: &[Option<Result<(), BazelGraphFailure>>],
 ) -> Vec<Option<usize>> {
     let active: Vec<_> = outcomes.iter().map(Option::is_none).collect();
     let mut visited = vec![false; pending.len()];

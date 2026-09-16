@@ -1,22 +1,24 @@
 //! Ty-only declarations for a stable, unannotated Bazel `.bzl` source.
 //!
 //! Bazel does not load `.bzl.pyi` files. A declaration never creates a runtime
-//! binding or proves its result; the runtime source must pass its own preflight
-//! before this module exposes a sibling's declarations.
+//! binding. Match declarations to admitted source functions and pass their
+//! types and locations to Ty, which checks the original bodies and defaults.
 
 use std::collections::HashSet;
 
 use ruff_db::Db;
-use ruff_db::files::{File, FileError, system_path_to_file};
+use ruff_db::files::{File, FileError, FileRange, system_path_to_file};
 use ruff_db::source::{SourceTextError, source_text};
 use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_python_ast::{self as ast, Expr, PySourceType, PythonVersion, Stmt};
 use ruff_python_parser::{ParseError, ParseOptions, UnsupportedSyntaxError, parse_unchecked};
 use ruff_text_size::{Ranged, TextRange};
 
-use crate::checker::BazelScalar;
-use crate::preflight::{BazelPreflight, BazelPreflightFailure, preflight_bazel_source};
-use crate::source::BazelSource;
+use ty_python_core::starlark::{
+    StarlarkAnnotation, StarlarkFunctionAnnotations, StarlarkParameterAnnotation, StarlarkType,
+};
+
+use crate::source::{BazelAdmissionFailure, BazelSource, BazelSourceAdmission, admit_bazel_source};
 
 /// Absence means Ruff's tracked status has no resolvable regular sibling;
 /// inaccessible paths and unresolved links can appear absent. An existing
@@ -28,87 +30,36 @@ pub enum BazelStubAdmission {
     Opaque(BazelStubFailure),
 }
 
-/// Declaration syntax only: no return value has been verified against source.
+/// Matched annotations retain original source ranges and companion locations.
 #[derive(Debug, get_size2::GetSize)]
 pub struct BazelStubDeclarations {
     file: File,
-    functions: Box<[BazelStubFunction]>,
+    annotations: Box<[StarlarkFunctionAnnotations]>,
 }
 
 impl BazelStubDeclarations {
-    pub fn file(&self) -> File {
+    pub(crate) fn file(&self) -> File {
         self.file
     }
-
-    pub fn functions(&self) -> &[BazelStubFunction] {
-        &self.functions
-    }
-
-    pub fn function(&self, name: &str) -> Option<&BazelStubFunction> {
-        self.functions.iter().find(|function| function.name == name)
+    pub(crate) fn annotations(&self) -> &[StarlarkFunctionAnnotations] {
+        &self.annotations
     }
 }
 
-#[derive(Debug, get_size2::GetSize)]
-pub struct BazelStubFunction {
+struct BazelStubFunction {
     name: String,
     range: TextRange,
     parameters: Box<[BazelStubParameter]>,
-    result: BazelScalar,
+    result: StarlarkType,
     result_range: TextRange,
 }
 
-impl BazelStubFunction {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn range(&self) -> TextRange {
-        self.range
-    }
-
-    pub fn parameters(&self) -> &[BazelStubParameter] {
-        &self.parameters
-    }
-
-    pub fn result(&self) -> BazelScalar {
-        self.result
-    }
-
-    pub fn result_range(&self) -> TextRange {
-        self.result_range
-    }
-}
-
-#[derive(Debug, get_size2::GetSize)]
-pub struct BazelStubParameter {
+struct BazelStubParameter {
     name: String,
     name_range: TextRange,
     annotation_range: TextRange,
-    scalar: BazelScalar,
+    scalar: StarlarkType,
     has_default: bool,
-}
-
-impl BazelStubParameter {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn name_range(&self) -> TextRange {
-        self.name_range
-    }
-
-    pub fn annotation_range(&self) -> TextRange {
-        self.annotation_range
-    }
-
-    pub fn scalar(&self) -> BazelScalar {
-        self.scalar
-    }
-
-    pub fn has_default(&self) -> bool {
-        self.has_default
-    }
 }
 
 /// Source failures have a source File; a directory sibling retains its path.
@@ -118,9 +69,15 @@ pub struct BazelStubFailure {
     path: Option<SystemPathBuf>,
     range: Option<TextRange>,
     reason: BazelStubError,
+    #[get_size(ignore)] // FileRange owns no heap storage.
+    related: Option<FileRange>,
 }
 
 impl BazelStubFailure {
+    pub fn related(&self) -> Option<FileRange> {
+        self.related
+    }
+
     pub fn file(&self) -> Option<File> {
         self.file
     }
@@ -141,7 +98,7 @@ impl BazelStubFailure {
 #[derive(Clone, Debug, get_size2::GetSize, thiserror::Error)]
 pub enum BazelStubError {
     #[error("the selected Bazel source is opaque")]
-    Source(BazelPreflightFailure),
+    Source(BazelAdmissionFailure),
     #[error("the selected Bazel source has no system path")]
     InvalidSourcePath,
     #[error("the sibling .bzl.pyi path is a directory")]
@@ -154,6 +111,14 @@ pub enum BazelStubError {
     PythonVersion(UnsupportedSyntaxError),
     #[error("cannot check {0} in this Ty-only .bzl.pyi subset")]
     Unsupported(&'static str),
+    #[error(".bzl.pyi declaration '{0}' does not name a public source function")]
+    MissingFunction(String),
+    #[error(".bzl.pyi signature for '{0}' has different parameter kinds or count")]
+    ParameterShape(String),
+    #[error(".bzl.pyi parameter '{declared}' does not match source parameter '{runtime}'")]
+    ParameterName { declared: String, runtime: String },
+    #[error(".bzl.pyi parameter '{0}' disagrees with the source default's presence")]
+    DefaultPresence(String),
     #[error("duplicate .bzl.pyi declaration '{0}'")]
     DuplicateFunction(String),
     #[error("duplicate .bzl.pyi parameter '{0}'")]
@@ -166,23 +131,22 @@ pub enum BazelStubError {
 pub fn admit_bazel_stub(db: &dyn Db, source: BazelSource<'_>) -> BazelStubAdmission {
     let source_file = source.selected_file(db);
     let source_path = source_file.path(db).as_system_path();
-    match preflight_bazel_source(db, source) {
-        BazelPreflight::Opaque(failure) => {
+    let suite = match admit_bazel_source(db, source) {
+        BazelSourceAdmission::Opaque(failure) => {
             return BazelStubAdmission::Opaque(BazelStubFailure {
                 file: Some(source_file),
                 path: source_path.map(SystemPath::to_path_buf),
                 range: failure.range(),
                 reason: BazelStubError::Source(failure.clone()),
+                related: None,
             });
         }
-        BazelPreflight::Ready => {}
-    }
-    parse_bazel_stub_sibling(db, source_file)
+        BazelSourceAdmission::Admitted(admitted) => admitted.suite(),
+    };
+    parse_bazel_stub_sibling(db, source_file, suite)
 }
 
-/// Parse sibling syntax only. The source-only admission query and graph-aware
-/// verifier must each check the current runtime before trusting declarations.
-pub(crate) fn parse_bazel_stub_sibling(db: &dyn Db, source_file: File) -> BazelStubAdmission {
+fn parse_bazel_stub_sibling(db: &dyn Db, source_file: File, suite: &[Stmt]) -> BazelStubAdmission {
     let source_path = source_file.path(db).as_system_path();
     let Some(source_path) = source_path else {
         // The source validator normally rejects virtual and vendored files.
@@ -191,6 +155,7 @@ pub(crate) fn parse_bazel_stub_sibling(db: &dyn Db, source_file: File) -> BazelS
             path: None,
             range: None,
             reason: BazelStubError::InvalidSourcePath,
+            related: None,
         });
     };
     let stub_path = SystemPathBuf::from(format!("{}.pyi", source_path.as_str()));
@@ -279,9 +244,24 @@ pub(crate) fn parse_bazel_stub_sibling(db: &dyn Db, source_file: File) -> BazelS
             }
         }
     }
+    let mut annotations = Vec::with_capacity(functions.len());
+    for declaration in functions {
+        match match_function(source_file, suite, stub_file, &declaration) {
+            Ok(annotation) => annotations.push(annotation),
+            Err((range, related, reason)) => {
+                return BazelStubAdmission::Opaque(BazelStubFailure {
+                    file: Some(stub_file),
+                    path: Some(stub_path),
+                    range: Some(range),
+                    reason,
+                    related,
+                });
+            }
+        }
+    }
     BazelStubAdmission::Admitted(BazelStubDeclarations {
         file: stub_file,
-        functions: functions.into_boxed_slice(),
+        annotations: annotations.into_boxed_slice(),
     })
 }
 
@@ -296,6 +276,78 @@ fn opaque(
         path: Some(path),
         range,
         reason,
+        related: None,
+    })
+}
+
+/// Declaration matching is structural. Ty owns value compatibility and body checks.
+fn match_function(
+    source_file: File,
+    suite: &[Stmt],
+    stub_file: File,
+    declaration: &BazelStubFunction,
+) -> Result<StarlarkFunctionAnnotations, (TextRange, Option<FileRange>, BazelStubError)> {
+    let function = suite
+        .iter()
+        .filter_map(Stmt::as_function_def_stmt)
+        .find(|function| {
+            function.name.as_str() == declaration.name && !declaration.name.starts_with('_')
+        })
+        .ok_or_else(|| {
+            (
+                declaration.range,
+                None,
+                BazelStubError::MissingFunction(declaration.name.clone()),
+            )
+        })?;
+    let parameters = &function.parameters;
+    if !parameters.posonlyargs.is_empty()
+        || parameters.vararg.is_some()
+        || !parameters.kwonlyargs.is_empty()
+        || parameters.kwarg.is_some()
+        || parameters.args.len() != declaration.parameters.len()
+    {
+        return Err((
+            declaration.range,
+            Some(FileRange::new(source_file, function.name.range())),
+            BazelStubError::ParameterShape(declaration.name.clone()),
+        ));
+    }
+    let mut annotations = Vec::with_capacity(declaration.parameters.len());
+    for (actual, declared) in parameters.args.iter().zip(&declaration.parameters) {
+        let related = Some(FileRange::new(source_file, actual.parameter.range()));
+        if actual.name().as_str() != declared.name {
+            return Err((
+                declared.name_range,
+                related,
+                BazelStubError::ParameterName {
+                    declared: declared.name.clone(),
+                    runtime: actual.name().to_string(),
+                },
+            ));
+        }
+        if actual.default().is_some() != declared.has_default {
+            return Err((
+                declared.name_range,
+                related,
+                BazelStubError::DefaultPresence(declared.name.clone()),
+            ));
+        }
+        annotations.push(StarlarkParameterAnnotation {
+            parameter: actual.parameter.range(),
+            annotation: StarlarkAnnotation {
+                ty: declared.scalar,
+                origin: FileRange::new(stub_file, declared.annotation_range),
+            },
+        });
+    }
+    Ok(StarlarkFunctionAnnotations {
+        function: function.range(),
+        parameters: annotations.into_boxed_slice(),
+        returns: Some(StarlarkAnnotation {
+            ty: declaration.result,
+            origin: FileRange::new(stub_file, declaration.result_range),
+        }),
     })
 }
 
@@ -391,15 +443,15 @@ fn parse_function(
     })
 }
 
-fn primitive(annotation: &Expr) -> Option<BazelScalar> {
+fn primitive(annotation: &Expr) -> Option<StarlarkType> {
     match annotation {
         Expr::Name(name) => match name.id.as_str() {
-            "int" => Some(BazelScalar::Int),
-            "str" => Some(BazelScalar::Str),
-            "bool" => Some(BazelScalar::Bool),
+            "int" => Some(StarlarkType::Int),
+            "str" => Some(StarlarkType::Str),
+            "bool" => Some(StarlarkType::Bool),
             _ => None,
         },
-        Expr::NoneLiteral(_) => Some(BazelScalar::None),
+        Expr::NoneLiteral(_) => Some(StarlarkType::None),
         _ => None,
     }
 }

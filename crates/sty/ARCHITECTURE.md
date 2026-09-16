@@ -1,31 +1,19 @@
 # Shared Starlark analysis
 
-## Status and target
-
-Hosted `.star` graphs use Ty's inference for types, scopes, calls, records,
-and diagnostics. Their frontend validates captured sources and host facts,
-then creates explicit Starlark semantic inputs. The former hosted type
-model, argument mapper, and proof counters have been removed.
-
-The Bazel frontend still uses its scalar analyzer. Its remaining migration
-requires external function annotations; see the Bazel declarations section
-below.
-
-Success means removing the replaced inference, signature, and assignability
-code. A second implementation behind a backend switch would add maintenance
-work. Each production migration must replace a complete mechanism and keep
-its existing conformance tests.
+Bazel `.bzl` and hosted `.star` sources use Ty's semantic engine. The
+frontends admit syntax, resolve loads, and provide declarations; Ty owns
+inference, argument binding, assignability, and body checking.
 
 ## Ownership
 
-| Owner                | Responsibility                                                                                              |
-| -------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `sty`                | CLI targets, editor documents, host process lifecycle, configuration, and presentation                      |
-| `ty_starlark`        | Starlark syntax admission, Bazel roots and labels, resolved load bindings, host facts, and dialect policies |
-| `ty_python_core`     | Semantic module identity, definitions, scopes, use/definition maps, and dependency tracking                 |
-| `ty_python_semantic` | Types, signatures, argument binding, assignability, function bodies, returns, and semantic diagnostics      |
-| `ruff_db`            | Source snapshots, parsing infrastructure, diagnostic spans, and rendering                                   |
-| External host        | Its parser, private loader, and declarations of native capabilities                                         |
+| Owner                | Responsibility                                                                                         |
+| -------------------- | ------------------------------------------------------------------------------------------------------ |
+| `sty`                | CLI targets, editor documents, host process lifecycle, configuration, and presentation                 |
+| `ty_starlark`        | Starlark syntax admission, Bazel roots and labels, resolved load bindings, and host facts              |
+| `ty_python_core`     | Semantic module identity, definitions, scopes, use/definition maps, and dependency tracking            |
+| `ty_python_semantic` | Types, signatures, argument binding, assignability, function bodies, returns, and semantic diagnostics |
+| `ruff_db`            | Source snapshots, parsing infrastructure, diagnostic spans, and rendering                              |
+| External host        | Its parser, private loader, and declarations of native capabilities                                    |
 
 The external host continues to produce a declarative source graph. Sty owns
 static analysis. Native execution, deployment evaluation, and host runtime
@@ -46,19 +34,20 @@ sources while definitions remain separate for distinct logical modules.
 The physical file stays fixed for each module instance; its contents and
 resolved edges can be updated through tracked inputs.
 
-Captured source, resolved edges, and host declarations must enter the
-database as tracked inputs. Updating a loaded source or changing an edge
-must invalidate its importers. A host result's source text must never be
-replaced by a later disk read. Concurrent host profiles or captured revisions
-must not share semantic results merely because their paths match.
+Each check captures its graph in a fresh in-memory semantic database,
+[`AnalysisDb`](../ty_starlark/src/analysis.rs). Sources, resolved edges, and
+host declarations become tracked inputs within that database. Bazel reads
+source, companion, package, and repository files through the outer database's
+tracked filesystem; editor changes trigger a new graph check. Semantic caches
+currently live for one check, so the LSP does not reuse inference across edits.
+A host result's captured text is never replaced by a later disk read.
 
 ## Loads and builtins
 
 Each admitted `load` binding is a definition at its original string or alias
 span, with the resolved target module and exported name.
-The frontend supplies resolution; the semantic engine must not reinterpret
-Bazel labels as Python imports. Handle the load statement as definitions
-instead of inferring an ordinary call to a global named `load`.
+The frontend supplies resolution. The semantic index records the load's
+bindings directly, and inference reads the resolved module's exports.
 
 Ty's Python imports and Starlark loads share the explicit end-of-module
 lookup in [`exported_symbol`](../ty_python_semantic/src/place.rs). Python's
@@ -72,8 +61,11 @@ without the unreachable region's narrowing. Live uses and module exports
 retain the usual control-flow analysis. This keeps a dead assignment from
 changing an exported type while still checking calls inside that branch.
 
-Use program-specific builtin declarations through the existing custom
-standard-library mechanism. The
+The existing custom standard-library mechanism supplies builtin declarations.
+Shared methods live in [`builtins.pyi`](../ty_starlark/resources/starlark/builtins.pyi);
+small Bazel and hosted fragments select differing signatures, visible globals,
+and type-value operations. They form one builtin module so Ty retains its
+canonical builtin identities. The
 [custom-typeshed regression](../ty_python_semantic/resources/mdtest/mdtest_custom_typeshed.md)
 proves that Ty's existing argument and return checks distinguish `bool`
 from `int` when their builtin classes are unrelated, while normal Python
@@ -110,53 +102,48 @@ converted to an owned source snapshot. No database file handle escapes.
 
 ## Bazel declarations
 
-The existing [`overlay`](../ty_starlark/src/overlay.rs) checks runtime
-function bodies before exposing `.bzl.pyi` signatures. Preserve that
-contract. External annotations must supply types to signature construction,
-body parameters, and return checking, with declaration spans in the stub.
-Simply resolving a load to the stub would bypass the runtime-body check.
+[`stub.rs`](../ty_starlark/src/stub.rs) parses the exact `.bzl.pyi` sibling and
+matches each declaration to a public source function. The MVP supports
+`int`, `str`, `bool`, and `None` annotations on positional-or-keyword functions.
+Parameter names, kinds, counts, and default presence must match; malformed or
+unmatched declarations reject the companion as a whole.
+
+`StarlarkFunctionAnnotations` attaches types to original function and parameter
+ranges, with separate companion origins. Ty's shared signature, parameter,
+default, reassignment, and return checks consume those annotations. Loads still
+resolve to source definitions. Semantic errors stay attached to the offending
+source; they do not turn the whole load graph into an opaque module.
+
+Syntax, label, companion, and cycle failures prevent dependent modules from
+being analyzed. Independent admitted modules remain checkable.
 
 Unannotated functions use Ty's ordinary inference. In particular, their
 parameters and return values can remain unknown. Callers do not specialize
 helper bodies; `.bzl.pyi` annotations supply the missing constraints. Those
-annotations must also check source bodies, defaults, and reassignments.
+annotations constrain source bodies, defaults, and reassignments.
 
 ## Diagnostics and editor integration
 
-Both frontends now produce `ruff_db::Diagnostic` through
-[`diagnostics.rs`](src/diagnostics.rs). Hosted diagnostics own immutable
-`SourceFile` spans. The CLI uses Ruff's renderer; the editor converts those
-same diagnostics to LSP. The old CLI reporters and editor snapshot renderer
-have been removed.
+Both frontends produce `ruff_db::Diagnostic` values.
+Semantic diagnostics own immutable `SourceFile` spans. The CLI uses Ruff's
+renderer; the editor converts those same diagnostics to LSP.
+[`diagnostics.rs`](src/diagnostics.rs) also projects host admission failures
+onto the captured source graph.
 
 The LSP conversion preserves located subdiagnostics and secondary annotations.
 Embedded builtin declarations have display-only names; their annotations
-appear as text when no editor location exists. Keep
-document synchronization and host-worker scheduling separate from semantic
-analysis. Sharing Ty's entire Python project server is not a prerequisite
-for sharing its analysis.
+appear as text when no editor location exists. Sty owns document synchronization
+and host-worker scheduling, independently of Ty's Python project server.
 
-## Migration gates
+## MVP limits
 
-1. Establish the module identity and load-definition boundary with Ty
-    tests: aliases, shadowing, final exports, original spans, and importer
-    invalidation. Include two logical modules sharing one physical source.
-    Also check one physical source under distinct builtin/host profiles and
-    captured revisions in the same database.
-1. Prove nominal records, union fields, native signatures, and annotated
-    function bodies through Ty. Cover wrong nominal arguments, constructor
-    keyword rules, callable fields, loaded `struct` members, related spans,
-    and invalid returns.
-1. Route the hosted frontend through that path and remove `StarKnownType`,
-    `type_accepts`, source-function signatures, native argument mapping, and
-    the replaced analysis in [`star.rs`](../ty_starlark/src/star.rs).
-1. Supply Bazel external declarations to the same
-    engine. Remove the replaced inference in
-    [`checker.rs`](../ty_starlark/src/checker.rs),
-    [`imports.rs`](../ty_starlark/src/imports.rs), and
-    [`overlay.rs`](../ty_starlark/src/overlay.rs); retain frontend admission,
-    label resolution, and declaration validation.
+The Bazel frontend selects files in one main repository, not arbitrary Bazel
+build targets or external repositories. Its builtin inventory is a subset of
+Bazel's language environment; Bazel rule, provider, and repository APIs are
+not yet declared. The shared Python parser also rejects some valid Starlark
+forms, including positional symbols after named aliases in `load`.
 
-Keep each change reviewable against its Python users as well as its
-Starlark users. Add shared interfaces alongside real consumers, and avoid
-broad crate renames or a generic compiler framework during these steps.
+The server publishes diagnostics and related locations. It does not yet
+provide completion, hover, or navigation. A single CLI invocation selects
+either Bazel or a configured hosted graph; it does not combine Python and
+Starlark projects.

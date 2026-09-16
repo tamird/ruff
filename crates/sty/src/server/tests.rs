@@ -672,15 +672,17 @@ fn unsaved_bazel_source_reports_utf16_and_related_uri_then_restores_disk() {
     let error = &publication.diagnostics[0];
     assert_eq!(
         error.code,
-        Some(lsp_types::Code::String("invalid-argument-count".into()))
+        Some(lsp_types::Code::String(
+            "too-many-positional-arguments".into()
+        ))
     );
     assert!(
-        has_error(&publication.diagnostics, "expects 1 positional argument"),
+        has_error(&publication.diagnostics, "Too many positional arguments"),
         "{publication:?}"
     );
     assert_eq!(error.range.start.line, 2);
-    assert_eq!(error.range.start.character, 11);
-    assert_eq!(error.range.end.character, 28);
+    assert_eq!(error.range.start.character, 26);
+    assert_eq!(error.range.end.character, 27);
     assert_eq!(
         error.related_information.as_ref().unwrap()[0].location.uri,
         server.uri("shared/defs.bzl")
@@ -729,7 +731,10 @@ fn unsaved_loaded_file_and_stub_recheck_importer_and_close_restores_disk() {
     );
     let changed = server.published("pkg/entry.bzl");
     assert!(
-        has_error(&changed.diagnostics, "expects 2 positional arguments"),
+        has_error(
+            &changed.diagnostics,
+            "No argument provided for required parameter `extra`"
+        ),
         "{changed:?}"
     );
     server.close("lib/defs.bzl");
@@ -752,7 +757,7 @@ fn unsaved_loaded_file_and_stub_recheck_importer_and_close_restores_disk() {
     );
     let changed = server.published("pkg/entry.bzl");
     assert!(
-        has_error(&changed.diagnostics, "can receive int"),
+        has_error(&changed.diagnostics, "Expected `str`, found `Literal[1]`"),
         "{changed:?}"
     );
     server.close("lib/defs.bzl.pyi");
@@ -802,7 +807,7 @@ fn loaded_file_diagnostics_are_cleared_when_dependency_disappears() {
     server.open("pkg/entry.bzl", root, 1);
     assert!(has_error(
         &server.published("pkg/defs.bzl").diagnostics,
-        "expects 1 positional argument"
+        "Too many positional arguments"
     ));
     let importer = server.published("pkg/entry.bzl");
     assert!(importer.diagnostics.is_empty(), "{importer:?}");
@@ -830,7 +835,7 @@ fn new_unsaved_bazel_file_is_selectable_in_an_existing_package() {
     );
     let publication = server.published("pkg/new.bzl");
     assert!(
-        has_error(&publication.diagnostics, "expects 1 positional argument"),
+        has_error(&publication.diagnostics, "Too many positional arguments"),
         "{publication:?}"
     );
     assert!(!new_path.exists());
@@ -886,7 +891,7 @@ fn bad_editor_notifications_log_an_error_and_preserve_following_edits() {
     assert_eq!(publication.version, Some(2));
     assert!(has_error(
         &publication.diagnostics,
-        "expects 1 positional argument"
+        "Too many positional arguments"
     ));
     server.no_pending_publication();
 }
@@ -912,7 +917,7 @@ fn opened_percent_encoded_uri_owns_the_versioned_source_diagnostic() {
     assert_eq!(publication.version, Some(7));
     assert!(has_error(
         &publication.diagnostics,
-        "expects 1 positional argument"
+        "Too many positional arguments"
     ));
     server.no_pending_publication();
 }
@@ -936,7 +941,7 @@ fn simultaneous_sources_in_nested_repositories_keep_independent_graphs() {
     );
     assert!(has_error(
         &server.published("pkg/outer.bzl").diagnostics,
-        "expects 1 positional argument"
+        "Too many positional arguments"
     ));
     server.open("nested/pkg/inner.bzl", "GOOD = 1\n", 1);
     assert!(
@@ -947,7 +952,7 @@ fn simultaneous_sources_in_nested_repositories_keep_independent_graphs() {
     );
     assert!(has_error(
         &server.published("pkg/outer.bzl").diagnostics,
-        "expects 1 positional argument"
+        "Too many positional arguments"
     ));
     server.no_pending_publication();
 }

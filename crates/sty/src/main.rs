@@ -1,4 +1,4 @@
-//! Standalone Bazel `.bzl` and host-owned `.star` checking.
+//! Standalone Bazel `.bzl` and host-resolved `.star` checking.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,8 +18,6 @@ mod diagnostics;
 mod editor_system;
 mod host;
 mod server;
-
-use diagnostics::{bazel_diagnostics, graph_message};
 
 #[salsa::db]
 #[derive(Clone)]
@@ -69,7 +67,10 @@ impl Db for StyDb {
 impl salsa::Database for StyDb {}
 
 #[derive(Parser)]
-#[command(name = "sty", about = "Check Bazel .bzl or host-owned .star sources")]
+#[command(
+    name = "sty",
+    about = "Check Bazel .bzl or host-resolved .star sources"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -180,13 +181,8 @@ fn run_bazel(cwd: &SystemPath, options: CheckCommand) -> Result<bool> {
                 .with_context(|| format!("cannot select Bazel label {label}"))
         })
         .collect::<Result<_>>()?;
-    let graph = check_bazel_graph(&db, &selections).map_err(|failure| {
-        anyhow!(
-            "cannot check selected Bazel sources: {}",
-            graph_message(failure.reason())
-        )
-    })?;
-    let diagnostics = bazel_diagnostics(&graph);
+    let diagnostics =
+        check_bazel_graph(&db, &selections).context("cannot check selected Bazel sources")?;
     diagnostics::report(&db, &diagnostics).context("cannot write Sty diagnostics")?;
     Ok(diagnostics.is_empty())
 }

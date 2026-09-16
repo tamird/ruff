@@ -18,7 +18,7 @@ use ty_python_core::starlark::{
     StarlarkType,
 };
 
-use crate::analysis::AnalysisDb;
+use crate::analysis::{AnalysisDb, StarlarkProfile};
 
 /// Direct bindings already resolved by the host's actual loader.
 #[derive(Debug)]
@@ -123,7 +123,7 @@ pub fn check_star_graph(db: &dyn Db, graph: &StarResolvedGraph) -> anyhow::Resul
         load_ranges,
         by_id,
     } = admitted;
-    let mut analysis = AnalysisDb::new()?;
+    let mut analysis = AnalysisDb::new(StarlarkProfile::Hosted)?;
     let environment = StarlarkEnvironment::new(&analysis, declarations);
     let mut files = HashMap::new();
     let mut modules = Vec::with_capacity(graph.modules.len() + 1);

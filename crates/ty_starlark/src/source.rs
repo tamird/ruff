@@ -3,6 +3,8 @@
 //! Starlark and Python have different grammars. The checker may inspect a
 //! parsed source only when this module has admitted the entire file.
 
+use std::collections::HashSet;
+
 use ruff_db::Db;
 use ruff_db::diagnostic::{Annotation, Diagnostic, DiagnosticId, Severity, Span};
 use ruff_db::files::File;
@@ -44,7 +46,7 @@ pub struct AdmittedBazelSource {
 }
 
 impl AdmittedBazelSource {
-    /// Raw syntax stays within the crate until whole-file preflight succeeds.
+    /// Raw syntax stays within the frontend after whole-file admission.
     pub(crate) fn suite(&self) -> &[Stmt] {
         self.parsed.suite()
     }
@@ -198,6 +200,11 @@ struct BazelSyntax<'source> {
     first_failure: Option<(TextRange, &'static str)>,
     string_ranges: Vec<TextRange>,
     statement_depth: usize,
+    function_depth: usize,
+    loop_depth: usize,
+    globals: HashSet<ast::name::Name>,
+    starred_arguments: HashSet<TextRange>,
+    loop_targets: HashSet<TextRange>,
     allow_load: bool,
     first_root_statement: bool,
     top_level_load: Option<(TextRange, TextRange)>,
@@ -210,6 +217,11 @@ impl<'source> BazelSyntax<'source> {
             first_failure: None,
             string_ranges: Vec::new(),
             statement_depth: 0,
+            function_depth: 0,
+            loop_depth: 0,
+            globals: HashSet::new(),
+            starred_arguments: HashSet::new(),
+            loop_targets: HashSet::new(),
             allow_load: true,
             first_root_statement: true,
             top_level_load: None,
@@ -221,6 +233,50 @@ impl<'source> BazelSyntax<'source> {
             .is_none_or(|(existing, _)| range.start() < existing.start())
         {
             self.first_failure = Some((range, description));
+        }
+    }
+
+    fn bind_global(&mut self, name: &ast::name::Name, range: TextRange) {
+        if !self.globals.insert(name.clone()) {
+            self.reject(range, "duplicate module bindings");
+        }
+    }
+
+    fn bind_target(&mut self, target: &Expr) {
+        visit_target_names(target, &mut |name| self.bind_global(&name.id, name.range()));
+    }
+
+    fn check_call_arguments(&mut self, call: &ast::ExprCall) {
+        let mut named = false;
+        let mut names = HashSet::new();
+        let mut starred = false;
+        let mut keywords = false;
+        for argument in call.arguments.iter_source_order() {
+            let invalid = match argument {
+                ast::ArgOrKeyword::Arg(Expr::Starred(argument)) => {
+                    self.starred_arguments.insert(argument.range());
+                    let invalid = starred || keywords;
+                    starred = true;
+                    invalid
+                }
+                ast::ArgOrKeyword::Arg(_) => named || starred || keywords,
+                ast::ArgOrKeyword::Keyword(argument) => {
+                    if let Some(name) = &argument.arg {
+                        named = true;
+                        !names.insert(name.as_str()) || starred || keywords
+                    } else {
+                        let invalid = keywords;
+                        keywords = true;
+                        invalid
+                    }
+                }
+            };
+            if invalid {
+                self.reject(
+                    argument.range(),
+                    "this call argument order or repeated unpacking",
+                );
+            }
         }
     }
 
@@ -381,6 +437,18 @@ impl<'source> BazelSyntax<'source> {
 impl<'a> Visitor<'a> for BazelSyntax<'_> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         if self.statement_depth == 0 {
+            match statement {
+                Stmt::FunctionDef(function) => {
+                    self.bind_global(&function.name.id, function.name.range());
+                }
+                Stmt::Assign(assign) => {
+                    for target in &assign.targets {
+                        self.bind_target(target);
+                    }
+                }
+                Stmt::AugAssign(assign) => self.bind_target(&assign.target),
+                _ => {}
+            }
             if let Stmt::Expr(expr) = statement
                 && let Expr::Call(call) = expr.value.as_ref()
                 && let Expr::Name(name) = call.func.as_ref()
@@ -401,13 +469,25 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
         let description = match statement {
             Stmt::If(_) => (self.statement_depth == 0).then_some("top-level if statements"),
             Stmt::For(loop_stmt) => {
-                if self.statement_depth == 0 {
+                self.loop_targets.insert(loop_stmt.target.range());
+                if loop_stmt.is_async {
+                    Some("async for statements")
+                } else if self.statement_depth == 0 {
                     Some("top-level for statements")
                 } else if !loop_stmt.orelse.is_empty() {
                     Some("for-else statements")
                 } else {
                     None
                 }
+            }
+            Stmt::Assign(assign) => (assign.targets.len() > 1).then_some("chained assignments"),
+            Stmt::AugAssign(assign) => {
+                matches!(assign.op, ast::Operator::Pow | ast::Operator::MatMult)
+                    .then_some("exponentiation or matrix multiplication")
+            }
+            Stmt::Return(_) => (self.function_depth == 0).then_some("top-level return statements"),
+            Stmt::Break(_) | Stmt::Continue(_) => {
+                (self.loop_depth == 0).then_some("loop control outside a for loop")
             }
             Stmt::ClassDef(_) => Some("class definitions"),
             Stmt::Import(_) => Some("Python import statements"),
@@ -426,6 +506,12 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
             Stmt::IpyEscapeCommand(_) => Some("IPython commands"),
             Stmt::FunctionDef(function) => {
                 self.reject_non_bazel_identifier(function.name.range());
+                if let Some(returns) = &function.returns {
+                    self.reject(
+                        returns.range(),
+                        "inline return annotations in the stable profile",
+                    );
+                }
                 if function.name.as_str() == "load" {
                     self.reject(function.name.range(), "rebinding the reserved load name");
                 }
@@ -447,9 +533,20 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
         if let Some(description) = description {
             self.reject(statement.range(), description);
         }
+        let previous_loop_depth = self.loop_depth;
+        if matches!(statement, Stmt::FunctionDef(_)) {
+            self.function_depth += 1;
+            self.loop_depth = 0;
+        } else if matches!(statement, Stmt::For(_)) {
+            self.loop_depth += 1;
+        }
         self.statement_depth += 1;
         ast::visitor::walk_stmt(self, statement);
         self.statement_depth -= 1;
+        self.loop_depth = previous_loop_depth;
+        if matches!(statement, Stmt::FunctionDef(_)) {
+            self.function_depth -= 1;
+        }
         if self.statement_depth == 0 {
             self.top_level_load = None;
         }
@@ -472,6 +569,10 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
                 }
             }
             Expr::Call(call) => {
+                // Load has its own grammar and is validated independently.
+                if !is_load_call(call) {
+                    self.check_call_arguments(call);
+                }
                 if call
                     .arguments
                     .keywords
@@ -495,6 +596,14 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
                 }
             }
             Expr::Lambda(lambda) => {
+                if let Some(parameters) = &lambda.parameters
+                    && self.ends_with_comma(parameters.range())
+                {
+                    self.reject(
+                        parameters.range(),
+                        "lambda parameters with a trailing comma",
+                    );
+                }
                 if lambda.parameters.as_ref().is_some_and(|parameters| {
                     parameters
                         .iter()
@@ -507,10 +616,34 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
             }
             Expr::Attribute(attribute) => {
                 self.reject_non_bazel_identifier(attribute.attr.range());
-                None
+                (attribute.attr.as_str() == "load")
+                    .then_some("the reserved load name as an attribute")
             }
+            Expr::BytesLiteral(_) => Some("byte strings"),
+            Expr::Starred(starred) => (!self.starred_arguments.contains(&starred.range()))
+                .then_some("starred assignment or collection expressions"),
+            Expr::Dict(dict) => dict
+                .items
+                .iter()
+                .any(|item| item.key.is_none())
+                .then_some("dictionary unpacking"),
+            Expr::BinOp(binary) => matches!(binary.op, ast::Operator::Pow | ast::Operator::MatMult)
+                .then_some("exponentiation or matrix multiplication"),
+            Expr::Subscript(subscript) => match subscript.slice.as_ref() {
+                Expr::Slice(_) => {
+                    (subscript.ctx == ast::ExprContext::Store).then_some("slice assignment")
+                }
+                Expr::Tuple(tuple) => tuple
+                    .elts
+                    .iter()
+                    .any(Expr::is_slice_expr)
+                    .then_some("multidimensional slices"),
+                _ => None,
+            },
             Expr::Named(_) => Some("named assignment expressions"),
-            Expr::Tuple(tuple) if !tuple.parenthesized => {
+            Expr::Tuple(tuple)
+                if !tuple.parenthesized && !self.loop_targets.contains(&tuple.range()) =>
+            {
                 if tuple.elts.len() == 1 {
                     Some("unparenthesized singleton tuples")
                 } else if self.ends_with_comma(tuple.range()) {
@@ -555,7 +688,8 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
                     .then_some("implicitly concatenated or Unicode-prefixed strings")
             }
             Expr::NumberLiteral(number) => match &number.value {
-                Number::Int(_) => match self
+                Number::Float(value) if !value.is_finite() => Some("non-finite float literals"),
+                Number::Int(_) | Number::Float(_) => match self
                     .text
                     .get(number.range().start().to_usize()..number.range().end().to_usize())
                 {
@@ -565,7 +699,6 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
                     Some(_) => None,
                     None => Some("numeric literal source spans unavailable"),
                 },
-                Number::Float(_) => Some("float literals"),
                 Number::Complex { real: _, imag: _ } => Some("complex literals"),
             },
             Expr::Compare(compare) => {
@@ -589,8 +722,35 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
         ast::visitor::walk_expr(self, expression);
     }
 
+    fn visit_parameters(&mut self, parameters: &'a ast::Parameters) {
+        if !parameters.posonlyargs.is_empty() {
+            self.reject(parameters.range(), "positional-only parameter separators");
+        }
+        let mut names = HashSet::new();
+        for parameter in parameters {
+            if !names.insert(parameter.name().as_str()) {
+                self.reject(parameter.name().range(), "duplicate parameters");
+            }
+        }
+        ast::visitor::walk_parameters(self, parameters);
+    }
+
+    fn visit_comprehension(&mut self, comprehension: &'a ast::Comprehension) {
+        self.loop_targets.insert(comprehension.target.range());
+        if comprehension.is_async {
+            self.reject(comprehension.range(), "async comprehensions");
+        }
+        ast::visitor::walk_comprehension(self, comprehension);
+    }
+
     fn visit_parameter(&mut self, parameter: &'a ast::Parameter) {
         self.reject_non_bazel_identifier(parameter.name.range());
+        if let Some(annotation) = &parameter.annotation {
+            self.reject(
+                annotation.range(),
+                "inline parameter annotations in the stable profile",
+            );
+        }
         ast::visitor::walk_parameter(self, parameter);
     }
 
@@ -599,6 +759,25 @@ impl<'a> Visitor<'a> for BazelSyntax<'_> {
             self.reject_non_bazel_identifier(name.range());
         }
         ast::visitor::walk_keyword(self, keyword);
+    }
+}
+
+/// Visit bindings in an assignment target without including index expressions.
+pub(crate) fn visit_target_names<'a>(target: &'a Expr, visit: &mut impl FnMut(&'a ast::ExprName)) {
+    match target {
+        Expr::Name(name) => visit(name),
+        Expr::Tuple(tuple) => {
+            for item in &tuple.elts {
+                visit_target_names(item, visit);
+            }
+        }
+        Expr::List(list) => {
+            for item in &list.elts {
+                visit_target_names(item, visit);
+            }
+        }
+        Expr::Starred(starred) => visit_target_names(&starred.value, visit),
+        _ => {}
     }
 }
 

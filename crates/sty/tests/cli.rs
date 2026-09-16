@@ -310,8 +310,8 @@ fn full_graph_errors_include_source_stub_and_distinct_actual_argument_kinds() ->
             "load(\"//shared:defs.bzl\", helper=\"identity\")\n",
             "GOOD = 1\n",
             "def relay(value):\n    return helper(value)\n",
-            "def wrong_str():\n    return relay(\"wrong\")\n",
-            "def wrong_bool():\n    return relay(False)\n",
+            "def wrong_str():\n    return helper(\"wrong\")\n",
+            "def wrong_bool():\n    return helper(False)\n",
         ),
     )?;
     fixture.write(

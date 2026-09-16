@@ -5,9 +5,6 @@ use ruff_python_ast::PythonVersion;
 use ruff_python_parser::{Mode, ParseOptions, parse_unchecked};
 
 use crate::bazel::{BazelLoadError, BazelRepository};
-use crate::checker::{BazelCheckedSource, summarize_bazel_source};
-use crate::overlay::{BazelVerifiedSource, verify_bazel_source};
-use crate::preflight::{BazelPreflight, preflight_bazel_source};
 use crate::testing::test_db;
 
 use super::{
@@ -51,7 +48,7 @@ fn admits_entire_plain_bazel_source_without_python_project() -> anyhow::Result<(
 }
 
 #[test]
-fn admits_annotation_syntax_for_experimental_typed_bazel() -> anyhow::Result<()> {
+fn rejects_annotations_in_the_stable_bazel_profile() -> anyhow::Result<()> {
     let (db, root) = test_db(&[
         ("MODULE.bazel", ""),
         ("pkg/BUILD.bazel", ""),
@@ -62,7 +59,10 @@ fn admits_annotation_syntax_for_experimental_typed_bazel() -> anyhow::Result<()>
     ])?;
     let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
     let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
-    assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 1);
+    assert!(matches!(
+        opaque(admit_bazel_source(&db, source))?.reason(),
+        BazelAdmissionError::BazelSyntax(_)
+    ));
     Ok(())
 }
 
@@ -166,7 +166,7 @@ fn rejects_python_only_forms_before_exposing_any_export() -> anyhow::Result<()> 
     );
     assert_eq!(diagnostic.range(), failure.range());
 
-    db.write_file(&path, "def public() -> int:\n    return 1\n")?;
+    db.write_file(&path, "def public():\n    return 1\n")?;
     let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
     assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 1);
     Ok(())
@@ -337,7 +337,48 @@ fn excludes_python_control_flow_and_expressions_anywhere() -> anyhow::Result<()>
             "def f(value):\n    return value is None\n",
             "Python identity comparisons",
         ),
-        ("def f():\n    return 3.14\n", "float literals"),
+        ("def f():\n    return 1e999\n", "non-finite float literals"),
+        (
+            "def f(value):\n    return value.load\n",
+            "the reserved load name as an attribute",
+        ),
+        ("x = y = 1\n", "chained assignments"),
+        ("x = b'bytes'\n", "byte strings"),
+        (
+            "x = [*values]\n",
+            "starred assignment or collection expressions",
+        ),
+        ("x = {**values}\n", "dictionary unpacking"),
+        ("x = 2 ** 3\n", "exponentiation or matrix multiplication"),
+        ("x = 2 @ 3\n", "exponentiation or matrix multiplication"),
+        ("x[1:] = []\n", "slice assignment"),
+        ("x = y[1:, 2]\n", "multidimensional slices"),
+        ("return 1\n", "top-level return statements"),
+        ("def f():\n    break\n", "loop control outside a for loop"),
+        (
+            "def f():\n    for x in []:\n        def g():\n            continue\n",
+            "loop control outside a for loop",
+        ),
+        (
+            "def f(x, /):\n    return x\n",
+            "positional-only parameter separators",
+        ),
+        (
+            "f(*x, y=1)\n",
+            "this call argument order or repeated unpacking",
+        ),
+        (
+            "f(*x, *y)\n",
+            "this call argument order or repeated unpacking",
+        ),
+        (
+            "f(x=1, x=2)\n",
+            "this call argument order or repeated unpacking",
+        ),
+        (
+            "f = lambda x,: x\n",
+            "lambda parameters with a trailing comma",
+        ),
         ("RESULT: int = 1\n", "annotated variable assignments"),
         ("RESULT = 1,\n", "unparenthesized singleton tuples"),
         (
@@ -367,6 +408,13 @@ fn excludes_python_control_flow_and_expressions_anywhere() -> anyhow::Result<()>
 #[test]
 fn accepts_parenthesized_trailing_comma_and_bare_pair() -> anyhow::Result<()> {
     for code in [
+        "RESULT = [x for x, in [(1,)]]\n",
+        "def f():\n    for x, in [(1,)]:\n        pass\n",
+        "RESULT = 3.14\n",
+        "RESULT = values[1, 2]\n",
+        "RESULT = lambda *, x=1: x\n",
+        "RESULT = f(1, x=2, *args, **kwargs)\n",
+        "def outer():\n    def inner():\n        return 1\n    return inner\n",
         "RESULT = (1,)\n",
         "RESULT = (1, 2,)\n",
         "RESULT = 1, 2\n",
@@ -521,18 +569,6 @@ fn rejects_unicode_identifiers_even_when_python_admits_them() -> anyhow::Result<
             Some(site.len()),
             "{code}"
         );
-        assert!(matches!(
-            preflight_bazel_source(&db, source),
-            BazelPreflight::Opaque(_)
-        ));
-        assert!(matches!(
-            summarize_bazel_source(&db, source),
-            BazelCheckedSource::Opaque(_)
-        ));
-        assert!(matches!(
-            verify_bazel_source(&db, source),
-            BazelVerifiedSource::Opaque(_)
-        ));
     }
     Ok(())
 }
@@ -552,10 +588,6 @@ fn keeps_unicode_strings_and_comments_without_unicode_identifiers() -> anyhow::R
     assert!(matches!(
         admit_bazel_source(&db, source),
         BazelSourceAdmission::Admitted(_)
-    ));
-    assert!(matches!(
-        preflight_bazel_source(&db, source),
-        BazelPreflight::Ready
     ));
     Ok(())
 }
@@ -607,10 +639,6 @@ fn docstring_trailing_tabs_leave_the_whole_source_ready() -> anyhow::Result<()> 
         let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
         let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
         assert_eq!(admitted(admit_bazel_source(&db, source))?.suite().len(), 2);
-        assert!(
-            matches!(preflight_bazel_source(&db, source), BazelPreflight::Ready),
-            "{code}"
-        );
     }
     Ok(())
 }

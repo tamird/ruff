@@ -28,7 +28,6 @@ use ty_starlark::graph::check_bazel_graph;
 use ty_starlark::source::BazelSource;
 
 use crate::StyDb;
-use crate::diagnostics::{bazel_diagnostics, bazel_failure};
 use crate::editor_system::{EditorSystem, OpenText};
 
 mod star_host;
@@ -426,8 +425,8 @@ impl Server {
             }
             for sources in groups.values() {
                 let problems = match check_bazel_graph(&self.db, sources) {
-                    Ok(graph) => bazel_diagnostics(&graph),
-                    Err(failure) => vec![bazel_failure(&failure)],
+                    Ok(diagnostics) => diagnostics,
+                    Err(failure) => vec![failure.diagnostic()],
                 };
                 for problem in problems {
                     let (uri, diagnostic) =

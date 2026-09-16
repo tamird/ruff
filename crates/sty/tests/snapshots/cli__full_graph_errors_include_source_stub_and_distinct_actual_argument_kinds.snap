@@ -2,47 +2,59 @@
 source: crates/sty/tests/cli.rs
 expression: stderr(&output)
 ---
-error[invalid-argument-type]: function 'helper' can receive str here; expected int
- --> consumer/entry.bzl:4:19
+error[invalid-argument-type]: Argument to function `identity` is incorrect
+ --> consumer/entry.bzl:6:19
   |
-2 | GOOD = 1
-3 | def relay(value):
 4 |     return helper(value)
-  |                   ^^^^^
 5 | def wrong_str():
-6 |     return relay("wrong")
+6 |     return helper("wrong")
+  |                   ^^^^^^^ Expected `int`, found `Literal["wrong"]`
+7 | def wrong_bool():
+8 |     return helper(False)
   |
  ::: shared/defs.bzl.pyi:1:21
   |
 1 | def identity(value: int) -> int: ...
-  |                     --- declared at
-
-error[invalid-argument-type]: function 'helper' can receive bool here; expected int
- --> consumer/entry.bzl:4:19
+  |                     --- Parameter type declared here
+info: Function defined here
+ --> shared/defs.bzl:1:5
   |
-2 | GOOD = 1
-3 | def relay(value):
-4 |     return helper(value)
-  |                   ^^^^^
-5 | def wrong_str():
-6 |     return relay("wrong")
+1 | def identity(value):
+  |     ^^^^^^^^ ----- Parameter declared here
+2 |     return value
+  |
+
+error[invalid-argument-type]: Argument to function `identity` is incorrect
+ --> consumer/entry.bzl:8:19
+  |
+6 |     return helper("wrong")
+7 | def wrong_bool():
+8 |     return helper(False)
+  |                   ^^^^^ Expected `int`, found `Literal[False]`
   |
  ::: shared/defs.bzl.pyi:1:21
   |
 1 | def identity(value: int) -> int: ...
-  |                     --- declared at
+  |                     --- Parameter type declared here
+info: Function defined here
+ --> shared/defs.bzl:1:5
+  |
+1 | def identity(value):
+  |     ^^^^^^^^ ----- Parameter declared here
+2 |     return value
+  |
 
-error[invalid-argument-count]: function 'picked' expects 1 positional argument, got 2
- --> consumer/other.bzl:3:12
+error[too-many-positional-arguments]: Too many positional arguments to function `identity`: expected 1, got 2
+ --> consumer/other.bzl:3:22
   |
 1 | load("//shared:defs.bzl", picked="identity")
 2 | def bad_arity():
 3 |     return picked(1, 2)
-  |            ^^^^^^^^^^^^
-  |
- ::: shared/defs.bzl:1:5
+  |                      ^
+info: Function signature here
+ --> shared/defs.bzl:1:5
   |
 1 | def identity(value):
-  |     -------- declared at
+  |     ^^^^^^^^^^^^^^^
 2 |     return value
   |

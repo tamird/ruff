@@ -1,7 +1,7 @@
-//! Unresolved file-local bindings from leading Bazel `.bzl` loads.
+//! Admission and unresolved labels for leading Bazel `.bzl` loads.
 //!
-//! This plan records names and label strings but does not follow imports. A
-//! pending plan never grants checked exports or a ready source preflight.
+//! This plan validates binders and records labels without following imports. A
+//! pending plan must be resolved before semantic analysis.
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
@@ -12,7 +12,7 @@ use ruff_text_size::{Ranged, TextRange};
 
 use crate::source::{
     BazelAdmissionFailure, BazelSource, BazelSourceAdmission, admit_bazel_source,
-    is_bazel_9_identifier,
+    is_bazel_9_identifier, visit_target_names,
 };
 
 /// A source without imports, a source requiring resolution, or an opaque file.
@@ -23,13 +23,12 @@ pub enum BazelLoadPlan {
     Opaque(BazelLoadPlanFailure),
 }
 
-/// A label and its file-local binders, before the target module is verified.
+/// A validated load statement, before its label is resolved.
 #[derive(Debug, get_size2::GetSize)]
 pub struct BazelCandidateLoad {
     range: TextRange,
     label: String,
     label_range: TextRange,
-    bindings: Box<[BazelImportBinding]>,
 }
 
 impl BazelCandidateLoad {
@@ -43,37 +42,6 @@ impl BazelCandidateLoad {
 
     pub fn label_range(&self) -> TextRange {
         self.label_range
-    }
-
-    pub fn bindings(&self) -> &[BazelImportBinding] {
-        &self.bindings
-    }
-}
-
-/// A requested exported name and its distinct local file-block name.
-#[derive(Debug, get_size2::GetSize)]
-pub struct BazelImportBinding {
-    source_name: String,
-    source_range: TextRange,
-    local_name: String,
-    local_range: TextRange,
-}
-
-impl BazelImportBinding {
-    pub fn source_name(&self) -> &str {
-        &self.source_name
-    }
-
-    pub fn source_range(&self) -> TextRange {
-        self.source_range
-    }
-
-    pub fn local_name(&self) -> &str {
-        &self.local_name
-    }
-
-    pub fn local_range(&self) -> TextRange {
-        self.local_range
     }
 }
 
@@ -147,9 +115,8 @@ pub enum BazelLoadPlanError {
 
 /// Inspect only a whole-file admitted Bazel source, without trusting imports.
 ///
-/// The checked source verifier may enter its existing scalar preflight only
-/// when this plan has no loads. The later graph checker must resolve every
-/// pending edge and verify the public source export before using a binding.
+/// The graph checker resolves every pending edge. Ty then checks that the
+/// target exports the requested public binding.
 /// <https://github.com/bazelbuild/starlark/blob/master/spec.md#load-statements>
 /// <https://github.com/bazelbuild/bazel/blob/9.0.0/src/main/java/net/starlark/java/syntax/Resolver.java>
 #[salsa::tracked(returns(ref), no_eq, heap_size=ruff_memory_usage::heap_size, lru=200)]
@@ -175,10 +142,14 @@ pub fn plan_bazel_loads(db: &dyn Db, source: BazelSource<'_>) -> BazelLoadPlan {
             }
             Stmt::Assign(assign) => {
                 for target in &assign.targets {
-                    collect_target_names(target, &mut globals);
+                    visit_target_names(target, &mut |name| {
+                        globals.insert(name.id.as_str());
+                    });
                 }
             }
-            Stmt::AugAssign(assign) => collect_target_names(&assign.target, &mut globals),
+            Stmt::AugAssign(assign) => visit_target_names(&assign.target, &mut |name| {
+                globals.insert(name.id.as_str());
+            }),
             _ => {}
         }
     }
@@ -193,7 +164,6 @@ pub fn plan_bazel_loads(db: &dyn Db, source: BazelSource<'_>) -> BazelLoadPlan {
                 BazelLoadPlanError::InvalidArguments,
             ));
         };
-        let mut bindings = Vec::new();
         for argument in call.arguments.iter_source_order().skip(1) {
             let (source, alias) = match argument {
                 ast::ArgOrKeyword::Arg(Expr::StringLiteral(string)) => (string, None),
@@ -263,25 +233,11 @@ pub fn plan_bazel_loads(db: &dyn Db, source: BazelSource<'_>) -> BazelLoadPlan {
                     entry.insert(local_range);
                 }
             }
-            bindings.push(BazelImportBinding {
-                source_name: source_name.to_string(),
-                source_range,
-                local_name: local_name.to_string(),
-                local_range,
-            });
-        }
-        if bindings.is_empty() {
-            return BazelLoadPlan::Opaque(BazelLoadPlanFailure::at(
-                file,
-                call.range(),
-                BazelLoadPlanError::InvalidArguments,
-            ));
         }
         loads.push(BazelCandidateLoad {
             range: call.range(),
             label: module.value.to_str().to_string(),
             label_range: module.range(),
-            bindings: bindings.into_boxed_slice(),
         });
     }
     BazelLoadPlan::Pending(loads.into_boxed_slice())
@@ -295,26 +251,6 @@ fn leading_load_call(statement: &Stmt) -> Option<&ast::ExprCall> {
         return None;
     };
     matches!(call.func.as_ref(), Expr::Name(name) if name.id == "load").then_some(call)
-}
-
-fn collect_target_names<'source>(target: &'source Expr, names: &mut HashSet<&'source str>) {
-    match target {
-        Expr::Name(name) => {
-            names.insert(name.id.as_str());
-        }
-        Expr::Tuple(tuple) => {
-            for item in &tuple.elts {
-                collect_target_names(item, names);
-            }
-        }
-        Expr::List(list) => {
-            for item in &list.elts {
-                collect_target_names(item, names);
-            }
-        }
-        Expr::Starred(starred) => collect_target_names(&starred.value, names),
-        _ => {}
-    }
 }
 
 /// Keywords recognized by the pinned Bazel 9 `.bzl` Java lexer.

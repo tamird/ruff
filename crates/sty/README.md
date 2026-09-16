@@ -1,8 +1,8 @@
 # Sty
 
 Sty is an unpublished workspace command for a bounded Starlark check.
-See [the architecture and migration plan](ARCHITECTURE.md) for ownership
-boundaries and the planned reuse of Ty's semantic analysis.
+See [the architecture](ARCHITECTURE.md) for ownership boundaries and
+reuse of Ty's semantic analysis.
 
 Build it once from the Ruff checkout:
 
@@ -29,6 +29,14 @@ checks every selected source and its load dependencies. Its bounded
 parser also marks valid Starlark forms outside the shared Python parser
 subset opaque. Unsupported source semantics and uncheckable stubs are
 opaque, and opaque sources cause a nonzero exit.
+
+Both frontends use Ty's ordinary inference. Unannotated parameters and return
+values can remain unknown; callers do not specialize helper bodies. A matching
+`.bzl.pyi` supplies `int`, `str`, `bool`, or `None` annotations to public source
+functions with positional-or-keyword parameters. Sty checks the original
+bodies, defaults, reassignments, and calls against those declarations. The
+Bazel builtin inventory is incomplete; Bazel rule and provider APIs are not
+yet declared.
 
 Command diagnostics use Ruff's renderer, with source snippets, diagnostic
 codes, and related declarations. The editor uses the same diagnostics and

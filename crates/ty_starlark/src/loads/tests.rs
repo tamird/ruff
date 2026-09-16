@@ -2,9 +2,6 @@ use ruff_db::files::system_path_to_file;
 use ruff_db::system::DbWithWritableSystem as _;
 
 use crate::bazel::BazelRepository;
-use crate::checker::{BazelCheckedSource, summarize_bazel_source};
-use crate::overlay::{BazelVerifiedSource, verify_bazel_source};
-use crate::preflight::{BazelPreflight, BazelPreflightError, preflight_bazel_source};
 use crate::source::{BazelAdmissionError, BazelSource};
 use crate::testing::test_db;
 
@@ -25,7 +22,7 @@ fn opaque(plan: &BazelLoadPlan) -> anyhow::Result<&BazelLoadPlanFailure> {
 }
 
 #[test]
-fn leading_loads_record_file_local_bindings_without_checked_exports() -> anyhow::Result<()> {
+fn leading_loads_retain_original_labels_and_ranges() -> anyhow::Result<()> {
     let code = concat!(
         "\"Module docs\"\n",
         "load(\"//shared:defs.bzl\", \"direct\", _alias=\"public\", another=\"public\")\n",
@@ -36,11 +33,6 @@ fn leading_loads_record_file_local_bindings_without_checked_exports() -> anyhow:
         ("MODULE.bazel", ""),
         ("pkg/BUILD", ""),
         ("pkg/importer.bzl", code),
-        // A target and even a sibling stub cannot make a candidate trusted.
-        ("shared/BUILD.bazel", ""),
-        ("shared/defs.bzl", "direct = 1\npublic = 2\n"),
-        ("pkg/local.bzl", "public = 2\n"),
-        ("pkg/importer.bzl.pyi", "def own() -> int: ...\n"),
     ])?;
     let file = system_path_to_file(&db, root.join("pkg/importer.bzl"))?;
     let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
@@ -52,43 +44,10 @@ fn leading_loads_record_file_local_bindings_without_checked_exports() -> anyhow:
         Some(loads[0].label_range().start().to_usize()),
         code.find("\"//shared")
     );
-    assert_eq!(loads[0].bindings().len(), 3);
-    assert_eq!(loads[0].bindings()[0].source_name(), "direct");
-    assert_eq!(loads[0].bindings()[0].local_name(), "direct");
-    assert_eq!(loads[0].bindings()[1].source_name(), "public");
-    assert_eq!(loads[0].bindings()[1].local_name(), "_alias");
-    assert_eq!(loads[0].bindings()[2].source_name(), "public");
-    assert_eq!(loads[0].bindings()[2].local_name(), "another");
-    assert_eq!(loads[1].bindings()[0].source_name(), "public");
-    assert_eq!(loads[1].bindings()[0].local_name(), "extra");
-    assert_eq!(
-        Some(loads[0].bindings()[1].local_range().start().to_usize()),
-        code.find("_alias=")
-    );
-    assert_eq!(
-        Some(loads[0].bindings()[1].source_range().start().to_usize()),
-        code.find("\"public\"")
-    );
     assert_eq!(
         Some(loads[0].range().start().to_usize()),
         code.find("load(")
     );
-    let BazelPreflight::Opaque(failure) = preflight_bazel_source(&db, source) else {
-        anyhow::bail!("pending loads must never enable source preflight");
-    };
-    assert_eq!(failure.file(), file);
-    assert!(matches!(
-        failure.reason(),
-        BazelPreflightError::UnresolvedLoad
-    ));
-    assert!(matches!(
-        summarize_bazel_source(&db, source),
-        BazelCheckedSource::Opaque(_)
-    ));
-    assert!(matches!(
-        verify_bazel_source(&db, source),
-        BazelVerifiedSource::Opaque(_)
-    ));
     Ok(())
 }
 
@@ -132,14 +91,6 @@ fn quoted_names_must_identify_public_bazel_9_symbols() -> anyhow::Result<()> {
                 code.find(&format!("\"{symbol}\"")),
                 "{code}"
             );
-            let BazelPreflight::Opaque(preflight) = preflight_bazel_source(&db, source) else {
-                anyhow::bail!("{code}: invalid load produced Ready preflight");
-            };
-            assert!(matches!(
-                preflight.reason(),
-                BazelPreflightError::LoadPlan(_)
-            ));
-            assert_eq!(preflight.range(), failure.range());
         }
     }
     Ok(())
@@ -211,10 +162,6 @@ fn file_block_aliases_cannot_conflict_with_each_other_or_globals() -> anyhow::Re
                 "{code}"
             );
         }
-        assert!(matches!(
-            summarize_bazel_source(&db, source),
-            BazelCheckedSource::Opaque(_)
-        ));
     }
     Ok(())
 }
@@ -255,10 +202,6 @@ fn missing_literals_late_loads_and_mixed_order_parser_limits_remain_opaque() -> 
         }
         assert_eq!(failure.file(), file);
         assert!(failure.range().is_some());
-        assert!(matches!(
-            verify_bazel_source(&db, source),
-            BazelVerifiedSource::Opaque(_)
-        ));
     }
     Ok(())
 }
@@ -299,10 +242,6 @@ fn source_edits_revalidate_unresolved_bindings_without_new_keys() -> anyhow::Res
     assert!(matches!(
         plan_bazel_loads(&db, source),
         BazelLoadPlan::NoLoads
-    ));
-    assert!(matches!(
-        preflight_bazel_source(&db, source),
-        BazelPreflight::Ready
     ));
     Ok(())
 }

@@ -6,3 +6,10 @@ target-version = "py312"
 # constructors are not subclassable, and runtime type values are assignments.
 # The embedded typing module owns Callable; collections only provides iterators.
 extend-ignore = ["PYI026", "PYI034", "PYI041", "UP035"]
+
+[lint.per-file-ignores]
+# AnalysisDb combines the common declarations with one profile into builtins.
+# Imports, helper classes, and overload decorators cross the fragment boundary.
+"builtins.pyi" = ["F401", "F821"]
+"bazel.pyi" = ["F811", "F821"]
+"hosted.pyi" = ["F811", "F821"]

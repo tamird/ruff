@@ -1,12 +1,11 @@
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::system::{DbWithTestSystem as _, DbWithWritableSystem as _};
+use ruff_text_size::Ranged;
 
 use crate::bazel::BazelRepository;
-use crate::checker::{
-    BazelCheckedSource, BazelExport, BazelExportKind, BazelScalar, summarize_bazel_source,
-};
 use crate::source::BazelSource;
 use crate::testing::test_db;
+use ty_python_core::starlark::StarlarkType;
 
 use super::{
     BazelStubAdmission, BazelStubDeclarations, BazelStubError, BazelStubFailure, admit_bazel_stub,
@@ -46,41 +45,24 @@ fn parses_exact_sibling_primitive_declarations_without_claiming_runtime_types() 
     let source = BazelSource::new(&db, BazelRepository::new(&db, root), source_file);
     let declarations = admitted(admit_bazel_stub(&db, source))?;
     assert_eq!(declarations.file(), stub_file);
-    assert_eq!(declarations.functions().len(), 2);
-    let check = declarations
-        .function("check")
-        .ok_or(anyhow::anyhow!("check"))?;
-    assert!(!check.range().is_empty());
-    assert_eq!(check.result(), BazelScalar::Bool);
-    assert_ne!(check.range(), check.result_range());
-    assert_eq!(check.parameters().len(), 2);
-    assert_eq!(check.parameters()[0].name(), "value");
-    assert_eq!(check.parameters()[0].scalar(), BazelScalar::Int);
-    assert!(!check.parameters()[0].has_default());
-    assert_eq!(check.parameters()[1].name(), "text");
-    assert_eq!(check.parameters()[1].scalar(), BazelScalar::Str);
-    assert!(check.parameters()[1].has_default());
-    assert!(!check.parameters()[1].name_range().is_empty());
-    assert!(!check.parameters()[1].annotation_range().is_empty());
-    assert_ne!(
-        check.parameters()[1].name_range(),
-        check.parameters()[1].annotation_range()
+    let [check, identity] = declarations.annotations() else {
+        anyhow::bail!("expected two matched functions: {declarations:?}");
+    };
+    assert_eq!(
+        check.returns.as_ref().map(|value| value.ty),
+        Some(StarlarkType::Bool)
     );
-    let identity = declarations
-        .function("identity")
-        .ok_or(anyhow::anyhow!("identity"))?;
-    assert_eq!(identity.result(), BazelScalar::None);
-    assert_eq!(identity.parameters()[0].scalar(), BazelScalar::None);
-
-    let BazelCheckedSource::Checked(summary) = summarize_bazel_source(&db, source) else {
-        anyhow::bail!("the runtime must remain checked independently of declarations")
+    let [value, text] = check.parameters.as_ref() else {
+        anyhow::bail!("expected two parameters");
     };
-    let Some(BazelExportKind::Function(function)) =
-        summary.export("identity").map(BazelExport::kind)
-    else {
-        anyhow::bail!("the runtime identity export is missing")
-    };
-    assert_eq!(function.result(), BazelScalar::Unknown);
+    assert_eq!(value.annotation.ty, StarlarkType::Int);
+    assert_eq!(text.annotation.ty, StarlarkType::Str);
+    assert_eq!(value.annotation.origin.file(), stub_file);
+    assert_ne!(value.parameter, value.annotation.origin.range());
+    assert_eq!(
+        identity.returns.as_ref().map(|value| value.ty),
+        Some(StarlarkType::None)
+    );
     Ok(())
 }
 
@@ -112,10 +94,11 @@ fn absent_sibling_revalidates_on_creation_edit_and_removal() -> anyhow::Result<(
             &db,
             BazelSource::new(&db, BazelRepository::new(&db, root.clone()), source_file)
         ))?
-        .function("identity")
-        .ok_or(anyhow::anyhow!("identity"))?
-        .result(),
-        BazelScalar::Int
+        .annotations()[0]
+            .returns
+            .as_ref()
+            .map(|value| value.ty),
+        Some(StarlarkType::Int)
     );
 
     db.write_file(&sibling, "from typing import Any\n")?;
@@ -214,10 +197,7 @@ fn duplicate_declarations_and_opaque_source_fail_closed() -> anyhow::Result<()> 
     let (db, root) = test_db(&[
         ("MODULE.bazel", ""),
         ("pkg/BUILD", ""),
-        (
-            "pkg/defs.bzl",
-            "GOOD = 1\ndef broken():\n    return not_defined\n",
-        ),
+        ("pkg/defs.bzl", "GOOD = 1\nclass Broken: pass\n"),
         (
             "pkg/defs.bzl.pyi",
             "def good(value: int) -> int: ...\ndef good(value: str) -> str: ...\n",
@@ -268,5 +248,51 @@ fn a_directory_at_the_sibling_path_is_not_an_absent_stub() -> anyhow::Result<()>
     assert!(matches!(failure.reason(), BazelStubError::IsDirectory));
     assert_eq!(failure.file(), None);
     assert_eq!(failure.path(), Some(sibling.as_path()));
+    Ok(())
+}
+
+#[test]
+fn companion_must_match_a_public_source_signature() -> anyhow::Result<()> {
+    for (runtime, stub, expected) in [
+        (
+            "def f(x):\n    return x\n",
+            "def missing(x: int) -> int: ...\n",
+            "does not name a public",
+        ),
+        (
+            "def _f(x):\n    return x\n",
+            "def _f(x: int) -> int: ...\n",
+            "does not name a public",
+        ),
+        (
+            "def f(x):\n    return x\n",
+            "def f(y: int) -> int: ...\n",
+            "does not match source parameter",
+        ),
+        (
+            "def f(*x):\n    return x\n",
+            "def f(x: int) -> int: ...\n",
+            "different parameter kinds or count",
+        ),
+        (
+            "def f(x=1):\n    return x\n",
+            "def f(x: int) -> int: ...\n",
+            "default's presence",
+        ),
+    ] {
+        let (db, root) = test_db(&[
+            ("MODULE.bazel", ""),
+            ("pkg/BUILD", ""),
+            ("pkg/defs.bzl", runtime),
+            ("pkg/defs.bzl.pyi", stub),
+        ])?;
+        let file = system_path_to_file(&db, root.join("pkg/defs.bzl"))?;
+        let source = BazelSource::new(&db, BazelRepository::new(&db, root), file);
+        let failure = opaque(admit_bazel_stub(&db, source))?;
+        assert!(
+            failure.reason().to_string().contains(expected),
+            "{runtime}: {failure:?}"
+        );
+    }
     Ok(())
 }

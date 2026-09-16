@@ -21,10 +21,6 @@ use ty_python_semantic::{AnalysisSettings, PythonVersionWithSource, default_lint
 
 const STDLIB: &[(&str, &str)] = &[
     (
-        "builtins.pyi",
-        include_str!("../resources/starlark/builtins.pyi"),
-    ),
-    (
         "typing.pyi",
         include_str!("../resources/starlark/typing.pyi"),
     ),
@@ -40,6 +36,12 @@ const STDLIB: &[(&str, &str)] = &[
         "builtins: 3.0-\ntyping: 3.0-\ntypes: 3.0-\n_typeshed: 3.0-\ncollections: 3.0-\ncollections.abc: 3.0-\n",
     ),
 ];
+
+#[derive(Clone, Copy)]
+pub(crate) enum StarlarkProfile {
+    Bazel,
+    Hosted,
+}
 
 /// The database reads only captured text and embedded builtin declarations.
 /// File handles never cross this database's boundary; diagnostics own their
@@ -58,13 +60,25 @@ pub(crate) struct AnalysisDb {
 }
 
 impl AnalysisDb {
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(profile: StarlarkProfile) -> Result<Self> {
         let fs = MemoryFileSystem::new();
         fs.create_directory_all("/stdlib/stdlib/collections")?;
         fs.create_directory_all("/sources")?;
         for (path, text) in STDLIB {
             fs.write_file(format!("/stdlib/stdlib/{path}"), text)?;
         }
+        // Canonical classes must remain in `builtins` for Ty's KnownClass
+        // recognition. Share method declarations, then select host signatures
+        // and type-value capabilities within that same module.
+        let profile = match profile {
+            StarlarkProfile::Bazel => include_str!("../resources/starlark/bazel.pyi"),
+            StarlarkProfile::Hosted => include_str!("../resources/starlark/hosted.pyi"),
+        };
+        let builtins = format!(
+            "{}\n{profile}",
+            include_str!("../resources/starlark/builtins.pyi")
+        );
+        fs.write_file("/stdlib/stdlib/builtins.pyi", &builtins)?;
         let system = InMemorySystem::from_memory_fs(fs);
         let vendored = VendoredFileSystem::default();
         let search_settings = SearchPathSettings {
