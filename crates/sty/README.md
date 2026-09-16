@@ -61,8 +61,15 @@ stay unproved.
 Sty also follows source `struct` members that refer to known record
 constructors or other proven `struct` bindings, including through
 resolved loads. Members computed at runtime stay unproved. The native
-checker validates field defaults and missing required fields. For a
-validated v3 graph, Sty also follows stable source `def` bindings and
+checker validates field defaults and missing required fields.
+
+When a top level name has one assignment, Sty can carry a scalar value
+or proven nominal record instance through a load, alias, or direct
+function body. An instance supplies an argument type but never an
+annotation type. Mutable lists and arbitrary computed or catalog values
+stay unproved.
+
+For a validated v3 graph, Sty also follows stable source `def` bindings and
 checks their known regular positional and named parameter annotations,
 including functions exported through `struct` and resolved loads. A
 known return annotation can supply a type when the call supplies every

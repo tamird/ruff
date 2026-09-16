@@ -500,6 +500,7 @@ struct StarParameter {
 enum StarBinding {
     Constructor(StarConstructor),
     Alias(StarKnownType),
+    Value(StarKnownType),
     Struct(HashMap<String, StarBinding>),
     Function(StarFunction),
 }
@@ -509,6 +510,7 @@ impl StarBinding {
         match self {
             Self::Constructor(constructor) => Some(&constructor.ty),
             Self::Alias(ty) => Some(ty),
+            Self::Value(_) => None,
             Self::Struct(_) => None,
             Self::Function(_) => None,
         }
@@ -1101,6 +1103,14 @@ fn source_bindings(
 ) -> HashMap<String, StarBinding> {
     let mut preceding_callables = HashSet::new();
     let mut exports = HashMap::new();
+    let local_names = HashSet::new();
+    let native = NativeScope {
+        functions: &forms.host_functions,
+        writes: &parsed.writes,
+        loaded_names: &parsed.loaded_names,
+        local_names: &local_names,
+        loaded_initialization: matches!(module, StarRecordModule::Loaded(_)),
+    };
     for statement in parsed.suite() {
         let assign = match statement {
             Stmt::FunctionDef(function) => {
@@ -1146,13 +1156,18 @@ fn source_bindings(
                 &preceding_callables,
             )
             .map(StarBinding::Constructor)
-            .or_else(|| struct_declaration(parsed, call, forms, &visible)),
+            .or_else(|| struct_declaration(parsed, call, forms, &visible))
+            .or_else(|| source_value_binding(&assign.value, &visible, &native)),
             Expr::Name(_) | Expr::Attribute(_) => binding_in_scope(&assign.value, &visible)
                 .cloned()
                 .or_else(|| {
                     type_expression(parsed, &visible, &assign.value).map(StarBinding::Alias)
-                }),
-            expression => type_expression(parsed, &visible, expression).map(StarBinding::Alias),
+                })
+                .or_else(|| source_value_binding(&assign.value, &visible, &native)),
+            Expr::NoneLiteral(_) => source_value_binding(&assign.value, &visible, &native),
+            expression => type_expression(parsed, &visible, expression)
+                .map(StarBinding::Alias)
+                .or_else(|| source_value_binding(expression, &visible, &native)),
         };
         if let Some(declaration) = declaration {
             visible.insert(name.to_string(), declaration.clone());
@@ -1162,6 +1177,16 @@ fn source_bindings(
     // v1 does not attest whether load aliases themselves are reexported.
     // Explicit declarations can retain an imported type's identity.
     exports
+}
+
+fn source_value_binding(
+    expression: &Expr,
+    visible: &HashMap<String, StarBinding>,
+    native: &NativeScope<'_, '_>,
+) -> Option<StarBinding> {
+    let ty = argument_type(expression, visible, native)?;
+    matches!(&ty, StarKnownType::Primitive(_) | StarKnownType::Record(_))
+        .then_some(StarBinding::Value(ty))
 }
 
 fn struct_declaration(
@@ -2119,12 +2144,11 @@ fn argument_type(
         Expr::StringLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::Str)),
         Expr::BooleanLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::Bool)),
         Expr::NoneLiteral(_) => Some(StarKnownType::Primitive(StarPrimitive::None)),
-        Expr::Name(_) | Expr::Attribute(_) => {
-            let StarBinding::Function(_) = binding_in_scope(expression, visible)? else {
-                return None;
-            };
-            Some(StarKnownType::Callable)
-        }
+        Expr::Name(_) | Expr::Attribute(_) => match binding_in_scope(expression, visible)? {
+            StarBinding::Function(_) => Some(StarKnownType::Callable),
+            StarBinding::Value(ty) => Some(ty.clone()),
+            _ => None,
+        },
         Expr::Call(call) => {
             if let Some(binding) = binding_in_scope(&call.func, visible) {
                 return match binding {
@@ -2134,7 +2158,7 @@ fn argument_type(
                     StarBinding::Function(function) => {
                         function_result_type(call, function, visible, native)
                     }
-                    StarBinding::Alias(_) | StarBinding::Struct(_) => None,
+                    StarBinding::Alias(_) | StarBinding::Value(_) | StarBinding::Struct(_) => None,
                 };
             }
             let function = native.function(&call.func)?;

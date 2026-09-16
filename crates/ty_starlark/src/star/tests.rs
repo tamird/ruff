@@ -1097,6 +1097,199 @@ fn source_return_annotations_abstain_on_known_wrong_or_unknown_inputs() -> anyho
 }
 
 #[test]
+fn single_write_scalar_values_check_calls_only_after_their_source_assignment() -> anyhow::Result<()>
+{
+    let source = concat!(
+        "Config = record(name=str, port=int, enabled=bool, missing=None)\n",
+        "Config(port=later)\n",
+        "name = \"service\"\n",
+        "port = 8081\n",
+        "enabled = True\n",
+        "missing = None\n",
+        "later = \"wrong\"\n",
+        "if False:\n",
+        "    Config(name=name, port=port, enabled=enabled, missing=missing)\n",
+        "    Config(name=port, port=name, enabled=port, missing=name)\n",
+        "    Config(port=later)\n",
+    );
+    let (_db, graph) = root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [name, port, enabled, missing, later] = analysis.problems() else {
+        anyhow::bail!("expected only post-assignment scalar proofs: {analysis:?}");
+    };
+    for (problem, field, actual, primary) in [
+        (name, "name", "int", "port"),
+        (port, "port", "str", "name"),
+        (enabled, "enabled", "int", "port"),
+        (missing, "missing", "str", "name"),
+        (later, "port", "str", "later"),
+    ] {
+        assert_eq!(problem.file(), graph.root.file);
+        assert_eq!(problem.field(), field);
+        assert_eq!(problem.actual().to_string(), actual);
+        assert_eq!(slice(source, problem.range()), Some(primary));
+    }
+    assert!(analysis.unproved_arguments() >= 1);
+    Ok(())
+}
+
+#[test]
+fn record_instances_are_values_and_never_annotation_type_aliases() -> anyhow::Result<()> {
+    let source = concat!(
+        "Repository = record(name=str)\n",
+        "repository = Repository(name=\"api/service\")\n",
+        "repository_alias = repository\n",
+        "Unknown = record(item=repository_alias)\n",
+        "def take(repository: Repository):\n    pass\n",
+        "if False:\n",
+        "    take(repository=repository_alias)\n",
+        "    Unknown(item=7)\n",
+    );
+    let (_db, graph) = v2_root_only(source)?;
+    let analysis = analyzed(check_star_graph(&graph))?;
+    assert!(analysis.problems().is_empty(), "{analysis:?}");
+    assert_eq!(analysis.unproved_arguments(), 1);
+
+    for (source, checked, errors) in [
+        (
+            "Repository = record(name=str)\nrepository = Repository(name=7)\ndef take(value: Repository):\n    pass\ntake(value=repository)\n",
+            1,
+            1,
+        ),
+        (
+            "Repository = record(name=str)\nrepository = Repository(name=unknown())\ndef take(value: Repository):\n    pass\ntake(value=repository)\n",
+            0,
+            0,
+        ),
+        (
+            "Repository = record(name=str)\nrepository = Repository(name=\"good\")\nrepository = unknown()\ndef take(value: Repository):\n    pass\ntake(value=repository)\n",
+            1,
+            0,
+        ),
+    ] {
+        let (_db, graph) = v2_root_only(source)?;
+        let analysis = analyzed(check_star_graph(&graph))?;
+        assert!(
+            analysis
+                .problems()
+                .iter()
+                .all(|problem| problem.constructor() == "Repository"),
+            "{source}: {analysis:?}"
+        );
+        assert_eq!(analysis.problems().len(), errors, "{source}");
+        assert_eq!(analysis.checked_arguments(), checked, "{source}");
+    }
+    Ok(())
+}
+
+#[test]
+fn loaded_record_values_flow_through_struct_and_deferred_root_calls() -> anyhow::Result<()> {
+    let images_id = "//example:images.star";
+    let workloads_id = "//example:workloads.star";
+    let images_source = concat!(
+        "def validate(value):\n    pass\n",
+        "ImageRepository = wrapper_record(validate, name=str)\n",
+        "images = struct(repository=ImageRepository)\n",
+    );
+    let workloads_source = format!(
+        "load(\"{images_id}\", \"ImageRepository\")\n{}",
+        "def deployment(repository: ImageRepository, name: str, port: int):\n    pass\nworkloads = struct(deployment=deployment)\n"
+    );
+    let root_source = format!(
+        "load(\"{images_id}\", \"images\")\nload(\"{workloads_id}\", \"workloads\")\n{}",
+        concat!(
+            "name = \"service\"\n",
+            "port = 8081\n",
+            "repository = images.repository(name=\"api/service\")\n",
+            "def resources():\n",
+            "    workloads.deployment(repository=repository, name=name, port=port)\n",
+            "    workloads.deployment(repository=name, name=port, port=name)\n",
+            "def shadow(repository):\n",
+            "    workloads.deployment(repository=repository, name=name, port=port)\n",
+        )
+    );
+    let (db, root) = test_db(&[
+        ("root.star", &root_source),
+        ("images.star", images_source),
+        ("workloads.star", &workloads_source),
+    ])?;
+    let root_file = system_path_to_file(&db, root.join("root.star"))?;
+    let images_file = system_path_to_file(&db, root.join("images.star"))?;
+    let workloads_file = system_path_to_file(&db, root.join("workloads.star"))?;
+    let graph = StarResolvedGraph {
+        version: "sty-star-graph-v2".to_string(),
+        profile: v2_profile(),
+        root: StarSource {
+            file: root_file,
+            text: root_source.clone(),
+            loads: Box::new([
+                StarDirectLoad {
+                    module_id: images_id.to_string(),
+                    label_range: span(&root_source, &format!("\"{images_id}\""))?,
+                    bindings: Box::new([StarLoadBinding {
+                        local: "images".to_string(),
+                        source: "images".to_string(),
+                    }]),
+                },
+                StarDirectLoad {
+                    module_id: workloads_id.to_string(),
+                    label_range: span(&root_source, &format!("\"{workloads_id}\""))?,
+                    bindings: Box::new([StarLoadBinding {
+                        local: "workloads".to_string(),
+                        source: "workloads".to_string(),
+                    }]),
+                },
+            ]),
+        },
+        modules: Box::new([
+            StarModule {
+                id: workloads_id.to_string(),
+                source: StarSource {
+                    file: workloads_file,
+                    text: workloads_source.clone(),
+                    loads: Box::new([StarDirectLoad {
+                        module_id: images_id.to_string(),
+                        label_range: span(&workloads_source, &format!("\"{images_id}\""))?,
+                        bindings: Box::new([StarLoadBinding {
+                            local: "ImageRepository".to_string(),
+                            source: "ImageRepository".to_string(),
+                        }]),
+                    }]),
+                },
+            },
+            StarModule {
+                id: images_id.to_string(),
+                source: StarSource {
+                    file: images_file,
+                    text: images_source.to_string(),
+                    loads: Box::new([]),
+                },
+            },
+        ]),
+    };
+    let analysis = analyzed(check_star_graph(&graph))?;
+    let [repository, name, port] = analysis.problems() else {
+        anyhow::bail!("expected three proven wrong deferred arguments: {analysis:?}");
+    };
+    for (problem, parameter, source_span, expected, actual) in [
+        (repository, "repository", "name", "ImageRepository", "str"),
+        (name, "name", "port", "str", "int"),
+        (port, "port", "name", "int", "str"),
+    ] {
+        assert_eq!(problem.file(), root_file);
+        assert_eq!(problem.related_file(), workloads_file);
+        assert_eq!(problem.constructor(), "workloads.deployment");
+        assert_eq!(problem.field(), parameter);
+        assert_eq!(problem.expected().to_string(), expected);
+        assert_eq!(problem.actual().to_string(), actual);
+        assert_eq!(slice(&root_source, problem.range()), Some(source_span));
+    }
+    assert_eq!(analysis.checked_arguments(), 9);
+    assert_eq!(analysis.unproved_arguments(), 1);
+    Ok(())
+}
+
+#[test]
 fn deferred_source_functions_check_stable_loads_without_borrowing_local_names() -> anyhow::Result<()>
 {
     let root_source = format!(
@@ -1301,15 +1494,15 @@ fn reports_dead_branch_mismatch_in_a_loaded_module_with_owning_files() -> anyhow
 }
 
 #[test]
-fn valid_literal_passes_and_unknown_argument_remains_unproved() -> anyhow::Result<()> {
+fn literal_and_stable_scalar_binding_prove_primitive_arguments() -> anyhow::Result<()> {
     let root_source = format!(
         "load(\"{LABEL}\", \"LimitConfig\")\ncurrent = 5\n\nif False:\n    LimitConfig(max_connections=4)\n    LimitConfig(max_connections=current)\n"
     );
     let (_db, graph) = case(&root_source, DECLARATION)?;
     let analysis = analyzed(check_star_graph(&graph))?;
     assert!(analysis.problems().is_empty());
-    assert_eq!(analysis.checked_arguments(), 1);
-    assert_eq!(analysis.unproved_arguments(), 1);
+    assert_eq!(analysis.checked_arguments(), 2);
+    assert_eq!(analysis.unproved_arguments(), 0);
     Ok(())
 }
 
@@ -1440,9 +1633,9 @@ fn different_load_ids_keep_distinct_nominal_types_for_one_physical_file() -> any
     let first_id = "//example:first.star";
     let second_id = "//example:second.star";
     let root_source = format!(
-        "load(\"{first_id}\", first=\"Config\")\nload(\"{second_id}\", second=\"Config\")\nHolder = record(item=first)\nif False:\n    Holder(item=second(value=\"ok\"))\n"
+        "load(\"{first_id}\", first=\"Config\", first_value=\"instance\")\nload(\"{second_id}\", second=\"Config\", second_value=\"instance\")\nHolder = record(item=first)\nif False:\n    Holder(item=first_value)\n    Holder(item=second_value)\n    Holder(item=second(value=\"ok\"))\n"
     );
-    let module_source = "Config = record(value=str)\n";
+    let module_source = "Config = record(value=str)\ninstance = Config(value=\"ok\")\n";
     let (db, root) = test_db(&[("root.star", &root_source), ("shared.star", module_source)])?;
     let root_file = system_path_to_file(&db, root.join("root.star"))?;
     let shared_file = system_path_to_file(&db, root.join("shared.star"))?;
@@ -1456,18 +1649,30 @@ fn different_load_ids_keep_distinct_nominal_types_for_one_physical_file() -> any
                 StarDirectLoad {
                     module_id: first_id.to_string(),
                     label_range: span(&root_source, &format!("\"{first_id}\""))?,
-                    bindings: Box::new([StarLoadBinding {
-                        local: "first".to_string(),
-                        source: "Config".to_string(),
-                    }]),
+                    bindings: Box::new([
+                        StarLoadBinding {
+                            local: "first".to_string(),
+                            source: "Config".to_string(),
+                        },
+                        StarLoadBinding {
+                            local: "first_value".to_string(),
+                            source: "instance".to_string(),
+                        },
+                    ]),
                 },
                 StarDirectLoad {
                     module_id: second_id.to_string(),
                     label_range: span(&root_source, &format!("\"{second_id}\""))?,
-                    bindings: Box::new([StarLoadBinding {
-                        local: "second".to_string(),
-                        source: "Config".to_string(),
-                    }]),
+                    bindings: Box::new([
+                        StarLoadBinding {
+                            local: "second".to_string(),
+                            source: "Config".to_string(),
+                        },
+                        StarLoadBinding {
+                            local: "second_value".to_string(),
+                            source: "instance".to_string(),
+                        },
+                    ]),
                 },
             ]),
         },
@@ -1491,17 +1696,27 @@ fn different_load_ids_keep_distinct_nominal_types_for_one_physical_file() -> any
         ]),
     };
     let analysis = analyzed(check_star_graph(&graph))?;
-    let [problem] = analysis.problems() else {
-        anyhow::bail!("expected distinct logical load identities: {analysis:?}");
+    let [value_problem, constructor_problem] = analysis.problems() else {
+        anyhow::bail!("expected distinct logical load value identities: {analysis:?}");
     };
-    assert_eq!(problem.file(), root_file);
-    assert_eq!(problem.related_file(), root_file);
-    assert_eq!(slice(&root_source, problem.related_range()), Some("first"));
-    assert_eq!(problem.expected().to_string(), "Config");
-    assert_eq!(problem.actual().to_string(), "Config");
-    let message = problem.to_string();
-    assert!(message.contains(first_id), "{message}");
-    assert!(message.contains(second_id), "{message}");
+    assert_eq!(
+        slice(&root_source, value_problem.range()),
+        Some("second_value")
+    );
+    assert_eq!(
+        slice(&root_source, constructor_problem.range()),
+        Some("second(value=\"ok\")")
+    );
+    for problem in [value_problem, constructor_problem] {
+        assert_eq!(problem.file(), root_file);
+        assert_eq!(problem.related_file(), root_file);
+        assert_eq!(slice(&root_source, problem.related_range()), Some("first"));
+        assert_eq!(problem.expected().to_string(), "Config");
+        assert_eq!(problem.actual().to_string(), "Config");
+        let message = problem.to_string();
+        assert!(message.contains(first_id), "{message}");
+        assert!(message.contains(second_id), "{message}");
+    }
     Ok(())
 }
 
