@@ -16,9 +16,11 @@ use ty_python_core::starlark::{
     StarlarkModule, StarlarkModuleRole,
 };
 
-use crate::analysis::{AnalysisDb, StarlarkProfile};
+use crate::analysis::{Analysis, AnalysisDb, StarlarkProfile};
 use crate::bazel::{BazelLoadError, resolve_bazel_load};
-use crate::loads::{BazelLoadPlan, BazelLoadPlanError, BazelLoadPlanFailure, plan_bazel_loads};
+use crate::loads::{
+    BazelLoadPlan, BazelLoadPlanError, BazelLoadPlanFailure, plan_bazel_loads, recover_bazel_loads,
+};
 use crate::source::{BazelSource, BazelSourceKind};
 use crate::stub::{
     BazelStubAdmission, BazelStubDeclarations, BazelStubError, BazelStubFailure, admit_bazel_stub,
@@ -146,8 +148,32 @@ pub fn check_bazel_graph<'db>(
     db: &'db dyn Db,
     selections: &[BazelSource<'db>],
 ) -> Result<Vec<Diagnostic>, BazelGraphFailure> {
+    analyze_bazel_graph(db, selections).map(|(diagnostics, _)| diagnostics)
+}
+
+/// Strict diagnostics together with the admitted graph used to produce them.
+pub fn analyze_bazel_graph<'db>(
+    db: &'db dyn Db,
+    selections: &[BazelSource<'db>],
+) -> Result<(Vec<Diagnostic>, Option<Analysis>), BazelGraphFailure> {
+    build_graph(db, selections, false)
+}
+
+/// A partial graph for editor queries only. No recovery diagnostics are exposed.
+pub fn recover_bazel_graph<'db>(
+    db: &'db dyn Db,
+    selections: &[BazelSource<'db>],
+) -> Result<Option<Analysis>, BazelGraphFailure> {
+    build_graph(db, selections, true).map(|(_, analysis)| analysis)
+}
+
+fn build_graph<'db>(
+    db: &'db dyn Db,
+    selections: &[BazelSource<'db>],
+    recovery: bool,
+) -> Result<(Vec<Diagnostic>, Option<Analysis>), BazelGraphFailure> {
     let Some(first) = selections.first() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     let first_file = first.selected_file(db);
     let repository = first.selected_repository(db);
@@ -186,7 +212,14 @@ pub fn check_bazel_graph<'db>(
         let source = pending[node_index].source;
         let mut edges = Vec::new();
         let mut failure = None;
-        match plan_bazel_loads(db, source) {
+        let recovered;
+        let plan = if recovery {
+            recovered = recover_bazel_loads(db, source);
+            &recovered
+        } else {
+            plan_bazel_loads(db, source)
+        };
+        match plan {
             BazelLoadPlan::NoLoads => {}
             BazelLoadPlan::Opaque(problem) => {
                 failure = Some(BazelGraphFailure::at(
@@ -200,6 +233,9 @@ pub fn check_bazel_graph<'db>(
                     let target = match resolve_bazel_load(db, repository, file, load.label()) {
                         Ok(target) => target,
                         Err(error) => {
+                            if recovery {
+                                continue;
+                            }
                             failure = Some(BazelGraphFailure::at(
                                 file,
                                 Some(load.label_range()),
@@ -240,15 +276,17 @@ pub fn check_bazel_graph<'db>(
                     pending[node_index].declarations = Some(declarations);
                 }
                 BazelStubAdmission::Opaque(problem) => {
-                    let mut error = BazelGraphFailure::at(
-                        problem.file().unwrap_or(file),
-                        problem.range(),
-                        BazelGraphError::Stub(Box::new(problem.clone())),
-                    );
-                    if let Some(related) = problem.related() {
-                        error = error.related(related.file(), Some(related.range()));
+                    if !recovery {
+                        let mut error = BazelGraphFailure::at(
+                            problem.file().unwrap_or(file),
+                            problem.range(),
+                            BazelGraphError::Stub(Box::new(problem.clone())),
+                        );
+                        if let Some(related) = problem.related() {
+                            error = error.related(related.file(), Some(related.range()));
+                        }
+                        failure = Some(error);
                     }
-                    failure = Some(error);
                 }
             }
         }
@@ -314,6 +352,15 @@ pub fn check_bazel_graph<'db>(
         );
     }
 
+    if recovery {
+        // Invalid dependencies prevent checking, but do not erase a valid
+        // importer's local names from editor queries.
+        for (node, outcome) in pending.iter().zip(&mut outcomes) {
+            if node.failure.is_none() {
+                *outcome = Some(Ok(()));
+            }
+        }
+    }
     let mut analysis = AnalysisDb::new(StarlarkProfile::Bazel)
         .map_err(|error| BazelGraphFailure::analysis(first_file, &error))?;
     let mut inputs = Vec::new();
@@ -390,6 +437,7 @@ pub fn check_bazel_graph<'db>(
         let loads = pending[index]
             .edges
             .iter()
+            .filter(|edge| !recovery || modules[edge.target].is_some())
             .map(|edge| {
                 let target = modules[edge.target].ok_or_else(|| {
                     BazelGraphFailure::analysis(
@@ -417,10 +465,12 @@ pub fn check_bazel_graph<'db>(
                         &anyhow::anyhow!("admitted source has no semantic module"),
                     )
                 })?;
-                checked.extend(ty_python_semantic::check_file_unwrap(
-                    &analysis,
-                    ProgramFile::new_starlark(&analysis, module, program),
-                ));
+                if !recovery {
+                    checked.extend(ty_python_semantic::check_file_unwrap(
+                        &analysis,
+                        ProgramFile::new_starlark(&analysis, module, program),
+                    ));
+                }
             }
             Some(Err(failure)) => admission.push(failure.diagnostic()),
             None => {
@@ -437,7 +487,17 @@ pub fn check_bazel_graph<'db>(
         .freeze(&mut checked)
         .map_err(|error| BazelGraphFailure::analysis(first_file, &error))?;
     checked.extend(admission);
-    Ok(checked)
+    let build_files = pending
+        .iter()
+        .zip(&modules)
+        .filter_map(|(node, module)| {
+            (node.source.kind(db) == BazelSourceKind::Build)
+                .then(|| module.map(|module| module.file(&analysis)))
+                .flatten()
+        })
+        .collect();
+    let modules = modules.into_iter().flatten().collect();
+    Ok((checked, Some(Analysis::new(analysis, modules, build_files))))
 }
 
 fn bazel_builtin(name: &str) -> StarlarkGlobalDeclaration {

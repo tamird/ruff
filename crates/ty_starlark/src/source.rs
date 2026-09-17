@@ -33,16 +33,21 @@ impl<'db> BazelSource<'db> {
         *self.repository(db)
     }
 
-    pub(crate) fn selected_file(self, db: &dyn Db) -> File {
+    pub fn selected_file(self, db: &dyn Db) -> File {
         *self.file(db)
     }
 
     pub(crate) fn kind(self, db: &dyn Db) -> BazelSourceKind {
-        match self.selected_file(db).path(db).as_str() {
-            path if path.ends_with("/BUILD") || path.ends_with("/BUILD.bazel") => {
-                BazelSourceKind::Build
-            }
-            _ => BazelSourceKind::Extension,
+        if matches!(
+            self.selected_file(db)
+                .path(db)
+                .as_system_path()
+                .and_then(|path| path.file_name()),
+            Some("BUILD" | "BUILD.bazel")
+        ) {
+            BazelSourceKind::Build
+        } else {
+            BazelSourceKind::Extension
         }
     }
 }
@@ -133,6 +138,20 @@ pub enum BazelAdmissionError {
 /// any future lint level or diagnostic suppression.
 #[salsa::tracked(returns(ref), no_eq, heap_size=ruff_memory_usage::heap_size, lru=200)]
 pub fn admit_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelSourceAdmission {
+    parse_bazel_source(db, source, false)
+}
+
+/// Editor recovery may use a partial parse, but still rejects known foreign
+/// syntax and never represents the result as a checked source.
+pub(crate) fn recover_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelSourceAdmission {
+    parse_bazel_source(db, source, true)
+}
+
+fn parse_bazel_source(
+    db: &dyn Db,
+    source: BazelSource<'_>,
+    recovery: bool,
+) -> BazelSourceAdmission {
     let file = *source.file(db);
     if let Err(error) = validate_bazel_source(db, *source.repository(db), file) {
         return BazelSourceAdmission::Opaque(BazelAdmissionFailure {
@@ -172,6 +191,7 @@ pub fn admit_bazel_source(db: &dyn Db, source: BazelSource<'_>) -> BazelSourceAd
         .iter()
         .min_by_key(|error| error.range().start());
     if let Some(error) = parser_error
+        && !recovery
         && version_error.is_none_or(|other| error.range().start() <= other.range().start())
     {
         return BazelSourceAdmission::Opaque(BazelAdmissionFailure {
@@ -450,6 +470,11 @@ impl<'source> BazelSyntax<'source> {
     }
 
     fn reject_non_bazel_identifier(&mut self, range: TextRange) {
+        // A missing identifier is a parser recovery placeholder. Strict
+        // admission already rejected the parse error before this visitor.
+        if range.is_empty() {
+            return;
+        }
         let raw = self
             .text
             .get(range.start().to_usize()..range.end().to_usize());

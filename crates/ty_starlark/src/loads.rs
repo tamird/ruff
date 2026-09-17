@@ -12,7 +12,7 @@ use ruff_text_size::{Ranged, TextRange};
 
 use crate::source::{
     BazelAdmissionFailure, BazelSource, BazelSourceAdmission, BazelSourceKind, admit_bazel_source,
-    is_bazel_9_identifier, visit_target_names,
+    is_bazel_9_identifier, recover_bazel_source, visit_target_names,
 };
 
 /// A source without imports, a source requiring resolution, or an opaque file.
@@ -121,9 +121,21 @@ pub enum BazelLoadPlanError {
 /// <https://github.com/bazelbuild/bazel/blob/9.0.0/src/main/java/net/starlark/java/syntax/Resolver.java>
 #[salsa::tracked(returns(ref), no_eq, heap_size=ruff_memory_usage::heap_size, lru=200)]
 pub fn plan_bazel_loads(db: &dyn Db, source: BazelSource<'_>) -> BazelLoadPlan {
+    plan_loads(db, source, admit_bazel_source(db, source))
+}
+
+pub(crate) fn recover_bazel_loads(db: &dyn Db, source: BazelSource<'_>) -> BazelLoadPlan {
+    plan_loads(db, source, &recover_bazel_source(db, source))
+}
+
+fn plan_loads(
+    db: &dyn Db,
+    source: BazelSource<'_>,
+    admission: &BazelSourceAdmission,
+) -> BazelLoadPlan {
     let file = source.selected_file(db);
     let extension = source.kind(db) == BazelSourceKind::Extension;
-    let suite = match admit_bazel_source(db, source) {
+    let suite = match admission {
         BazelSourceAdmission::Admitted(admitted) => admitted.suite(),
         BazelSourceAdmission::Opaque(failure) => {
             return BazelLoadPlan::Opaque(BazelLoadPlanFailure::from_admission(file, failure));

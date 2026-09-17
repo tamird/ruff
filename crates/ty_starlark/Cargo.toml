@@ -22,6 +22,7 @@ ruff_python_parser = { workspace = true }
 ruff_source_file = { workspace = true }
 ruff_text_size = { workspace = true, features = ["get-size"] }
 
+ty_ide = { workspace = true }
 ty_module_resolver = { workspace = true }
 ty_python_core = { workspace = true }
 ty_python_semantic = { workspace = true }

@@ -8,7 +8,7 @@ use crate::testing::{TestDb, test_db};
 use super::{
     StarCheck, StarDirectLoad, StarFailureReason, StarHostFunction, StarHostParam, StarHostProfile,
     StarIntrinsic, StarLoadBinding, StarModule, StarResolvedGraph, StarSource, StarSpecialForm,
-    check_star_graph,
+    analyze_star_graph, check_star_graph,
 };
 
 const LABEL: &str = "//example:limits.star";
@@ -723,7 +723,10 @@ fn different_load_ids_keep_distinct_nominal_types_for_one_physical_file() -> any
             },
         ]),
     };
-    let diagnostics = checked(&db, &graph)?;
+    let (StarCheck::Checked(diagnostics), Some(mut analysis)) = analyze_star_graph(&db, &graph)?
+    else {
+        anyhow::bail!("expected an admitted graph");
+    };
     assert_eq!(
         codes(&diagnostics),
         ["invalid-argument-type", "invalid-argument-type"],
@@ -753,5 +756,81 @@ fn different_load_ids_keep_distinct_nominal_types_for_one_physical_file() -> any
             "{message}"
         );
     }
+    // Both logical contexts share physical source navigation. Identical
+    // locations must be returned once, including after an unsaved edit.
+    let edited = format!("# shifted\n{module_source}instance.value\n");
+    analysis.update_source(&root.join("shared.star"), &edited)?;
+    let offset = TextSize::try_from(edited.rfind("value").unwrap())?;
+    let definitions = analysis.definitions(&root.join("shared.star"), offset);
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(
+        &definitions[0].source.source_text()[definitions[0].range],
+        "value"
+    );
+    assert_eq!(definitions[0].source.source_text(), edited);
+    let incomplete = format!("# shifted\n{module_source}instance.");
+    analysis.update_source(&root.join("shared.star"), &incomplete)?;
+    let items = analysis.completions(
+        &root.join("shared.star"),
+        TextSize::try_from(incomplete.len())?,
+    );
+    assert_eq!(items.iter().filter(|item| item.label == "value").count(), 1);
+    Ok(())
+}
+
+#[test]
+fn editor_recovery_retains_only_unchanged_top_level_loads() -> anyhow::Result<()> {
+    let text =
+        format!("load(\"{LABEL}\", \"LimitConfig\")\nitem = LimitConfig(max_connections=1)\n");
+    let (db, graph) = case(&text, DECLARATION)?;
+    let (_, analysis) = analyze_star_graph(&db, &graph)?;
+    let mut analysis = analysis.unwrap();
+    let path = graph
+        .root
+        .file
+        .path(&db)
+        .as_system_path()
+        .unwrap()
+        .to_path_buf();
+    let complete = format!("# inserted line\n{text}item.");
+    analysis.update_source(&path, &complete)?;
+    let completions = analysis.completions(&path, TextSize::try_from(complete.len())?);
+    assert!(
+        completions
+            .iter()
+            .any(|item| item.label == "max_connections"),
+        "{completions:?}"
+    );
+    for changed in [
+        complete.replace(LABEL, "//changed:other.star"),
+        complete.replace(
+            &format!("load(\"{LABEL}\", \"LimitConfig\")"),
+            &format!("def nested():\n    load(\"{LABEL}\", \"LimitConfig\")"),
+        ),
+        complete.replace(&format!("load(\"{LABEL}\", \"LimitConfig\")\n"), ""),
+    ] {
+        analysis.update_source(&path, &changed)?;
+        let completions = analysis.completions(&path, TextSize::try_from(changed.len())?);
+        assert!(
+            !completions
+                .iter()
+                .any(|item| item.label == "max_connections"),
+            "{completions:?}"
+        );
+    }
+    analysis.update_source(&path, &complete)?;
+    let completions = analysis.completions(&path, TextSize::try_from(complete.len())?);
+    assert!(
+        completions
+            .iter()
+            .any(|item| item.label == "max_connections")
+    );
+    let offset = TextSize::try_from(complete.find("LimitConfig(max").unwrap())?;
+    let definitions = analysis.definitions(&path, offset);
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(
+        &definitions[0].source.source_text()[definitions[0].range],
+        "LimitConfig"
+    );
     Ok(())
 }

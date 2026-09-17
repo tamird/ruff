@@ -18,7 +18,7 @@ use ty_python_core::starlark::{
     StarlarkType,
 };
 
-use crate::analysis::{AnalysisDb, StarlarkProfile};
+use crate::analysis::{Analysis, AnalysisDb, StarlarkProfile};
 
 /// Direct bindings already resolved by the host's actual loader.
 #[derive(Debug)]
@@ -114,9 +114,17 @@ struct AdmittedGraph<'graph> {
 
 /// Checks captured text without executing source or consulting a Python project.
 pub fn check_star_graph(db: &dyn Db, graph: &StarResolvedGraph) -> anyhow::Result<StarCheck> {
+    analyze_star_graph(db, graph).map(|(result, _)| result)
+}
+
+/// Retains admitted source and host facts for subsequent editor queries.
+pub fn analyze_star_graph(
+    db: &dyn Db,
+    graph: &StarResolvedGraph,
+) -> anyhow::Result<(StarCheck, Option<Analysis>)> {
     let admitted = match admit_graph(graph) {
         Ok(admitted) => admitted,
-        Err(failure) => return Ok(StarCheck::Opaque(failure)),
+        Err(failure) => return Ok((StarCheck::Opaque(failure), None)),
     };
     let AdmittedGraph {
         declarations,
@@ -183,14 +191,17 @@ pub fn check_star_graph(db: &dyn Db, graph: &StarResolvedGraph) -> anyhow::Resul
     }
     let program = analysis.program();
     let mut diagnostics = Vec::new();
-    for module in modules {
+    for &module in &modules {
         diagnostics.extend(ty_python_semantic::check_file_unwrap(
             &analysis,
             ProgramFile::new_starlark(&analysis, module, program),
         ));
     }
     analysis.freeze(&mut diagnostics)?;
-    Ok(StarCheck::Checked(diagnostics))
+    Ok((
+        StarCheck::Checked(diagnostics),
+        Some(Analysis::new(analysis, modules, Vec::new())),
+    ))
 }
 
 fn admit_graph(graph: &StarResolvedGraph) -> Result<AdmittedGraph<'_>, StarFailure> {

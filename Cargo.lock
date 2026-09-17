@@ -5036,6 +5036,7 @@ dependencies = [
  "ruff_text_size",
  "salsa",
  "thiserror 2.0.20",
+ "ty_ide",
  "ty_module_resolver",
  "ty_python_core",
  "ty_python_semantic",

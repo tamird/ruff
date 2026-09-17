@@ -10,11 +10,18 @@ use ruff_db::source::source_text;
 use ruff_db::system::{InMemorySystem, MemoryFileSystem, System, SystemPath};
 use ruff_db::vendored::VendoredFileSystem;
 use ruff_python_ast::PythonVersion;
+use ruff_python_parser::{Mode, ParseOptions, parse_unchecked};
 use ruff_source_file::{SourceFile, SourceFileBuilder};
+use ruff_text_size::{Ranged, TextRange, TextSize};
+use salsa::Setter;
+pub use ty_ide::CompletionKind;
+use ty_ide::{CompletionCapabilities, CompletionSettings};
 use ty_module_resolver::SearchPathSettings;
 use ty_python_core::ProgramFile;
 use ty_python_core::platform::PythonPlatform;
 use ty_python_core::program::{FallibleStrategy, Program, ProgramSettings};
+use ty_python_core::starlark::{StarlarkLoad, StarlarkModule, load_call};
+use ty_python_semantic::ProgramEnvironment;
 use ty_python_semantic::dependency::DependencyMetadata;
 use ty_python_semantic::lint::{LintRegistry, LintSource, RuleSelection};
 use ty_python_semantic::{AnalysisSettings, PythonVersionWithSource, default_lint_registry};
@@ -41,6 +48,253 @@ const STDLIB: &[(&str, &str)] = &[
 pub(crate) enum StarlarkProfile {
     Bazel,
     Hosted,
+}
+
+/// A completion presentation with no database-bound semantic handles.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Completion {
+    pub label: String,
+    pub insert: Option<String>,
+    pub kind: Option<CompletionKind>,
+    pub detail: Option<String>,
+    pub documentation: Option<String>,
+}
+
+/// A definition in the exact source snapshot used by semantic analysis.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Definition {
+    pub source: SourceFile,
+    pub range: TextRange,
+}
+
+struct OriginalModule {
+    module: StarlarkModule,
+    source: SourceFile,
+    loads: Box<[StarlarkLoad]>,
+}
+
+/// A captured graph retained for editor queries. Checking and recovery are
+/// separate: edits update IDE facts, but never turn recovery into admission.
+pub struct Analysis {
+    db: AnalysisDb,
+    modules: Vec<OriginalModule>,
+    build_files: Vec<File>,
+}
+
+impl Analysis {
+    pub(crate) fn new(
+        db: AnalysisDb,
+        modules: Vec<StarlarkModule>,
+        build_files: Vec<File>,
+    ) -> Self {
+        let modules = modules
+            .into_iter()
+            .map(|module| OriginalModule {
+                source: db.sources[&module.file(&db)].clone(),
+                loads: module.loads(&db).clone(),
+                module,
+            })
+            .collect();
+        Self {
+            db,
+            modules,
+            build_files,
+        }
+    }
+
+    pub fn contains(&self, path: &SystemPath) -> bool {
+        self.modules
+            .iter()
+            .any(|original| original.source.name() == path.as_str())
+    }
+
+    pub fn source_paths(&self) -> impl Iterator<Item = &SystemPath> {
+        self.modules
+            .iter()
+            .map(|original| SystemPath::new(original.source.name()))
+    }
+
+    /// Update a previously captured file for IDE queries only. Original load
+    /// attestations remain the reference even after several edits or an undo.
+    pub fn update_source(&mut self, path: &SystemPath, text: &str) -> Result<()> {
+        let files: Vec<_> = self
+            .db
+            .sources
+            .iter()
+            .filter_map(|(file, source)| {
+                (source.name() == path.as_str()
+                    && self
+                        .modules
+                        .iter()
+                        .any(|original| original.module.file(&self.db) == *file))
+                .then_some(*file)
+            })
+            .collect();
+        for file in files {
+            if self.db.sources[&file].source_text() == text {
+                continue;
+            }
+            let internal = file
+                .path(&self.db)
+                .as_system_path()
+                .context("captured source has no path")?
+                .to_path_buf();
+            self.db.system.fs().write_file(&internal, text)?;
+            File::sync_path(&mut self.db, &internal);
+            self.db
+                .sources
+                .insert(file, SourceFileBuilder::new(path.as_str(), text).finish());
+            for original in &self.modules {
+                if original.module.file(&self.db) != file {
+                    continue;
+                }
+                let loads = remap_loads(original.source.source_text(), text, &original.loads);
+                original.module.set_loads(&mut self.db).to(loads);
+                // Source offsets in companion declarations are attested only
+                // for the exact original source, never for a recovery parse.
+                original
+                    .module
+                    .set_annotations(&mut self.db)
+                    .to(Box::default());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn completions(&self, path: &SystemPath, offset: TextSize) -> Vec<Completion> {
+        let mut result = Vec::new();
+        for original in &self.modules {
+            if original.source.name() != path.as_str() {
+                continue;
+            }
+            let module = original.module;
+            let file = module.file(&self.db);
+            let source = &self.db.sources[&file];
+            if !source.source_text().is_char_boundary(offset.to_usize()) {
+                continue;
+            }
+            let program_file = ProgramFile::new_starlark(&self.db, module, self.db.program());
+            let env = ProgramEnvironment::from_file(program_file);
+            let settings = CompletionSettings {
+                auto_import: false,
+                complete_function_parentheses: false,
+            };
+            for item in ty_ide::local_completion(
+                &self.db,
+                &settings,
+                CompletionCapabilities::default(),
+                program_file,
+                offset,
+            ) {
+                if self.build_files.contains(&file)
+                    && item.kind == Some(CompletionKind::Keyword)
+                    && matches!(
+                        item.name.as_str(),
+                        "def" | "lambda" | "return" | "break" | "continue" | "pass"
+                    )
+                {
+                    continue;
+                }
+                let completion = Completion {
+                    label: item.label().to_owned(),
+                    insert: item.insert.map(|insert| insert.to_string()),
+                    kind: item.kind,
+                    detail: item.ty.map(|ty| ty.display(&self.db, &env).to_string()),
+                    documentation: item.documentation.map(|doc| doc.render_plaintext()),
+                };
+                if !result.contains(&completion) {
+                    result.push(completion);
+                }
+            }
+        }
+        result
+    }
+
+    pub fn definitions(&self, path: &SystemPath, offset: TextSize) -> Vec<Definition> {
+        let mut result = Vec::new();
+        for original in &self.modules {
+            if original.source.name() != path.as_str() {
+                continue;
+            }
+            let module = original.module;
+            if !self.db.sources[&module.file(&self.db)]
+                .source_text()
+                .is_char_boundary(offset.to_usize())
+            {
+                continue;
+            }
+            let file = ProgramFile::new_starlark(&self.db, module, self.db.program());
+            let Some(targets) = ty_ide::goto_definition(&self.db, file, offset) else {
+                continue;
+            };
+            for target in targets {
+                // Embedded declarations have no navigable filesystem URI.
+                let Some(source) = self.db.sources.get(&target.file()) else {
+                    continue;
+                };
+                let definition = Definition {
+                    source: source.clone(),
+                    range: target.focus_range(),
+                };
+                if !result.contains(&definition) {
+                    result.push(definition);
+                }
+            }
+        }
+        result
+    }
+}
+
+fn remap_loads(original: &str, current: &str, loads: &[StarlarkLoad]) -> Box<[StarlarkLoad]> {
+    let calls = |text: &str| {
+        let parsed = parse_unchecked(
+            text,
+            ParseOptions::from(Mode::Module).with_target_version(PythonVersion::PY310),
+        );
+        parsed
+            .syntax()
+            .as_module()
+            .map(|module| {
+                module
+                    .body
+                    .iter()
+                    .filter_map(|stmt| {
+                        stmt.as_expr_stmt()
+                            .and_then(|stmt| load_call(&stmt.value))
+                            .map(Ranged::range)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let old_calls = calls(original);
+    let new_calls = calls(current);
+    loads
+        .iter()
+        .filter_map(|load| {
+            let old_text = &original[load.range];
+            let index = old_calls.iter().position(|range| *range == load.range)?;
+            let range = *new_calls.get(index)?;
+            if &current[range] != old_text
+                || old_calls
+                    .iter()
+                    .filter(|range| &original[**range] == old_text)
+                    .count()
+                    != 1
+                || new_calls
+                    .iter()
+                    .filter(|range| &current[**range] == old_text)
+                    .count()
+                    != 1
+            {
+                return None;
+            }
+            Some(StarlarkLoad {
+                range,
+                module: load.module,
+            })
+        })
+        .collect()
 }
 
 /// The database reads only captured text and embedded builtin declarations.
@@ -226,8 +480,8 @@ impl ty_python_semantic::Db for AnalysisDb {
     fn verbose(&self) -> bool {
         false
     }
-    fn is_open_file(&self, _file: File) -> bool {
-        false
+    fn is_open_file(&self, file: File) -> bool {
+        self.sources.contains_key(&file)
     }
     fn dyn_clone(&self) -> Box<dyn ty_python_semantic::Db> {
         Box::new(self.clone())

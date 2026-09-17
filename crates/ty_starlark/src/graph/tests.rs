@@ -6,7 +6,8 @@ use crate::bazel::BazelRepository;
 use crate::source::BazelSource;
 use crate::testing::{TestDb, test_db};
 
-use super::check_bazel_graph;
+use super::{analyze_bazel_graph, check_bazel_graph, recover_bazel_graph};
+use ruff_text_size::TextSize;
 
 fn graph_for(
     db: &TestDb,
@@ -542,5 +543,91 @@ fn bazel_rejects_hosted_only_calls_and_type_operations() -> anyhow::Result<()> {
             "must reach semantic analysis: {source}: {diagnostics:?}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn editor_recovers_initial_incomplete_sources_without_checking_them() -> anyhow::Result<()> {
+    for name in ["defs.bzl", "BUILD"] {
+        let text = "items = ['x']\nitems.";
+        let (db, root) = test_db(&[("MODULE.bazel", ""), ("BUILD", ""), (name, text)])?;
+        let file = system_path_to_file(&db, root.join(name))?;
+        let sources = [BazelSource::new(
+            &db,
+            BazelRepository::new(&db, root.clone()),
+            file,
+        )];
+        assert!(!check_bazel_graph(&db, &sources)?.is_empty());
+        let analysis = recover_bazel_graph(&db, &sources)?.unwrap();
+        let items = analysis.completions(&root.join(name), TextSize::try_from(text.len())?);
+        assert!(items.iter().any(|item| item.label == "append"), "{items:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn editor_build_namespace_uses_declared_builtins_and_source_shadowing() -> anyhow::Result<()> {
+    for name in ["defs.bzl", "BUILD"] {
+        let text = "glob = 42\n\n";
+        let (db, root) = test_db(&[("MODULE.bazel", ""), ("BUILD", ""), (name, text)])?;
+        let file = system_path_to_file(&db, root.join(name))?;
+        let sources = [BazelSource::new(
+            &db,
+            BazelRepository::new(&db, root.clone()),
+            file,
+        )];
+        let (_, analysis) = analyze_bazel_graph(&db, &sources)?;
+        let items = analysis
+            .unwrap()
+            .completions(&root.join(name), TextSize::try_from(text.len())?);
+        let has = |label| items.iter().any(|item| item.label == label);
+        assert!(has("select"));
+        assert!(has("load"));
+        assert!(!items.iter().any(|item| item.label.starts_with("_bazel_")));
+        assert_eq!(has("filegroup"), name == "BUILD");
+        assert_eq!(has("struct"), name == "defs.bzl");
+        assert_eq!(has("def"), name == "defs.bzl");
+        assert_eq!(has("lambda"), name == "defs.bzl");
+        let glob = items.iter().find(|item| item.label == "glob").unwrap();
+        assert_eq!(glob.detail.as_deref(), Some("Literal[42]"));
+    }
+    Ok(())
+}
+
+#[test]
+fn editor_recovery_keeps_local_names_with_a_missing_load() -> anyhow::Result<()> {
+    let text = "load(':missing.bzl', 'f')\nitems = ['x']\nitems.";
+    let (db, root) = test_db(&[("MODULE.bazel", ""), ("BUILD", ""), ("defs.bzl", text)])?;
+    let file = system_path_to_file(&db, root.join("defs.bzl"))?;
+    let sources = [BazelSource::new(
+        &db,
+        BazelRepository::new(&db, root.clone()),
+        file,
+    )];
+    let analysis = recover_bazel_graph(&db, &sources)?.unwrap();
+    let items = analysis.completions(&root.join("defs.bzl"), TextSize::try_from(text.len())?);
+    assert!(items.iter().any(|item| item.label == "append"), "{items:?}");
+    Ok(())
+}
+
+#[test]
+fn editor_recovery_keeps_valid_loaded_companion_types() -> anyhow::Result<()> {
+    let text = "load(':helper.bzl', 'identity')\nidentity('x').";
+    let (db, root) = test_db(&[
+        ("MODULE.bazel", ""),
+        ("BUILD", ""),
+        ("defs.bzl", text),
+        ("helper.bzl", "def identity(value):\n    return value\n"),
+        ("helper.bzl.pyi", "def identity(value: str) -> str: ...\n"),
+    ])?;
+    let file = system_path_to_file(&db, root.join("defs.bzl"))?;
+    let sources = [BazelSource::new(
+        &db,
+        BazelRepository::new(&db, root.clone()),
+        file,
+    )];
+    let analysis = recover_bazel_graph(&db, &sources)?.unwrap();
+    let items = analysis.completions(&root.join("defs.bzl"), TextSize::try_from(text.len())?);
+    assert!(items.iter().any(|item| item.label == "split"), "{items:?}");
     Ok(())
 }
