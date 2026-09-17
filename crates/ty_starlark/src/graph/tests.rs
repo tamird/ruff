@@ -414,6 +414,87 @@ fn build_globals_and_loads_report_invalid_calls() -> anyhow::Result<()> {
         "{}",
         rendered(&db, &diagnostics)
     );
+    let output = rendered(&db, &diagnostics);
+    assert!(output.contains("function `filegroup`"), "{output}");
+    assert!(!output.contains("_bazel_"), "{output}");
+    Ok(())
+}
+
+#[test]
+fn configurable_build_attributes_keep_branch_types() -> anyhow::Result<()> {
+    let (mut db, root) = test_db(&[("MODULE.bazel", ""), ("BUILD", "")])?;
+    for source in [
+        "filegroup(name='mixed', srcs=select({':a': ['x'], '//conditions:default': ('y',)}))",
+        "filegroup(name='default', srcs=select({':a': ['x'], '//conditions:default': None}))",
+        "filegroup(name='left', srcs=glob(['*.cc']) + select({'//conditions:default': ('x',)}))",
+        "filegroup(name='right', srcs=select({'//conditions:default': ['x']}) + ('y',))",
+        "filegroup(name='both', srcs=select({':a': ['x'], '//conditions:default': ('y',)}) + select({'//conditions:default': ['z']}))",
+        "filegroup(name='attrs', aspect_hints=select({'//conditions:default': [':hint']}), features=select({'//conditions:default': ['feature']}), target_compatible_with=select({'//conditions:default': ['//platform:cpu']}))",
+        "genrule(name='command', outs=['out'], cmd='prefix' + select({':a': 'a', '//conditions:default': 'b'}) + 'suffix')",
+        "genrule(name='attrs', outs=['out'], cmd=select({'//conditions:default': None}), exec_properties=select({'//conditions:default': {'pool': 'cpu'}}), output_licenses=select({'//conditions:default': ['notice']}))",
+    ] {
+        db.write_file(root.join("BUILD"), source)?;
+        let diagnostics = graph_for(&db, &root, &["BUILD"])?;
+        assert!(
+            diagnostics.is_empty(),
+            "{source}: {}",
+            rendered(&db, &diagnostics)
+        );
+    }
+    for source in [
+        "filegroup(name='bad', srcs=select({'//conditions:default': [1]}))",
+        "filegroup(name='bad', srcs=select({':a': ['x'], '//conditions:default': (1,)}))",
+        "filegroup(name='bad', features=select({'//conditions:default': [1]}))",
+        "filegroup(name='bad', tags=select({'//conditions:default': ['manual']}))",
+        "genrule(name='bad', outs=['out'], exec_properties=select({'//conditions:default': {'pool': 1}}))",
+        "value = select({'//conditions:default': 'text'}) + ['file']",
+    ] {
+        db.write_file(root.join("BUILD"), source)?;
+        let diagnostics = graph_for(&db, &root, &["BUILD"])?;
+        assert!(!diagnostics.is_empty(), "accepted {source}");
+        assert!(
+            !codes(&diagnostics).contains(&"unsupported-starlark".to_string()),
+            "{source}: {}",
+            rendered(&db, &diagnostics)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn build_boolean_attribute_conversion_is_limited() -> anyhow::Result<()> {
+    let (mut db, root) = test_db(&[("MODULE.bazel", ""), ("BUILD", "")])?;
+    for source in [
+        "package(default_testonly=1)",
+        "filegroup(name='test', testonly=0)",
+        "genrule(name='tool', outs=['out'], local=1, executable=1, output_to_bindir=0, testonly=True)",
+        "genrule(name='selected', outs=['out'], local=select({':a': True, '//conditions:default': None}))",
+        "genrule(name='selected', outs=['out'], local=select({':a': 0, '//conditions:default': 1}))",
+    ] {
+        db.write_file(root.join("BUILD"), source)?;
+        let diagnostics = graph_for(&db, &root, &["BUILD"])?;
+        assert!(
+            diagnostics.is_empty(),
+            "{source}: {}",
+            rendered(&db, &diagnostics)
+        );
+    }
+    for source in [
+        "package(default_testonly=2)",
+        "filegroup(name='test', testonly=-1)",
+        "genrule(name='tool', outs=['out'], executable='yes')",
+        "genrule(name='selected', outs=['out'], local=select({'//conditions:default': 2}))",
+        "glob(['*.cc'], allow_empty=1)",
+    ] {
+        db.write_file(root.join("BUILD"), source)?;
+        let diagnostics = graph_for(&db, &root, &["BUILD"])?;
+        assert_eq!(
+            codes(&diagnostics),
+            ["invalid-argument-type"],
+            "{source}: {}",
+            rendered(&db, &diagnostics)
+        );
+    }
     Ok(())
 }
 

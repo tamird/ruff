@@ -9,6 +9,7 @@ class _Generic: ...
 Generic: type[_Generic]
 Protocol: _SpecialForm
 Callable: _SpecialForm
+Literal: _SpecialForm
 Never: _SpecialForm
 
 def overload[F](function: F) -> F: ...

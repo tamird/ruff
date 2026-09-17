@@ -504,7 +504,7 @@ fn bazel_builtin(name: &str) -> StarlarkGlobalDeclaration {
     StarlarkGlobalDeclaration {
         name: Name::new(name),
         kind: StarlarkGlobalKind::Builtin {
-            symbol: Name::new(format!("_bazel_{name}")),
+            symbol: Name::new(name),
         },
     }
 }

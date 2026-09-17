@@ -1,3 +1,5 @@
+from typing import Literal as _Literal
+
 __all__ = [
     "abs",
     "all",
@@ -119,63 +121,80 @@ class range:
 _BazelLabels = list[str] | tuple[str, ...]
 
 class _BazelSelector[T]:
-    def __add__(self, other: T | _BazelSelector[T], /) -> _BazelSelector[T]: ...
-    def __radd__(self, other: T, /) -> _BazelSelector[T]: ...
+    # Selectors are immutable. Keep T covariant so different branch container
+    # types can be converted to the same attribute type by Bazel.
+    @_overload
+    def __add__(
+        self: _BazelSelector[_BazelLabels],
+        other: _BazelLabels | _BazelSelector[_BazelLabels],
+        /,
+    ) -> _BazelSelector[T]: ...
+    @_overload
+    def __add__(
+        self: _BazelSelector[str], other: str | _BazelSelector[str], /
+    ) -> _BazelSelector[T]: ...
+    @_overload
+    def __radd__(
+        self: _BazelSelector[_BazelLabels], other: _BazelLabels, /
+    ) -> _BazelSelector[T]: ...
+    @_overload
+    def __radd__(self: _BazelSelector[str], other: str, /) -> _BazelSelector[T]: ...
 
-_BazelConfigurableLabels = (
-    _BazelLabels | _BazelSelector[list[str]] | _BazelSelector[tuple[str, ...]]
-)
-_BazelConfigurableString = str | _BazelSelector[str]
-_BazelConfigurableBool = bool | _BazelSelector[bool]
+# None in a select branch requests the attribute's default value.
+_BazelConfigurableLabels = _BazelLabels | _BazelSelector[_BazelLabels | None]
+_BazelConfigurableString = str | _BazelSelector[str | None]
+# Type.BOOLEAN also converts integer literals 0 and 1 for rule/package attributes.
+# https://github.com/bazelbuild/bazel/blob/9.0.0/src/main/java/com/google/devtools/build/lib/packages/Type.java
+_BazelBool = bool | _Literal[0, 1]
+_BazelConfigurableBool = _BazelBool | _BazelSelector[_BazelBool | None]
+_BazelConfigurableDict = dict[str, str] | _BazelSelector[dict[str, str] | None]
 
-def _bazel_glob(
+def glob(
     include: _BazelLabels = ...,
     exclude: _BazelLabels = ...,
     exclude_directories: int = 1,
     allow_empty: bool = ...,
 ) -> list[str]: ...
-def _bazel_select[T](
-    x: dict[str, T], /, no_match_error: str = ""
-) -> _BazelSelector[T]: ...
-def _bazel_package(
+def select[T](x: dict[str, T], /, no_match_error: str = "") -> _BazelSelector[T]: ...
+def package(
     *,
     default_deprecation: str = "",
     default_package_metadata: _BazelLabels = ...,
     default_applicable_licenses: _BazelLabels = ...,
-    default_testonly: bool = False,
+    default_testonly: _BazelBool = False,
     default_visibility: _BazelLabels = ...,
     features: _BazelLabels = ...,
 ) -> None: ...
-def _bazel_exports_files(
+def exports_files(
     srcs: _BazelLabels,
     visibility: _BazelLabels | None = None,
     licenses: _BazelLabels | None = None,
 ) -> None: ...
-def _bazel_filegroup(
+def filegroup(
     *,
     name: str,
     srcs: _BazelConfigurableLabels = ...,
     data: _BazelConfigurableLabels = ...,
-    aspect_hints: _BazelLabels = ...,
+    aspect_hints: _BazelConfigurableLabels = ...,
     compatible_with: _BazelLabels = ...,
     deprecation: str = "",
-    features: _BazelLabels = ...,
+    features: _BazelConfigurableLabels = ...,
     licenses: _BazelLabels = ...,
     output_group: _BazelConfigurableString = "",
     package_metadata: _BazelLabels = ...,
     restricted_to: _BazelLabels = ...,
     visibility: _BazelLabels = ...,
     tags: _BazelLabels = ...,
-    target_compatible_with: _BazelLabels = ...,
-    testonly: bool = False,
+    target_compatible_with: _BazelConfigurableLabels = ...,
+    testonly: _BazelBool = False,
 ) -> None: ...
-def _bazel_genrule(
+def genrule(
     *,
     name: str,
     outs: _BazelLabels,
     srcs: _BazelConfigurableLabels = ...,
     tools: _BazelConfigurableLabels = ...,
-    aspect_hints: _BazelLabels = ...,
+    aspect_hints: _BazelConfigurableLabels = ...,
     cmd: _BazelConfigurableString = "",
     cmd_bash: _BazelConfigurableString = "",
     cmd_bat: _BazelConfigurableString = "",
@@ -184,19 +203,19 @@ def _bazel_genrule(
     deprecation: str = "",
     exec_compatible_with: _BazelLabels = ...,
     exec_group_compatible_with: dict[str, _BazelLabels] = ...,
-    exec_properties: dict[str, str] = ...,
+    exec_properties: _BazelConfigurableDict = ...,
     message: _BazelConfigurableString = "",
     local: _BazelConfigurableBool = False,
-    executable: bool = False,
-    features: _BazelLabels = ...,
+    executable: _BazelBool = False,
+    features: _BazelConfigurableLabels = ...,
     licenses: _BazelLabels = ...,
-    output_licenses: _BazelLabels = ...,
-    output_to_bindir: bool = False,
+    output_licenses: _BazelConfigurableLabels = ...,
+    output_to_bindir: _BazelBool = False,
     package_metadata: _BazelLabels = ...,
     restricted_to: _BazelLabels = ...,
     visibility: _BazelLabels = ...,
     tags: _BazelLabels = ...,
-    target_compatible_with: _BazelLabels = ...,
-    testonly: bool = False,
+    target_compatible_with: _BazelConfigurableLabels = ...,
+    testonly: _BazelBool = False,
     toolchains: _BazelLabels = ...,
 ) -> None: ...
