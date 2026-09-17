@@ -61,12 +61,39 @@ can then be stale relative to the unsaved editor text.
 
 Register `/abs/ruff/target/debug/sty server` as a stdio LSP command for
 `BUILD`, `BUILD.bazel`, `.bzl`, `.bzl.pyi`, and `.star` filetypes.
-Sty currently publishes diagnostics and related source locations; it
-does not provide hover, completion, or navigation. Opened and changed
-buffers recheck directly.
+Sty publishes diagnostics, completes names and members, and provides Go to
+Definition for source names, loaded bindings, and record or struct fields.
+Go to Definition on a `load` label opens its source file; it does not resolve
+arbitrary Bazel target labels. Completion uses the declared builtin inventory
+above and ordinary Ty inference. It does not suggest Python imports. Hover
+and navigation into embedded builtin declarations are not available.
+Opened and changed buffers recheck directly. Incomplete Bazel buffers also
+receive completion before their first successful check.
 The client may also send `workspace/didChangeWatchedFiles` for changes
 on disk; Sty does not register file-watch patterns itself, so configure
 external file watches in the editor when needed.
+
+For VS Code, the Bazel extension (`BazelBuild.vscode-bazel`) registers the
+`starlark` language, including BUILD files. Generic LSP Client v2
+(`zsol.vscode-glspc`, version 0.2.1) can start Sty with these settings:
+
+```json
+{
+  "files.associations": {
+    "*.bzl": "starlark",
+    "*.bzl.pyi": "starlark",
+    "*.star": "starlark"
+  },
+  "glspc.server.command": "/abs/ruff/target/debug/sty",
+  "glspc.server.commandArguments": ["server"],
+  "glspc.server.languageId": ["starlark"]
+}
+```
+
+The same LSP command works in Cursor with a compatible installed client;
+extension availability depends on its marketplace. Rebuild Sty and restart
+the client after updating this checkout. Generic LSP Client's
+`glspc.server.initializationOptions` takes the host configuration below.
 
 For `.star`, pass the host and selected source roots in the editor's
 LSP initialization options. A loaded `.star` file opened alone is
@@ -92,6 +119,14 @@ The host's loader locates physically existing sources and resolves its
 private loads; Sty checks captured text and host facts without running
 native checks or deployment evaluation. An opened `.star` without a
 configured host root receives a setup diagnostic.
+
+Hosted completion and navigation need one successful captured graph first.
+While a later host request is pending or an incomplete edit prevents capture,
+IDE queries use the current editor text with the last attested host profile.
+Only unchanged, unambiguous top-level load calls retain their old edges;
+changed or nested loads lose those targets. Diagnostics still require a
+fresh admitted graph. Watched changes to captured dependencies, the host
+executable, its runfiles manifest, or named inputs invalidate retained facts.
 
 For a `.star` file, supply a host implementing `--sty-graph-v3`. This
 works from any directory without a Bazel marker or BUILD file.

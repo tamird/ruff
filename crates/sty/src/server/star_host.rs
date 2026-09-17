@@ -16,7 +16,8 @@ use crossbeam::channel::{self, Receiver, Sender, TrySendError};
 use lsp_types::{Diagnostic, Uri};
 use ruff_db::system::SystemPath;
 use serde::Deserialize;
-use ty_starlark::star::check_star_graph;
+use ty_starlark::analysis::Analysis;
+use ty_starlark::star::analyze_star_graph;
 
 use crate::StyDb;
 use crate::diagnostics::star_diagnostics;
@@ -370,12 +371,18 @@ fn run_host_graph(
     run(source, overlays, cancel, timeout).map_err(|error| format!("{error:#}"))
 }
 
+pub(super) struct CheckedCompletion {
+    pub diagnostics: HashMap<Uri, Vec<Diagnostic>>,
+    pub analyses: Vec<(PathBuf, Option<Analysis>)>,
+}
+
 pub(super) fn check_completion(
     db: &StyDb,
     documents: &HashMap<ruff_db::system::SystemPathBuf, OpenDocument>,
     completion: &HostCompletion,
     encoding: Encoding,
-) -> HashMap<Uri, Vec<Diagnostic>> {
+) -> CheckedCompletion {
+    let mut analyses = Vec::new();
     let mut diagnostics: HashMap<Uri, Vec<Diagnostic>> = HashMap::new();
     let mut visited = HashSet::new();
     let open: HashMap<_, _> = documents
@@ -437,17 +444,18 @@ pub(super) fn check_completion(
                 .to_str()
                 .ok_or_else(|| anyhow!("invalid host root path"))?;
             let graph = captured.into_star_graph(db, SystemPath::new(selected))?;
-            let result = check_star_graph(db, &graph)?;
+            let (result, analysis) = analyze_star_graph(db, &graph)?;
             let problems = star_diagnostics(db, &graph, &result)?;
             let mut graph_diagnostics: HashMap<Uri, Vec<Diagnostic>> = HashMap::new();
             for problem in &problems {
                 let (uri, diagnostic) = lsp_diagnostic(db, documents, problem, encoding)?;
                 graph_diagnostics.entry(uri).or_default().push(diagnostic);
             }
-            Ok((observed, graph_diagnostics))
+            Ok((observed, graph_diagnostics, analysis))
         });
         match result {
-            Ok((observed, mut graph_diagnostics)) => {
+            Ok((observed, mut graph_diagnostics, analysis)) => {
+                analyses.push((source.root.clone(), analysis));
                 visited.extend(observed);
                 let mut uris: Vec<_> = graph_diagnostics.keys().cloned().collect();
                 uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -492,7 +500,10 @@ pub(super) fn check_completion(
             ));
         }
     }
-    diagnostics
+    CheckedCompletion {
+        diagnostics,
+        analyses,
+    }
 }
 
 fn canonical(path: &Path) -> Result<PathBuf> {

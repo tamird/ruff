@@ -13,6 +13,7 @@ body checking.
 | `ty_starlark`        | Starlark syntax admission, Bazel roots and labels, resolved load bindings, and host facts              |
 | `ty_python_core`     | Semantic module identity, definitions, scopes, use/definition maps, and dependency tracking            |
 | `ty_python_semantic` | Types, signatures, argument binding, assignability, function bodies, returns, and semantic diagnostics |
+| `ty_ide`             | Completion contexts, ranking, signatures, and source definition queries                                |
 | `ruff_db`            | Source snapshots, parsing infrastructure, diagnostic spans, and rendering                              |
 | External host        | Its parser, private loader, and declarations of native capabilities                                    |
 
@@ -39,9 +40,11 @@ Each check captures its graph in a fresh in-memory semantic database,
 [`AnalysisDb`](../ty_starlark/src/analysis.rs). Sources, resolved edges, and
 host declarations become tracked inputs within that database. Bazel reads
 source, companion, package, and repository files through the outer database's
-tracked filesystem; editor changes trigger a new graph check. Semantic caches
-currently live for one check, so the LSP does not reuse inference across edits.
-A host result's captured text is never replaced by a later disk read.
+tracked filesystem; editor changes trigger a new graph check. The editor
+retains the resulting `Analysis` for shared IDE queries. A host result's
+captured text is never replaced by a later disk read. Hosted recovery updates
+tracked source text and safe load edges within the retained database while
+new host facts are pending; it cannot establish checked diagnostics.
 
 ## Loads and builtins
 
@@ -97,9 +100,10 @@ instance-member representation; function values do not acquire receivers.
 
 The captured graph is checked in an in-memory database with embedded
 Starlark builtin declarations. Physical source snapshots share parser keys;
-logical modules retain separate semantic identities. Before the database
-is dropped, every diagnostic annotation and subdiagnostic annotation is
-converted to an owned source snapshot. No database file handle escapes.
+logical modules retain separate semantic identities. Every diagnostic
+annotation is converted to an owned source snapshot before returning to the
+caller. Editor queries likewise return owned completion presentations or
+captured definition sources and ranges. No database file handle escapes.
 
 ## Bazel declarations
 
@@ -146,6 +150,28 @@ Embedded builtin declarations have display-only names; their annotations
 appear as text when no editor location exists. Sty owns document synchronization
 and host-worker scheduling, independently of Ty's Python project server.
 
+[`ty_ide::local_completion`](../ty_ide/src/completion.rs) uses the same
+context, ranking, and signature logic as Python completion, with no project
+search or import edits. Runtime names use the same builtin visibility lookup
+as inference. Definition queries follow final public load exports and retain
+record field declaration names separately from diagnostic type origins.
+Queries run in every logical context for a physical file and deduplicate
+identical presentations or locations.
+
+Bazel recovery reuses the source admission visitor and load discovery, allows
+parser recovery placeholders, and retains local facts when a dependency is
+unavailable. It does not relax CLI admission or publish recovery diagnostics.
+Valid dependencies retain their companion declarations. Hosted recovery
+requires an earlier admitted graph: unchanged, unique top-level load call
+text may retain its original edge at a new source range. Changed, reordered,
+or nested calls lose their old edges. Source edits discard companion offsets.
+The original attestations remain the reference across repeated edits and undo.
+
+The server installs host analyses behind the same revision gates as diagnostics.
+Watched dependency, executable, manifest, and input changes invalidate retained
+facts and advance the host revision. Definition positions use captured target
+text, including unsaved Unicode, through the diagnostic span projector.
+
 ## MVP limits
 
 The Bazel frontend selects BUILD files and `.bzl` sources in one main
@@ -156,7 +182,9 @@ are not yet declared.
 The shared Python parser also rejects some valid Starlark
 forms, including positional symbols after named aliases in `load`.
 
-The server publishes diagnostics and related locations. It does not yet
-provide completion, hover, or navigation. A single CLI invocation selects
+The server provides diagnostics, completion, and source Go to Definition.
+Hover, embedded builtin navigation, and arbitrary Bazel target navigation
+are not implemented. Hosted IDE queries need a first successful graph capture.
+A single CLI invocation selects
 either Bazel or a configured hosted graph; it does not combine Python and
 Starlark projects.

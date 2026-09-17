@@ -1,4 +1,4 @@
-//! A diagnostics-only Starlark language server.
+//! Starlark diagnostics and shared Ty editor queries over captured sources.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -23,8 +23,9 @@ use ruff_db::source::{line_index, source_text};
 use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_source_file::{LineIndex, OneIndexed, SourceLocation};
 use ruff_text_size::{TextRange, TextSize};
+use ty_starlark::analysis::{Analysis, CompletionKind};
 use ty_starlark::bazel::{BazelRepository, find_bazel_repository};
-use ty_starlark::graph::check_bazel_graph;
+use ty_starlark::graph::{analyze_bazel_graph, recover_bazel_graph};
 use ty_starlark::source::BazelSource;
 
 use crate::StyDb;
@@ -96,6 +97,8 @@ struct Server {
     published_host: HashSet<Uri>,
     host_sources: Vec<star_host::HostSource>,
     host: Option<star_host::HostWorker>,
+    bazel_analyses: Vec<Analysis>,
+    host_analyses: BTreeMap<std::path::PathBuf, Analysis>,
     pending: VecDeque<ServerMessage>,
     encoding: Encoding,
     revision: u64,
@@ -155,6 +158,11 @@ fn run_connection(connection: Connection, cwd: &SystemPath) -> Result<()> {
     };
     let capabilities = ServerCapabilities {
         position_encoding: Some(encoding.kind()),
+        completion_provider: Some(lsp_types::CompletionOptions {
+            trigger_characters: Some(vec![".".into()]),
+            ..lsp_types::CompletionOptions::default()
+        }),
+        definition_provider: Some(true.into()),
         text_document_sync: Some(
             TextDocumentSyncOptions {
                 open_close: Some(true),
@@ -182,6 +190,8 @@ fn run_connection(connection: Connection, cwd: &SystemPath) -> Result<()> {
         published_host: HashSet::new(),
         host_sources: host_settings.host_sources,
         host,
+        bazel_analyses: Vec::new(),
+        host_analyses: BTreeMap::new(),
         pending: VecDeque::new(),
         encoding,
         revision: 0,
@@ -194,6 +204,108 @@ fn run_connection(connection: Connection, cwd: &SystemPath) -> Result<()> {
 }
 
 impl Server {
+    fn editor_request(&mut self, request: Request) -> Response {
+        let Request { id, method, params } = request;
+        if !matches!(
+            method.as_str(),
+            "textDocument/completion" | "textDocument/definition"
+        ) {
+            return Response::new_err(
+                id,
+                ErrorCode::MethodNotFound as i32,
+                format!("Sty does not implement {method}"),
+            );
+        }
+        let result = self.editor_result(&method, params);
+        match result {
+            Ok(value) => Response::new_ok(id, value),
+            Err(error) => {
+                Response::new_err(id, ErrorCode::InvalidParams as i32, format!("{error:#}"))
+            }
+        }
+    }
+
+    fn editor_result(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let params: lsp_types::TextDocumentPositionParams = serde_json::from_value(params)?;
+        let path = uri_path(&params.text_document.uri)?;
+        let text = self
+            .system
+            .text(&path)
+            .ok_or_else(|| anyhow!("request for unopened document {path}"))?;
+        let index = LineIndex::from_source_text(&text.text);
+        let offset = TextSize::try_from(text_offset(
+            &text.text,
+            &index,
+            params.position,
+            self.encoding,
+        )?)?;
+        // A host graph may still be running or reject an incomplete edit. IDE
+        // recovery uses its last attested facts with every current overlay.
+        let mut documents: Vec<_> = self.documents.keys().collect();
+        documents.sort();
+        for analysis in self.host_analyses.values_mut() {
+            for open in &documents {
+                if let Some(text) = self.system.text(open) {
+                    for source in analysis_source_paths(analysis, open) {
+                        analysis.update_source(&source, &text.text)?;
+                    }
+                }
+            }
+        }
+        let mut completions = Vec::new();
+        let mut locations = Vec::new();
+        for analysis in self
+            .bazel_analyses
+            .iter()
+            .chain(self.host_analyses.values())
+        {
+            for source in analysis_source_paths(analysis, &path) {
+                if method == "textDocument/completion" {
+                    for item in analysis.completions(&source, offset) {
+                        if !completions.contains(&item) {
+                            completions.push(item);
+                        }
+                    }
+                } else {
+                    for definition in analysis.definitions(&source, offset) {
+                        let span = Span::from(definition.source).with_range(definition.range);
+                        if let Some(location) =
+                            span_location(&self.db, &self.documents, &span, self.encoding)?
+                            && !locations.contains(&location)
+                        {
+                            locations.push(location);
+                        }
+                    }
+                }
+            }
+        }
+        if method == "textDocument/definition" {
+            return Ok(serde_json::to_value(locations)?);
+        }
+        let items: Vec<_> = completions
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| lsp_types::CompletionItem {
+                label: item.label,
+                insert_text: item.insert,
+                kind: item.kind.map(completion_kind),
+                detail: item.detail,
+                documentation: item.documentation.map(lsp_types::Documentation::String),
+                sort_text: Some(format!("{index:08}")),
+                ..lsp_types::CompletionItem::default()
+            })
+            .collect();
+        Ok(serde_json::to_value(lsp_types::CompletionList {
+            is_incomplete: true,
+            items,
+            ..lsp_types::CompletionList::default()
+        })?)
+    }
+
     fn run(mut self) -> Result<()> {
         loop {
             let (message, completed) = if let Some(message) = self.pending.pop_front() {
@@ -234,24 +346,22 @@ impl Server {
 
     fn handle_message(&mut self, message: ServerMessage) -> Result<bool> {
         match message {
-            ServerMessage::Request(Request { id, method, .. }) => {
-                if method == ShutdownRequest::METHOD.as_str() {
+            ServerMessage::Request(request) => {
+                let response = if request.method == ShutdownRequest::METHOD.as_str() {
                     self.shutdown = true;
-                    self.connection
-                        .sender
-                        .send(ServerMessage::Response(Response::new_ok(
-                            id,
-                            serde_json::Value::Null,
-                        )))?;
+                    Response::new_ok(request.id, serde_json::Value::Null)
+                } else if self.shutdown {
+                    Response::new_err(
+                        request.id,
+                        ErrorCode::InvalidRequest as i32,
+                        "Sty has shut down".into(),
+                    )
                 } else {
-                    self.connection
-                        .sender
-                        .send(ServerMessage::Response(Response::new_err(
-                            id,
-                            ErrorCode::MethodNotFound as i32,
-                            format!("Sty does not implement {method}"),
-                        )))?;
-                }
+                    self.editor_request(request)
+                };
+                self.connection
+                    .sender
+                    .send(ServerMessage::Response(response))?;
             }
             ServerMessage::Notification(notification) => {
                 if notification.method == ExitNotification::METHOD.as_str() {
@@ -323,26 +433,32 @@ impl Server {
             "textDocument/didClose" => {
                 let params: DidCloseTextDocumentParams = serde_json::from_value(params)?;
                 let path = uri_path(&params.text_document.uri)?;
+                if self.is_host_input(&path) {
+                    self.invalidate_host();
+                }
                 self.documents.remove(&path);
                 self.system.close(&path);
                 File::sync_path(&mut self.db, &path);
                 self.needs_bazel_check |= is_bazel_relevant(&path);
-                self.mark_host_change(&path);
             }
             "textDocument/didSave" => {
                 let params: DidSaveTextDocumentParams = serde_json::from_value(params)?;
                 let path = uri_path(&params.text_document.uri)?;
                 File::sync_path(&mut self.db, &path);
                 self.needs_bazel_check |= is_bazel_relevant(&path);
-                self.mark_host_change(&path);
+                if self.is_host_input(&path) {
+                    self.invalidate_host();
+                }
             }
             "workspace/didChangeWatchedFiles" => {
                 let params: DidChangeWatchedFilesParams = serde_json::from_value(params)?;
                 for event in params.changes {
                     let path = uri_path(&event.uri)?;
+                    if self.is_host_input(&path) {
+                        self.invalidate_host();
+                    }
                     File::sync_path(&mut self.db, &path);
                     self.needs_bazel_check |= is_bazel_relevant(&path);
-                    self.mark_host_change(&path);
                 }
             }
             _ => {}
@@ -356,10 +472,37 @@ impl Server {
     }
 
     fn mark_host_change(&mut self, path: &SystemPath) {
-        if path.extension() == Some("star") {
+        if self.is_host_input(path) {
             self.host_revision += 1;
             self.needs_host_check = true;
         }
+    }
+
+    fn invalidate_host(&mut self) {
+        self.host_analyses.clear();
+        self.host_revision += 1;
+        self.needs_host_check = true;
+    }
+
+    fn is_host_input(&self, path: &SystemPath) -> bool {
+        path.extension() == Some("star")
+            || self.host_sources.iter().any(|source| {
+                std::iter::once(&source.checker)
+                    .chain(source.runfiles_manifest.iter())
+                    .chain(source.inputs.values())
+                    .any(|input| {
+                        input == path.as_std_path()
+                            || input
+                                .canonicalize()
+                                .ok()
+                                .zip(path.as_std_path().canonicalize().ok())
+                                .is_some_and(|(left, right)| left == right)
+                    })
+            })
+            || self
+                .host_analyses
+                .values()
+                .any(|analysis| !analysis_source_paths(analysis, path).is_empty())
     }
 
     fn apply_notification(&mut self, notification: lsp_server::Notification) -> Result<()> {
@@ -403,6 +546,7 @@ impl Server {
         // remains scoped to one marked main repository.
         loop {
             self.needs_bazel_check = false;
+            let mut analyses = Vec::new();
             let mut by_uri: HashMap<Uri, Vec<Diagnostic>> = HashMap::new();
             let mut documents: Vec<_> = self.documents.iter().collect();
             documents.sort_by_key(|(path, _)| *path);
@@ -424,8 +568,28 @@ impl Server {
                 }
             }
             for sources in groups.values() {
-                let problems = match check_bazel_graph(&self.db, sources) {
-                    Ok(diagnostics) => diagnostics,
+                let problems = match analyze_bazel_graph(&self.db, sources) {
+                    Ok((diagnostics, analysis)) => {
+                        let needs_recovery = analysis.as_ref().is_none_or(|analysis| {
+                            sources.iter().any(|source| {
+                                source
+                                    .selected_file(&self.db)
+                                    .path(&self.db)
+                                    .as_system_path()
+                                    .is_none_or(|path| !analysis.contains(path))
+                            })
+                        });
+                        let analysis = if needs_recovery {
+                            recover_bazel_graph(&self.db, sources)
+                                .ok()
+                                .flatten()
+                                .or(analysis)
+                        } else {
+                            analysis
+                        };
+                        analyses.extend(analysis);
+                        diagnostics
+                    }
                     Err(failure) => vec![failure.diagnostic()],
                 };
                 for problem in problems {
@@ -443,6 +607,7 @@ impl Server {
             if self.needs_bazel_check {
                 continue;
             }
+            self.bazel_analyses = analyses;
             send_publications(
                 &self.connection,
                 &self.documents,
@@ -538,6 +703,7 @@ impl Server {
             });
         }
         if let Some(error) = alias_conflict {
+            self.host_analyses.clear();
             let by_uri = self
                 .documents
                 .iter()
@@ -577,18 +743,77 @@ impl Server {
                 return Ok(());
             }
         }
-        let diagnostics =
+        let checked =
             star_host::check_completion(&self.db, &self.documents, completion, self.encoding);
         self.drain_editor_notifications()?;
         if self.shutdown || self.host_revision != completion.job.revision {
             return Ok(());
         }
+        for (root, analysis) in checked.analyses {
+            if let Some(analysis) = analysis {
+                self.host_analyses.insert(root, analysis);
+            } else {
+                self.host_analyses.remove(&root);
+            }
+        }
         send_publications(
             &self.connection,
             &self.documents,
             &mut self.published_host,
-            diagnostics,
+            checked.diagnostics,
         )
+    }
+}
+
+fn analysis_source_paths(analysis: &Analysis, path: &SystemPath) -> Vec<SystemPathBuf> {
+    let physical = path.as_std_path().canonicalize().ok();
+    let mut paths = Vec::new();
+    for source in analysis.source_paths() {
+        let matches = source == path
+            || physical.as_ref().is_some_and(|physical| {
+                source
+                    .as_std_path()
+                    .canonicalize()
+                    .is_ok_and(|source| &source == physical)
+            });
+        if matches
+            && !paths
+                .iter()
+                .any(|previous: &SystemPathBuf| previous.as_path() == source)
+        {
+            paths.push(source.to_path_buf());
+        }
+    }
+    paths
+}
+
+fn completion_kind(kind: CompletionKind) -> lsp_types::CompletionItemKind {
+    match kind {
+        CompletionKind::Text => lsp_types::CompletionItemKind::Text,
+        CompletionKind::Method => lsp_types::CompletionItemKind::Method,
+        CompletionKind::Function => lsp_types::CompletionItemKind::Function,
+        CompletionKind::Constructor => lsp_types::CompletionItemKind::Constructor,
+        CompletionKind::Field => lsp_types::CompletionItemKind::Field,
+        CompletionKind::Variable => lsp_types::CompletionItemKind::Variable,
+        CompletionKind::Class => lsp_types::CompletionItemKind::Class,
+        CompletionKind::Interface => lsp_types::CompletionItemKind::Interface,
+        CompletionKind::Module => lsp_types::CompletionItemKind::Module,
+        CompletionKind::Property => lsp_types::CompletionItemKind::Property,
+        CompletionKind::Unit => lsp_types::CompletionItemKind::Unit,
+        CompletionKind::Value => lsp_types::CompletionItemKind::Value,
+        CompletionKind::Enum => lsp_types::CompletionItemKind::Enum,
+        CompletionKind::Keyword => lsp_types::CompletionItemKind::Keyword,
+        CompletionKind::Snippet => lsp_types::CompletionItemKind::Snippet,
+        CompletionKind::Color => lsp_types::CompletionItemKind::Color,
+        CompletionKind::File => lsp_types::CompletionItemKind::File,
+        CompletionKind::Reference => lsp_types::CompletionItemKind::Reference,
+        CompletionKind::Folder => lsp_types::CompletionItemKind::Folder,
+        CompletionKind::EnumMember => lsp_types::CompletionItemKind::EnumMember,
+        CompletionKind::Constant => lsp_types::CompletionItemKind::Constant,
+        CompletionKind::Struct => lsp_types::CompletionItemKind::Struct,
+        CompletionKind::Event => lsp_types::CompletionItemKind::Event,
+        CompletionKind::Operator => lsp_types::CompletionItemKind::Operator,
+        CompletionKind::TypeParameter => lsp_types::CompletionItemKind::TypeParameter,
     }
 }
 

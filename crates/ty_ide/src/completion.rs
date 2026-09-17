@@ -24,7 +24,7 @@ use ty_python_semantic::importer::{ImportRequest, Importer};
 use ty_python_semantic::types::{SpecialFormType, UnionType};
 use ty_python_semantic::{
     Completion as SemanticCompletion, NameKind, SemanticModel,
-    types::{CycleDetector, KnownClass, Type},
+    types::{CycleDetector, KnownClass, KnownInstanceType, Type},
 };
 
 use crate::docstring::Docstring;
@@ -3347,7 +3347,8 @@ fn completion_kind_from_type<'db>(db: &'db dyn Db, ty: Type<'db>) -> Option<Comp
             | Type::DataclassDecorator(_)
             | Type::WrapperDescriptor(_)
             | Type::DataclassTransformer(_)
-            | Type::Callable(_) => CompletionKind::Function,
+            | Type::Callable(_)
+            | Type::KnownInstance(KnownInstanceType::StarlarkGlobal(_)) => CompletionKind::Function,
             Type::BoundMethod(_) | Type::KnownBoundMethod(_) => CompletionKind::Method,
             Type::ModuleLiteral(_) => CompletionKind::Module,
             Type::ClassLiteral(_) | Type::GenericAlias(_) | Type::SubclassOf(_) => {

@@ -159,6 +159,41 @@ impl TestServer {
         );
     }
 
+    fn request(&self, method: &str, params: serde_json::Value) -> lsp_server::Response {
+        let id = RequestId::from(self.request_id.fetch_add(1, Ordering::Relaxed));
+        self.connection
+            .sender
+            .send(Message::Request(Request {
+                id: id.clone(),
+                method: method.into(),
+                params,
+            }))
+            .unwrap();
+        loop {
+            let message = self
+                .connection
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            if let Message::Response(response) = message {
+                assert_eq!(response.id, id);
+                return response;
+            }
+        }
+    }
+
+    fn editor_request(
+        &self,
+        method: &str,
+        relative: &str,
+        line: u32,
+        character: u32,
+    ) -> serde_json::Value {
+        self.request(method, serde_json::json!({
+            "textDocument": {"uri": self.uri(relative)}, "position": {"line":line, "character":character}
+        })).response_result.unwrap()
+    }
+
     fn no_pending_publication(&self) {
         let id = RequestId::from(self.request_id.fetch_add(1, Ordering::Relaxed));
         self.connection
@@ -490,11 +525,14 @@ fn stale_host_graph_completion_never_publishes_an_old_editor_version() {
         server.write("release", "");
     }
     assert!(started, "producer was not started");
-    server.change("root.star", 2, &serde_json::json!([{"text":latest}]));
+    let pending = server.editor_request("textDocument/completion", "root.star", 1, 0);
+    assert!(pending["items"].as_array().unwrap().is_empty());
+    server.close("root.star");
+    server.open("root.star", latest, 1);
     server.no_pending_publication();
     server.write("release", "");
     let publication = server.published("root.star");
-    assert_eq!(publication.version, Some(2), "{publication:?}");
+    assert_eq!(publication.version, Some(1), "{publication:?}");
     assert!(
         has_error(&publication.diagnostics, "Expected `int`"),
         "{publication:?}"
@@ -1015,4 +1053,224 @@ fn shutdown_prevents_queued_edits_from_mutating_the_source() {
     assert_eq!(response.id, RequestId::from(2));
     assert!(response.response_result.is_ok());
     server.no_pending_publication();
+}
+
+#[test]
+fn editor_completes_initial_incomplete_bazel_and_build_sources() {
+    let server = TestServer::new();
+    server.write("MODULE.bazel", "");
+    server.write("BUILD", "");
+    for name in ["defs.bzl", "BUILD"] {
+        server.open(name, "items = ['x']\nitems.", 1);
+        let result = server.editor_request("textDocument/completion", name, 1, 6);
+        assert_eq!(result["isIncomplete"], true);
+        let items = result["items"].as_array().unwrap();
+        assert!(
+            items.iter().any(|item| item["label"] == "append"),
+            "{result}"
+        );
+        assert!(
+            items
+                .windows(2)
+                .all(|pair| pair[0]["sortText"].as_str() < pair[1]["sortText"].as_str())
+        );
+    }
+    let invalid = server.request("textDocument/completion", serde_json::json!({}));
+    assert!(invalid.response_result.is_err());
+    let result = server.editor_request("textDocument/completion", "BUILD", 1, 6);
+    assert!(!result["items"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn editor_navigates_load_aliases_and_unsaved_utf16_targets() {
+    let server = TestServer::new();
+    server.write("MODULE.bazel", "");
+    server.write("BUILD", "");
+    server.write("defs.bzl", "value = 1\n");
+    let unsaved = "value = struct(prefix='😀', name=1)\n";
+    server.open("defs.bzl", unsaved, 1);
+    server.open(
+        "BUILD",
+        "load(':defs.bzl', alias='value')\nresult = alias.name\n",
+        1,
+    );
+    for character in [20, 25] {
+        let target = server.editor_request("textDocument/definition", "BUILD", 0, character);
+        assert_eq!(target[0]["uri"], server.uri("defs.bzl").as_str());
+        assert_eq!(
+            target[0]["range"]["start"],
+            serde_json::json!({"line":0,"character":0})
+        );
+    }
+    let target = server.editor_request("textDocument/definition", "BUILD", 1, 16);
+    let start = unsaved[..unsaved.find("name=").unwrap()]
+        .encode_utf16()
+        .count();
+    assert_eq!(target[0]["uri"], server.uri("defs.bzl").as_str());
+    assert_eq!(
+        target[0]["range"]["start"],
+        serde_json::json!({"line":0,"character":start})
+    );
+    assert_eq!(
+        fs::read_to_string(server.path("defs.bzl")).unwrap(),
+        "value = 1\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn editor_host_recovery_uses_current_text_and_drops_changed_loads() {
+    let server = TestServer::with_options(host_settings);
+    let source =
+        "load(\"//example:limits.star\", \"LimitConfig\")\nitem = LimitConfig(max_connections=1)\n";
+    let declaration = "LimitConfig = record(max_connections=int)\n";
+    server.write("root.star", source);
+    server.write("limits.star", declaration);
+    let graph = star_graph(
+        &server.path("root.star"),
+        source,
+        Some((&server.path("limits.star"), declaration)),
+    );
+    server.write("graph.json", &serde_json::to_string(&graph).unwrap());
+    server.open("root.star", source, 1);
+    assert!(server.published("root.star").diagnostics.is_empty());
+    let names = server.editor_request("textDocument/completion", "root.star", 2, 0);
+    assert!(
+        names["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["label"] == "example_host_native" && item["kind"] == 3)
+    );
+    let edited = format!("# shifted source\n{source}item.");
+    server.change("root.star", 2, &serde_json::json!([{"text":edited}]));
+    let result = server.editor_request("textDocument/completion", "root.star", 3, 5);
+    assert!(
+        result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["label"] == "max_connections"),
+        "{result}"
+    );
+    let changed = edited.replace("//example:limits.star", "//other:new.star");
+    server.change("root.star", 3, &serde_json::json!([{"text":changed}]));
+    let result = server.editor_request("textDocument/completion", "root.star", 3, 5);
+    assert!(
+        !result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["label"] == "max_connections"),
+        "{result}"
+    );
+    let target = server.editor_request("textDocument/definition", "root.star", 1, 10);
+    assert_eq!(target, serde_json::json!([]));
+    server.change("root.star", 4, &serde_json::json!([{"text":edited}]));
+    let result = server.editor_request("textDocument/completion", "root.star", 3, 5);
+    assert!(
+        result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["label"] == "max_connections")
+    );
+    // Host inputs are not necessarily .star files. A watcher event invalidates
+    // the attested profile even if the pending producer cannot parse this edit.
+    server.notify(
+        "workspace/didChangeWatchedFiles",
+        serde_json::json!({"changes":[{"uri":server.uri("graph.json"),"type":2}]}),
+    );
+    let result = server.editor_request("textDocument/completion", "root.star", 3, 5);
+    assert!(result["items"].as_array().unwrap().is_empty(), "{result}");
+}
+
+#[cfg(unix)]
+#[test]
+fn editor_host_updates_every_physical_alias_context() {
+    let server = TestServer::with_options(host_settings);
+    let source = "load(\"//first\", First=\"Config\")\nload(\"//second\", Second=\"Config\")\na = First(value=1)\nb = Second(value=1)\na.value\nb.value\n";
+    let declaration = "Config = record(value=int)\n";
+    server.write("root.star", source);
+    server.write("shared.star", declaration);
+    symlink(server.path("shared.star"), server.path("alias.star")).unwrap();
+    let mut graph = star_graph(&server.path("root.star"), source, None);
+    let loads: Vec<_> = [("//first", "First"), ("//second", "Second")].into_iter().map(|(id, local)| {
+        let literal = format!("\"{id}\"");
+        let start = source.find(&literal).unwrap();
+        serde_json::json!({"module_id":id,"start":start,"end":start+literal.len(),"symbols":[{"local":local,"source":"Config"}]})
+    }).collect();
+    graph["root"]["loads"] = serde_json::json!(loads);
+    graph["modules"] = serde_json::json!([
+        {"id":"//first","path":server.path("shared.star"),"source":declaration,"loads":[]},
+        {"id":"//second","path":server.path("alias.star"),"source":declaration,"loads":[]}
+    ]);
+    server.write("graph.json", &serde_json::to_string(&graph).unwrap());
+    server.open("root.star", source, 1);
+    assert!(server.published("root.star").diagnostics.is_empty());
+    let changed = "# unsaved\nConfig = record(value=str)\n";
+    server.open("shared.star", changed, 1);
+    for line in [4, 5] {
+        let targets = server.editor_request("textDocument/definition", "root.star", line, 3);
+        assert_eq!(targets[0]["uri"], server.uri("shared.star").as_str());
+        assert_eq!(targets[0]["range"]["start"]["line"], 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn editor_watched_non_star_dependency_refreshes_host_analysis() {
+    let server = TestServer::with_options(host_settings);
+    let source = "load(\"//example:limits.star\", \"LimitConfig\")\n";
+    let declaration = "LimitConfig = record(old=int)\n";
+    server.write("root.star", source);
+    server.write("definitions.data", declaration);
+    let mut graph = star_graph(
+        &server.path("root.star"),
+        source,
+        Some((&server.path("definitions.data"), declaration)),
+    );
+    server.write("graph.json", &serde_json::to_string(&graph).unwrap());
+    server.open("root.star", source, 1);
+    assert!(server.published("root.star").diagnostics.is_empty());
+    graph["modules"][0]["source"] = serde_json::json!("LimitConfig = record(new=str)\n");
+    server.write("graph.json", &serde_json::to_string(&graph).unwrap());
+    server.notify(
+        "workspace/didChangeWatchedFiles",
+        serde_json::json!({"changes":[{"uri":server.uri("definitions.data"),"type":2}]}),
+    );
+    // This publication requires a new host job, not just cache eviction.
+    assert!(server.published("root.star").diagnostics.is_empty());
+    server.change(
+        "root.star",
+        2,
+        &serde_json::json!([{"text":format!("{source}item = LimitConfig(new='x')\nitem.")} ]),
+    );
+    let result = server.editor_request("textDocument/completion", "root.star", 2, 5);
+    assert!(
+        result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["label"] == "new"),
+        "{result}"
+    );
+    assert!(
+        !result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["label"] == "old"),
+        "{result}"
+    );
+    server.open(
+        "definitions.data",
+        "# unsaved\nLimitConfig = record(new=str)\n",
+        1,
+    );
+    let targets = server.editor_request("textDocument/definition", "root.star", 0, 34);
+    assert_eq!(targets[0]["range"]["start"]["line"], 1);
+    server.close("definitions.data");
+    let targets = server.editor_request("textDocument/definition", "root.star", 0, 34);
+    assert_eq!(targets, serde_json::json!([]));
 }
