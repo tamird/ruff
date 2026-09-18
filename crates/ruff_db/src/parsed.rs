@@ -5,7 +5,7 @@ use arc_swap::ArcSwapOption;
 use get_size2::GetSize;
 use ruff_python_ast::{
     AnyRootNodeRef, HasNodeIndex, ModExpression, ModModule, NodeIndex, NodeIndexError,
-    PythonVersion, StringLiteral,
+    PySourceType, PythonVersion, StringLiteral,
 };
 use ruff_python_parser::{
     ParseError, ParseErrorType, ParseOptions, Parsed, parse_cells_unchecked,
@@ -35,22 +35,27 @@ use crate::{Db, PythonFile};
 pub fn parsed_module(db: &dyn Db, file: PythonFile<'_>) -> ParsedModule {
     let source_file = file.file(db);
     let python_version = file.python_version(db);
-    let _span = tracing::trace_span!("parsed_module", ?source_file, %python_version).entered();
+    let source_type = file.source_type(db);
+    let _span = tracing::trace_span!("parsed_module", ?source_file, %python_version, ?source_type)
+        .entered();
 
-    let parsed = parsed_module_impl(db, source_file, python_version);
+    let parsed = parsed_module_impl(db, source_file, python_version, source_type);
 
-    ParsedModule::new(source_file, python_version, parsed)
+    ParsedModule::new(source_file, python_version, source_type, parsed)
 }
 
 pub(super) fn disable_lru(db: &mut dyn Db) {
     parsed_module::set_lru_capacity(db, 0);
 }
 
-fn parsed_module_impl(db: &dyn Db, file: File, target_version: PythonVersion) -> Parsed<ModModule> {
+fn parsed_module_impl(
+    db: &dyn Db,
+    file: File,
+    target_version: PythonVersion,
+    source_type: PySourceType,
+) -> Parsed<ModModule> {
     let source = source_text(db, file);
-    let ty = file.source_type(db);
-
-    let options = ParseOptions::from(ty).with_target_version(target_version);
+    let options = ParseOptions::from(source_type).with_target_version(target_version);
 
     // Notebooks parse each cell as an independent module so a syntax error confined to one cell is
     // surfaced instead of being masked by a later cell's content. Regular files take the existing
@@ -112,15 +117,22 @@ pub fn parsed_string_annotation(
 pub struct ParsedModule {
     file: File,
     python_version: PythonVersion,
+    source_type: PySourceType,
     #[get_size(size_fn = arc_swap_size)]
     inner: Arc<ArcSwapOption<indexed::IndexedModule>>,
 }
 
 impl ParsedModule {
-    fn new(file: File, python_version: PythonVersion, parsed: Parsed<ModModule>) -> Self {
+    fn new(
+        file: File,
+        python_version: PythonVersion,
+        source_type: PySourceType,
+        parsed: Parsed<ModModule>,
+    ) -> Self {
         Self {
             file,
             python_version,
+            source_type,
             inner: Arc::new(ArcSwapOption::new(Some(indexed::IndexedModule::new(
                 parsed,
             )))),
@@ -139,6 +151,7 @@ impl ParsedModule {
                     db,
                     self.file,
                     self.python_version,
+                    self.source_type,
                 ));
                 tracing::debug!(
                     "File `{}` was reparsed after being collected in the current Salsa revision",
@@ -945,8 +958,21 @@ mod tests {
     };
     use crate::tests::TestDb;
     use crate::vendored::{VendoredFileSystemBuilder, VendoredPath};
-    use ruff_python_ast::PythonVersion;
+    use ruff_python_ast::{PySourceType, PythonVersion};
     use zip::CompressionMethod;
+
+    const NOTEBOOK: &str = r#"{
+        "cells": [{
+            "cell_type": "code",
+            "execution_count": null,
+            "metadata": {},
+            "outputs": [],
+            "source": ["%timeit a = b"]
+        }],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }"#;
 
     #[test]
     fn python_file() -> crate::system::Result<()> {
@@ -970,14 +996,16 @@ mod tests {
         let mut db = TestDb::new();
         let path = SystemPath::new("test.ipynb");
 
-        db.write_file(path, "%timeit a = b")?;
+        db.write_file(path, NOTEBOOK)?;
 
         let file = system_path_to_file(&db, path).unwrap();
 
+        assert!(crate::source::source_text(&db, file).read_error().is_none());
         let file = PythonFile::new(&db, file, PythonVersion::latest_ty());
         let parsed = parsed_module(&db, file).load(&db);
 
         assert!(parsed.has_valid_syntax());
+        assert!(!parsed.syntax().body.is_empty());
 
         Ok(())
     }
@@ -1004,14 +1032,20 @@ mod tests {
         let mut db = TestDb::new();
         let path = SystemVirtualPath::new("untitled:Untitled-1.ipynb");
 
-        db.write_virtual_file(path, "%timeit a = b");
+        db.write_virtual_file(path, NOTEBOOK);
 
         let virtual_file = db.files().virtual_file(&db, path);
 
+        assert!(
+            crate::source::source_text(&db, virtual_file.file())
+                .read_error()
+                .is_none()
+        );
         let file = PythonFile::new(&db, virtual_file.file(), PythonVersion::latest_ty());
         let parsed = parsed_module(&db, file).load(&db);
 
         assert!(parsed.has_valid_syntax());
+        assert!(!parsed.syntax().body.is_empty());
 
         Ok(())
     }
@@ -1044,6 +1078,36 @@ else:
         let parsed = parsed_module(&db, file).load(&db);
 
         assert!(parsed.has_valid_syntax());
+    }
+
+    #[test]
+    fn same_file_with_different_parser_grammars() -> crate::system::Result<()> {
+        let mut db = TestDb::new();
+        db.write_file("test.py", "%timeit a = b")?;
+        let file = system_path_to_file(&db, "test.py").unwrap();
+
+        let python = PythonFile::new(&db, file, PythonVersion::latest_ty());
+        let ipython = PythonFile::new_with_source_type(
+            &db,
+            file,
+            PythonVersion::latest_ty(),
+            PySourceType::Ipynb,
+        );
+        let parsed_python = parsed_module(&db, python);
+        let parsed_ipython = parsed_module(&db, ipython);
+
+        for _ in 0..2 {
+            assert!(!parsed_python.load(&db).has_valid_syntax());
+            assert!(parsed_ipython.load(&db).has_valid_syntax());
+            // Eviction must preserve each query's grammar when it reparses.
+            parsed_python.clear();
+            parsed_ipython.clear();
+        }
+
+        // Parser configuration does not change the file's source representation.
+        assert!(!crate::source::source_text(&db, file).is_notebook());
+        assert_eq!(file.source_type(&db), PySourceType::Python);
+        Ok(())
     }
 
     #[test]

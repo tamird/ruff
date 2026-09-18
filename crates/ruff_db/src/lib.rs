@@ -6,7 +6,7 @@
 use crate::files::{File, Files};
 use crate::system::System;
 use crate::vendored::VendoredFileSystem;
-use ruff_python_ast::PythonVersion;
+use ruff_python_ast::{PySourceType, PythonVersion};
 use rustc_hash::FxHasher;
 use std::hash::BuildHasherDefault;
 use std::num::NonZeroUsize;
@@ -25,17 +25,31 @@ pub mod system;
 pub mod testing;
 pub mod vendored;
 
-/// A file paired with the Python version used to parse its contents.
+/// A file paired with the configuration used to parse its contents.
 ///
-/// This is the key for [`parsed::parsed_module`]. Including the Python version allows the same
-/// file to be parsed for different versions within a single Salsa revision without sharing an
-/// incompatible AST or syntax diagnostics.
-#[salsa::interned(debug, heap_size = ruff_memory_usage::heap_size)]
+/// This is the key for [`parsed::parsed_module`]. Including the Python version and source type
+/// allows the same file to be parsed with different grammars within a single Salsa revision
+/// without sharing an incompatible AST or syntax diagnostics.
+#[salsa::interned(
+    debug,
+    constructor = new_with_source_type,
+    heap_size = ruff_memory_usage::heap_size
+)]
 pub struct PythonFile<'db> {
     #[returns(copy)]
     pub file: File,
     #[returns(copy)]
     pub python_version: PythonVersion,
+    /// The parser grammar, independent of source decoding and [`File::is_stub`].
+    #[returns(copy)]
+    pub source_type: PySourceType,
+}
+
+impl<'db> PythonFile<'db> {
+    /// Selects the default parser grammar using [`File::source_type`].
+    pub fn new(db: &'db dyn Db, file: File, python_version: PythonVersion) -> Self {
+        Self::new_with_source_type(db, file, python_version, file.source_type(db))
+    }
 }
 
 // The Salsa heap is tracked separately.
