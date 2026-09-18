@@ -48,6 +48,7 @@ ruff_text_size = { version = "0.0.14", path = "crates/ruff_text_size" }
 ruff_workspace = { version = "0.0.14", path = "crates/ruff_workspace" }
 
 ty = { path = "crates/ty" }
+ty_call_binding = { version = "0.0.14", path = "crates/ty_call_binding" }
 ty_combine = { version = "0.0.14", path = "crates/ty_combine" }
 ty_completion_bench = { path = "crates/ty_completion_bench" }
 ty_completion_eval = { path = "crates/ty_completion_eval" }

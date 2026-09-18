@@ -4693,6 +4693,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ty_call_binding"
+version = "0.0.14"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
 name = "ty_combine"
 version = "0.0.14"
 dependencies = [
@@ -4949,6 +4956,7 @@ dependencies = [
  "test-case",
  "thiserror 2.0.20",
  "tracing",
+ "ty_call_binding",
  "ty_module_resolver",
  "ty_python_core",
  "ty_site_packages",

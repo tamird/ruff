@@ -1,0 +1,17 @@
+[package]
+name = "ty_call_binding"
+version = "0.0.14"
+description = "Structural argument matching for ty"
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+homepage = { workspace = true }
+documentation = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+smallvec = { workspace = true }
+
+[lints]
+workspace = true

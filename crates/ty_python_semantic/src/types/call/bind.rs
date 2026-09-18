@@ -80,6 +80,7 @@ use crate::types::{
 use crate::{DisplaySettings, FxOrderSet};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
 use ruff_python_ast::{self as ast, AnyNodeRef, ArgOrKeyword, PythonVersion};
+use ty_call_binding::{KeywordError, Matcher, Parameter as BindingParameter};
 use ty_python_core::{ProgramFile, semantic_index};
 
 pub(crate) use self::constructor::ConstructorCallableKind;
@@ -3926,15 +3927,17 @@ impl<'db> CallableBinding<'db> {
                 matched_parameters.iter().all(|matched_parameter| {
                     let parameter = &overload.signature.parameters()[matched_parameter.index];
                     if parameter.has_starred_annotation()
-                        && matched_parameter.expected_type.is_none()
+                        && matched_parameter.data.expected_type.is_none()
                     {
                         return true;
                     }
 
                     let parameter_type = matched_parameter
+                        .data
                         .expected_type
                         .unwrap_or_else(|| parameter.annotated_type());
                     let argument_type = matched_parameter
+                        .data
                         .argument_type
                         .unwrap_or_else(|| argument_types.get_for_declared_type(parameter_type));
 
@@ -4238,7 +4241,7 @@ impl<'db> CallableBinding<'db> {
                                 // Argument types are cached by the raw parameter type, even when
                                 // they were inferred using a return-context specialization.
                                 argument: argument_types.get_for_declared_type(raw_parameter_type),
-                                variadic_argument: matched_parameter.argument_type,
+                                variadic_argument: matched_parameter.data.argument_type,
                             }
                         })
                     })
@@ -4869,31 +4872,17 @@ pub(crate) enum MatchingOverloadIndex {
     Multiple(Vec<usize>),
 }
 
-#[derive(Default, Clone, Copy)]
-struct ParameterInfo {
-    matched: bool,
-    suppress_missing_error: bool,
-}
-
 struct ArgumentMatcher<'a, 'db> {
     arguments: &'a CallArguments<'a, 'db>,
     parameters: &'a Parameters<'db>,
     errors: &'a mut Vec<BindingError<'db>>,
 
-    argument_matches: Vec<MatchedArgument<'db>>,
-    parameter_info: Vec<ParameterInfo>,
-    next_positional: usize,
-    first_excess_positional: Option<usize>,
+    matcher: Matcher<'a, MatchedParameterData<'db>>,
+    suppress_missing_errors: Vec<usize>,
     num_synthetic_args: usize,
     /// Forwarded argument indices and the lengths of their fixed tuple prefixes and suffixes.
     variable_length_positional_arguments: SmallVec<[(usize, usize, usize); 1]>,
     variadic_argument_matched_to_variadic_parameter: bool,
-
-    /// Parameter indices that have explicit keyword arguments (e.g., `foo=value`).
-    ///
-    /// This is used to prevent variadic arguments from greedily matching parameters that will be
-    /// explicitly provided via keyword arguments.
-    explicit_keyword_parameters: FxHashSet<usize>,
 }
 
 impl<'a, 'db> ArgumentMatcher<'a, 'db> {
@@ -4902,29 +4891,40 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         parameters: &'a Parameters<'db>,
         errors: &'a mut Vec<BindingError<'db>>,
     ) -> Self {
-        let explicit_keyword_parameters: FxHashSet<usize> = arguments
-            .iter()
-            .filter_map(|(argument, _)| {
-                if let Argument::Keyword(name) = argument {
-                    parameters.keyword_by_name(name).map(|(idx, _)| idx)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut matcher = Matcher::new(
+            parameters.iter().map(|parameter| match parameter.kind() {
+                ParameterKind::PositionalOnly {
+                    name,
+                    default_type: _,
+                } => BindingParameter::PositionalOnly(name.as_ref().map(Name::as_str)),
+                ParameterKind::PositionalOrKeyword {
+                    name,
+                    default_type: _,
+                } => BindingParameter::PositionalOrKeyword(name.as_str()),
+                ParameterKind::KeywordOnly {
+                    name,
+                    default_type: _,
+                } => BindingParameter::KeywordOnly(name.as_str()),
+                ParameterKind::Variadic { name: _ } => BindingParameter::Variadic,
+                ParameterKind::KeywordVariadic { name: _ } => BindingParameter::KeywordVariadic,
+            }),
+            arguments.len(),
+        );
+        for (argument, _) in arguments.iter() {
+            if let Argument::Keyword(name) = argument {
+                matcher.reserve_keyword(name);
+            }
+        }
 
         Self {
             arguments,
             parameters,
             errors,
-            argument_matches: vec![MatchedArgument::default(); arguments.len()],
-            parameter_info: vec![ParameterInfo::default(); parameters.len()],
-            next_positional: 0,
-            first_excess_positional: None,
+            matcher,
+            suppress_missing_errors: Vec::new(),
             num_synthetic_args: 0,
             variable_length_positional_arguments: SmallVec::new(),
             variadic_argument_matched_to_variadic_parameter: false,
-            explicit_keyword_parameters,
         }
     }
 
@@ -4964,9 +4964,16 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         positional: bool,
         variable_argument_length: bool,
     ) {
-        if self.parameter_info[parameter_index].matched
-            && !parameter.is_variadic()
-            && !parameter.is_keyword_variadic()
+        let duplicate = self.matcher.assign(
+            argument_index,
+            parameter_index,
+            MatchedParameterData {
+                argument_type,
+                expected_type: None,
+                provenance,
+            },
+        );
+        if duplicate
             // Repeated explicit keywords are already reported as syntax errors.
             && !matches!(
                 argument,
@@ -4990,15 +4997,6 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         {
             self.variadic_argument_matched_to_variadic_parameter = true;
         }
-        let matched_argument = &mut self.argument_matches[argument_index];
-        matched_argument.parameters.push(MatchedParameter {
-            index: parameter_index,
-            argument_type,
-            expected_type: None,
-            provenance,
-        });
-        matched_argument.matched = true;
-        self.parameter_info[parameter_index].matched = true;
     }
 
     fn match_positional(
@@ -5011,17 +5009,10 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         if matches!(argument, Argument::Synthetic) {
             self.num_synthetic_args += 1;
         }
-        let Some((parameter_index, parameter)) = self
-            .parameters
-            .get_positional(self.next_positional)
-            .map(|param| (self.next_positional, param))
-            .or_else(|| self.parameters.variadic())
-        else {
-            self.first_excess_positional.get_or_insert(argument_index);
-            self.next_positional += 1;
+        let Some(parameter_index) = self.matcher.next_positional(argument_index) else {
             return Err(());
         };
-        self.next_positional += 1;
+        let parameter = &self.parameters[parameter_index];
         self.assign_argument(
             argument_index,
             argument,
@@ -5042,28 +5033,33 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument_type: Option<Type<'db>>,
         name: &str,
     ) -> Result<(), ()> {
-        let Some((parameter_index, parameter)) = self
-            .parameters
-            .keyword_by_name(name)
-            .or_else(|| self.parameters.keyword_variadic())
-        else {
-            if let Some((parameter_index, parameter)) =
-                self.parameters.positional_only_by_name(name)
-            {
-                self.errors
-                    .push(BindingError::PositionalOnlyParameterAsKwarg {
-                        argument_index: self.get_argument_index(argument_index),
-                        parameter: ParameterContext::new(parameter, parameter_index, true),
-                    });
-                self.parameter_info[parameter_index].suppress_missing_error = true;
-            } else {
-                self.errors.push(BindingError::UnknownArgument {
-                    argument_name: ast::name::Name::new(name),
-                    argument_index: self.get_argument_index(argument_index),
-                });
+        let parameter_index = match self.matcher.keyword(name) {
+            Ok(index) => index,
+            Err(error) => {
+                match error {
+                    KeywordError::PositionalOnly(index) => {
+                        self.errors
+                            .push(BindingError::PositionalOnlyParameterAsKwarg {
+                                argument_index: self.get_argument_index(argument_index),
+                                parameter: ParameterContext::new(
+                                    &self.parameters[index],
+                                    index,
+                                    true,
+                                ),
+                            });
+                        self.suppress_missing_errors.push(index);
+                    }
+                    KeywordError::Unknown => {
+                        self.errors.push(BindingError::UnknownArgument {
+                            argument_name: ast::name::Name::new(name),
+                            argument_index: self.get_argument_index(argument_index),
+                        });
+                    }
+                }
+                return Err(());
             }
-            return Err(());
         };
+        let parameter = &self.parameters[parameter_index];
         self.assign_argument(
             argument_index,
             argument,
@@ -5128,7 +5124,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     // slots; otherwise, a later positional argument could shift left differently
                     // for different union members.
                     Type::Union(union)
-                        if self.parameters.variadic().is_none()
+                        if self.matcher.variadic_index().is_none()
                             && !self.has_later_positional_input(argument_index) =>
                     {
                         let tuple_specs: Vec<_> = union
@@ -5247,10 +5243,14 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         // present in the longer union members. They therefore cannot satisfy a required
         // positional parameter, because the shorter members would still be missing that argument.
         if has_fixed_union_tail {
-            while let Some(parameter) = self.parameters.get_positional(self.next_positional) {
+            while let Some(parameter) = self
+                .matcher
+                .positional_index()
+                .map(|index| &self.parameters[index])
+            {
                 if self
-                    .explicit_keyword_parameters
-                    .contains(&self.next_positional)
+                    .matcher
+                    .keyword_reserved(self.matcher.provided_positional_count())
                 {
                     break;
                 }
@@ -5267,14 +5267,10 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         // keyword argument or a parameter that can only be provided via keyword argument, or if
         // we run out of `argument_types` and have no `variable_element`.
         } else if is_variable {
-            while self
-                .parameters
-                .get_positional(self.next_positional)
-                .is_some()
-            {
+            while self.matcher.positional_index().is_some() {
                 if self
-                    .explicit_keyword_parameters
-                    .contains(&self.next_positional)
+                    .matcher
+                    .keyword_reserved(self.matcher.provided_positional_count())
                 {
                     break;
                 }
@@ -5303,7 +5299,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         // argument types to it, but only if there is at least one remaining argument type. This is
         // because a variadic parameter is optional, so if this was done unconditionally, ty could
         // raise a false positive as "too many arguments".
-        if self.parameters.variadic().is_some() {
+        if self.matcher.variadic_index().is_some() {
             if let Some(argument_type) = argument_types.next().or(variable_element) {
                 self.match_positional(argument_index, argument, Some(argument_type), is_variable)?;
                 for argument_type in argument_types {
@@ -5344,7 +5340,8 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             self.match_typed_dict_openness(argument_index, openness);
         } else {
             for (parameter_index, parameter) in self.parameters.iter().enumerate() {
-                if self.parameter_info[parameter_index].matched && !parameter.is_keyword_variadic()
+                if self.matcher.parameter_matched(parameter_index)
+                    && !parameter.is_keyword_variadic()
                 {
                     continue;
                 }
@@ -5401,22 +5398,25 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
 
         if has_explicit_extra_items {
             for (parameter_index, parameter) in self.parameters.iter().enumerate() {
-                if self.parameter_info[parameter_index].matched
+                if self.matcher.parameter_matched(parameter_index)
                     || parameter.keyword_name().is_none()
                 {
                     continue;
                 }
-                let matched_argument = &mut self.argument_matches[argument_index];
-                matched_argument.parameters.push(MatchedParameter {
-                    index: parameter_index,
-                    argument_type: Some(extra_items_ty),
-                    expected_type: None,
-                    provenance: InvalidArgumentTypeProvenance::Argument,
-                });
+                self.matcher.constrain(
+                    argument_index,
+                    parameter_index,
+                    MatchedParameterData {
+                        argument_type: Some(extra_items_ty),
+                        expected_type: None,
+                        provenance: InvalidArgumentTypeProvenance::Argument,
+                    },
+                );
             }
         }
 
-        if let Some((parameter_index, parameter)) = self.parameters.keyword_variadic() {
+        if let Some(parameter_index) = self.matcher.keyword_variadic_index() {
+            let parameter = &self.parameters[parameter_index];
             self.assign_argument(
                 argument_index,
                 Argument::Keywords,
@@ -5459,9 +5459,10 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         env: &ProgramEnvironment<'db>,
         missing: &mut Vec<ParameterContext>,
     ) {
-        let Some((parameter_index, parameter)) = self.parameters.variadic() else {
+        let Some(parameter_index) = self.matcher.variadic_index() else {
             return;
         };
+        let parameter = &self.parameters[parameter_index];
         if !parameter.has_starred_annotation() {
             return;
         }
@@ -5475,7 +5476,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         let mut last_variable = None;
         let mut first_excess_argument_index = None;
 
-        for (argument_index, argument) in self.argument_matches.iter().enumerate() {
+        for (argument_index, argument) in self.matcher.matches().iter().enumerate() {
             let match_count = argument.parameters.len();
             let variable_segment = self
                 .variable_length_positional_arguments
@@ -5521,8 +5522,8 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         {
             self.errors.push(BindingError::TooManyPositionalArguments {
                 first_excess_argument_index,
-                expected_positional_count: self.parameters.positional().count() + maximum,
-                provided_positional_count: self.next_positional,
+                expected_positional_count: self.matcher.positional_count() + maximum,
+                provided_positional_count: self.matcher.provided_positional_count(),
             });
             // TODO: Check matched tuple elements without inferring from excess arguments.
             return;
@@ -5533,14 +5534,13 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         };
         let variable_type = expected.variable_element_type(db);
         let mut expected_types = expected.iter_element_types(db);
-        for (position, matched) in self
-            .argument_matches
-            .iter_mut()
-            .flat_map(|argument| argument.parameters.iter_mut())
-            .filter(|matched| matched.index == parameter_index)
+        for (position, (_, data)) in self
+            .matcher
+            .matched_parameters_mut()
+            .filter(|(index, _)| *index == parameter_index)
             .enumerate()
         {
-            matched.expected_type = if first_variable
+            data.expected_type = if first_variable
                 .zip(last_variable)
                 .is_some_and(|(first, last)| position > first && position <= last)
             {
@@ -5556,11 +5556,11 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> Box<[MatchedArgument<'db>]> {
-        if let Some(first_excess_argument_index) = self.first_excess_positional {
+        if let Some(first_excess_argument_index) = self.matcher.first_excess_positional() {
             self.errors.push(BindingError::TooManyPositionalArguments {
                 first_excess_argument_index: self.get_argument_index(first_excess_argument_index),
-                expected_positional_count: self.parameters.positional().count(),
-                provided_positional_count: self.next_positional,
+                expected_positional_count: self.matcher.positional_count(),
+                provided_positional_count: self.matcher.provided_positional_count(),
             });
         }
 
@@ -5570,19 +5570,11 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         let paramspec = self.parameters.as_paramspec();
 
         let mut missing = vec![];
-        for (
-            index,
-            ParameterInfo {
-                matched,
-                suppress_missing_error,
-            },
-        ) in self.parameter_info.iter().copied().enumerate()
-        {
-            if !matched {
-                if suppress_missing_error {
+        for (index, param) in self.parameters.iter().enumerate() {
+            if !self.matcher.parameter_matched(index) {
+                if self.suppress_missing_errors.contains(&index) {
                     continue;
                 }
-                let param = &self.parameters[index];
                 if paramspec.is_none() && (param.is_variadic() || param.is_keyword_variadic())
                     || param.has_default()
                 {
@@ -5601,7 +5593,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             });
         }
 
-        self.argument_matches.into_boxed_slice()
+        self.matcher.into_matches()
     }
 }
 
@@ -5662,6 +5654,7 @@ impl<'db> ArgumentRelation<'db> {
             adjusted_argument_index,
             matched_parameter,
             declared_type: matched_parameter
+                .data
                 .expected_type
                 .unwrap_or_else(|| parameter.annotated_type()),
             argument_type,
@@ -5804,9 +5797,11 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
                         let parameter = &parameters[parameter_index];
                         let declared_type = matched_parameter
+                            .data
                             .expected_type
                             .unwrap_or_else(|| parameter.annotated_type());
                         let argument_type = matched_parameter
+                            .data
                             .argument_type
                             .or_else(|| argument_types.try_get_for_declared_type(declared_type))?;
 
@@ -6496,10 +6491,12 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 .filter(|matched| matched.index == parameter_index)
             {
                 let declared_type = matched
+                    .data
                     .expected_type
                     .unwrap_or_else(|| parameter.annotated_type());
                 actual.push(
                     matched
+                        .data
                         .argument_type
                         .unwrap_or_else(|| argument_types.get_for_declared_type(declared_type)),
                 );
@@ -6550,7 +6547,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         for relation in self.argument_relations() {
             // Fixed elements can infer normally; the complete variadic pack is inferred below.
             if relation.has_starred_annotation
-                && relation.matched_parameter.expected_type.is_none()
+                && relation.matched_parameter.data.expected_type.is_none()
                 && (matches!(
                     relation.declared_type,
                     Type::TypeVar(typevar) if typevar.is_typevartuple(db)
@@ -6693,7 +6690,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         // An unresolved `*Ts` still has no per-element expected type.
         if !self.constraint_set_errors[argument_index]
             && !constructor_receiver
-            && (!has_starred_annotation || matched_parameter.expected_type.is_some())
+            && (!has_starred_annotation || matched_parameter.data.expected_type.is_some())
             && !is_valid_isinstance_target()
             && argument_type
                 .when_assignable_to(
@@ -6718,7 +6715,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 last_argument_index: None,
                 expected_ty,
                 provided_ty: argument_type,
-                provenance: matched_parameter.provenance,
+                provenance: matched_parameter.data.provenance,
                 parameter_source: None,
             });
         }
@@ -7095,6 +7092,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 &self.signature.parameters()[parameter_index],
                 matched_parameter,
                 matched_parameter
+                    .data
                     .argument_type
                     .unwrap_or_else(Type::unknown),
             );
@@ -7191,44 +7189,19 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     }
 }
 
-/// Information about which parameter(s) an argument was matched against. This is tracked
-/// separately for each overload.
-#[derive(Clone, Debug, Default)]
-pub struct MatchedArgument<'db> {
-    /// The parameters that an argument was matched against. A splatted argument might be matched
-    /// against multiple parameters.
-    pub parameters: SmallVec<[MatchedParameter<'db>; 1]>,
+/// Information about which parameters an argument matched, for one overload.
+pub(crate) type MatchedArgument<'db> = ty_call_binding::MatchedArgument<MatchedParameterData<'db>>;
+type MatchedParameter<'db> = ty_call_binding::MatchedParameter<MatchedParameterData<'db>>;
 
-    /// Whether there were errors matching this argument. For a splatted argument, _all_ splatted
-    /// elements must have been successfully matched. (That means that this can be `false` while
-    /// the `parameters` field is non-empty.)
-    pub matched: bool,
-}
-
-/// One parameter matched to an argument.
+/// Type information retained for an argument-to-parameter relationship.
 #[derive(Clone, Copy, Debug)]
-pub struct MatchedParameter<'db> {
-    /// The index of the matched parameter.
-    pub index: usize,
-
-    /// The type contributed by an unpacked positional or keyword argument.
-    ///
-    /// This is `None` for non-splatted arguments because their type is not known when argument
-    /// matching runs.
+pub struct MatchedParameterData<'db> {
+    /// The type contributed by an unpacked argument. Non-splatted arguments are
+    /// inferred after matching, so their type is not yet available here.
     argument_type: Option<Type<'db>>,
-
     /// The tuple element expected at this position in an unpacked variadic parameter.
     expected_type: Option<Type<'db>>,
-
-    /// Why this parameter match exists.
     provenance: InvalidArgumentTypeProvenance,
-}
-
-impl<'db> MatchedArgument<'db> {
-    /// Returns an iterator over the matched parameters.
-    fn iter(&self) -> impl Iterator<Item = MatchedParameter<'db>> + '_ {
-        self.parameters.iter().copied()
-    }
 }
 
 /// The type context to use when inferring a call-site argument, for a given binding.
@@ -7802,6 +7775,7 @@ impl<'db> Binding<'db> {
         let parameter = &self.signature.parameters()[matched_parameter.index];
         let original_parameter_type = parameter.annotated_type();
         let mut parameter_type = matched_parameter
+            .data
             .expected_type
             .unwrap_or(original_parameter_type);
         let paramspec_callable = |paramspec| {
@@ -8280,7 +8254,7 @@ impl<'db> Binding<'db> {
                         partial_application.bind_by_keyword(
                             parameter_index,
                             (parameter.annotated_type() != Type::Never).then(|| {
-                                matched_parameter.argument_type.unwrap_or_else(|| {
+                                matched_parameter.data.argument_type.unwrap_or_else(|| {
                                     argument_ty.get_default().unwrap_or_else(Type::unknown)
                                 })
                             }),

@@ -85,6 +85,7 @@ impl<'db> Bindings<'db> {
                             .iter()
                             .find(|parameter| parameter.index == parameter_index)?;
                         parameter
+                            .data
                             .argument_type
                             .or_else(|| argument_types.get_default())
                     })
