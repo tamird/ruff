@@ -10,7 +10,7 @@
 use crate::Program;
 use ruff_db::PythonFile;
 use ruff_db::files::File;
-use ruff_index::{FrozenIndexVec, Idx, IndexVec};
+use ruff_index::{FrozenIndexVec, IndexVec};
 use ruff_python_ast::{self as ast, Singleton, name::Name};
 
 use crate::ProgramFile;
@@ -22,38 +22,7 @@ use crate::reachability_constraints::ScopedReachabilityConstraintId;
 use crate::scope::{FileScopeId, ScopeId};
 use crate::symbol::ScopedSymbolId;
 
-// A scoped identifier for each `Predicate` in a scope.
-#[derive(Clone, Debug, Copy, PartialOrd, Ord, PartialEq, Eq, Hash, get_size2::GetSize)]
-pub struct ScopedPredicateId(u32);
-
-impl ScopedPredicateId {
-    /// A special ID that is used for an "always true" predicate.
-    pub(crate) const ALWAYS_TRUE: ScopedPredicateId = ScopedPredicateId(0xffff_ffff);
-
-    /// A special ID that is used for an "always false" predicate.
-    pub(crate) const ALWAYS_FALSE: ScopedPredicateId = ScopedPredicateId(0xffff_fffe);
-
-    const SMALLEST_TERMINAL: ScopedPredicateId = Self::ALWAYS_FALSE;
-
-    fn is_terminal(self) -> bool {
-        self >= Self::SMALLEST_TERMINAL
-    }
-}
-
-impl Idx for ScopedPredicateId {
-    #[inline]
-    fn new(value: usize) -> Self {
-        assert!(value <= (Self::SMALLEST_TERMINAL.0 as usize));
-        #[expect(clippy::cast_possible_truncation)]
-        Self(value as u32)
-    }
-
-    #[inline]
-    fn index(self) -> usize {
-        debug_assert!(!self.is_terminal());
-        self.0 as usize
-    }
-}
+pub use ty_flow::predicate::ScopedPredicateId;
 
 // A collection of predicates for a given scope.
 pub type Predicates<'db> = FrozenIndexVec<ScopedPredicateId, Predicate<'db>>;

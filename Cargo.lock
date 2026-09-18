@@ -4736,6 +4736,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ty_flow"
+version = "0.0.14"
+dependencies = [
+ "bitvec",
+ "get-size2",
+ "hashbrown 0.17.1",
+ "itertools 0.15.0",
+ "ruff_index",
+ "rustc-hash",
+ "smallvec",
+ "static_assertions",
+]
+
+[[package]]
 name = "ty_ide"
 version = "0.0.0"
 dependencies = [
@@ -4858,7 +4872,6 @@ version = "0.0.14"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
- "bitvec",
  "char_str",
  "get-size2",
  "hashbrown 0.17.1",
@@ -4881,6 +4894,7 @@ dependencies = [
  "thin-vec",
  "tracing",
  "ty_combine",
+ "ty_flow",
  "ty_module_resolver",
  "ty_site_packages",
  "ty_vendored",

@@ -52,32 +52,13 @@
 //! imported-`Final` queries.
 
 use itertools::{EitherOrBoth, Itertools};
-use ruff_index::newtype_index;
 use smallvec::{SmallVec, smallvec};
 
 use crate::ReachabilityConstraintsBuilder;
 use crate::narrowing_constraints::{NarrowingConstraintsBuilder, ScopedNarrowingConstraint};
 use crate::reachability_constraints::ScopedReachabilityConstraintId;
 
-/// An index into a scope's use-def history. A combined definition can have separate declaration
-/// and binding entries when they take effect at different points in control flow.
-#[newtype_index]
-#[derive(Ord, PartialOrd, get_size2::GetSize)]
-pub struct ScopedDefinitionId;
-
-impl ScopedDefinitionId {
-    /// A special ID that is used to describe an implicit start-of-scope state. When
-    /// we see that this definition is live, we know that the place is (possibly)
-    /// unbound or undeclared at a given usage site.
-    /// When creating a use-def-map builder, we always add an empty `DefinitionState::Undefined` definition
-    /// at index 0, so this ID is always present.
-    pub(super) const UNBOUND: ScopedDefinitionId = ScopedDefinitionId::from_u32(0);
-
-    pub(crate) fn is_unbound(self) -> bool {
-        self == Self::UNBOUND
-    }
-}
-
+pub use ty_flow::bindings::ScopedDefinitionId;
 /// Live declarations for a single place at some point in control flow, with their
 /// corresponding reachability constraints.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, get_size2::GetSize)]
@@ -153,30 +134,7 @@ static_assertions::assert_eq_size!(LiveDeclaration, [u32; 2]);
 
 pub(super) type LiveDeclarationsIterator<'a> = std::slice::Iter<'a, LiveDeclaration>;
 
-/// What happens to any preexisting definitions when a new binding of the same place is added.
-/// `AreShadowed` is how normal assignments behave, but we model some features (loop headers,
-/// `nonlocal` writes from nested scopes) as "synthetic" bindings that don't shadow other bindings.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PreviousDefinitions {
-    AreShadowed,
-    AreKept,
-}
-
-/// What will happen to a definition if/when a when a new binding of the same place is added later.
-/// `ShadowThisOne` is how normal assignments behave, and it's also how some "synthetic" bindings
-/// behave (loop headers), but there are other synthetic bindings (nested `nonlocal` writes) that
-/// cannot be shadowed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
-pub(crate) enum FutureDefinitions {
-    ShadowThisOne,
-    DontShadowThisOne,
-}
-
-impl PreviousDefinitions {
-    fn are_shadowed(self) -> bool {
-        matches!(self, PreviousDefinitions::AreShadowed)
-    }
-}
+pub(crate) use ty_flow::bindings::{FutureDefinitions, PreviousDefinitions};
 
 impl Declarations {
     pub(super) fn undeclared_reachability_constraint(
@@ -308,257 +266,105 @@ pub(super) enum EnclosingSnapshot {
     Bindings(Bindings),
 }
 
-/// Live bindings for a single place at some point in control flow. Each live binding comes
-/// with a set of narrowing constraints and a reachability constraint.
+/// Python's class-scope state in addition to the shared reaching bindings.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub(super) struct Bindings {
-    /// The narrowing constraint applicable to the "unbound" binding, if we need access to it even
-    /// when it's not visible. This happens in class scopes, where local name bindings are not visible
-    /// to nested scopes, but we still need to know what narrowing constraints were applied to the
-    /// "unbound" binding.
+    // Class locals are hidden from nested scopes, but their unbound narrowing
+    // remains visible even after a local assignment shadows that binding.
     unbound_narrowing_constraint: Option<ScopedNarrowingConstraint>,
-    /// A list of live bindings for this place, sorted by their `ScopedDefinitionId`
-    live_bindings: SmallVec<[LiveBinding; 2]>,
+    live_bindings: ty_flow::bindings::Bindings,
 }
+
+pub use ty_flow::bindings::LiveBinding;
+pub(super) use ty_flow::bindings::LiveBindingsIterator;
 
 impl Bindings {
     pub(super) fn is_always_unbound(&self) -> bool {
-        let [binding] = self.live_bindings.as_slice() else {
-            return false;
-        };
-        self.unbound_narrowing_constraint.is_none()
-            && binding.binding() == ScopedDefinitionId::UNBOUND
-            && binding.narrowing_constraint == ScopedNarrowingConstraint::ALWAYS_TRUE
-            && binding.reachability_constraint == ScopedReachabilityConstraintId::ALWAYS_TRUE
-            && binding.can_be_shadowed() == FutureDefinitions::ShadowThisOne
+        self.unbound_narrowing_constraint.is_none() && self.live_bindings.is_always_unbound()
     }
 
     pub(super) fn unbound_narrowing_constraint(&self) -> ScopedNarrowingConstraint {
         self.unbound_narrowing_constraint
-            .unwrap_or(self.live_bindings[0].narrowing_constraint)
+            .unwrap_or(self.live_bindings.as_slice()[0].narrowing_constraint())
     }
 
-    pub(super) fn finish(
-        &mut self,
-        narrowing_constraints: &mut NarrowingConstraintsBuilder,
-        reachability_constraints: &mut ReachabilityConstraintsBuilder,
-    ) {
-        self.live_bindings.shrink_to_fit();
-        for binding in &self.live_bindings {
-            reachability_constraints.mark_used(binding.reachability_constraint);
-            narrowing_constraints.mark_used(binding.narrowing_constraint);
-        }
-    }
-}
-
-/// One of the live bindings for a single place at some point in control flow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
-pub struct LiveBinding {
-    binding: PackedDefinitionId,
-    narrowing_constraint: ScopedNarrowingConstraint,
-    reachability_constraint: ScopedReachabilityConstraintId,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
-struct PackedDefinitionId(u32);
-
-impl PackedDefinitionId {
-    // Scope-local definition IDs cannot practically use the high bit, so retain the shadowing
-    // policy there instead of adding a byte plus padding to every `LiveBinding`.
-    const DONT_SHADOW: u32 = 1 << 31;
-    const DEFINITION_MASK: u32 = !Self::DONT_SHADOW;
-
-    fn new(binding: ScopedDefinitionId, can_be_shadowed: FutureDefinitions) -> Self {
-        let binding = binding.as_u32();
-        assert_eq!(
-            binding & Self::DONT_SHADOW,
-            0,
-            "scopes cannot contain more than 2^31 definitions"
-        );
-        Self(
-            binding
-                | match can_be_shadowed {
-                    FutureDefinitions::ShadowThisOne => 0,
-                    FutureDefinitions::DontShadowThisOne => Self::DONT_SHADOW,
-                },
-        )
-    }
-
-    const fn definition(self) -> ScopedDefinitionId {
-        ScopedDefinitionId::from_u32(self.0 & Self::DEFINITION_MASK)
-    }
-
-    const fn can_be_shadowed(self) -> FutureDefinitions {
-        if self.0 & Self::DONT_SHADOW == 0 {
-            FutureDefinitions::ShadowThisOne
-        } else {
-            FutureDefinitions::DontShadowThisOne
-        }
-    }
-}
-
-impl LiveBinding {
-    fn new(
-        binding: ScopedDefinitionId,
-        narrowing_constraint: ScopedNarrowingConstraint,
-        reachability_constraint: ScopedReachabilityConstraintId,
-        can_be_shadowed: FutureDefinitions,
-    ) -> Self {
-        Self {
-            binding: PackedDefinitionId::new(binding, can_be_shadowed),
-            narrowing_constraint,
-            reachability_constraint,
-        }
-    }
-
-    pub const fn binding(&self) -> ScopedDefinitionId {
-        self.binding.definition()
-    }
-
-    pub const fn narrowing_constraint(&self) -> ScopedNarrowingConstraint {
-        self.narrowing_constraint
-    }
-
-    pub const fn reachability_constraint(&self) -> ScopedReachabilityConstraintId {
-        self.reachability_constraint
-    }
-
-    const fn can_be_shadowed(&self) -> FutureDefinitions {
-        self.binding.can_be_shadowed()
-    }
-}
-
-static_assertions::assert_eq_size!(LiveBinding, [u32; 3]);
-
-pub(super) type LiveBindingsIterator<'a> = std::slice::Iter<'a, LiveBinding>;
-
-impl Bindings {
-    pub(super) fn unbound(reachability_constraint: ScopedReachabilityConstraintId) -> Self {
-        let initial_binding = LiveBinding::new(
-            ScopedDefinitionId::UNBOUND,
-            ScopedNarrowingConstraint::ALWAYS_TRUE,
-            reachability_constraint,
-            FutureDefinitions::ShadowThisOne,
-        );
+    pub(super) fn unbound(reachability: ScopedReachabilityConstraintId) -> Self {
         Self {
             unbound_narrowing_constraint: None,
-            live_bindings: smallvec![initial_binding],
+            live_bindings: ty_flow::bindings::Bindings::unbound(reachability),
         }
     }
 
-    /// Record a newly-encountered binding for this place.
     pub(super) fn record_binding(
         &mut self,
         binding: ScopedDefinitionId,
-        reachability_constraint: ScopedReachabilityConstraintId,
+        reachability: ScopedReachabilityConstraintId,
         is_class_scope: bool,
         is_place_name: bool,
         previous_definitions: PreviousDefinitions,
         can_be_shadowed: FutureDefinitions,
     ) {
-        // If we are in a class scope, and the unbound name binding was previously visible, but we will
-        // now replace it, record the narrowing constraints on it:
         if is_class_scope
             && is_place_name
-            && let Some(binding) = self.live_bindings.first()
+            && let Some(binding) = self.live_bindings.as_slice().first()
             && binding.binding().is_unbound()
         {
-            self.unbound_narrowing_constraint = Some(binding.narrowing_constraint);
+            self.unbound_narrowing_constraint = Some(binding.narrowing_constraint());
         }
-        // If the new binding is a shadowing type, it replaces previous live bindings in this path
-        // (unless they're marked as not shadowable), and has no constraints.
-        if previous_definitions.are_shadowed() {
-            self.live_bindings
-                .retain(|b| b.can_be_shadowed() == FutureDefinitions::DontShadowThisOne);
-        }
-        self.live_bindings.push(LiveBinding::new(
+        self.live_bindings.record_binding(
             binding,
-            ScopedNarrowingConstraint::ALWAYS_TRUE,
-            reachability_constraint,
+            reachability,
+            previous_definitions,
             can_be_shadowed,
-        ));
-    }
-
-    /// Add given constraint to all live bindings.
-    fn record_narrowing_constraint(
-        &mut self,
-        narrowing_constraints: &mut NarrowingConstraintsBuilder,
-        constraint: ScopedNarrowingConstraint,
-    ) {
-        for binding in &mut self.live_bindings {
-            binding.narrowing_constraint =
-                narrowing_constraints.add_and_constraint(binding.narrowing_constraint, constraint);
-        }
-    }
-
-    /// Add given reachability constraint to all live bindings.
-    fn record_reachability_constraint(
-        &mut self,
-        reachability_constraints: &mut ReachabilityConstraintsBuilder,
-        constraint: ScopedReachabilityConstraintId,
-    ) {
-        for binding in &mut self.live_bindings {
-            binding.reachability_constraint = reachability_constraints
-                .add_and_constraint(binding.reachability_constraint, constraint);
-        }
-    }
-
-    /// Iterate over currently live bindings for this place
-    pub(super) fn iter(&self) -> LiveBindingsIterator<'_> {
-        self.live_bindings.iter()
-    }
-
-    pub(super) fn as_slice(&self) -> &[LiveBinding] {
-        &self.live_bindings
+        );
     }
 
     pub(super) fn merge(
         &mut self,
         b: Self,
-        narrowing_constraints: &mut NarrowingConstraintsBuilder,
-        reachability_constraints: &mut ReachabilityConstraintsBuilder,
+        narrowing: &mut NarrowingConstraintsBuilder,
+        reachability: &mut ReachabilityConstraintsBuilder,
     ) {
-        let a = std::mem::take(self);
-
-        if let Some((a, b)) = a
+        self.unbound_narrowing_constraint = self
             .unbound_narrowing_constraint
             .zip(b.unbound_narrowing_constraint)
-        {
-            self.unbound_narrowing_constraint = Some(narrowing_constraints.add_or_constraint(a, b));
-        }
+            .map(|(a, b)| narrowing.add_or_constraint(a, b));
+        self.live_bindings
+            .merge(b.live_bindings, narrowing, reachability);
+    }
 
-        // Invariant: merge_join_by consumes the two iterators in sorted order, which ensures that
-        // the merged `live_bindings` vec remains sorted. If a definition is found in both `a` and
-        // `b`, we combine its boolean narrowing constraints and its ternary reachability
-        // constraints. If a definition is found in only one path, it is used as-is.
-        let a = a.live_bindings.into_iter();
-        let b = b.live_bindings.into_iter();
-        for zipped in a.merge_join_by(b, |a, b| a.binding().cmp(&b.binding())) {
-            match zipped {
-                EitherOrBoth::Both(a, b) => {
-                    // If the same definition is visible through both paths, we OR the narrowing
-                    // constraints: the type should be narrowed by whichever path was taken.
-                    let narrowing_constraint = narrowing_constraints
-                        .add_or_constraint(a.narrowing_constraint, b.narrowing_constraint);
+    pub(super) fn finish(
+        &mut self,
+        narrowing: &mut NarrowingConstraintsBuilder,
+        reachability: &mut ReachabilityConstraintsBuilder,
+    ) {
+        self.live_bindings.finish(narrowing, reachability);
+    }
 
-                    // For reachability constraints, we also merge using a ternary OR operation:
-                    let reachability_constraint = reachability_constraints
-                        .add_or_constraint(a.reachability_constraint, b.reachability_constraint);
+    pub(super) fn iter(&self) -> LiveBindingsIterator<'_> {
+        self.live_bindings.iter()
+    }
 
-                    debug_assert_eq!(a.can_be_shadowed(), b.can_be_shadowed());
-                    self.live_bindings.push(LiveBinding::new(
-                        a.binding(),
-                        narrowing_constraint,
-                        reachability_constraint,
-                        a.can_be_shadowed(),
-                    ));
-                }
+    pub(super) fn as_slice(&self) -> &[LiveBinding] {
+        self.live_bindings.as_slice()
+    }
 
-                EitherOrBoth::Left(binding) | EitherOrBoth::Right(binding) => {
-                    self.live_bindings.push(binding);
-                }
-            }
-        }
+    fn record_narrowing_constraint(
+        &mut self,
+        narrowing: &mut NarrowingConstraintsBuilder,
+        constraint: ScopedNarrowingConstraint,
+    ) {
+        self.live_bindings
+            .record_narrowing_constraint(narrowing, constraint);
+    }
+
+    fn record_reachability_constraint(
+        &mut self,
+        reachability: &mut ReachabilityConstraintsBuilder,
+        constraint: ScopedReachabilityConstraintId,
+    ) {
+        self.live_bindings
+            .record_reachability_constraint(reachability, constraint);
     }
 }
 
@@ -615,15 +421,13 @@ impl PlaceState {
         constraint: ScopedNarrowingConstraint,
         bindings_at_use: &Bindings,
     ) {
-        for binding in &mut self.bindings.live_bindings {
-            if bindings_at_use
-                .iter()
-                .any(|binding_at_use| binding_at_use.binding() == binding.binding())
-            {
-                binding.narrowing_constraint = narrowing_constraints
-                    .add_and_constraint(binding.narrowing_constraint, constraint);
-            }
-        }
+        self.bindings
+            .live_bindings
+            .record_narrowing_constraint_for_bindings(
+                narrowing_constraints,
+                constraint,
+                &bindings_at_use.iter().map(LiveBinding::binding),
+            );
     }
 
     /// Add the given constraint to live bindings selected by definition ID.
@@ -633,12 +437,13 @@ impl PlaceState {
         constraint: ScopedNarrowingConstraint,
         bindings: &[ScopedDefinitionId],
     ) {
-        for binding in &mut self.bindings.live_bindings {
-            if bindings.contains(&binding.binding()) {
-                binding.narrowing_constraint = narrowing_constraints
-                    .add_and_constraint(binding.narrowing_constraint, constraint);
-            }
-        }
+        self.bindings
+            .live_bindings
+            .record_narrowing_constraint_for_bindings(
+                narrowing_constraints,
+                constraint,
+                &bindings.iter().copied(),
+            );
     }
 
     /// Add given reachability constraint to all live bindings.
@@ -724,7 +529,7 @@ mod tests {
             .map(|live_binding| {
                 (
                     live_binding.binding().as_u32(),
-                    live_binding.narrowing_constraint,
+                    live_binding.narrowing_constraint(),
                 )
             })
             .collect();
@@ -906,7 +711,12 @@ mod tests {
         );
         let sym2 = sym2a;
         // Different constraints: OR(atom1, atom2) produces a new TDD node (not a terminal)
-        let merged_constraint = sym2.bindings().iter().next().unwrap().narrowing_constraint;
+        let merged_constraint = sym2
+            .bindings()
+            .iter()
+            .next()
+            .unwrap()
+            .narrowing_constraint();
         assert_ne!(merged_constraint, ScopedNarrowingConstraint::ALWAYS_TRUE);
         assert_ne!(merged_constraint, ScopedNarrowingConstraint::ALWAYS_FALSE);
         assert_ne!(merged_constraint, atom1);
@@ -936,7 +746,7 @@ mod tests {
         let bindings: Vec<_> = sym3
             .bindings()
             .iter()
-            .map(|b| (b.binding().as_u32(), b.narrowing_constraint))
+            .map(|b| (b.binding().as_u32(), b.narrowing_constraint()))
             .collect();
         assert_eq!(bindings.len(), 2);
         assert_eq!(bindings[0].0, 0); // unbound
@@ -953,7 +763,7 @@ mod tests {
         let bindings: Vec<_> = sym
             .bindings()
             .iter()
-            .map(|b| (b.binding().as_u32(), b.narrowing_constraint))
+            .map(|b| (b.binding().as_u32(), b.narrowing_constraint()))
             .collect();
         assert_eq!(bindings.len(), 3);
         assert_eq!(bindings[0].0, 0); // unbound

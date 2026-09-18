@@ -13,6 +13,7 @@ authors = ["Charlie Marsh <charlie.r.marsh@gmail.com>"]
 license = "MIT"
 
 [workspace.dependencies]
+ty_flow = { version = "0.0.14", path = "crates/ty_flow" }
 char_str = { version = "0.0.4", default-features = false, features = ["std"] }
 ruff = { version = "0.16.8", path = "crates/ruff" }
 ruff_annotate_snippets = { version = "0.0.14", path = "crates/ruff_annotate_snippets" }

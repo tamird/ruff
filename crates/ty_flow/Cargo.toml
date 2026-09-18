@@ -1,0 +1,24 @@
+[package]
+name = "ty_flow"
+version = "0.0.14"
+description = "Symbolic control-flow constraints and reaching bindings for ty"
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+homepage = { workspace = true }
+documentation = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+ruff_index = { workspace = true }
+bitvec = { workspace = true }
+get-size2 = { workspace = true }
+hashbrown = { workspace = true }
+itertools = { workspace = true }
+rustc-hash = { workspace = true }
+smallvec = { workspace = true }
+static_assertions = { workspace = true }
+
+[lints]
+workspace = true
