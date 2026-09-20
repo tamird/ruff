@@ -17,7 +17,10 @@ use ty_python_core::{ProgramFile, TestProgramDb as _};
 use zip::CompressionMethod;
 
 /// Replace one declaration while retaining the support types from the standard typeshed.
-fn with_builtin_str(declaration: &str) -> anyhow::Result<TestDbBuilder<'static>> {
+fn with_builtin_declaration<'a>(
+    name: &str,
+    declaration: &str,
+) -> anyhow::Result<TestDbBuilder<'a>> {
     let vendored = ty_vendored::file_system();
     let mut builtins = vendored.read_to_string("stdlib/builtins.pyi")?;
     let parsed = ruff_python_parser::parse_module(&builtins)?;
@@ -25,8 +28,8 @@ fn with_builtin_str(declaration: &str) -> anyhow::Result<TestDbBuilder<'static>>
         .suite()
         .iter()
         .filter_map(ast::Stmt::as_class_def_stmt)
-        .find(|class| class.name.as_str() == "str")
-        .expect("typeshed defines str");
+        .find(|class| class.name.as_str() == name)
+        .expect("typeshed defines the requested class");
     let start = class
         .decorator_list
         .first()
@@ -59,7 +62,7 @@ fn string_iteration_respects_disabled_dunder(class_header: &str) -> anyhow::Resu
     let declaration = format!(
         "{class_header}:\n    __iter__: None\n    def __getitem__(self, index: int) -> str: ..."
     );
-    let builder = with_builtin_str(&declaration)?;
+    let builder = with_builtin_declaration("str", &declaration)?;
     let db = builder
         .with_file(
             "/src/check.py",
@@ -87,7 +90,8 @@ def check(value: str, literal: LiteralString):
 
 #[test]
 fn string_literals_use_declared_base_and_iterator() -> anyhow::Result<()> {
-    let builder = with_builtin_str(
+    let builder = with_builtin_declaration(
+        "str",
         "class StringBase: ...
 class str(StringBase):
     def __iter__(self) -> Iterator[int]: ...",
@@ -114,8 +118,10 @@ class str(StringBase):
 
 #[test]
 fn string_literals_retain_additional_declared_bases() -> anyhow::Result<()> {
-    let builder =
-        with_builtin_str("class ExtraBase: ...\nclass str(Sequence[str], ExtraBase): ...")?;
+    let builder = with_builtin_declaration(
+        "str",
+        "class ExtraBase: ...\nclass str(Sequence[str], ExtraBase): ...",
+    )?;
     let db = builder.build()?;
     let env = db.program_environment();
     let base = crate::place::builtins_symbol(&db, &env, "ExtraBase")
@@ -129,7 +135,8 @@ fn string_literals_retain_additional_declared_bases() -> anyhow::Result<()> {
 
 #[test]
 fn string_literal_precision_requires_string_sequence_elements() -> anyhow::Result<()> {
-    let builder = with_builtin_str(
+    let builder = with_builtin_declaration(
+        "str",
         "class str(Sequence[int]):\n    def __iter__(self) -> Iterator[int]: ...",
     )?;
     let db = builder.build()?;
@@ -143,6 +150,145 @@ fn string_literal_precision_requires_string_sequence_elements() -> anyhow::Resul
         KnownClass::Sequence.to_specialized_instance(&db, &env, &[Type::string_literal(&db, "a")]);
     assert!(literal.is_assignable_to(&db, &env, integers));
     assert!(!literal.is_assignable_to(&db, &env, characters));
+    Ok(())
+}
+
+#[test_case("+True"; "unary_plus")]
+#[test_case("-False"; "unary_minus")]
+#[test_case("~True"; "unary_invert")]
+#[test_case("True + 1"; "addition")]
+#[test_case("1 + True"; "reflected_addition")]
+#[test_case("True - 1"; "subtraction")]
+#[test_case("True * 1"; "multiplication")]
+#[test_case("True | False"; "bitwise_or")]
+#[test_case("True & False"; "bitwise_and")]
+#[test_case("True ^ False"; "bitwise_xor")]
+#[test_case("True << 1"; "shift")]
+#[test_case("True / 0"; "zero_division_numerator")]
+#[test_case("1 / False"; "zero_division_denominator")]
+#[test_case("False % 0"; "zero_modulus")]
+#[test_case("True < 1"; "ordering")]
+#[test_case("1 < True"; "reflected_ordering")]
+#[test_case("True < False"; "boolean_ordering")]
+fn boolean_literals_without_numeric_methods_reject_operators(
+    expression: &str,
+) -> anyhow::Result<()> {
+    let builder = with_builtin_declaration("bool", "class bool: ...")?;
+    let db = builder.with_file("/src/check.py", expression).build()?;
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let diagnostics = crate::check_file_unwrap(&db, db.program_file(file));
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("Expected one unsupported operation for {expression}, got {diagnostics:#?}");
+    };
+    assert_eq!(
+        diagnostic.id().as_str(),
+        "unsupported-operator",
+        "{diagnostic:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn boolean_literals_use_declared_operators() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration(
+        "bool",
+        "class bool:
+    def __add__(self, other: int) -> str: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __ne__(self, other: object) -> bool: ...",
+    )?;
+    let db = builder
+        .with_file(
+            "/src/check.py",
+            "added = True + 1
+cross_kind = True == 1
+same_kind = True == True
+different = True != False
+negated = not True
+interval = slice(False, True)",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let file = db.program_file(file);
+    let diagnostics = crate::check_file_unwrap(&db, file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let env = ProgramEnvironment::from_file(file);
+    for (name, expected) in [
+        ("added", KnownClass::Str.to_instance(&db, &env)),
+        ("cross_kind", KnownClass::Bool.to_instance(&db, &env)),
+        ("same_kind", Type::bool_literal(true)),
+        ("different", Type::bool_literal(true)),
+        ("negated", Type::bool_literal(false)),
+    ] {
+        let actual = global_symbol(&db, file, name).place.expect_type();
+        assert_eq!(actual, expected, "{name}");
+    }
+    let interval = global_symbol(&db, file, "interval")
+        .place
+        .expect_type()
+        .as_nominal_instance()
+        .expect("slice constructor returns a nominal instance");
+    assert!(interval.slice_literal(&db, &env).is_none());
+    Ok(())
+}
+
+#[test]
+fn boolean_numeric_narrowing_requires_integer_base() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration(
+        "bool",
+        "class bool:\n    def __eq__(self, other: object) -> bool: ...",
+    )?;
+    let db = builder.build()?;
+    let env = db.program_environment();
+    let policy = equality::ComparisonSoundnessPolicy::CONSERVATIVE;
+    for (boolean, integer) in [(false, 0), (true, 1)] {
+        let boolean = Type::bool_literal(boolean);
+        let integer = Type::int_literal(integer);
+        assert_eq!(boolean.as_int_like_literal(&db, &env), None);
+        for (left, right) in [(boolean, integer), (integer, boolean)] {
+            for positive in [true, false] {
+                assert_eq!(
+                    equality::evaluate_type_equality(&db, &env, left, right, positive, policy),
+                    None,
+                );
+            }
+        }
+    }
+    assert_eq!(
+        equality::evaluate_type_equality(
+            &db,
+            &env,
+            KnownClass::Bool.to_instance(&db, &env),
+            Type::bool_literal(true),
+            true,
+            policy,
+        ),
+        Some(Type::bool_literal(true)),
+    );
+    Ok(())
+}
+
+#[test]
+fn literal_string_index_requires_integer_base() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration("bool", "class bool: ...")?;
+    let db = builder
+        .with_file(
+            "/src/check.py",
+            "from typing_extensions import LiteralString
+def index(value: LiteralString):
+    return value[True]",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let diagnostics = crate::check_file_unwrap(&db, db.program_file(file));
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("Expected an invalid index, got {diagnostics:#?}");
+    };
+    assert_eq!(
+        diagnostic.id().as_str(),
+        "invalid-argument-type",
+        "{diagnostic:#?}"
+    );
     Ok(())
 }
 

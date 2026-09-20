@@ -11432,6 +11432,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         };
 
+        if operand_type.is_bool_literal()
+            && matches!(
+                op,
+                ast::UnaryOp::UAdd | ast::UnaryOp::USub | ast::UnaryOp::Invert
+            )
+            && !KnownClass::bool_is_subclass_of_int(db, env)
+        {
+            return fallback_unary_expression_type();
+        }
+
         match (op, operand_type) {
             (_, Type::RecursiveVar(_)) => {
                 unreachable!("semantic operation on an unbound recursive variable")

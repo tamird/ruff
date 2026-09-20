@@ -3084,10 +3084,13 @@ impl<'db> Type<'db> {
         }
     }
 
-    fn as_int_like_literal(self) -> Option<i64> {
-        match self.as_literal_value_kind() {
-            Some(LiteralValueTypeKind::Int(value)) => Some(value.as_i64()),
-            Some(LiteralValueTypeKind::Bool(value)) => Some(i64::from(value)),
+    fn as_int_like_literal(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Option<i64> {
+        let literal = self.as_literal_value_kind()?;
+        match literal {
+            LiteralValueTypeKind::Int(value) => Some(value.as_i64()),
+            LiteralValueTypeKind::Bool(value) => {
+                KnownClass::bool_is_subclass_of_int(db, env).then_some(i64::from(value))
+            }
             _ => None,
         }
     }

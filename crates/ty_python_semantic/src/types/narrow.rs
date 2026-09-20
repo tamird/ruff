@@ -4108,7 +4108,9 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                     let [arg] = &*call.arguments.args else {
                         return;
                     };
-                    let Some(length) = length_type.resolve_type_alias(db).as_int_like_literal()
+                    let Some(length) = length_type
+                        .resolve_type_alias(db)
+                        .as_int_like_literal(db, &self.env)
                     else {
                         return;
                     };

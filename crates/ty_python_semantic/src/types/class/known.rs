@@ -1453,6 +1453,18 @@ impl KnownClass {
             .unwrap_or_else(SubclassOfType::subclass_of_unknown)
     }
 
+    /// Whether `bool` inherits `int`, as required by integer literal optimizations.
+    /// Custom typeshed declarations need not retain Python's `bool(int)` inheritance.
+    pub(crate) fn bool_is_subclass_of_int<'db>(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
+        let Some(integer) = Self::Int.try_to_class_literal(db, env) else {
+            return false;
+        };
+        Self::Bool.is_subclass_of(db, env, integer.default_specialization(db))
+    }
+
     /// Return `true` if this symbol can be resolved to a class definition `class` in its canonical
     /// module, *and* `class` is a subclass of `other`.
     pub(crate) fn is_subclass_of<'db>(

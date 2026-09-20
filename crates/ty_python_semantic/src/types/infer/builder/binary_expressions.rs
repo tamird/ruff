@@ -456,9 +456,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 op,
                 ast::Operator::Div | ast::Operator::FloorDiv | ast::Operator::Mod
             )
-            && right_ty.as_literal_value().is_some_and(|literal| {
-                literal.as_bool() == Some(false) || literal.as_int() == Some(0)
-            })
+            && right_ty.as_int_like_literal(db, env) == Some(0)
         {
             state.emitted_division_by_zero_diagnostic =
                 self.check_division_by_zero(node, op, left_ty);
@@ -731,6 +729,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             (Type::Never, _, _) | (_, Type::Never, _) => Some(Type::Never),
+
+            (left, right, _)
+                if (left.is_bool_literal() || right.is_bool_literal())
+                    && !KnownClass::bool_is_subclass_of_int(db, env) =>
+            {
+                self.infer_binary_dunder(state, left_ty, op, right_ty)
+            }
 
             (Type::LiteralValue(left), Type::LiteralValue(right), _) => {
                 let recursively_defined = if left.recursively_defined().is_yes()
@@ -1242,17 +1247,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         left: Type<'db>,
     ) -> bool {
         let db = self.db();
+        let env = self.program_environment();
         match left {
-            Type::LiteralValue(literal)
-                if matches!(
-                    literal.kind(),
-                    LiteralValueTypeKind::Bool(_) | LiteralValueTypeKind::Int(_)
-                ) => {}
+            Type::LiteralValue(_) if left.as_int_like_literal(db, env).is_some() => {}
             Type::NominalInstance(instance)
                 if matches!(
                     instance.known_class(db),
-                    Some(KnownClass::Float | KnownClass::Int | KnownClass::Bool)
-                ) => {}
+                    Some(KnownClass::Float | KnownClass::Int)
+                ) || (instance.has_known_class(db, KnownClass::Bool)
+                    && KnownClass::bool_is_subclass_of_int(db, env)) => {}
             _ => return false,
         }
 
