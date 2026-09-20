@@ -160,14 +160,29 @@ const SYNTHETIC_DATACLASS_ATTRIBUTES: &[&str] = &[
     "__dataclass_params__",
 ];
 
+/// Whether member enumeration includes attributes defined by the canonical `object` class.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ObjectMembers {
+    #[default]
+    Include,
+    Exclude,
+}
+
 struct AllMembers<'db> {
     members: FxHashSet<Member<'db>>,
+    object_members: ObjectMembers,
 }
 
 impl<'db> AllMembers<'db> {
-    fn of(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> Self {
+    fn of(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        object_members: ObjectMembers,
+    ) -> Self {
         let mut all_members = Self {
             members: FxHashSet::default(),
+            object_members,
         };
         all_members.extend_with_type(db, env, ty);
         all_members
@@ -200,7 +215,7 @@ impl<'db> AllMembers<'db> {
                     union
                         .elements(db)
                         .iter()
-                        .map(|ty| AllMembers::of(db, env, *ty).members)
+                        .map(|ty| AllMembers::of(db, env, *ty, self.object_members).members)
                         .reduce(|acc, members| acc.intersection(&members).cloned().collect())
                         .unwrap_or_default(),
                 );
@@ -210,7 +225,7 @@ impl<'db> AllMembers<'db> {
                 intersection
                     .positive(db)
                     .iter()
-                    .map(|ty| AllMembers::of(db, env, *ty).members)
+                    .map(|ty| AllMembers::of(db, env, *ty, self.object_members).members)
                     .reduce(|acc, members| acc.union(&members).cloned().collect())
                     .unwrap_or_default(),
             ),
@@ -342,7 +357,7 @@ impl<'db> AllMembers<'db> {
                             constraints
                                 .elements(db)
                                 .iter()
-                                .map(|ty| AllMembers::of(db, env, *ty).members)
+                                .map(|ty| AllMembers::of(db, env, *ty, self.object_members).members)
                                 .reduce(|acc, members| {
                                     acc.intersection(&members).cloned().collect()
                                 })
@@ -507,6 +522,11 @@ impl<'db> AllMembers<'db> {
                 | ClassLiteral::DynamicTypedDict(_)
                 | ClassLiteral::DynamicEnum(_) => continue,
             };
+            if self.object_members == ObjectMembers::Exclude
+                && parent.is_known(db, KnownClass::Object)
+            {
+                continue;
+            }
             self.extend_with_slot_members(db, env, ty, parent);
 
             let parent_scope = parent.body_scope(db);
@@ -583,6 +603,11 @@ impl<'db> AllMembers<'db> {
         ty: Type<'db>,
         class_literal: StaticClassLiteral<'db>,
     ) {
+        if self.object_members == ObjectMembers::Exclude
+            && class_literal.is_known(db, KnownClass::Object)
+        {
+            return;
+        }
         let class_body_scope = class_literal.body_scope(db);
         let program_file = class_body_scope.program_file(db);
         let index = semantic_index(db, program_file);
@@ -956,5 +981,14 @@ pub(crate) fn all_members<'db>(
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
 ) -> FxHashSet<Member<'db>> {
-    AllMembers::of(db, env, ty).members
+    all_members_with_object_policy(db, env, ty, ObjectMembers::Include)
+}
+
+pub(crate) fn all_members_with_object_policy<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    object_members: ObjectMembers,
+) -> FxHashSet<Member<'db>> {
+    AllMembers::of(db, env, ty, object_members).members
 }
