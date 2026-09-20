@@ -772,7 +772,8 @@ fn definition_contains_special_cased_condition<'db>(
             }
             Some(&*assignment.value)
         }
-        DefinitionKind::Import(_)
+        DefinitionKind::ProvidedBinding(_)
+        | DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)
         | DefinitionKind::ImportFromSubmodule(_)
         | DefinitionKind::StarImport(_)

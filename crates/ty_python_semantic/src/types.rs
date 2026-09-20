@@ -164,6 +164,7 @@ pub(crate) mod narrow;
 mod newtype;
 mod overrides;
 mod protocol_class;
+pub mod provided;
 mod recursive;
 pub(crate) use recursive::RecursiveMapping;
 pub use recursive::{RecursiveType, RecursiveVar, UnfoldResult};

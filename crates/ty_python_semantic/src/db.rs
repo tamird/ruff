@@ -1,13 +1,35 @@
 use crate::dependency::DependencyMetadata;
 use crate::lint::{LintRegistry, RuleSelection};
+use crate::provided::{BuiltinUsage, ProvidedBindingResolution, ProvidedBindingValue};
 use crate::{AnalysisSettings, PythonVersionWithSource};
 use ruff_db::diagnostic::Diagnostic;
 use ruff_db::files::File;
+use ty_python_core::definition::Definition;
 use ty_python_core::{Db as PythonCoreDb, ProgramFile};
 
 /// Database giving access to semantic information about a Python program.
 #[salsa::db]
 pub trait Db: PythonCoreDb {
+    /// Resolves a binding introduced by [`PythonCoreDb::provided_statements`].
+    /// Implementations must read tracked inputs and preserve the target program's context.
+    fn provided_binding<'db>(
+        &'db self,
+        _definition: Definition<'db>,
+    ) -> ProvidedBindingResolution<'db> {
+        ProvidedBindingValue::Unresolved.into()
+    }
+
+    /// Overrides a name in the builtin namespace of an embedded program.
+    /// `None` selects ordinary Python lookup; `Some(Unresolved)` hides that name.
+    fn provided_builtin<'db>(
+        &'db self,
+        _file: ProgramFile<'db>,
+        _name: &str,
+        _usage: BuiltinUsage,
+    ) -> Option<ProvidedBindingValue<'db>> {
+        None
+    }
+
     fn check_file(&self, file: File) -> Vec<Diagnostic>;
 
     /// Returns the program file for `file`.
@@ -59,6 +81,26 @@ pub(crate) mod tests {
     use ty_python_core::program::{FallibleStrategy, ProgramSettings};
     use ty_site_packages::{PythonVersionSource, PythonVersionWithSource};
 
+    pub(crate) trait SourceProvider: Send + Sync {
+        fn statements(
+            &self,
+            db: &TestDb,
+            file: ProgramFile<'_>,
+        ) -> Vec<ty_python_core::definition::ProvidedStatement>;
+        fn binding<'db>(
+            &self,
+            db: &'db TestDb,
+            definition: Definition<'db>,
+        ) -> ProvidedBindingResolution<'db>;
+        fn builtin<'db>(
+            &self,
+            db: &'db TestDb,
+            file: ProgramFile<'db>,
+            name: &str,
+            usage: BuiltinUsage,
+        ) -> Option<ProvidedBindingValue<'db>>;
+    }
+
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
 
     #[salsa::db]
@@ -73,6 +115,8 @@ pub(crate) mod tests {
         analysis_settings: Arc<AnalysisSettings>,
         open_files: rustc_hash::FxHashSet<File>,
         program_settings: ProgramSettings,
+
+        source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
     impl TestDb {
@@ -97,6 +141,8 @@ pub(crate) mod tests {
                 analysis_settings: AnalysisSettings::default().into(),
                 open_files: rustc_hash::FxHashSet::default(),
                 program_settings,
+
+                source_provider: None,
             }
         }
 
@@ -158,6 +204,15 @@ pub(crate) mod tests {
 
     #[salsa::db]
     impl ty_python_core::Db for TestDb {
+        fn provided_statements(
+            &self,
+            file: ProgramFile<'_>,
+        ) -> Vec<ty_python_core::definition::ProvidedStatement> {
+            self.source_provider
+                .as_ref()
+                .map_or_else(Vec::new, |provider| provider.statements(self, file))
+        }
+
         fn should_check_file(&self, file: File) -> bool {
             !file.path(self).is_vendored_path()
         }
@@ -172,6 +227,27 @@ pub(crate) mod tests {
 
     #[salsa::db]
     impl Db for TestDb {
+        fn provided_binding<'db>(
+            &'db self,
+            definition: Definition<'db>,
+        ) -> ProvidedBindingResolution<'db> {
+            self.source_provider.as_ref().map_or_else(
+                || ProvidedBindingValue::Unresolved.into(),
+                |provider| provider.binding(self, definition),
+            )
+        }
+
+        fn provided_builtin<'db>(
+            &'db self,
+            file: ProgramFile<'db>,
+            name: &str,
+            usage: BuiltinUsage,
+        ) -> Option<ProvidedBindingValue<'db>> {
+            self.source_provider
+                .as_ref()
+                .and_then(|provider| provider.builtin(self, file, name, usage))
+        }
+
         fn check_file(&self, file: File) -> Vec<Diagnostic> {
             if !self.should_check_file(file) {
                 return Vec::new();
@@ -235,6 +311,8 @@ pub(crate) mod tests {
         /// Whether module resolution should include packages from the synthetic virtual environment.
         third_party_packages: bool,
         rule_selection: Option<RuleSelection>,
+
+        source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
     impl<'a> TestDbBuilder<'a> {
@@ -246,6 +324,8 @@ pub(crate) mod tests {
                 files: vec![],
                 third_party_packages: false,
                 rule_selection: None,
+
+                source_provider: None,
             }
         }
 
@@ -269,6 +349,14 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_source_provider(
+            mut self,
+            provider: impl SourceProvider + 'static,
+        ) -> Self {
+            self.source_provider = Some(Arc::new(provider));
+            self
+        }
+
         pub(crate) fn with_file(
             mut self,
             path: &'a (impl AsRef<SystemPath> + ?Sized),
@@ -289,6 +377,7 @@ pub(crate) mod tests {
 
         pub(crate) fn build(self) -> anyhow::Result<TestDb> {
             let mut db = TestDb::new();
+            db.source_provider = self.source_provider;
 
             if let Some(selection) = self.rule_selection {
                 db.rule_selection = Arc::new(selection);

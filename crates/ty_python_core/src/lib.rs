@@ -676,6 +676,19 @@ impl<'db> SemanticIndex<'db> {
             .expect("definition should be present in the semantic index")
     }
 
+    /// Returns the bindings of an application-defined expression statement.
+    /// `Some([])` means that the statement is supplied but does not bind any names.
+    pub fn provided_statement_definitions(
+        &self,
+        statement: &ast::Stmt,
+    ) -> Option<&[Definition<'db>]> {
+        if !matches!(statement, ast::Stmt::Expr(_)) {
+            return None;
+        }
+        self.definitions_by_node
+            .get(DefinitionNodeKey::from_node_ref(statement.into()))
+    }
+
     /// Returns the [`definition::Definition`] salsa ingredient(s) for `definition_node`, if any.
     pub fn try_definitions(
         &self,

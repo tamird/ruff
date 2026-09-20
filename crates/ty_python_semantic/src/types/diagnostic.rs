@@ -1844,7 +1844,8 @@ fn assignment_declaration_annotation<'db>(
             .annotation
             .as_deref()
             .map(|annotation| (annotation, DeclarationKind::KeywordVariadicParameter)),
-        DefinitionKind::Import(_)
+        DefinitionKind::ProvidedBinding(_)
+        | DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)
         | DefinitionKind::ImportFromSubmodule(_)
         | DefinitionKind::StarImport(_)
@@ -1905,7 +1906,8 @@ fn assignment_value_node<'db, 'ast>(
         DefinitionKind::NamedExpression(assignment) => {
             Some(&*assignment.node(context.module()).value)
         }
-        DefinitionKind::Import(_)
+        DefinitionKind::ProvidedBinding(_)
+        | DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)
         | DefinitionKind::ImportFromSubmodule(_)
         | DefinitionKind::StarImport(_)

@@ -98,7 +98,8 @@ fn lexical_name_path_component_for_leaf(
             };
             name.id.clone()
         }
-        DefinitionKind::TypeAlias(_)
+        DefinitionKind::ProvidedBinding(_)
+        | DefinitionKind::TypeAlias(_)
         | DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)
         | DefinitionKind::ImportFromSubmodule(_)

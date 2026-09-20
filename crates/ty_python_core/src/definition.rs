@@ -6,7 +6,7 @@ use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::find_node::covering_node;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::traversal::suite;
-use ruff_python_ast::{self as ast, AnyNodeRef, Expr};
+use ruff_python_ast::{self as ast, AnyNodeRef, Expr, NodeIndex};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use smallvec::SmallVec;
 
@@ -929,6 +929,7 @@ impl DefinitionCategory {
 /// for an in-depth explanation of why this is necessary.
 #[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub enum DefinitionKind<'db> {
+    ProvidedBinding(Box<ProvidedBindingDefinitionKind>),
     Import(ImportDefinitionKind),
     ImportFrom(ImportFromDefinitionKind),
     ImportFromSubmodule(ImportFromSubmoduleDefinitionKind),
@@ -983,7 +984,8 @@ impl<'db> DefinitionKind<'db> {
     pub fn is_import(&self) -> bool {
         matches!(
             self,
-            DefinitionKind::Import(_)
+            DefinitionKind::ProvidedBinding(_)
+                | DefinitionKind::Import(_)
                 | DefinitionKind::ImportFrom(_)
                 | DefinitionKind::StarImport(_)
                 | DefinitionKind::ImportFromSubmodule(_)
@@ -1028,6 +1030,7 @@ impl<'db> DefinitionKind<'db> {
     /// [`ast::ExprName`], [`ast::Identifier`], [`ast::ExprAttribute`] or [`ast::ExprSubscript`] but could also be other nodes.
     pub fn target_range(&self, module: &ParsedModuleRef) -> TextRange {
         match self {
+            DefinitionKind::ProvidedBinding(binding) => binding.binding.range,
             DefinitionKind::Import(import) => import.alias(module).range(),
             DefinitionKind::ImportFrom(import) => import.alias(module).range(),
             DefinitionKind::ImportFromSubmodule(import) => import.target_range(module),
@@ -1078,6 +1081,7 @@ impl<'db> DefinitionKind<'db> {
     /// Returns the [`TextRange`] of the entire definition.
     pub fn full_range(&self, module: &ParsedModuleRef) -> TextRange {
         match self {
+            DefinitionKind::ProvidedBinding(binding) => binding.statement.node(module).range(),
             DefinitionKind::Import(import) => import.alias(module).range(),
             DefinitionKind::ImportFrom(import) => import.alias(module).range(),
             DefinitionKind::ImportFromSubmodule(import) => import.module(module).range(),
@@ -1154,7 +1158,8 @@ impl<'db> DefinitionKind<'db> {
                 }
             }
             // all of these bind values without declaring a type
-            DefinitionKind::DictKeyAssignment(_)
+            DefinitionKind::ProvidedBinding(_)
+            | DefinitionKind::DictKeyAssignment(_)
             | DefinitionKind::NamedExpression(_)
             | DefinitionKind::Assignment(_)
             | DefinitionKind::AugmentedAssignment(_)
@@ -1182,6 +1187,38 @@ impl<'db> DefinitionKind<'db> {
             DefinitionKind::AnnotatedAssignment(assignment) => assignment.value(module),
             _ => None,
         }
+    }
+}
+
+/// An expression statement whose bindings are supplied by an embedding application.
+///
+/// The application owns validation of this statement's syntax. The statement and targets must
+/// belong to the current parsed module; their indices cannot be reused across source revisions.
+/// An empty binding list still replaces ordinary expression-statement inference.
+#[derive(Clone, Debug)]
+pub struct ProvidedStatement {
+    pub statement: NodeIndex,
+    pub bindings: Box<[ProvidedBinding]>,
+}
+
+/// A name introduced by a supplied statement, anchored to its original source target.
+#[derive(Clone, Debug, get_size2::GetSize)]
+pub struct ProvidedBinding {
+    pub target: NodeIndex,
+    pub name: Name,
+    /// The identifier's range within the target node, excluding surrounding syntax.
+    pub range: TextRange,
+}
+
+#[derive(Clone, Debug, get_size2::GetSize)]
+pub struct ProvidedBindingDefinitionKind {
+    pub(crate) statement: AstNodeRef<ast::StmtExpr>,
+    pub binding: ProvidedBinding,
+}
+
+impl ProvidedBindingDefinitionKind {
+    pub fn statement<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::StmtExpr {
+        self.statement.node(module)
     }
 }
 
@@ -1756,6 +1793,9 @@ pub enum NestedBindingExecution {
 pub struct DefinitionNodeKey(NodeKey);
 
 impl DefinitionNodeKey {
+    pub(crate) fn from_root_node(node: ast::AnyRootNodeRef<'_>) -> Self {
+        Self(NodeKey::from_node(node))
+    }
     pub(crate) fn from_node_ref(node: ast::AnyNodeRef<'_>) -> Self {
         match node {
             ast::AnyNodeRef::ParameterWithDefault(parameter) => parameter.into(),
