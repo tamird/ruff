@@ -31,7 +31,9 @@ use crate::lint::LintMetadata;
 use crate::place::{DefinedPlace, Definedness, Place};
 use crate::subscript::PyIndex;
 use crate::types::ProgramEnvironment;
-use crate::types::call::arguments::{CallArgumentExpansions, CallArgumentTypes, Expansion};
+use crate::types::call::arguments::{
+    CallArgumentExpansions, CallArgumentTypes, Expansion, LiteralUnpacking,
+};
 use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::{
     CandidateSolutions, CandidateTypeVarSolution, ConstraintSet, ConstraintSetBuilder,
@@ -4914,7 +4916,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         parameters: &'a Parameters<'db>,
         errors: &'a mut Vec<BindingError<'db>>,
     ) -> Self {
-        let explicit_keyword_parameters: FxHashSet<usize> = arguments
+        let mut explicit_keyword_parameters: FxHashSet<usize> = arguments
             .iter()
             .filter_map(|(argument, _)| {
                 if let Argument::Keyword(name) = argument {
@@ -4924,6 +4926,13 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 }
             })
             .collect();
+        for (index, _) in arguments.iter().enumerate() {
+            if let Some(LiteralUnpacking::Keywords(keywords)) = arguments.literal_unpacking(index) {
+                explicit_keyword_parameters.extend(keywords.iter().filter_map(|(name, _)| {
+                    parameters.keyword_by_name(name).map(|(index, _)| index)
+                }));
+            }
+        }
 
         Self {
             arguments,
@@ -5114,6 +5123,15 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 variable_element: Option<Type<'db>>,
             },
             None,
+        }
+
+        if let Some(LiteralUnpacking::Positional(types)) =
+            self.arguments.literal_unpacking(argument_index)
+        {
+            for ty in types {
+                self.match_positional(argument_index, argument, Some(*ty), false)?;
+            }
+            return Ok(());
         }
 
         let variadic_type = match argument_type {
@@ -5339,7 +5357,18 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument_index: usize,
         argument_type: Option<Type<'db>>,
     ) {
-        if let Some(unpacked) =
+        if let Some(LiteralUnpacking::Keywords(keywords)) =
+            self.arguments.literal_unpacking(argument_index)
+        {
+            for (name, ty) in keywords {
+                let _ = self.match_keyword(
+                    argument_index,
+                    Argument::Keywords,
+                    Some(*ty),
+                    name.as_str(),
+                );
+            }
+        } else if let Some(unpacked) =
             argument_type.and_then(|ty| extract_unpacked_typed_dict_from_value_type(db, env, ty))
         {
             let openness = unpacked.openness;
@@ -6497,6 +6526,17 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             }
 
             if matches!(argument, Argument::Variadic) {
+                if let Some(LiteralUnpacking::Positional(_)) =
+                    self.arguments.literal_unpacking(argument_index)
+                {
+                    for matched in matches
+                        .iter()
+                        .filter(|matched| matched.index == parameter_index)
+                    {
+                        actual.push(matched.argument_type?);
+                    }
+                    continue;
+                }
                 let argument_type = argument_types.get_default()?;
                 let mut argument_tuple = argument_type.iterate(db, self.env);
                 let consumed_prefix = matches
@@ -7169,6 +7209,19 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
             None
         };
+
+        if let Some(LiteralUnpacking::Keywords(_)) =
+            self.arguments.literal_unpacking(argument_index)
+        {
+            self.check_variadic_argument_type(
+                constraints,
+                argument_index,
+                adjusted_argument_index,
+                Argument::Keywords,
+                paramspec_component_start,
+            );
+            return;
+        }
 
         for matched_parameter in self.argument_matches[argument_index].iter() {
             let parameter_index = matched_parameter.index;

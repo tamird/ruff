@@ -637,6 +637,42 @@ def ab(a: str):
     }
 
     #[test]
+    fn signature_help_literal_list_after_keyword() {
+        let test = CursorTest::builder()
+            .source(
+                "main.py",
+                "def f(x: int, *, y: int): pass\nf(x=1, *[2]<CURSOR>)\n",
+            )
+            .build();
+
+        assert_snapshot!(test.signature_help_render());
+    }
+
+    #[test]
+    fn signature_help_literal_dictionary() {
+        let test = CursorTest::builder()
+            .source(
+                "main.py",
+                "def f(x: int, *, y: int): pass\nf(**{'y': 2}<CURSOR>)\n",
+            )
+            .build();
+
+        assert_snapshot!(test.signature_help_render());
+    }
+
+    #[test]
+    fn signature_help_positional_argument_after_keyword() {
+        let test = CursorTest::builder()
+            .source(
+                "main.py",
+                "def f(x: int, y: int): pass\nf(x=1, 2<CURSOR>)\n",
+            )
+            .build();
+
+        assert_snapshot!(test.signature_help_render());
+    }
+
+    #[test]
     fn signature_help_overload_arity_disambiguated1() {
         let test = CursorTest::builder()
             .source(
@@ -806,9 +842,7 @@ def ab(a: int, *, c: int):
         ---------------------------------------------
         c overload
 
-        -------------- active parameter -------------
-        c: int
-        ---------------------------------------------
+        (no active parameter specified)
         ");
     }
 
@@ -872,9 +906,7 @@ def ab(a: int, *, c: int):
         ---------------------------------------------
         b overload
 
-        -------------- active parameter -------------
-        b: int
-        ---------------------------------------------
+        (no active parameter specified)
         ");
     }
 

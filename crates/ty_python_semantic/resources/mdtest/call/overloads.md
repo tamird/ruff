@@ -1437,8 +1437,10 @@ def _(x1: int, x2: int, kwargs: dict[str, int]):
     reveal_type(f(x1=x1))  # revealed: int
     reveal_type(f(x1=x1, x2=x2))  # revealed: tuple[int, int]
 
-    # Step 4 should filter out all but the last overload.
-    reveal_type(f(**{"x1": x1, "x2": x2}))  # revealed: int
+    # The literal dictionary has exactly the two keys required by the second overload.
+    reveal_type(f(**{"x1": x1, "x2": x2}))  # revealed: tuple[int, int]
+
+    # Step 4 should filter out all but the last overload for unknown dictionary contents.
     reveal_type(f(**kwargs))  # revealed: int
 ```
 
