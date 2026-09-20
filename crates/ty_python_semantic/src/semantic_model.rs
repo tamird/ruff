@@ -1273,10 +1273,44 @@ impl HasType for ast::ExceptHandlerExceptHandler {
 #[cfg(test)]
 mod tests {
     use crate::db::tests::TestDbBuilder;
-    use crate::{HasType, SemanticModel};
+    use crate::{Db as _, HasType, SemanticModel};
     use ruff_db::files::system_path_to_file;
     use ruff_db::parsed::parsed_module;
     use ty_python_core::ProgramFile;
+
+    #[test]
+    fn inherited_completion_preserves_type_check_only() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new()
+            .with_file(
+                "/src/main.py",
+                "from typing import type_check_only\nclass Base:\n    @type_check_only\n    def hidden(self) -> int: ...\n    def visible(self) -> int: ...\nclass Child(Base): ...\nvalue = Child()\nvalue.visible\n",
+            )
+            .build()?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let attribute = module
+            .suite()
+            .last()
+            .unwrap()
+            .as_expr_stmt()
+            .unwrap()
+            .value
+            .as_attribute_expr()
+            .unwrap();
+        let model = SemanticModel::new(&db, file);
+        let completions = model.attribute_completions(attribute);
+        assert!(
+            completions
+                .iter()
+                .any(|member| member.name == "hidden" && member.is_type_check_only)
+        );
+        assert!(
+            completions
+                .iter()
+                .any(|member| member.name == "visible" && !member.is_type_check_only)
+        );
+        Ok(())
+    }
 
     #[test]
     fn function_type() -> anyhow::Result<()> {

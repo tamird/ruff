@@ -54,7 +54,7 @@ pub(crate) fn all_end_of_scope_members<'db>(
             let member = Member {
                 name: symbol.name().clone(),
                 ty,
-                is_type_check_only: false,
+                is_type_check_only: !may_exist_at_runtime(db, first_reachable_definition),
             };
             Some(MemberWithDefinition {
                 member,
@@ -75,7 +75,7 @@ pub(crate) fn all_end_of_scope_members<'db>(
                 let member = Member {
                     name: symbol.name().clone(),
                     ty,
-                    is_type_check_only: false,
+                    is_type_check_only: !may_exist_at_runtime(db, first_reachable_definition),
                 };
                 Some(MemberWithDefinition {
                     member,
