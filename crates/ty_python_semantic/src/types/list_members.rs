@@ -220,20 +220,9 @@ impl<'db> AllMembers<'db> {
             }
 
             Type::NominalInstance(instance) => {
-                let class = instance.class(db, env);
-                if let Some((class_literal, _)) = class.static_class_literal(db) {
-                    self.extend_with_instance_members(db, env, ty, class_literal);
-                    self.extend_with_synthetic_members(
-                        db,
-                        env,
-                        ty,
-                        ClassLiteral::Static(class_literal),
-                    );
-                } else {
-                    // For dynamic classes, we can't enumerate instance members (requires body scope),
-                    // but we can still add synthetic members for dataclass-like classes.
-                    self.extend_with_synthetic_members(db, env, ty, class.class_literal(db));
-                }
+                let class = instance.class(db, env).class_literal(db);
+                self.extend_with_instance_members(db, env, ty, class);
+                self.extend_with_synthetic_members(db, env, ty, class);
             }
 
             Type::NewTypeInstance(newtype) => {
@@ -414,7 +403,7 @@ impl<'db> AllMembers<'db> {
                 if let Type::ClassLiteral(ClassLiteral::Static(class)) =
                     KnownClass::TypedDictFallback.to_class_literal(db, env)
                 {
-                    self.extend_with_instance_members(db, env, ty, class);
+                    self.extend_with_instance_members(db, env, ty, class.into());
                 }
             }
 
@@ -507,11 +496,17 @@ impl<'db> AllMembers<'db> {
         ty: Type<'db>,
         class_literal: ClassLiteral<'db>,
     ) {
-        for parent in class_literal
-            .iter_mro(db)
-            .filter_map(ClassBase::into_class)
-            .filter_map(|class| class.static_class_literal(db).map(|(lit, _)| lit))
-        {
+        for parent in class_literal.iter_mro(db).filter_map(ClassBase::into_class) {
+            let parent = match parent.class_literal(db) {
+                ClassLiteral::Static(parent) => parent,
+                ClassLiteral::Dynamic(parent) => {
+                    self.extend_with_dynamic_members(db, env, ty, parent, false);
+                    continue;
+                }
+                ClassLiteral::DynamicNamedTuple(_)
+                | ClassLiteral::DynamicTypedDict(_)
+                | ClassLiteral::DynamicEnum(_) => continue,
+            };
             self.extend_with_slot_members(db, env, ty, parent);
 
             let parent_scope = parent.body_scope(db);
@@ -577,9 +572,7 @@ impl<'db> AllMembers<'db> {
         };
 
         self.extend_with_class_members(db, env, ty, metaclass.class_literal(db));
-        if let Some((metaclass, _)) = metaclass.static_class_literal(db) {
-            self.extend_with_instance_members(db, env, ty, metaclass);
-        }
+        self.extend_with_instance_members(db, env, ty, metaclass.class_literal(db));
     }
 
     /// Extend with instance members from a single class (not its MRO).
@@ -637,15 +630,46 @@ impl<'db> AllMembers<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         ty: Type<'db>,
-        class_literal: StaticClassLiteral<'db>,
+        class_literal: ClassLiteral<'db>,
     ) {
-        for class in class_literal
-            .iter_mro(db, None)
-            .filter_map(ClassBase::into_class)
-        {
-            if let Some((class_literal, _)) = class.static_class_literal(db) {
-                self.extend_with_instance_members_for_class(db, env, ty, class_literal);
+        for class in class_literal.iter_mro(db).filter_map(ClassBase::into_class) {
+            match class.class_literal(db) {
+                ClassLiteral::Static(class) => {
+                    self.extend_with_instance_members_for_class(db, env, ty, class);
+                }
+                ClassLiteral::Dynamic(class) => {
+                    self.extend_with_dynamic_members(db, env, ty, class, true);
+                }
+                ClassLiteral::DynamicNamedTuple(_)
+                | ClassLiteral::DynamicTypedDict(_)
+                | ClassLiteral::DynamicEnum(_) => {}
             }
+        }
+    }
+
+    fn extend_with_dynamic_members(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        class: super::class::DynamicClassLiteral<'db>,
+        include_instance_fields: bool,
+    ) {
+        let instance_fields = class
+            .instance_fields(db)
+            .as_ref()
+            .filter(|_| include_instance_fields)
+            .map_or([].as_slice(), |fields| fields.fields.as_ref());
+        for (name, _) in class.members(db).iter().chain(instance_fields) {
+            let Some(member_type) = ty.member(db, env, name).place.ignore_possibly_undefined()
+            else {
+                continue;
+            };
+            self.members.insert(Member {
+                name: name.clone(),
+                ty: member_type,
+                is_type_check_only: false,
+            });
         }
     }
 

@@ -1,6 +1,7 @@
 use crate::dependency::DependencyMetadata;
 use crate::lint::{LintRegistry, RuleSelection};
 use crate::provided::{BuiltinUsage, ProvidedBindingResolution, ProvidedBindingValue};
+use crate::types::CheckedCall;
 use crate::{AnalysisSettings, PythonVersionWithSource};
 use ruff_db::diagnostic::Diagnostic;
 use ruff_db::files::File;
@@ -27,6 +28,20 @@ pub trait Db: PythonCoreDb {
         _name: &str,
         _usage: BuiltinUsage,
     ) -> Option<ProvidedBindingValue<'db>> {
+        None
+    }
+
+    /// Refines the result of an application-defined factory after ordinary argument checking.
+    ///
+    /// The declaration, bound arguments, and inferred child types come from this inference pass.
+    /// Implementations must identify the resolved declaration, rather than the spelling of the
+    /// call, and must not request completed inference of the scope currently being inferred.
+    /// Invalid calls retain their diagnostics and can supply a recovery result. Overloaded
+    /// callables retain ordinary inference; this hook only handles single-signature callables.
+    fn provided_call_result<'db>(
+        &'db self,
+        _call: &CheckedCall<'_, 'db>,
+    ) -> Option<crate::types::Type<'db>> {
         None
     }
 
@@ -108,6 +123,8 @@ pub(crate) mod tests {
     }
 
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
+    type CallResultProvider =
+        for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> Option<crate::types::Type<'db>>;
 
     #[salsa::db]
     #[derive(Clone)]
@@ -121,7 +138,7 @@ pub(crate) mod tests {
         analysis_settings: Arc<AnalysisSettings>,
         open_files: rustc_hash::FxHashSet<File>,
         program_settings: ProgramSettings,
-
+        call_result_provider: Option<CallResultProvider>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
@@ -147,7 +164,7 @@ pub(crate) mod tests {
                 analysis_settings: AnalysisSettings::default().into(),
                 open_files: rustc_hash::FxHashSet::default(),
                 program_settings,
-
+                call_result_provider: None,
                 source_provider: None,
             }
         }
@@ -264,6 +281,14 @@ pub(crate) mod tests {
                 .and_then(|provider| provider.builtin(self, file, name, usage))
         }
 
+        fn provided_call_result<'db>(
+            &'db self,
+            call: &CheckedCall<'_, 'db>,
+        ) -> Option<crate::types::Type<'db>> {
+            self.call_result_provider
+                .and_then(|provider| provider(self, call))
+        }
+
         fn check_file(&self, file: File) -> Vec<Diagnostic> {
             if !self.should_check_file(file) {
                 return Vec::new();
@@ -327,7 +352,7 @@ pub(crate) mod tests {
         /// Whether module resolution should include packages from the synthetic virtual environment.
         third_party_packages: bool,
         rule_selection: Option<RuleSelection>,
-
+        call_result_provider: Option<CallResultProvider>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
@@ -340,7 +365,7 @@ pub(crate) mod tests {
                 files: vec![],
                 third_party_packages: false,
                 rule_selection: None,
-
+                call_result_provider: None,
                 source_provider: None,
             }
         }
@@ -373,6 +398,11 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_call_result_provider(mut self, provider: CallResultProvider) -> Self {
+            self.call_result_provider = Some(provider);
+            self
+        }
+
         pub(crate) fn with_file(
             mut self,
             path: &'a (impl AsRef<SystemPath> + ?Sized),
@@ -393,6 +423,7 @@ pub(crate) mod tests {
 
         pub(crate) fn build(self) -> anyhow::Result<TestDb> {
             let mut db = TestDb::new();
+            db.call_result_provider = self.call_result_provider;
             db.source_provider = self.source_provider;
 
             if let Some(selection) = self.rule_selection {

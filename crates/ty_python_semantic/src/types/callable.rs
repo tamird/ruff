@@ -102,14 +102,36 @@ impl<'db> Type<'db> {
     }
 
     /// Create a callable type with a single non-overloaded signature.
-    pub(crate) fn single_callable(db: &'db dyn Db, signature: Signature<'db>) -> Type<'db> {
+    pub fn single_callable(db: &'db dyn Db, signature: Signature<'db>) -> Type<'db> {
         Type::Callable(CallableType::single(db, signature))
+    }
+
+    /// Builds a wrapper callable by transforming each signature while retaining unions and
+    /// overloads. Source parameter definitions and generic contexts remain in the signature.
+    pub fn map_callable_signatures(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        kind: CallableTypeKind,
+        mut map: impl FnMut(Signature<'db>) -> Signature<'db>,
+    ) -> Option<Type<'db>> {
+        let callables = self.try_upcast_to_callable(db, env)?;
+        Some(
+            callables
+                .map(|callable| {
+                    let signatures = CallableSignature::from_overloads(
+                        callable.signatures(db).iter().cloned().map(&mut map),
+                    );
+                    callable.with_signatures(db, signatures).with_kind(db, kind)
+                })
+                .to_type(db, env),
+        )
     }
 
     /// Create a non-overloaded, function-like callable type with a single signature.
     ///
     /// A function-like callable will bind `self` when accessed as an attribute on an instance.
-    pub(crate) fn function_like_callable(db: &'db dyn Db, signature: Signature<'db>) -> Type<'db> {
+    pub fn function_like_callable(db: &'db dyn Db, signature: Signature<'db>) -> Type<'db> {
         Type::Callable(CallableType::function_like(db, signature))
     }
 
@@ -715,6 +737,10 @@ pub struct CallableType<'db> {
     /// for diagnostic names, source annotations, and deduplication, independently of binding kind.
     #[returns(copy)]
     pub(crate) deprecated: Option<OverloadLiteral<'db>>,
+
+    /// Immutable application metadata for synthesized callable values.
+    #[returns(ref)]
+    pub(crate) provided_data: Option<crate::provided::ProvidedData>,
 }
 
 pub(super) fn walk_callable_type<'db, V: visitor::TypeVisitor<'db> + ?Sized>(
@@ -736,11 +762,17 @@ impl<'db> CallableType<'db> {
         S: salsa::Lookup<CallableSignature<'db>> + std::hash::Hash,
         CallableSignature<'db>: salsa::HashEqLike<S>,
     {
-        Self::new_internal(db, signatures, kind, None)
+        Self::new_internal(db, signatures, kind, None, None)
     }
 
     pub(crate) fn with_deprecated(self, db: &'db dyn Db, deprecated: OverloadLiteral<'db>) -> Self {
-        Self::new_internal(db, self.signatures(db), self.kind(db), Some(deprecated))
+        Self::new_internal(
+            db,
+            self.signatures(db),
+            self.kind(db),
+            Some(deprecated),
+            self.provided_data(db).clone(),
+        )
     }
 
     /// Replace the signatures without losing binding behavior or deprecation metadata.
@@ -749,11 +781,37 @@ impl<'db> CallableType<'db> {
         S: salsa::Lookup<CallableSignature<'db>> + std::hash::Hash,
         CallableSignature<'db>: salsa::HashEqLike<S>,
     {
-        Self::new_internal(db, signatures, self.kind(db), self.deprecated(db))
+        Self::new_internal(
+            db,
+            signatures,
+            self.kind(db),
+            self.deprecated(db),
+            self.provided_data(db).clone(),
+        )
     }
 
     pub(crate) fn with_kind(self, db: &'db dyn Db, kind: CallableTypeKind) -> Self {
-        Self::new_internal(db, self.signatures(db), kind, self.deprecated(db))
+        Self::new_internal(
+            db,
+            self.signatures(db),
+            kind,
+            self.deprecated(db),
+            self.provided_data(db).clone(),
+        )
+    }
+
+    pub(crate) fn with_provided_data(
+        self,
+        db: &'db dyn Db,
+        data: crate::provided::ProvidedData,
+    ) -> Self {
+        Self::new_internal(
+            db,
+            self.signatures(db),
+            self.kind(db),
+            self.deprecated(db),
+            Some(data),
+        )
     }
 
     pub(crate) fn single(db: &'db dyn Db, signature: Signature<'db>) -> CallableType<'db> {
@@ -924,6 +982,7 @@ impl<'db> CallableType<'db> {
                 .bind_method_receiver(db, env, receiver_type, typing_self_type),
             CallableTypeKind::Regular,
             self.deprecated(db),
+            self.provided_data(db).clone(),
         )
     }
 

@@ -2963,6 +2963,13 @@ impl<'db> FmtDetailed<'db> for DisplayParameter<'_, 'db> {
                 } else {
                     f.write_str("=")?;
                 }
+                if let Some(super::ParameterDefault::Source { ty: _, source }) =
+                    self.param.default()
+                {
+                    let text = ruff_db::source::source_text(db, source.file());
+                    f.write_str(&text[source.range()])?;
+                    return Ok(());
+                }
                 match default_type {
                     Type::LiteralValue(literal)
                         if matches!(

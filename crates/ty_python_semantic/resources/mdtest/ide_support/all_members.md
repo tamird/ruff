@@ -1045,7 +1045,7 @@ static_assert(has_member(Dynamic, "__mro__"))
 static_assert(has_member(Dynamic, "__subclasses__"))
 ```
 
-Attributes from the namespace dict (third argument) are not tracked:
+Attributes from the namespace dict (third argument) are available on the class and its instances:
 
 ```py
 from ty_extensions import static_assert
@@ -1053,9 +1053,8 @@ from ty_extensions._internal import has_member
 
 DynamicWithDict = type("DynamicWithDict", (), {"custom_attr": 42})
 
-# TODO: these should pass -- namespace dict attributes are not yet available for autocomplete
-static_assert(has_member(DynamicWithDict, "custom_attr"))  # error: [static-assert-error]
-static_assert(has_member(DynamicWithDict(), "custom_attr"))  # error: [static-assert-error]
+static_assert(has_member(DynamicWithDict, "custom_attr"))
+static_assert(has_member(DynamicWithDict(), "custom_attr"))
 ```
 
 Dynamic classes inheriting from classes with custom metaclasses get metaclass members:
@@ -1077,7 +1076,7 @@ static_assert(has_member(Dynamic, "meta_attr"))
 static_assert(has_member(Dynamic, "base_attr"))
 ```
 
-However, instances of dynamic classes currently do not expose members for autocomplete:
+Instances of dynamic classes also expose inherited members for autocomplete:
 
 ```py
 from ty_extensions import static_assert
@@ -1089,10 +1088,9 @@ class Base:
 DynamicSingle = type("DynamicSingle", (Base,), {})
 instance = DynamicSingle()
 
-# TODO: these should pass; instance members should be available
-static_assert(has_member(instance, "base_attr"))  # error: [static-assert-error]
-static_assert(has_member(instance, "__repr__"))  # error: [static-assert-error]
-static_assert(has_member(instance, "__hash__"))  # error: [static-assert-error]
+static_assert(has_member(instance, "base_attr"))
+static_assert(has_member(instance, "__repr__"))
+static_assert(has_member(instance, "__hash__"))
 ```
 
 ### Attributes not available at runtime

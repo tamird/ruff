@@ -1,22 +1,111 @@
-use ruff_python_ast as ast;
+use ruff_python_ast::{self as ast, name::Name};
+use ty_python_core::ProgramFile;
+use ty_python_core::definition::Definition;
 
 use super::arguments::CallArgumentTypes;
 use super::{Binding, CallArguments};
 use crate::types::Type;
+use crate::types::class::DynamicClassAnchor;
+
+/// Whether a checked parameter was supplied by one definite argument.
+pub enum CheckedArgument<'a, 'db> {
+    /// No argument supplied this parameter.
+    Omitted,
+    /// A single value supplied this parameter. A synthetic receiver has no source expression.
+    Value {
+        ty: Type<'db>,
+        expression: Option<&'a ast::Expr>,
+    },
+    /// Argument recovery or unpacking did not determine a single value.
+    Indeterminate,
+}
 
 /// A call after ordinary argument matching and type checking.
 ///
-/// Native refinements use the matcher's checked parameter types and original source nodes.
-pub(crate) struct CheckedCall<'a, 'db> {
+/// Native refinements can update the return type through this view. Applications receive
+/// read-only access. Child types come from the current inference result, so inspecting them
+/// cannot recursively request the enclosing scope. Source nodes belong to the original call.
+pub struct CheckedCall<'a, 'db> {
     pub(crate) binding: &'a mut Binding<'db>,
     pub(crate) arguments: &'a CallArguments<'a, 'db>,
     pub(crate) bound_receiver: bool,
+    pub(crate) file: ProgramFile<'db>,
     pub(crate) call: &'a ast::ExprCall,
+    pub(crate) expression_type: &'a dyn Fn(&ast::Expr) -> Option<Type<'db>>,
+    pub(crate) class_anchor: &'a dyn Fn(Box<[Type<'db>]>) -> DynamicClassAnchor<'db>,
+    pub(crate) has_binding_errors: bool,
 }
 
 impl<'a, 'db> CheckedCall<'a, 'db> {
-    pub(crate) fn call(&self) -> &'a ast::ExprCall {
+    pub fn file(&self) -> ProgramFile<'db> {
+        self.file
+    }
+
+    pub fn call(&self) -> &'a ast::ExprCall {
         self.call
+    }
+
+    pub fn declaration(&self) -> Option<Definition<'db>> {
+        self.binding.signature.definition()
+    }
+
+    pub fn return_type(&self) -> Type<'db> {
+        self.binding.return_ty
+    }
+
+    pub fn has_binding_errors(&self) -> bool {
+        self.has_binding_errors
+    }
+
+    pub fn expression_type(&self, expression: &ast::Expr) -> Option<Type<'db>> {
+        (self.expression_type)(expression)
+    }
+
+    pub fn argument(&self, name: &str) -> CheckedArgument<'a, 'db> {
+        let Some(parameter) = self
+            .binding
+            .signature
+            .parameters()
+            .iter()
+            .position(|parameter| parameter.name().map(Name::as_str) == Some(name))
+        else {
+            return CheckedArgument::Indeterminate;
+        };
+        self.argument_at(parameter)
+    }
+
+    fn argument_at(&self, parameter: usize) -> CheckedArgument<'a, 'db> {
+        let mut arguments = self.matched_arguments(parameter);
+        let Some(source) = arguments.next() else {
+            return CheckedArgument::Omitted;
+        };
+        if arguments.next().is_some() {
+            return CheckedArgument::Indeterminate;
+        }
+        let Some(ty) = self.parameter_types()[parameter] else {
+            return CheckedArgument::Indeterminate;
+        };
+        let expression = match source {
+            Some((source, _)) => {
+                let expression = match source {
+                    ast::ArgOrKeyword::Arg(expression) => {
+                        if expression.is_starred_expr() {
+                            return CheckedArgument::Indeterminate;
+                        }
+                        expression
+                    }
+                    ast::ArgOrKeyword::Keyword(keyword) => {
+                        if keyword.arg.is_none() {
+                            return CheckedArgument::Indeterminate;
+                        }
+                        &keyword.value
+                    }
+                };
+                Some(expression)
+            }
+            None => None,
+        };
+        CheckedArgument::Value { ty, expression }
     }
 
     /// Associates the matcher's receiver-prefixed arguments with original source arguments.
@@ -84,25 +173,19 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
     }
 
     pub(crate) fn argument_expression(&self, parameter: usize) -> Option<&'a ast::Expr> {
-        let mut arguments = self.matched_arguments(parameter);
-        let (source, _) = arguments.next()??;
-        if arguments.next().is_some() {
-            return None;
-        }
-        self.parameter_types()[parameter]?;
-        match source {
-            ast::ArgOrKeyword::Arg(expression) => {
-                (!expression.is_starred_expr()).then_some(expression)
-            }
-            ast::ArgOrKeyword::Keyword(keyword) => {
-                keyword.arg.as_ref()?;
-                Some(&keyword.value)
-            }
+        match self.argument_at(parameter) {
+            CheckedArgument::Value { ty: _, expression } => expression,
+            CheckedArgument::Omitted => None,
+            CheckedArgument::Indeterminate => None,
         }
     }
 
     pub(crate) fn set_return_type(&mut self, ty: Type<'db>) {
         self.binding.set_return_type(ty);
+    }
+
+    pub(crate) fn class_anchor(&self, bases: Box<[Type<'db>]>) -> DynamicClassAnchor<'db> {
+        (self.class_anchor)(bases)
     }
 }
 
