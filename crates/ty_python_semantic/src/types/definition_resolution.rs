@@ -663,7 +663,11 @@ fn resolve_reachable_definitions<'db>(
 /// Returns resolved definitions which can be either specific definitions or module files.
 /// For non-import definitions, returns the definition wrapped in `ResolvedDefinition::Definition`.
 /// Always returns at least the original definition as a fallback if resolution fails.
-pub(crate) fn resolve_definition<'db>(
+///
+/// The caller must supply a definition from the canonical semantic index and the
+/// environment of that definition's source program. This entry point preserves
+/// the exact selected binding when an editor already has its definition identity.
+pub fn resolve_definition<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     definition: Definition<'db>,
