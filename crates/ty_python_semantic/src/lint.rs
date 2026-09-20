@@ -368,8 +368,9 @@ pub struct LintRegistryBuilder {
 }
 
 impl LintRegistryBuilder {
+    /// Registers a lint, panicking if its name is already registered.
     #[track_caller]
-    pub(crate) fn register_lint(&mut self, lint: &'static LintMetadata) {
+    pub fn register_lint(&mut self, lint: &'static LintMetadata) {
         assert_eq!(
             self.by_name.insert(&*lint.name, lint.into()),
             None,
@@ -406,11 +407,18 @@ impl LintRegistryBuilder {
         );
     }
 
-    pub(crate) fn build(self) -> LintRegistry {
+    pub fn build(self) -> LintRegistry {
         LintRegistry {
             lints: self.lints,
             by_name: self.by_name,
         }
+    }
+}
+
+impl From<LintRegistry> for LintRegistryBuilder {
+    fn from(registry: LintRegistry) -> Self {
+        let LintRegistry { lints, by_name } = registry;
+        Self { lints, by_name }
     }
 }
 

@@ -12,9 +12,9 @@ use super::{
 use crate::dependency::is_direct_dependency;
 use crate::diagnostic::{did_you_mean, format_enumeration};
 use crate::importer::{ImportAction, ImportRequest, MembersInScope};
-use crate::lint::{Level, LintRegistryBuilder, LintStatus};
+use crate::lint::{Level, LintId, LintRegistryBuilder, LintSource, LintStatus};
 use crate::place::{DefinedPlace, Place, imported_symbol, place_from_bindings};
-use crate::suppression::FileSuppressionId;
+use crate::suppression::{FileSuppressionId, suppressions};
 use crate::types::abstract_methods::AbstractMethods;
 use crate::types::call::bind::CallableDescription;
 use crate::types::call::{Bindings, CallDiagnosticOverride, CallError};
@@ -42,9 +42,13 @@ use crate::types::{
 use crate::types::{KnownInstanceType, MemberLookupPolicy, TypeVarKind, TypedDictType, UnionType};
 use crate::{Db, DisplaySettings, FxIndexMap, ProgramEnvironment, SemanticModel, declare_lint};
 use itertools::Itertools;
+use ruff_db::PythonFile;
 use ruff_db::source::source_text;
 use ruff_db::{
-    diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity},
+    diagnostic::{
+        Annotation, Diagnostic, DiagnosticId, Span, SubDiagnostic, SubDiagnosticSeverity,
+        UnifiedFile,
+    },
     files::File,
     parsed::parsed_module,
 };
@@ -1486,6 +1490,52 @@ impl TypeCheckDiagnostics {
 
     pub(super) fn extend_diagnostics(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
         self.diagnostics.extend(diagnostics);
+    }
+
+    /// Applies the checked file's lint configuration to application-supplied diagnostics.
+    pub(super) fn extend_provided(
+        &mut self,
+        db: &dyn Db,
+        file: PythonFile<'_>,
+        diagnostics: impl IntoIterator<Item = Diagnostic>,
+    ) {
+        for mut diagnostic in diagnostics {
+            if let DiagnosticId::Lint(name) = diagnostic.id()
+                && let Ok(lint) = db.lint_registry().get(name.as_str())
+                && let Some(span) = diagnostic.primary_span()
+                && span.file() == &UnifiedFile::Ty(file.file(db))
+            {
+                if !db.should_check_file(file.file(db)) {
+                    continue;
+                }
+                let Some((severity, source)) = db.rule_selection(file.file(db)).get(lint) else {
+                    continue;
+                };
+                if let Some(range) = span.range()
+                    && self.is_suppressed(db, file, range, lint)
+                {
+                    continue;
+                }
+                if source != LintSource::Default {
+                    diagnostic.set_severity(severity);
+                }
+            }
+            self.push(diagnostic);
+        }
+    }
+
+    pub(crate) fn is_suppressed(
+        &mut self,
+        db: &dyn Db,
+        file: PythonFile<'_>,
+        range: TextRange,
+        lint: LintId,
+    ) -> bool {
+        let Some(suppression) = suppressions(db, file).find_suppression(range, lint) else {
+            return false;
+        };
+        self.mark_used(suppression.id());
+        true
     }
 
     pub(crate) fn mark_used(&mut self, suppression_id: FileSuppressionId) {

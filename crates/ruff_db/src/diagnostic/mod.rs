@@ -273,6 +273,11 @@ impl Diagnostic {
         self.inner.severity
     }
 
+    /// Changes the severity without changing the diagnostic's annotations or other details.
+    pub fn set_severity(&mut self, severity: Severity) {
+        Arc::make_mut(&mut self.inner).severity = severity;
+    }
+
     /// Returns a shared borrow of the "primary" annotation of this diagnostic
     /// if one exists.
     ///
