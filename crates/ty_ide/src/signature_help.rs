@@ -207,36 +207,9 @@ fn create_signature_details_from_call_signature_details<'db>(
         .definition
         .and_then(|def| docstring_for_call_definition(db, def));
 
-    // Translate the argument index to parameter index using the mapping.
-    let active_parameter =
-        if details.argument_to_parameter_mapping.is_empty() && current_arg_index == 0 {
-            Some(0)
-        } else {
-            details
-                .argument_to_displayed_parameter_mapping
-                .get(current_arg_index)
-                .copied()
-                .flatten()
-                .or({
-                    // If we can't find a mapping for this argument, fall back to the argument
-                    // index when it still points at a displayed parameter. Otherwise, if the
-                    // last displayed parameter is variadic, keep it active for any later
-                    // positional or keyword arguments that would still bind there. The `- 1`
-                    // converts the parameter count to the zero-based index of that last entry.
-                    if current_arg_index < details.parameters.len() {
-                        Some(current_arg_index)
-                    } else if details.parameters.last().is_some_and(|parameter| {
-                        parameter.is_variadic || parameter.is_keyword_variadic
-                    }) {
-                        Some(details.parameters.len() - 1)
-                    } else {
-                        None
-                    }
-                })
-        };
+    let active_parameter = details.active_parameter(current_arg_index);
 
     let parameters = create_parameters(details.parameters, documentation.as_ref());
-    let active_parameter = active_parameter.filter(|&index| index < parameters.len());
     SignatureDetails {
         label: details.label,
         documentation,
