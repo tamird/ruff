@@ -401,7 +401,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             &TRUTHINESS_TEST_OF_NONE_UNION,
         ];
 
-        !self.in_string_annotation()
+        !self.in_detached_annotation()
             && self.db().should_check_file(self.file())
             && !self.file().is_stub(self.db())
             && RELEVANT_RULES

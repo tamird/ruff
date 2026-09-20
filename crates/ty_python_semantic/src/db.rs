@@ -87,6 +87,12 @@ pub(crate) mod tests {
             db: &TestDb,
             file: ProgramFile<'_>,
         ) -> Vec<ty_python_core::definition::ProvidedStatement>;
+        fn annotation(
+            &self,
+            db: &TestDb,
+            file: ProgramFile<'_>,
+            owner: ruff_python_ast::NodeIndex,
+        ) -> Option<ruff_text_size::TextRange>;
         fn binding<'db>(
             &self,
             db: &'db TestDb,
@@ -211,6 +217,16 @@ pub(crate) mod tests {
             self.source_provider
                 .as_ref()
                 .map_or_else(Vec::new, |provider| provider.statements(self, file))
+        }
+
+        fn provided_annotation(
+            &self,
+            file: ProgramFile<'_>,
+            owner: ruff_python_ast::NodeIndex,
+        ) -> Option<ruff_text_size::TextRange> {
+            self.source_provider
+                .as_ref()
+                .and_then(|provider| provider.annotation(self, file, owner))
         }
 
         fn should_check_file(&self, file: File) -> bool {

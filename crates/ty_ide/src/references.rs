@@ -1022,10 +1022,8 @@ impl<'a> LocalReferencesFinder<'a> {
             return false;
         };
 
-        let file = local_definition.file(db);
         let module = ruff_db::parsed::parsed_module(db, local_definition.python_file(db)).load(db);
-        let kind = local_definition.kind(db);
-        let category = kind.category(file.is_stub(db), &module);
+        let category = local_definition.category(db, &module);
 
         if category.is_declaration() {
             return true;

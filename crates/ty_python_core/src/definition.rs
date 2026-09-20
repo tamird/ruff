@@ -6,7 +6,7 @@ use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::find_node::covering_node;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::traversal::suite;
-use ruff_python_ast::{self as ast, AnyNodeRef, Expr, NodeIndex};
+use ruff_python_ast::{self as ast, AnyNodeRef, Expr, HasNodeIndex, NodeIndex};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use smallvec::SmallVec;
 
@@ -62,6 +62,31 @@ pub struct Definition<'db> {
 impl get_size2::GetSize for Definition<'_> {}
 
 impl<'db> Definition<'db> {
+    /// Returns whether this definition binds a value, declares a type, or does both.
+    pub fn category(self, db: &'db dyn Db, module: &ParsedModuleRef) -> DefinitionCategory {
+        let kind = self.kind(db);
+        if let DefinitionKind::Parameter(parameter) = kind {
+            let owner = match parameter {
+                ParameterDefinitionNodeKind::Parameter(parameter) => {
+                    &parameter.node(module).parameter
+                }
+                ParameterDefinitionNodeKind::VariadicPositionalParameter(parameter) => {
+                    parameter.node(module)
+                }
+                ParameterDefinitionNodeKind::VariadicKeywordParameter(parameter) => {
+                    parameter.node(module)
+                }
+            };
+            if db
+                .provided_annotation(self.program_file(db), owner.node_index().load())
+                .is_some()
+            {
+                return DefinitionCategory::DeclarationAndBinding;
+            }
+        }
+        kind.category(self.file(db).is_stub(db), module)
+    }
+
     pub(crate) fn new(
         db: &'db dyn Db,
         scope_id: ScopeId<'db>,
@@ -1134,7 +1159,7 @@ impl<'db> DefinitionKind<'db> {
         }
     }
 
-    pub fn category(&self, in_stub: bool, module: &ParsedModuleRef) -> DefinitionCategory {
+    fn category(&self, in_stub: bool, module: &ParsedModuleRef) -> DefinitionCategory {
         match self {
             // Functions and classes always bind, and we consider them declarations.
             DefinitionKind::Function(_)

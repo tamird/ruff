@@ -8,7 +8,7 @@ use crate::{
     },
 };
 use ruff_python_ast as ast;
-use ruff_text_size::Ranged;
+use ruff_text_size::{Ranged, TextRange};
 use ty_python_core::SemanticIndex;
 
 /// Validate the usage of `ParamSpec` components (`P.args` and `P.kwargs`) across all
@@ -23,15 +23,14 @@ pub(super) fn validate_paramspec_components<'db>(
     context: &'db InferContext<'db, '_>,
     index: &SemanticIndex<'db>,
     parameters: &ast::Parameters,
-    infer_type: impl Fn(&ast::Expr) -> Type<'db>,
+    infer_annotation: impl Fn(&ast::Parameter) -> Option<(Type<'db>, TextRange)>,
 ) {
     let db = context.db();
     let env = context.program_environment();
 
     // Extract ParamSpec info from *args annotation
     let args_paramspec = parameters.vararg.as_deref().and_then(|vararg| {
-        let annotation = vararg.annotation()?;
-        let ty = infer_type(annotation);
+        let (ty, annotation) = infer_annotation(vararg)?;
         if let Type::TypeVar(typevar) = ty
             && typevar.is_paramspec(db)
             && typevar.paramspec_attr(db) == Some(ParamSpecAttrKind::Args)
@@ -44,8 +43,7 @@ pub(super) fn validate_paramspec_components<'db>(
 
     // Extract ParamSpec info from **kwargs annotation
     let kwargs_paramspec = parameters.kwarg.as_deref().and_then(|kwarg| {
-        let annotation = kwarg.annotation()?;
-        let ty = infer_type(annotation);
+        let (ty, annotation) = infer_annotation(kwarg)?;
         if let Type::TypeVar(typevar) = ty
             && typevar.is_paramspec(db)
             && typevar.paramspec_attr(db) == Some(ParamSpecAttrKind::Kwargs)
@@ -76,8 +74,8 @@ pub(super) fn validate_paramspec_components<'db>(
             } else {
                 let paramspec_is_bound_by_parameter = parameters
                     .iter()
-                    .filter_map(ast::AnyParameterRef::annotation)
-                    .map(&infer_type)
+                    .filter_map(|parameter| infer_annotation(parameter.as_parameter()))
+                    .map(|(ty, _range)| ty)
                     .filter(|ty| {
                         !matches!(
                             ty,
@@ -140,9 +138,8 @@ pub(super) fn validate_paramspec_components<'db>(
             let kwarg = kwarg_name.unwrap_or("kwargs");
             // Report on the kwarg annotation if it exists, otherwise on *args
             let range = if let Some(kwarg_param) = parameters.kwarg.as_deref() {
-                kwarg_param
-                    .annotation()
-                    .map(Ranged::range)
+                infer_annotation(kwarg_param)
+                    .map(|(_ty, range)| range)
                     .unwrap_or_else(|| kwarg_param.range())
             } else {
                 args_annotation.range()
@@ -161,9 +158,8 @@ pub(super) fn validate_paramspec_components<'db>(
             let kwarg = kwarg_name.unwrap_or("kwargs");
             // Report on the vararg annotation if it exists, otherwise on **kwargs
             let range = if let Some(vararg_param) = parameters.vararg.as_deref() {
-                vararg_param
-                    .annotation()
-                    .map(Ranged::range)
+                infer_annotation(vararg_param)
+                    .map(|(_ty, range)| range)
                     .unwrap_or_else(|| vararg_param.range())
             } else {
                 kwargs_annotation.range()

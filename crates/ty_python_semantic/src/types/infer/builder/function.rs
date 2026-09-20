@@ -32,10 +32,7 @@ use crate::{
         generics::{enclosing_generic_contexts, typing_self},
         infer::{
             InferenceFlags, TypeExpressionFlags, TypeInferenceBuilder,
-            builder::{
-                DeclaredAndInferredType, DeferredExpressionState, TypeAndRange,
-                validate_paramspec_components,
-            },
+            builder::{DeclaredAndInferredType, TypeAndRange, validate_paramspec_components},
             function_known_decorator_flags, function_known_decorators, infer_deferred_types,
             infer_function_default_types, infer_statement_types, nearest_enclosing_function,
             original_class_type,
@@ -43,7 +40,7 @@ use crate::{
         infer_definition_types,
         list_members::all_members,
         relation::TypeRelation,
-        signatures::{ReturnCallableTypeVarScope, function_signature_expression_type},
+        signatures::ReturnCallableTypeVarScope,
         tuple::{TupleSpec, TupleSpecBuilder, TupleType},
         typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation,
         typevar::TypeVarSet,
@@ -64,8 +61,10 @@ use ty_python_core::{
     scope::NodeWithScopeRef,
 };
 
-use ruff_python_ast::{self as ast, find_node::covering_node};
+use crate::types::string_annotation::SourceAnnotation;
+use ruff_python_ast::{self as ast, HasNodeIndex, find_node::covering_node};
 use ruff_text_size::Ranged;
+use ty_python_core::ProgramFile;
 
 fn parameters_have_defaults(parameters: &ast::Parameters) -> bool {
     parameters
@@ -73,13 +72,22 @@ fn parameters_have_defaults(parameters: &ast::Parameters) -> bool {
         .any(|param| param.default.is_some())
 }
 
-fn function_has_deferred_annotations(function: &ast::StmtFunctionDef) -> bool {
+fn function_has_deferred_annotations(
+    db: &dyn Db,
+    file: ProgramFile<'_>,
+    function: &ast::StmtFunctionDef,
+) -> bool {
     function.type_params.is_none()
         && (function.returns.is_some()
-            || function
-                .parameters
-                .iter()
-                .any(|param| param.annotation().is_some()))
+            || db
+                .provided_annotation(file, function.node_index().load())
+                .is_some()
+            || function.parameters.iter().any(|param| {
+                param.annotation().is_some()
+                    || db
+                        .provided_annotation(file, param.as_parameter().node_index().load())
+                        .is_some()
+            }))
 }
 
 /// Whether a non-static method receives an instance or the class itself.
@@ -234,14 +242,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.infer_definition(parameter);
         }
 
-        validate_paramspec_components(&self.context, self.index, &function.parameters, |expr| {
-            self.file_expression_type(expr)
-        });
+        validate_paramspec_components(
+            &self.context,
+            self.index,
+            &function.parameters,
+            |parameter| {
+                self.parameter_annotation_type(parameter)
+                    .map(|(annotation, ty, _flags)| (ty, annotation.range()))
+            },
+        );
         self.validate_unpacked_typed_dict_kwargs(&function.parameters);
 
         self.infer_scope_body(&function.body);
 
-        if let Some(returns) = function.returns.as_deref() {
+        if let Some(returns) = SourceAnnotation::new(
+            db,
+            self.program_file(),
+            function,
+            function.returns.as_deref(),
+        ) {
             let has_empty_body = self.return_types_and_ranges.is_empty()
                 && function_body_kind(db, env, function, |expr| self.expression_type(expr))
                     == FunctionBodyKind::Stub;
@@ -549,7 +568,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // requires getting the signature of this function definition, which in turn requires
         // (lazily) inferring the parameter and return types.) If defaults exist, we also defer so
         // they can be inferred once with type context in the enclosing scope.
-        if function_has_deferred_annotations(function) || parameters_have_defaults(parameters) {
+        if function_has_deferred_annotations(db, self.program_file(), function)
+            || parameters_have_defaults(parameters)
+        {
             self.deferred.insert(definition);
         }
 
@@ -573,7 +594,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             function_decorators,
             None,
             dataclass_transformer_params,
-            function.returns.is_some(),
+            function.returns.is_some()
+                || db
+                    .provided_annotation(self.program_file(), function.node_index().load())
+                    .is_some(),
         );
         let function_literal = FunctionLiteral::new(db, overload_literal);
         let function_type = FunctionType::new(db, function_literal, None);
@@ -790,7 +814,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         function: &ast::StmtFunctionDef,
     ) {
         let db = self.db();
-        if function_has_deferred_annotations(function) {
+        if function_has_deferred_annotations(db, self.program_file(), function) {
             self.extend_definition(definition, infer_deferred_types(db, definition));
         }
         if parameters_have_defaults(&function.parameters) {
@@ -804,7 +828,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         function: &ast::StmtFunctionDef,
     ) {
         // PEP 695 annotations are inferred in the function's type-parameter scope.
-        if !function_has_deferred_annotations(function) {
+        if !function_has_deferred_annotations(self.db(), self.program_file(), function) {
             return;
         }
 
@@ -836,9 +860,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let Some(default) = param_with_default.default() else {
                 continue;
             };
-            let annotation = param_with_default
-                .annotation()
-                .map(|annotation| function_signature_expression_type(db, definition, annotation));
+            let annotation = SourceAnnotation::new(
+                db,
+                self.program_file(),
+                &param_with_default.parameter,
+                param_with_default.annotation(),
+            )
+            .map(|annotation| annotation.inferred_type(db, definition));
             self.infer_expression(default, TypeContext::new(annotation));
         }
 
@@ -861,13 +889,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
-    fn infer_return_type_annotation(&mut self, returns: Option<&ast::Expr>) {
-        if let Some(returns) = returns {
+    fn infer_return_type_annotation(&mut self, function: &ast::StmtFunctionDef) {
+        if let Some(returns) = SourceAnnotation::new(
+            self.db(),
+            self.program_file(),
+            function,
+            function.returns.as_deref(),
+        ) {
             self.context.inference_flags |= InferenceFlags::IN_RETURN_TYPE;
-            self.infer_type_expression_with_state(
-                returns,
-                DeferredExpressionState::from(self.defer_annotations()),
-            );
+            self.infer_function_annotation(&returns);
             self.context
                 .inference_flags
                 .remove(InferenceFlags::IN_RETURN_TYPE);
@@ -900,7 +930,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             receiver_is_incompatible == Some(true),
         );
 
-        self.infer_return_type_annotation(function.returns.as_deref());
+        self.infer_return_type_annotation(function);
         if let Some(type_params) = function.type_params.as_deref() {
             self.infer_type_parameters(type_params);
         }
@@ -926,7 +956,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .posonlyargs
             .first()
             .or_else(|| function.parameters.args.first())?;
-        let annotation = receiver.parameter.annotation.as_deref()?;
+        let annotation = SourceAnnotation::new(
+            self.db(),
+            self.program_file(),
+            &receiver.parameter,
+            receiver.parameter.annotation.as_deref(),
+        )?;
         let receiver_kind = MethodReceiverKind::from_function(self.db(), definition, function)?;
 
         let previously_in_parameter_annotation = self
@@ -937,10 +972,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             InferenceFlags::IN_INIT_RECEIVER_ANNOTATION,
             function.name.id == "__init__" && receiver_kind == MethodReceiverKind::Instance,
         );
-        let annotation_type = self.infer_type_expression_with_state(
-            annotation,
-            DeferredExpressionState::from(self.defer_annotations()),
-        );
+        let annotation_type = self.infer_function_annotation(&annotation);
         self.context.inference_flags.set(
             InferenceFlags::IN_PARAMETER_ANNOTATION,
             previously_in_parameter_annotation,
@@ -1001,22 +1033,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let Some(kwargs) = parameters.kwarg.as_ref() else {
             return;
         };
-        let Some(annotation) = kwargs.annotation.as_deref() else {
+        let Some((annotation, annotated_type, annotation_flags)) =
+            self.parameter_annotation_type(kwargs)
+        else {
             return;
         };
-        let annotation_flags = self.file_type_expression_flags(annotation);
         if !annotation_flags.contains(TypeExpressionFlags::UNPACK) {
             return;
         }
 
-        let annotated_type = self.file_expression_type(annotation);
         let Some(unpacked_keys) = extract_unpacked_typed_dict_keys_from_kwargs_annotation(
             db,
             annotated_type,
             annotation_flags,
         ) else {
             if !annotated_type.is_unknown()
-                && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                && let Some(builder) = self
+                    .context
+                    .report_lint(&INVALID_TYPE_FORM, annotation.range())
             {
                 let diag = builder.into_diagnostic(format_args!(
                     "Unpacked value for `**kwargs` must be a TypedDict, not `{}`",
@@ -1085,28 +1119,42 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             default: _,
         } = parameter_with_default;
 
-        if let Some(annotation) = parameter.annotation.as_deref() {
-            self.infer_type_expression_with_state(
-                annotation,
-                DeferredExpressionState::from(self.defer_annotations()),
-            );
-        }
+        self.infer_parameter(parameter);
     }
 
     fn infer_parameter(&mut self, parameter: &ast::Parameter) {
-        let ast::Parameter {
-            range: _,
-            node_index: _,
-            name: _,
-            annotation,
-        } = parameter;
-
-        if let Some(annotation) = annotation.as_deref() {
-            self.infer_type_expression_with_state(
-                annotation,
-                DeferredExpressionState::from(self.defer_annotations()),
-            );
+        if let Some(annotation) = SourceAnnotation::new(
+            self.db(),
+            self.program_file(),
+            parameter,
+            parameter.annotation(),
+        ) {
+            self.infer_function_annotation(&annotation);
         }
+    }
+
+    fn infer_function_annotation(&mut self, annotation: &SourceAnnotation<'_>) -> Type<'db> {
+        let Some((expression, state)) = self.annotation_expression(annotation) else {
+            return Type::unknown();
+        };
+        self.infer_type_expression_with_state(expression, state)
+    }
+
+    fn parameter_annotation_type<'a>(
+        &self,
+        parameter: &'a ast::Parameter,
+    ) -> Option<(SourceAnnotation<'a>, Type<'db>, TypeExpressionFlags)> {
+        let annotation = SourceAnnotation::new(
+            self.db(),
+            self.program_file(),
+            parameter,
+            parameter.annotation(),
+        )?;
+        let definition = self
+            .index
+            .expect_single_definition(self.current_function_definition()?);
+        let (ty, flags) = annotation.inferred(self.db(), definition);
+        Some((annotation, ty, flags))
     }
 
     /// Set initial declared type (if annotated) and inferred type for a function-parameter symbol,
@@ -1144,9 +1192,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let db = self.db();
 
         let default_expr = default.as_ref();
-        if let Some(annotation) = parameter.annotation.as_ref() {
-            let declared_ty = self.file_expression_type(annotation);
-
+        if let Some((annotation, declared_ty, _flags)) = self.parameter_annotation_type(parameter) {
             // P.args and P.kwargs are only valid as annotations on *args and **kwargs,
             // not on regular parameters.
             if let Type::TypeVar(typevar) = declared_ty
@@ -1160,7 +1206,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 };
                 if let Some(builder) = self
                     .context
-                    .report_lint(&INVALID_PARAMSPEC, annotation.as_ref())
+                    .report_lint(&INVALID_PARAMSPEC, annotation.range())
                 {
                     builder.into_diagnostic(format_args!(
                         "`{name}.{attr_name}` is only valid for annotating `{variadic}`",
@@ -1235,11 +1281,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) {
         let db = self.db();
 
-        if let Some(annotation) = parameter.annotation() {
-            let annotated_type = self.file_expression_type(annotation);
-            let has_unpacked_annotation = self
-                .file_type_expression_flags(annotation)
-                .contains(TypeExpressionFlags::UNPACK);
+        if let Some((annotation, annotated_type, flags)) = self.parameter_annotation_type(parameter)
+        {
+            let has_unpacked_annotation = flags.contains(TypeExpressionFlags::UNPACK);
             let ty = match annotated_type {
                 Type::TypeVar(typevar)
                     if has_unpacked_annotation && typevar.is_typevartuple(db) =>
@@ -1262,8 +1306,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         Some(ParamSpecAttrKind::Kwargs) => {
                             // TODO: Should this diagnostic be raised as part of
                             // `ArgumentTypeChecker`?
-                            if let Some(builder) =
-                                self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                            if let Some(builder) = self
+                                .context
+                                .report_lint(&INVALID_TYPE_FORM, annotation.range())
                             {
                                 let name = typevar.name(db);
                                 let mut diag = builder.into_diagnostic(format_args!(
@@ -1369,8 +1414,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let env = self.program_environment();
         let db = self.db();
 
-        if let Some(annotation) = parameter.annotation() {
-            let annotated_type = self.file_expression_type(annotation);
+        if let Some((annotation, annotated_type, flags)) = self.parameter_annotation_type(parameter)
+        {
             let ty = if let Type::TypeVar(typevar) = annotated_type
                 && typevar.is_paramspec(db)
             {
@@ -1378,8 +1423,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // `**kwargs: P.args`
                     Some(ParamSpecAttrKind::Args) => {
                         // TODO: Should this diagnostic be raised as part of `ArgumentTypeChecker`?
-                        if let Some(builder) =
-                            self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                        if let Some(builder) = self
+                            .context
+                            .report_lint(&INVALID_TYPE_FORM, annotation.range())
                         {
                             let name = typevar.name(db);
                             let mut diag = builder.into_diagnostic(format_args!(
@@ -1413,7 +1459,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             } else if extract_unpacked_typed_dict_keys_from_kwargs_annotation(
                 db,
                 annotated_type,
-                self.file_type_expression_flags(annotation),
+                flags,
             )
             .is_some()
             {

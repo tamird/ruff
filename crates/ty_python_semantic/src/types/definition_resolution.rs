@@ -71,9 +71,8 @@ impl<'db> ResolvedDefinition<'db> {
     pub(crate) fn category(&self, db: &dyn Db) -> DefinitionCategory {
         match self {
             ResolvedDefinition::Definition(definition) => {
-                let file = definition.file(db);
                 let parsed = parsed_module(db, definition.python_file(db)).load(db);
-                definition.kind(db).category(file.is_stub(db), &parsed)
+                definition.category(db, &parsed)
             }
             ResolvedDefinition::Module(_) | ResolvedDefinition::FileWithRange(_) => {
                 DefinitionCategory::DeclarationAndBinding
