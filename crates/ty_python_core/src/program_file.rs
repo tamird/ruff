@@ -68,6 +68,19 @@ impl get_size2::GetSize for ProgramFile<'_> {}
 impl<'db> ProgramFile<'db> {
     pub fn new(db: &'db dyn Db, file: File, program: Program<'db>) -> Self {
         let python_file = PythonFile::new(db, file, program.python_version(db));
+        Self::from_python_file(db, python_file, program)
+    }
+
+    /// Interprets an explicitly selected parse in a semantic environment.
+    ///
+    /// Embedders that choose a grammar independently of the filename must pass the same parser
+    /// key here and when obtaining AST nodes for semantic queries.
+    pub fn from_python_file(
+        db: &'db dyn Db,
+        python_file: PythonFile<'db>,
+        program: Program<'db>,
+    ) -> Self {
+        assert_eq!(python_file.python_version(db), program.python_version(db));
         Self::new_internal(db, python_file, program)
     }
 
