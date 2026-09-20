@@ -31,6 +31,18 @@ pub trait Db: PythonCoreDb {
         None
     }
 
+    /// Supplies the initial body type of an unannotated ordinary parameter.
+    ///
+    /// This does not change the function's public signature or declare a type for later
+    /// assignments. Source annotations, defaults, and implicit method receivers take precedence.
+    /// Implementations must read tracked inputs and must not infer this parameter's body scope.
+    fn provided_parameter_type<'db>(
+        &'db self,
+        _definition: Definition<'db>,
+    ) -> Option<crate::types::Type<'db>> {
+        None
+    }
+
     /// Refines the result of an application-defined factory after ordinary argument checking.
     ///
     /// The declaration, bound arguments, and inferred child types come from this inference pass.
@@ -120,6 +132,14 @@ pub(crate) mod tests {
             name: &str,
             usage: BuiltinUsage,
         ) -> Option<ProvidedBindingValue<'db>>;
+
+        fn parameter_type<'db>(
+            &self,
+            _db: &'db TestDb,
+            _definition: Definition<'db>,
+        ) -> Option<crate::types::Type<'db>> {
+            None
+        }
     }
 
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
@@ -286,6 +306,15 @@ pub(crate) mod tests {
         ) -> Option<crate::types::Type<'db>> {
             self.call_result_provider
                 .and_then(|provider| provider(self, call))
+        }
+
+        fn provided_parameter_type<'db>(
+            &'db self,
+            definition: Definition<'db>,
+        ) -> Option<crate::types::Type<'db>> {
+            self.source_provider
+                .as_ref()
+                .and_then(|provider| provider.parameter_type(self, definition))
         }
 
         fn check_file(&self, file: File) -> Vec<Diagnostic> {
