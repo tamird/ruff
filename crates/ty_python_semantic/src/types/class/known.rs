@@ -2,8 +2,8 @@ use crate::{
     Db, Program, ProgramEnvironment,
     place::{DefinedPlace, Definedness, Place, known_module_symbol},
     types::{
-        Binding, ClassLiteral, ClassType, GenericContext, KnownInstanceType, StaticClassLiteral,
-        SubclassOfType, Type, binding_type,
+        CheckedCall, ClassLiteral, ClassType, GenericContext, KnownInstanceType,
+        StaticClassLiteral, SubclassOfType, Type, binding_type,
         bound_super::{BoundSuperError, BoundSuperType},
         class::CodeGeneratorKind,
         constraints::{ConstraintSet, ConstraintSetBuilder},
@@ -13,7 +13,6 @@ use crate::{
         known_instance::DeprecatedInstance,
     },
 };
-use ruff_python_ast as ast;
 use ruff_python_ast::PythonVersion;
 use rustc_hash::FxHashSet;
 use std::{
@@ -2005,10 +2004,10 @@ impl KnownClass {
         self,
         context: &InferContext<'db, '_>,
         index: &SemanticIndex<'db>,
-        overload: &mut Binding<'db>,
-        call_expression: &ast::ExprCall,
+        call: &mut CheckedCall<'_, 'db>,
     ) {
         let db = context.db();
+        let call_expression = call.call();
         let scope = context.scope();
         let module = context.module();
 
@@ -2018,14 +2017,14 @@ impl KnownClass {
                 // In this case, we need to infer the two arguments:
                 //   1. The nearest enclosing class
                 //   2. The first parameter of the current function (typically `self` or `cls`)
-                match overload.parameter_types() {
+                match call.parameter_types() {
                     [] => {
                         let Some(enclosing_class) =
                             nearest_enclosing_class(context.db(), index, scope)
                         else {
                             BoundSuperError::UnavailableImplicitArguments
                                 .report_diagnostic(context, call_expression.into());
-                            overload.set_return_type(Type::unknown());
+                            call.set_return_type(Type::unknown());
                             return;
                         };
 
@@ -2041,7 +2040,7 @@ impl KnownClass {
                                     enclosing_class.name(db)
                                 ));
                             }
-                            overload.set_return_type(Type::unknown());
+                            call.set_return_type(Type::unknown());
                             return;
                         }
 
@@ -2064,7 +2063,7 @@ impl KnownClass {
                         let Some(first_param) = first_param else {
                             BoundSuperError::UnavailableImplicitArguments
                                 .report_diagnostic(context, call_expression.into());
-                            overload.set_return_type(Type::unknown());
+                            call.set_return_type(Type::unknown());
                             return;
                         };
 
@@ -2082,7 +2081,7 @@ impl KnownClass {
                             Type::unknown()
                         });
 
-                        overload.set_return_type(bound_super);
+                        call.set_return_type(bound_super);
                     }
                     [Some(pivot_class_type), Some(owner_type)] => {
                         // Check if the enclosing class is a `NamedTuple`, which forbids the use of `super()`.
@@ -2100,7 +2099,7 @@ impl KnownClass {
                                         enclosing_class.name(db)
                                     ));
                                 }
-                                overload.set_return_type(Type::unknown());
+                                call.set_return_type(Type::unknown());
                                 return;
                             }
                         }
@@ -2115,7 +2114,7 @@ impl KnownClass {
                             err.report_diagnostic(context, call_expression.into());
                             Type::unknown()
                         });
-                        overload.set_return_type(bound_super);
+                        call.set_return_type(bound_super);
                     }
                     _ => {}
                 }
@@ -2138,12 +2137,12 @@ impl KnownClass {
                 // is included in `Type::bindings`.
                 //
                 // See: <https://typing.python.org/en/latest/spec/directives.html#deprecated>
-                let [Some(message), ..] = overload.parameter_types() else {
+                let [Some(message), ..] = call.parameter_types() else {
                     // Checking in Type::bindings will complain about this for us
                     return;
                 };
 
-                overload.set_return_type(Type::KnownInstance(KnownInstanceType::Deprecated(
+                call.set_return_type(Type::KnownInstance(KnownInstanceType::Deprecated(
                     DeprecatedInstance {
                         message: message.as_string_literal(),
                     },

@@ -9707,26 +9707,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         for binding in bindings.iter_flat_mut() {
             let binding_type = binding.callable_type;
+            let bound_receiver = binding.bound_type.is_some();
             for (_, overload) in binding.matching_overloads_mut() {
+                let mut call = crate::types::CheckedCall {
+                    binding: overload,
+                    arguments: &call_arguments,
+                    bound_receiver,
+                    call: call_expression,
+                };
                 match binding_type {
                     Type::FunctionLiteral(function_literal) => {
                         if let Some(known_function) = function_literal.known(self.db()) {
-                            known_function.check_call(
-                                self,
-                                overload,
-                                &call_arguments,
-                                call_expression,
-                            );
+                            known_function.check_call(self, &mut call);
                         }
                     }
                     Type::ClassLiteral(class) => {
                         if let Some(known_class) = class.known(self.db()) {
-                            known_class.check_call(
-                                &self.context,
-                                self.index,
-                                overload,
-                                call_expression,
-                            );
+                            known_class.check_call(&self.context, self.index, &mut call);
                         }
                     }
                     Type::Never => {

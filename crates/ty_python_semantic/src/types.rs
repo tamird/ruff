@@ -135,6 +135,7 @@ mod attribute_write;
 mod bool;
 mod bound_super;
 mod call;
+pub(crate) use call::CheckedCall;
 mod callable;
 mod class;
 mod class_base;

@@ -2,7 +2,7 @@ use crate::{
     Db, DisplaySettings, FxIndexMap, ProgramEnvironment,
     reachability::ReachabilityConstraintsExtension,
     types::{
-        Binding, CallArguments, CallableType, ClassBase, ClassLiteral, ClassType, DynamicType,
+        CheckedCall, CallableType, ClassBase, ClassLiteral, ClassType, DynamicType,
         IntersectionBuilder, KnownClass, KnownInstanceType, ParamSpecAttrKind, SpecialFormType,
         SubclassOfInner, SubclassOfType, Type, TypeContext, TypeVarBoundOrConstraints, TypeVarKind,
         UnionBuilder, UnionType,
@@ -1600,26 +1600,23 @@ impl KnownFunction {
     pub(super) fn check_call<'db>(
         self,
         builder: &TypeInferenceBuilder<'db, '_>,
-        overload: &mut Binding<'db>,
-        call_arguments: &CallArguments<'_, 'db>,
-        call_expression: &ast::ExprCall,
+        call: &mut CheckedCall<'_, 'db>,
     ) {
         let db = builder.db();
-        let parameter_types = overload.parameter_types();
+        let call_expression = call.call();
+        let parameter_types = call.parameter_types();
 
         match self {
             KnownFunction::RevealType => {
                 let env = builder.program_environment();
-                let revealed_type = overload
-                    .arguments_for_parameter(call_arguments, 0)
-                    .fold(UnionBuilder::new(db, env), |builder, (_, ty)| {
-                        builder.add(ty)
-                    })
+                let revealed_type = call
+                    .arguments_for_parameter(0)
+                    .fold(UnionBuilder::new(db, env), UnionBuilder::add)
                     .build();
                 report_revealed_type(
                     &builder.context,
                     revealed_type,
-                    call_argument_node(call_expression, "obj", 0)
+                    call.argument_node(0)
                         .unwrap_or_else(|| ast::AnyNodeRef::from(call_expression)),
                 );
             }
@@ -1633,7 +1630,7 @@ impl KnownFunction {
                 };
                 let env = builder.program_environment();
                 let ty_members = all_members(db, env, *ty);
-                overload.set_return_type(Type::bool_literal(
+                call.set_return_type(Type::bool_literal(
                     ty_members.iter().any(|m| m.name == member.value(db)),
                 ));
             }
@@ -1668,7 +1665,7 @@ impl KnownFunction {
                     diagnostic.annotate(
                         Annotation::secondary(
                             builder.context.span(
-                                call_argument_node(call_expression, "val", 0)
+                                call.argument_node(0)
                                     .unwrap_or_else(|| ast::AnyNodeRef::from(call_expression)),
                             ),
                         )
@@ -1717,7 +1714,7 @@ impl KnownFunction {
                     diagnostic.annotate(
                         Annotation::secondary(
                             builder.context.span(
-                                call_argument_node(call_expression, "arg", 0)
+                                call.argument_node(0)
                                     .unwrap_or_else(|| ast::AnyNodeRef::from(call_expression)),
                             ),
                         )
@@ -1748,7 +1745,7 @@ impl KnownFunction {
                     Err(err) => {
                         err.report_diagnostic(
                             &builder.context,
-                            call_argument_node(call_expression, "condition", 0)
+                            call.argument_node(0)
                                 .unwrap_or_else(|| ast::AnyNodeRef::from(call_expression)),
                         );
 
@@ -1786,7 +1783,7 @@ impl KnownFunction {
                             parameter_ty = parameter_ty.display(db, env)
                         ))
                     };
-                    if let Some(condition) = call_argument_node(call_expression, "condition", 0) {
+                    if let Some(condition) = call.argument_node(0) {
                         diagnostic.annotate(
                             Annotation::secondary(builder.context.span(condition)).message(
                                 format_args!(
@@ -1823,7 +1820,7 @@ impl KnownFunction {
                                 "`{casted_display}` is equivalent to `{source_display}`",
                             ));
                         }
-                        if let Some(value) = call_expression.arguments.find_argument_value("val", 1)
+                        if let Some(value) = call.argument_expression(1)
                         {
                             let source = source_text(db, builder.file());
                             let covering = covering_node(
@@ -1853,9 +1850,7 @@ impl KnownFunction {
                     && source_type.is_disjoint_from(db, env, casted_type)
                     && !casted_type.is_equivalent_to(db, env, Type::Never)
                     && !source_type.is_equivalent_to(db, env, Type::Never)
-                    && call_expression
-                        .arguments
-                        .find_argument_value("val", 1)
+                    && call.argument_expression(1)
                         .is_none_or(|value_expr| {
                             builder
                                 .speculate_without_diagnostics()
@@ -1873,7 +1868,7 @@ impl KnownFunction {
                     diagnostic.set_concise_message(format_args!(
                         "Cast from `{source_display}` to disjoint type `{casted_display}`",
                     ));
-                    if let Some(arg) = call_expression.arguments.find_argument_value("typ", 0) {
+                    if let Some(arg) = call.argument_expression(0) {
                         diagnostic.annotate(
                             builder
                                 .context
@@ -1881,7 +1876,7 @@ impl KnownFunction {
                                 .message("Disjoint from the inferred type"),
                         );
                     }
-                    if let Some(arg) = call_expression.arguments.find_argument_value("val", 1) {
+                    if let Some(arg) = call.argument_expression(1) {
                         diagnostic.annotate(
                             builder
                                 .context
@@ -1988,7 +1983,7 @@ impl KnownFunction {
                 {
                     let mut diag = diagnostic.into_diagnostic("Revealed protocol interface");
                     let span = builder.context.span(
-                        call_argument_node(call_expression, "protocol", 0)
+                        call.argument_node(0)
                             .unwrap_or_else(|| ast::AnyNodeRef::from(call_expression)),
                     );
                     diag.annotate(Annotation::primary(span).message(format_args!(
@@ -2051,7 +2046,7 @@ impl KnownFunction {
                     let env = builder.program_environment();
                     let mut diag = diagnostic.into_diagnostic("Revealed MRO");
                     let span = builder.context.span(
-                        call_argument_node(call_expression, "cls", 0)
+                        call.argument_node(0)
                             .unwrap_or_else(|| ast::AnyNodeRef::from(call_expression)),
                     );
                     let mut message = String::new();
@@ -2106,7 +2101,7 @@ impl KnownFunction {
                     call_expression,
                     self,
                     *second_argument,
-                    call_expression.arguments.args.get(1),
+                    call.argument_expression(1),
                 );
 
                 if self == KnownFunction::IsInstance {
@@ -2137,7 +2132,7 @@ impl KnownFunction {
                         }
                         _ => Truthiness::Ambiguous,
                     };
-                    overload.set_return_type(Type::from_truthiness(db, env, truthiness));
+                    call.set_return_type(Type::from_truthiness(db, env, truthiness));
                 }
             }
 
@@ -2174,7 +2169,7 @@ impl KnownFunction {
                     return;
                 };
 
-                overload.set_return_type(Type::module_literal(db, builder.program_file(), module));
+                call.set_return_type(Type::module_literal(db, builder.program_file(), module));
             }
 
             KnownFunction::TotalOrdering => {
@@ -2202,20 +2197,6 @@ impl KnownFunction {
             _ => {}
         }
     }
-}
-
-fn call_argument_node<'a>(
-    call_expression: &'a ast::ExprCall,
-    name: &str,
-    position: usize,
-) -> Option<ast::AnyNodeRef<'a>> {
-    call_expression
-        .arguments
-        .find_argument(name, position)
-        .map(|argument| match argument {
-            ast::ArgOrKeyword::Arg(expr) => ast::AnyNodeRef::from(expr),
-            ast::ArgOrKeyword::Keyword(keyword) => ast::AnyNodeRef::from(keyword),
-        })
 }
 
 /// Check the second argument to `isinstance()` or `issubclass()` for types that cannot be used
