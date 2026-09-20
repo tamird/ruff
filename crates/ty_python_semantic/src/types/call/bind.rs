@@ -4495,6 +4495,14 @@ impl<'db> CallableBinding<'db> {
         self.overloads.as_slice()
     }
 
+    /// Returns the only signature, including its recovery binding after argument errors.
+    pub(crate) fn single_overload_mut(&mut self) -> Option<&mut Binding<'db>> {
+        match self.overloads.as_mut_slice() {
+            [overload] => Some(overload),
+            _ => None,
+        }
+    }
+
     /// Returns an iterator over all the overloads that matched for this call binding.
     pub(crate) fn matching_overloads(
         &self,

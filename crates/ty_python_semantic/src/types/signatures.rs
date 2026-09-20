@@ -821,7 +821,7 @@ impl<'db> PartialApplication<'db> {
 }
 
 impl<'db> Signature<'db> {
-    pub(crate) fn new(parameters: Parameters<'db>, return_ty: Type<'db>) -> Self {
+    pub fn new(parameters: Parameters<'db>, return_ty: Type<'db>) -> Self {
         Self {
             generic_context: None,
             definition: None,
@@ -1148,7 +1148,7 @@ impl<'db> Signature<'db> {
     }
 
     /// Return the parameters in this signature.
-    pub(crate) fn parameters(&self) -> &Parameters<'db> {
+    pub fn parameters(&self) -> &Parameters<'db> {
         &self.parameters
     }
 
@@ -2151,12 +2151,14 @@ impl<'db> Signature<'db> {
     }
 
     /// Create a new signature with the given parameters.
-    fn with_parameters(self, parameters: Parameters<'db>) -> Self {
+    #[must_use]
+    pub fn with_parameters(self, parameters: Parameters<'db>) -> Self {
         Self { parameters, ..self }
     }
 
     /// Create a new signature with the given return type.
-    pub(crate) fn with_return_type(self, return_ty: Type<'db>) -> Self {
+    #[must_use]
+    pub fn with_return_type(self, return_ty: Type<'db>) -> Self {
         Self { return_ty, ..self }
     }
 }
@@ -4607,7 +4609,7 @@ struct ParametersData<'db> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
-pub(crate) struct Parameters<'db> {
+pub struct Parameters<'db> {
     data: Arc<ParametersData<'db>>,
 }
 
@@ -4635,7 +4637,7 @@ impl<'db> Parameters<'db> {
     /// `ParamSpec`, or a `Concatenate` form. `**kwargs: Unpack[TypedDict]` is normalized here by
     /// synthesizing keyword-only parameters for the unpacked keys and a possible trailing
     /// `**kwargs` parameter for explicit extra items or an open `TypedDict`.
-    pub(crate) fn from_annotation(
+    pub fn from_annotation(
         db: &'db dyn Db,
         parameters: impl IntoIterator<Item = Parameter<'db>>,
     ) -> Self {
@@ -4775,7 +4777,7 @@ impl<'db> Parameters<'db> {
     }
 
     /// Create a standard parameter list without inferring its kind or normalizing annotations.
-    pub(crate) fn standard(parameters: impl IntoIterator<Item = Parameter<'db>>) -> Self {
+    pub fn standard(parameters: impl IntoIterator<Item = Parameter<'db>>) -> Self {
         Self::new(
             parameters.into_iter().collect::<Box<[_]>>(),
             ParametersKind::Standard,
@@ -5241,7 +5243,7 @@ impl<'db> Parameters<'db> {
         self.data.value.len()
     }
 
-    pub(crate) fn iter(&self) -> std::slice::Iter<'_, Parameter<'db>> {
+    pub fn iter(&self) -> std::slice::Iter<'_, Parameter<'db>> {
         self.data.value.iter()
     }
 
@@ -5548,7 +5550,7 @@ impl ParameterNamePrefix {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
-pub(crate) struct Parameter<'db> {
+pub struct Parameter<'db> {
     /// Annotated type of the parameter. If no annotation was provided, this is `Unknown`.
     annotated_type: Type<'db>,
 
@@ -5598,7 +5600,7 @@ enum ParameterAnnotationKind {
 }
 
 impl<'db> Parameter<'db> {
-    pub(crate) fn positional_only(name: Option<Name>) -> Self {
+    pub fn positional_only(name: Option<Name>) -> Self {
         Self {
             annotated_type: Type::unknown(),
             definition: None,
@@ -5612,7 +5614,7 @@ impl<'db> Parameter<'db> {
         }
     }
 
-    pub(crate) fn positional_or_keyword(name: Name) -> Self {
+    pub fn positional_or_keyword(name: Name) -> Self {
         Self {
             annotated_type: Type::unknown(),
             definition: None,
@@ -5626,7 +5628,7 @@ impl<'db> Parameter<'db> {
         }
     }
 
-    pub(crate) fn variadic(name: Name) -> Self {
+    pub fn variadic(name: Name) -> Self {
         Self {
             annotated_type: Type::unknown(),
             definition: None,
@@ -5637,7 +5639,7 @@ impl<'db> Parameter<'db> {
         }
     }
 
-    pub(crate) fn keyword_only(name: Name) -> Self {
+    pub fn keyword_only(name: Name) -> Self {
         Self {
             annotated_type: Type::unknown(),
             definition: None,
@@ -5651,7 +5653,7 @@ impl<'db> Parameter<'db> {
         }
     }
 
-    pub(crate) fn keyword_variadic(name: Name) -> Self {
+    pub fn keyword_variadic(name: Name) -> Self {
         Self {
             annotated_type: Type::unknown(),
             definition: None,
@@ -5664,7 +5666,8 @@ impl<'db> Parameter<'db> {
 
     /// Set the annotated type for this parameter. This also marks the annotation as explicit
     /// (not inferred), so it will be displayed.
-    pub(crate) fn with_annotated_type(mut self, annotated_type: Type<'db>) -> Self {
+    #[must_use]
+    pub fn with_annotated_type(mut self, annotated_type: Type<'db>) -> Self {
         self.annotated_type = annotated_type;
         self.inferred_annotation = false;
         self
@@ -5682,12 +5685,23 @@ impl<'db> Parameter<'db> {
         self
     }
 
-    pub(crate) fn with_default_type(mut self, default: Type<'db>) -> Self {
+    /// Sets a default on a positional or keyword-only parameter.
+    ///
+    /// # Panics
+    /// Panics for `*args` and `**kwargs`, which cannot have defaults.
+    #[must_use]
+    pub fn with_default_type(self, default: Type<'db>) -> Self {
+        self.with_default(ParameterDefault::Inferred(default))
+    }
+
+    /// Sets an inferred or source-backed default. Variadic parameters cannot have defaults.
+    #[must_use]
+    pub fn with_default(mut self, default: ParameterDefault<'db>) -> Self {
         match &mut self.kind {
             ParameterKind::PositionalOnly { default_type, .. }
             | ParameterKind::PositionalOrKeyword { default_type, .. }
             | ParameterKind::KeywordOnly { default_type, .. } => {
-                *default_type = Some(ParameterDefault::Inferred(default));
+                *default_type = Some(default);
             }
             ParameterKind::Variadic { .. } | ParameterKind::KeywordVariadic { .. } => {
                 panic!("cannot set default value for variadic parameter")
@@ -5806,7 +5820,10 @@ impl<'db> Parameter<'db> {
             ParameterKind::PositionalOnly { default_type, .. }
             | ParameterKind::PositionalOrKeyword { default_type, .. }
             | ParameterKind::KeywordOnly { default_type, .. } => {
-                if let Some(ParameterDefault::Inferred(ty)) = default_type {
+                if let Some(
+                    ParameterDefault::Inferred(ty) | ParameterDefault::Source { ty, source: _ },
+                ) = default_type
+                {
                     *ty = normalize_type(*ty)?;
                 }
             }
@@ -5991,7 +6008,7 @@ impl<'db> Parameter<'db> {
         self.default().is_some()
     }
 
-    fn default(&self) -> Option<ParameterDefault<'db>> {
+    pub(super) fn default(&self) -> Option<ParameterDefault<'db>> {
         match self.kind {
             ParameterKind::PositionalOnly { default_type, .. }
             | ParameterKind::PositionalOrKeyword { default_type, .. }
@@ -6034,6 +6051,12 @@ impl<'db> Parameter<'db> {
 pub enum ParameterDefault<'db> {
     /// An already inferred default.
     Inferred(Type<'db>),
+    /// An inferred default retaining its original expression for signature presentation.
+    Source {
+        ty: Type<'db>,
+        #[get_size(ignore)]
+        source: ruff_db::files::FileRange,
+    },
     /// A source parameter whose default is inferred on demand.
     Deferred(Definition<'db>),
 }
@@ -6042,6 +6065,7 @@ impl<'db> ParameterDefault<'db> {
     fn ty(self, db: &'db dyn Db) -> Type<'db> {
         match self {
             Self::Inferred(ty) => ty,
+            Self::Source { ty, source: _ } => ty,
             Self::Deferred(parameter) => parameter_default_type(db, parameter),
         }
     }
@@ -6049,6 +6073,7 @@ impl<'db> ParameterDefault<'db> {
     fn eager_type(self) -> Option<Type<'db>> {
         match self {
             Self::Inferred(ty) => Some(ty),
+            Self::Source { ty, source: _ } => Some(ty),
             Self::Deferred(_) => None,
         }
     }
@@ -6056,6 +6081,7 @@ impl<'db> ParameterDefault<'db> {
     fn map_type(self, f: impl FnOnce(Type<'db>) -> Type<'db>) -> Self {
         match self {
             Self::Inferred(ty) => Self::Inferred(f(ty)),
+            Self::Source { ty, source } => Self::Source { ty: f(ty), source },
             // A source default is a runtime value, not part of the callable's type parameters.
             // Specializing or otherwise transforming the signature must not evaluate it.
             Self::Deferred(_) => self,

@@ -114,7 +114,7 @@ impl<'db> Type<'db> {
         Type::tuple(TupleType::homogeneous(db, env, element))
     }
 
-    pub(crate) fn heterogeneous_tuple<I, T>(
+    pub fn heterogeneous_tuple<I, T>(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         elements: I,

@@ -60,7 +60,7 @@ pub(crate) use self::set_theoretic::builder::{
 };
 pub use self::set_theoretic::{IntersectionType, UnionType};
 use self::set_theoretic::{KnownUnion, RecursivelyDefined};
-pub(crate) use self::signatures::Signature;
+pub use self::signatures::Signature;
 pub use self::signatures::{ParameterDefault, ParameterKind};
 pub(crate) use self::subclass_of::{SubclassOfInner, SubclassOfType};
 pub(crate) use self::type_expansion::expand_type;
@@ -73,6 +73,7 @@ use crate::suppression::check_suppressions;
 use crate::types::bound_super::BoundSuperType;
 use crate::types::call::bind::ConstructorCallableKind;
 use crate::types::call::{Binding, Bindings, CallArguments, CallableBinding};
+pub use crate::types::callable::CallableTypeKind;
 pub(crate) use crate::types::callable::{CallableType, CallableTypes};
 pub(crate) use crate::types::class_base::ClassBase;
 use crate::types::constraints::ConstraintSetBuilder;
@@ -99,7 +100,7 @@ use crate::types::mro::{MroIterator, StaticMroError};
 pub(crate) use crate::types::narrow::{NarrowingConstraint, infer_narrowing_constraints};
 use crate::types::newtype::NewType;
 use crate::types::signatures::{ConcatenateTail, walk_signature};
-pub(crate) use crate::types::signatures::{Parameter, Parameters};
+pub use crate::types::signatures::{Parameter, Parameters};
 use crate::types::special_form::TypeQualifier;
 use crate::types::tuple::TupleSpec;
 pub use crate::types::type_alias::TypeAliasType;
@@ -135,7 +136,7 @@ mod attribute_write;
 mod bool;
 mod bound_super;
 mod call;
-pub(crate) use call::CheckedCall;
+pub use call::{CheckedArgument, CheckedCall};
 mod callable;
 mod class;
 mod class_base;
@@ -1226,11 +1227,9 @@ impl<'db> From<Place<'db>> for MemberLookupResult<'db> {
 /// This enum is used to control the behavior of the descriptor protocol implementation.
 /// When invoked on a class object, the fallback type (a class attribute) can shadow a
 /// non-data descriptor of the meta-type (the class's metaclass). However, this is not
-/// true for instances. When invoked on an instance, the fallback type (an attribute on
-/// the instance) cannot completely shadow a non-data descriptor of the meta-type (the
-/// class), because we do not currently attempt to statically infer if an instance
-/// attribute is definitely defined (i.e. to check whether a particular method has been
-/// called).
+/// generally true for inferred instance attributes: we do not statically establish whether
+/// a particular initializer has been called. Supplied instance storage carries separate
+/// evidence that its value is present, which also allows it to shadow non-data descriptors.
 #[derive(Clone, Debug, Copy, PartialEq)]
 enum InstanceFallbackShadowsNonDataDescriptor {
     Yes,
@@ -3066,6 +3065,11 @@ impl<'db> Type<'db> {
         }
     }
 
+    /// Returns the exact string value, if this is a string literal type.
+    pub fn string_literal_value(self, db: &'db dyn Db) -> Option<&'db str> {
+        self.as_string_literal().map(|literal| literal.value(db))
+    }
+
     fn is_int_literal(&self) -> bool {
         self.as_literal_value()
             .is_some_and(LiteralValueType::is_int)
@@ -3086,7 +3090,8 @@ impl<'db> Type<'db> {
         }
     }
 
-    const fn as_bool_literal(self) -> Option<bool> {
+    /// Returns the exact boolean value, if this is a boolean literal type.
+    pub const fn as_bool_literal(self) -> Option<bool> {
         match self {
             Type::LiteralValue(literal) => literal.as_bool(),
             _ => None,
@@ -3161,7 +3166,7 @@ impl<'db> Type<'db> {
     }
 
     /// Create a promotable integer literal.
-    pub(crate) fn int_literal(int: i64) -> Self {
+    pub fn int_literal(int: i64) -> Self {
         Self::LiteralValue(LiteralValueType::promotable(int))
     }
 
@@ -5440,7 +5445,15 @@ impl<'db> Type<'db> {
         let fallback_error = fallback.err().map(|error| error.kind(db));
         let fallback_member = fallback.unwrap_or_else(|error| error.fallback_member(db));
         let fallback_properties = fallback_member.deprecated_properties(db);
-        let fallback_member = fallback_member.member(db);
+        let mut fallback_member = fallback_member.member(db);
+        let guaranteed_storage = fallback_member
+            .qualifiers
+            .contains(TypeQualifiers::GUARANTEED_INSTANCE_STORAGE);
+        // This fact belongs to the instance fallback, not the resolved attribute. Consume it
+        // before descriptor results can be joined with attributes from other receiver types.
+        fallback_member
+            .qualifiers
+            .remove(TypeQualifiers::GUARANTEED_INSTANCE_STORAGE);
 
         // A slot stores the same instance attribute described by the receiver's declarations.
         // Unlike an arbitrary data descriptor, its inherited getter must not hide a more precise
@@ -5449,7 +5462,7 @@ impl<'db> Type<'db> {
             && matches!(meta_attr_ty, Some(Type::SlotDescriptor(_)))
             && !fallback_member.place.is_undefined()
         {
-            return fallback;
+            return member_lookup_result(db, fallback_member, fallback_error, fallback_properties);
         }
 
         let PlaceAndQualifiers {
@@ -5518,12 +5531,10 @@ impl<'db> Type<'db> {
 
             // `meta_attr` is *not* a data descriptor. This means that the `fallback` type has
             // now the highest priority. However, we only return the pure `fallback` type if the
-            // policy allows it. When invoked on class objects, the policy is set to `Yes`, which
-            // means that class-level attributes (the fallback) can shadow non-data descriptors
-            // on metaclasses. However, for instances, the policy is set to `No`, because we do
-            // allow instance-level attributes to shadow class-level non-data descriptors. This
-            // would require us to statically infer if an instance attribute is always set, which
-            // is something we currently don't attempt to do.
+            // policy allows it or the value is guaranteed to be stored on the instance. On class
+            // objects, class-level attributes shadow non-data descriptors on metaclasses.
+            // Ordinary instance declarations do not establish that a value is always stored,
+            // but explicitly supplied instance fields carry that guarantee.
             (
                 Place::Defined(_),
                 AttributeKind::NormalOrNonDataDescriptor,
@@ -5531,12 +5542,14 @@ impl<'db> Type<'db> {
                     definedness: Definedness::AlwaysDefined,
                     ..
                 }),
-            ) if policy == InstanceFallbackShadowsNonDataDescriptor::Yes => member_lookup_result(
-                db,
-                fallback.with_qualifiers(fallback_qualifiers),
-                fallback_error,
-                fallback_properties,
-            ),
+            ) if policy == InstanceFallbackShadowsNonDataDescriptor::Yes || guaranteed_storage => {
+                member_lookup_result(
+                    db,
+                    fallback.with_qualifiers(fallback_qualifiers),
+                    fallback_error,
+                    fallback_properties,
+                )
+            }
 
             // `meta_attr` is *not* a data descriptor. The `fallback` symbol is either possibly
             // unbound or the policy argument is `No`. In both cases, the `fallback` type does
@@ -8506,7 +8519,7 @@ impl<'db> Type<'db> {
     /// Use this only when an over-approximation is sound, such as constructor inference or a
     /// source-side relation. Target-side subtype checks must use [`Self::to_instance`].
     #[must_use]
-    fn to_instance_approximation(
+    pub fn to_instance_approximation(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -11211,7 +11224,7 @@ impl std::fmt::Display for DynamicType<'_> {
 bitflags! {
     /// Type qualifiers from annotations or synthesized member metadata.
     #[derive(Copy, Clone, Debug, Eq, PartialEq, Default, Hash)]
-    pub struct TypeQualifiers: u8 {
+    pub struct TypeQualifiers: u16 {
         /// `typing.ClassVar`
         const CLASS_VAR = 1 << 0;
         /// `typing.Final`
@@ -11232,6 +11245,10 @@ bitflags! {
         /// `__getattr__` function. We need this in order to implement precedence of submodules
         /// over module-level `__getattr__`, for compatibility with other type checkers.
         const FROM_MODULE_GETATTR = 1 << 7;
+        /// A synthesized field whose value is guaranteed to be stored on the instance.
+        /// Unlike a declaration alone, this storage shadows class defaults and non-data
+        /// descriptors. Data descriptors retain their usual precedence.
+        const GUARANTEED_INSTANCE_STORAGE = 1 << 8;
     }
 }
 
@@ -11264,8 +11281,9 @@ impl TypeQualifiers {
     /// Non-standard qualifiers are internal implementation details like
     /// `IMPLICIT_INSTANCE_ATTRIBUTE` and `FROM_MODULE_GETATTR`.
     pub fn is_non_standard(self) -> bool {
-        const NON_STANDARD: TypeQualifiers =
-            TypeQualifiers::IMPLICIT_INSTANCE_ATTRIBUTE.union(TypeQualifiers::FROM_MODULE_GETATTR);
+        const NON_STANDARD: TypeQualifiers = TypeQualifiers::IMPLICIT_INSTANCE_ATTRIBUTE
+            .union(TypeQualifiers::FROM_MODULE_GETATTR)
+            .union(TypeQualifiers::GUARANTEED_INSTANCE_STORAGE);
         self.intersects(NON_STANDARD)
     }
 }

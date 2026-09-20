@@ -1313,7 +1313,7 @@ impl KnownClass {
     /// If the class cannot be found, or if you provide a specialization with the wrong number of
     /// types, a debug-level log message will be emitted stating this.
     #[track_caller]
-    pub(crate) fn to_specialized_instance<'t, 'db, T>(
+    pub fn to_specialized_instance<'t, 'db, T>(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -1421,7 +1421,7 @@ impl KnownClass {
     /// class literal.
     ///
     /// If the class cannot be found, a debug-level log message will be emitted stating this.
-    pub(crate) fn to_class_literal<'db>(
+    pub fn to_class_literal<'db>(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,

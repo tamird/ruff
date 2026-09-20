@@ -9609,6 +9609,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             Ok(()) => bindings,
             Err(_) => {
                 bindings.report_diagnostics(&self.context, call_expression.into());
+                self.refine_provided_call_results(
+                    call_expression,
+                    &call_arguments,
+                    &mut bindings,
+                    true,
+                );
                 return bindings.return_type(db, env);
             }
         };
@@ -9631,6 +9637,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             pydantic::report_discarded_extra_arguments(&self.context, class, arguments, &bindings);
         }
 
+        let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
+        let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
+            scope: self.scope(),
+            offset: self.dynamic_class_scope_offset(call_expression),
+            explicit_bases,
+        };
         for binding in bindings.iter_flat_mut() {
             let binding_type = binding.callable_type;
             let bound_receiver = binding.bound_type.is_some();
@@ -9639,7 +9651,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     binding: overload,
                     arguments: &call_arguments,
                     bound_receiver,
+                    file: self.scope().program_file(db),
                     call: call_expression,
+                    expression_type: &expression_type,
+                    class_anchor: &class_anchor,
+                    has_binding_errors: false,
                 };
                 match binding_type {
                     Type::FunctionLiteral(function_literal) => {
@@ -9747,6 +9763,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let db = self.db();
+        self.refine_provided_call_results(call_expression, &call_arguments, &mut bindings, false);
         let return_ty = bindings.return_type(db, env);
         let return_ty = match collection_initializer_class {
             Some(collection_class @ (KnownClass::List | KnownClass::Set))
@@ -9765,6 +9782,41 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         typeguard::bind_type_guard_return_type(db, self.scope(), return_ty, &bindings, arguments)
+    }
+
+    /// Applications can refine factory results without replacing binding or argument inference.
+    fn refine_provided_call_results(
+        &self,
+        call: &ast::ExprCall,
+        arguments: &CallArguments<'_, 'db>,
+        bindings: &mut Bindings<'db>,
+        has_binding_errors: bool,
+    ) {
+        let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
+        let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
+            scope: self.scope(),
+            offset: self.dynamic_class_scope_offset(call),
+            explicit_bases,
+        };
+        for callable in bindings.iter_flat_mut() {
+            let bound_receiver = callable.bound_type.is_some();
+            let Some(binding) = callable.single_overload_mut() else {
+                continue;
+            };
+            let mut context = crate::types::CheckedCall {
+                binding,
+                arguments,
+                bound_receiver,
+                file: self.scope().program_file(self.db()),
+                call,
+                expression_type: &expression_type,
+                class_anchor: &class_anchor,
+                has_binding_errors,
+            };
+            if let Some(result) = self.db().provided_call_result(&context) {
+                context.set_return_type(result);
+            }
+        }
     }
 
     fn infer_starred_expression(

@@ -3,6 +3,7 @@ use ruff_db::{diagnostic::Span, parsed::parsed_module};
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::TextRange;
 
+use crate::provided::ProvidedInstanceFields;
 use crate::{
     Db, TypeQualifiers,
     place::{Place, PlaceAndQualifiers},
@@ -81,6 +82,10 @@ pub struct DynamicClassLiteral<'db> {
     /// or passed to `dataclass()` as a function.
     #[returns(copy)]
     pub dataclass_params: Option<DataclassParams<'db>>,
+
+    /// Storage supplied by a factory, separate from the descriptor-bearing class namespace.
+    #[returns(ref)]
+    pub(crate) instance_fields: Option<ProvidedInstanceFields<'db>>,
 }
 
 /// Anchor for identifying a dynamic class literal.
@@ -458,10 +463,31 @@ impl<'db> DynamicClassLiteral<'db> {
 
     /// Look up an instance member defined directly on this class (not inherited).
     ///
-    /// Namespace entries are class attributes, not values stored directly on instances.
-    #[expect(clippy::unused_self)]
-    pub(super) fn own_instance_member(self, _db: &'db dyn Db, _name: &str) -> Member<'db> {
-        Member::unbound()
+    /// Namespace entries are class attributes. Factory-supplied fields are immutable instance
+    /// storage, so a function stored in a field is returned without descriptor binding.
+    pub(super) fn own_instance_member(self, db: &'db dyn Db, name: &str) -> Member<'db> {
+        let Some(ProvidedInstanceFields {
+            fields,
+            has_dynamic_fields,
+            data: _,
+        }) = self.instance_fields(db)
+        else {
+            return Member::unbound();
+        };
+        let field = fields
+            .iter()
+            .find_map(|(field_name, ty)| (field_name == name).then_some(*ty));
+        let qualifiers = if field.is_some() {
+            TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE
+        } else {
+            TypeQualifiers::FINAL
+        };
+        field
+            .or_else(|| has_dynamic_fields.then(Type::unknown))
+            .map(|ty| Member {
+                inner: Place::declared(ty).with_qualifiers(qualifiers),
+            })
+            .unwrap_or_default()
     }
 
     /// Try to compute the MRO for this dynamic class.
@@ -542,6 +568,7 @@ impl<'db> DynamicClassLiteral<'db> {
             self.members(db),
             self.has_dynamic_namespace(db),
             dataclass_params,
+            self.instance_fields(db),
         )
     }
 }
@@ -571,6 +598,28 @@ impl<'db> DynamicClassLiteral<'db> {
             Some(params) => Some(params.recursive_type_normalized_impl(db, env, div, nested)?),
             None => None,
         };
+        let instance_fields = match self.instance_fields(db) {
+            Some(ProvidedInstanceFields {
+                fields,
+                has_dynamic_fields,
+                data,
+            }) => {
+                let fields = fields
+                    .iter()
+                    .map(|(name, ty)| {
+                        let ty = ty.recursive_type_normalized_impl(db, env, div, true);
+                        let ty = if nested { ty? } else { ty.unwrap_or(div) };
+                        Some((name.clone(), ty))
+                    })
+                    .collect::<Option<Box<_>>>()?;
+                Some(ProvidedInstanceFields {
+                    fields,
+                    has_dynamic_fields: *has_dynamic_fields,
+                    data: data.clone(),
+                })
+            }
+            None => None,
+        };
 
         Some(Self::new(
             db,
@@ -579,6 +628,7 @@ impl<'db> DynamicClassLiteral<'db> {
             members,
             self.has_dynamic_namespace(db),
             dataclass_params,
+            instance_fields,
         ))
     }
 }
