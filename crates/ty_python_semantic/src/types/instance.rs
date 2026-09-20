@@ -35,8 +35,7 @@ use crate::types::visitor::{
 };
 use crate::types::{
     ApplyTypeMappingVisitor, CallableType, ClassBase, ClassLiteral, ErrorContext,
-    FindLegacyTypeVarsVisitor, LiteralValueTypeKind, TypeContext, TypeMapping, VarianceInferable,
-    VarianceTerm,
+    FindLegacyTypeVarsVisitor, TypeContext, TypeMapping, VarianceInferable, VarianceTerm,
 };
 use crate::{Db, FxOrderSet};
 pub(super) use synthesized_protocol::SynthesizedProtocolType;
@@ -366,7 +365,11 @@ impl<'db> NominalInstanceType<'db> {
     ///
     /// The specialization must be one in which the typevars are solved as being statically known
     /// integers or `None`.
-    pub(crate) fn slice_literal(self, db: &'db dyn Db) -> Option<SliceLiteral> {
+    pub(crate) fn slice_literal(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<SliceLiteral> {
         let class = match self.0 {
             NominalInstanceInner::NonTuple(class) => class.class(db),
             NominalInstanceInner::ExactTuple(_)
@@ -383,11 +386,10 @@ impl<'db> NominalInstanceType<'db> {
         };
 
         let to_u32 = |ty: &Type<'db>| match ty {
-            Type::LiteralValue(literal) => match literal.kind() {
-                LiteralValueTypeKind::Int(n) => i32::try_from(n.as_i64()).map(Some).ok(),
-                LiteralValueTypeKind::Bool(b) => Some(Some(i32::from(b))),
-                _ => None,
-            },
+            Type::LiteralValue(_) => {
+                let value = ty.as_int_like_literal(db, env)?;
+                i32::try_from(value).map(Some).ok()
+            }
             Type::NominalInstance(instance)
                 if instance.has_known_class(db, KnownClass::NoneType) =>
             {

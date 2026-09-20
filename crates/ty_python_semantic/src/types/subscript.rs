@@ -695,7 +695,7 @@ impl<'db> Type<'db> {
                         | KnownClass::Memoryview
                 )
             ) && let Some(SliceLiteral { step: Some(0), .. }) =
-                maybe_slice_nominal.slice_literal(db) =>
+                maybe_slice_nominal.slice_literal(db, env) =>
             {
                 Some(Err(SubscriptError::new(
                     value_ty,
@@ -730,7 +730,7 @@ impl<'db> Type<'db> {
                 Type::NominalInstance(maybe_slice_nominal),
             ) if let Some(tuple) = maybe_tuple_nominal.tuple_spec(db, env)
                 && let Some(SliceLiteral { start, stop, step }) =
-                    maybe_slice_nominal.slice_literal(db) =>
+                    maybe_slice_nominal.slice_literal(db, env) =>
             {
                 Some(
                     tuple
@@ -771,7 +771,8 @@ impl<'db> Type<'db> {
             // Ex) Given `"value"[1:3]`, return `"al"`
             (Type::LiteralValue(literal), Type::NominalInstance(nominal))
                 if let Some(literal_ty) = literal.as_string()
-                    && let Some(SliceLiteral { start, stop, step }) = nominal.slice_literal(db) =>
+                    && let Some(SliceLiteral { start, stop, step }) =
+                        nominal.slice_literal(db, env) =>
             {
                 let literal_value = literal_ty.value(db);
                 let chars: Vec<_> = literal_value.chars().collect();
@@ -792,13 +793,15 @@ impl<'db> Type<'db> {
 
             (Type::LiteralValue(lhs_literal), Type::LiteralValue(rhs_literal))
                 if lhs_literal.is_literal_string()
-                    && (rhs_literal.is_int() || rhs_literal.is_bool()) =>
+                    && (rhs_literal.is_int()
+                        || (rhs_literal.is_bool()
+                            && KnownClass::bool_is_subclass_of_int(db, env))) =>
             {
                 Some(Ok(Type::literal_string()))
             }
 
             (Type::LiteralValue(literal), Type::NominalInstance(nominal))
-                if literal.is_literal_string() && nominal.slice_literal(db).is_some() =>
+                if literal.is_literal_string() && nominal.slice_literal(db, env).is_some() =>
             {
                 Some(Ok(Type::literal_string()))
             }
@@ -830,7 +833,8 @@ impl<'db> Type<'db> {
             // Ex) Given `b"value"[1:3]`, return `b"al"`
             (Type::LiteralValue(literal), Type::NominalInstance(nominal))
                 if let Some(literal_ty) = literal.as_bytes()
-                    && let Some(SliceLiteral { start, stop, step }) = nominal.slice_literal(db) =>
+                    && let Some(SliceLiteral { start, stop, step }) =
+                        nominal.slice_literal(db, env) =>
             {
                 let literal_value = literal_ty.value(db);
 

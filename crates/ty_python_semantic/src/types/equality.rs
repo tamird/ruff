@@ -881,6 +881,11 @@ fn builtin_literal_constraint<'db>(
     let Type::LiteralValue(right) = right.resolve_type_alias(db) else {
         return None;
     };
+    // Numeric literal constraints assume that bool and int share equality semantics. Without
+    // that ancestry, let the ordinary evaluator establish which finite alternatives can narrow.
+    if (right.is_int() || right.is_bool()) && !KnownClass::bool_is_subclass_of_int(db, env) {
+        return None;
+    }
 
     let equal_to_right =
         builtin_literals_equal_to(db, env, Type::LiteralValue(right), right.kind())?;
@@ -1857,7 +1862,10 @@ impl KnownComparisonSemantics {
         operator: ComparisonOperator,
     ) -> Option<Self> {
         match literal {
-            LiteralValueTypeKind::Int(_) | LiteralValueTypeKind::Bool(_) => Some(Self::Int),
+            LiteralValueTypeKind::Int(_) => Some(Self::Int),
+            LiteralValueTypeKind::Bool(_) => {
+                KnownClass::bool_is_subclass_of_int(db, env).then_some(Self::Int)
+            }
             LiteralValueTypeKind::String(_) | LiteralValueTypeKind::LiteralString => {
                 Some(Self::Str)
             }
@@ -2051,7 +2059,8 @@ fn known_literal_equality<'db>(
         }
         (LiteralValueTypeKind::Int(left), LiteralValueTypeKind::Bool(right))
         | (LiteralValueTypeKind::Bool(right), LiteralValueTypeKind::Int(left)) => {
-            Some(left.as_i64() == i64::from(right))
+            KnownClass::bool_is_subclass_of_int(db, env)
+                .then_some(left.as_i64() == i64::from(right))
         }
         (LiteralValueTypeKind::String(left), LiteralValueTypeKind::String(right)) => {
             Some(left.value(db) == right.value(db))

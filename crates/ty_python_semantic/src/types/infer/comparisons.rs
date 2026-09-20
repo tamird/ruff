@@ -1092,6 +1092,11 @@ fn infer_binary_type_comparison_inner<'db>(
         }
 
         (Type::LiteralValue(left_literal), Type::LiteralValue(right_literal)) => {
+            if (left_literal.is_bool() || right_literal.is_bool())
+                && !KnownClass::bool_is_subclass_of_int(db, env)
+            {
+                return try_dunder(MemberLookupPolicy::default());
+            }
             match (left_literal.kind(), right_literal.kind()) {
                 (LiteralValueTypeKind::Int(n), LiteralValueTypeKind::Int(m)) => {
                     Some(match op {
