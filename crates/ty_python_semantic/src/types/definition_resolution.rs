@@ -26,7 +26,10 @@ use ty_python_core::{
 
 use crate::place::implicit_builtins_symbol_source;
 use crate::provided::ProvidedBindingValue;
-use crate::types::{ClassBase, ClassLiteral, ClassType, SubclassOfInner, Type, binding_type};
+use crate::types::{
+    ClassBase, ClassLiteral, MemberLookupKey, MemberLookupPolicy, SubclassOfInner, Type,
+    TypeQualifiers, binding_type,
+};
 use crate::{Db, FxIndexSet, ProgramEnvironment, module_docstring};
 
 /// Controls whether local import aliases should be resolved to their targets or returned as-is.
@@ -347,9 +350,7 @@ pub(crate) fn definitions_for_attribute<'db>(
             SubclassOfInner::Protocol(protocol) => protocol.class_origin(db).map(|origin| *origin),
             subclass_of => subclass_of.into_class(db, env),
         }?;
-        class
-            .static_class_literal(db)
-            .map(|(literal, _)| ClassLiteral::Static(literal))
+        Some(class.class_literal(db))
     };
 
     let tys = match lhs_ty {
@@ -412,19 +413,26 @@ pub(crate) fn definitions_for_attribute<'db>(
             _ => continue,
         };
 
-        resolved.extend(definitions_for_attribute_in_class_hierarchy(
+        let instance_receiver = match ty {
+            Type::ClassLiteral(_) | Type::SubclassOf(_) | Type::GenericAlias(_) => None,
+            _ => Some(ty),
+        };
+        let definitions = definitions_for_attribute_in_class_hierarchy(
             db,
             env,
             &class_literal,
             name_str,
-        ));
+            instance_receiver,
+        );
+        let found = definitions.is_some();
+        resolved.extend(definitions.into_iter().flatten());
 
         // The metaclass of a derived class must be a subclass of the metaclasses of all of
         // its base classes. This is why we only have to look at the metaclass of the
         // class_literal.
         // Only look up definitions on the metaclass if the type is a class object to begin with in
         // order to prevent looking up instance members on the class metaclass
-        if resolved.is_empty() && meta_type != lookup_type {
+        if !found && meta_type != lookup_type {
             let class_literal = match meta_type {
                 Type::ClassLiteral(class_literal) => class_literal,
                 Type::SubclassOf(subclass) => {
@@ -436,12 +444,17 @@ pub(crate) fn definitions_for_attribute<'db>(
                 _ => continue,
             };
 
-            resolved.extend(definitions_for_attribute_in_class_hierarchy(
-                db,
-                env,
-                &class_literal,
-                name_str,
-            ));
+            resolved.extend(
+                definitions_for_attribute_in_class_hierarchy(
+                    db,
+                    env,
+                    &class_literal,
+                    name_str,
+                    Some(ty),
+                )
+                .into_iter()
+                .flatten(),
+            );
         }
     }
 
@@ -453,13 +466,68 @@ fn definitions_for_attribute_in_class_hierarchy<'db>(
     env: &ProgramEnvironment<'db>,
     class_literal: &ClassLiteral<'db>,
     attribute_name: &str,
-) -> Vec<ResolvedDefinition<'db>> {
-    let mut resolved = Vec::new();
-    'scopes: for ancestor in class_literal
-        .iter_mro(db)
-        .filter_map(ClassBase::into_class)
-        .filter_map(|cls: ClassType<'db>| cls.static_class_literal(db).map(|(lit, _)| lit))
-    {
+    instance_receiver: Option<Type<'db>>,
+) -> Option<Vec<ResolvedDefinition<'db>>> {
+    let mut resolved = None;
+    for ancestor in class_literal.iter_mro(db).filter_map(ClassBase::into_class) {
+        let ancestor = match ancestor.class_literal(db) {
+            ClassLiteral::Static(ancestor) => ancestor,
+            ClassLiteral::Dynamic(ancestor) => {
+                if let Some(receiver) = instance_receiver
+                    && let Some(fields) = ancestor.instance_fields(db)
+                    && let Some(field) = fields
+                        .fields
+                        .iter()
+                        .find(|field| field.name == attribute_name)
+                {
+                    // A Python subclass can replace the instance declaration. Its methods and
+                    // ordinary class defaults, however, still yield to inherited storage.
+                    if !receiver
+                        .instance_member(db, env, attribute_name)
+                        .qualifiers
+                        .contains(TypeQualifiers::GUARANTEED_INSTANCE_STORAGE)
+                    {
+                        return resolved;
+                    }
+                    let key = MemberLookupKey::new(
+                        db,
+                        env.program(db),
+                        receiver,
+                        attribute_name,
+                        MemberLookupPolicy::default(),
+                    );
+                    let class_member =
+                        Type::instance_lookup_class_member_with_policy(db, env, key, receiver);
+                    // Properties and other data descriptors precede instance storage. A slot
+                    // represents that same storage, so its inherited declaration does not hide
+                    // the supplied field (matching `invoke_descriptor_protocol`).
+                    let descriptor_precedes = class_member
+                        .place
+                        .ignore_possibly_undefined()
+                        .is_some_and(|ty| {
+                            !matches!(ty, Type::SlotDescriptor(_))
+                                && ty.attribute_kind_for_read(db, env).is_data()
+                        });
+                    if !descriptor_precedes {
+                        // An explicit field without source still shadows a base declaration.
+                        return Some(
+                            field
+                                .source
+                                .into_iter()
+                                .map(ResolvedDefinition::FileWithRange)
+                                .collect(),
+                        );
+                    }
+                }
+                continue;
+            }
+            ClassLiteral::DynamicNamedTuple(_)
+            | ClassLiteral::DynamicTypedDict(_)
+            | ClassLiteral::DynamicEnum(_) => continue,
+        };
+        if resolved.is_some() {
+            continue;
+        }
         let class_scope = ancestor.body_scope(db);
         let class_place_table = ty_python_core::place_table(db, class_scope);
 
@@ -480,8 +548,11 @@ fn definitions_for_attribute_in_class_hierarchy<'db>(
                     ),
             );
             if !resolved_in_scope.is_empty() {
-                resolved.extend(resolved_in_scope);
-                break 'scopes;
+                resolved = Some(resolved_in_scope);
+                if instance_receiver.is_none() {
+                    return resolved;
+                }
+                continue;
             }
         }
 
@@ -508,8 +579,8 @@ fn definitions_for_attribute_in_class_hierarchy<'db>(
                         ),
                 );
                 if !resolved_in_scope.is_empty() {
-                    resolved.extend(resolved_in_scope);
-                    break 'scopes;
+                    resolved = Some(resolved_in_scope);
+                    break;
                 }
             }
         }
@@ -884,6 +955,8 @@ mod tests {
 
     use super::*;
     use crate::db::tests::TestDbBuilder;
+    use crate::provided::{ProvidedClass, ProvidedField, ProvidedInstanceFields};
+    use ruff_python_ast::name::Name;
 
     #[test]
     fn builtin_names_do_not_infer_scope() -> anyhow::Result<()> {
@@ -931,6 +1004,50 @@ mod tests {
             anyhow::bail!("expected one definition for C.flag");
         };
         assert_eq!(definition.name(&db).as_deref(), Some("flag"));
+
+        let events = db.take_salsa_events();
+        assert_function_query_was_not_run_by_name(&db, "infer_scope_types_impl", None, &events);
+        Ok(())
+    }
+
+    #[test]
+    fn supplied_field_navigation_does_not_infer_the_callers_scope() -> anyhow::Result<()> {
+        let mut db = TestDbBuilder::new()
+            .with_file("/src/main.py", "record()\nunrelated = missing_name\n")
+            .build()?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let call = module.suite()[0]
+            .as_expr_stmt()
+            .unwrap()
+            .value
+            .as_call_expr()
+            .unwrap();
+        let source = FileRange::new(file.file(&db), TextRange::new(0.into(), 6.into()));
+        let model = crate::SemanticModel::new(&db, file);
+        let class = model
+            .provided_class_at_call(
+                call,
+                ProvidedClass {
+                    name: Name::new_static("Record"),
+                    bases: Box::default(),
+                    class_members: Box::default(),
+                    instance_fields: ProvidedInstanceFields {
+                        fields: Box::from([ProvidedField {
+                            name: Name::new_static("value"),
+                            ty: Type::int_literal(1),
+                            source: Some(source),
+                        }]),
+                        has_dynamic_fields: false,
+                        data: None,
+                    },
+                },
+            )
+            .unwrap();
+        let env = model.program_environment();
+        let instance = class.to_instance_approximation(&db, &env).unwrap();
+        let definitions = definitions_for_attribute(&db, &env, instance, "value");
+        assert_eq!(definitions, [ResolvedDefinition::FileWithRange(source)]);
 
         let events = db.take_salsa_events();
         assert_function_query_was_not_run_by_name(&db, "infer_scope_types_impl", None, &events);

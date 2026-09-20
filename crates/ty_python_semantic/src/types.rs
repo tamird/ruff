@@ -4907,6 +4907,91 @@ impl<'db> Type<'db> {
         }
     }
 
+    /// Looks up a concrete descriptor getter without calling it. The method, its definedness,
+    /// and its read precedence travel together so inference and navigation use the same lookup.
+    fn descriptor_get_method(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<(Type<'db>, Definedness, AttributeKind)> {
+        let Place::Defined(DefinedPlace {
+            ty: concrete_get, ..
+        }) = self
+            .class_member_with_policy(db, env, "__get__", MemberLookupPolicy::REQUIRE_CONCRETE)
+            .place
+        else {
+            return None;
+        };
+        // A recursive lookup's cycle marker is not a concrete descriptor method.
+        if concrete_get.is_divergent() {
+            return None;
+        }
+        // Descriptor special-method lookup checks the descriptor's type, so instance storage
+        // cannot shadow `__get__`. Dynamic MRO entries still participate in the lookup.
+        let Place::Defined(DefinedPlace {
+            ty: get,
+            definedness,
+            ..
+        }) = self
+            .class_member_with_policy(db, env, "__get__", MemberLookupPolicy::NO_INSTANCE_FALLBACK)
+            .place
+        else {
+            return None;
+        };
+        let kind = if self.is_data_descriptor(db, env) {
+            AttributeKind::DataDescriptor
+        } else {
+            AttributeKind::NormalOrNonDataDescriptor
+        };
+        Some((get, definedness, kind))
+    }
+
+    /// Classifies descriptor read precedence without inferring a getter's return type.
+    /// Keep the outer intersection policy aligned with `try_call_dunder_get_on_attribute`.
+    fn attribute_kind_for_read(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> AttributeKind {
+        if let Some(fallback) = self.materialized_divergent_fallback() {
+            return fallback.attribute_kind_for_read(db, env);
+        }
+        match self {
+            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => AttributeKind::DataDescriptor,
+            Type::Intersection(_) => AttributeKind::NormalOrNonDataDescriptor,
+            _ => self.descriptor_get_kind(db, env),
+        }
+    }
+
+    fn descriptor_get_kind(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> AttributeKind {
+        if matches!(self, Type::BoundMethod(_))
+            || self.function_like_dunder_get(db, env, None, None).is_some()
+        {
+            return AttributeKind::NormalOrNonDataDescriptor;
+        }
+        if let Some(fallback) = self.materialized_divergent_fallback() {
+            return fallback.descriptor_get_kind(db, env);
+        }
+        if matches!(self, Type::SlotDescriptor(_)) || self.dynamic_descriptor_type().is_some() {
+            return AttributeKind::DataDescriptor;
+        }
+        if let Some(union) = self.as_union_like(db) {
+            return if union
+                .elements(db)
+                .iter()
+                .all(|element| element.descriptor_get_kind(db, env).is_data())
+            {
+                AttributeKind::DataDescriptor
+            } else {
+                AttributeKind::NormalOrNonDataDescriptor
+            };
+        }
+        self.descriptor_get_method(db, env)
+            .map_or(AttributeKind::NormalOrNonDataDescriptor, |(_, _, kind)| {
+                kind
+            })
+    }
+
     /// Looks up `__get__` on the meta-type of `self` and calls it with `self`, `instance`, and
     /// `owner`. Unlike other dunder methods, `__get__` is not itself looked up using the
     /// descriptor protocol.
@@ -4991,46 +5076,11 @@ impl<'db> Type<'db> {
                 };
             }
 
-            let Place::Defined(DefinedPlace {
-                ty: concrete_descr_get,
-                ..
-            }) = ty
-                .class_member_with_policy(db, env, "__get__", MemberLookupPolicy::REQUIRE_CONCRETE)
-                .place
+            let Some((descr_get, descr_get_boundness, kind)) = ty.descriptor_get_method(db, env)
             else {
                 return Ok(None);
             };
-
-            // A recursive member lookup can yield the internal cycle marker. It does not
-            // represent a concrete descriptor method and must not escape through the access.
-            if concrete_descr_get.is_divergent() {
-                return Ok(None);
-            }
-
-            // Descriptor special-method lookup checks the descriptor's type, so instance storage
-            // cannot shadow `__get__`. Dynamic MRO entries still participate in the lookup.
-            let Place::Defined(DefinedPlace {
-                ty: descr_get,
-                definedness: descr_get_boundness,
-                ..
-            }) = ty
-                .class_member_with_policy(
-                    db,
-                    env,
-                    "__get__",
-                    MemberLookupPolicy::NO_INSTANCE_FALLBACK,
-                )
-                .place
-            else {
-                return Ok(None);
-            };
-
             let instance_ty = instance.unwrap_or_else(|| Type::none(db, env));
-            let kind = if ty.is_data_descriptor(db, env) {
-                AttributeKind::DataDescriptor
-            } else {
-                AttributeKind::NormalOrNonDataDescriptor
-            };
             let (return_type, error) = match descr_get.try_call(
                 db,
                 env,

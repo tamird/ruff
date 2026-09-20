@@ -4,6 +4,7 @@
 //! program-file identity so type inference and navigation use the same ordinary definitions.
 
 use ruff_db::diagnostic::Diagnostic;
+use ruff_db::files::FileRange;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex};
 use ty_python_core::ProgramFile;
@@ -11,8 +12,10 @@ use ty_python_core::semantic_index;
 
 use crate::Db;
 use crate::ProgramEnvironment;
+use crate::types::CheckedCall;
+use crate::types::ClassLiteral;
+use crate::types::Type;
 use crate::types::class::{DynamicClassAnchor, DynamicClassLiteral, DynamicClassScopeOffset};
-use crate::types::{CheckedCall, ClassLiteral, Type};
 
 mod data;
 pub use data::ProvidedData;
@@ -20,9 +23,17 @@ pub use data::ProvidedData;
 /// Instance storage supplied by a class factory. Callable values here do not bind as methods.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, get_size2::GetSize, salsa::SalsaValue, Default)]
 pub struct ProvidedInstanceFields<'db> {
-    pub fields: Box<[(Name, Type<'db>)]>,
+    pub fields: Box<[ProvidedField<'db>]>,
     pub has_dynamic_fields: bool,
     pub data: Option<ProvidedData>,
+}
+
+/// A stored instance field and the source declaration that defines it, when available.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub struct ProvidedField<'db> {
+    pub name: Name,
+    pub ty: Type<'db>,
+    pub source: Option<FileRange>,
 }
 
 /// A source-created nominal class using Ty's ordinary member lookup and constructor analysis.

@@ -3,7 +3,7 @@ use ruff_db::{diagnostic::Span, parsed::parsed_module};
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::TextRange;
 
-use crate::provided::ProvidedInstanceFields;
+use crate::provided::{ProvidedField, ProvidedInstanceFields};
 use crate::{
     Db, TypeQualifiers,
     place::{Place, PlaceAndQualifiers},
@@ -476,7 +476,7 @@ impl<'db> DynamicClassLiteral<'db> {
         };
         let field = fields
             .iter()
-            .find_map(|(field_name, ty)| (field_name == name).then_some(*ty));
+            .find_map(|field| (field.name == name).then_some(field.ty));
         let qualifiers = if field.is_some() {
             TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE
         } else {
@@ -606,10 +606,14 @@ impl<'db> DynamicClassLiteral<'db> {
             }) => {
                 let fields = fields
                     .iter()
-                    .map(|(name, ty)| {
+                    .map(|ProvidedField { name, ty, source }| {
                         let ty = ty.recursive_type_normalized_impl(db, env, div, true);
                         let ty = if nested { ty? } else { ty.unwrap_or(div) };
-                        Some((name.clone(), ty))
+                        Some(ProvidedField {
+                            name: name.clone(),
+                            ty,
+                            source: *source,
+                        })
                     })
                     .collect::<Option<Box<_>>>()?;
                 Some(ProvidedInstanceFields {
