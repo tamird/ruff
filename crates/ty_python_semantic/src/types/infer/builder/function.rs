@@ -242,8 +242,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             function.returns.as_deref(),
         ) {
             let has_empty_body = self.return_types_and_ranges.is_empty()
-                && function_body_kind(db, env, function, |expr| self.expression_type(expr))
-                    == FunctionBodyKind::Stub;
+                && function_body_kind(db, env, self.index, function, |expr| {
+                    self.expression_type(expr)
+                }) == FunctionBodyKind::Stub;
 
             let mut enclosing_class_context = None;
 

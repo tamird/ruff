@@ -21,6 +21,7 @@
 //! whole [`super::semantic_index()`] query would probably be prohibitively expensive.
 
 use ruff_db::parsed::parsed_module;
+use ruff_text_size::Ranged;
 
 use ruff_python_ast::{
     self as ast,
@@ -54,6 +55,7 @@ struct ExportFinder<'db> {
     db: &'db dyn Db,
     program_file: ProgramFile<'db>,
     visiting_stub_file: bool,
+    exclusions: crate::SourceExclusions,
     exports: FxHashMap<&'db Name, PossibleExportKind>,
     dunder_all: DunderAll,
 }
@@ -64,6 +66,7 @@ impl<'db> ExportFinder<'db> {
             db,
             program_file: file,
             visiting_stub_file: file.file(db).is_stub(db),
+            exclusions: db.source_exclusions(file),
             exports: FxHashMap::default(),
             dunder_all: DunderAll::NotPresent,
         }
@@ -174,6 +177,9 @@ impl<'db> Visitor<'db> for ExportFinder<'db> {
     }
 
     fn visit_stmt(&mut self, stmt: &'db ast::Stmt) {
+        if self.exclusions.contains(stmt.range()) {
+            return;
+        }
         match stmt {
             ast::Stmt::ClassDef(ast::StmtClassDef {
                 name,

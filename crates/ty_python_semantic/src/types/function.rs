@@ -1042,7 +1042,7 @@ impl<'db> FunctionLiteral<'db> {
             let file = python_file.file(db);
             let module = parsed_module(db, python_file).load(db);
             let node = implementation.node(db, file, &module);
-            function_body_kind(db, &env, node, |expr| {
+            function_body_kind(db, &env, semantic_index(db, program_file), node, |expr| {
                 definition_expression_type(db, definition, expr)
             })
         }
@@ -2242,14 +2242,20 @@ fn is_instance_tuple_covers<'db>(
 }
 
 /// Returns `true` if the function body is stub-like, ignoring a leading docstring.
-pub(crate) fn function_has_stub_body(node: &ast::StmtFunctionDef) -> bool {
+pub(crate) fn function_has_stub_body(
+    node: &ast::StmtFunctionDef,
+    index: &ty_python_core::SemanticIndex<'_>,
+) -> bool {
     let suite = ast::helpers::body_without_leading_docstring(&node.body);
 
-    suite.iter().all(|stmt| match stmt {
-        ast::Stmt::Pass(_) => true,
-        ast::Stmt::Expr(ast::StmtExpr { value, .. }) => value.is_ellipsis_literal_expr(),
-        _ => false,
-    })
+    suite
+        .iter()
+        .filter(|stmt| !index.is_excluded(stmt.range()))
+        .all(|stmt| match stmt {
+            ast::Stmt::Pass(_) => true,
+            ast::Stmt::Expr(ast::StmtExpr { value, .. }) => value.is_ellipsis_literal_expr(),
+            _ => false,
+        })
 }
 
 /// Classify the body of this function:
@@ -2263,17 +2269,19 @@ pub(crate) fn function_has_stub_body(node: &ast::StmtFunctionDef) -> bool {
 pub(super) fn function_body_kind<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
+    index: &ty_python_core::SemanticIndex<'db>,
     node: &ast::StmtFunctionDef,
     infer_type: impl Fn(&ast::Expr) -> Type<'db>,
 ) -> FunctionBodyKind {
     // Allow docstrings, but only as the first statement.
     let suite = ast::helpers::body_without_leading_docstring(&node.body);
 
-    if function_has_stub_body(node) {
+    if function_has_stub_body(node, index) {
         return FunctionBodyKind::Stub;
     }
 
-    if let [ast::Stmt::Raise(raise)] = suite
+    let mut suite = suite.iter().filter(|stmt| !index.is_excluded(stmt.range()));
+    if let (Some(ast::Stmt::Raise(raise)), None) = (suite.next(), suite.next())
         && let ast::StmtRaise {
             exc: Some(exc),
             cause: None,

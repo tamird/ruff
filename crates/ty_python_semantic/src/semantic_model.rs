@@ -488,6 +488,9 @@ impl<'db> SemanticModel<'db> {
     /// bound in the same scope (i.e., the class definition is a re-assignment).
     pub fn is_class_name_reassigned(&self, class_def: &ast::StmtClassDef) -> bool {
         let index = semantic_index(self.db, self.program_file());
+        if index.is_excluded(class_def.range()) {
+            return false;
+        }
         let definition = index.expect_single_definition(class_def);
         let scope = definition.scope(self.db);
         let table = place_table(self.db, scope);
@@ -498,6 +501,9 @@ impl<'db> SemanticModel<'db> {
     /// Returns the scope in which `node` is defined (handles string annotations).
     pub fn scope(&self, node: ast::AnyNodeRef<'_>) -> Option<FileScopeId> {
         let index = semantic_index(self.db, self.program_file());
+        if index.is_excluded(node.range()) {
+            return None;
+        }
         match self.node_in_ast(node) {
             ast::AnyNodeRef::Identifier(identifier) => index.try_expression_scope_id(identifier),
 
@@ -798,6 +804,9 @@ impl<'db> SemanticModel<'db> {
                 }),
                 _ => Vec::new(),
             }
+        }
+        if semantic_index(self.db, self.file).is_excluded(string_expr.range()) {
+            return Vec::new();
         }
         let db = self.db;
 
@@ -1135,10 +1144,11 @@ pub trait HasType {
 }
 
 pub trait HasDefinition {
-    /// Returns the definition of `self`.
+    /// Returns the definition of an admitted, indexed source node.
     ///
     /// ## Panics
-    /// May panic if `self` is from another file than `model`.
+    /// May panic if `self` is from another file than `model`, or belongs to a statement
+    /// excluded by the source frontend. Use [`SemanticModel::scope`] to test source admission.
     fn definition<'db>(&self, model: &SemanticModel<'db>) -> Definition<'db>;
 }
 
@@ -1154,6 +1164,9 @@ impl HasType for ast::ExprRef<'_> {
     fn inferred_type<'db>(&self, model: &SemanticModel<'db>) -> Option<Type<'db>> {
         let file = model.program_file();
         let index = semantic_index(model.db, file);
+        if index.is_excluded(self.range()) {
+            return None;
+        }
         // TODO(#1637): semantic tokens is making this crash even with
         // `try_expr_ref_in_ast` guarding this, for now just use `try_expression_scope_id`.
         // The problematic input is `x: "float` (with a dangling quote). I imagine the issue
@@ -1264,6 +1277,9 @@ macro_rules! impl_binding_has_ty_def {
         impl HasType for $ty {
             #[inline]
             fn inferred_type<'db>(&self, model: &SemanticModel<'db>) -> Option<Type<'db>> {
+                if semantic_index(model.db, model.program_file()).is_excluded(self.range()) {
+                    return None;
+                }
                 let binding = HasDefinition::definition(self, model);
                 Some(model.definition_type(binding))
             }
@@ -1282,6 +1298,9 @@ impl_binding_has_ty_def!(ast::StmtTypeAlias);
 
 impl HasType for ast::Alias {
     fn inferred_type<'db>(&self, model: &SemanticModel<'db>) -> Option<Type<'db>> {
+        if semantic_index(model.db, model.program_file()).is_excluded(self.range()) {
+            return None;
+        }
         if &self.name == "*" {
             return Some(Type::Never);
         }
@@ -1293,6 +1312,9 @@ impl HasType for ast::Alias {
 impl HasOptionalDefinition for ast::ExceptHandlerExceptHandler {
     fn optional_definition<'db>(&self, model: &SemanticModel<'db>) -> Option<Definition<'db>> {
         self.name.as_ref()?;
+        if semantic_index(model.db, model.program_file()).is_excluded(self.range()) {
+            return None;
+        }
 
         let index = semantic_index(model.db, model.program_file());
         Some(index.expect_single_definition(self))

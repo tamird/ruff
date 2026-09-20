@@ -556,6 +556,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
 
         for (i, statement) in suite.iter().enumerate() {
+            if self.index.is_excluded(statement.range()) {
+                continue;
+            }
             match statement {
                 ast::Stmt::If(if_stmt) => {
                     let ast::StmtIf {
@@ -1191,7 +1194,7 @@ fn suite_ends_with_exit(
     suite
         .iter()
         .rev()
-        .find(|stmt| !is_trivial_statement(stmt))
+        .find(|stmt| !builder.index.is_excluded(stmt.range()) && !is_trivial_statement(stmt))
         .is_some_and(|stmt| match stmt {
             ast::Stmt::Raise(_) => true,
             ast::Stmt::Break(_) | ast::Stmt::Continue(_) => kind == SuiteExitKind::Any,

@@ -67,7 +67,9 @@ fn async_generator_stub_declaration<'db>(
     };
     let module = parsed_module(db, definition.program_file(db).python_file(db)).load(db);
     let node = function.node(&module);
-    if !node.is_async || !function_has_stub_body(node) {
+    if !node.is_async
+        || !function_has_stub_body(node, semantic_index(db, definition.program_file(db)))
+    {
         return None;
     }
     // Start at `async`, excluding any decorators from the declaration's range.

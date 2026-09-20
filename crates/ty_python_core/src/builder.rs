@@ -286,6 +286,7 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     scopes_by_expression: ExpressionsScopeMapBuilder,
     definitions_by_node: FxHashMap<DefinitionNodeKey, Definitions<'db>>,
     provided_statements: FxHashMap<NodeIndex, Box<[ProvidedBinding]>>,
+    source_exclusions: crate::SourceExclusions,
     expressions_by_node: FxHashMap<ExpressionNodeKey, Expression<'db>>,
     unpacks_by_target: FxHashMap<ExpressionNodeKey, Unpack<'db>>,
     condition_flow_snapshots_by_node: FxHashMap<ExpressionNodeKey, ConditionFlowSnapshots>,
@@ -325,6 +326,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         file: ProgramFile<'db>,
         module_ref: &'ast ParsedModuleRef,
     ) -> Self {
+        let source_exclusions = db.source_exclusions(file);
         let mut provided_statements = FxHashMap::default();
         for ProvidedStatement {
             statement,
@@ -336,6 +338,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 matches!(node, ast::AnyRootNodeRef::Stmt(ast::Stmt::Expr(_))),
                 "provided statements must identify expression statements in the current module"
             );
+            if source_exclusions.contains(node.range()) {
+                continue;
+            }
             match provided_statements.entry(statement) {
                 Entry::Vacant(entry) => {
                     entry.insert(bindings);
@@ -369,6 +374,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             scopes_by_node: FxHashMap::default(),
             definitions_by_node: FxHashMap::default(),
             provided_statements,
+            source_exclusions,
             expressions_by_node: FxHashMap::default(),
             unpacks_by_target: FxHashMap::default(),
             condition_flow_snapshots_by_node: FxHashMap::default(),
@@ -3437,6 +3443,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .collect();
 
         SemanticIndex {
+            source_exclusions: self.source_exclusions,
             place_tables,
             scopes: self.scopes.into(),
             definitions_by_node: DefinitionsByNode::from_map(self.definitions_by_node),
@@ -4626,7 +4633,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 // definition for each bound place. See `struct LoopHeader` for more on this. Loop
                 // header definitions store the ID of a reserved `LoopHeader` that we populate
                 // after walking the body.
-                let bound_places = loop_bindings_visitor::collect_while_loop_bindings(while_stmt);
+                let bound_places = loop_bindings_visitor::collect_while_loop_bindings(
+                    while_stmt,
+                    &self.source_exclusions,
+                );
                 let mut maybe_loop_header_info = None;
                 // Avoid allocating a `LoopHeader` if there are no bound places in this loop.
                 if !bound_places.is_empty() {
@@ -4842,7 +4852,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 // definition for each bound place. See `struct LoopHeader` for more on this. Loop
                 // header definitions store the ID of a reserved `LoopHeader` that we populate
                 // after walking the body.
-                let bound_places = loop_bindings_visitor::collect_for_loop_bindings(for_stmt);
+                let bound_places = loop_bindings_visitor::collect_for_loop_bindings(
+                    for_stmt,
+                    &self.source_exclusions,
+                );
                 let mut maybe_loop_header_info = None;
                 // Avoid allocating a `LoopHeader` if there are no bound places in this loop.
                 if !bound_places.is_empty() {
@@ -5593,6 +5606,9 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
     }
 
     fn visit_stmt(&mut self, stmt: &'ast ast::Stmt) {
+        if self.source_exclusions.contains(stmt.range()) {
+            return;
+        }
         if !self.provided_statements.is_empty()
             && let Some(bindings) = self.provided_statements.remove(&stmt.node_index().load())
         {

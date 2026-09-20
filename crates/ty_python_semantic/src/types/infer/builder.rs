@@ -2151,6 +2151,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn infer_body(&mut self, suite: &[ast::Stmt]) {
         for statement in suite {
+            if self.index.is_excluded(statement.range()) {
+                continue;
+            }
             self.infer_maybe_standalone_statement(statement);
 
             if self
@@ -2175,6 +2178,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn infer_statement(&mut self, statement: &ast::Stmt) {
+        if self.index.is_excluded(statement.range()) {
+            return;
+        }
         if let Some(definitions) = self.index.provided_statement_definitions(statement) {
             for &definition in definitions {
                 let result = infer_definition_types(self.db(), definition);
