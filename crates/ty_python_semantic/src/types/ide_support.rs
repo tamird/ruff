@@ -34,7 +34,7 @@ use crate::types::definition_resolution::{self, user_visible_definitions};
 pub use crate::types::definition_resolution::{ImportAliasResolution, ResolvedDefinition};
 pub use stub_mapping::map_stub_definition;
 pub use unreachable_code::{UnreachableKind, UnreachableRange, unreachable_ranges};
-pub use unused_binding_support::{UnusedBinding, unused_bindings};
+pub use unused_binding_support::{UnusedBinding, unused_bindings, unused_definitions};
 
 static CLASS_MATCHER: LazyLock<NameMatcher<'static>> =
     LazyLock::new(|| NameMatcher::keyword("class"));
