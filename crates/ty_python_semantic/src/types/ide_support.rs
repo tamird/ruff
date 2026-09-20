@@ -972,6 +972,24 @@ pub struct CallSignatureParameter<'db> {
 }
 
 impl<'db> CallSignatureDetails<'db> {
+    /// Selects the displayed parameter for an argument, including an unfinished argument.
+    pub fn active_parameter(&self, argument_index: usize) -> Option<usize> {
+        self.argument_to_displayed_parameter_mapping
+            .get(argument_index)
+            .copied()
+            .flatten()
+            .or_else(|| {
+                if argument_index < self.parameters.len() {
+                    Some(argument_index)
+                } else {
+                    self.parameters.last().and_then(|parameter| {
+                        (parameter.is_variadic || parameter.is_keyword_variadic)
+                            .then(|| self.parameters.len() - 1)
+                    })
+                }
+            })
+    }
+
     fn from_binding(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
