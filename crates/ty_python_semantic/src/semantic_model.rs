@@ -404,31 +404,41 @@ impl<'db> SemanticModel<'db> {
             .collect()
     }
 
-    /// Returns completions for symbols available in the scope containing the
-    /// given expression.
+    /// Returns symbols from this scope and its enclosing scopes.
     ///
-    /// If a scope could not be determined, then completions for the global
-    /// scope of this model's `File` are returned.
-    pub fn scoped_completions(&self, node: ast::AnyNodeRef<'_>) -> Vec<Completion<'db>> {
+    /// The scope must come from this model's current semantic index. Symbols from nearer scopes come
+    /// first; consumers that deduplicate names should retain the first occurrence. Implicit
+    /// module globals and builtin namespaces are added separately by the caller.
+    pub fn lexical_completions(
+        &self,
+        file_scope: FileScopeId,
+    ) -> impl Iterator<Item = Completion<'db>> + '_ {
         let db = self.db;
         let program_file = self.program_file();
-        let index = semantic_index(self.db, program_file);
-        let Some(file_scope) = self.scope(node) else {
-            return vec![];
-        };
-        let mut completions = vec![];
-        for (file_scope, _) in index.ancestor_scopes(file_scope) {
-            completions.extend(
-                all_reachable_members(db, file_scope.to_scope_id(self.db, program_file)).map(
+        let index = semantic_index(db, program_file);
+        index
+            .ancestor_scopes(file_scope)
+            .flat_map(move |(file_scope, _)| {
+                all_reachable_members(db, file_scope.to_scope_id(db, program_file)).map(
                     |memberdef| Completion {
                         name: CompactString::new(memberdef.member.name),
                         ty: Some(memberdef.member.ty),
                         builtin: false,
                         is_type_check_only: memberdef.member.is_type_check_only,
                     },
-                ),
-            );
-        }
+                )
+            })
+    }
+
+    /// Returns completions for symbols available in the scope containing the
+    /// given node, including implicit module globals and Python builtins.
+    ///
+    /// Returns an empty list if the node has no indexed scope.
+    pub fn scoped_completions(&self, node: ast::AnyNodeRef<'_>) -> Vec<Completion<'db>> {
+        let Some(file_scope) = self.scope(node) else {
+            return vec![];
+        };
+        let mut completions: Vec<_> = self.lexical_completions(file_scope).collect();
 
         // Add implicit module globals (like `__file__`, `__name__`, etc.) with their
         // correct types. These are added before builtins so that the deduplication
