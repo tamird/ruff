@@ -29,9 +29,11 @@ use ty_python_core::{
     scope::ScopeId, semantic_index, use_def_map,
 };
 
-/// Iterate over all declarations and bindings that exist at the end
-/// of the given scope.
-pub(crate) fn all_end_of_scope_members<'db>(
+/// Iterate over declarations and bindings reachable at the end of the given scope.
+///
+/// Each item retains the first reachable definition when a symbol has alternatives.
+/// This excludes implicit namespaces and does not apply an export policy.
+pub fn all_end_of_scope_members<'db>(
     db: &'db dyn Db,
     scope_id: ScopeId<'db>,
 ) -> impl Iterator<Item = MemberWithDefinition<'db>> + 'db {
@@ -751,8 +753,8 @@ impl<'db> AllMembers<'db> {
 /// A member of a type or scope, with the first reachable definition of that member.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct MemberWithDefinition<'db> {
-    pub(crate) member: Member<'db>,
-    pub(crate) first_reachable_definition: Definition<'db>,
+    pub member: Member<'db>,
+    pub first_reachable_definition: Definition<'db>,
 }
 
 /// A member of a type or scope.
@@ -770,10 +772,10 @@ pub struct MemberWithDefinition<'db> {
 /// ordered comparisons.
 #[derive(Clone, Debug)]
 pub struct Member<'db> {
-    pub(crate) name: Name,
-    pub(crate) ty: Type<'db>,
+    pub name: Name,
+    pub ty: Type<'db>,
     /// Whether this member is known to exist only during type checking.
-    pub(crate) is_type_check_only: bool,
+    pub is_type_check_only: bool,
 }
 
 impl<'db> Member<'db> {
