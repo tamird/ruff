@@ -1,4 +1,5 @@
 use ruff_db::files::system_path_to_file;
+use ruff_db::parsed::parsed_module;
 use ruff_db::system::DbWithWritableSystem as _;
 use ruff_text_size::{TextLen, TextRange};
 
@@ -90,6 +91,40 @@ fn setup(source: &str) -> anyhow::Result<TestDb> {
         .with_file("/src/main.py", source)
         .with_call_result_provider(factory_result)
         .build()
+}
+
+#[test]
+fn source_call_class_matches_factory_result_identity() -> anyhow::Result<()> {
+    let db = setup("from native import make\nrecord = make(1)\n")?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let file = db.program_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let assignment = module.suite()[1].as_assign_stmt().unwrap();
+    let call = assignment.value.as_call_expr().unwrap();
+    let model = crate::SemanticModel::new(&db, file);
+    let class = model
+        .provided_class_at_call(
+            call,
+            ProvidedClass {
+                name: Name::new("Record"),
+                bases: Box::default(),
+                class_members: Box::default(),
+                instance_fields: ProvidedInstanceFields {
+                    fields: Box::from([(Name::new("value"), Type::int_literal(1))]),
+                    has_dynamic_fields: false,
+                    data: Some(ProvidedData::new(Name::new("native record"))),
+                },
+            },
+        )
+        .unwrap();
+    let inferred = crate::place::global_symbol(&db, file, "record")
+        .place
+        .expect_type();
+    assert_eq!(
+        class.to_instance_approximation(&db, &model.program_environment()),
+        Some(inferred)
+    );
+    Ok(())
 }
 
 #[test]

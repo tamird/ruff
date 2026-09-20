@@ -1238,6 +1238,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 UnionType::from_two_elements(db, env, Type::unknown(), default_ty)
             } else if let Some(ty) = self.special_first_method_parameter_type(parameter) {
                 ty
+            } else if let Some(ty) = db.provided_parameter_type(definition) {
+                ty
             } else {
                 Type::unknown()
             };

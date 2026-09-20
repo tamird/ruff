@@ -26,7 +26,7 @@ use crate::place_load::{
     ImplicitPlaceLoad, PlaceLoadMode, PlaceLoadResolutionStep, PlaceLoadSourceKind,
     resolve_place_load,
 };
-use crate::provided::{BuiltinUsage, ProvidedBindingValue};
+use crate::provided::{BuiltinUsage, ProvidedBindingValue, ProvidedClass};
 use crate::types::ide_support::{ImportAliasResolution, definition_for_name};
 pub use crate::types::list_members::ObjectMembers;
 use crate::types::list_members::{
@@ -108,6 +108,21 @@ impl<'db> SemanticModel<'db> {
         implicit_builtins_symbol(self.db, &self.program_environment(), name, usage)
             .place
             .ignore_possibly_undefined()
+    }
+
+    /// Creates an application-supplied class anchored to a call in this file's canonical AST.
+    ///
+    /// This only establishes source identity; it does not infer or bind the call. Detached
+    /// annotation expressions must use their existing inference-time construction path.
+    pub fn provided_class_at_call(
+        &self,
+        call: &ast::ExprCall,
+        class: ProvidedClass<'db>,
+    ) -> Option<Type<'db>> {
+        if self.in_string_annotation_expr.is_some() {
+            return None;
+        }
+        class.into_type_at_call(self.db, self.file, call)
     }
 
     /// Returns the type at `offset` in an application-supplied annotation.

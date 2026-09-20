@@ -2,7 +2,9 @@ use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_db::system::DbWithWritableSystem as _;
-use ruff_db::testing::assert_function_query_was_not_run;
+use ruff_db::testing::{
+    assert_function_query_was_not_run, assert_function_query_was_not_run_by_name,
+};
 use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_core::Db as _;
@@ -49,7 +51,8 @@ fn semantic_namespaces_share_python_support_types() -> anyhow::Result<()> {
 }
 
 /// A deliberately small source adapter: `include("name")` exports a native declaration,
-/// and trailing comments supply assignment, parameter, and return annotations.
+/// trailing comments supply assignment, parameter, and return annotations; and
+/// `context(callback)` supplies a native context to the callback's ordinary parameters.
 struct CommentedSource;
 
 impl SourceProvider for CommentedSource {
@@ -92,6 +95,9 @@ impl SourceProvider for CommentedSource {
         file: ProgramFile<'_>,
         owner: NodeIndex,
     ) -> Option<TextRange> {
+        if file.file(db).path(db).as_system_path()?.as_str() != "/src/main.py" {
+            return None;
+        }
         let module = parsed_module(db, file.python_file(db)).load(db);
         let source = source_text(db, file.file(db));
         for statement in module.suite() {
@@ -113,8 +119,10 @@ impl SourceProvider for CommentedSource {
             };
             let header =
                 &source[TextRange::new(function.parameters.end(), function.body.first()?.start())];
-            let offset =
-                function.parameters.end() + TextSize::try_from(header.find("# (")? + 3).unwrap();
+            let Some(marker) = header.find("# (") else {
+                continue;
+            };
+            let offset = function.parameters.end() + TextSize::try_from(marker + 3).unwrap();
             let (parameter, returns) = source[usize::from(offset)..].split_once(") -> ")?;
             let range = if owner == function.node_index().load() {
                 let start = offset + TextSize::of(parameter) + TextSize::new(5);
@@ -168,6 +176,248 @@ impl SourceProvider for CommentedSource {
             }),
         })
     }
+
+    fn parameter_type<'db>(
+        &self,
+        db: &'db TestDb,
+        definition: Definition<'db>,
+    ) -> Option<Type<'db>> {
+        let file = definition.program_file(db);
+        if file.file(db).path(db).as_system_path()?.as_str() != "/src/main.py" {
+            return None;
+        }
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let name = definition.scope(db).name(db, &module);
+        for statement in module.suite() {
+            let expression = match statement {
+                ast::Stmt::Expr(statement) => statement.value.as_ref(),
+                ast::Stmt::Assign(statement) => statement.value.as_ref(),
+                _ => continue,
+            };
+            let ast::Expr::Call(call) = expression else {
+                continue;
+            };
+            if call
+                .func
+                .as_name_expr()
+                .is_none_or(|name| name.id != "context")
+            {
+                continue;
+            }
+            let [callback] = call.arguments.args.as_ref() else {
+                continue;
+            };
+            let callback_name = match callback {
+                ast::Expr::Name(callback) => &callback.id,
+                ast::Expr::Attribute(callback) => &callback.attr.id,
+                _ => continue,
+            };
+            if callback_name == name {
+                let class = callback_context_class(db, file, call)?;
+                return class.to_instance_approximation(db, &ProgramEnvironment::from_file(file));
+            }
+        }
+        None
+    }
+}
+
+/// The configuration selects an ordinary native class; the call supplies nominal identity.
+fn callback_context_class<'db>(
+    db: &'db TestDb,
+    file: ProgramFile<'db>,
+    call: &ast::ExprCall,
+) -> Option<Type<'db>> {
+    let configuration = system_path_to_file(db, "/src/context.cfg").ok()?;
+    let native = system_path_to_file(db, "/src/native.pyi").ok()?;
+    let name = source_text(db, configuration);
+    let base = ProvidedBindingValue::Export {
+        file: db.program_file(native),
+        name: Name::new(name.trim()),
+    }
+    .resolve_type(db)?;
+    SemanticModel::new(db, file).provided_class_at_call(
+        call,
+        ProvidedClass {
+            name: Name::new_static("CallbackContext"),
+            bases: Box::from([base]),
+            class_members: Box::default(),
+            instance_fields: ProvidedInstanceFields::default(),
+        },
+    )
+}
+
+#[test]
+fn supplied_parameter_types_are_initial_bindings_only() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/context.cfg", "Context")
+        .with_file(
+            "/src/native.pyi",
+            "from typing import Callable\nclass Context:\n    value: int | None\ndef context(callback: Callable[..., object]) -> type: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import context
+from typing_extensions import Literal, assert_type
+def callback(ctx):
+    assert_type(ctx.value, int | None)
+    if ctx.value is not None:
+        assert_type(ctx.value, int)
+    ctx = 'reassigned'
+    assert_type(ctx, Literal['reassigned'])
+context(callback)
+callback(None)
+",
+        )
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let callback = crate::place::global_symbol(&db, db.program_file(file), "callback")
+        .place
+        .expect_type()
+        .expect_function_literal();
+    let signature = callback.last_definition_signature(&db);
+    let [parameter] = signature.parameters().as_slice() else {
+        panic!("Expected one callback parameter, got {signature:?}");
+    };
+    assert_eq!(parameter.annotated_type(), Type::unknown());
+    Ok(())
+}
+
+#[test]
+fn supplied_parameter_types_preserve_annotation_default_and_variadic_types() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/context.cfg", "Context")
+        .with_file(
+            "/src/native.pyi",
+            "from typing import Callable\nclass Context: ...\ndef context(callback: Callable[..., object]) -> type: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import context
+from typing_extensions import assert_type
+def annotated(ctx: int):
+    assert_type(ctx, int)
+def supplied(ctx): # (str) -> None
+    assert_type(ctx, str)
+def defaulted(ctx=1):
+    ctx + 1
+def variadic(*args, **kwargs):
+    args.count(None)
+    kwargs.keys()
+class Owner:
+    value: int
+    def method(self):
+        assert_type(self.value, int)
+context(annotated)
+context(supplied)
+context(defaulted)
+context(variadic)
+context(Owner.method)
+",
+        )
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn supplied_parameter_types_follow_source_native_and_configuration_edits() -> anyhow::Result<()> {
+    let source =
+        "from native import context\ndef callback(ctx):\n    ctx.value + 1\ncontext(callback)\n";
+    let native = "from typing import Callable\nclass Context:\n    value: int\nclass Other:\n    value: str\ndef context(callback: Callable[..., object]) -> type: ...\n";
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", source)
+        .with_file("/src/native.pyi", native)
+        .with_file("/src/context.cfg", "Context")
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    assert!(db.check_file(file).is_empty());
+    db.write_file("/src/context.cfg", "Other")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "unsupported-operator");
+    db.write_file(
+        "/src/native.pyi",
+        native.replace("value: str", "value: int"),
+    )?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let modified_source = source.replace("+ 1", "+ 'text'");
+    db.write_file("/src/main.py", &modified_source)?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "unsupported-operator");
+    db.write_file(
+        "/src/main.py",
+        modified_source.replace("context(callback)", ""),
+    )?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn supplied_class_identity_uses_the_source_call_without_inference() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            "first = missing(callback)\nsecond = missing(callback)\n",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    db.clear_salsa_events();
+    {
+        let file = db.program_file(file);
+        let model = SemanticModel::new(&db, file);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let calls = module
+            .suite()
+            .iter()
+            .map(|statement| {
+                statement
+                    .as_assign_stmt()
+                    .unwrap()
+                    .value
+                    .as_call_expr()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = calls.as_slice() else {
+            panic!("Expected two source calls");
+        };
+        let class = |call, name| {
+            model
+                .provided_class_at_call(
+                    call,
+                    ProvidedClass {
+                        name: Name::new(name),
+                        bases: Box::default(),
+                        class_members: Box::default(),
+                        instance_fields: ProvidedInstanceFields::default(),
+                    },
+                )
+                .unwrap()
+        };
+        let first_type = class(first, "Context");
+        assert_eq!(first_type, class(first, "Context"));
+        assert_ne!(first_type, class(second, "Context"));
+        assert_ne!(first_type, class(first, "Attributes"));
+    }
+    let events = db.take_salsa_events();
+    for query in [
+        "infer_scope_types_impl",
+        "infer_expression_types_impl",
+        "infer_definition_types",
+    ] {
+        assert_function_query_was_not_run_by_name(&db, query, None, &events);
+    }
+    Ok(())
 }
 
 #[test]

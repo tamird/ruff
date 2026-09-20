@@ -5,11 +5,13 @@
 
 use ruff_db::diagnostic::Diagnostic;
 use ruff_python_ast::name::Name;
+use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex};
 use ty_python_core::ProgramFile;
+use ty_python_core::semantic_index;
 
 use crate::Db;
 use crate::ProgramEnvironment;
-use crate::types::class::DynamicClassLiteral;
+use crate::types::class::{DynamicClassAnchor, DynamicClassLiteral, DynamicClassScopeOffset};
 use crate::types::{CheckedCall, ClassLiteral, Type};
 
 mod data;
@@ -29,6 +31,53 @@ pub struct ProvidedClass<'db> {
     pub bases: Box<[Type<'db>]>,
     pub class_members: Box<[(Name, Type<'db>)]>,
     pub instance_fields: ProvidedInstanceFields<'db>,
+}
+
+impl<'db> ProvidedClass<'db> {
+    pub(crate) fn into_type_at_call(
+        self,
+        db: &'db dyn Db,
+        file: ProgramFile<'db>,
+        call: &ast::ExprCall,
+    ) -> Option<Type<'db>> {
+        let index = semantic_index(db, file);
+        let file_scope = index.try_expression_scope_id(&ast::ExprRef::Call(call))?;
+        let scope = file_scope.to_scope_id(db, file);
+        let scope_index = scope.node(db).node_index().unwrap_or(NodeIndex::from(0));
+        let call_index = call.node_index().load().as_u32()?;
+        let scope_index = scope_index.as_u32()?;
+        let offset = call_index.checked_sub(scope_index)?;
+        Some(
+            self.into_type(db, |explicit_bases| DynamicClassAnchor::ScopeOffset {
+                scope,
+                offset: DynamicClassScopeOffset::Node(offset),
+                explicit_bases,
+            }),
+        )
+    }
+
+    fn into_type(
+        self,
+        db: &'db dyn Db,
+        anchor: impl FnOnce(Box<[Type<'db>]>) -> DynamicClassAnchor<'db>,
+    ) -> Type<'db> {
+        let Self {
+            name,
+            bases,
+            class_members,
+            instance_fields,
+        } = self;
+        DynamicClassLiteral::new(
+            db,
+            name,
+            anchor(bases),
+            class_members,
+            false,
+            None,
+            Some(instance_fields),
+        )
+        .into()
+    }
 }
 
 /// The namespace in which a builtin name is being used.
@@ -77,22 +126,7 @@ impl<'db> From<ProvidedBindingValue<'db>> for ProvidedBindingResolution<'db> {
 impl<'db> CheckedCall<'_, 'db> {
     /// Creates a class whose nominal identity is anchored to this call in the original source.
     pub fn class_type(&self, db: &'db dyn Db, class: ProvidedClass<'db>) -> Type<'db> {
-        let ProvidedClass {
-            name,
-            bases,
-            class_members,
-            instance_fields,
-        } = class;
-        DynamicClassLiteral::new(
-            db,
-            name,
-            self.class_anchor(bases),
-            class_members,
-            false,
-            None,
-            Some(instance_fields),
-        )
-        .into()
+        class.into_type(db, |bases| self.class_anchor(bases))
     }
 }
 
