@@ -4942,6 +4942,7 @@ dependencies = [
  "ty_static",
  "ty_test",
  "ty_vendored",
+ "zip",
 ]
 
 [[package]]

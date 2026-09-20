@@ -143,9 +143,8 @@ pub(crate) mod tests {
     }
 
     impl TestDb {
-        fn new() -> Self {
+        fn new(vendored: VendoredFileSystem) -> Self {
             let events = Events::default();
-            let vendored = ty_vendored::file_system().clone();
             let program_settings = ProgramSettings::empty(&vendored);
             Self {
                 storage: salsa::Storage::new(Some(Box::new({
@@ -341,6 +340,7 @@ pub(crate) mod tests {
     impl salsa::Database for TestDb {}
 
     pub(crate) struct TestDbBuilder<'a> {
+        vendored: VendoredFileSystem,
         /// Target Python version
         python_version: PythonVersion,
         /// Target Python platform
@@ -359,6 +359,7 @@ pub(crate) mod tests {
     impl<'a> TestDbBuilder<'a> {
         pub(crate) fn new() -> Self {
             Self {
+                vendored: ty_vendored::file_system().clone(),
                 python_version: PythonVersion::default(),
                 python_platform: PythonPlatform::default(),
                 src_roots: vec![SystemPathBuf::from("/src")],
@@ -368,6 +369,11 @@ pub(crate) mod tests {
                 call_result_provider: None,
                 source_provider: None,
             }
+        }
+
+        pub(crate) fn with_vendored(mut self, vendored: VendoredFileSystem) -> Self {
+            self.vendored = vendored;
+            self
         }
 
         pub(crate) fn with_python_version(mut self, version: PythonVersion) -> Self {
@@ -422,7 +428,7 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn build(self) -> anyhow::Result<TestDb> {
-            let mut db = TestDb::new();
+            let mut db = TestDb::new(self.vendored);
             db.call_result_provider = self.call_result_provider;
             db.source_provider = self.source_provider;
 

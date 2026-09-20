@@ -67,6 +67,7 @@ insta = { workspace = true }
 pretty_assertions = { workspace = true }
 quickcheck = { workspace = true }
 quickcheck_macros = { workspace = true }
+zip = { workspace = true }
 
 [features]
 schemars = ["dep:schemars"]

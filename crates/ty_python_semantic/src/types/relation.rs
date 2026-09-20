@@ -13,6 +13,7 @@ use crate::types::constraints::{
 use crate::types::cyclic::{HasIdentity, PairVisitor, TypeIdentity};
 use crate::types::enums::is_single_member_enum;
 use crate::types::function::FunctionDecorators;
+use crate::types::iteration::str_has_character_sequence_base;
 use crate::types::relation_error::ErrorRelation;
 use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::signatures::{ParametersKind, SignatureRelationVisitor};
@@ -2648,6 +2649,10 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                     return self.always();
                 }
 
+                if !str_has_character_sequence_base(db, env) {
+                    return self.check_type_pair(db, literal.fallback_instance(db, env), target);
+                }
+
                 if let Some(sequence_class) = KnownClass::Sequence.try_to_class_literal(db, env)
                     && !sequence_class
                         .iter_mro(db, None)
@@ -2655,7 +2660,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                         .map(|class| class.class_literal(db))
                         .contains(&target_class.class_literal(db))
                 {
-                    return self.never();
+                    return self.check_type_pair(db, literal.fallback_instance(db, env), target);
                 }
 
                 let chars: FxHashSet<char> = value.value(db).chars().collect();
