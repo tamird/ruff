@@ -206,7 +206,7 @@ pub fn unused_bindings(db: &dyn Db, file: ProgramFile<'_>) -> Box<[UnusedBinding
             let is_method_scope = index.class_definition_of_method(file_scope_id).is_some();
             let method_has_stub_body = is_method_scope
                 && scope.node().as_function().is_some_and(|function| {
-                    crate::types::function::function_has_stub_body(function.node(&parsed))
+                    crate::types::function::function_has_stub_body(function.node(&parsed), index)
                 });
             if is_stub_file
                 || function_scope_is_overload_declaration(db, index, file_scope_id)

@@ -55,6 +55,8 @@ pub mod platform;
 pub mod predicate;
 pub mod rank;
 mod re_exports;
+mod source_exclusions;
+pub use source_exclusions::SourceExclusions;
 pub mod reachability_constraints;
 pub mod scope;
 pub mod statement;
@@ -284,6 +286,7 @@ impl<'db> DefinitionsByNode<'db> {
 /// The place tables and use-def maps for all scopes in a file.
 #[derive(Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub struct SemanticIndex<'db> {
+    source_exclusions: SourceExclusions,
     /// List of all place tables in this file, indexed by scope.
     place_tables: FrozenIndexVec<FileScopeId, Arc<PlaceTable>>,
 
@@ -674,6 +677,11 @@ impl<'db> SemanticIndex<'db> {
         self.definitions_by_node
             .get(definition_key.into())
             .expect("definition should be present in the semantic index")
+    }
+
+    /// Whether this canonical source subtree is opaque to semantic analysis.
+    pub fn is_excluded(&self, range: TextRange) -> bool {
+        self.source_exclusions.contains(range)
     }
 
     /// Returns the bindings of an application-defined expression statement.

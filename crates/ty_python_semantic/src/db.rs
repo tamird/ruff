@@ -109,6 +109,13 @@ pub(crate) mod tests {
     use ty_site_packages::{PythonVersionSource, PythonVersionWithSource};
 
     pub(crate) trait SourceProvider: Send + Sync {
+        fn exclusions(
+            &self,
+            _db: &TestDb,
+            _file: ProgramFile<'_>,
+        ) -> ty_python_core::SourceExclusions {
+            ty_python_core::SourceExclusions::default()
+        }
         fn statements(
             &self,
             db: &TestDb,
@@ -248,6 +255,13 @@ pub(crate) mod tests {
 
     #[salsa::db]
     impl ty_python_core::Db for TestDb {
+        fn source_exclusions(&self, file: ProgramFile<'_>) -> ty_python_core::SourceExclusions {
+            self.source_provider
+                .as_ref()
+                .map_or_else(ty_python_core::SourceExclusions::default, |provider| {
+                    provider.exclusions(self, file)
+                })
+        }
         fn provided_statements(
             &self,
             file: ProgramFile<'_>,

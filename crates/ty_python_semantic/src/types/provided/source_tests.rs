@@ -1,14 +1,16 @@
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
-use ruff_db::system::DbWithWritableSystem as _;
+use ruff_db::system::{DbWithWritableSystem as _, SystemPath};
 use ruff_db::testing::{
     assert_function_query_was_not_run, assert_function_query_was_not_run_by_name,
 };
-use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex};
+use ruff_python_ast::NodeIndex;
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_core::Db as _;
-use ty_python_core::definition::{Definition, DefinitionKind, ProvidedBinding, ProvidedStatement};
+use ty_python_core::definition::Definition;
+use ty_python_core::definition::{DefinitionKind, ProvidedBinding, ProvidedStatement};
 use ty_python_core::semantic_index;
 
 use super::*;
@@ -56,6 +58,53 @@ fn semantic_namespaces_share_python_support_types() -> anyhow::Result<()> {
 struct CommentedSource;
 
 impl SourceProvider for CommentedSource {
+    fn exclusions(&self, db: &TestDb, file: ProgramFile<'_>) -> ty_python_core::SourceExclusions {
+        #[derive(Default)]
+        struct Omitted {
+            roots: Vec<NodeIndex>,
+            owner: Option<NodeIndex>,
+        }
+        impl<'ast> Visitor<'ast> for Omitted {
+            fn visit_stmt(&mut self, stmt: &'ast ast::Stmt) {
+                let previous = self.owner.replace(stmt.node_index().load());
+                if matches!(stmt, ast::Stmt::While(_) | ast::Stmt::ClassDef(_)) {
+                    self.roots.push(stmt.node_index().load());
+                } else {
+                    walk_stmt(self, stmt);
+                }
+                self.owner = previous;
+            }
+            fn visit_expr(&mut self, expr: &'ast ast::Expr) {
+                if matches!(expr, ast::Expr::Named(_) | ast::Expr::EllipsisLiteral(_))
+                    || matches!(expr, ast::Expr::Dict(dict) if dict.items.iter().any(|item| item.key.is_none()))
+                {
+                    self.roots
+                        .push(self.owner.expect("expression has a statement owner"));
+                } else {
+                    walk_expr(self, expr);
+                }
+            }
+        }
+        if file
+            .file(db)
+            .path(db)
+            .as_system_path()
+            .map(SystemPath::as_str)
+            != Some("/src/excluded.py")
+        {
+            return ty_python_core::SourceExclusions::default();
+        }
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let mut omitted = Omitted::default();
+        omitted.visit_body(module.suite());
+        ty_python_core::SourceExclusions::from_statements(omitted.roots.into_iter().map(|node| {
+            let ast::AnyRootNodeRef::Stmt(statement) = module.get_by_index(node) else {
+                unreachable!()
+            };
+            statement
+        }))
+    }
+
     fn statements(&self, db: &TestDb, file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
         let module = parsed_module(db, file.python_file(db)).load(db);
         module
@@ -809,5 +858,46 @@ fn malformed_assignment_annotation_still_checks_the_value() -> anyhow::Result<()
         ["invalid-type-form", "unresolved-reference"],
         "{diagnostics:#?}"
     );
+    Ok(())
+}
+
+#[test]
+fn excluded_source_has_no_bindings_or_flow_effects() -> anyhow::Result<()> {
+    use crate::HasType;
+    let mut db = TestDbBuilder::new()
+        .with_source_provider(CommentedSource)
+        .with_file("/src/excluded.py", "value = 1\n")
+        .build()?;
+    let file = system_path_to_file(&db, "/src/excluded.py")?;
+    for source in [
+        "value = 1\nobserved = value\n",
+        "value = 1\nwhile True:\n    value = 'bad'\nclass value: pass\nfor item in [0]:\n    while True:\n        value = 'bad'\n    opaque = (value := 'bad')\nif not ...:\n    left = value\nelse:\n    right = value\nobserved = value\n",
+        "value = 1\nobserved = value\n",
+    ] {
+        db.write_file("/src/excluded.py", source)?;
+        let program_file = db.program_file(file);
+        let module = parsed_module(&db, program_file.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, program_file);
+        let ast::Stmt::Assign(last) = module.suite().last().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            last.value
+                .inferred_type(&model)
+                .unwrap()
+                .display(&db, &model.program_environment())
+                .to_string(),
+            "Literal[1]"
+        );
+        let diagnostics = crate::check_file_unwrap(&db, program_file);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        if let Some(while_statement) = module
+            .suite()
+            .get(1)
+            .filter(|stmt| matches!(stmt, ast::Stmt::While(_)))
+        {
+            assert_eq!(model.scope(while_statement.into()), None);
+        }
+    }
     Ok(())
 }

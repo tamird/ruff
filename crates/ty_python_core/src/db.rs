@@ -25,6 +25,13 @@ pub trait Db: ModuleResolverDb {
         None
     }
 
+    /// Excludes source subtrees that have no semantics in the requesting frontend.
+    /// Implementations read tracked syntax inputs only, without requesting the semantic index.
+    /// Returned ranges belong to this file's canonical parse and include all descendants.
+    fn source_exclusions(&self, _file: ProgramFile<'_>) -> crate::SourceExclusions {
+        crate::SourceExclusions::default()
+    }
+
     /// Projects application-defined expression statements into ordinary name bindings.
     ///
     /// Called while constructing the semantic index. Implementations must read tracked inputs
