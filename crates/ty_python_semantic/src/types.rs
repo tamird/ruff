@@ -99,9 +99,11 @@ pub use crate::types::method::{BoundMethodType, KnownBoundMethodType, WrapperDes
 use crate::types::mro::{MroIterator, StaticMroError};
 pub(crate) use crate::types::narrow::{NarrowingConstraint, infer_narrowing_constraints};
 use crate::types::newtype::NewType;
+pub(crate) use crate::types::signatures::function_signature_annotation_info;
 use crate::types::signatures::{ConcatenateTail, walk_signature};
 pub use crate::types::signatures::{Parameter, Parameters};
 use crate::types::special_form::TypeQualifier;
+pub(crate) use crate::types::string_annotation::SourceAnnotation;
 use crate::types::tuple::TupleSpec;
 pub use crate::types::type_alias::TypeAliasType;
 pub use crate::types::type_form::TypeFormType;

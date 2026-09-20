@@ -65,24 +65,36 @@ impl<'db> Definition<'db> {
     /// Returns whether this definition binds a value, declares a type, or does both.
     pub fn category(self, db: &'db dyn Db, module: &ParsedModuleRef) -> DefinitionCategory {
         let kind = self.kind(db);
-        if let DefinitionKind::Parameter(parameter) = kind {
-            let owner = match parameter {
+        let annotation_owner = match kind {
+            DefinitionKind::Parameter(parameter) => Some(match parameter {
                 ParameterDefinitionNodeKind::Parameter(parameter) => {
-                    &parameter.node(module).parameter
+                    parameter.node(module).parameter.node_index().load()
                 }
                 ParameterDefinitionNodeKind::VariadicPositionalParameter(parameter) => {
-                    parameter.node(module)
+                    parameter.node(module).node_index().load()
                 }
                 ParameterDefinitionNodeKind::VariadicKeywordParameter(parameter) => {
-                    parameter.node(module)
+                    parameter.node(module).node_index().load()
                 }
-            };
-            if db
-                .provided_annotation(self.program_file(db), owner.node_index().load())
-                .is_some()
-            {
-                return DefinitionCategory::DeclarationAndBinding;
+            }),
+            DefinitionKind::Assignment(assignment) => {
+                if assignment.unpack().is_none() {
+                    assignment
+                        .target(module)
+                        .as_name_expr()
+                        .map(|target| target.node_index().load())
+                } else {
+                    None
+                }
             }
+            _ => None,
+        };
+        if let Some(owner) = annotation_owner
+            && db
+                .provided_annotation(self.program_file(db), owner)
+                .is_some()
+        {
+            return DefinitionCategory::DeclarationAndBinding;
         }
         kind.category(self.file(db).is_stub(db), module)
     }
