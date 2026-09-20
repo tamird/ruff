@@ -31,7 +31,9 @@ mod unreachable_code;
 mod unused_binding_support;
 
 use crate::types::definition_resolution::{self, user_visible_definitions};
-pub use crate::types::definition_resolution::{ImportAliasResolution, ResolvedDefinition};
+pub use crate::types::definition_resolution::{
+    ImportAliasResolution, ResolvedDefinition, resolve_definition,
+};
 pub use stub_mapping::map_stub_definition;
 pub use unreachable_code::{UnreachableKind, UnreachableRange, unreachable_ranges};
 pub use unused_binding_support::{UnusedBinding, unused_bindings, unused_definitions};
