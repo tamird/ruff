@@ -23,7 +23,6 @@ use crate::types::infer::InferenceFlags;
 use crate::{
     Db, Program,
     lint::{LintId, LintMetadata},
-    suppression::suppressions,
 };
 use ty_module_resolver::ResolverEnvironment;
 use ty_python_core::definition::Definition;
@@ -266,7 +265,10 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
 
     pub(super) fn extend_provided_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
         if !self.diagnostics_suppressed {
-            self.diagnostics.get_mut().extend_diagnostics(diagnostics);
+            let file = self.python_file();
+            self.diagnostics
+                .get_mut()
+                .extend_provided(self.db, file, diagnostics);
         }
     }
 
@@ -658,9 +660,11 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
 
         let (severity, source) = Self::severity_and_source(ctx, lint_id)?;
 
-        let suppressions = suppressions(ctx.db(), ctx.python_file());
-        if let Some(suppression) = suppressions.find_suppression(range, lint_id) {
-            ctx.diagnostics.borrow_mut().mark_used(suppression.id());
+        if ctx
+            .diagnostics
+            .borrow_mut()
+            .is_suppressed(ctx.db(), ctx.python_file(), range, lint_id)
+        {
             return None;
         }
 
@@ -768,5 +772,47 @@ impl<'db, 'ctx> DiagnosticGuardBuilder<'db, 'ctx> {
         let diag = Diagnostic::new(self.id, self.severity, message);
 
         DiagnosticGuard::new(self.ctx.file, &self.ctx.diagnostics, diag)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::tests::TestDbBuilder;
+    use crate::suppression::check_suppressions;
+    use crate::types::diagnostic::UNRESOLVED_REFERENCE;
+    use ruff_db::files::system_path_to_file;
+    use ruff_db::parsed::parsed_module;
+    use ty_python_core::global_scope;
+
+    #[test]
+    fn provided_binding_diagnostics_record_used_suppressions() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new()
+            .with_file("/src/main.py", "pass # ty: ignore[unresolved-reference]\n")
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let program_file = db.program_file(file);
+        let parsed = parsed_module(&db, program_file.python_file(&db)).load(&db);
+        let environment = ProgramEnvironment::from_file(program_file);
+        let mut context = InferContext::new(
+            &db,
+            &environment,
+            global_scope(&db, program_file),
+            file,
+            program_file,
+            &parsed,
+        );
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticId::Lint(UNRESOLVED_REFERENCE.name()),
+            Severity::Warning,
+            "Application binding unavailable",
+        );
+        diagnostic.annotate(Annotation::primary(
+            Span::from(file).with_range(TextRange::new(0.into(), 4.into())),
+        ));
+        context.extend_provided_diagnostics(vec![diagnostic]);
+        let diagnostics = check_suppressions(&db, program_file.python_file(&db), context.finish());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        Ok(())
     }
 }

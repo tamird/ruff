@@ -198,6 +198,23 @@ mod property_tests;
 mod subscript;
 
 pub fn check_types(db: &dyn Db, file: ProgramFile<'_>) -> Vec<Diagnostic> {
+    check_types_with_diagnostics(db, file, [])
+}
+
+/// Checks a file and includes diagnostics supplied by the embedding application.
+///
+/// Registered lint diagnostics whose primary span belongs to this file participate in its rule
+/// selection and suppression comments. An explicit rule severity overrides their supplied severity;
+/// otherwise their severity, annotations, and tags are preserved. Diagnostics without such a span,
+/// unregistered lints, and non-lint diagnostics pass through unchanged.
+///
+/// Supplemental diagnostics are not filtered by reachability: they may describe unreachable code.
+/// Suppression usage is validated once, after both inferred and supplemental diagnostics are added.
+pub fn check_types_with_diagnostics(
+    db: &dyn Db,
+    file: ProgramFile<'_>,
+    supplemental: impl IntoIterator<Item = Diagnostic>,
+) -> Vec<Diagnostic> {
     let source_file = file.file(db);
     let _span = tracing::trace_span!("check_types", ?source_file).entered();
     tracing::debug!("Checking file '{path}'", path = source_file.path(db));
@@ -266,6 +283,7 @@ pub fn check_types(db: &dyn Db, file: ProgramFile<'_>) -> Vec<Diagnostic> {
             .map(|error| Diagnostic::invalid_syntax(source_file, error, error)),
     );
 
+    diagnostics.extend_provided(db, file.python_file(db), supplemental);
     let diagnostics = check_suppressions(db, file.python_file(db), diagnostics);
 
     let elapsed = start.elapsed();

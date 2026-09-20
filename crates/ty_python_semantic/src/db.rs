@@ -155,6 +155,7 @@ pub(crate) mod tests {
         vendored: VendoredFileSystem,
         events: Events,
         rule_selection: Arc<RuleSelection>,
+        lint_registry: Option<Arc<LintRegistry>>,
         analysis_settings: Arc<AnalysisSettings>,
         open_files: rustc_hash::FxHashSet<File>,
         program_settings: ProgramSettings,
@@ -180,6 +181,7 @@ pub(crate) mod tests {
                 events,
                 files: Files::default(),
                 rule_selection: Arc::new(RuleSelection::from_registry(default_lint_registry())),
+                lint_registry: None,
                 analysis_settings: AnalysisSettings::default().into(),
                 open_files: rustc_hash::FxHashSet::default(),
                 program_settings,
@@ -338,7 +340,9 @@ pub(crate) mod tests {
         }
 
         fn lint_registry(&self) -> &LintRegistry {
-            default_lint_registry()
+            self.lint_registry
+                .as_deref()
+                .unwrap_or_else(|| default_lint_registry())
         }
 
         fn analysis_settings(&self, _file: File) -> &AnalysisSettings {
@@ -381,6 +385,7 @@ pub(crate) mod tests {
         /// Whether module resolution should include packages from the synthetic virtual environment.
         third_party_packages: bool,
         rule_selection: Option<RuleSelection>,
+        lint_registry: Option<LintRegistry>,
         call_result_provider: Option<CallResultProvider>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
@@ -395,6 +400,7 @@ pub(crate) mod tests {
                 files: vec![],
                 third_party_packages: false,
                 rule_selection: None,
+                lint_registry: None,
                 call_result_provider: None,
                 source_provider: None,
             }
@@ -422,6 +428,11 @@ pub(crate) mod tests {
 
         pub(crate) fn with_rule_selection(mut self, selection: RuleSelection) -> Self {
             self.rule_selection = Some(selection);
+            self
+        }
+
+        pub(crate) fn with_lint_registry(mut self, registry: LintRegistry) -> Self {
+            self.lint_registry = Some(registry);
             self
         }
 
@@ -460,6 +471,11 @@ pub(crate) mod tests {
             let mut db = TestDb::new(self.vendored);
             db.call_result_provider = self.call_result_provider;
             db.source_provider = self.source_provider;
+
+            if let Some(registry) = self.lint_registry {
+                db.rule_selection = Arc::new(RuleSelection::from_registry(&registry));
+                db.lint_registry = Some(Arc::new(registry));
+            }
 
             if let Some(selection) = self.rule_selection {
                 db.rule_selection = Arc::new(selection);
