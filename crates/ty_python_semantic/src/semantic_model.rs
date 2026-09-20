@@ -28,7 +28,10 @@ use crate::place_load::{
 };
 use crate::provided::{BuiltinUsage, ProvidedBindingValue};
 use crate::types::ide_support::{ImportAliasResolution, definition_for_name};
-use crate::types::list_members::{all_members, all_reachable_members};
+pub use crate::types::list_members::ObjectMembers;
+use crate::types::list_members::{
+    all_members, all_members_with_object_policy, all_reachable_members,
+};
 use crate::types::{
     CycleDetector, ProgramEnvironment, SpecialFormType, Type, TypeQualifiers, binding_type,
     infer_complete_scope_types, infer_definition_types, inferred_declaration,
@@ -362,12 +365,20 @@ impl<'db> SemanticModel<'db> {
 
     /// Returns completions for symbols available in a `object.<CURSOR>` context.
     pub fn attribute_completions(&self, node: &ast::ExprAttribute) -> Vec<Completion<'db>> {
-        let db = self.db;
         let Some(ty) = node.value.inferred_type(self) else {
             return Vec::new();
         };
 
-        all_members(db, &self.program_environment(), ty)
+        self.member_completions(ty, ObjectMembers::Include)
+    }
+
+    /// Returns members of an already inferred receiver, including incomplete attribute syntax.
+    pub fn member_completions(
+        &self,
+        ty: Type<'db>,
+        object_members: ObjectMembers,
+    ) -> Vec<Completion<'db>> {
+        all_members_with_object_policy(self.db, &self.program_environment(), ty, object_members)
             .into_iter()
             .map(|member| Completion {
                 name: CompactString::new(member.name),
@@ -1272,11 +1283,47 @@ impl HasType for ast::ExceptHandlerExceptHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::ObjectMembers;
     use crate::db::tests::TestDbBuilder;
     use crate::{Db as _, HasType, SemanticModel};
     use ruff_db::files::system_path_to_file;
     use ruff_db::parsed::parsed_module;
     use ty_python_core::ProgramFile;
+
+    #[test]
+    fn member_completion_can_exclude_object_declarations() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new()
+            .with_file(
+                "/src/main.py",
+                "class A:\n    __explicit__: int\nclass B:\n    __explicit__: str\ndef use(value: A | B): ...\n",
+            )
+            .build()?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, file);
+        let [
+            ruff_python_ast::Stmt::ClassDef(class),
+            _,
+            ruff_python_ast::Stmt::FunctionDef(function),
+        ] = module.suite().as_slice()
+        else {
+            panic!("expected two classes and a function");
+        };
+        let [parameter] = function.parameters.args.as_slice() else {
+            panic!("expected one parameter");
+        };
+        for ty in [
+            class.inferred_type(&model).unwrap(),
+            parameter.parameter.inferred_type(&model).unwrap(),
+        ] {
+            let included = model.member_completions(ty, ObjectMembers::Include);
+            assert!(included.iter().any(|member| member.name == "__eq__"));
+            let excluded = model.member_completions(ty, ObjectMembers::Exclude);
+            assert!(excluded.iter().all(|member| member.name != "__eq__"));
+            assert!(excluded.iter().any(|member| member.name == "__explicit__"));
+        }
+        Ok(())
+    }
 
     #[test]
     fn inherited_completion_preserves_type_check_only() -> anyhow::Result<()> {
