@@ -2,8 +2,8 @@ use crate::Db;
 use crate::ProgramEnvironment;
 use crate::types::{
     AwaitError, Bindings, CallArguments, CallDunderError, KnownClass, LintDiagnosticGuard,
-    LintDiagnosticGuardBuilder, LiteralValueTypeKind, Type, TypeContext, TypeVarBoundOrConstraints,
-    UnionType,
+    LintDiagnosticGuardBuilder, LiteralValueTypeKind, MemberLookupPolicy, Type, TypeContext,
+    TypeVarBoundOrConstraints, UnionType,
     call::CallErrorKind,
     context::InferContext,
     diagnostic::NOT_ITERABLE,
@@ -127,6 +127,38 @@ pub(super) fn extract_literal_container_element_types<'db>(
         }
         _ => None,
     }
+}
+
+/// Whether the selected `str` declaration promises a sequence of strings.
+///
+/// Literal character precision relies on this base, which a custom typeshed can omit or specialize
+/// differently. Check the declared MRO directly so this guard does not recurse into type relations.
+pub(super) fn str_has_character_sequence_base<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+) -> bool {
+    let str_instance = KnownClass::Str.to_instance(db, env);
+    KnownClass::Sequence
+        .to_specialized_class_type(db, env, &[str_instance])
+        .is_some_and(|sequence| KnownClass::Str.is_subclass_of(db, env, sequence))
+}
+
+fn str_supports_literal_iteration<'db>(db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+    if !str_has_character_sequence_base(db, env) {
+        return false;
+    }
+    // A declared `__iter__: None` disables iteration even when `__getitem__` is available.
+    !KnownClass::Str
+        .to_instance(db, env)
+        .member_lookup_with_policy(
+            db,
+            env,
+            "__iter__",
+            MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+        )
+        .place
+        .ignore_possibly_undefined()
+        .is_some_and(|iter| iter.is_none(db))
 }
 
 /// Extract the element types from an expression with a statically known fixed-length iteration.
@@ -280,6 +312,9 @@ impl<'db> Type<'db> {
                         Some(Cow::Owned(spec))
                     }
                     LiteralValueTypeKind::String(string_literal_ty) => {
+                        if !str_supports_literal_iteration(db, env) {
+                            return None;
+                        }
                         let string_literal = string_literal_ty.value(db);
                         let spec = if string_literal.len() < MAX_TUPLE_LENGTH {
                             TupleSpec::heterogeneous(
@@ -293,9 +328,8 @@ impl<'db> Type<'db> {
                         Some(Cow::Owned(spec))
                     }
                     // N.B. This special case isn't strictly necessary, it's just an obvious optimization
-                    LiteralValueTypeKind::LiteralString => {
-                        Some(Cow::Owned(TupleSpec::homogeneous(ty)))
-                    }
+                    LiteralValueTypeKind::LiteralString => str_supports_literal_iteration(db, env)
+                        .then(|| Cow::Owned(TupleSpec::homogeneous(ty))),
                     _ => None,
                 },
                 Type::Never => {

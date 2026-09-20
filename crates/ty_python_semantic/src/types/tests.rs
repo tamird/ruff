@@ -7,12 +7,144 @@ use crate::{Db, ProgramEnvironment};
 use ruff_db::files::system_path_to_file;
 use ruff_db::system::DbWithWritableSystem as _;
 use ruff_db::testing::assert_function_query_was_not_run_by_name;
+use ruff_db::vendored::{VendoredFileSystemBuilder, VendoredPathBuf};
 use ruff_python_ast as ast;
 use ruff_python_ast::PythonVersion;
 use salsa::plumbing::AsId;
 use test_case::test_case;
 use ty_python_core::program::Program;
 use ty_python_core::{ProgramFile, TestProgramDb as _};
+use zip::CompressionMethod;
+
+/// Replace one declaration while retaining the support types from the standard typeshed.
+fn with_builtin_str(declaration: &str) -> anyhow::Result<TestDbBuilder<'static>> {
+    let vendored = ty_vendored::file_system();
+    let mut builtins = vendored.read_to_string("stdlib/builtins.pyi")?;
+    let parsed = ruff_python_parser::parse_module(&builtins)?;
+    let class = parsed
+        .suite()
+        .iter()
+        .filter_map(ast::Stmt::as_class_def_stmt)
+        .find(|class| class.name.as_str() == "str")
+        .expect("typeshed defines str");
+    let start = class
+        .decorator_list
+        .first()
+        .map_or(class.start(), Ranged::start);
+    builtins.replace_range(usize::from(start)..usize::from(class.end()), declaration);
+    let mut archive = VendoredFileSystemBuilder::new(CompressionMethod::Stored);
+    let mut directories = vec![VendoredPathBuf::from("")];
+    while let Some(directory) = directories.pop() {
+        for entry in vendored.read_directory(&directory) {
+            let path = entry.path();
+            if entry.file_type().is_directory() {
+                archive.add_directory(path)?;
+                directories.push(path.to_owned());
+            } else {
+                let content = if path.as_str() == "stdlib/builtins.pyi" {
+                    builtins.clone()
+                } else {
+                    vendored.read_to_string(path)?
+                };
+                archive.add_file(path, &content)?;
+            }
+        }
+    }
+    Ok(TestDbBuilder::new().with_vendored(archive.finish()?))
+}
+
+#[test_case("class str"; "without_sequence_base")]
+#[test_case("class str(Sequence[str])"; "with_sequence_base")]
+fn string_iteration_respects_disabled_dunder(class_header: &str) -> anyhow::Result<()> {
+    let declaration = format!(
+        "{class_header}:\n    __iter__: None\n    def __getitem__(self, index: int) -> str: ..."
+    );
+    let builder = with_builtin_str(&declaration)?;
+    let db = builder
+        .with_file(
+            "/src/check.py",
+            "from typing_extensions import LiteralString
+def check(value: str, literal: LiteralString):
+    for item in value: pass
+    for item in literal: pass
+    for item in 'ab': pass
+    first, second = 'ab'
+",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let diagnostics = crate::check_file_unwrap(&db, db.program_file(file));
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["not-iterable"; 4],
+        "{diagnostics:#?}",
+    );
+    Ok(())
+}
+
+#[test]
+fn string_literals_use_declared_base_and_iterator() -> anyhow::Result<()> {
+    let builder = with_builtin_str(
+        "class StringBase: ...
+class str(StringBase):
+    def __iter__(self) -> Iterator[int]: ...",
+    )?;
+    let db = builder.build()?;
+    let env = db.program_environment();
+    let str_instance = KnownClass::Str.to_instance(&db, &env);
+    let integer = KnownClass::Int.to_instance(&db, &env);
+    for ty in [Type::string_literal(&db, "ab"), Type::literal_string()] {
+        let elements = ty.try_iterate(&db, &env).unwrap();
+        assert_eq!(elements.homogeneous_element_type(&db, &env), integer);
+    }
+    let base = crate::place::builtins_symbol(&db, &env, "StringBase")
+        .place
+        .expect_type()
+        .to_instance_approximation(&db, &env)
+        .expect("StringBase is a class");
+    let sequence = KnownClass::Sequence.to_specialized_instance(&db, &env, &[str_instance]);
+    let literal = Type::string_literal(&db, "ab");
+    assert!(literal.is_assignable_to(&db, &env, base));
+    assert!(!literal.is_assignable_to(&db, &env, sequence));
+    Ok(())
+}
+
+#[test]
+fn string_literals_retain_additional_declared_bases() -> anyhow::Result<()> {
+    let builder =
+        with_builtin_str("class ExtraBase: ...\nclass str(Sequence[str], ExtraBase): ...")?;
+    let db = builder.build()?;
+    let env = db.program_environment();
+    let base = crate::place::builtins_symbol(&db, &env, "ExtraBase")
+        .place
+        .expect_type()
+        .to_instance_approximation(&db, &env)
+        .expect("ExtraBase is a class");
+    assert!(Type::string_literal(&db, "ab").is_assignable_to(&db, &env, base));
+    Ok(())
+}
+
+#[test]
+fn string_literal_precision_requires_string_sequence_elements() -> anyhow::Result<()> {
+    let builder = with_builtin_str(
+        "class str(Sequence[int]):\n    def __iter__(self) -> Iterator[int]: ...",
+    )?;
+    let db = builder.build()?;
+    let env = db.program_environment();
+    let integer = KnownClass::Int.to_instance(&db, &env);
+    let literal = Type::string_literal(&db, "ab");
+    let elements = literal.try_iterate(&db, &env).unwrap();
+    assert_eq!(elements.homogeneous_element_type(&db, &env), integer);
+    let integers = KnownClass::Sequence.to_specialized_instance(&db, &env, &[integer]);
+    let characters =
+        KnownClass::Sequence.to_specialized_instance(&db, &env, &[Type::string_literal(&db, "a")]);
+    assert!(literal.is_assignable_to(&db, &env, integers));
+    assert!(!literal.is_assignable_to(&db, &env, characters));
+    Ok(())
+}
 
 #[test]
 fn member_lookup_result_size() {
