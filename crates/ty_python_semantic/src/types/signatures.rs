@@ -51,6 +51,7 @@ use crate::types::{
     VarianceTerm, infer_complete_scope_types, todo_type,
 };
 use crate::{Db, FxOrderSet};
+use ruff_db::files::FileRange;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::{self as ast, name::Name};
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
@@ -5426,7 +5427,7 @@ impl<'db> Parameters<'db> {
                 let positional_parameter = |ty| {
                     Parameter::positional_only(None)
                         .with_annotated_type(ty)
-                        .with_definition(parameter.definition())
+                        .with_source(parameter.source.clone())
                         .with_source_parameter_index(parameter.source_parameter_index())
                 };
                 match tuple.as_ref() {
@@ -5451,7 +5452,7 @@ impl<'db> Parameters<'db> {
                         };
                         parameters.push(
                             variadic
-                                .with_definition(parameter.definition())
+                                .with_source(parameter.source.clone())
                                 .with_source_parameter_index(parameter.source_parameter_index()),
                         );
                         parameters
@@ -5601,7 +5602,7 @@ pub struct Parameter<'db> {
     /// synthesized signatures, this can point to the field or declaration that the synthesized
     /// parameter represents, such as a dataclass field or `TypedDict` item. IDE features use this to
     /// navigate from keyword arguments back to the declaration that defines the accepted keyword.
-    definition: Option<Definition<'db>>,
+    source: Option<ParameterSource<'db>>,
 
     /// Does the type of this parameter come from an explicit annotation, or was it inferred from
     /// the context, like `Unknown` for any normal un-annotated parameter, `Self` for the `self`
@@ -5621,6 +5622,14 @@ pub struct Parameter<'db> {
     source_parameter_index: Option<NonZeroU32>,
 
     kind: ParameterKind<'db>,
+}
+
+// Keep ordinary definitions inline. The uncommon source range is shared because parameter
+// specialization and variadic expansion clone provenance along with the parameter type.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+enum ParameterSource<'db> {
+    Definition(Definition<'db>),
+    Range(Arc<FileRange>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
@@ -5644,7 +5653,7 @@ impl<'db> Parameter<'db> {
     pub fn positional_only(name: Option<Name>) -> Self {
         Self {
             annotated_type: Type::unknown(),
-            definition: None,
+            source: None,
             inferred_annotation: true,
             annotation_kind: ParameterAnnotationKind::Normal,
             source_parameter_index: None,
@@ -5658,7 +5667,7 @@ impl<'db> Parameter<'db> {
     pub fn positional_or_keyword(name: Name) -> Self {
         Self {
             annotated_type: Type::unknown(),
-            definition: None,
+            source: None,
             inferred_annotation: true,
             annotation_kind: ParameterAnnotationKind::Normal,
             source_parameter_index: None,
@@ -5672,7 +5681,7 @@ impl<'db> Parameter<'db> {
     pub fn variadic(name: Name) -> Self {
         Self {
             annotated_type: Type::unknown(),
-            definition: None,
+            source: None,
             inferred_annotation: true,
             annotation_kind: ParameterAnnotationKind::Normal,
             source_parameter_index: None,
@@ -5683,7 +5692,7 @@ impl<'db> Parameter<'db> {
     pub fn keyword_only(name: Name) -> Self {
         Self {
             annotated_type: Type::unknown(),
-            definition: None,
+            source: None,
             inferred_annotation: true,
             annotation_kind: ParameterAnnotationKind::Normal,
             source_parameter_index: None,
@@ -5697,7 +5706,7 @@ impl<'db> Parameter<'db> {
     pub fn keyword_variadic(name: Name) -> Self {
         Self {
             annotated_type: Type::unknown(),
-            definition: None,
+            source: None,
             inferred_annotation: true,
             annotation_kind: ParameterAnnotationKind::Normal,
             source_parameter_index: None,
@@ -5761,7 +5770,26 @@ impl<'db> Parameter<'db> {
 
     /// Set the source definition represented by this parameter.
     pub(crate) fn with_definition(mut self, definition: Option<Definition<'db>>) -> Self {
-        self.definition = definition;
+        self.source = definition.map(ParameterSource::Definition);
+        self
+    }
+
+    /// Sets the source declaration represented by a synthesized parameter.
+    #[must_use]
+    pub fn with_source_range(mut self, source: FileRange) -> Self {
+        self.source = Some(ParameterSource::Range(Arc::new(source)));
+        self
+    }
+
+    pub(crate) fn source_range(&self) -> Option<FileRange> {
+        match self.source.as_ref()? {
+            ParameterSource::Definition(_) => None,
+            ParameterSource::Range(source) => Some(**source),
+        }
+    }
+
+    fn with_source(mut self, source: Option<ParameterSource<'db>>) -> Self {
+        self.source = source;
         self
     }
 
@@ -5797,7 +5825,7 @@ impl<'db> Parameter<'db> {
                 tcx,
                 visitor,
             ),
-            definition: self.definition,
+            source: self.source.clone(),
             kind: self
                 .kind
                 .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
@@ -5822,7 +5850,7 @@ impl<'db> Parameter<'db> {
 
         Self {
             annotated_type,
-            definition: self.definition,
+            source: self.source.clone(),
             inferred_annotation: self.inferred_annotation,
             annotation_kind: self.annotation_kind,
             source_parameter_index: self.source_parameter_index,
@@ -5839,7 +5867,7 @@ impl<'db> Parameter<'db> {
     ) -> Option<Self> {
         let Parameter {
             annotated_type,
-            definition,
+            source,
             annotation_kind,
             inferred_annotation,
             source_parameter_index,
@@ -5873,7 +5901,7 @@ impl<'db> Parameter<'db> {
 
         Some(Self {
             annotated_type,
-            definition: *definition,
+            source: source.clone(),
             inferred_annotation: *inferred_annotation,
             annotation_kind: *annotation_kind,
             source_parameter_index: *source_parameter_index,
@@ -5888,7 +5916,9 @@ impl<'db> Parameter<'db> {
         kind: ParameterKind<'db>,
     ) -> Self {
         let index = semantic_index(db, function_definition.program_file(db));
-        let definition = Some(index.expect_single_definition(parameter));
+        let source = Some(ParameterSource::Definition(
+            index.expect_single_definition(parameter),
+        ));
 
         let (annotated_type, inferred_annotation, annotation_flags, has_starred_annotation) =
             if let Some(annotation) = SourceAnnotation::new(
@@ -5927,7 +5957,7 @@ impl<'db> Parameter<'db> {
         };
         Self {
             annotated_type,
-            definition,
+            source,
             inferred_annotation,
             annotation_kind,
             source_parameter_index: None,
@@ -6002,7 +6032,10 @@ impl<'db> Parameter<'db> {
 
     /// Returns the source definition represented by this parameter, if any.
     pub(crate) fn definition(&self) -> Option<Definition<'db>> {
-        self.definition
+        match self.source.as_ref()? {
+            ParameterSource::Definition(definition) => Some(*definition),
+            ParameterSource::Range(_) => None,
+        }
     }
 
     /// Return `true` if this parameter has an unpacked variadic annotation,
@@ -6367,6 +6400,61 @@ mod tests {
                 "source-backed parameter should have a definition"
             );
         }
+    }
+
+    #[test]
+    fn supplied_parameter_source_survives_specialization_and_variadic_expansion() {
+        let mut db = setup_db();
+        db.write_dedented("/src/a.py", "def f[T](args: tuple[T, T]) -> T: ...")
+            .unwrap();
+        let file = ruff_db::files::system_path_to_file(&db, "/src/a.py").unwrap();
+        let source = FileRange::new(file, ruff_text_size::TextRange::default());
+        let signature = get_function_f(&db, "/src/a.py")
+            .literal(&db)
+            .last_definition
+            .signature(&db);
+        let generic_context = signature.generic_context.unwrap();
+        let parameter = Parameter::variadic(Name::new_static("args"))
+            .with_annotated_type(signature.parameters[0].annotated_type())
+            .with_starred_annotation()
+            .with_source_range(source);
+        let signature = Signature {
+            parameters: Parameters::standard([parameter]),
+            ..signature
+        };
+        let specialized = CallableSignature::single(signature).apply_type_mapping_impl(
+            &db,
+            &TypeMapping::ApplySpecialization(ApplySpecialization::specialization(
+                generic_context.identity_specialization(&db),
+            )),
+            TypeContext::default(),
+            &ApplyTypeMappingVisitor::new(&db.program_environment()),
+        );
+        let [signature] = specialized.overloads.as_slice() else {
+            panic!("expected one signature: {specialized:?}");
+        };
+        let parameters = signature.parameters();
+        assert_eq!(parameters.len(), 2);
+        for parameter in parameters {
+            assert_eq!(parameter.source_range(), Some(source));
+            assert_eq!(parameter.definition(), None);
+        }
+        let callable = Type::function_like_callable(&db, signature.clone());
+        let other_source = FileRange::new(file, ruff_text_size::TextRange::new(1.into(), 2.into()));
+        let other = Type::function_like_callable(
+            &db,
+            Signature {
+                parameters: Parameters::standard(
+                    parameters
+                        .iter()
+                        .cloned()
+                        .map(|parameter| parameter.with_source_range(other_source)),
+                ),
+                ..signature.clone()
+            },
+        );
+        assert_ne!(callable, other);
+        assert!(callable.is_equivalent_to(&db, &db.program_environment(), other));
     }
 
     #[test]

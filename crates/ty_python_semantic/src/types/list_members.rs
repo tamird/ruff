@@ -687,7 +687,12 @@ impl<'db> AllMembers<'db> {
             .as_ref()
             .filter(|_| include_instance_fields)
             .map_or([].as_slice(), |fields| fields.fields.as_ref());
-        for (name, _) in class.members(db).iter().chain(instance_fields) {
+        for name in class
+            .members(db)
+            .iter()
+            .map(|(name, _)| name)
+            .chain(instance_fields.iter().map(|field| &field.name))
+        {
             let Some(member_type) = ty.member(db, env, name).place.ignore_possibly_undefined()
             else {
                 continue;

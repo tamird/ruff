@@ -872,9 +872,12 @@ pub fn definitions_for_keyword_argument<'db>(
         for signature in callables.signatures(db) {
             if let Some((_param_index, param)) =
                 signature.parameters().keyword_by_name(keyword_name_str)
-                && let Some(definition) = param.definition()
             {
-                resolved_definitions.push(ResolvedDefinition::Definition(definition));
+                if let Some(definition) = param.definition() {
+                    resolved_definitions.push(ResolvedDefinition::Definition(definition));
+                } else if let Some(source) = param.source_range() {
+                    resolved_definitions.push(ResolvedDefinition::FileWithRange(source));
+                }
             }
         }
     }
@@ -1713,10 +1716,13 @@ pub fn inlay_hint_call_argument_details<'db>(
             continue;
         };
 
-        let parameter_label_offset = param.definition().map(|definition| {
-            let module = parsed_module(db, definition.python_file(db)).load(db);
-            definition.focus_range(db, &module)
-        });
+        let parameter_label_offset = param
+            .definition()
+            .map(|definition| {
+                let module = parsed_module(db, definition.python_file(db)).load(db);
+                definition.focus_range(db, &module)
+            })
+            .or_else(|| param.source_range());
 
         // Only add hints for parameters that can be specified by name
         if !param.is_positional_only() && !param.is_variadic() && !param.is_keyword_variadic() {
