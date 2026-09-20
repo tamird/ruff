@@ -114,6 +114,7 @@ use crate::types::newtype::NewType;
 use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::signatures::{CallableSignature, ReturnCallableTypeVarScope};
 use crate::types::special_form::TypeQualifier;
+use crate::types::string_annotation::SourceAnnotation;
 use crate::types::subclass_of::SubclassOfInner;
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
 use crate::types::tuple::{Tuple, TupleLength, TupleSpecBuilder, TupleType, VariableSegment};
@@ -1232,6 +1233,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 .is_typealias_special_form() =>
                     {
                         self.implicit_aliases.insert(definition);
+                    }
+                    DefinitionKind::Assignment(assignment) => {
+                        let Some(annotation) = SourceAnnotation::new(
+                            self.db(),
+                            self.program_file(),
+                            assignment.target(self.module()),
+                            None,
+                        ) else {
+                            continue;
+                        };
+                        let Some(expression) = annotation.expression() else {
+                            continue;
+                        };
+                        if self.expression_type(expression).is_typealias_special_form() {
+                            self.implicit_aliases.insert(definition);
+                        }
                     }
                     _ => {}
                 }
@@ -3437,6 +3454,42 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) {
         let target = assignment.target(self.module());
 
+        if assignment.unpack().is_none()
+            && target.is_name_expr()
+            && let Some(annotation) =
+                SourceAnnotation::new(self.db(), self.program_file(), target, None)
+        {
+            if let Some((expression, state)) = self.annotation_expression(&annotation) {
+                self.setup_dataclass_field_specifiers();
+                let declared = self.infer_annotation_expression_allow_pep_613(expression, state);
+                self.dataclass_field_specifiers.clear();
+                self.infer_assignment_with_annotation(
+                    definition,
+                    target,
+                    Some(assignment.value(self.module())),
+                    expression,
+                    declared,
+                    assignment.owner(),
+                );
+            } else {
+                let inferred_ty = self.infer_maybe_standalone_expression_with_bindings_owner(
+                    assignment.value(self.module()),
+                    TypeContext::default(),
+                    assignment.owner(),
+                );
+                self.add_declaration_with_binding(
+                    target.into(),
+                    definition,
+                    &DeclaredAndInferredType::MightBeDifferent {
+                        declared_ty: TypeAndQualifiers::declared(Type::unknown()),
+                        inferred_ty,
+                    },
+                );
+                self.store_expression_type(target, inferred_ty);
+            }
+            return;
+        }
+
         let add = self.add_binding(target.into(), definition);
         let target_ty =
             self.infer_assignment_definition_impl(assignment, definition, add.type_context());
@@ -3477,16 +3530,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 let value_ty = if let Some(standalone_expression) = self.index.try_expression(value)
                 {
-                    let inference = infer_expression_types(self.db(), standalone_expression, tcx);
-                    match assignment.owner() {
-                        BindingsOwner::Definition => {
-                            self.extend_expression(inference);
-                        }
-                        BindingsOwner::Statement => {
-                            self.extend_expression_without_bindings(inference);
-                        }
-                    }
-                    inference.expression_type(value)
+                    self.infer_standalone_expression_impl(
+                        value,
+                        standalone_expression,
+                        tcx,
+                        assignment.owner(),
+                    )
                 } else if let ast::Expr::Call(call_expr) = value {
                     // If the RHS is not a standalone expression, this is a simple assignment
                     // (single target, no unpackings). That means it's a valid syntactic form
@@ -4484,7 +4533,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         definition: Definition<'db>,
     ) {
         let db = self.db();
-        let env = self.program_environment();
         let target = assignment.target(self.module());
         let value = assignment.value(self.module());
 
@@ -4522,7 +4570,29 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let annotation = assignment.annotation(self.module());
-        let mut declared = self.infer_annotated_assignment_annotation(assignment);
+        let declared = self.infer_annotated_assignment_annotation(assignment);
+        self.infer_assignment_with_annotation(
+            definition,
+            target,
+            value,
+            annotation,
+            declared,
+            BindingsOwner::Definition,
+        );
+    }
+
+    /// Apply the same declaration validation and binding rules to native and supplied annotations.
+    fn infer_assignment_with_annotation(
+        &mut self,
+        definition: Definition<'db>,
+        target: &ast::Expr,
+        value: Option<&ast::Expr>,
+        annotation: &ast::Expr,
+        mut declared: TypeAndQualifiers<'db>,
+        bindings_owner: BindingsOwner,
+    ) {
+        let db = self.db();
+        let env = self.program_environment();
 
         // P.args and P.kwargs are only valid as annotations on *args and **kwargs,
         // not as variable annotations. Check both resolved type and AST form.
@@ -4745,9 +4815,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // RHS (`list[T] | None`), in order to bind `T` to `OptionalList`.
             let previous_typevar_binding_context = self.typevar_binding_context.replace(definition);
 
-            let inferred_ty = self.infer_maybe_standalone_expression(
+            let tcx = TypeContext::new(Some(declared.inner_type()));
+            let inferred_ty = self.infer_maybe_standalone_expression_with_bindings_owner(
                 value,
-                TypeContext::new(Some(declared.inner_type())),
+                tcx,
+                bindings_owner,
             );
             let inferred_ty = if is_pep_613_type_alias && target.is_name_expr() {
                 // Alias type inference emits the diagnostic, but this runtime value is
@@ -6436,8 +6508,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expression: &ast::Expr,
         tcx: TypeContext<'db>,
     ) -> Type<'db> {
+        self.infer_maybe_standalone_expression_with_bindings_owner(
+            expression,
+            tcx,
+            BindingsOwner::Definition,
+        )
+    }
+
+    fn infer_maybe_standalone_expression_with_bindings_owner(
+        &mut self,
+        expression: &ast::Expr,
+        tcx: TypeContext<'db>,
+        bindings_owner: BindingsOwner,
+    ) -> Type<'db> {
         if let Some(standalone_expression) = self.index.try_expression(expression) {
-            self.infer_standalone_expression_impl(expression, standalone_expression, tcx)
+            self.infer_standalone_expression_impl(
+                expression,
+                standalone_expression,
+                tcx,
+                bindings_owner,
+            )
         } else {
             self.infer_expression(expression, tcx)
         }
@@ -6503,7 +6593,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         tcx: TypeContext<'db>,
     ) -> Type<'db> {
         let standalone_expression = self.index.expression(expression);
-        self.infer_standalone_expression_impl(expression, standalone_expression, tcx)
+        self.infer_standalone_expression_impl(
+            expression,
+            standalone_expression,
+            tcx,
+            BindingsOwner::Definition,
+        )
     }
 
     fn infer_standalone_expression_impl(
@@ -6511,9 +6606,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expression: &ast::Expr,
         standalone_expression: Expression<'db>,
         tcx: TypeContext<'db>,
+        bindings_owner: BindingsOwner,
     ) -> Type<'db> {
         let types = infer_expression_types(self.db(), standalone_expression, tcx);
-        self.extend_expression(types);
+        match bindings_owner {
+            BindingsOwner::Definition => self.extend_expression(types),
+            BindingsOwner::Statement => self.extend_expression_without_bindings(types),
+        }
 
         // Instead of calling `self.expression_type(expr)` after extending here, we get
         // the result from `types` directly because we might be in cycle recovery where

@@ -1802,6 +1802,19 @@ fn assignment_declaration_annotation<'db>(
     declaration: Option<Definition<'db>>,
 ) -> Option<AssignmentDeclarationAnnotation> {
     let db = context.db();
+    if let DefinitionKind::Assignment(assignment) = definition_kind
+        && let Some(range) = crate::types::string_annotation::SourceAnnotation::source_range(
+            db,
+            context.program_file(),
+            assignment.target(context.module()),
+            None,
+        )
+    {
+        return Some(AssignmentDeclarationAnnotation {
+            range,
+            declaration_kind: DeclarationKind::Regular,
+        });
+    }
     let declaration_definition_kind =
         if matches!(definition_kind, DefinitionKind::AnnotatedAssignment(_)) {
             definition_kind
@@ -1823,6 +1836,15 @@ fn assignment_declaration_annotation<'db>(
             assignment.annotation(context.module()).range(),
             DeclarationKind::Regular,
         )),
+        DefinitionKind::Assignment(assignment) => {
+            crate::types::string_annotation::SourceAnnotation::source_range(
+                db,
+                context.program_file(),
+                assignment.target(context.module()),
+                None,
+            )
+            .map(|range| (range, DeclarationKind::Regular))
+        }
         DefinitionKind::Parameter(ParameterDefinitionNodeKind::Parameter(parameter)) => {
             parameter_annotation(
                 &parameter.node(context.module()).parameter,
@@ -1850,7 +1872,6 @@ fn assignment_declaration_annotation<'db>(
         | DefinitionKind::Class(_)
         | DefinitionKind::TypeAlias(_)
         | DefinitionKind::NamedExpression(_)
-        | DefinitionKind::Assignment(_)
         | DefinitionKind::AugmentedAssignment(_)
         | DefinitionKind::DictKeyAssignment(_)
         | DefinitionKind::For(_)

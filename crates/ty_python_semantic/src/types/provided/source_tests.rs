@@ -2,12 +2,16 @@ use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_db::system::DbWithWritableSystem as _;
+use ruff_db::testing::assert_function_query_was_not_run;
 use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex};
 use ruff_text_size::{Ranged, TextRange, TextSize};
+use ty_python_core::Db as _;
 use ty_python_core::definition::{Definition, DefinitionKind, ProvidedBinding, ProvidedStatement};
+use ty_python_core::semantic_index;
 
 use super::*;
 use crate::ProgramEnvironment;
+use crate::SemanticModel;
 use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
 use crate::types::KnownClass;
 
@@ -45,7 +49,7 @@ fn semantic_namespaces_share_python_support_types() -> anyhow::Result<()> {
 }
 
 /// A deliberately small source adapter: `include("name")` exports a native declaration,
-/// and a comment following a function header supplies its parameter and return types.
+/// and trailing comments supply assignment, parameter, and return annotations.
 struct CommentedSource;
 
 impl SourceProvider for CommentedSource {
@@ -91,6 +95,19 @@ impl SourceProvider for CommentedSource {
         let module = parsed_module(db, file.python_file(db)).load(db);
         let source = source_text(db, file.file(db));
         for statement in module.suite() {
+            if let ast::Stmt::Assign(assignment) = statement
+                && assignment
+                    .targets
+                    .iter()
+                    .any(|target| target.node_index().load() == owner)
+            {
+                let tail = source[usize::from(assignment.value.end())..]
+                    .lines()
+                    .next()?;
+                let marker = tail.find("# ")?;
+                let start = assignment.value.end() + TextSize::try_from(marker + 2).unwrap();
+                return Some(TextRange::at(start, TextSize::of(&tail[marker + 2..])));
+            }
             let ast::Stmt::FunctionDef(function) = statement else {
                 continue;
             };
@@ -253,6 +270,92 @@ fn supplied_declarations_follow_source_and_export_edits() -> anyhow::Result<()> 
 }
 
 #[test]
+fn function_annotation_hover_uses_the_owning_signature_scope() -> anyhow::Result<()> {
+    for (source, generic) in [
+        (
+            "def identity(value): # (list[Scalar]) -> list[Scalar]\n    return value\n",
+            false,
+        ),
+        (
+            "def identity[T](value): # (list[T]) -> list[T]\n    return value\n",
+            true,
+        ),
+    ] {
+        let db = TestDbBuilder::new()
+            .with_file("/src/main.py", source)
+            .with_file("/src/native.pyi", "Scalar = int\nsentinel: str\n")
+            .with_source_provider(CommentedSource)
+            .build()?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let function = module.suite()[0].as_function_def_stmt().unwrap();
+        let parameter = &function.parameters.args[0].parameter;
+        let model = SemanticModel::new(&db, file);
+        let env = model.program_environment();
+        for owner in [function.node_index().load(), parameter.node_index().load()] {
+            let range = db.provided_annotation(file, owner).unwrap();
+            let element = model
+                .provided_annotation_type_at(owner, range.start() + TextSize::new(5))
+                .unwrap();
+            if generic {
+                assert!(matches!(element, Type::TypeVar(_)), "{element:?}");
+            } else {
+                assert_eq!(element, KnownClass::Int.to_instance(&db, &env));
+            }
+            assert_eq!(
+                model.provided_annotation_type_at(owner, range.end()),
+                Some(KnownClass::List.to_specialized_instance(&db, &env, &[element])),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn nested_supplied_annotations_follow_source_edits() -> anyhow::Result<()> {
+    let source = "def identity(value): # (list[\"Scalar\"]) -> list[\"Scalar\"]\n    return value\nitems = [] # list[\"Scalar\"]\n";
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", source)
+        .with_file("/src/native.pyi", "Scalar = int\n")
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (prefix, name, expected) in [
+        ("", "int", KnownClass::Int),
+        ("", "str", KnownClass::Str),
+        ("# moved\n", "str", KnownClass::Str),
+        ("", "int", KnownClass::Int),
+    ] {
+        db.write_file("/src/main.py", format!("{prefix}{source}"))?;
+        db.write_file("/src/native.pyi", format!("Scalar = {name}\n"))?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let file = db.program_file(file);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let function = module.suite()[0].as_function_def_stmt().unwrap();
+        let assignment = module.suite()[1].as_assign_stmt().unwrap();
+        let model = SemanticModel::new(&db, file);
+        for owner in [
+            function.node_index().load(),
+            function.parameters.args[0].parameter.node_index().load(),
+            assignment.targets[0].node_index().load(),
+        ] {
+            let range = db.provided_annotation(file, owner).unwrap();
+            let env = model.program_environment();
+            assert_eq!(
+                model.provided_annotation_type_at(owner, range.end()),
+                Some(KnownClass::List.to_specialized_instance(
+                    &db,
+                    &env,
+                    &[expected.to_instance(&db, &env)],
+                )),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_builtin_usage_selects_the_declaration() -> anyhow::Result<()> {
     let db = TestDbBuilder::new()
         .with_file(
@@ -265,5 +368,196 @@ fn supplied_builtin_usage_selects_the_declaration() -> anyhow::Result<()> {
     let file = system_path_to_file(&db, "/src/main.py")?;
     let diagnostics = db.check_file(file);
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn supplied_assignment_annotations_contextualize_and_constrain_bindings() -> anyhow::Result<()> {
+    let source = "items = [] # list[Scalar]\nitems.append('wrong')\nitems = ['wrong']\nruntime = Scalar # str\n";
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", source)
+        .with_file("/src/native.pyi", "Scalar = int\nsentinel: str\n")
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    let mut ids = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.id().as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["invalid-argument-type", "invalid-assignment"],
+        "{diagnostics:#?}"
+    );
+
+    let annotation_start = TextSize::try_from(source.find("list[Scalar]").unwrap())?;
+    let annotation_range = TextRange::at(annotation_start, TextSize::of("list[Scalar]"));
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.id().as_str() == "invalid-assignment"
+                && diagnostic
+                    .secondary_annotations()
+                    .any(|annotation| annotation.get_span().range() == Some(annotation_range))
+        }),
+        "{diagnostics:#?}"
+    );
+
+    let file = db.program_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let assignment = module.suite()[0].as_assign_stmt().unwrap();
+    let owner = assignment.targets[0].node_index().load();
+    let model = SemanticModel::new(&db, file);
+    let env = model.program_environment();
+    assert_eq!(
+        model.provided_annotation_type_at(owner, annotation_start + TextSize::new(1)),
+        Some(KnownClass::List.to_class_literal(&db, &env)),
+    );
+    assert_eq!(
+        model.provided_annotation_type_at(owner, annotation_range.end()),
+        Some(KnownClass::List.to_specialized_instance(
+            &db,
+            &env,
+            &[KnownClass::Int.to_instance(&db, &env)],
+        )),
+    );
+    assert_eq!(
+        model.provided_annotation_type_at(owner, annotation_start + TextSize::new(6)),
+        Some(KnownClass::Int.to_instance(&db, &env)),
+    );
+
+    db.write_file("/src/main.py", source.replace("list[Scalar]", "list[str]"))?;
+    let diagnostics = db.check_file(system_path_to_file(&db, "/src/main.py")?);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn assignment_annotation_hover_does_not_infer_an_unrelated_initializer() -> anyhow::Result<()> {
+    let source = "items = [] # list[int]\nunrelated = missing\n";
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", source)
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    db.clear_salsa_events();
+    {
+        let file = db.program_file(file);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let assignment = module.suite()[0].as_assign_stmt().unwrap();
+        let owner = assignment.targets[0].node_index().load();
+        let model = SemanticModel::new(&db, file);
+        let offset = TextSize::try_from(source.find("int").unwrap())?;
+        assert_eq!(
+            model.provided_annotation_type_at(owner, offset),
+            Some(KnownClass::Int.to_instance(&db, &model.program_environment())),
+        );
+    }
+    let events = db.take_salsa_events();
+    let file = db.program_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let assignment = module.suite()[1].as_assign_stmt().unwrap();
+    let target = assignment.targets[0].as_name_expr().unwrap();
+    let definition = semantic_index(&db, file).expect_single_definition(target);
+    assert_function_query_was_not_run(
+        &db,
+        crate::types::infer_definition_types,
+        definition,
+        &events,
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_assignment_qualifiers_use_native_validation() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            "from typing import Final, ClassVar\nx = 1 # Final[int]\nx = 2\ny = 1 # ClassVar[int]\n",
+        )
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    let mut ids = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.id().as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["invalid-assignment", "invalid-type-form"],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_assignment_aliases_use_native_validation() -> anyhow::Result<()> {
+    for source in [
+        "from typing import TypeAlias\nBad: TypeAlias = 1\n",
+        "from typing import TypeAlias\nBad = 1 # TypeAlias\n",
+    ] {
+        let db = TestDbBuilder::new()
+            .with_file("/src/main.py", source)
+            .with_source_provider(CommentedSource)
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            ["invalid-type-form"],
+            "{source}\n{diagnostics:#?}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_assignment_type_checking_validation_runs_once() -> anyhow::Result<()> {
+    for source in [
+        "TYPE_CHECKING: bool = True\n",
+        "TYPE_CHECKING = True # bool\n",
+    ] {
+        let db = TestDbBuilder::new()
+            .with_file("/src/main.py", source)
+            .with_source_provider(CommentedSource)
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            ["invalid-type-checking-constant"],
+            "{source}\n{diagnostics:#?}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_assignment_annotation_still_checks_the_value() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/main.py", "value = missing # list[\n")
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    let mut ids = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.id().as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["invalid-type-form", "unresolved-reference"],
+        "{diagnostics:#?}"
+    );
     Ok(())
 }

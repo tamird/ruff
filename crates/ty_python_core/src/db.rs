@@ -12,8 +12,9 @@ pub trait Db: ModuleResolverDb {
     /// Returns `true` if the file should be checked.
     fn should_check_file(&self, file: File) -> bool;
 
-    /// Supplies the range of a function annotation outside its ordinary AST slot.
-    /// `owner` is a function node for a return annotation, or a parameter node for its type.
+    /// Supplies the range of a type annotation outside its ordinary AST slot.
+    /// `owner` is a function node for a return annotation, a parameter node for its type,
+    /// or a simple name assignment target for that target's declared type.
     /// The range refers to the same physical source and must identify one type expression.
     /// Implementations must read tracked syntax inputs without requesting this file's index.
     fn provided_annotation(

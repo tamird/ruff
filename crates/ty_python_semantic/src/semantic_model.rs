@@ -3,12 +3,12 @@ use ruff_db::PythonFile;
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::{parsed_module, parsed_string_annotation};
 use ruff_db::source::{line_index, source_text};
-use ruff_python_ast::find_node::CoveringNode;
-use ruff_python_ast::{self as ast, ExprStringLiteral, ModExpression};
+use ruff_python_ast::find_node::{CoveringNode, covering_node};
+use ruff_python_ast::{self as ast, ExprStringLiteral, ModExpression, NodeIndex};
 use ruff_python_ast::{Expr, ExprRef, name::Name};
 use ruff_python_parser::Parsed;
 use ruff_source_file::LineIndex;
-use ruff_text_size::Ranged;
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{
     ImportingFile, KnownModule, Module, ModuleName, list_modules, resolve_module,
@@ -19,14 +19,14 @@ use crate::Db;
 use crate::place::definitions::DefinitionResolution;
 use crate::place::implicit_globals::all_implicit_module_globals;
 use crate::place::{
-    builtins_module_scope, class_body_implicit_symbol, implicit_builtins_symbol_source,
-    loop_header_reachability, place_from_bindings,
+    builtins_module_scope, class_body_implicit_symbol, implicit_builtins_symbol,
+    implicit_builtins_symbol_source, loop_header_reachability, place_from_bindings,
 };
 use crate::place_load::{
     ImplicitPlaceLoad, PlaceLoadMode, PlaceLoadResolutionStep, PlaceLoadSourceKind,
     resolve_place_load,
 };
-use crate::provided::ProvidedBindingValue;
+use crate::provided::{BuiltinUsage, ProvidedBindingValue};
 use crate::types::ide_support::{ImportAliasResolution, definition_for_name};
 use crate::types::list_members::{all_members, all_reachable_members};
 use crate::types::{
@@ -34,6 +34,7 @@ use crate::types::{
     infer_complete_scope_types, infer_definition_types, inferred_declaration,
     is_discarded_dict_key_assignment,
 };
+use crate::types::{SourceAnnotation, function_signature_annotation_info};
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::place::PlaceExpr;
 use ty_python_core::place_table;
@@ -92,6 +93,59 @@ impl<'db> SemanticModel<'db> {
 
     pub fn program_environment(&self) -> ProgramEnvironment<'db> {
         ProgramEnvironment::from_file(self.program_file())
+    }
+
+    /// Returns the inferred value of a binding, including application-supplied source bindings.
+    pub fn definition_type(&self, definition: Definition<'db>) -> Type<'db> {
+        binding_type(self.db, definition)
+    }
+
+    /// Looks up a builtin without consulting local bindings.
+    pub fn builtin_type(&self, name: &str, usage: BuiltinUsage) -> Option<Type<'db>> {
+        implicit_builtins_symbol(self.db, &self.program_environment(), name, usage)
+            .place
+            .ignore_possibly_undefined()
+    }
+
+    /// Returns the type at `offset` in an application-supplied annotation.
+    ///
+    /// The annotation is read from its owning declaration's inference result. `owner` must be
+    /// the canonical node used by [`ty_python_core::Db::provided_annotation`] in this file.
+    pub fn provided_annotation_type_at(
+        &self,
+        owner: NodeIndex,
+        offset: TextSize,
+    ) -> Option<Type<'db>> {
+        let module = parsed_module(self.db, self.python_file()).load(self.db);
+        let owner = module.get_by_index(owner);
+        let annotation = SourceAnnotation::new(self.db, self.file, owner, None)?;
+        let expression = annotation.expression()?;
+        let range = TextRange::empty(offset);
+        if !expression.range().contains_range(range) {
+            return None;
+        }
+        let node = covering_node(expression.into(), range);
+        let expression = node.node().as_expr_ref()?;
+        let index = semantic_index(self.db, self.file);
+        let function = match owner {
+            ast::AnyRootNodeRef::Stmt(statement) => {
+                let ast::Stmt::FunctionDef(function) = statement else {
+                    return None;
+                };
+                index.try_definition(function)?
+            }
+            ast::AnyRootNodeRef::Parameter(parameter) => {
+                let definition = index.try_definition(parameter)?;
+                let function = definition.scope(self.db).node(self.db).as_function()?;
+                index.try_definition(function.node(&module))?
+            }
+            ast::AnyRootNodeRef::Expr(owner) => {
+                let definition = index.try_definition(owner.as_name_expr()?)?;
+                return infer_definition_types(self.db, definition).try_expression_type(expression);
+            }
+            _ => return None,
+        };
+        function_signature_annotation_info(self.db, function, expression).0
     }
 
     pub fn file_path(&self) -> &FilePath {
@@ -1175,7 +1229,7 @@ macro_rules! impl_binding_has_ty_def {
             #[inline]
             fn inferred_type<'db>(&self, model: &SemanticModel<'db>) -> Option<Type<'db>> {
                 let binding = HasDefinition::definition(self, model);
-                Some(binding_type(model.db(), binding))
+                Some(model.definition_type(binding))
             }
         }
     };
@@ -1196,10 +1250,7 @@ impl HasType for ast::Alias {
             return Some(Type::Never);
         }
         let index = semantic_index(model.db, model.program_file());
-        Some(binding_type(
-            model.db(),
-            index.expect_single_definition(self),
-        ))
+        Some(model.definition_type(index.expect_single_definition(self)))
     }
 }
 
@@ -1215,7 +1266,7 @@ impl HasOptionalDefinition for ast::ExceptHandlerExceptHandler {
 impl HasType for ast::ExceptHandlerExceptHandler {
     fn inferred_type<'db>(&self, model: &SemanticModel<'db>) -> Option<Type<'db>> {
         let definition = self.optional_definition(model)?;
-        Some(binding_type(model.db(), definition))
+        Some(model.definition_type(definition))
     }
 }
 
