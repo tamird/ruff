@@ -7623,13 +7623,13 @@ impl<'db> Binding<'db> {
     ///
     /// [`CallableBinding`] prepends a synthetic bound receiver before matching bound methods, while
     /// inference still iterates over source call arguments. This method centralizes that offset.
-    fn matched_argument_for_call_argument(
+    pub(super) fn matched_argument_for_call_argument(
         &self,
-        binding: &CallableBinding<'db>,
+        bound_receiver: bool,
         argument_index: usize,
     ) -> Option<&MatchedArgument<'db>> {
         self.argument_matches
-            .get(argument_index + usize::from(binding.bound_type.is_some()))
+            .get(argument_index + usize::from(bound_receiver))
     }
 
     /// Returns the number of occurrences of inferable type variables in the parameter(s) matching the
@@ -7644,7 +7644,8 @@ impl<'db> Binding<'db> {
         let Some(generic_context) = self.signature.generic_context else {
             return 0;
         };
-        let Some(argument) = self.matched_argument_for_call_argument(binding, argument_index)
+        let Some(argument) =
+            self.matched_argument_for_call_argument(binding.bound_type.is_some(), argument_index)
         else {
             return 0;
         };
@@ -7797,7 +7798,7 @@ impl<'db> Binding<'db> {
         expected_return_ty: Type<'db>,
     ) -> Option<Type<'db>> {
         let [matched_parameter] = self
-            .matched_argument_for_call_argument(binding, argument_index)?
+            .matched_argument_for_call_argument(binding.bound_type.is_some(), argument_index)?
             .parameters
             .as_slice()
         else {
@@ -7834,7 +7835,9 @@ impl<'db> Binding<'db> {
 
         let tuple_index = return_tuple.prefix_elements().len().checked_add(
             (0..argument_index)
-                .filter_map(|index| self.matched_argument_for_call_argument(binding, index))
+                .filter_map(|index| {
+                    self.matched_argument_for_call_argument(binding.bound_type.is_some(), index)
+                })
                 .flat_map(MatchedArgument::iter)
                 .filter(|matched| matched.index == matched_parameter.index)
                 .count(),
@@ -7871,7 +7874,8 @@ impl<'db> Binding<'db> {
         call_expression_tcx: TypeContext<'db>,
         specialization: impl Fn() -> Option<Specialization<'db>>,
     ) -> Option<ArgumentTypeContext<'db>> {
-        let argument_matches = self.matched_argument_for_call_argument(binding, argument_index)?;
+        let argument_matches =
+            self.matched_argument_for_call_argument(binding.bound_type.is_some(), argument_index)?;
         let [matched_parameter] = argument_matches.parameters.as_slice() else {
             return None;
         };
@@ -8426,29 +8430,6 @@ impl<'db> Binding<'db> {
         } else {
             Ok(None)
         }
-    }
-
-    pub(crate) fn arguments_for_parameter<'a>(
-        &'a self,
-        call_arguments: &'a CallArguments<'a, 'db>,
-        parameter_index: usize,
-    ) -> impl Iterator<Item = (Argument<'a>, Type<'db>)> + 'a {
-        call_arguments
-            .iter()
-            .zip(&self.argument_matches)
-            .filter(move |(_, argument_matches)| {
-                argument_matches
-                    .parameters
-                    .iter()
-                    .any(|parameter| parameter.index == parameter_index)
-            })
-            .map(move |((argument, argument_types), _)| {
-                let declared_type = self.signature.parameters()[parameter_index].annotated_type();
-                (
-                    argument,
-                    argument_types.get_for_declared_type(declared_type),
-                )
-            })
     }
 
     /// Mark this overload binding as an unmatched overload.
