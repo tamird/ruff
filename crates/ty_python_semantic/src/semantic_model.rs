@@ -19,13 +19,14 @@ use crate::Db;
 use crate::place::definitions::DefinitionResolution;
 use crate::place::implicit_globals::all_implicit_module_globals;
 use crate::place::{
-    builtins_module_scope, class_body_implicit_symbol, implicit_builtins_symbol_scope,
+    builtins_module_scope, class_body_implicit_symbol, implicit_builtins_symbol_source,
     loop_header_reachability, place_from_bindings,
 };
 use crate::place_load::{
     ImplicitPlaceLoad, PlaceLoadMode, PlaceLoadResolutionStep, PlaceLoadSourceKind,
     resolve_place_load,
 };
+use crate::provided::ProvidedBindingValue;
 use crate::types::ide_support::{ImportAliasResolution, definition_for_name};
 use crate::types::list_members::{all_members, all_reachable_members};
 use crate::types::{
@@ -130,8 +131,11 @@ impl<'db> SemanticModel<'db> {
         }
 
         let env = self.program_environment();
-        implicit_builtins_symbol_scope(self.db, &env, name)
-            .is_some_and(|scope| Some(scope) == builtins_module_scope(self.db, &env))
+        implicit_builtins_symbol_source(self.db, &env, name, self.builtin_usage(node)).is_some_and(
+            |source| {
+                source.name.is_none() && Some(source.scope) == builtins_module_scope(self.db, &env)
+            },
+        )
     }
 
     /// Returns a map from symbol name to that symbol's
@@ -497,6 +501,19 @@ impl<'db> SemanticModel<'db> {
         }
 
         None
+    }
+
+    /// Selects the same builtin namespace used to infer the node.
+    pub(crate) fn builtin_usage(&self, node: ast::AnyNodeRef<'_>) -> crate::provided::BuiltinUsage {
+        let index = semantic_index(self.db, self.program_file());
+        let module = parsed_module(self.db, self.program_file().python_file(self.db)).load(self.db);
+        if self.in_string_annotation_expr.is_some()
+            || index.annotation_parent_scope_id(&module, &node).is_some()
+        {
+            crate::provided::BuiltinUsage::Annotation
+        } else {
+            crate::provided::BuiltinUsage::Runtime
+        }
     }
 
     /// Get a "safe" [`ast::AnyNodeRef`] to use for referring to the given (sub-)AST node.
@@ -873,7 +890,7 @@ impl<'db> SemanticModel<'db> {
         definitions
     }
 
-    /// Appends the reachable bindings of a `from` import's symbol in its target module.
+    /// Appends the reachable bindings of an imported symbol in its target module.
     ///
     /// Follows one import at a time so an overwritten re-export cannot contribute keys.
     fn extend_imported_definitions(
@@ -883,6 +900,16 @@ impl<'db> SemanticModel<'db> {
     ) {
         let file = definition.program_file(self.db);
         let kind = definition.kind(self.db);
+        if matches!(kind, DefinitionKind::ProvidedBinding(_)) {
+            match self.db.provided_binding(definition).value {
+                ProvidedBindingValue::Export { file, name } => {
+                    self.extend_exported_definitions(file, &name, definitions);
+                }
+                ProvidedBindingValue::Value(_) => {}
+                ProvidedBindingValue::Unresolved => {}
+            }
+            return;
+        }
         let module = parsed_module(self.db, file.python_file(self.db)).load(self.db);
         let (import, name) = match &kind {
             DefinitionKind::ImportFrom(import) => {
@@ -909,6 +936,15 @@ impl<'db> SemanticModel<'db> {
             return;
         };
         let target_file = ProgramFile::new(self.db, target_file, env.program(self.db));
+        self.extend_exported_definitions(target_file, name, definitions);
+    }
+
+    fn extend_exported_definitions(
+        &self,
+        target_file: ProgramFile<'db>,
+        name: &str,
+        definitions: &mut Vec<Definition<'db>>,
+    ) {
         let index = semantic_index(self.db, target_file);
         let Some(id) = index.place_table(FileScopeId::global()).symbol_id(name) else {
             return;

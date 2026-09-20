@@ -1,9 +1,11 @@
 pub(crate) mod definitions;
 
 use crate::ProgramEnvironment;
+use crate::provided::{BuiltinUsage, ProvidedBindingValue};
 use itertools::Either;
 use ruff_index::IndexSlice;
 use ruff_python_ast::PythonVersion;
+use ruff_python_ast::name::Name;
 use rustc_hash::FxHashMap;
 use ty_module_resolver::{
     KnownModule, Module, ModuleName, file_to_module, resolve_module_confident,
@@ -526,6 +528,34 @@ pub(crate) fn global_symbol<'db>(
     })
 }
 
+pub(crate) fn exported_symbol<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    name: &str,
+    requires_explicit_reexport: RequiresExplicitReExport,
+) -> PlaceAndQualifiers<'db> {
+    symbol_impl(
+        db,
+        global_scope(db, file),
+        name,
+        requires_explicit_reexport,
+        ConsideredDefinitions::EndOfScope,
+    )
+}
+
+pub(crate) fn provided_binding_value<'db>(
+    db: &'db dyn Db,
+    value: ProvidedBindingValue<'db>,
+) -> PlaceAndQualifiers<'db> {
+    match value {
+        ProvidedBindingValue::Value(ty) => Place::bound(ty).into(),
+        ProvidedBindingValue::Export { file, name } => {
+            exported_symbol(db, file, &name, RequiresExplicitReExport::No)
+        }
+        ProvidedBindingValue::Unresolved => Place::Undefined.into(),
+    }
+}
+
 /// Infers the public type of an imported symbol.
 ///
 /// If `requires_explicit_reexport` is [`None`], it will be inferred from the file's source type.
@@ -567,13 +597,7 @@ pub(crate) fn imported_symbol<'db>(
             }
         });
 
-        symbol_impl(
-            db,
-            global_scope(db, file),
-            name,
-            requires_explicit_reexport,
-            ConsideredDefinitions::EndOfScope,
-        )
+        exported_symbol(db, file, name, requires_explicit_reexport)
     })
     .unwrap_or_default()
     .or_fall_back_to(db, env, || {
@@ -617,9 +641,15 @@ pub(crate) fn builtins_symbol<'db>(
     env: &ProgramEnvironment<'db>,
     symbol: &str,
 ) -> PlaceAndQualifiers<'db> {
-    builtins_symbol_impl(db, env, symbol, BuiltinVisibility::All)
-        .map(|(_, symbol)| symbol)
-        .unwrap_or_default()
+    builtins_symbol_impl(
+        db,
+        env,
+        symbol,
+        BuiltinVisibility::All,
+        BuiltinUsage::Runtime,
+    )
+    .map(|(_, symbol)| symbol)
+    .unwrap_or_default()
 }
 
 /// Looks up `symbol` for implicit builtin fallback.
@@ -638,8 +668,9 @@ pub(crate) fn implicit_builtins_symbol<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     symbol: &str,
+    usage: BuiltinUsage,
 ) -> PlaceAndQualifiers<'db> {
-    builtins_symbol_impl(db, env, symbol, BuiltinVisibility::RuntimeOnly)
+    builtins_symbol_impl(db, env, symbol, BuiltinVisibility::RuntimeOnly, usage)
         .map(|(_, symbol)| symbol)
         .unwrap_or_default()
 }
@@ -648,12 +679,20 @@ pub(crate) fn implicit_builtins_symbol<'db>(
 ///
 /// Uses the same visibility rules as [`implicit_builtins_symbol`] so IDE definition lookup cannot
 /// resolve a private typing-only helper that type inference considers undefined.
-pub(crate) fn implicit_builtins_symbol_scope<'db>(
+pub(crate) fn implicit_builtins_symbol_source<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     symbol: &str,
-) -> Option<ScopeId<'db>> {
-    builtins_symbol_impl(db, env, symbol, BuiltinVisibility::RuntimeOnly).map(|(scope, _)| scope)
+    usage: BuiltinUsage,
+) -> Option<BuiltinSource<'db>> {
+    builtins_symbol_impl(db, env, symbol, BuiltinVisibility::RuntimeOnly, usage)
+        .and_then(|(scope, _)| scope)
+}
+
+pub(crate) struct BuiltinSource<'db> {
+    pub(crate) scope: ScopeId<'db>,
+    /// Only allocated when an application maps the name to a differently named export.
+    pub(crate) name: Option<Name>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -671,8 +710,26 @@ fn builtins_symbol_impl<'db>(
     env: &ProgramEnvironment<'db>,
     symbol: &str,
     visibility: BuiltinVisibility,
-) -> Option<(ScopeId<'db>, PlaceAndQualifiers<'db>)> {
+    usage: BuiltinUsage,
+) -> Option<(Option<BuiltinSource<'db>>, PlaceAndQualifiers<'db>)> {
     let program = env.program(db);
+    if let Some(file) = env.program_file(db)
+        && let Some(value) = db.provided_builtin(file, symbol, usage)
+    {
+        let scope = match &value {
+            ProvidedBindingValue::Export { file, name } => Some(BuiltinSource {
+                scope: global_scope(db, *file),
+                name: (name.as_str() != symbol).then(|| name.clone()),
+            }),
+            ProvidedBindingValue::Value(_) => None,
+            ProvidedBindingValue::Unresolved => return None,
+        };
+        return Some((scope, provided_binding_value(db, value)));
+    }
+    // Supplied names belong to the requesting source environment. Python fallback declarations
+    // belong to the shared support environment, including when their names occur in annotations.
+    let program = program.without_semantic_namespace(db);
+    let env = &ProgramEnvironment::from_program(program);
     let resolver_environment = program.resolver_environment(db);
     let resolver = |module: Module<'db>| {
         let file = ProgramFile::new(db, module.file(db)?, program);
@@ -700,7 +757,7 @@ fn builtins_symbol_impl<'db>(
             return None;
         }
 
-        Some((scope, found_symbol))
+        Some((Some(BuiltinSource { scope, name: None }), found_symbol))
     };
     // If this symbol is not present in project-level builtins, search in the default ones.
     resolve_module_confident(
@@ -724,9 +781,11 @@ pub(crate) fn known_module_symbol<'db>(
     known_module: KnownModule,
     symbol: &str,
 ) -> PlaceAndQualifiers<'db> {
+    let program = env.program(db).without_semantic_namespace(db);
+    let env = &ProgramEnvironment::from_program(program);
     resolve_module_confident(db, env.resolver_environment(db), &known_module.name())
         .and_then(|module| {
-            let file = ProgramFile::new(db, module.file(db)?, env.program(db));
+            let file = ProgramFile::new(db, module.file(db)?, program);
             Some(imported_symbol(db, env, Some(file), symbol, None))
         })
         .unwrap_or_default()
@@ -775,7 +834,7 @@ fn core_module_scope<'db>(
     env: &ProgramEnvironment<'db>,
     core_module: KnownModule,
 ) -> Option<ScopeId<'db>> {
-    let program = env.program(db);
+    let program = env.program(db).without_semantic_namespace(db);
     let module = resolve_module_confident(db, env.resolver_environment(db), &core_module.name())?;
     Some(global_scope(
         db,

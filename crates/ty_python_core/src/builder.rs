@@ -1,4 +1,5 @@
 use std::cell::{OnceCell, RefCell};
+use std::collections::hash_map::Entry;
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
@@ -39,7 +40,8 @@ use crate::definition::{
     ImportFromDefinitionNodeRef, ImportFromSubmoduleDefinitionNodeRef,
     LambdaParameterDefinitionNodeRef, LoopHeaderDefinitionNodeRef, LoopStmtRef,
     MatchPatternDefinitionNodeRef, NestedBindingExecution, NestedBindingsDefinitionKind,
-    ParameterDefinitionNodeRef, StarImportDefinitionNodeRef, WithItemDefinitionNodeRef,
+    ParameterDefinitionNodeRef, ProvidedBinding, ProvidedBindingDefinitionKind, ProvidedStatement,
+    StarImportDefinitionNodeRef, WithItemDefinitionNodeRef,
 };
 use crate::expression::{Expression, ExpressionContext, ExpressionKind};
 use crate::frozen::{FrozenMap, FrozenSet};
@@ -283,6 +285,7 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     scopes_by_node: FxHashMap<NodeWithScopeKey, FileScopeId>,
     scopes_by_expression: ExpressionsScopeMapBuilder,
     definitions_by_node: FxHashMap<DefinitionNodeKey, Definitions<'db>>,
+    provided_statements: FxHashMap<NodeIndex, Box<[ProvidedBinding]>>,
     expressions_by_node: FxHashMap<ExpressionNodeKey, Expression<'db>>,
     unpacks_by_target: FxHashMap<ExpressionNodeKey, Unpack<'db>>,
     condition_flow_snapshots_by_node: FxHashMap<ExpressionNodeKey, ConditionFlowSnapshots>,
@@ -322,6 +325,24 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         file: ProgramFile<'db>,
         module_ref: &'ast ParsedModuleRef,
     ) -> Self {
+        let mut provided_statements = FxHashMap::default();
+        for ProvidedStatement {
+            statement,
+            bindings,
+        } in db.provided_statements(file)
+        {
+            let node = module_ref.get_by_index(statement);
+            assert!(
+                matches!(node, ast::AnyRootNodeRef::Stmt(ast::Stmt::Expr(_))),
+                "provided statements must identify expression statements in the current module"
+            );
+            match provided_statements.entry(statement) {
+                Entry::Vacant(entry) => {
+                    entry.insert(bindings);
+                }
+                Entry::Occupied(_) => panic!("provided statements must have unique node indices"),
+            }
+        }
         let mut builder = Self {
             db,
             file,
@@ -347,6 +368,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             scopes_by_expression: ExpressionsScopeMapBuilder::new(),
             scopes_by_node: FxHashMap::default(),
             definitions_by_node: FxHashMap::default(),
+            provided_statements,
             expressions_by_node: FxHashMap::default(),
             unpacks_by_target: FxHashMap::default(),
             condition_flow_snapshots_by_node: FxHashMap::default(),
@@ -1598,6 +1620,15 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
         // Note `definition_node` is guaranteed to be a child of `self.module`
         let kind = definition_node.into_owned(self.module);
+        self.create_definition_with_kind(place, definition_node.key(), kind)
+    }
+
+    fn create_definition_with_kind(
+        &mut self,
+        place: ScopedPlaceId,
+        key: DefinitionNodeKey,
+        kind: DefinitionKind<'db>,
+    ) -> (Definition<'db>, usize) {
         let is_loop_header = kind.is_loop_header();
         let is_reexported = kind.is_reexported();
 
@@ -1609,7 +1640,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             // token rather than by their AST node.
             0
         } else {
-            let definitions = self.add_entry_for_definition_key(definition_node.key());
+            let definitions = self.add_entry_for_definition_key(key);
             definitions.push(definition);
             definitions.len()
         };
@@ -1645,9 +1676,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             }
             DefinitionCategory::Binding => {
                 let imported_qualifier_action = match kind {
-                    DefinitionKind::ImportFrom(_) | DefinitionKind::StarImport(_) => {
-                        ImportedQualifierAction::Record
-                    }
+                    DefinitionKind::ProvidedBinding(_)
+                    | DefinitionKind::ImportFrom(_)
+                    | DefinitionKind::StarImport(_) => ImportedQualifierAction::Record,
                     DefinitionKind::Import(_) | DefinitionKind::ImportFromSubmodule(_) => {
                         ImportedQualifierAction::Clear
                     }
@@ -3349,6 +3380,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
     pub(super) fn build(mut self) -> SemanticIndex<'db> {
         self.visit_body(self.module.suite());
+        assert!(
+            self.provided_statements.is_empty(),
+            "provided statements must belong to the traversed module"
+        );
 
         // Pop the root scope
         self.pop_scope();
@@ -5558,6 +5593,33 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
     }
 
     fn visit_stmt(&mut self, stmt: &'ast ast::Stmt) {
+        if !self.provided_statements.is_empty()
+            && let Some(bindings) = self.provided_statements.remove(&stmt.node_index().load())
+        {
+            let ast::Stmt::Expr(statement) = stmt else {
+                panic!("provided statements must be expression statements");
+            };
+            let mut definitions = Definitions::default();
+            for binding in bindings {
+                let target = self.module.get_by_index(binding.target);
+                assert!(statement.range().contains_range(target.range()));
+                assert!(target.range().contains_range(binding.range));
+                let key = DefinitionNodeKey::from_root_node(target);
+                let place = self.add_symbol(binding.name.clone()).into();
+                let kind =
+                    DefinitionKind::ProvidedBinding(Box::new(ProvidedBindingDefinitionKind {
+                        statement: AstNodeRef::new(self.module, statement),
+                        binding,
+                    }));
+                let (definition, count) = self.create_definition_with_kind(place, key, kind);
+                assert_eq!(count, 1, "provided binding targets must be unique");
+                self.record_definition(place, definition, None);
+                definitions.push(definition);
+            }
+            self.definitions_by_node
+                .insert(DefinitionNodeKey::from_node_ref(stmt.into()), definitions);
+            return;
+        }
         self.push_statement(CurrentStatement::default());
         self.visit_stmt_impl(stmt);
         let mut current_statement = self.pop_statement();

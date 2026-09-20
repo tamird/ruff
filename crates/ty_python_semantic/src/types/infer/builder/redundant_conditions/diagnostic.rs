@@ -1511,7 +1511,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         while let Some(PlaceLoadResolutionStep::Source(source)) = resolution.next() {
             let constraints = resolution.narrowing_constraints_for(&source);
             place = place.or_fall_back_to(db, env, || {
-                self.infer_place_load_source(resolution.place_expr(), source, constraints)
+                self.infer_place_load_source(
+                    resolution.place_expr(),
+                    ast::ExprRef::Name(name),
+                    source,
+                    constraints,
+                )
             });
             if place.place.is_definitely_bound() {
                 break;

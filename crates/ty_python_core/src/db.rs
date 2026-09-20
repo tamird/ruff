@@ -1,3 +1,5 @@
+use crate::ProgramFile;
+use crate::definition::ProvidedStatement;
 use ruff_db::files::File;
 use ty_module_resolver::Db as ModuleResolverDb;
 
@@ -9,6 +11,14 @@ use crate::program::{Program, ProgramSettings};
 pub trait Db: ModuleResolverDb {
     /// Returns `true` if the file should be checked.
     fn should_check_file(&self, file: File) -> bool;
+
+    /// Projects application-defined expression statements into ordinary name bindings.
+    ///
+    /// Called while constructing the semantic index. Implementations must read tracked inputs
+    /// and must not infer types or recursively request this file's semantic index.
+    fn provided_statements(&self, _file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
+        Vec::new()
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]

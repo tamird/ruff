@@ -24,7 +24,8 @@ use ty_python_core::{
     ProgramFile, attribute_scopes, global_scope, place_table, semantic_index, use_def_map,
 };
 
-use crate::place::implicit_builtins_symbol_scope;
+use crate::place::implicit_builtins_symbol_source;
+use crate::provided::ProvidedBindingValue;
 use crate::types::{ClassBase, ClassLiteral, ClassType, SubclassOfInner, Type, binding_type};
 use crate::{Db, FxIndexSet, ProgramEnvironment, module_docstring};
 
@@ -174,8 +175,10 @@ pub(crate) fn definitions_for_name<'db>(
         return definitions;
     }
     let env = ProgramEnvironment::from_scope(scope);
-    implicit_builtins_symbol_scope(db, &env, name)
-        .map(|scope| definitions_for_builtin(db, scope, name))
+    implicit_builtins_symbol_source(db, &env, name, crate::provided::BuiltinUsage::Runtime)
+        .map(|source| {
+            definitions_for_builtin(db, source.scope, source.name.as_deref().unwrap_or(name))
+        })
         .unwrap_or_default()
 }
 
@@ -633,6 +636,31 @@ fn resolve_definition_recursive<'db>(
     let kind = definition.kind(db);
 
     match kind {
+        DefinitionKind::ProvidedBinding(_) => {
+            if alias_resolution == ImportAliasResolution::PreserveAliases {
+                return vec![ResolvedDefinition::Definition(definition)];
+            }
+            match db.provided_binding(definition).value {
+                ProvidedBindingValue::Value(_) => vec![ResolvedDefinition::Definition(definition)],
+                ProvidedBindingValue::Unresolved => Vec::new(),
+                ProvidedBindingValue::Export { file, name } => {
+                    let target_env = ProgramEnvironment::from_file(file);
+                    find_symbol_in_scope(db, global_scope(db, file), &name)
+                        .into_iter()
+                        .flat_map(|target| {
+                            resolve_definition_recursive(
+                                db,
+                                &target_env,
+                                target,
+                                visited,
+                                Some(&name),
+                                alias_resolution,
+                            )
+                        })
+                        .collect()
+                }
+            }
+        }
         DefinitionKind::Import(import_def) => {
             let file = definition.program_file(db);
             let module = parsed_module(db, file.python_file(db)).load(db);

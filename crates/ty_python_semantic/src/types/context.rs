@@ -33,7 +33,8 @@ use ty_python_core::{ProgramFile, semantic_index};
 /// The lazily resolved program used by a semantic operation.
 #[derive(Clone)]
 pub struct ProgramEnvironment<'db> {
-    environment: Cell<ProgramSource>,
+    source: ProgramSource,
+    cached_program: Cell<Option<Id>>,
     lifetime: PhantomData<&'db ()>,
 }
 
@@ -41,7 +42,8 @@ impl<'db> ProgramEnvironment<'db> {
     /// Creates an environment that lazily obtains its program from `file`.
     pub fn from_file(file: ProgramFile<'db>) -> Self {
         Self {
-            environment: Cell::new(ProgramSource::File(file.as_id())),
+            source: ProgramSource::File(file.as_id()),
+            cached_program: Cell::new(None),
             lifetime: PhantomData,
         }
     }
@@ -49,7 +51,8 @@ impl<'db> ProgramEnvironment<'db> {
     /// Creates an environment that lazily obtains its program from `definition`.
     pub(crate) fn from_definition(definition: Definition<'db>) -> Self {
         Self {
-            environment: Cell::new(ProgramSource::Definition(definition.as_id())),
+            source: ProgramSource::Definition(definition.as_id()),
+            cached_program: Cell::new(None),
             lifetime: PhantomData,
         }
     }
@@ -57,7 +60,8 @@ impl<'db> ProgramEnvironment<'db> {
     /// Creates an environment that lazily obtains its program from `scope`.
     pub(crate) fn from_scope(scope: ScopeId<'db>) -> Self {
         Self {
-            environment: Cell::new(ProgramSource::Scope(scope.as_id())),
+            source: ProgramSource::Scope(scope.as_id()),
+            cached_program: Cell::new(None),
             lifetime: PhantomData,
         }
     }
@@ -65,7 +69,8 @@ impl<'db> ProgramEnvironment<'db> {
     /// Creates an environment with an already-established program.
     pub fn from_program(program: Program<'db>) -> Self {
         Self {
-            environment: Cell::new(ProgramSource::Program(program.as_id())),
+            source: ProgramSource::Program(program.as_id()),
+            cached_program: Cell::new(Some(program.as_id())),
             lifetime: PhantomData,
         }
     }
@@ -73,7 +78,10 @@ impl<'db> ProgramEnvironment<'db> {
     /// Returns the program used by this operation.
     #[inline]
     pub fn program(&self, db: &'db dyn Db) -> Program<'db> {
-        let program = match self.environment.get() {
+        if let Some(id) = self.cached_program.get() {
+            return Program::from_id(id);
+        }
+        let program = match self.source {
             ProgramSource::Program(id) => return Program::from_id(id),
             ProgramSource::File(file) => {
                 cold_path();
@@ -95,9 +103,19 @@ impl<'db> ProgramEnvironment<'db> {
             }
         };
 
-        self.environment
-            .set(ProgramSource::Program(program.as_id()));
+        self.cached_program.set(Some(program.as_id()));
         program
+    }
+
+    /// Returns the source environment requesting an operation, when it has one.
+    /// Program-wide operations have no source file and use the program's default semantics.
+    pub fn program_file(&self, db: &'db dyn Db) -> Option<ProgramFile<'db>> {
+        match self.source {
+            ProgramSource::Program(_) => None,
+            ProgramSource::File(id) => Some(ProgramFile::from_id(id)),
+            ProgramSource::Definition(id) => Some(Definition::from_id(id).program_file(db)),
+            ProgramSource::Scope(id) => Some(ScopeId::from_id(id).program_file(db)),
+        }
     }
 
     /// Returns the Python version used by this operation.
@@ -118,8 +136,8 @@ enum ProgramSource {
     Program(Id),
     // Salsa interned handles are thin `Id` wrappers, so converting between `ProgramFile` and `Id`
     // is an inlined representation change with no database lookup. Keeping the lifetime-bearing
-    // `ProgramFile` out of the `Cell` preserves covariance in `'db`; replacing this variant after
-    // the first read avoids repeated Salsa ingredient reads in hot, recursive type operations.
+    // `ProgramFile` out of the cached `Cell` preserves covariance in `'db`. The separate program
+    // cache avoids repeated ingredient reads while retaining the source for builtin lookup.
     File(Id),
     Definition(Id),
     Scope(Id),
@@ -244,6 +262,12 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
         !self.diagnostics_suppressed
             && self.db().should_check_file(self.file())
             && !self.is_in_no_type_check()
+    }
+
+    pub(super) fn extend_provided_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
+        if !self.diagnostics_suppressed {
+            self.diagnostics.get_mut().extend_diagnostics(diagnostics);
+        }
     }
 
     pub(super) fn has_diagnostics(&self) -> bool {

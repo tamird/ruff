@@ -454,7 +454,13 @@ impl<'db> GenericContext<'db> {
     /// contains type variables from both contexts.
     pub(crate) fn merge(self, db: &'db dyn Db, other: Self) -> Self {
         let program = self.program(db);
-        debug_assert_eq!(program, other.program(db));
+        // Embedded declarations can combine their own type variables with those from canonical
+        // support files. Each variable retains its definition and binding context; the merged
+        // context only needs a common resolver and platform for later type operations.
+        debug_assert_eq!(
+            program.without_semantic_namespace(db),
+            other.program(db).without_semantic_namespace(db),
+        );
         Self::from_typevar_instances_in_program(
             db,
             program,

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::FxIndexSet;
-use crate::place::implicit_builtins_symbol_scope;
+use crate::place::implicit_builtins_symbol_source;
 use crate::reachability::is_range_reachable;
 use crate::types::call::bind::CheckTypesMode;
 use crate::types::call::{CallArguments, CallError, MatchedArgument};
@@ -81,7 +81,9 @@ pub fn definitions_for_name<'db>(
     }
 
     // If we didn't find any definitions in scopes, fallback to builtins
-    let Some(builtins_scope) = implicit_builtins_symbol_scope(db, &env, name_str) else {
+    let Some(builtins_source) =
+        implicit_builtins_symbol_source(db, &env, name_str, model.builtin_usage(node))
+    else {
         return vec![];
     };
     // Special cases for `float` and `complex` in type annotation positions.
@@ -116,7 +118,11 @@ pub fn definitions_for_name<'db>(
             .collect();
     }
 
-    definition_resolution::definitions_for_builtin(db, builtins_scope, name_str)
+    definition_resolution::definitions_for_builtin(
+        db,
+        builtins_source.scope,
+        builtins_source.name.as_deref().unwrap_or(name_str),
+    )
 }
 
 /// Returns definitions for an attribute expression, inferring its receiver through the IDE model.

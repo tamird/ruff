@@ -1280,6 +1280,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn infer_region_definition(&mut self, definition: Definition<'db>) {
         match definition.kind(self.db()) {
+            DefinitionKind::ProvidedBinding(binding) => {
+                self.infer_provided_binding(binding, definition);
+            }
             DefinitionKind::Function(function) => {
                 self.infer_function_definition(function.node(self.module()), definition);
             }
@@ -2167,6 +2170,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         for statement in suite {
             self.infer_maybe_standalone_statement(statement);
 
+            if self
+                .index
+                .provided_statement_definitions(statement)
+                .is_some()
+            {
+                continue;
+            }
+
             if let ast::Stmt::Expr(ast::StmtExpr {
                 range: _,
                 node_index: _,
@@ -2181,6 +2192,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn infer_statement(&mut self, statement: &ast::Stmt) {
+        if let Some(definitions) = self.index.provided_statement_definitions(statement) {
+            for &definition in definitions {
+                let result = infer_definition_types(self.db(), definition);
+                self.extend_definition(definition, result);
+            }
+            return;
+        }
         match statement {
             ast::Stmt::FunctionDef(function) => self.infer_function_definition_statement(function),
             ast::Stmt::ClassDef(class) => self.infer_class_definition_statement(class),
@@ -10452,6 +10470,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     place = place.or_fall_back_to(self.db(), env, || {
                         self.infer_place_load_source(
                             resolution.place_expr(),
+                            expr_ref,
                             source,
                             narrowing_constraints,
                         )
@@ -10493,6 +10512,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn infer_place_load_source(
         &self,
         place_expr: PlaceExprRef,
+        expr_ref: ast::ExprRef,
         source: PlaceLoadSource<'db>,
         narrowing_constraints: &[(FileScopeId, ConstraintKey)],
     ) -> PlaceAndQualifiers<'db> {
@@ -10550,7 +10570,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     if Some(self.scope()) == builtins_module_scope(db, env) {
                         Place::Undefined.into()
                     } else {
-                        implicit_builtins_symbol(db, env, &name)
+                        implicit_builtins_symbol(
+                            db,
+                            env,
+                            &name,
+                            if self
+                                .inference_flags()
+                                .contains(InferenceFlags::IN_TYPE_EXPRESSION)
+                                || self.in_string_annotation()
+                                || self
+                                    .index
+                                    .annotation_parent_scope_id(self.module(), &expr_ref)
+                                    .is_some()
+                            {
+                                crate::provided::BuiltinUsage::Annotation
+                            } else {
+                                crate::provided::BuiltinUsage::Runtime
+                            },
+                        )
                     }
                 }
             },
