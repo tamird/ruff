@@ -9,8 +9,9 @@ use ruff_python_ast::{
 };
 use ruff_python_parser::{
     ParseError, ParseErrorType, ParseOptions, Parsed, parse_cells_unchecked,
-    parse_string_annotation, parse_unchecked,
+    parse_expression_range, parse_string_annotation, parse_unchecked,
 };
+use ruff_text_size::TextRange;
 
 use crate::files::File;
 use crate::source::source_text;
@@ -74,9 +75,27 @@ pub fn parsed_string_annotation(
     string: &StringLiteral,
 ) -> Result<Parsed<ModExpression>, ParseError> {
     let expr = parse_string_annotation(source, string)?;
+    index_annotation(expr, string.node_index().load(), string.range)
+}
 
+/// Parses a source annotation outside the module AST, preserving its source offsets.
+/// The owner must be a canonical node in the same module, with at most one detached annotation.
+pub fn parsed_annotation_range(
+    source: &str,
+    range: TextRange,
+    owner: NodeIndex,
+) -> Result<Parsed<ModExpression>, ParseError> {
+    let expr = parse_expression_range(source, range)?;
+    index_annotation(expr, owner, range)
+}
+
+fn index_annotation(
+    expr: Parsed<ModExpression>,
+    owner: NodeIndex,
+    range: TextRange,
+) -> Result<Parsed<ModExpression>, ParseError> {
     // We need the sub-ast of the string annotation to be indexed
-    indexed::ensure_indexed(&expr, string.node_index().load()).map_err(|err| {
+    indexed::ensure_indexed(&expr, owner).map_err(|err| {
         let message = match err {
             NodeIndexError::NoParent => {
                 "Internal error: string annotation's parent had no NodeIndex"
@@ -102,7 +121,7 @@ pub fn parsed_string_annotation(
 
         ParseError {
             error: ParseErrorType::StringAnnotationError(message),
-            location: string.range,
+            location: range,
         }
     })?;
 

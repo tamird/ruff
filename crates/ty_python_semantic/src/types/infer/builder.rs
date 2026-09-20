@@ -979,11 +979,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.deferred_state.is_deferred()
     }
 
-    /// Return the node key of the given AST node, or the key of the outermost enclosing string
-    /// literal, if the node originates from inside a stringified annotation.
+    /// Return the node key of the given AST node, or the canonical owner of an enclosing
+    /// detached annotation. Nested quoted expressions retain that outermost module anchor.
     fn enclosing_node_key(&self, node: AnyNodeRef<'_>) -> NodeKey {
         match self.deferred_state {
-            DeferredExpressionState::InStringAnnotation(enclosing_node_key) => enclosing_node_key,
+            DeferredExpressionState::InDetachedAnnotation(enclosing_node_key) => enclosing_node_key,
             _ => NodeKey::from_node(node),
         }
     }
@@ -992,20 +992,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.context.in_stub()
     }
 
-    fn in_string_annotation(&self) -> bool {
-        self.deferred_state.in_string_annotation()
+    fn in_detached_annotation(&self) -> bool {
+        self.deferred_state.in_detached_annotation()
     }
 
-    /// Temporarily changes lookup behavior without discarding the current string annotation.
+    /// Temporarily changes lookup behavior without discarding a detached annotation's anchor.
     ///
-    /// Parsed string nodes do not belong to the module's semantic index, so their enclosing
-    /// annotation must remain available even when nested expressions request another lookup mode.
+    /// Detached nodes do not belong to the module's semantic index, so their enclosing owner
+    /// must remain available even when nested expressions request another lookup mode.
     fn replace_deferred_state(
         &mut self,
         state: DeferredExpressionState,
     ) -> DeferredExpressionState {
         let previous = self.deferred_state;
-        if !previous.in_string_annotation() {
+        if !previous.in_detached_annotation() {
             self.deferred_state = state;
         }
         previous
@@ -1084,20 +1084,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 self.expression_type(expression)
             }
             _ => infer_complete_scope_types(self.db(), expr_scope).expression_type(expression),
-        }
-    }
-
-    /// Get metadata for a type expression from any scope in the same file.
-    fn file_type_expression_flags(&self, expression: &ast::Expr) -> TypeExpressionFlags {
-        let file_scope = self.index.expression_scope_id(expression);
-        let expr_scope = file_scope.to_scope_id(self.db(), self.program_file());
-        match self.region {
-            InferenceRegion::Scope(scope, _) if scope == expr_scope => {
-                self.type_expression_flags(expression)
-            }
-            _ => {
-                infer_complete_scope_types(self.db(), expr_scope).type_expression_flags(expression)
-            }
         }
     }
 
@@ -1515,12 +1501,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         binding: Definition<'db>,
     ) -> AddBinding<'db, 'a> {
         let db = self.db();
-        debug_assert!(
-            binding
-                .kind(db)
-                .category(self.context.in_stub(), self.module())
-                .is_binding()
-        );
+        debug_assert!(binding.category(db, self.module()).is_binding());
 
         let db = self.db();
         let file_scope_id = binding.file_scope(db);
@@ -1784,12 +1765,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         ty: TypeAndQualifiers<'db>,
     ) {
         let db = self.db();
-        debug_assert!(
-            declaration
-                .kind(self.db())
-                .category(self.context.in_stub(), self.module())
-                .is_declaration()
-        );
+        debug_assert!(declaration.category(db, self.module()).is_declaration());
         let use_def = self.index.use_def_map(declaration.file_scope(self.db()));
         let prior_bindings = use_def.bindings_at_definition(declaration);
         let env = self.program_environment();
@@ -1843,18 +1819,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         declared_and_inferred_ty: &DeclaredAndInferredType<'db>,
     ) {
         let db = self.db();
-        debug_assert!(
-            definition
-                .kind(self.db())
-                .category(self.context.in_stub(), self.module())
-                .is_binding()
-        );
-        debug_assert!(
-            definition
-                .kind(self.db())
-                .category(self.context.in_stub(), self.module())
-                .is_declaration()
-        );
+        debug_assert!(definition.category(db, self.module()).is_binding());
+        debug_assert!(definition.category(db, self.module()).is_declaration());
 
         let (declared_ty, inferred_ty) = match *declared_and_inferred_ty {
             DeclaredAndInferredType::AreTheSame(type_and_qualifiers) => {
@@ -4525,11 +4491,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if !target.is_name_expr() && !self.is_valid_receiver_annotation_target(target) {
             // Omit this definition from `self.declarations`; declaration lookup treats an absent
             // inferred declaration as rejected.
-            if !definition
-                .kind(self.db())
-                .category(self.in_stub(), self.module())
-                .is_binding()
-            {
+            if !definition.category(db, self.module()).is_binding() {
                 return;
             }
 
@@ -8578,7 +8540,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn infer_named_expression(&mut self, named: &ast::ExprNamed) -> Type<'db> {
         // See https://peps.python.org/pep-0572/#differences-between-assignment-expressions-and-assignment-statements
-        if named.target.is_name_expr() && !self.in_string_annotation() {
+        if named.target.is_name_expr() && !self.in_detached_annotation() {
             let definition = self.index.expect_single_definition(named);
             let result = infer_definition_types(self.db(), definition);
             self.extend_definition(definition, result);
@@ -8836,7 +8798,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Option<Type<'db>> {
         // Parsed string annotations are not indexed, so their keyword arguments have no
         // use-definition information from which to narrow dictionary keys.
-        if self.in_string_annotation() {
+        if self.in_detached_annotation() {
             return None;
         }
 
@@ -10439,7 +10401,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expr_ref: ast::ExprRef,
     ) -> (PlaceAndQualifiers<'db>, Vec<(FileScopeId, ConstraintKey)>) {
         let env = self.program_environment();
-        let mode = if self.is_deferred() && self.in_string_annotation() {
+        let mode = if self.is_deferred() && self.in_detached_annotation() {
             PlaceLoadMode::StringAnnotation
         } else if self.is_deferred() {
             PlaceLoadMode::Deferred
@@ -10577,7 +10539,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             if self
                                 .inference_flags()
                                 .contains(InferenceFlags::IN_TYPE_EXPRESSION)
-                                || self.in_string_annotation()
+                                || self.in_detached_annotation()
                                 || self
                                     .index
                                     .annotation_parent_scope_id(self.module(), &expr_ref)
@@ -12789,36 +12751,25 @@ enum DeferredExpressionState {
     /// deferred and in a string annotation context.
     Deferred,
 
-    /// The expression is in a string annotation context.
+    /// A parsed annotation whose nodes are absent from the module's semantic index.
     ///
-    /// This is required to differentiate between a deferred annotation and a string annotation.
-    /// The former can occur when there's a `from __future__ import annotations` statement or we're
-    /// in a stub file.
-    ///
-    /// In the following example,
-    /// ```py
-    /// a: "List[int]" = ...
-    /// b: tuple[int, "ForwardRef"] = ...
-    /// ```
-    ///
-    /// The annotation of `a` is completely inside a string while for `b`, it's only partially
-    /// stringified.
-    ///
-    /// This variant wraps a [`NodeKey`] that allows us to retrieve the original
-    /// [`ast::ExprStringLiteral`] node which created the string annotation.
-    InStringAnnotation(NodeKey),
+    /// This includes quoted annotations and source ranges supplied for existing declarations.
+    /// Unlike ordinary deferred syntax, detached nodes need a canonical lookup anchor. Nested
+    /// quoted annotations retain the outermost module node, while their parsed identities use
+    /// the immediate string parent. The owner may be an expression, parameter, or function.
+    InDetachedAnnotation(NodeKey),
 }
 
 impl DeferredExpressionState {
     const fn is_deferred(self) -> bool {
         matches!(
             self,
-            DeferredExpressionState::Deferred | DeferredExpressionState::InStringAnnotation(_)
+            DeferredExpressionState::Deferred | DeferredExpressionState::InDetachedAnnotation(_)
         )
     }
 
-    const fn in_string_annotation(self) -> bool {
-        matches!(self, DeferredExpressionState::InStringAnnotation(_))
+    const fn in_detached_annotation(self) -> bool {
+        matches!(self, DeferredExpressionState::InDetachedAnnotation(_))
     }
 }
 

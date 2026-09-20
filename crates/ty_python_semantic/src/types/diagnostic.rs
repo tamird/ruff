@@ -1809,31 +1809,38 @@ fn assignment_declaration_annotation<'db>(
             declaration?.kind(db)
         };
 
-    let (annotation, declaration_kind) = match declaration_definition_kind {
+    let parameter_annotation = |parameter: &ast::Parameter, kind| {
+        crate::types::string_annotation::SourceAnnotation::source_range(
+            db,
+            context.program_file(),
+            parameter,
+            parameter.annotation(),
+        )
+        .map(|range| (range, kind))
+    };
+    let (range, declaration_kind) = match declaration_definition_kind {
         DefinitionKind::AnnotatedAssignment(assignment) => Some((
-            assignment.annotation(context.module()),
+            assignment.annotation(context.module()).range(),
             DeclarationKind::Regular,
         )),
-        DefinitionKind::Parameter(ParameterDefinitionNodeKind::Parameter(parameter)) => parameter
-            .node(context.module())
-            .parameter
-            .annotation
-            .as_deref()
-            .map(|annotation| (annotation, DeclarationKind::Regular)),
+        DefinitionKind::Parameter(ParameterDefinitionNodeKind::Parameter(parameter)) => {
+            parameter_annotation(
+                &parameter.node(context.module()).parameter,
+                DeclarationKind::Regular,
+            )
+        }
         DefinitionKind::Parameter(ParameterDefinitionNodeKind::VariadicPositionalParameter(
             parameter,
-        )) => parameter
-            .node(context.module())
-            .annotation
-            .as_deref()
-            .map(|annotation| (annotation, DeclarationKind::VariadicParameter)),
+        )) => parameter_annotation(
+            parameter.node(context.module()),
+            DeclarationKind::VariadicParameter,
+        ),
         DefinitionKind::Parameter(ParameterDefinitionNodeKind::VariadicKeywordParameter(
             parameter,
-        )) => parameter
-            .node(context.module())
-            .annotation
-            .as_deref()
-            .map(|annotation| (annotation, DeclarationKind::KeywordVariadicParameter)),
+        )) => parameter_annotation(
+            parameter.node(context.module()),
+            DeclarationKind::KeywordVariadicParameter,
+        ),
         DefinitionKind::ProvidedBinding(_)
         | DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)
@@ -1860,7 +1867,7 @@ fn assignment_declaration_annotation<'db>(
     }?;
 
     Some(AssignmentDeclarationAnnotation {
-        range: annotation.range(),
+        range,
         declaration_kind,
     })
 }

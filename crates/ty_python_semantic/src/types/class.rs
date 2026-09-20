@@ -89,11 +89,11 @@ pub enum DynamicClassScopeOffset {
     /// A call in the module AST, identified by its scope-relative node index.
     Node(u32),
 
-    /// A call in a parsed string annotation, whose nodes are not in the module AST.
+    /// A call in a detached annotation, whose nodes are not in the module AST.
     ///
-    /// `offset` identifies the outermost string expression in the module AST, relative to the
-    /// scope's node index. `range` identifies the call within that string expression.
-    StringAnnotation { offset: u32, range: TextRange },
+    /// `offset` identifies the annotation's owner in the module AST, relative to the
+    /// scope's node index. `range` identifies the call relative to that owner's start.
+    DetachedAnnotation { offset: u32, range: TextRange },
 }
 
 /// Returns the source range of a call that creates a dynamic class.
@@ -117,7 +117,7 @@ fn dynamic_class_header_range<'db>(
         DynamicClassHeaderAnchor::ScopeOffset(offset) => {
             let (offset, relative_range) = match offset {
                 DynamicClassScopeOffset::Node(offset) => (offset, None),
-                DynamicClassScopeOffset::StringAnnotation { offset, range } => {
+                DynamicClassScopeOffset::DetachedAnnotation { offset, range } => {
                     (offset, Some(range))
                 }
             };
@@ -127,11 +127,8 @@ fn dynamic_class_header_range<'db>(
                 .expect("anchor should not be NodeIndex::NONE");
             let absolute_index = NodeIndex::from(anchor_u32 + offset);
             if let Some(relative_range) = relative_range {
-                let string: &ast::ExprStringLiteral = module
-                    .get_by_index(absolute_index)
-                    .try_into()
-                    .expect("string annotation offset should point to ExprStringLiteral");
-                return relative_range + string.start();
+                let owner = module.get_by_index(absolute_index);
+                return relative_range + owner.start();
             }
             let node: &ast::ExprCall = module
                 .get_by_index(absolute_index)

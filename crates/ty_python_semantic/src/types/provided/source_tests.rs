@@ -1,7 +1,9 @@
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::parsed_module;
-use ruff_python_ast::{self as ast, HasNodeIndex};
-use ruff_text_size::Ranged;
+use ruff_db::source::source_text;
+use ruff_db::system::DbWithWritableSystem as _;
+use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_core::definition::{Definition, DefinitionKind, ProvidedBinding, ProvidedStatement};
 
 use super::*;
@@ -42,7 +44,8 @@ fn semantic_namespaces_share_python_support_types() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A small source adapter: `include("name")` exports a native declaration.
+/// A deliberately small source adapter: `include("name")` exports a native declaration,
+/// and a comment following a function header supplies its parameter and return types.
 struct CommentedSource;
 
 impl SourceProvider for CommentedSource {
@@ -77,6 +80,40 @@ impl SourceProvider for CommentedSource {
                 })
             })
             .collect()
+    }
+
+    fn annotation(
+        &self,
+        db: &TestDb,
+        file: ProgramFile<'_>,
+        owner: NodeIndex,
+    ) -> Option<TextRange> {
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let source = source_text(db, file.file(db));
+        for statement in module.suite() {
+            let ast::Stmt::FunctionDef(function) = statement else {
+                continue;
+            };
+            let header =
+                &source[TextRange::new(function.parameters.end(), function.body.first()?.start())];
+            let offset =
+                function.parameters.end() + TextSize::try_from(header.find("# (")? + 3).unwrap();
+            let (parameter, returns) = source[usize::from(offset)..].split_once(") -> ")?;
+            let range = if owner == function.node_index().load() {
+                let start = offset + TextSize::of(parameter) + TextSize::new(5);
+                TextRange::at(start, TextSize::of(returns.lines().next()?))
+            } else {
+                let [parameter_node] = function.parameters.args.as_ref() else {
+                    continue;
+                };
+                if owner != parameter_node.parameter.node_index().load() {
+                    continue;
+                }
+                TextRange::at(offset, TextSize::of(parameter))
+            };
+            return Some(range);
+        }
+        None
     }
 
     fn binding<'db>(
@@ -152,6 +189,66 @@ assert_type(second.value(), Literal["two"])
     );
     let diagnostics = crate::check_file_unwrap(&db, program.program_file(&db, source));
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn supplied_declarations_follow_source_and_export_edits() -> anyhow::Result<()> {
+    let source = "include(\"consume\")\ndef identity(value): # (Scalar) -> str\n    consume(value)\n    return value\nidentity(\"bad\")\n";
+    let native = "Scalar = int\nsentinel: str\ndef consume(value: int) -> int: ...\n";
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", source)
+        .with_file("/src/native.pyi", native)
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    let mut ids = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.id().as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["invalid-argument-type", "invalid-return-type"],
+        "{diagnostics:#?}"
+    );
+
+    db.write_file(
+        "/src/native.pyi",
+        native.replace("value: int", "value: str"),
+    )?;
+    let diagnostics = db.check_file(file);
+    let mut ids = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.id().as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-return-type"
+        ],
+        "{diagnostics:#?}"
+    );
+
+    db.write_file("/src/main.py", source.replace("(Scalar)", "(str)"))?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    db.write_file(
+        "/src/main.py",
+        source.replace("consume(value)", "value = None"),
+    )?;
+    let diagnostics = db.check_file(file);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.id().as_str() == "invalid-assignment"),
+        "{diagnostics:#?}"
+    );
     Ok(())
 }
 

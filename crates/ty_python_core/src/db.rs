@@ -12,6 +12,18 @@ pub trait Db: ModuleResolverDb {
     /// Returns `true` if the file should be checked.
     fn should_check_file(&self, file: File) -> bool;
 
+    /// Supplies the range of a function annotation outside its ordinary AST slot.
+    /// `owner` is a function node for a return annotation, or a parameter node for its type.
+    /// The range refers to the same physical source and must identify one type expression.
+    /// Implementations must read tracked syntax inputs without requesting this file's index.
+    fn provided_annotation(
+        &self,
+        _file: ProgramFile<'_>,
+        _owner: ruff_python_ast::NodeIndex,
+    ) -> Option<ruff_text_size::TextRange> {
+        None
+    }
+
     /// Projects application-defined expression statements into ordinary name bindings.
     ///
     /// Called while constructing the semantic index. Implementations must read tracked inputs

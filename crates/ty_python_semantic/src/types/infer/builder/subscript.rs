@@ -561,7 +561,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Type<'db> {
         let db = self.db();
         if generic_type_alias.specialization(db).is_some() {
-            if !self.in_string_annotation() {
+            if !self.in_detached_annotation() {
                 self.infer_expression(&subscript.slice, TypeContext::default());
             }
             if let Some(builder) = self.context.report_lint(&NOT_SUBSCRIPTABLE, subscript) {

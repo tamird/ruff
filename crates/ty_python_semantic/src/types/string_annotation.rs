@@ -1,13 +1,20 @@
-use ruff_db::parsed::parsed_string_annotation;
+use ruff_db::parsed::{parsed_annotation_range, parsed_string_annotation};
 use ruff_db::source::source_text;
-use ruff_python_ast::{self as ast, ModExpression, StringFlags};
+use ruff_python_ast::{self as ast, HasNodeIndex, StringFlags};
 use ruff_python_parser::{ParseError, ParseErrorType, Parsed};
-use ruff_text_size::Ranged;
+use ruff_text_size::{Ranged, TextRange};
+use ty_python_core::ProgramFile;
+use ty_python_core::definition::Definition;
+use ty_python_core::node_key::NodeKey;
 
+use crate::Db;
 use crate::declare_lint;
 use crate::lint::{Level, LintStatus};
+use crate::types::Type;
+use crate::types::diagnostic::INVALID_TYPE_FORM;
 use crate::types::diagnostic::autofix_with_literal;
-use crate::types::infer::InferenceFlags;
+use crate::types::infer::{InferenceFlags, TypeExpressionFlags};
+use crate::types::signatures::function_signature_annotation_info;
 
 use super::context::InferContext;
 
@@ -47,12 +54,112 @@ declare_lint! {
     }
 }
 
+/// An annotation in the module AST or a detached expression anchored to a canonical source node.
+pub(crate) enum SourceAnnotation<'a> {
+    Native(&'a ast::Expr),
+    Detached {
+        owner: NodeKey,
+        range: TextRange,
+        parsed: Result<Parsed<ast::ModExpression>, ParseError>,
+    },
+}
+
+impl<'a> SourceAnnotation<'a> {
+    pub(crate) fn source_range(
+        db: &dyn Db,
+        file: ProgramFile<'_>,
+        owner: impl HasNodeIndex,
+        native: Option<&ast::Expr>,
+    ) -> Option<TextRange> {
+        native
+            .map(Ranged::range)
+            .or_else(|| db.provided_annotation(file, owner.node_index().load()))
+    }
+
+    pub(crate) fn new(
+        db: &dyn Db,
+        file: ProgramFile<'_>,
+        owner: impl HasNodeIndex,
+        native: Option<&'a ast::Expr>,
+    ) -> Option<Self> {
+        if let Some(expr) = native {
+            return Some(Self::Native(expr));
+        }
+        let range = db.provided_annotation(file, owner.node_index().load())?;
+        let source = source_text(db, file.file(db));
+        let parsed = parsed_annotation_range(&source, range, owner.node_index().load());
+        Some(Self::Detached {
+            owner: NodeKey::from_node(owner),
+            range,
+            parsed,
+        })
+    }
+
+    pub(crate) fn expression_or_report(&self, context: &InferContext) -> Option<&ast::Expr> {
+        if let Self::Detached {
+            owner: _,
+            range: _,
+            parsed: Err(error),
+        } = self
+            && let Some(builder) = context.report_lint(&INVALID_TYPE_FORM, error.location)
+        {
+            builder.into_diagnostic(format_args!("Invalid type expression: {}", error.error));
+        }
+        self.expression()
+    }
+
+    pub(crate) fn expression(&self) -> Option<&ast::Expr> {
+        match self {
+            Self::Native(expr) => Some(expr),
+            Self::Detached {
+                owner: _,
+                range: _,
+                parsed,
+            } => parsed.as_ref().ok().map(Parsed::expr),
+        }
+    }
+
+    pub(crate) fn inferred_type<'db>(
+        &self,
+        db: &'db dyn Db,
+        function: Definition<'db>,
+    ) -> Type<'db> {
+        self.inferred(db, function).0
+    }
+
+    pub(crate) fn inferred<'db>(
+        &self,
+        db: &'db dyn Db,
+        function: Definition<'db>,
+    ) -> (Type<'db>, TypeExpressionFlags) {
+        let Some(expression) = self.expression() else {
+            return (Type::unknown(), TypeExpressionFlags::empty());
+        };
+        let (ty, flags) = function_signature_annotation_info(db, function, expression.into());
+        (ty.unwrap_or_else(Type::unknown), flags)
+    }
+}
+
+impl Ranged for SourceAnnotation<'_> {
+    fn range(&self) -> TextRange {
+        match self {
+            Self::Native(expr) => expr.range(),
+            Self::Detached {
+                owner: _,
+                range,
+                parsed: _,
+            } => *range,
+        }
+    }
+}
+
 /// Parses the given expression as a string annotation.
-pub(crate) fn parse_string_annotation(
+pub(crate) fn parse_string_annotation<'a>(
     context: &InferContext,
     inference_flags: InferenceFlags,
     string_expr: &ast::ExprStringLiteral,
-) -> Option<Parsed<ModExpression>> {
+    owner: NodeKey,
+) -> Option<SourceAnnotation<'a>> {
     let file = context.file();
     let db = context.db();
 
@@ -75,7 +182,13 @@ pub(crate) fn parse_string_annotation(
         // contained in the string literal.
         } else if &source[string_literal.content_range()] == string_literal.as_str() {
             match parsed_string_annotation(source.as_str(), string_literal) {
-                Ok(parsed) => return Some(parsed),
+                Ok(parsed) => {
+                    return Some(SourceAnnotation::Detached {
+                        owner,
+                        range: string_expr.range(),
+                        parsed: Ok(parsed),
+                    });
+                }
                 Err(ParseError { error, location }) => {
                     if let Some(builder) =
                         context.report_lint(&INVALID_SYNTAX_IN_FORWARD_ANNOTATION, location)

@@ -11,6 +11,7 @@
 //! arguments must match _at least one_ overload.
 
 use crate::ProgramEnvironment;
+use crate::types::string_annotation::SourceAnnotation;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::slice::Iter;
@@ -53,6 +54,7 @@ use crate::{Db, FxOrderSet};
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::{self as ast, name::Name};
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
+use ty_python_core::scope::{NodeWithScopeKey, NodeWithScopeKind};
 
 /// Selects which binding context to use for type variables that only appear in a return-position
 /// `Callable`.
@@ -64,47 +66,39 @@ pub(super) enum ReturnCallableTypeVarScope {
     Public,
 }
 
-/// Infer the type of a parameter or return annotation in a function signature.
+/// Reads a function annotation from its owning inference result, including detached expressions.
 ///
-/// This is very similar to `definition_expression_type`, but knows that `TypeInferenceBuilder`
-/// will always infer the parameters and return of a function in its PEP-695 typevar scope, if
-/// there is one; otherwise they will be inferred in the function definition scope, but will always
-/// be deferred. (This prevents spurious salsa cycles when we need the signature of the function
-/// while in the middle of inferring its definition scope — for instance, when applying
-/// decorators.)
-pub(super) fn function_signature_expression_type<'db>(
+/// Signature annotations belong to the PEP 695 type-parameter scope when present, otherwise to
+/// deferred function inference. Selecting that region from the function avoids looking up detached
+/// nodes in the semantic index and requesting a definition scope while its signature is in use.
+pub(crate) fn function_signature_annotation_info<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
-    expression: &ast::Expr,
-) -> Type<'db> {
+    expression: ast::ExprRef<'_>,
+) -> (Option<Type<'db>>, TypeExpressionFlags) {
+    let DefinitionKind::Function(function) = definition.kind(db) else {
+        unreachable!("signature annotations belong to a function");
+    };
     let file = definition.program_file(db);
     let index = semantic_index(db, file);
-    let file_scope = index.expression_scope_id(expression);
-    let scope = file_scope.to_scope_id(db, file);
-    if scope == definition.scope(db) {
-        // expression is in the function definition scope, but always deferred
-        infer_deferred_types(db, definition).expression_type(expression)
+    let body = index.node_scope_by_key(NodeWithScopeKey::Function(function.node_key()));
+    if let Some(parent) = index.scope(body).parent()
+        && matches!(
+            index.scope(parent).node(),
+            NodeWithScopeKind::FunctionTypeParameters(_)
+        )
+    {
+        let inference = infer_complete_scope_types(db, parent.to_scope_id(db, file));
+        (
+            inference.try_expression_type(expression),
+            inference.type_expression_flags(expression),
+        )
     } else {
-        // expression is in the PEP-695 type params sub-scope
-        infer_complete_scope_types(db, scope).expression_type(expression)
-    }
-}
-
-fn function_signature_type_expression_flags<'db>(
-    db: &'db dyn Db,
-    definition: Definition<'db>,
-    expression: &ast::Expr,
-) -> TypeExpressionFlags {
-    let file = definition.program_file(db);
-    let index = semantic_index(db, file);
-    let file_scope = index.expression_scope_id(expression);
-    let scope = file_scope.to_scope_id(db, file);
-    if scope == definition.scope(db) {
-        // expression is in the function definition scope, but always deferred
-        infer_deferred_types(db, definition).type_expression_flags(expression)
-    } else {
-        // expression is in the PEP-695 type params sub-scope
-        infer_complete_scope_types(db, scope).type_expression_flags(expression)
+        let inference = infer_deferred_types(db, definition);
+        (
+            inference.try_expression_type(expression),
+            inference.type_expression_flags(expression),
+        )
     }
 }
 
@@ -886,11 +880,14 @@ impl<'db> Signature<'db> {
             function_node.parameters.as_ref(),
             has_implicitly_positional_first_parameter,
         );
-        let return_ty = function_node
-            .returns
-            .as_ref()
-            .map(|returns| function_signature_expression_type(db, definition, returns.as_ref()))
-            .unwrap_or_else(Type::unknown);
+        let return_ty = SourceAnnotation::new(
+            db,
+            definition.program_file(db),
+            function_node,
+            function_node.returns.as_deref(),
+        )
+        .map(|annotation| annotation.inferred_type(db, definition))
+        .unwrap_or_else(Type::unknown);
         let legacy_generic_context =
             GenericContext::from_function_params(db, definition, &parameters, return_ty);
         let full_generic_context = GenericContext::merge_pep695_and_legacy(
@@ -5836,12 +5833,20 @@ impl<'db> Parameter<'db> {
         let definition = Some(index.expect_single_definition(parameter));
 
         let (annotated_type, inferred_annotation, annotation_flags, has_starred_annotation) =
-            if let Some(annotation) = parameter.annotation() {
+            if let Some(annotation) = SourceAnnotation::new(
+                db,
+                function_definition.program_file(db),
+                parameter,
+                parameter.annotation(),
+            ) {
+                let (ty, flags) = annotation.inferred(db, function_definition);
                 (
-                    function_signature_expression_type(db, function_definition, annotation),
+                    ty,
                     false,
-                    function_signature_type_expression_flags(db, function_definition, annotation),
-                    annotation.is_starred_expr(),
+                    flags,
+                    annotation
+                        .expression()
+                        .is_some_and(ast::Expr::is_starred_expr),
                 )
             } else {
                 (Type::unknown(), true, TypeExpressionFlags::empty(), false)
