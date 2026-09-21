@@ -884,7 +884,7 @@ impl<'m> Context<'m> {
 /// The lifetime parameter `'m` refers to the shorter of the following
 /// lifetimes: the parsed module the cursor is in and the actual bytes
 /// making up the source file containing the cursor.
-struct CompletionCursor<'m> {
+pub struct CompletionCursor<'m> {
     /// The parsed module containing the cursor.
     parsed: &'m ParsedModuleRef,
     /// The source code of the module containing the cursor.
@@ -937,7 +937,7 @@ impl RangeEndPosition {
 
 impl<'m> CompletionCursor<'m> {
     /// Returns the canonical syntax to which completion candidates apply.
-    fn target(&self) -> Option<CompletionTarget<'m>> {
+    pub fn target(&self) -> Option<CompletionTarget<'m>> {
         let tokens = CompletionTargetTokens::find(self)?;
         tokens.ast(self)
     }
@@ -946,7 +946,7 @@ impl<'m> CompletionCursor<'m> {
     ///
     /// After a logical newline, this starts with the suite that still contains
     /// the cursor, omitting completed inner suites and preceding statements.
-    fn ancestors(&self) -> impl DoubleEndedIterator<Item = AnyNodeRef<'m>> + '_ {
+    pub fn ancestors(&self) -> impl DoubleEndedIterator<Item = AnyNodeRef<'m>> + '_ {
         self.covering_node.ancestors()
     }
 
@@ -954,7 +954,7 @@ impl<'m> CompletionCursor<'m> {
     ///
     /// The model must describe the same program file and source revision as
     /// this cursor's parsed module.
-    fn scope(&self, model: &SemanticModel<'_>) -> Option<FileScopeId> {
+    pub fn scope(&self, model: &SemanticModel<'_>) -> Option<FileScopeId> {
         let index = semantic_index(model.db(), model.program_file());
         if index.is_excluded(self.range) {
             return None;
@@ -1108,7 +1108,7 @@ impl<'m> CompletionCursor<'m> {
     /// `parsed` and `source` must describe the same source revision. All returned
     /// nodes belong to `parsed`. Comments and offsets outside a UTF-8 boundary
     /// in the source return `None`.
-    fn new(
+    pub fn new(
         parsed: &'m ParsedModuleRef,
         source: &'m SourceText,
         offset: TextSize,
@@ -1231,7 +1231,7 @@ impl<'m> CompletionCursor<'m> {
     ///
     /// Note that this will return `false` when the last token is positioned within an
     /// interpolation block in an f-string or a t-string.
-    fn is_in_string(&self) -> bool {
+    pub fn is_in_string(&self) -> bool {
         self.tokens_before.last().is_some_and(|t| {
             matches!(
                 t.kind(),
@@ -1347,7 +1347,7 @@ impl<'m> CompletionCursor<'m> {
 
     /// Returns true when the tokens indicate that the definition of a new
     /// name is being introduced at the end.
-    fn is_in_definition_place(&self) -> bool {
+    pub fn is_in_definition_place(&self) -> bool {
         fn is_definition_token(token: &Token) -> bool {
             matches!(
                 token.kind(),
@@ -1724,7 +1724,7 @@ impl<'m> CompletionCursor<'m> {
     }
 
     /// Whether a statement can start at the cursor.
-    fn is_statement_start(&self) -> bool {
+    pub fn is_statement_start(&self) -> bool {
         let mut tokens = self
             .tokens_before
             .iter()
@@ -1747,7 +1747,7 @@ impl<'m> CompletionCursor<'m> {
     }
 
     /// Returns the canonical call whose direct argument slot contains the cursor.
-    fn keyword_call(&self) -> Option<&'m ast::ExprCall> {
+    pub fn keyword_call(&self) -> Option<&'m ast::ExprCall> {
         let (call, _) = crate::call_at_offset(self.parsed, self.source.as_str(), self.offset)?;
         self.is_keyword_slot(&call.arguments).then_some(call)
     }
@@ -2805,7 +2805,7 @@ impl<'t> CompletionTargetTokens<'t> {
 
 /// The AST node patterns that we support identifying under the cursor.
 #[derive(Debug)]
-enum CompletionTarget<'t> {
+pub enum CompletionTarget<'t> {
     /// A `object.attribute` scenario, where we want to
     /// list attributes on `object` for completions.
     Attribute(&'t ast::ExprAttribute),

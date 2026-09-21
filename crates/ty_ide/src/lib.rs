@@ -40,8 +40,8 @@ pub use call_hierarchy::outgoing_calls::{OutgoingCall, outgoing_calls};
 pub use call_hierarchy::{CallHierarchyItem, prepare_call_hierarchy};
 pub use code_action::{QuickFix, code_actions};
 pub use completion::{
-    Completion, CompletionCapabilities, CompletionCommand, CompletionInsertTextFormat,
-    CompletionKind, CompletionSettings, completion,
+    Completion, CompletionCapabilities, CompletionCommand, CompletionCursor,
+    CompletionInsertTextFormat, CompletionKind, CompletionSettings, CompletionTarget, completion,
 };
 pub use doc_highlights::document_highlights;
 pub use docstring::{Docstring, DocstringFragment};
