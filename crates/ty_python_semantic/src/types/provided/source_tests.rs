@@ -518,6 +518,21 @@ fn supplied_declarations_follow_source_and_export_edits() -> anyhow::Result<()> 
         .with_source_provider(CommentedSource)
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
+    {
+        let program_file = db.program_file(file);
+        let model = SemanticModel::new(&db, program_file);
+        let parsed = parsed_module(&db, program_file.python_file(&db)).load(&db);
+        let [ast::Stmt::Expr(statement), ..] = parsed.suite().as_slice() else {
+            panic!("expected a supplied declaration");
+        };
+        let ast::Expr::Call(call) = statement.value.as_ref() else {
+            panic!("expected the include call");
+        };
+        let [ast::Expr::StringLiteral(name)] = call.arguments.args.as_ref() else {
+            panic!("expected the supplied name");
+        };
+        assert!(model.enter_string_annotation(name).is_none());
+    }
     let diagnostics = db.check_file(file);
     let mut ids = diagnostics
         .iter()
