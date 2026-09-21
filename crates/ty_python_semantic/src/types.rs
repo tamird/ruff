@@ -138,7 +138,7 @@ mod attribute_write;
 mod bool;
 mod bound_super;
 mod call;
-pub use call::{CheckedArgument, CheckedCall};
+pub use call::{CheckedArgument, CheckedCall, DictionaryItem, DictionaryItems};
 mod callable;
 mod class;
 mod class_base;

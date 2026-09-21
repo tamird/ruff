@@ -27,14 +27,15 @@ use crate::place_load::{
     resolve_place_load,
 };
 use crate::provided::{BuiltinUsage, ProvidedBindingValue, ProvidedClass};
+use crate::reachability::ReachabilityEvaluationCache;
 use crate::types::ide_support::{ImportAliasResolution, definition_for_name};
 pub use crate::types::list_members::ObjectMembers;
 use crate::types::list_members::{
     all_members, all_members_with_object_policy, all_reachable_members,
 };
 use crate::types::{
-    CycleDetector, ProgramEnvironment, SpecialFormType, Type, TypeQualifiers, binding_type,
-    infer_complete_scope_types, infer_definition_types, inferred_declaration,
+    CycleDetector, DictionaryItems, ProgramEnvironment, SpecialFormType, Type, TypeQualifiers,
+    binding_type, infer_complete_scope_types, infer_definition_types, inferred_declaration,
     is_discarded_dict_key_assignment,
 };
 use crate::types::{SourceAnnotation, function_signature_annotation_info};
@@ -123,6 +124,30 @@ impl<'db> SemanticModel<'db> {
             return None;
         }
         class.into_type_at_call(self.db, self.file, call)
+    }
+
+    /// Returns known string entries at an original call argument expression.
+    ///
+    /// Immediate literals have a complete key set. Other indexed argument uses expose partial
+    /// flow observations; expressions outside those uses can have no observed entries.
+    pub fn dictionary_items(&self, expression: &Expr) -> Option<DictionaryItems<'db>> {
+        if self.in_string_annotation_expr.is_some() {
+            return None;
+        }
+        DictionaryItems::literal(self.db, expression, &mut |expression| {
+            expression.inferred_type(self)
+        })
+        .or_else(|| {
+            let index = semantic_index(self.db, self.file);
+            let file_scope = index.try_expression_scope_id(expression)?;
+            let scope = file_scope.to_scope_id(self.db, self.file);
+            let cache = ReachabilityEvaluationCache::new(
+                scope,
+                index.use_def_map(file_scope).reachability_constraints(),
+            );
+            let ty = expression.inferred_type(self)?;
+            DictionaryItems::observed(self.db, scope, expression, ty, &cache)
+        })
     }
 
     /// Returns the type at `offset` in an application-supplied annotation.
