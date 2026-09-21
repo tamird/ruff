@@ -662,7 +662,7 @@ impl<'db> SemanticModel<'db> {
         let index = semantic_index(self.db, self.program_file());
         // When looking up scopes, use the expr in the top-level AST
         // (we might be trying to enter a sub-sub-AST, so this isn't silly)
-        let file_scope = index.expression_scope_id(&self.expr_ref_in_ast(expr));
+        let file_scope = index.try_expression_scope_id(&self.expr_ref_in_ast(expr))?;
         let scope = file_scope.to_scope_id(self.db, self.program_file());
         // When querying whether the expr is a string annotation, we do however use the actual expr
         // (the inference engine should record this information even for sub-nodes)
