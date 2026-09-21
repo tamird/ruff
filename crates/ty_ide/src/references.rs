@@ -299,7 +299,7 @@ fn is_slots_assignment(node: AnyNodeRef<'_>, value: AnyNodeRef<'_>) -> bool {
 /// Find all references to a local symbol within the current file.
 /// The behavior depends on the provided mode.
 fn references_for_file(
-    db: &dyn Db,
+    db: &dyn SemanticDb,
     file: ProgramFile<'_>,
     search: &LocalReferenceSearch<'_>,
     mode: ReferencesMode,
@@ -322,6 +322,26 @@ fn references_for_file(
     AnyNodeRef::from(module.syntax()).visit_source_order(&mut finder);
 
     references
+}
+
+/// Find occurrences in `file` that share any of the supplied definition identities.
+///
+/// Import aliases retain their own identities, and declarations are included.
+/// The caller selects the definitions and their spelling; this search does not
+/// discover project files or follow fixture exposures.
+pub fn references_in_file<'db>(
+    db: &'db dyn SemanticDb,
+    file: ProgramFile<'db>,
+    name: &str,
+    definitions: &[ResolvedDefinition<'db>],
+) -> Vec<ReferenceTarget> {
+    let search = LocalReferenceSearch {
+        target_text: name.into(),
+        target_definitions: Definitions::new(definitions.to_vec()),
+        import_alias_resolution: ImportAliasResolution::PreserveAliases,
+        fixture_resolution: None,
+    };
+    references_for_file(db, file, &search, ReferencesMode::DocumentHighlights)
 }
 
 /// Determines whether the resolved definitions can have references outside their file.
@@ -593,7 +613,9 @@ struct LocalReferencesFinder<'a> {
 
 impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
     fn enter_node(&mut self, node: AnyNodeRef<'a>) -> TraversalSignal {
-        self.ancestors.push(node);
+        if let TraversalSignal::Skip = self.push_ancestor(node) {
+            return TraversalSignal::Skip;
+        }
 
         match node {
             AnyNodeRef::ExprName(name_expr) => {
@@ -712,7 +734,9 @@ struct KeywordArgumentReferencesFinder<'a>(LocalReferencesFinder<'a>);
 
 impl<'a> SourceOrderVisitor<'a> for KeywordArgumentReferencesFinder<'a> {
     fn enter_node(&mut self, node: AnyNodeRef<'a>) -> TraversalSignal {
-        self.0.ancestors.push(node);
+        if let TraversalSignal::Skip = self.0.push_ancestor(node) {
+            return TraversalSignal::Skip;
+        }
 
         if let AnyNodeRef::Keyword(keyword) = node {
             if let Some(arg) = &keyword.arg {
@@ -730,6 +754,19 @@ impl<'a> SourceOrderVisitor<'a> for KeywordArgumentReferencesFinder<'a> {
 }
 
 impl<'a> LocalReferencesFinder<'a> {
+    fn push_ancestor(&mut self, node: AnyNodeRef<'a>) -> TraversalSignal {
+        // The visitor calls leave_node even for skipped subtrees.
+        self.ancestors.push(node);
+        if node.is_statement()
+            && ty_python_core::semantic_index(self.model.db(), self.model.program_file())
+                .is_excluded(node.range())
+        {
+            TraversalSignal::Skip
+        } else {
+            TraversalSignal::Traverse
+        }
+    }
+
     /// Checks an identifier of a binding (e.g. `x = 10`)
     fn check_binding_identifier(&mut self, identifier: &ast::Identifier) {
         self.check_identifier(identifier, OccurrenceKind::Binding);
@@ -1063,6 +1100,39 @@ mod tests {
     use super::*;
     use crate::goto::find_goto_target;
     use crate::tests::{CursorTest, cursor_test};
+
+    #[test]
+    fn file_references_preserve_definition_identity() {
+        let test = cursor_test(
+            "value<CURSOR> = 1\nvalue\ndef shadow():\n    value = 2\n    return value\nvalue",
+        );
+        let file = test.program_file(test.cursor.file);
+        let model = SemanticModel::new(&test.db, file);
+        let target = find_goto_target(&model, &test.cursor.parsed, test.cursor.offset).unwrap();
+        let definitions = target
+            .definitions(&model, ImportAliasResolution::PreserveAliases)
+            .unwrap();
+        let definitions = definitions.iter().cloned().collect::<Vec<_>>();
+        let references = references_in_file(&test.db, file, "value", &definitions);
+        let actual = references
+            .iter()
+            .map(|reference| {
+                assert_eq!(reference.file(), test.cursor.file);
+                (usize::from(reference.range().start()), reference.kind())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                (0, ReferenceKind::Write),
+                (10, ReferenceKind::Read),
+                (
+                    test.cursor.source.rfind("value").unwrap(),
+                    ReferenceKind::Read
+                ),
+            ]
+        );
+    }
 
     fn cursor_target_is_externally_visible(test: &CursorTest) -> bool {
         let model = SemanticModel::new(&test.db, test.program_file(test.cursor.file));
