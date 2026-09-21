@@ -430,14 +430,11 @@ impl<'db> SemanticModel<'db> {
             })
     }
 
-    /// Returns completions for symbols available in the scope containing the
-    /// given node, including implicit module globals and Python builtins.
+    /// Returns completions for symbols available in the given scope, including
+    /// implicit module globals and Python builtins.
     ///
-    /// Returns an empty list if the node has no indexed scope.
-    pub fn scoped_completions(&self, node: ast::AnyNodeRef<'_>) -> Vec<Completion<'db>> {
-        let Some(file_scope) = self.scope(node) else {
-            return vec![];
-        };
+    /// The scope must come from this model's current semantic index.
+    pub fn scoped_completions(&self, file_scope: FileScopeId) -> Vec<Completion<'db>> {
         let mut completions: Vec<_> = self.lexical_completions(file_scope).collect();
 
         // Add implicit module globals (like `__file__`, `__name__`, etc.) with their

@@ -13,11 +13,14 @@ use ruff_python_ast::str::Quote;
 use ruff_python_ast::token::{Token, TokenKind, Tokens};
 use ruff_python_ast::{self as ast, AnyNodeRef, StringFlags};
 use ruff_python_literal::escape::{Escape, UnicodeEscape};
+use ruff_python_trivia::{expand_tabs, indentation_at_offset};
+use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustc_hash::FxHashSet;
 use ty_module_resolver::{
     ImportingFile, KnownModule, Module, ModuleName, resolve_real_shadowable_module,
 };
+use ty_python_core::scope::{FileScopeId, NodeWithScopeRef};
 use ty_python_core::{ProgramFile, semantic_index};
 use ty_python_semantic::HasType;
 use ty_python_semantic::importer::{ImportRequest, Importer};
@@ -90,12 +93,15 @@ pub fn completion<'db>(
             import.add_completions(db, program_file, &mut completions);
         }
         ContextKind::NonImport(ref non_import) => match non_import.target {
-            CompletionTargetAst::ObjectDot { expr } => {
+            CompletionTarget::Attribute(expr) => {
                 completions.extend(model.attribute_completions(expr));
             }
-            CompletionTargetAst::Scoped(scoped) => {
+            CompletionTarget::Scoped(scoped) => {
+                let Some(scope) = context.cursor.scope(&model) else {
+                    return vec![];
+                };
                 let env = model.program_environment();
-                for semantic_completion in model.scoped_completions(scoped.node) {
+                for semantic_completion in model.scoped_completions(scope) {
                     let module_dependency_kind = if semantic_completion.builtin {
                         ModuleDependencyKind::Builtin
                     } else {
@@ -743,7 +749,7 @@ impl Default for CompletionSettings {
 /// the cursor.
 struct Context<'m> {
     kind: ContextKind<'m>,
-    cursor: ContextCursor<'m>,
+    cursor: CompletionCursor<'m>,
 }
 
 #[derive(Debug)]
@@ -790,7 +796,7 @@ impl ContextualKeyword {
 #[derive(Debug)]
 struct ContextNonImport<'m> {
     /// The AST of the completion target.
-    target: CompletionTargetAst<'m>,
+    target: CompletionTarget<'m>,
 }
 
 impl<'m> Context<'m> {
@@ -802,10 +808,7 @@ impl<'m> Context<'m> {
         source: &'m SourceText,
         offset: TextSize,
     ) -> Option<Context<'m>> {
-        let cursor = ContextCursor::new(parsed, source, offset);
-        if cursor.is_in_comment() {
-            return None;
-        }
+        let cursor = CompletionCursor::new(parsed, source, offset)?;
 
         let kind = if let Some(keywords) = cursor.incomplete_keywords() {
             ContextKind::Keywords(keywords)
@@ -818,8 +821,7 @@ impl<'m> Context<'m> {
         ) {
             ContextKind::Import(import)
         } else {
-            let target_token = CompletionTargetTokens::find(&cursor)?;
-            let target = target_token.ast(&cursor)?;
+            let target = cursor.target()?;
             ContextKind::NonImport(ContextNonImport { target })
         };
 
@@ -882,7 +884,7 @@ impl<'m> Context<'m> {
 /// The lifetime parameter `'m` refers to the shorter of the following
 /// lifetimes: the parsed module the cursor is in and the actual bytes
 /// making up the source file containing the cursor.
-struct ContextCursor<'m> {
+struct CompletionCursor<'m> {
     /// The parsed module containing the cursor.
     parsed: &'m ParsedModuleRef,
     /// The source code of the module containing the cursor.
@@ -933,43 +935,254 @@ impl RangeEndPosition {
     }
 }
 
-impl<'m> ContextCursor<'m> {
+impl<'m> CompletionCursor<'m> {
+    /// Returns the canonical syntax to which completion candidates apply.
+    fn target(&self) -> Option<CompletionTarget<'m>> {
+        let tokens = CompletionTargetTokens::find(self)?;
+        tokens.ast(self)
+    }
+
+    /// Returns the cursor's canonical ancestors, from innermost to outermost.
+    ///
+    /// After a logical newline, this starts with the suite that still contains
+    /// the cursor, omitting completed inner suites and preceding statements.
+    fn ancestors(&self) -> impl DoubleEndedIterator<Item = AnyNodeRef<'m>> + '_ {
+        self.covering_node.ancestors()
+    }
+
+    /// Resolves the scope at the cursor, including whitespace outside expression ranges.
+    ///
+    /// The model must describe the same program file and source revision as
+    /// this cursor's parsed module.
+    fn scope(&self, model: &SemanticModel<'_>) -> Option<FileScopeId> {
+        let index = semantic_index(model.db(), model.program_file());
+        if index.is_excluded(self.range) {
+            return None;
+        }
+
+        for node in self.ancestors() {
+            if index.is_excluded(node.range()) {
+                return None;
+            }
+            let body = match node {
+                AnyNodeRef::ExprLambda(lambda) => {
+                    let header_end = lambda
+                        .parameters
+                        .as_deref()
+                        .map_or(lambda.start(), Ranged::end);
+                    self.parsed
+                        .tokens()
+                        .in_range(TextRange::new(header_end, lambda.body.start()))
+                        .iter()
+                        .any(|token| token.kind() == TokenKind::Colon && token.end() <= self.offset)
+                        .then_some(NodeWithScopeRef::Lambda(lambda))
+                }
+                AnyNodeRef::ExprListComp(comp) => Some(NodeWithScopeRef::ListComprehension(comp)),
+                AnyNodeRef::ExprSetComp(comp) => Some(NodeWithScopeRef::SetComprehension(comp)),
+                AnyNodeRef::ExprDictComp(comp) => Some(NodeWithScopeRef::DictComprehension(comp)),
+                AnyNodeRef::ExprGenerator(comp) => {
+                    Some(NodeWithScopeRef::GeneratorExpression(comp))
+                }
+                _ => self.suite_scope(node),
+            };
+            if let Some(body) = body {
+                let generators: Option<&[ast::Comprehension]> = match node {
+                    AnyNodeRef::ExprListComp(comp) => Some(comp.generators.as_ref()),
+                    AnyNodeRef::ExprSetComp(comp) => Some(comp.generators.as_ref()),
+                    AnyNodeRef::ExprDictComp(comp) => Some(comp.generators.as_ref()),
+                    AnyNodeRef::ExprGenerator(comp) => Some(comp.generators.as_ref()),
+                    _ => None,
+                };
+                if let Some(generators) = generators {
+                    if let Some(first) = generators.first() {
+                        let start = self
+                            .parsed
+                            .tokens()
+                            .in_range(TextRange::new(first.target.end(), first.iter.start()))
+                            .iter()
+                            .find(|token| token.kind() == TokenKind::In)
+                            .map(Token::end);
+                        let end = first.ifs.first().map_or_else(
+                            || generators.get(1).map_or(node.end(), Ranged::start),
+                            |condition| {
+                                self.parsed
+                                    .tokens()
+                                    .in_range(TextRange::new(first.iter.end(), condition.start()))
+                                    .iter()
+                                    .find(|token| token.kind() == TokenKind::If)
+                                    .map_or(condition.start(), Token::start)
+                            },
+                        );
+                        if start.is_some_and(|start| start <= self.offset && self.offset <= end) {
+                            return index.try_expression_scope_id(&first.iter);
+                        }
+                    }
+                }
+                return index.try_node_scope(body);
+            }
+            if let Some(expr) = node.as_expr_ref() {
+                return index.try_expression_scope_id(&expr);
+            }
+            if node.is_stmt_function_def() || node.is_stmt_class_def() {
+                return model.scope(node);
+            }
+        }
+        Some(FileScopeId::global())
+    }
+
+    fn suite_scope(&self, node: AnyNodeRef<'m>) -> Option<NodeWithScopeRef<'m>> {
+        let owner = match node {
+            AnyNodeRef::StmtFunctionDef(function) => NodeWithScopeRef::Function(function),
+            AnyNodeRef::StmtClassDef(class) => NodeWithScopeRef::Class(class),
+            _ => return None,
+        };
+        self.in_suite(node).then_some(owner)
+    }
+
+    fn in_suite(&self, owner: AnyNodeRef<'_>) -> bool {
+        let header_end = match owner {
+            AnyNodeRef::StmtFunctionDef(function) => function
+                .returns
+                .as_deref()
+                .map_or(function.parameters.end(), Ranged::end),
+            AnyNodeRef::StmtClassDef(class) => class.arguments.as_deref().map_or_else(
+                || {
+                    class
+                        .type_params
+                        .as_deref()
+                        .map_or(class.name.end(), Ranged::end)
+                },
+                Ranged::end,
+            ),
+            AnyNodeRef::StmtIf(statement) => statement.test.end(),
+            AnyNodeRef::ElifElseClause(clause) => clause
+                .test
+                .as_ref()
+                .map_or(clause.start() + TextSize::of("else"), Ranged::end),
+            AnyNodeRef::StmtFor(statement) => statement.iter.end(),
+            AnyNodeRef::StmtWhile(statement) => statement.test.end(),
+            AnyNodeRef::StmtWith(statement) => statement
+                .items
+                .last()
+                .map_or(statement.start(), Ranged::end),
+            AnyNodeRef::StmtTry(statement) => statement.start() + TextSize::of("try"),
+            AnyNodeRef::ExceptHandlerExceptHandler(handler) => handler.name.as_ref().map_or_else(
+                || {
+                    handler
+                        .type_
+                        .as_deref()
+                        .map_or(handler.start() + TextSize::of("except"), Ranged::end)
+                },
+                Ranged::end,
+            ),
+            AnyNodeRef::StmtMatch(statement) => statement.subject.end(),
+            AnyNodeRef::MatchCase(case) => case
+                .guard
+                .as_deref()
+                .map_or(case.pattern.end(), Ranged::end),
+            _ => return false,
+        };
+        let Some(colon) = self
+            .parsed
+            .tokens()
+            .in_range(TextRange::new(header_end, owner.end()))
+            .iter()
+            .find(|token| !token.kind().is_trivia())
+        else {
+            return false;
+        };
+        if colon.kind() != TokenKind::Colon || self.offset < colon.end() {
+            return false;
+        }
+        if let Some(indentation) = indentation_at_offset(self.offset, self.source.as_str()) {
+            let header_indentation =
+                indentation_at_offset(owner.start(), self.source.as_str()).unwrap_or_default();
+            return expand_tabs(indentation).len() > expand_tabs(header_indentation).len();
+        }
+        owner.range().contains_inclusive(self.offset)
+            || self.source.line_start(self.offset) == self.source.line_start(owner.end())
+    }
+
     /// Returns information about the context of the cursor.
+    ///
+    /// `parsed` and `source` must describe the same source revision. All returned
+    /// nodes belong to `parsed`. Comments and offsets outside a UTF-8 boundary
+    /// in the source return `None`.
     fn new(
         parsed: &'m ParsedModuleRef,
         source: &'m SourceText,
         offset: TextSize,
-    ) -> ContextCursor<'m> {
+    ) -> Option<CompletionCursor<'m>> {
+        if !source.as_str().is_char_boundary(usize::from(offset)) {
+            return None;
+        }
         let tokens_before = tokens_start_before(parsed.tokens(), offset);
-        let Some(range) = ContextCursor::find_typed_text_range(tokens_before, offset) else {
-            let range = TextRange::empty(offset);
-            let covering_node = covering_node(parsed.syntax().into(), range);
-            return ContextCursor {
-                parsed,
-                source,
-                typed: None,
-                offset,
-                range,
-                tokens_before,
-                covering_node,
-            };
-        };
-
-        let text = &source[range];
-        assert!(
-            !text.is_empty(),
-            "expected typed text, when found, to be non-empty"
-        );
-
+        let typed_range = CompletionCursor::find_typed_text_range(tokens_before, offset);
+        let range = typed_range.unwrap_or(TextRange::empty(offset));
         let covering_node = covering_node(parsed.syntax().into(), range);
-        ContextCursor {
+        let mut cursor = CompletionCursor {
             parsed,
             source,
-            typed: Some(text),
+            typed: typed_range.map(|range| &source[range]),
             offset,
             range,
             tokens_before,
             covering_node,
+        };
+        if cursor.is_in_comment() {
+            return None;
+        }
+        cursor.recover_ancestors();
+        Some(cursor)
+    }
+
+    /// Extends canonical ownership into whitespace without creating syntax nodes.
+    fn recover_ancestors(&mut self) {
+        if !self.range.is_empty() {
+            return;
+        }
+        let Some(token) = self.tokens_before.iter().rev().find(|token| {
+            !matches!(
+                token.kind(),
+                TokenKind::Newline
+                    | TokenKind::NonLogicalNewline
+                    | TokenKind::Indent
+                    | TokenKind::Dedent
+                    | TokenKind::Comment
+                    | TokenKind::EndOfFile
+            )
+        }) else {
+            return;
+        };
+        if token.end() > self.offset {
+            return;
+        }
+        let preceding = self.covering_node(token.range());
+        if self
+            .parsed
+            .tokens()
+            .in_range(TextRange::new(token.end(), self.offset))
+            .iter()
+            .all(|token| token.kind().is_trivia())
+        {
+            self.covering_node = if matches!(
+                token.kind(),
+                TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace
+            ) {
+                preceding
+                    .find_first(|node| {
+                        node.end() > self.offset
+                            || node.is_expr_lambda()
+                            || (!node.is_expression() && !node.is_arguments())
+                    })
+                    .unwrap_or_else(|node| node)
+            } else {
+                preceding
+            };
+        } else if let Ok(suite) =
+            preceding.find_first(|node| self.in_suite(node) || node.is_mod_module())
+        {
+            self.covering_node = suite;
         }
     }
 
@@ -1177,6 +1390,9 @@ impl<'m> ContextCursor<'m> {
             }
             ast::AnyNodeRef::StmtFor(stmt_for) => {
                 stmt_for.target.range().contains_range(self.range)
+            }
+            ast::AnyNodeRef::Comprehension(comprehension) => {
+                comprehension.target.range().contains_range(self.range)
             }
             // The AST does not produce `ast::AnyNodeRef::Parameter` nodes for keywords
             // or otherwise invalid syntax. Rather they are captured in a
@@ -1490,7 +1706,10 @@ impl<'m> ContextCursor<'m> {
         if self.is_in_decorator_name() {
             return Some(FxHashSet::from_iter(["lambda"]));
         }
-        self.covering_node.ancestors().find_map(|node| {
+        if self.is_statement_start() {
+            return None;
+        }
+        self.ancestors().find_map(|node| {
             self.is_in_for_statement_iterable(node)
                 .then(|| FxHashSet::from_iter(["yield", "lambda", "await"]))
                 .or_else(|| {
@@ -1502,6 +1721,29 @@ impl<'m> ContextCursor<'m> {
                     })
                 })
         })
+    }
+
+    /// Whether a statement can start at the cursor.
+    fn is_statement_start(&self) -> bool {
+        let mut tokens = self
+            .tokens_before
+            .iter()
+            .rev()
+            .filter(|token| !token.kind().is_trivia());
+        if self.typed.is_some() {
+            tokens.next();
+        }
+        let Some(token) = tokens.next() else {
+            return true;
+        };
+        match token.kind() {
+            TokenKind::Newline | TokenKind::Indent | TokenKind::Dedent | TokenKind::Semi => true,
+            TokenKind::Colon => self
+                .covering_node
+                .ancestors()
+                .any(|node| self.in_suite(node)),
+            _ => false,
+        }
     }
 
     /// Returns true when only an expression is valid after the cursor
@@ -2096,7 +2338,7 @@ fn add_argument_completions<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
     model: &SemanticModel<'db>,
-    cursor: &ContextCursor<'_>,
+    cursor: &CompletionCursor<'_>,
     completions: &mut Completions<'db>,
 ) {
     let mut in_arguments = false;
@@ -2183,7 +2425,7 @@ fn add_class_arg_completions<'db>(
 fn add_function_arg_completions<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
-    cursor: &ContextCursor<'_>,
+    cursor: &CompletionCursor<'_>,
     completions: &mut Completions<'db>,
 ) {
     debug_assert!(
@@ -2238,7 +2480,7 @@ fn add_function_arg_completions<'db>(
 ///
 /// If the parent node is not an arguments node, the return value
 /// is an empty Vec.
-fn detect_set_function_args<'m>(cursor: &ContextCursor<'m>) -> FxHashSet<&'m str> {
+fn detect_set_function_args<'m>(cursor: &CompletionCursor<'m>) -> FxHashSet<&'m str> {
     cursor
         .covering_node
         .parent()
@@ -2269,7 +2511,7 @@ pub(crate) fn unresolved_fixes<'db>(
     node: AnyNodeRef,
 ) -> Vec<ImportEdit> {
     let mut results = Vec::new();
-    let scoped = ScopedTarget { node };
+    let scoped = node;
     let query = UserQuery::exactly(symbol);
     let ctx = CollectionContext::none();
 
@@ -2412,7 +2654,7 @@ fn add_unimported_completions<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
     parsed: &ParsedModuleRef,
-    scoped: ScopedTarget<'_>,
+    scoped: AnyNodeRef<'_>,
     create_import_request: impl for<'a> Fn(&'a ModuleName, &'a str) -> ImportRequest<'a>,
     completions: &mut Completions<'db>,
 ) {
@@ -2426,7 +2668,7 @@ fn add_unimported_completions<'db>(
 
     let source_file = file.file(db);
     let importer = Importer::new(db, file, parsed);
-    let members = importer.members_in_scope_at(scoped.node, scoped.node.start());
+    let members = importer.members_in_scope_at(scoped, scoped.start());
     let importing_file = ImportingFile::File(source_file, file.resolver_environment(db));
 
     for symbol in all_symbols(db, file, &completions.query.pattern) {
@@ -2503,7 +2745,7 @@ enum CompletionTargetTokens<'t> {
 
 impl<'t> CompletionTargetTokens<'t> {
     /// Look for the best matching token pattern at the given offset.
-    fn find(cursor: &ContextCursor<'t>) -> Option<CompletionTargetTokens<'t>> {
+    fn find(cursor: &CompletionCursor<'t>) -> Option<CompletionTargetTokens<'t>> {
         static OBJECT_DOT_EMPTY: [TokenKind; 1] = [TokenKind::Dot];
 
         let before = cursor.tokens_before;
@@ -2556,19 +2798,18 @@ impl<'t> CompletionTargetTokens<'t> {
     /// `offset` should be the offset of the cursor.
     ///
     /// If no plausible AST node could be found, then `None` is returned.
-    fn ast(&self, cursor: &ContextCursor<'t>) -> Option<CompletionTargetAst<'t>> {
+    fn ast(&self, cursor: &CompletionCursor<'t>) -> Option<CompletionTarget<'t>> {
         match *self {
             CompletionTargetTokens::PossibleObjectDot { object, .. } => {
                 let covering_node = cursor
                     .covering_node(object.range())
                     .find_last(|node| {
-                        // We require that the end of the node range not
-                        // exceed the cursor offset. This avoids selecting
-                        // a node "too high" in the AST in cases where
-                        // completions are requested in the middle of an
-                        // expression. e.g., `foo.<CURSOR>.bar`.
-                        if node.is_expr_attribute() {
-                            return node.range().end() <= cursor.offset;
+                        // Select the attribute being written, including a
+                        // cursor in the middle of its identifier. Do not select
+                        // a later enclosing access, as in `foo.<CURSOR>.bar`.
+                        if let AnyNodeRef::ExprAttribute(attribute) = node {
+                            return attribute.end() <= cursor.offset
+                                || attribute.attr.range().contains_inclusive(cursor.offset);
                         }
                         // For import statements though, they can't be
                         // nested, so we don't care as much about the
@@ -2582,39 +2823,30 @@ impl<'t> CompletionTargetTokens<'t> {
                     })
                     .ok()?;
                 match covering_node.node() {
-                    ast::AnyNodeRef::ExprAttribute(expr) => {
-                        Some(CompletionTargetAst::ObjectDot { expr })
-                    }
+                    ast::AnyNodeRef::ExprAttribute(expr) => Some(CompletionTarget::Attribute(expr)),
                     _ => None,
                 }
             }
             CompletionTargetTokens::Generic { token } => {
                 let node = cursor.covering_node(token.range()).node();
-                Some(CompletionTargetAst::Scoped(ScopedTarget { node }))
+                Some(CompletionTarget::Scoped(node))
             }
-            CompletionTargetTokens::Unknown => Some(CompletionTargetAst::Scoped(ScopedTarget {
-                node: cursor.covering_node.node(),
-            })),
+            CompletionTargetTokens::Unknown => {
+                Some(CompletionTarget::Scoped(cursor.covering_node.node()))
+            }
         }
     }
 }
 
 /// The AST node patterns that we support identifying under the cursor.
 #[derive(Debug)]
-enum CompletionTargetAst<'t> {
+enum CompletionTarget<'t> {
     /// A `object.attribute` scenario, where we want to
     /// list attributes on `object` for completions.
-    ObjectDot { expr: &'t ast::ExprAttribute },
-    /// A scoped scenario, where we want to list all items available in
-    /// the most narrow scope containing the giving AST node.
-    Scoped(ScopedTarget<'t>),
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ScopedTarget<'t> {
-    /// The node with the smallest range that fully covers
-    /// the token under the cursor.
-    node: ast::AnyNodeRef<'t>,
+    Attribute(&'t ast::ExprAttribute),
+    /// A lexical completion. The canonical node anchors import edits; use
+    /// [`CompletionCursor::scope`] to resolve the scope at the cursor.
+    Scoped(AnyNodeRef<'t>),
 }
 
 /// A representation of the completion context for a possibly incomplete import
@@ -2711,7 +2943,7 @@ impl<'a> ImportStatement<'a> {
     fn detect(
         db: &'_ dyn Db,
         file: ImportingFile<'_>,
-        cursor: &ContextCursor<'a>,
+        cursor: &CompletionCursor<'a>,
     ) -> Option<ImportStatement<'a>> {
         use TokenKind as TK;
 
@@ -4008,25 +4240,177 @@ def foo():
 ",
         );
 
-        // FIXME: Should include `foofoo`.
-        //
-        // `foofoo` isn't included at present (2025-05-22). The problem
-        // here is that the AST for `def foo():` doesn't encompass the
-        // trailing indentation. So when the cursor position is in that
-        // trailing indentation, we can't (easily) get a handle to the
-        // right scope. And even if we could, the AST expressions for
-        // `def foo():` and `def foofoo(): ...` end at precisely the
-        // same point. So there is no AST we can hold after the end of
-        // `foofoo` but before the end of `foo`. So at the moment, it's
-        // not totally clear how to get the right scope.
-        //
-        // If we didn't want to change the ranges on the AST nodes,
-        // another approach here would be to get the inner most scope,
-        // and explore its ancestors until we get to a level that
-        // matches the current cursor's indentation. This seems fraught
-        // however. It's not clear to me that we can always assume a
-        // correspondence between scopes and indentation level.
-        assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"foo");
+        assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"
+        foo
+        foofoo
+        ");
+    }
+
+    #[test]
+    fn scope_recovery_respects_expression_and_suite_boundaries() {
+        for (source, present, absent) in [
+            ("def f(value):\n    <CURSOR>", &["value"][..], &[][..]),
+            ("def f(value):\n    return <CURSOR>", &["value"], &[]),
+            ("def f(value): return <CURSOR>", &["value"], &[]),
+            (
+                "def f(value):\n    pass\n# comment\n    <CURSOR>",
+                &["value"],
+                &[],
+            ),
+            (
+                "def f(value):\n    pass\n# comment\n<CURSOR>",
+                &["f"],
+                &["value"],
+            ),
+            (
+                "def f(value):\n    pass\nother = 1\n    <CURSOR>",
+                &["other"],
+                &["value"],
+            ),
+            (
+                "outer = 1\ndef f(value=<CURSOR>):\n    local = 1",
+                &["outer"],
+                &["value", "local"],
+            ),
+            (
+                "outer = 1\nf = lambda value=<CURSOR>: value",
+                &["outer"],
+                &["value"],
+            ),
+            (
+                "outer = [1]\nresult = [item for item in <CURSOR>]",
+                &["outer"],
+                &["item"],
+            ),
+            (
+                "outer = [[1]]\nresult = [later for item in outer for later in <CURSOR>]",
+                &["outer", "item", "later"],
+                &[],
+            ),
+            (
+                "outer = [1]\nresult = {<CURSOR>: item for item in outer}",
+                &["outer", "item"],
+                &[],
+            ),
+            (
+                "outer = [1]\nresult = {item for item in <CURSOR>}",
+                &["outer"],
+                &["item"],
+            ),
+            (
+                "outer = [1]\nresult = (item for item in <CURSOR>)",
+                &["outer"],
+                &["item"],
+            ),
+            (
+                "outer = [1]\nresult = [item for item in outer]<CURSOR>",
+                &["outer"],
+                &["item"],
+            ),
+            (
+                "outer = [1]\nresult = [item for item in outer] <CURSOR>",
+                &["outer"],
+                &["item"],
+            ),
+            (
+                "outer = [1]\nresult = {item for item in outer} <CURSOR>",
+                &["outer"],
+                &["item"],
+            ),
+            (
+                "outer = [1]\nresult = {item: item for item in outer} <CURSOR>",
+                &["outer"],
+                &["item"],
+            ),
+            (
+                "outer = [1]\nresult = (item for item in outer) <CURSOR>",
+                &["outer"],
+                &["item"],
+            ),
+            (
+                "outer = [1]\nresult = [len([]) <CURSOR> for item in outer]",
+                &["outer", "item"],
+                &[],
+            ),
+            (
+                "outer = [1]\nresult = [(1) <CURSOR> for item in outer]",
+                &["outer", "item"],
+                &[],
+            ),
+        ] {
+            let builder = completion_test_builder(source)
+                .skip_keywords()
+                .skip_builtins()
+                .skip_auto_import();
+            let result = builder.build();
+            let names = result
+                .filtered
+                .iter()
+                .map(|completion| completion.name.as_str())
+                .collect::<Vec<_>>();
+            for expected in present {
+                assert!(
+                    names.contains(expected),
+                    "missing {expected} in {source}: {names:?}"
+                );
+            }
+            for unexpected in absent {
+                assert!(
+                    !names.contains(unexpected),
+                    "unexpected {unexpected} in {source}: {names:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comprehension_target_is_a_binding_position() {
+        let builder =
+            completion_test_builder("outer = [1]\n[item for first, se<CURSOR>cond in outer]")
+                .skip_auto_import();
+        assert!(builder.build().original.is_empty());
+    }
+
+    #[test]
+    fn cursor_ancestors_follow_suite_boundaries() {
+        for (source, expected) in [
+            ("def f():\n    pass\n    <CURSOR>", vec!["function"]),
+            ("def f():\n    pass\n<CURSOR>\n    pass", vec![]),
+            (
+                "def f():\n    for value in []:\n        <CURSOR>",
+                vec!["for", "function"],
+            ),
+            (
+                "for value in []:\n    def f():\n        <CURSOR>",
+                vec!["function", "for"],
+            ),
+            (
+                "if True:\n    pass\nelse:\n    <CURSOR>",
+                vec!["else", "if"],
+            ),
+        ] {
+            let builder = completion_test_builder(source);
+            let db = builder.db();
+            let file = builder
+                .cursor_test
+                .program_file(builder.cursor_test.cursor.file);
+            let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+            let source = ruff_db::source::source_text(db, file.file(db));
+            let cursor =
+                super::CompletionCursor::new(&parsed, &source, builder.cursor_test.cursor.offset)
+                    .unwrap();
+            let actual = cursor
+                .ancestors()
+                .filter_map(|node| match node {
+                    ruff_python_ast::AnyNodeRef::StmtFunctionDef(_) => Some("function"),
+                    ruff_python_ast::AnyNodeRef::StmtFor(_) => Some("for"),
+                    ruff_python_ast::AnyNodeRef::StmtIf(_) => Some("if"),
+                    ruff_python_ast::AnyNodeRef::ElifElseClause(_) => Some("else"),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{}", source.as_str());
+        }
     }
 
     #[test]
@@ -4140,16 +4524,10 @@ def foo():
 ",
         );
 
-        // FIXME: Should include `foofoo` (but not `foofoofoo`).
-        //
-        // The tests below fail for the same reason that
-        // `nested_function_not_in_global_scope_blank` fails: there is no
-        // space in the AST ranges after the end of `foofoofoo` but before
-        // the end of `foofoo`. So either the AST needs to be tweaked to
-        // account for the indented whitespace, or some other technique
-        // needs to be used to get the scope containing `foofoo` but not
-        // `foofoofoo`.
-        assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"foo");
+        assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"
+        foo
+        foofoo
+        ");
     }
 
     #[test]
@@ -4162,8 +4540,10 @@ def foo():
     <CURSOR>",
         );
 
-        // FIXME: Should include `foofoo` (but not `foofoofoo`).
-        assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"foo");
+        assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"
+        foo
+        foofoo
+        ");
     }
 
     #[test]
@@ -4178,9 +4558,9 @@ def frob(): ...
             ",
         );
 
-        // FIXME: Should include `foofoo` (but not `foofoofoo`).
         assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"
         foo
+        foofoo
         frob
         ");
     }
@@ -4198,9 +4578,9 @@ def frob(): ...
 ",
         );
 
-        // FIXME: Should include `foofoo` (but not `foofoofoo`).
         assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"
         foo
+        foofoo
         frob
         ");
     }
@@ -4219,9 +4599,9 @@ def frob(): ...
 ",
         );
 
-        // FIXME: Should include `foofoo` (but not `foofoofoo`).
         assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"
         foo
+        foofoo
         frob
         ");
     }
@@ -4251,12 +4631,9 @@ def frob(): ...
 ",
         );
 
-        // TODO: it would be good if `bar` was included here, but
-        // the list comprehension is not yet valid and so we do not
-        // detect this as a definition of `bar`.
         assert_snapshot!(
             builder.skip_keywords().skip_builtins().build().snapshot(),
-            @"<No completions found after filtering out completions>",
+            @"bar",
         );
     }
 
@@ -4385,20 +4762,9 @@ items: list[str] = []
 ",
         );
 
-        // FIXME: Should include `foo`.
-        //
-        // This fails for similar reasons as above: the body of the
-        // lambda doesn't include the position of <CURSOR> because
-        // <CURSOR> is inside leading or trailing whitespace. (Even
-        // when enclosed in parentheses. Specifically, parentheses
-        // aren't part of the node's range unless it's relevant e.g.,
-        // tuples.)
-        //
-        // The `lambda_blank1` test works because there are expressions
-        // on either side of <CURSOR>.
         assert_snapshot!(
             builder.skip_keywords().skip_builtins().build().snapshot(),
-            @"<No completions found after filtering out completions>",
+            @"foo",
         );
     }
 
@@ -4412,7 +4778,7 @@ items: list[str] = []
 
         assert_snapshot!(
             builder.skip_keywords().skip_builtins().build().snapshot(),
-            @"<No completions found after filtering out completions>",
+            @"foo",
         );
     }
 
@@ -4477,13 +4843,12 @@ class Foo:
 ",
         );
 
-        // FIXME: Should include `bar`, `quux` and `frob`.
-        // (Unclear if `Foo` should be included, but a false
-        // positive isn't the end of the world.)
-        //
-        // These don't work for similar reasons as other
-        // tests above with the <CURSOR> inside of whitespace.
-        assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"Foo");
+        assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"
+        Foo
+        bar
+        frob
+        quux
+        ");
     }
 
     #[test]
@@ -4492,15 +4857,14 @@ class Foo:
             "\
 class Foo:
     bar = 1
-    quux = <CURSOR>
-    frob = 3
+    <CURSOR>
 ",
         );
 
-        // FIXME: Should include `bar`, `quux` and `frob`.
-        // (Unclear if `Foo` should be included, but a false
-        // positive isn't the end of the world.)
-        assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"Foo");
+        assert_snapshot!(builder.skip_keywords().skip_builtins().build().snapshot(), @"
+        Foo
+        bar
+        ");
     }
 
     #[test]
@@ -5883,16 +6247,13 @@ Re<CURSOR>
 
     #[test]
     fn attribute_access_set_keyword_prefix() {
-        let builder = completion_test_builder(
-            "\
-{1}.is<CURSOR>
-",
-        );
-
-        builder
-            .build()
-            .contains("isdisjoint")
-            .not_contains("isinstance");
+        for source in ["{1}.is<CURSOR>", "{1}.is<CURSOR>disjoint.__call__"] {
+            let builder = completion_test_builder(source);
+            builder
+                .build()
+                .contains("isdisjoint")
+                .not_contains("isinstance");
+        }
     }
 
     #[test]
