@@ -63,9 +63,9 @@ pub mod statement;
 pub mod symbol;
 pub mod unpack;
 mod use_def;
-pub use db::Db;
 #[cfg(any(test, feature = "testing"))]
 pub use db::TestProgramDb;
+pub use db::{Db, ProvidedAnnotation};
 pub mod program;
 pub mod program_file;
 pub use program::Program;

@@ -12,13 +12,171 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_core::Db as _;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::{DefinitionKind, ProvidedBinding, ProvidedStatement};
-use ty_python_core::{ProgramFileKind, semantic_index};
+use ty_python_core::{ProgramFileKind, ProvidedAnnotation, semantic_index};
 
 use super::*;
 use crate::ProgramEnvironment;
 use crate::SemanticModel;
 use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
 use crate::types::KnownClass;
+
+/// Pairs top-level functions by name and their ordinary parameters by position.
+/// Signature compatibility is the consumer's responsibility; this fixture exercises
+/// annotation ownership after the consumer has selected a correspondence.
+struct ExternalSource;
+
+impl SourceProvider for ExternalSource {
+    fn statements(&self, _db: &TestDb, _file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
+        Vec::new()
+    }
+
+    fn annotation<'db>(
+        &self,
+        db: &'db TestDb,
+        file: ProgramFile<'db>,
+        owner: NodeIndex,
+    ) -> Option<ProvidedAnnotation<'db>> {
+        if file.file(db).path(db).as_system_path()?.as_str() != "/src/main.py" {
+            return None;
+        }
+        let target = db.program_file(system_path_to_file(db, "/src/contracts.pyi").ok()?);
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let declarations = parsed_module(db, target.python_file(db)).load(db);
+        for statement in module.suite() {
+            let ast::Stmt::FunctionDef(function) = statement else {
+                continue;
+            };
+            let Some(foreign) = declarations.suite().iter().find_map(|statement| {
+                let ast::Stmt::FunctionDef(declaration) = statement else {
+                    return None;
+                };
+                (declaration.name.as_str() == function.name.as_str()).then_some(declaration)
+            }) else {
+                continue;
+            };
+            let foreign_owner =
+                if function.node_index().load() == owner {
+                    foreign.returns.as_ref()?;
+                    foreign.node_index().load()
+                } else {
+                    let Some(index) = function.parameters.iter().position(|parameter| {
+                        parameter.as_parameter().node_index().load() == owner
+                    }) else {
+                        continue;
+                    };
+                    let parameter = foreign.parameters.iter().nth(index)?;
+                    parameter.as_parameter().annotation()?;
+                    parameter.as_parameter().node_index().load()
+                };
+            return Some(ProvidedAnnotation::External {
+                file: target,
+                owner: foreign_owner,
+            });
+        }
+        None
+    }
+
+    fn binding<'db>(
+        &self,
+        _db: &'db TestDb,
+        _definition: Definition<'db>,
+    ) -> ProvidedBindingResolution<'db> {
+        ProvidedBindingValue::Unresolved.into()
+    }
+
+    fn builtin<'db>(
+        &self,
+        _db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        _name: &str,
+        _usage: BuiltinUsage,
+    ) -> Option<ProvidedBindingValue<'db>> {
+        None
+    }
+}
+
+#[test]
+fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", "Scalar = int\ndef helper():\n    return 1\ndef compute(value=1):\n    value = 1\n    return 1\ndef implicit(value):\n    print(value)\ndef native(value: int) -> int:\n    return value\n")
+        .with_file("/src/contracts.pyi", "")
+        .with_source_provider(ExternalSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let stub = system_path_to_file(&db, "/src/contracts.pyi")?;
+    for (scalar, expected) in [
+        (
+            "str",
+            vec![
+                "invalid-assignment",
+                "invalid-parameter-default",
+                "invalid-return-type",
+                "invalid-return-type",
+            ],
+        ),
+        ("int", vec!["invalid-return-type"]),
+        (
+            "str",
+            vec![
+                "invalid-assignment",
+                "invalid-parameter-default",
+                "invalid-return-type",
+                "invalid-return-type",
+            ],
+        ),
+    ] {
+        // Deliberately place the foreign annotations past the end of the implementation.
+        db.write_file("/src/contracts.pyi", format!("{}Scalar = {scalar}\ndef compute(value: Scalar = ...) -> Scalar: ...\ndef implicit(value: Scalar) -> Scalar: ...\ndef native(value: str) -> str: ...\n", "# declarations\n".repeat(30)))?;
+        let diagnostics = db.check_file(file);
+        let mut ids = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "{diagnostics:#?}");
+        for diagnostic in &diagnostics {
+            let primary = diagnostic.primary_annotation().unwrap();
+            assert_eq!(
+                primary.get_span().file(),
+                &ruff_db::diagnostic::UnifiedFile::Ty(file)
+            );
+        }
+        let foreign_annotations = diagnostics
+            .iter()
+            .flat_map(ruff_db::diagnostic::Diagnostic::annotations)
+            .filter(|annotation| {
+                annotation.get_span().file() == &ruff_db::diagnostic::UnifiedFile::Ty(stub)
+            })
+            .count();
+        // Explicit return and reassignment errors identify the declaring stub.
+        assert_eq!(foreign_annotations, if scalar == "str" { 2 } else { 0 });
+    }
+    Ok(())
+}
+
+#[test]
+fn external_annotations_preserve_variadic_and_nominal_types() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/main.py", "class Item: pass\ndef collect(*items, **labels):\n    labels = 1\n    return items[0]\ndef echo(value):\n    return value\ncollect(Item(), bad=1)\necho([Item()])\necho([1])\n")
+        .with_file("/src/contracts.pyi", "from main import Item\ndef collect(*items: Item, **labels: str) -> Item: ...\ndef echo(value: list[Item] | None) -> list[Item] | None: ...\n")
+        .with_source_provider(ExternalSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-assignment",
+            "invalid-argument-type",
+            "invalid-argument-type"
+        ],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
 
 #[test]
 fn semantic_file_kind_is_independent_of_parser_grammar() -> anyhow::Result<()> {
@@ -233,12 +391,12 @@ impl SourceProvider for CommentedSource {
             .collect()
     }
 
-    fn annotation(
+    fn annotation<'db>(
         &self,
-        db: &TestDb,
-        file: ProgramFile<'_>,
+        db: &'db TestDb,
+        file: ProgramFile<'db>,
         owner: NodeIndex,
-    ) -> Option<TextRange> {
+    ) -> Option<ProvidedAnnotation<'db>> {
         if file.file(db).path(db).as_system_path()?.as_str() != "/src/main.py" {
             return None;
         }
@@ -256,7 +414,10 @@ impl SourceProvider for CommentedSource {
                     .next()?;
                 let marker = tail.find("# ")?;
                 let start = assignment.value.end() + TextSize::try_from(marker + 2).unwrap();
-                return Some(TextRange::at(start, TextSize::of(&tail[marker + 2..])));
+                return Some(ProvidedAnnotation::Range(TextRange::at(
+                    start,
+                    TextSize::of(&tail[marker + 2..]),
+                )));
             }
             let ast::Stmt::FunctionDef(function) = statement else {
                 continue;
@@ -280,7 +441,7 @@ impl SourceProvider for CommentedSource {
                 }
                 TextRange::at(offset, TextSize::of(parameter))
             };
-            return Some(range);
+            return Some(ProvidedAnnotation::Range(range));
         }
         None
     }
@@ -702,7 +863,9 @@ fn function_annotation_hover_uses_the_owning_signature_scope() -> anyhow::Result
         let model = SemanticModel::new(&db, file);
         let env = model.program_environment();
         for owner in [function.node_index().load(), parameter.node_index().load()] {
-            let range = db.provided_annotation(file, owner).unwrap();
+            let Some(ProvidedAnnotation::Range(range)) = db.provided_annotation(file, owner) else {
+                panic!("expected a local annotation");
+            };
             let element = model
                 .provided_annotation_type_at(owner, range.start() + TextSize::new(5))
                 .unwrap();
@@ -749,7 +912,9 @@ fn nested_supplied_annotations_follow_source_edits() -> anyhow::Result<()> {
             function.parameters.args[0].parameter.node_index().load(),
             assignment.targets[0].node_index().load(),
         ] {
-            let range = db.provided_annotation(file, owner).unwrap();
+            let Some(ProvidedAnnotation::Range(range)) = db.provided_annotation(file, owner) else {
+                panic!("expected a local annotation");
+            };
             let env = model.program_environment();
             assert_eq!(
                 model.provided_annotation_type_at(owner, range.end()),

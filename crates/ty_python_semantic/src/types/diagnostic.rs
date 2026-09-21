@@ -43,6 +43,7 @@ use crate::types::{KnownInstanceType, MemberLookupPolicy, TypeVarKind, TypedDict
 use crate::{Db, DisplaySettings, FxIndexMap, ProgramEnvironment, SemanticModel, declare_lint};
 use itertools::Itertools;
 use ruff_db::PythonFile;
+use ruff_db::files::FileRange;
 use ruff_db::source::source_text;
 use ruff_db::{
     diagnostic::{
@@ -1820,18 +1821,18 @@ enum DeclarationKind {
 }
 
 struct AssignmentDeclarationAnnotation {
-    range: TextRange,
+    source: FileRange,
     declaration_kind: DeclarationKind,
 }
 
 impl AssignmentDeclarationAnnotation {
     fn into_annotation(
         self,
-        context: &InferContext,
         target_type_display: impl fmt::Display,
         ordinary_message: impl fmt::Display,
     ) -> Annotation {
-        let annotation = context.secondary(self.range);
+        let annotation =
+            Annotation::secondary(Span::from(self.source.file()).with_range(self.source.range()));
 
         match self.declaration_kind {
             DeclarationKind::KeywordVariadicParameter => annotation.message(format_args!(
@@ -1853,7 +1854,7 @@ fn assignment_declaration_annotation<'db>(
 ) -> Option<AssignmentDeclarationAnnotation> {
     let db = context.db();
     if let DefinitionKind::Assignment(assignment) = definition_kind
-        && let Some(range) = crate::types::string_annotation::SourceAnnotation::source_range(
+        && let Some(annotation) = crate::types::string_annotation::SourceAnnotation::new(
             db,
             context.program_file(),
             assignment.target(context.module()),
@@ -1861,7 +1862,7 @@ fn assignment_declaration_annotation<'db>(
         )
     {
         return Some(AssignmentDeclarationAnnotation {
-            range,
+            source: annotation.source(context.file()),
             declaration_kind: DeclarationKind::Regular,
         });
     }
@@ -1873,27 +1874,30 @@ fn assignment_declaration_annotation<'db>(
         };
 
     let parameter_annotation = |parameter: &ast::Parameter, kind| {
-        crate::types::string_annotation::SourceAnnotation::source_range(
+        crate::types::string_annotation::SourceAnnotation::new(
             db,
             context.program_file(),
             parameter,
             parameter.annotation(),
         )
-        .map(|range| (range, kind))
+        .map(|annotation| (annotation.source(context.file()), kind))
     };
-    let (range, declaration_kind) = match declaration_definition_kind {
+    let (source, declaration_kind) = match declaration_definition_kind {
         DefinitionKind::AnnotatedAssignment(assignment) => Some((
-            assignment.annotation(context.module()).range(),
+            FileRange::new(
+                context.file(),
+                assignment.annotation(context.module()).range(),
+            ),
             DeclarationKind::Regular,
         )),
         DefinitionKind::Assignment(assignment) => {
-            crate::types::string_annotation::SourceAnnotation::source_range(
+            crate::types::string_annotation::SourceAnnotation::new(
                 db,
                 context.program_file(),
                 assignment.target(context.module()),
                 None,
             )
-            .map(|range| (range, DeclarationKind::Regular))
+            .map(|annotation| (annotation.source(context.file()), DeclarationKind::Regular))
         }
         DefinitionKind::Parameter(ParameterDefinitionNodeKind::Parameter(parameter)) => {
             parameter_annotation(
@@ -1938,7 +1942,7 @@ fn assignment_declaration_annotation<'db>(
     }?;
 
     Some(AssignmentDeclarationAnnotation {
-        range,
+        source,
         declaration_kind,
     })
 }
@@ -2215,7 +2219,6 @@ pub(super) fn report_invalid_assignment<'db>(
         assignment_declaration_annotation(context, definition_kind, declaration)
     {
         diag.annotate(declaration_annotation.into_annotation(
-            context,
             target_ty.display_with(db, env, settings.clone()),
             "Declared type",
         ));
@@ -2331,7 +2334,6 @@ pub(super) fn report_unsound_assignment<'db>(
         assignment_declaration_annotation(context, definition_kind, declaration)
     {
         diagnostic.annotate(declaration_annotation.into_annotation(
-            context,
             &expected_display,
             format_args!("Expected a subtype of `{expected_display}` because of this annotation"),
         ));
@@ -2802,7 +2804,7 @@ pub(super) fn report_dynamic_function_decorator_return<'db>(
 pub(super) fn report_invalid_return_type(
     context: &InferContext,
     object_range: impl Ranged,
-    return_type_range: impl Ranged,
+    return_type_range: FileRange,
     expected_ty: Type,
     actual_ty: Type,
 ) {
@@ -2814,7 +2816,8 @@ pub(super) fn report_invalid_return_type(
     let env = &context.program_environment();
     let settings =
         DisplaySettings::from_possibly_ambiguous_types(db, env, [expected_ty, actual_ty]);
-    let return_type_span = context.span(return_type_range);
+    let return_type_span =
+        Span::from(return_type_range.file()).with_range(return_type_range.range());
 
     let mut diag = builder.into_diagnostic("Return type does not match returned value");
     diag.set_primary_annotation_message(format_args!(
@@ -2836,7 +2839,7 @@ pub(super) fn report_invalid_return_type(
 pub(super) fn report_unsound_return_statement(
     context: &InferContext,
     object_range: impl Ranged,
-    return_type_range: impl Ranged,
+    return_type_range: FileRange,
     expected_ty: Type,
     actual_ty: Type,
 ) {
@@ -2867,9 +2870,14 @@ pub(super) fn report_unsound_return_statement(
         of `{expected_ty_display}`"
     ));
     diag.set_primary_annotation_message(format_args!("Inferred as `{actual_ty_display}`"));
-    diag.annotate(context.secondary(return_type_range).message(format_args!(
-        "Expected a subtype of `{expected_ty_display}` because of the return type",
-    )));
+    diag.annotate(
+        Annotation::secondary(
+            Span::from(return_type_range.file()).with_range(return_type_range.range()),
+        )
+        .message(format_args!(
+            "Expected a subtype of `{expected_ty_display}` because of the return type",
+        )),
+    );
 
     diag.info(format_args!(
         "`{actual_ty_display}` is assignable to `{expected_ty_display}`, \

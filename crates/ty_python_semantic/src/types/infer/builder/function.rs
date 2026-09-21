@@ -313,7 +313,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             report_invalid_return_type(
                                 &self.context,
                                 return_statement.range,
-                                returns.range(),
+                                returns.source(self.context.file()),
                                 expected_return_ty,
                                 return_statement.ty,
                             );
@@ -330,7 +330,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             report_unsound_return_statement(
                                 &self.context,
                                 return_statement.range,
-                                returns.range(),
+                                returns.source(self.context.file()),
                                 expected_return_ty,
                                 return_statement.ty,
                             );
@@ -381,7 +381,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     report_invalid_return_type(
                         &self.context,
                         return_statement.range,
-                        returns.range(),
+                        returns.source(self.context.file()),
                         declared_ty,
                         return_statement.ty,
                     );
@@ -399,7 +399,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     report_unsound_return_statement(
                         &self.context,
                         return_statement.range,
-                        returns.range(),
+                        returns.source(self.context.file()),
                         declared_ty,
                         return_statement.ty,
                     );
@@ -1114,7 +1114,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
-    fn infer_function_annotation(&mut self, annotation: &SourceAnnotation<'_>) -> Type<'db> {
+    fn infer_function_annotation(&mut self, annotation: &SourceAnnotation<'_, 'db>) -> Type<'db> {
+        if let Some(ty) = annotation.external_type(self.db()) {
+            return ty;
+        }
         let Some((expression, state)) = self.annotation_expression(annotation) else {
             return Type::unknown();
         };
@@ -1124,7 +1127,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn parameter_annotation_type<'a>(
         &self,
         parameter: &'a ast::Parameter,
-    ) -> Option<(SourceAnnotation<'a>, Type<'db>, TypeExpressionFlags)> {
+    ) -> Option<(SourceAnnotation<'a, 'db>, Type<'db>, TypeExpressionFlags)> {
         let annotation = SourceAnnotation::new(
             self.db(),
             self.program_file(),

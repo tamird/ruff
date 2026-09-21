@@ -52,7 +52,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     pub(super) fn parse_string_annotation(
         &mut self,
         string: &ast::ExprStringLiteral,
-    ) -> Option<SourceAnnotation<'ast>> {
+    ) -> Option<SourceAnnotation<'ast, 'db>> {
         let annotation = parse_string_annotation(
             &self.context,
             self.inference_flags(),
@@ -67,7 +67,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Prepares either module syntax or a detached annotation for the ordinary inference paths.
     pub(super) fn annotation_expression<'a>(
         &self,
-        annotation: &'a SourceAnnotation<'_>,
+        annotation: &'a SourceAnnotation<'_, 'db>,
     ) -> Option<(&'a ast::Expr, DeferredExpressionState)> {
         let expression = annotation.expression_or_report(&self.context)?;
         let state = match annotation {
@@ -77,6 +77,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 range: _,
                 parsed: _,
             } => DeferredExpressionState::InDetachedAnnotation(*owner),
+            SourceAnnotation::External {
+                annotation: _,
+                range: _,
+            } => return None,
         };
         Some((expression, state))
     }

@@ -75,7 +75,7 @@ pub(super) enum ReturnCallableTypeVarScope {
 pub(crate) fn function_signature_annotation_info<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
-    expression: ast::ExprRef<'_>,
+    expression: ty_python_core::ExpressionNodeKey,
 ) -> (Option<Type<'db>>, TypeExpressionFlags) {
     let DefinitionKind::Function(function) = definition.kind(db) else {
         unreachable!("signature annotations belong to a function");
@@ -5887,14 +5887,7 @@ impl<'db> Parameter<'db> {
                 parameter.annotation(),
             ) {
                 let (ty, flags) = annotation.inferred(db, function_definition);
-                (
-                    ty,
-                    false,
-                    flags,
-                    annotation
-                        .expression()
-                        .is_some_and(ast::Expr::is_starred_expr),
-                )
+                (ty, false, flags, annotation.is_starred())
             } else {
                 (Type::unknown(), true, TypeExpressionFlags::empty(), false)
             };

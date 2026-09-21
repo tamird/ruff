@@ -764,21 +764,25 @@ impl<'db> OverloadLiteral<'db> {
         let span = Span::from(file);
         let module = parsed_module(db, self.python_file(db)).load(db);
         let func_def = self.node(db, file, &module);
-        let return_type_range = crate::types::string_annotation::SourceAnnotation::source_range(
+        let return_annotation = crate::types::string_annotation::SourceAnnotation::new(
             db,
             self.program_file(db),
             func_def,
             func_def.returns.as_deref(),
         );
+        let return_type_source = return_annotation.map(|annotation| annotation.source(file));
         let mut signature = func_def.name.range.cover(func_def.parameters.range);
-        if let Some(return_type_range) = return_type_range {
-            signature = signature.cover(return_type_range);
+        if let Some(source) = return_type_source
+            && source.file() == file
+        {
+            signature = signature.cover(source.range());
         }
         FunctionSpans {
             signature: span.clone().with_range(signature),
             name: span.clone().with_range(func_def.name.range),
             parameters: span.clone().with_range(func_def.parameters.range),
-            return_type: return_type_range.map(|range| span.clone().with_range(range)),
+            return_type: return_type_source
+                .map(|source| Span::from(source.file()).with_range(source.range())),
             decorators_and_header: span.with_range(signature.cover_offset(func_def.start())),
         }
     }

@@ -3,6 +3,21 @@ use crate::definition::ProvidedStatement;
 use ruff_db::files::File;
 use ty_module_resolver::Db as ModuleResolverDb;
 
+/// An annotation supplied outside a declaration's ordinary AST slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvidedAnnotation<'db> {
+    /// One type expression in the declaration's physical source file.
+    Range(ruff_text_size::TextRange),
+    /// Supplies a function return or parameter type from an annotated function or parameter
+    /// in another canonical source tree. Both owners must be function or parameter nodes;
+    /// the target must have a native annotation. Names and type parameters retain their
+    /// declaring scope. The provider owns the correspondence between the two declarations.
+    External {
+        file: ProgramFile<'db>,
+        owner: ruff_python_ast::NodeIndex,
+    },
+}
+
 #[cfg(any(test, feature = "testing"))]
 use crate::program::{Program, ProgramSettings};
 
@@ -12,16 +27,15 @@ pub trait Db: ModuleResolverDb {
     /// Returns `true` if the file should be checked.
     fn should_check_file(&self, file: File) -> bool;
 
-    /// Supplies the range of a type annotation outside its ordinary AST slot.
+    /// Supplies a type annotation outside its ordinary AST slot.
     /// `owner` is a function node for a return annotation, a parameter node for its type,
     /// or a simple name assignment target for that target's declared type.
-    /// The range refers to the same physical source and must identify one type expression.
     /// Implementations must read tracked syntax inputs without requesting this file's index.
-    fn provided_annotation(
-        &self,
-        _file: ProgramFile<'_>,
+    fn provided_annotation<'db>(
+        &'db self,
+        _file: ProgramFile<'db>,
         _owner: ruff_python_ast::NodeIndex,
-    ) -> Option<ruff_text_size::TextRange> {
+    ) -> Option<ProvidedAnnotation<'db>> {
         None
     }
 

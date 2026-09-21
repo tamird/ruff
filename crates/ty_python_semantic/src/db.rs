@@ -121,12 +121,12 @@ pub(crate) mod tests {
             db: &TestDb,
             file: ProgramFile<'_>,
         ) -> Vec<ty_python_core::definition::ProvidedStatement>;
-        fn annotation(
+        fn annotation<'db>(
             &self,
-            db: &TestDb,
-            file: ProgramFile<'_>,
+            db: &'db TestDb,
+            file: ProgramFile<'db>,
             owner: ruff_python_ast::NodeIndex,
-        ) -> Option<ruff_text_size::TextRange>;
+        ) -> Option<ty_python_core::ProvidedAnnotation<'db>>;
         fn binding<'db>(
             &self,
             db: &'db TestDb,
@@ -271,11 +271,11 @@ pub(crate) mod tests {
                 .map_or_else(Vec::new, |provider| provider.statements(self, file))
         }
 
-        fn provided_annotation(
-            &self,
-            file: ProgramFile<'_>,
+        fn provided_annotation<'db>(
+            &'db self,
+            file: ProgramFile<'db>,
             owner: ruff_python_ast::NodeIndex,
-        ) -> Option<ruff_text_size::TextRange> {
+        ) -> Option<ty_python_core::ProvidedAnnotation<'db>> {
             self.source_provider
                 .as_ref()
                 .and_then(|provider| provider.annotation(self, file, owner))
