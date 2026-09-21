@@ -2696,7 +2696,7 @@ impl<'db> StaticClassLiteral<'db> {
                 // Annotation-only declarations in stubs also act as bindings for attribute
                 // lookup, but they do not supply field defaults.
                 let mut default_ty = if field_policy == CodeGeneratorKind::TypedDict
-                    || (self.file(db).is_stub(db)
+                    || (self.program_file(db).is_stub(db)
                         && !first_declaration.is_some_and(|definition| {
                             matches!(
                                 definition.kind(db),
@@ -2996,7 +2996,7 @@ impl<'db> StaticClassLiteral<'db> {
                     // Stub assignments to slots describe instance storage, not runtime class
                     // attributes.
                     let has_binding = !(inferred.is_undefined()
-                        || self.file(db).is_stub(db) && self.has_instance_slot(db, name));
+                        || self.program_file(db).is_stub(db) && self.has_instance_slot(db, name));
 
                     if has_binding {
                         // The attribute is declared and bound in the class body.

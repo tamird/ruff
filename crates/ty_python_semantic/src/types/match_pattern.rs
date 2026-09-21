@@ -418,7 +418,7 @@ pub(crate) fn class_pattern_positional_result<'db>(
             if class.known(db).is_some()
                 || class
                     .as_static()
-                    .is_some_and(|class| !class.body_scope(db).file(db).is_stub(db)) =>
+                    .is_some_and(|class| !class.program_file(db).is_stub(db)) =>
         {
             Some(ClassPatternPositionalResult::Limit(0))
         }

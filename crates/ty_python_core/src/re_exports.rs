@@ -65,7 +65,7 @@ impl<'db> ExportFinder<'db> {
         Self {
             db,
             program_file: file,
-            visiting_stub_file: file.file(db).is_stub(db),
+            visiting_stub_file: file.is_stub(db),
             exclusions: db.source_exclusions(file),
             exports: FxHashMap::default(),
             dunder_all: DunderAll::NotPresent,

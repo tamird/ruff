@@ -69,7 +69,7 @@ pub use db::TestProgramDb;
 pub mod program;
 pub mod program_file;
 pub use program::Program;
-pub use program_file::ProgramFile;
+pub use program_file::{ProgramFile, ProgramFileKind};
 
 /// Returns the semantic index for `file`.
 ///

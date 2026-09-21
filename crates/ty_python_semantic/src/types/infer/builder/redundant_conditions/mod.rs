@@ -393,7 +393,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 
         !self.in_detached_annotation()
             && self.db().should_check_file(self.file())
-            && !self.file().is_stub(self.db())
+            && !self.program_file().is_stub(self.db())
             && RELEVANT_RULES
                 .iter()
                 .any(|rule| self.context.is_lint_enabled(rule))

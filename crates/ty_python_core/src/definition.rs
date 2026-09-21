@@ -96,7 +96,7 @@ impl<'db> Definition<'db> {
         {
             return DefinitionCategory::DeclarationAndBinding;
         }
-        kind.category(self.file(db).is_stub(db), module)
+        kind.category(self.program_file(db).is_stub(db), module)
     }
 
     pub(crate) fn new(

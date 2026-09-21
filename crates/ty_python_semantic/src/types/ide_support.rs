@@ -694,7 +694,7 @@ fn member_implementation_definition<'db>(
     }
 
     // Stub overload declarations can still map to a real source implementation later.
-    if definition.file(db).is_stub(db) {
+    if definition.program_file(db).is_stub(db) {
         return Some(ResolvedDefinition::Definition(definition));
     }
 
@@ -1770,8 +1770,10 @@ mod stub_mapping {
         // If the file isn't a stub, this is presumably the real definition
         let stub_file = stub_program_file.file(db);
         trace!("Stub mapping definition in: {}", stub_file.path(db));
-        if !stub_file.is_stub(db) {
-            trace!("File isn't a stub, no stub mapping to do");
+        // Python module pairing requires a physical stub; other declaration-file formats
+        // supply their own source mapping.
+        if !stub_program_file.is_stub(db) || !stub_file.is_stub(db) {
+            trace!("File isn't a Python stub, no stub mapping to do");
             return None;
         }
 

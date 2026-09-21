@@ -14,9 +14,7 @@ use ruff_db::source::{SourceText, source_text};
 use ruff_index::IndexVec;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_keyword, walk_pattern, walk_stmt};
-use ruff_python_ast::{
-    self as ast, AtomicNodeIndex, HasNodeIndex, NodeIndex, PySourceType, PythonVersion,
-};
+use ruff_python_ast::{self as ast, AtomicNodeIndex, HasNodeIndex, NodeIndex, PythonVersion};
 use ruff_python_parser::semantic_errors::{
     LazyImportContext, SemanticSyntaxChecker, SemanticSyntaxContext, SemanticSyntaxError,
     SemanticSyntaxErrorKind, YieldOutsideFunctionKind,
@@ -28,7 +26,6 @@ use ty_module_resolver::{
 };
 
 use crate::HasTrackedScope;
-use crate::ProgramFile;
 use crate::ast_ids::node_key::ExpressionNodeKey;
 use crate::ast_ids::{AstIdsBuilder, ScopedUseId};
 use crate::ast_node_ref::AstNodeRef;
@@ -78,6 +75,7 @@ use crate::{
     DefinitionsByNode, EvaluationMode, ExpressionsScopeMap, LoopHeader, LoopHeaderId,
     NarrowingAliasPredicate, PossiblyNarrowedPlaces, SemanticIndex, VisibleAncestorsIter,
 };
+use crate::{ProgramFile, ProgramFileKind};
 
 use super::place::PlaceExprRef;
 
@@ -239,7 +237,7 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     // Builder state
     db: &'db dyn Db,
     file: ProgramFile<'db>,
-    source_type: PySourceType,
+    file_kind: ProgramFileKind,
     module: &'ast ParsedModuleRef,
     scope_stack: Vec<ScopeInfo<'ast>>,
     /// The assignments we're currently visiting, with
@@ -351,7 +349,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         let mut builder = Self {
             db,
             file,
-            source_type: file.file(db).source_type(db),
+            file_kind: file.kind(db),
             module: module_ref,
             scope_stack: Vec::new(),
             current_assignments: Vec::new(),
@@ -5555,7 +5553,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     // return `Never`, so this does not have a meaningful semantic impact, except in
                     // the rare case where a collection is explicitly marked as having elements
                     // of type `Never`.
-                    if !self.source_type.is_stub()
+                    if self.file_kind != ProgramFileKind::Stub
                         && func
                             .as_attribute_expr()
                             .and_then(|attribute| {

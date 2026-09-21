@@ -590,7 +590,7 @@ pub(crate) fn imported_symbol<'db>(
     // module we're dealing with.
     file.map(|file| {
         let requires_explicit_reexport = requires_explicit_reexport.unwrap_or_else(|| {
-            if file.file(db).is_stub(db) {
+            if file.is_stub(db) {
                 RequiresExplicitReExport::Yes
             } else {
                 RequiresExplicitReExport::No
@@ -1532,7 +1532,7 @@ pub(crate) fn place_by_id<'db>(
             let scope_has_private_visibility = scope.scope(db).visibility().is_private();
 
             // We generally trust undeclared places in stubs and expose the raw type.
-            let in_stub_file = scope.file(db).is_stub(db);
+            let in_stub_file = scope.program_file(db).is_stub(db);
 
             if !(is_considered_non_modifiable
                 || is_module_global
@@ -2469,7 +2469,7 @@ pub(crate) mod implicit_globals {
             let DefinitionState::Defined(definition) = binding.binding else {
                 continue;
             };
-            if file.is_stub(db) && !is_reexported(db, definition) {
+            if program_file.is_stub(db) && !is_reexported(db, definition) {
                 continue;
             }
             if evaluate_reachability(db, use_def, binding.reachability_constraint).is_always_false()

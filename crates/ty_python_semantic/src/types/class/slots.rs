@@ -536,7 +536,7 @@ impl<'db> StaticClassLiteral<'db> {
                 .is_some_and(|slots| slots.iter().any(|slot| slot == name))
             && (self.has_generated_slots(db)
                 || !self.has_own_class_binding(db, name)
-                || self.file(db).is_stub(db) && self.has_instance_slot(db, name))
+                || self.program_file(db).is_stub(db) && self.has_instance_slot(db, name))
     }
 
     /// Synthesizes the class descriptor created for an instance slot.

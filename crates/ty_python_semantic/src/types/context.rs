@@ -389,7 +389,7 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
 
     /// Are we currently inferring types in a stub file?
     pub(crate) fn in_stub(&self) -> bool {
-        self.file.is_stub(self.db())
+        self.program_file.is_stub(self.db())
     }
 
     pub(crate) fn defuse(&mut self) {

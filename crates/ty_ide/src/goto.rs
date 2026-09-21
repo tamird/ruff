@@ -387,7 +387,10 @@ impl<'db> Definitions<'db> {
             .0
             .into_iter()
             .flat_map(|definition| {
-                if definition.focus_range(db).file().is_stub(db) {
+                if definition.program_file(db).map_or_else(
+                    || definition.focus_range(db).file().is_stub(db),
+                    |file| file.is_stub(db),
+                ) {
                     stub_mapper
                         .map_definition_to_source(&definition)
                         .unwrap_or_default()

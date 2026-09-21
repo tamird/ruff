@@ -694,7 +694,6 @@ fn definition_contains_special_cased_condition<'db>(
 ) -> bool {
     let module = parsed_module(db, definition.python_file(db)).load(db);
     let definition_kind = definition.kind(db);
-    let file = definition.file(db);
     let program_file = definition.program_file(db);
 
     let in_known_module = |known| {
@@ -703,7 +702,7 @@ fn definition_contains_special_cased_condition<'db>(
     };
 
     if let DefinitionKind::AnnotatedAssignment(annotated_assignment) = definition_kind
-        && file.is_stub(db)
+        && program_file.is_stub(db)
         && let ast::Expr::Name(ast::ExprName { id, .. }) = annotated_assignment.target(&module)
     {
         match &**id {

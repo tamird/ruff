@@ -5404,7 +5404,10 @@ pub(super) fn report_overridden_final_method<'db>(
             "At least one function definition in the superclass should be decorated with `@final`",
         );
 
-    let superclass_function_literal = if first_final_superclass_definition.file(db).is_stub(db) {
+    let superclass_function_literal = if first_final_superclass_definition
+        .program_file(db)
+        .is_stub(db)
+    {
         first_final_superclass_definition.first_overload_or_implementation(db)
     } else {
         first_final_superclass_definition

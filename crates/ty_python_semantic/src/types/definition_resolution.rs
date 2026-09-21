@@ -91,7 +91,8 @@ impl<'db> ResolvedDefinition<'db> {
         }
     }
 
-    pub(crate) fn program_file(&self, db: &'db dyn Db) -> Option<ProgramFile<'db>> {
+    /// Returns the target's semantic file, when the target carries a semantic identity.
+    pub fn program_file(&self, db: &'db dyn Db) -> Option<ProgramFile<'db>> {
         match *self {
             ResolvedDefinition::Definition(definition) => Some(definition.program_file(db)),
             ResolvedDefinition::Module(file) => Some(file),

@@ -395,7 +395,7 @@ impl<'db> ClassBase<'db> {
         let metaclass = match self {
             Self::Class(class) => return class.inferred_metaclass(db),
             Self::Protocol => {
-                if subclass.file(db).is_stub(db)
+                if subclass.program_file(db).is_stub(db)
                     && file_to_module(db, subclass.program_file(db).resolver_file(db))
                         .and_then(|module| module.search_path(db))
                         .is_some_and(SearchPath::is_standard_library)
