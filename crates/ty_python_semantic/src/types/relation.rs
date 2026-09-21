@@ -330,8 +330,10 @@ impl<'db> Type<'db> {
 
     /// Return true if this type is a subtype of type `target`.
     ///
-    /// See [`TypeRelation::Subtyping`] for more details.
-    pub(crate) fn is_subtype_of(
+    /// For gradual types, this requires every materialization of this type to be a subtype
+    /// of every materialization of `target`. Unlike [`Self::is_assignable_to`], it cannot
+    /// establish compatibility merely because some choice of an unknown type would work.
+    pub fn is_subtype_of(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
