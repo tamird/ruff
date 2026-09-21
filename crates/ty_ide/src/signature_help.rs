@@ -13,11 +13,11 @@ use crate::goto::docstring_for_call_definition;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_python_ast::find_node::covering_node;
-use ruff_python_ast::token::TokenKind;
+use ruff_python_ast::token::{TokenKind, Tokens, parenthesized_range};
 use ruff_python_ast::{self as ast, AnyNodeRef};
 use ruff_python_trivia::PythonWhitespace;
 use ruff_source_file::LineRanges;
-use ruff_text_size::{Ranged, TextSize};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_core::ProgramFile;
 use ty_python_semantic::SemanticModel;
 use ty_python_semantic::types::Type;
@@ -177,24 +177,49 @@ fn get_call_expr<'ast>(
     };
 
     // Determine which argument corresponds to the current cursor location.
-    let current_arg_index = get_argument_index(call_expr, offset);
+    let current_arg_index = get_argument_index(call_expr, parsed.tokens(), offset);
 
     Some((call_expr, current_arg_index))
 }
 
-/// Determine which argument is associated with the specified offset.
-/// Returns zero if not within any argument.
-fn get_argument_index(call_expr: &ast::ExprCall, offset: TextSize) -> usize {
-    let mut current_arg = 0;
+/// Determine the source-order argument index by counting separators before the
+/// cursor, including positions where an argument has not been written yet.
+fn get_argument_index(call_expr: &ast::ExprCall, tokens: &Tokens, offset: TextSize) -> usize {
+    let mut arguments = call_expr
+        .arguments
+        .iter_source_order()
+        .map(|arg| match arg {
+            ast::ArgOrKeyword::Arg(expr) => {
+                parenthesized_range(expr.into(), (&call_expr.arguments).into(), tokens)
+                    .unwrap_or_else(|| expr.range())
+            }
+            ast::ArgOrKeyword::Keyword(keyword) => {
+                let value = parenthesized_range((&keyword.value).into(), keyword.into(), tokens)
+                    .unwrap_or_else(|| keyword.value.range());
+                TextRange::new(keyword.start(), value.end())
+            }
+        })
+        .peekable();
 
-    for (i, arg) in call_expr.arguments.iter_source_order().enumerate() {
-        if offset <= arg.end() {
-            return i;
-        }
-        current_arg = i + 1;
-    }
-
-    current_arg
+    // Only argument separators advance the cursor. An argument can contain
+    // unbracketed commas, such as the parameters of a lambda expression.
+    tokens
+        .in_range(call_expr.arguments.range())
+        .iter()
+        .take_while(|token| token.end() <= offset)
+        .filter(|token| token.kind() == TokenKind::Comma)
+        .filter(|token| {
+            while arguments
+                .peek()
+                .is_some_and(|range| range.end() <= token.start())
+            {
+                arguments.next();
+            }
+            !arguments
+                .peek()
+                .is_some_and(|range| range.contains_range(token.range()))
+        })
+        .count()
 }
 
 /// Create signature details from `CallSignatureDetails`.
@@ -1339,6 +1364,30 @@ def ab(a: int, *, c: int):
 
             let result = test.signature_help().expect("Should have signature help");
             assert_eq!(result.signatures[0].active_parameter, Some(1));
+        }
+    }
+
+    #[test]
+    fn signature_help_argument_separators() {
+        for (call, expected) in [
+            ("func((1)<CURSOR> , 2)", 0),
+            ("func((1),<CURSOR> 2)", 1),
+            ("func((1,<CURSOR>), 2)", 0),
+            ("func(lambda x,<CURSOR> y: x, 2)", 0),
+            ("func(first=(1)<CURSOR> , second=2)", 0),
+            ("func(g() <CURSOR>", 0),
+            ("func(g(), <CURSOR>", 1),
+        ] {
+            let source = format!(
+                "def func(first: object, second: object) -> None: ...\ndef g() -> int: ...\n{call}"
+            );
+            let test = cursor_test(&source);
+            let result = test.signature_help().expect(call);
+            assert_eq!(
+                result.signatures[0].active_parameter,
+                Some(expected),
+                "{call}"
+            );
         }
     }
 
