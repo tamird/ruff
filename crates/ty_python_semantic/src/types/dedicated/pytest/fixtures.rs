@@ -1104,7 +1104,8 @@ fn exposures_contributed_by_definition<'db>(
     definition: Definition<'db>,
     symbol_name: &Name,
 ) -> Vec<FixtureExposure<'db>> {
-    if definition.file(db).is_stub(db)
+    if definition.program_file(db).is_stub(db)
+        && definition.file(db).is_stub(db)
         && let Some(source_file) =
             stub_file_to_real_module(db, definition.program_file(db).resolver_file(db))
                 .and_then(|module| module.file(db))

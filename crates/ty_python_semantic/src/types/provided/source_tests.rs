@@ -1,3 +1,4 @@
+use ruff_db::PythonFile;
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
@@ -5,19 +6,113 @@ use ruff_db::system::{DbWithWritableSystem as _, SystemPath};
 use ruff_db::testing::{
     assert_function_query_was_not_run, assert_function_query_was_not_run_by_name,
 };
-use ruff_python_ast::NodeIndex;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+use ruff_python_ast::{NodeIndex, PySourceType};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_core::Db as _;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::{DefinitionKind, ProvidedBinding, ProvidedStatement};
-use ty_python_core::semantic_index;
+use ty_python_core::{ProgramFileKind, semantic_index};
 
 use super::*;
 use crate::ProgramEnvironment;
 use crate::SemanticModel;
 use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
 use crate::types::KnownClass;
+
+#[test]
+fn semantic_file_kind_is_independent_of_parser_grammar() -> anyhow::Result<()> {
+    let source = "value: int\nplaceholder: int = ...\ndef make(arg: Later = ...) -> int: ...\nclass Later: ...\nobserved = value\n";
+    let db = TestDbBuilder::new()
+        .with_file("/src/declarations.api", source)
+        .with_file("/src/declarations.pyi", source)
+        .with_file("/src/declarations.py", "value = 1\n")
+        .build()?;
+    for (path, grammar, default_kind) in [
+        (
+            "/src/declarations.api",
+            PySourceType::Stub,
+            ProgramFileKind::Source,
+        ),
+        (
+            "/src/declarations.pyi",
+            PySourceType::Python,
+            ProgramFileKind::Stub,
+        ),
+    ] {
+        let physical = system_path_to_file(&db, path)?;
+        let program = db.program_file(physical).program(&db);
+        let python_file =
+            PythonFile::new_with_source_type(&db, physical, program.python_version(&db), grammar);
+        let default = ProgramFile::from_python_file(&db, python_file, program);
+        assert_eq!(default.kind(&db), default_kind);
+        let implementation = ProgramFile::from_python_file_with_kind(
+            &db,
+            python_file,
+            program,
+            ProgramFileKind::Source,
+        );
+        let stub = ProgramFile::from_python_file_with_kind(
+            &db,
+            python_file,
+            program,
+            ProgramFileKind::Stub,
+        );
+        assert_ne!(implementation, stub);
+        assert_eq!(implementation.python_file(&db), stub.python_file(&db));
+        for file in [implementation, stub, implementation, stub] {
+            let module = parsed_module(&db, file.python_file(&db)).load(&db);
+            let [ast::Stmt::AnnAssign(assignment), ..] = module.suite().as_slice() else {
+                panic!("expected the value declaration");
+            };
+            let definition = semantic_index(&db, file).expect_single_definition(assignment);
+            let resolved = crate::ResolvedDefinition::Definition(definition);
+            assert_eq!(resolved.program_file(&db), Some(file));
+            let mapped = crate::types::ide_support::map_stub_definition(&db, &resolved, None);
+            if file.is_stub(&db) && physical.is_stub(&db) {
+                let Some(mapped) = mapped else {
+                    panic!("expected the Python implementation");
+                };
+                let [target] = mapped.as_slice() else {
+                    panic!("expected one definition: {mapped:?}");
+                };
+                assert_eq!(
+                    target.focus_range(&db).file(),
+                    system_path_to_file(&db, "/src/declarations.py")?
+                );
+            } else {
+                assert!(mapped.is_none(), "{mapped:?}");
+            }
+            let diagnostics = crate::check_file_unwrap(&db, file);
+            if file.is_stub(&db) {
+                assert!(diagnostics.is_empty(), "{path}: {diagnostics:#?}");
+                let ty = ProvidedBindingValue::Export {
+                    file,
+                    name: Name::new_static("value"),
+                }
+                .resolve_type(&db);
+                assert_eq!(
+                    ty,
+                    Some(KnownClass::Int.to_instance(&db, &ProgramEnvironment::from_file(file)))
+                );
+            } else {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.id().as_str() == "invalid-assignment"),
+                    "{path}: {diagnostics:#?}"
+                );
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.id().as_str() == "unresolved-reference"),
+                    "{path}: {diagnostics:#?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn semantic_namespaces_share_python_support_types() -> anyhow::Result<()> {

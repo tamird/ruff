@@ -2293,7 +2293,7 @@ impl Relevance {
                 Sort::Even
             },
             type_check_only: if c.is_type_check_only
-                && !program_file.file(db).source_type(db).is_stub()
+                && !program_file.is_stub(db)
                 && !ctx
                     .type_checking_block
                     .as_ref()

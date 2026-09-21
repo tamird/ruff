@@ -309,7 +309,7 @@ impl<'db> ClassType<'db> {
             let place_table = place_table(db, scope);
             let use_def_map = use_def_map(db, class_literal.body_scope(db));
             let can_be_implicitly_abstract =
-                !class_literal.file(db).is_stub(db) && class.is_protocol(db);
+                !class_literal.program_file(db).is_stub(db) && class.is_protocol(db);
 
             // Treat abstract methods from superclasses as having been overridden
             // if this class has a synthesized method by that name,

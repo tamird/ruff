@@ -1009,7 +1009,7 @@ impl<'db> FunctionLiteral<'db> {
         if self.has_known_decorator(db, FunctionDecorators::ABSTRACT_METHOD) {
             return Some(AbstractMethodKind::Explicit);
         }
-        if self.definition(db).file(db).is_stub(db) {
+        if self.definition(db).program_file(db).is_stub(db) {
             return None;
         }
         if !enclosing_class.is_protocol(db) {
@@ -1061,7 +1061,7 @@ impl<'db> FunctionLiteral<'db> {
     /// Methods defined in stub files are never considered to have trivial bodies,
     /// since stubs use `...` as a placeholder regardless of the runtime implementation.
     fn has_trivial_body(self, db: &'db dyn Db) -> bool {
-        !self.definition(db).file(db).is_stub(db)
+        !self.definition(db).program_file(db).is_stub(db)
             && matches!(
                 self.body_kind(db),
                 FunctionBodyKind::Stub | FunctionBodyKind::AlwaysRaisesNotImplementedError

@@ -522,7 +522,7 @@ fn fixture_reference_resolution_for_definition<'db>(
         ) || (matches!(
             kind,
             DefinitionKind::Assignment(_) | DefinitionKind::AnnotatedAssignment(_)
-        ) && definition.file(db).is_stub(db)) =>
+        ) && definition.program_file(db).is_stub(db)) =>
         {
             // These definitions refer to Python bindings. Only `Binding` name sources use
             // that Python name as the fixture name; `Explicit` sources instead use the decorator:
@@ -586,7 +586,7 @@ fn collect_fixture_reference_roots<'db>(
     if !found_source_root {
         // Keep references resolved through a stub separate from the explicit-name declaration in
         // its runtime implementation, matching reference behavior for ordinary Python symbols.
-        let root = if exposure.local_binding().file(db).is_stub(db) {
+        let root = if exposure.local_binding().program_file(db).is_stub(db) {
             FixtureNameSource::Binding(exposure.local_binding())
         } else {
             exposure.name_source(db)
@@ -1000,7 +1000,7 @@ impl<'a> LocalReferencesFinder<'a> {
     /// slot.
     fn target_belongs_to_class(&self, class: &'a ast::StmtClassDef) -> bool {
         let db = self.model.db();
-        let file = self.model.file();
+        let file = self.model.program_file();
         let class_range = class.range();
         let module = ruff_db::parsed::parsed_module(db, self.model.python_file()).load(db);
         let index = ty_python_core::semantic_index(db, self.model.program_file());
@@ -1020,7 +1020,7 @@ impl<'a> LocalReferencesFinder<'a> {
             let Some(definition) = resolved.definition() else {
                 return false;
             };
-            if definition.file(db) != file {
+            if definition.program_file(db) != file {
                 return false;
             }
 
@@ -1045,7 +1045,7 @@ impl<'a> LocalReferencesFinder<'a> {
                     definition.kind(db),
                     DefinitionKind::AnnotatedAssignment(assignment)
                         if assignment.value(&module).is_none_or(|value| {
-                            file.is_stub(db) && value.is_ellipsis_literal_expr()
+                            definition.program_file(db).is_stub(db) && value.is_ellipsis_literal_expr()
                         })
                 );
             place.is_member() || is_class_attribute_declaration
@@ -1132,6 +1132,32 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn slot_references_preserve_semantic_file_identity() {
+        let test =
+            cursor_test("class Example:\n    __slots__ = ('value',)\n    value<CURSOR>: int\n");
+        let source = test.program_file(test.cursor.file);
+        let stub = ProgramFile::from_python_file_with_kind(
+            &test.db,
+            source.python_file(&test.db),
+            source.program(&test.db),
+            ty_python_core::ProgramFileKind::Stub,
+        );
+        for file in [source, stub] {
+            let model = SemanticModel::new(&test.db, file);
+            let target = find_goto_target(&model, &test.cursor.parsed, test.cursor.offset).unwrap();
+            let definitions = target
+                .definitions(&model, ImportAliasResolution::PreserveAliases)
+                .unwrap();
+            let definitions = definitions.iter().cloned().collect::<Vec<_>>();
+            let references = references_in_file(&test.db, file, "value", &definitions);
+            assert_eq!(references.len(), 2, "{references:?}");
+            let other = if file == source { stub } else { source };
+            let references = references_in_file(&test.db, other, "value", &definitions);
+            assert!(references.is_empty(), "{references:?}");
+        }
     }
 
     fn cursor_target_is_externally_visible(test: &CursorTest) -> bool {

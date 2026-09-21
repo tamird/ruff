@@ -61,6 +61,10 @@ pub struct ProgramFile<'db> {
 
     #[returns(copy)]
     pub program: Program<'db>,
+
+    /// Whether declarations describe a runtime implementation or a stub interface.
+    #[returns(copy)]
+    pub kind: ProgramFileKind,
 }
 
 impl get_size2::GetSize for ProgramFile<'_> {}
@@ -80,8 +84,32 @@ impl<'db> ProgramFile<'db> {
         python_file: PythonFile<'db>,
         program: Program<'db>,
     ) -> Self {
+        let kind = if python_file.file(db).is_stub(db) {
+            ProgramFileKind::Stub
+        } else {
+            ProgramFileKind::Source
+        };
+        Self::from_python_file_with_kind(db, python_file, program, kind)
+    }
+
+    /// Interprets a parse as source or a stub independently of its physical filename.
+    ///
+    /// The kind controls semantic rules such as annotation-only bindings, deferred annotations,
+    /// and ellipsis placeholders. It does not select parser grammar, source decoding, or Python
+    /// module resolution. Supplied bindings must retain this program file to preserve its kind.
+    pub fn from_python_file_with_kind(
+        db: &'db dyn Db,
+        python_file: PythonFile<'db>,
+        program: Program<'db>,
+        kind: ProgramFileKind,
+    ) -> Self {
         assert_eq!(python_file.python_version(db), program.python_version(db));
-        Self::new_internal(db, python_file, program)
+        Self::new_internal(db, python_file, program, kind)
+    }
+
+    /// Whether this interpretation uses stub declaration semantics.
+    pub fn is_stub(self, db: &'db dyn Db) -> bool {
+        self.kind(db) == ProgramFileKind::Stub
     }
 
     /// Returns the physical file represented by this program file.
@@ -103,4 +131,13 @@ impl<'db> ProgramFile<'db> {
     pub fn python_version(self, db: &'db dyn Db) -> PythonVersion {
         self.program(db).python_version(db)
     }
+}
+
+/// The semantic role of a file within a program, independent of its parser grammar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
+pub enum ProgramFileKind {
+    /// Executable source with ordinary binding and function-body checks.
+    Source,
+    /// Declarations with stub placeholder, binding, and annotation rules.
+    Stub,
 }

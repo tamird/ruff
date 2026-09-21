@@ -179,7 +179,7 @@ pub fn unused_definitions<'db>(db: &'db dyn Db, file: ProgramFile<'db>) -> Vec<D
 #[salsa::tracked(returns(deref), heap_size=ruff_memory_usage::heap_size)]
 pub fn unused_bindings(db: &dyn Db, file: ProgramFile<'_>) -> Box<[UnusedBinding]> {
     let parsed = parsed_module(db, file.python_file(db)).load(db);
-    let is_stub_file = file.file(db).is_stub(db);
+    let is_stub_file = file.is_stub(db);
     let index = semantic_index(db, file);
     let mut unused = Vec::new();
 
