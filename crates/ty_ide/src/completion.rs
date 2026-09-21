@@ -1746,6 +1746,34 @@ impl<'m> CompletionCursor<'m> {
         }
     }
 
+    /// Returns the canonical call whose direct argument slot contains the cursor.
+    fn keyword_call(&self) -> Option<&'m ast::ExprCall> {
+        let (call, _) = crate::call_at_offset(self.parsed, self.source.as_str(), self.offset)?;
+        self.is_keyword_slot(&call.arguments).then_some(call)
+    }
+
+    fn is_keyword_slot(&self, arguments: &ast::Arguments) -> bool {
+        let mut tokens = self
+            .tokens_before
+            .iter()
+            .rev()
+            .filter(|token| !token.kind().is_trivia());
+        if self.typed.is_some() {
+            tokens.next();
+        }
+        let Some(token) = tokens.next() else {
+            return false;
+        };
+        match token.kind() {
+            TokenKind::Lpar => token.start() == arguments.start(),
+            TokenKind::Comma => {
+                let node = self.covering_node(token.range());
+                matches!(node.node(), AnyNodeRef::Arguments(found) if found.range() == arguments.range())
+            }
+            _ => false,
+        }
+    }
+
     /// Returns true when only an expression is valid after the cursor
     /// according to the python grammar.
     ///
@@ -2341,38 +2369,15 @@ fn add_argument_completions<'db>(
     cursor: &CompletionCursor<'_>,
     completions: &mut Completions<'db>,
 ) {
-    let mut in_arguments = false;
-    for node in cursor.covering_node.ancestors() {
-        match node {
-            // Do not suggest argument completions in value positions for
-            // keyword arguments
-            ast::AnyNodeRef::Keyword(kw) => {
-                if kw.value.range().contains_range(cursor.range) {
-                    return;
-                }
-            }
-            ast::AnyNodeRef::Arguments(_) => {
-                in_arguments = true;
-            }
-            ast::AnyNodeRef::ExprCall(_) => {
-                if in_arguments {
-                    add_function_arg_completions(db, file, cursor, completions);
-                }
-                return;
-            }
-            ast::AnyNodeRef::StmtClassDef(class_def) => {
-                if let Some(arguments) = class_def.arguments.as_deref()
-                    && arguments.range().contains_range(cursor.range)
-                {
-                    add_class_arg_completions(model, class_def, completions);
-                }
-                return;
-            }
-            node => {
-                if node.is_statement() {
-                    return;
-                }
-            }
+    if let Some(call) = cursor.keyword_call() {
+        add_function_arg_completions(db, file, cursor, call, completions);
+    } else if let Some(class) = cursor.enclosing_class_def() {
+        if class
+            .arguments
+            .as_deref()
+            .is_some_and(|arguments| cursor.is_keyword_slot(arguments))
+        {
+            add_class_arg_completions(model, class, completions);
         }
     }
 }
@@ -2426,22 +2431,18 @@ fn add_function_arg_completions<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
     cursor: &CompletionCursor<'_>,
+    call: &ast::ExprCall,
     completions: &mut Completions<'db>,
 ) {
-    debug_assert!(
-        cursor
-            .covering_node
-            .ancestors()
-            .take_while(|node| !node.is_statement())
-            .any(|node| node.is_arguments()),
-        "Should only be called if we're already certain we're in an arguments node to avoid \
-        adding completions for something like `(<CURSOR>)(arg1, arg2)`-style expressions"
-    );
-
     let Some(sig_help) = signature_help(db, file, cursor.offset) else {
         return;
     };
-    let mut set_function_args = detect_set_function_args(cursor);
+    let mut set_function_args: FxHashSet<_> = call
+        .arguments
+        .keywords
+        .iter()
+        .filter_map(|keyword| keyword.arg.as_ref().map(|name| name.id.as_str()))
+        .collect();
 
     for sig in &sig_help.signatures {
         for p in &sig.parameters {
@@ -2459,42 +2460,6 @@ fn add_function_arg_completions<'db>(
             completions.add(builder);
         }
     }
-}
-
-/// Returns function arguments that have already been set.
-///
-/// If `offset` is inside an arguments node, this returns
-/// the list of argument names that are already set.
-///
-/// For example, given:
-///
-/// ```python
-/// def abc(foo, bar, baz): ...
-/// abc(foo=1, bar=2, b<CURSOR>)
-/// ```
-///
-/// the resulting value is `["foo", "bar"]`
-///
-/// This is useful to be able to exclude autocomplete suggestions
-/// for arguments that have already been set to some value.
-///
-/// If the parent node is not an arguments node, the return value
-/// is an empty Vec.
-fn detect_set_function_args<'m>(cursor: &CompletionCursor<'m>) -> FxHashSet<&'m str> {
-    cursor
-        .covering_node
-        .parent()
-        .and_then(|node| match node {
-            ast::AnyNodeRef::Arguments(args) => Some(args),
-            _ => None,
-        })
-        .map(|args| {
-            args.keywords
-                .iter()
-                .filter_map(|kw| kw.arg.as_ref().map(|ident| ident.id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 pub(crate) struct ImportEdit {
@@ -4360,6 +4325,30 @@ def foo():
                     "unexpected {unexpected} in {source}: {names:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn call_keywords_require_a_direct_argument_slot() {
+        for (expression, expected) in [
+            ("f(<CURSOR>)", true),
+            ("(f)(<CURSOR>)", true),
+            ("f(1, <CURSOR>)", true),
+            ("f((<CURSOR>))", false),
+            ("f(value=<CURSOR>)", false),
+            ("f(*<CURSOR>)", false),
+            ("f(**<CURSOR>)", false),
+            ("f([1, <CURSOR>])", false),
+            ("f(1 + <CURSOR>)", false),
+        ] {
+            let source = format!("def f(value=0, other=0): pass\n{expression}");
+            let builder = completion_test_builder(&source).skip_auto_import();
+            let result = builder.build();
+            let has_parameter = result
+                .filtered
+                .iter()
+                .any(|completion| completion.name == "other");
+            assert_eq!(has_parameter, expected, "{source}: {}", result.snapshot());
         }
     }
 
