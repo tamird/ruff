@@ -1367,7 +1367,7 @@ impl<'m> CompletionCursor<'m> {
 
     /// Whether the cursor is in a parameter, return, or variable annotation,
     /// including whitespace after its `:` or `->` separator.
-    fn is_in_annotation(&self) -> bool {
+    pub fn is_in_annotation(&self) -> bool {
         self.annotation_context().is_some()
     }
 
