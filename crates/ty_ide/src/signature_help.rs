@@ -83,9 +83,10 @@ pub fn signature_help<'db>(
     offset: TextSize,
 ) -> Option<SignatureHelpInfo<'db>> {
     let parsed = parsed_module(db, file.python_file(db)).load(db);
+    let source = source_text(db, parsed.module().file());
 
     // Get the call expression at the given position.
-    let (call_expr, current_arg_index) = get_call_expr(db, &parsed, offset)?;
+    let (call_expr, current_arg_index) = call_at_offset(&parsed, &source, offset)?;
 
     let model = SemanticModel::new(db, file);
 
@@ -116,13 +117,19 @@ pub fn signature_help<'db>(
 
 /// Returns the innermost call expression that contains the specified offset
 /// and the index of the argument that the offset maps to.
-fn get_call_expr<'ast>(
-    db: &dyn Db,
+///
+/// `parsed` and `source` must describe the same source revision. Selection
+/// includes the callee and unfinished calls, but ends after a closing
+/// parenthesis. Offsets beyond the source length return `None`.
+pub fn call_at_offset<'ast>(
     parsed: &'ast ruff_db::parsed::ParsedModuleRef,
+    source: &str,
     offset: TextSize,
 ) -> Option<(&'ast ast::ExprCall, usize)> {
+    if offset > TextSize::of(source) {
+        return None;
+    }
     let root_node: AnyNodeRef = parsed.syntax().into();
-    let source = source_text(db, parsed.module().file());
     let line_range = source.line_range(offset);
     let line = &source[line_range];
     let line_end = line_range.start() + TextSize::of(line.trim_whitespace_end());
