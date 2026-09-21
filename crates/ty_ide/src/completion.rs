@@ -905,6 +905,11 @@ pub struct CompletionCursor<'m> {
     covering_node: CoveringNode<'m>,
 }
 
+enum AnnotationContext<'m> {
+    Expression(&'m ast::Expr),
+    MissingFunction(&'m ast::StmtFunctionDef),
+}
+
 /// The cursor position relative to an AST range and its surrounding parentheses.
 enum RangeEndPosition {
     /// The cursor follows the complete range, including any surrounding parentheses.
@@ -958,6 +963,21 @@ impl<'m> CompletionCursor<'m> {
         let index = semantic_index(model.db(), model.program_file());
         if index.is_excluded(self.range) {
             return None;
+        }
+
+        if let Some(annotation) = self.annotation_context() {
+            match annotation {
+                AnnotationContext::Expression(expression) => {
+                    if self.offset <= expression.start() || expression.range().is_empty() {
+                        return index.try_expression_scope_id(expression);
+                    }
+                }
+                AnnotationContext::MissingFunction(function) => {
+                    return index
+                        .try_node_scope(NodeWithScopeRef::FunctionTypeParameters(function))
+                        .or_else(|| model.scope(function.into()));
+                }
+            }
         }
 
         for node in self.ancestors() {
@@ -1317,17 +1337,17 @@ impl<'m> CompletionCursor<'m> {
     }
 
     fn suppress_class_parentheses(&self, model: &SemanticModel<'_>) -> bool {
+        if self.is_in_annotation() {
+            return true;
+        }
         let contains = |expr: &ast::Expr| expr.range().contains_range(self.range);
 
         self.covering_node.ancestors().any(|node| match node {
             ast::AnyNodeRef::StmtAnnAssign(stmt) => {
-                contains(&stmt.annotation)
-                    || (stmt.value.as_deref().is_some_and(contains)
-                        && model.is_type_alias_annotation(&stmt.annotation))
+                stmt.value.as_deref().is_some_and(contains)
+                    && model.is_type_alias_annotation(&stmt.annotation)
             }
-            ast::AnyNodeRef::StmtFunctionDef(stmt) => stmt.returns.as_deref().is_some_and(contains),
             ast::AnyNodeRef::StmtTypeAlias(stmt) => contains(&stmt.value),
-            ast::AnyNodeRef::Parameter(param) => param.annotation.as_deref().is_some_and(contains),
             ast::AnyNodeRef::TypeParamTypeVar(type_param) => {
                 type_param.bound.as_deref().is_some_and(contains)
                     || type_param.default.as_deref().is_some_and(contains)
@@ -1345,6 +1365,92 @@ impl<'m> CompletionCursor<'m> {
         })
     }
 
+    /// Whether the cursor is in a parameter, return, or variable annotation,
+    /// including whitespace after its `:` or `->` separator.
+    fn is_in_annotation(&self) -> bool {
+        self.annotation_context().is_some()
+    }
+
+    fn annotation_context(&self) -> Option<AnnotationContext<'m>> {
+        let expression = self.ancestors().find_map(|node| {
+            let (annotation, preceding, separator) = match node {
+                AnyNodeRef::Parameter(parameter) => (
+                    parameter.annotation.as_deref()?,
+                    parameter.name.end(),
+                    TokenKind::Colon,
+                ),
+                AnyNodeRef::StmtFunctionDef(function) => (
+                    function.returns.as_deref()?,
+                    function.parameters.end(),
+                    TokenKind::Rarrow,
+                ),
+                AnyNodeRef::StmtAnnAssign(statement) => (
+                    statement.annotation.as_ref(),
+                    statement.target.end(),
+                    TokenKind::Colon,
+                ),
+                _ => return None,
+            };
+            if self.offset > annotation.end() {
+                if !annotation.range().is_empty()
+                    || self
+                        .parsed
+                        .tokens()
+                        .in_range(TextRange::new(annotation.end(), self.offset))
+                        .iter()
+                        .any(|token| !token.kind().is_trivia())
+                {
+                    return None;
+                }
+            }
+            let delimiter = self
+                .parsed
+                .tokens()
+                .in_range(TextRange::new(preceding, annotation.start()))
+                .iter()
+                .find(|token| token.kind() == separator)?;
+            (delimiter.end() <= self.offset).then_some(annotation)
+        });
+        if let Some(expression) = expression {
+            return Some(AnnotationContext::Expression(expression));
+        }
+
+        // An unfinished function annotation has a delimiter but no expression
+        // in the recovered AST. Its declaration still owns the annotation scope.
+        let token = self
+            .tokens_before
+            .iter()
+            .rev()
+            .find(|token| !token.kind().is_trivia())?;
+        if token.end() > self.offset {
+            return None;
+        }
+        self.ancestors().find_map(|node| {
+            let AnyNodeRef::StmtFunctionDef(function) = node else {
+                return None;
+            };
+            let missing = match token.kind() {
+                TokenKind::Rarrow => {
+                    function.returns.is_none()
+                        && token.start() >= function.parameters.end()
+                        && self
+                            .parsed
+                            .tokens()
+                            .in_range(TextRange::new(function.parameters.end(), token.end()))
+                            .iter()
+                            .find(|token| !token.kind().is_trivia())
+                            .is_some_and(|first| first.range() == token.range())
+                }
+                TokenKind::Colon => function.parameters.iter().any(|parameter| {
+                    let parameter = parameter.as_parameter();
+                    parameter.annotation.is_none() && parameter.end() == token.end()
+                }),
+                _ => false,
+            };
+            missing.then_some(AnnotationContext::MissingFunction(function))
+        })
+    }
+
     /// Returns true when the tokens indicate that the definition of a new
     /// name is being introduced at the end.
     pub fn is_in_definition_place(&self) -> bool {
@@ -1359,6 +1465,9 @@ impl<'m> CompletionCursor<'m> {
             )
         }
 
+        if self.is_in_annotation() {
+            return false;
+        }
         let is_definition_keyword = |token: &Token| {
             if is_definition_token(token) {
                 true
@@ -4325,6 +4434,76 @@ def foo():
                     "unexpected {unexpected} in {source}: {names:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn annotation_slots_use_declaration_scope() {
+        for (declaration, present) in [
+            ("def f(value: <CURSOR>): pass", "UserType"),
+            ("def f(value: <CURSOR> UserType): pass", "UserType"),
+            ("def f(value: Us<CURSOR>erType): pass", "UserType"),
+            ("def f(value) -> <CURSOR>: pass", "UserType"),
+            ("def f(value) -> <CURSOR> UserType: pass", "UserType"),
+            ("def f[T](value: <CURSOR>): pass", "T"),
+            ("def f[T](value) -> <CURSOR>: pass", "T"),
+            ("value: <CURSOR> = None", "UserType"),
+            ("value: list[<CURSOR>] = []", "UserType"),
+        ] {
+            let source = format!("class UserType: pass\n{declaration}");
+            let builder = completion_test_builder(&source)
+                .skip_auto_import()
+                .complete_function_parentheses();
+            let db = builder.db();
+            let file = builder
+                .cursor_test
+                .program_file(builder.cursor_test.cursor.file);
+            let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+            let source_text = ruff_db::source::source_text(db, file.file(db));
+            let cursor = super::CompletionCursor::new(
+                &parsed,
+                &source_text,
+                builder.cursor_test.cursor.offset,
+            )
+            .unwrap();
+            assert!(cursor.is_in_annotation(), "{source}");
+            let result = builder.build();
+            assert!(
+                result.filtered.iter().any(|item| item.name == present),
+                "{source}: {}",
+                result.snapshot()
+            );
+            if declaration.starts_with("def") {
+                result.not_contains("value");
+            }
+            let class = result
+                .filtered
+                .iter()
+                .find(|item| item.name == "UserType")
+                .unwrap();
+            assert_eq!(class.insert.as_deref().unwrap_or(class.label()), "UserType");
+        }
+        for source in [
+            "def f(<CURSOR>): pass",
+            "def f(value: int = <CURSOR>): pass",
+            "def f(value: int) -> int: <CURSOR>",
+            "value: int = <CURSOR>",
+            "def f(value):\n    value -> <CURSOR>\n    pass",
+        ] {
+            let builder = completion_test_builder(source);
+            let db = builder.db();
+            let file = builder
+                .cursor_test
+                .program_file(builder.cursor_test.cursor.file);
+            let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+            let source_text = ruff_db::source::source_text(db, file.file(db));
+            let cursor = super::CompletionCursor::new(
+                &parsed,
+                &source_text,
+                builder.cursor_test.cursor.offset,
+            )
+            .unwrap();
+            assert!(!cursor.is_in_annotation(), "{source}");
         }
     }
 
