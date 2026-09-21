@@ -1,11 +1,13 @@
+use ruff_db::files::FileRange;
+use ruff_db::parsed::parsed_module;
 use ruff_db::parsed::{parsed_annotation_range, parsed_string_annotation};
 use ruff_db::source::source_text;
-use ruff_python_ast::{self as ast, HasNodeIndex, StringFlags};
+use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex, StringFlags};
 use ruff_python_parser::{ParseError, ParseErrorType, Parsed};
 use ruff_text_size::{Ranged, TextRange};
-use ty_python_core::ProgramFile;
 use ty_python_core::definition::Definition;
 use ty_python_core::node_key::NodeKey;
+use ty_python_core::{ExpressionNodeKey, ProgramFile, ProvidedAnnotation, semantic_index};
 
 use crate::Db;
 use crate::declare_lint;
@@ -55,37 +57,42 @@ declare_lint! {
 }
 
 /// An annotation in the module AST or a detached expression anchored to a canonical source node.
-pub(crate) enum SourceAnnotation<'a> {
+pub(crate) enum SourceAnnotation<'a, 'db> {
     Native(&'a ast::Expr),
     Detached {
         owner: NodeKey,
         range: TextRange,
         parsed: Result<Parsed<ast::ModExpression>, ParseError>,
     },
+    External {
+        annotation: ExternalAnnotation<'db>,
+        /// The local declaration is the diagnostic location for invalid annotation use.
+        range: TextRange,
+    },
 }
 
-impl<'a> SourceAnnotation<'a> {
-    pub(crate) fn source_range(
-        db: &dyn Db,
-        file: ProgramFile<'_>,
-        owner: impl HasNodeIndex,
-        native: Option<&ast::Expr>,
-    ) -> Option<TextRange> {
-        native
-            .map(Ranged::range)
-            .or_else(|| db.provided_annotation(file, owner.node_index().load()))
-    }
-
+impl<'a, 'db> SourceAnnotation<'a, 'db> {
     pub(crate) fn new(
-        db: &dyn Db,
-        file: ProgramFile<'_>,
-        owner: impl HasNodeIndex,
+        db: &'db dyn Db,
+        file: ProgramFile<'db>,
+        owner: impl HasNodeIndex + Ranged,
         native: Option<&'a ast::Expr>,
     ) -> Option<Self> {
         if let Some(expr) = native {
             return Some(Self::Native(expr));
         }
-        let range = db.provided_annotation(file, owner.node_index().load())?;
+        let range = match db.provided_annotation(file, owner.node_index().load())? {
+            ProvidedAnnotation::Range(range) => range,
+            ProvidedAnnotation::External {
+                file,
+                owner: foreign_owner,
+            } => {
+                return Some(Self::External {
+                    annotation: external_annotation(db, file, foreign_owner)?,
+                    range: owner.range(),
+                });
+            }
+        };
         let source = source_text(db, file.file(db));
         let parsed = parsed_annotation_range(&source, range, owner.node_index().load());
         Some(Self::Detached {
@@ -116,22 +123,74 @@ impl<'a> SourceAnnotation<'a> {
                 range: _,
                 parsed,
             } => parsed.as_ref().ok().map(Parsed::expr),
+            Self::External {
+                annotation: _,
+                range: _,
+            } => None,
         }
     }
 
-    pub(crate) fn inferred_type<'db>(
-        &self,
-        db: &'db dyn Db,
-        function: Definition<'db>,
-    ) -> Type<'db> {
+    pub(crate) fn source(&self, file: ruff_db::files::File) -> FileRange {
+        match self {
+            Self::External {
+                annotation,
+                range: _,
+            } => annotation.source,
+            Self::Native(_)
+            | Self::Detached {
+                owner: _,
+                range: _,
+                parsed: _,
+            } => FileRange::new(file, self.range()),
+        }
+    }
+
+    pub(crate) fn external_type(&self, db: &'db dyn Db) -> Option<Type<'db>> {
+        match self {
+            Self::External {
+                annotation,
+                range: _,
+            } => Some(annotation.inferred(db).0),
+            Self::Native(_)
+            | Self::Detached {
+                owner: _,
+                range: _,
+                parsed: _,
+            } => None,
+        }
+    }
+
+    pub(crate) fn is_starred(&self) -> bool {
+        match self {
+            Self::External {
+                annotation,
+                range: _,
+            } => annotation.starred,
+            Self::Native(_)
+            | Self::Detached {
+                owner: _,
+                range: _,
+                parsed: _,
+            } => self.expression().is_some_and(ast::Expr::is_starred_expr),
+        }
+    }
+
+    pub(crate) fn inferred_type(&self, db: &'db dyn Db, function: Definition<'db>) -> Type<'db> {
         self.inferred(db, function).0
     }
 
-    pub(crate) fn inferred<'db>(
+    pub(crate) fn inferred(
         &self,
         db: &'db dyn Db,
         function: Definition<'db>,
     ) -> (Type<'db>, TypeExpressionFlags) {
+        if let Self::External {
+            annotation,
+            range: _,
+        } = self
+        {
+            return annotation.inferred(db);
+        }
         let Some(expression) = self.expression() else {
             return (Type::unknown(), TypeExpressionFlags::empty());
         };
@@ -140,7 +199,7 @@ impl<'a> SourceAnnotation<'a> {
     }
 }
 
-impl Ranged for SourceAnnotation<'_> {
+impl Ranged for SourceAnnotation<'_, '_> {
     fn range(&self) -> TextRange {
         match self {
             Self::Native(expr) => expr.range(),
@@ -149,17 +208,80 @@ impl Ranged for SourceAnnotation<'_> {
                 range,
                 parsed: _,
             } => *range,
+            Self::External {
+                annotation: _,
+                range,
+            } => *range,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, salsa::SalsaValue)]
+pub(crate) struct ExternalAnnotation<'db> {
+    function: Definition<'db>,
+    expression: ExpressionNodeKey,
+    source: FileRange,
+    starred: bool,
+}
+
+impl<'db> ExternalAnnotation<'db> {
+    fn inferred(&self, db: &'db dyn Db) -> (Type<'db>, TypeExpressionFlags) {
+        let Self {
+            function,
+            expression,
+            source: _,
+            starred: _,
+        } = self;
+        let (ty, flags) = function_signature_annotation_info(db, *function, *expression);
+        (ty.unwrap_or_else(Type::unknown), flags)
+    }
+}
+
+/// Preserve the declaring function and expression identity for lazy annotation inference.
+/// Foreign nodes stay in their own expression table and name-resolution scope.
+#[salsa::tracked(returns(copy))]
+fn external_annotation<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    owner: NodeIndex,
+) -> Option<ExternalAnnotation<'db>> {
+    let module = parsed_module(db, file.python_file(db)).load(db);
+    let index = semantic_index(db, file);
+    let (function, expression) = match module.get_by_index(owner) {
+        ast::AnyRootNodeRef::Stmt(statement) => {
+            let ast::Stmt::FunctionDef(function) = statement else {
+                return None;
+            };
+            (
+                index.try_definition(function)?,
+                function.returns.as_deref()?,
+            )
+        }
+        ast::AnyRootNodeRef::Parameter(parameter) => {
+            let definition = index.try_definition(parameter)?;
+            let function = definition.scope(db).node(db).as_function()?;
+            (
+                index.try_definition(function.node(&module))?,
+                parameter.annotation()?,
+            )
+        }
+        _ => return None,
+    };
+    Some(ExternalAnnotation {
+        function,
+        expression: expression.into(),
+        source: FileRange::new(file.file(db), expression.range()),
+        starred: expression.is_starred_expr(),
+    })
+}
+
 /// Parses the given expression as a string annotation.
-pub(crate) fn parse_string_annotation<'a>(
-    context: &InferContext,
+pub(crate) fn parse_string_annotation<'a, 'db>(
+    context: &InferContext<'db, '_>,
     inference_flags: InferenceFlags,
     string_expr: &ast::ExprStringLiteral,
     owner: NodeKey,
-) -> Option<SourceAnnotation<'a>> {
+) -> Option<SourceAnnotation<'a, 'db>> {
     let file = context.file();
     let db = context.db();
 

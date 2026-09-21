@@ -163,7 +163,7 @@ impl<'db> SemanticModel<'db> {
             }
             _ => return None,
         };
-        function_signature_annotation_info(self.db, function, expression).0
+        function_signature_annotation_info(self.db, function, expression.into()).0
     }
 
     pub fn file_path(&self) -> &FilePath {
