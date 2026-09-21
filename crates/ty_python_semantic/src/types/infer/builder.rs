@@ -23,7 +23,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use strum::IntoEnumIterator;
 use ty_module_resolver::{ImportingFile, ModuleName, resolve_module};
-use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::statement::StatementInner;
 
 use super::{
@@ -129,13 +128,14 @@ use crate::types::unpacker::{
 };
 use crate::types::{
     BindingContext, BoundTypeVarInstance, CallDunderError, CallableBinding, CallableType,
-    ClassType, DynamicType, GeneratorTypeMode, InferenceFlags, InternedConstraintSet, InternedType,
-    IntersectionBuilder, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
-    KnownUnion, LiteralValueType, LiteralValueTypeKind, MemberLookupPolicy, ParamSpecAttrKind,
-    Parameter, Parameters, ProgramEnvironment, PropertyDeprecations, SentinelInstance, Signature,
-    SpecialFormType, SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext,
-    TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypingModule,
-    UnionAccumulator, UnionBuilder, UnionType, any_over_type, binding_type,
+    ClassType, DictionaryItem, DictionaryItems, DynamicType, GeneratorTypeMode, InferenceFlags,
+    InternedConstraintSet, InternedType, IntersectionBuilder, IntersectionType,
+    KnownBoundMethodType, KnownClass, KnownInstanceType, KnownUnion, LiteralValueType,
+    LiteralValueTypeKind, MemberLookupPolicy, ParamSpecAttrKind, Parameter, Parameters,
+    ProgramEnvironment, PropertyDeprecations, SentinelInstance, Signature, SpecialFormType,
+    SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext, TypeQualifiers,
+    TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypingModule, UnionAccumulator,
+    UnionBuilder, UnionType, any_over_type, binding_type,
     extract_fixed_length_iterable_element_types, infer_complete_scope_types, infer_scope_types,
     is_discarded_dict_key_assignment, todo_type,
 };
@@ -8891,91 +8891,68 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         ))
     }
 
-    /// Attempt to narrow a splatted dictionary argument based on the narrowed types of individual
-    /// keys, if any.
-    ///
-    /// Returns the intersection between the dictionary type and a synthesized typed dict of any narrowed
-    /// keys, or `None` otherwise.
-    fn try_narrow_dict_kwargs(
+    fn observed_dictionary_items(
         &self,
+        expression: &ast::Expr,
         argument_type: Type<'db>,
-        argument: &'ast ast::ArgOrKeyword,
-    ) -> Option<Type<'db>> {
-        // Parsed string annotations are not indexed, so their keyword arguments have no
+    ) -> Option<DictionaryItems<'db>> {
+        // Parsed string annotations are not indexed, so their argument expressions have no
         // use-definition information from which to narrow dictionary keys.
         if self.in_detached_annotation() {
             return None;
         }
 
-        let env = self.program_environment();
-        let db = self.db();
-        let file_scope_id = self.scope().file_scope_id(db);
-        let use_def = self.index.use_def_map(file_scope_id);
+        DictionaryItems::observed(
+            self.db(),
+            self.scope(),
+            expression,
+            argument_type,
+            self.reachability_cache(),
+        )
+    }
 
+    fn dictionary_items(
+        &self,
+        expression: &ast::Expr,
+        ty: Type<'db>,
+    ) -> Option<DictionaryItems<'db>> {
+        DictionaryItems::literal(self.db(), expression, &mut |expression| {
+            self.try_expression_type(expression)
+        })
+        .or_else(|| self.observed_dictionary_items(expression, ty))
+    }
+
+    /// Narrow a splatted dictionary using the same key observations exposed to call refinements.
+    fn try_narrow_dict_kwargs(
+        &self,
+        argument_type: Type<'db>,
+        argument: &'ast ast::ArgOrKeyword,
+    ) -> Option<Type<'db>> {
         let keyword = argument.as_variadic()?;
-
-        if !argument_type
-            .as_nominal_instance()?
-            .has_known_class(db, KnownClass::Dict)
-        {
+        let elements = self.observed_dictionary_items(&keyword.value, argument_type)?;
+        if elements.items.is_empty() {
             return None;
         }
-
-        let definition_key = |definition: Definition<'_>| {
-            let key = match definition.kind(db) {
-                DefinitionKind::DictKeyAssignment(assignment) => assignment.key(self.module()),
-                DefinitionKind::Assignment(assignment) => {
-                    &assignment.target(self.module()).as_subscript_expr()?.slice
-                }
-                DefinitionKind::AnnotatedAssignment(assignment) => {
-                    &assignment.target(self.module()).as_subscript_expr()?.slice
-                }
-                _ => return None,
-            };
-
-            Some(key.as_string_literal_expr()?.value.to_str())
-        };
-
-        // Collect the types of each distinct key.
-        let mut elements: Vec<(&str, Type<'db>)> = Vec::new();
-        for bindings in
-            use_def.multi_bindings_at_use(keyword.scoped_use_id(db, self.program_file()))
-        {
-            let place = place_from_bindings_with_reachability_cache(
-                db,
-                env,
-                bindings.clone(),
-                self.reachability_cache(),
-            );
-            let Some(key) = place.first_definition.and_then(definition_key) else {
-                continue;
-            };
-
-            if let Place::Defined(DefinedPlace {
-                ty: field_ty,
-                definedness: Definedness::AlwaysDefined,
-                ..
-            }) = place.place
-            {
-                elements.push((key, field_ty));
-            }
-        }
-
-        if elements.is_empty() {
-            return None;
-        }
+        let db = self.db();
+        let env = self.program_environment();
 
         // Synthesize overloads for `__getitem__` based on known dictionary elements.
-        let getitem_overloads = elements.into_iter().map(|(name, ty)| {
-            Signature::new(
-                Parameters::standard([
-                    Parameter::positional_only(Some(Name::new_static("self"))),
-                    Parameter::positional_or_keyword(Name::new_static("key"))
-                        .with_annotated_type(Type::string_literal(db, name)),
-                ]),
-                ty,
-            )
-        });
+        let getitem_overloads = elements.items.into_iter().map(
+            |DictionaryItem {
+                 name,
+                 ty,
+                 source: _,
+             }| {
+                Signature::new(
+                    Parameters::standard([
+                        Parameter::positional_only(Some(Name::new_static("self"))),
+                        Parameter::positional_or_keyword(Name::new_static("key"))
+                            .with_annotated_type(Type::string_literal(db, &name)),
+                    ]),
+                    ty,
+                )
+            },
+        );
 
         let getitem_protocol = Type::protocol_with_methods(
             db,
@@ -9020,7 +8997,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 ty
             })
-            .with_literal_unpacking(arguments, |expression| self.try_expression_type(expression));
+            .with_literal_unpacking(db, arguments, |expression| {
+                self.try_expression_type(expression)
+            });
 
         for arg in &arguments.args {
             if let ast::Expr::Starred(ast::ExprStarred { value, .. }) = arg {
@@ -9743,6 +9722,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
+        let dictionary_items = |expression: &ast::Expr, ty| self.dictionary_items(expression, ty);
         let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
             scope: self.scope(),
             offset: self.dynamic_class_scope_offset(call_expression),
@@ -9759,6 +9739,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     file: self.scope().program_file(db),
                     call: call_expression,
                     expression_type: &expression_type,
+                    dictionary_items: &dictionary_items,
                     class_anchor: &class_anchor,
                     has_binding_errors: false,
                 };
@@ -9898,6 +9879,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         has_binding_errors: bool,
     ) {
         let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
+        let dictionary_items = |expression: &ast::Expr, ty| self.dictionary_items(expression, ty);
         let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
             scope: self.scope(),
             offset: self.dynamic_class_scope_offset(call),
@@ -9915,6 +9897,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 file: self.scope().program_file(self.db()),
                 call,
                 expression_type: &expression_type,
+                dictionary_items: &dictionary_items,
                 class_anchor: &class_anchor,
                 has_binding_errors,
             };

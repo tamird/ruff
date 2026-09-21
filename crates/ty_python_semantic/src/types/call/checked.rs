@@ -1,11 +1,161 @@
+use std::collections::hash_map::Entry;
+
+use ruff_db::parsed::parsed_module;
 use ruff_python_ast::{self as ast, name::Name};
+use ruff_text_size::{Ranged, TextRange};
+use rustc_hash::FxHashMap;
 use ty_python_core::ProgramFile;
-use ty_python_core::definition::Definition;
+use ty_python_core::definition::{Definition, DefinitionKind};
+use ty_python_core::scope::ScopeId;
+use ty_python_core::semantic_index;
 
 use super::arguments::CallArgumentTypes;
 use super::{Binding, CallArguments};
-use crate::types::Type;
+use crate::Db;
+use crate::place::{DefinedPlace, Definedness, Place, place_from_bindings_with_reachability_cache};
+use crate::reachability::ReachabilityEvaluationCache;
 use crate::types::class::DynamicClassAnchor;
+use crate::types::{KnownClass, ProgramEnvironment, Type};
+
+/// A known string key and its observed value in a dictionary argument.
+pub struct DictionaryItem<'db> {
+    pub name: Name,
+    pub ty: Type<'db>,
+    /// The key's definition in the call's file.
+    pub source: TextRange,
+}
+
+/// Dictionary entries available at a call argument.
+pub struct DictionaryItems<'db> {
+    pub items: Box<[DictionaryItem<'db>]>,
+    /// True for an immediate literal whose entire string-key set is known.
+    ///
+    /// Otherwise, these are flow observations: additional keys and unmodeled mutations
+    /// can change the dictionary. They support narrowing and discovery of likely names,
+    /// but cannot establish required keys or reject calls based on their value types.
+    pub is_complete: bool,
+}
+
+impl<'db> DictionaryItems<'db> {
+    pub(crate) fn observed(
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        expression: &ast::Expr,
+        argument_type: Type<'db>,
+        reachability: &ReachabilityEvaluationCache<'db>,
+    ) -> Option<Self> {
+        let file = scope.program_file(db);
+        let env = ProgramEnvironment::from_file(file);
+        let index = semantic_index(db, file);
+        let use_def = index.use_def_map(scope.file_scope_id(db));
+        let module = parsed_module(db, file.python_file(db)).load(db);
+
+        let use_id = index.try_expression_use_id(expression.into())?;
+
+        if !argument_type
+            .as_nominal_instance()?
+            .has_known_class(db, KnownClass::Dict)
+        {
+            return None;
+        }
+
+        let definition_key = |definition: Definition<'_>| {
+            let key = match definition.kind(db) {
+                DefinitionKind::DictKeyAssignment(assignment) => assignment.key(&module),
+                DefinitionKind::Assignment(assignment) => {
+                    &assignment.target(&module).as_subscript_expr()?.slice
+                }
+                DefinitionKind::AnnotatedAssignment(assignment) => {
+                    &assignment.target(&module).as_subscript_expr()?.slice
+                }
+                _ => return None,
+            };
+
+            let literal = key.as_string_literal_expr()?;
+            Some((Name::new(literal.value.to_str()), key.range()))
+        };
+
+        // Collect the types of each distinct key.
+        let mut elements = Vec::new();
+        for bindings in use_def.multi_bindings_at_use(use_id) {
+            let place = place_from_bindings_with_reachability_cache(
+                db,
+                &env,
+                bindings.clone(),
+                reachability,
+            );
+            let Some((name, source)) = place.first_definition.and_then(definition_key) else {
+                continue;
+            };
+
+            if let Place::Defined(DefinedPlace {
+                ty: field_ty,
+                definedness: Definedness::AlwaysDefined,
+                ..
+            }) = place.place
+            {
+                elements.push(DictionaryItem {
+                    name,
+                    ty: field_ty,
+                    source,
+                });
+            }
+        }
+
+        Some(DictionaryItems {
+            items: elements.into_boxed_slice(),
+            is_complete: false,
+        })
+    }
+
+    pub(crate) fn literal(
+        db: &'db dyn Db,
+        expression: &ast::Expr,
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+    ) -> Option<Self> {
+        let ast::Expr::Dict(ast::ExprDict {
+            node_index: _,
+            range: _,
+            items,
+        }) = expression
+        else {
+            return None;
+        };
+        let mut entries = Vec::<DictionaryItem<'db>>::with_capacity(items.len());
+        let mut indexes = FxHashMap::<Name, usize>::default();
+        for ast::DictItem { key, value } in items {
+            let key = key.as_ref()?;
+            let name = match key {
+                ast::Expr::StringLiteral(literal) => Name::new(literal.value.to_str()),
+                _ => {
+                    let ty = expression_type(key)?;
+                    let name = ty.string_literal_value(db)?;
+                    Name::new(name)
+                }
+            };
+            let ty = expression_type(value)?;
+            let entry = DictionaryItem {
+                name: name.clone(),
+                ty,
+                source: key.range(),
+            };
+            match indexes.entry(name) {
+                Entry::Occupied(index) => {
+                    // Repeated keys replace their values without changing insertion order.
+                    entries[*index.get()] = entry;
+                }
+                Entry::Vacant(index) => {
+                    index.insert(entries.len());
+                    entries.push(entry);
+                }
+            }
+        }
+        Some(Self {
+            items: entries.into_boxed_slice(),
+            is_complete: true,
+        })
+    }
+}
 
 /// Whether a checked parameter was supplied by one definite argument.
 pub enum CheckedArgument<'a, 'db> {
@@ -32,6 +182,7 @@ pub struct CheckedCall<'a, 'db> {
     pub(crate) file: ProgramFile<'db>,
     pub(crate) call: &'a ast::ExprCall,
     pub(crate) expression_type: &'a dyn Fn(&ast::Expr) -> Option<Type<'db>>,
+    pub(crate) dictionary_items: &'a dyn Fn(&ast::Expr, Type<'db>) -> Option<DictionaryItems<'db>>,
     pub(crate) class_anchor: &'a dyn Fn(Box<[Type<'db>]>) -> DynamicClassAnchor<'db>,
     pub(crate) has_binding_errors: bool,
 }
@@ -72,6 +223,15 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
             return CheckedArgument::Indeterminate;
         };
         self.argument_at(parameter)
+    }
+
+    /// Known entries of a definitely supplied dictionary argument.
+    pub fn dictionary_argument(&self, name: &str) -> Option<DictionaryItems<'db>> {
+        let CheckedArgument::Value { ty, expression } = self.argument(name) else {
+            return None;
+        };
+        let expression = expression?;
+        (self.dictionary_items)(expression, ty)
     }
 
     fn argument_at(&self, parameter: usize) -> CheckedArgument<'a, 'db> {

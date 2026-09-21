@@ -440,6 +440,13 @@ pub(crate) struct MemberExprRef<'a> {
 }
 
 impl<'a> MemberExprRef<'a> {
+    pub(super) fn is_string_subscript(&self) -> bool {
+        self.segments
+            .iter()
+            .last()
+            .is_some_and(|segment| segment.kind() == SegmentKind::StringSubscript)
+    }
+
     pub(super) fn symbol_name(&self) -> &'a str {
         let end = self
             .segments

@@ -1,3 +1,4 @@
+use super::checked::{DictionaryItem, DictionaryItems};
 use crate::Db;
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -93,37 +94,24 @@ impl<'db> LiteralUnpacking<'db> {
     }
 
     fn keywords(
+        db: &'db dyn Db,
         expression: &ast::Expr,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> Option<Self> {
-        let ast::Expr::Dict(ast::ExprDict {
-            node_index: _,
-            range: _,
-            items,
-        }) = expression
-        else {
-            return None;
-        };
-        let mut keywords = Vec::<(Name, Type<'db>)>::with_capacity(items.len());
-        let mut indexes = FxHashMap::<Name, usize>::default();
-        for ast::DictItem { key, value } in items {
-            let Some(ast::Expr::StringLiteral(key)) = key else {
-                return None;
-            };
-            let name = Name::new(key.value.to_str());
-            let ty = expression_type(value)?;
-            match indexes.entry(name.clone()) {
-                std::collections::hash_map::Entry::Occupied(index) => {
-                    // A repeated key in a dictionary replaces its value without changing order.
-                    keywords[*index.get()].1 = ty;
-                }
-                std::collections::hash_map::Entry::Vacant(index) => {
-                    index.insert(keywords.len());
-                    keywords.push((name, ty));
-                }
-            }
-        }
-        Some(Self::Keywords(keywords.into_boxed_slice()))
+        let dictionary = DictionaryItems::literal(db, expression, expression_type)?;
+        Some(Self::Keywords(
+            dictionary
+                .items
+                .into_iter()
+                .map(
+                    |DictionaryItem {
+                         name,
+                         ty,
+                         source: _,
+                     }| (name, ty),
+                )
+                .collect(),
+        ))
     }
 }
 
@@ -275,6 +263,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     #[must_use]
     pub(crate) fn with_literal_unpacking(
         mut self,
+        db: &'db dyn Db,
         arguments: &ast::Arguments,
         mut expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> Self {
@@ -297,7 +286,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                     value,
                 }) => match arg {
                     Some(_) => None,
-                    None => LiteralUnpacking::keywords(value, &mut expression_type),
+                    None => LiteralUnpacking::keywords(db, value, &mut expression_type),
                 },
             };
         }

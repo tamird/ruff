@@ -2824,9 +2824,6 @@ impl<'db> UseDefMapBuilder<'db> {
                 .or_default()
                 .push(bindings);
         }
-
-        // Record a placeholder use of the parent expression to preserve the indices of `bindings_by_use`.
-        self.record_use_bindings(Bindings::default(), use_id);
     }
 
     fn record_use_bindings(&mut self, bindings: Bindings, use_id: ScopedUseId) {

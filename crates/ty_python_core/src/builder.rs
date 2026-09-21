@@ -1778,6 +1778,48 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         }
     }
 
+    fn record_mapping_use(&mut self, expression: &'ast ast::Expr) {
+        let Some(use_id) = self.ast_ids[self.current_scope()].try_use_id(expression) else {
+            return;
+        };
+
+        // Capture the known top-level members at this argument evaluation. The normal
+        // expression use and these member uses share an ID but have separate binding maps.
+        let current_scope = self.current_scope();
+        let member_places = PlaceExpr::try_from_expr(expression)
+            .and_then(|value_place_expr| {
+                self.current_place_table()
+                    .place_id((&value_place_expr).into())
+            })
+            .map(|value_place_id| {
+                let place_table = &self.place_tables[current_scope];
+                place_table
+                    .associated_place_ids(value_place_id)
+                    .iter()
+                    .filter(move |key_member_id| {
+                        let key_member_expr = place_table.member(**key_member_id).expression();
+                        if !key_member_expr.as_ref().is_string_subscript() {
+                            return false;
+                        }
+
+                        // Only include top-level keys.
+                        let Some(key_parent) = key_member_expr.as_ref().parent() else {
+                            return true;
+                        };
+                        match place_table.place(value_place_id) {
+                            PlaceExprRef::Symbol(_) => false,
+                            PlaceExprRef::Member(value_member) => {
+                                key_parent == value_member.expression()
+                            }
+                        }
+                    })
+                    .map(|key_member_id| ScopedPlaceId::from(*key_member_id))
+            });
+
+        self.use_def_maps[current_scope]
+            .record_multi_use(member_places.into_iter().flatten(), use_id);
+    }
+
     // Creates a definition for each key-value assignment in the dictionary.
     //
     // If there are multiple targets, no definitions will be created.
@@ -5721,45 +5763,21 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
         }
     }
 
+    fn visit_arguments(&mut self, arguments: &'ast ast::Arguments) {
+        // Python evaluates positional arguments before keywords, including when a later
+        // starred argument follows a keyword in source order.
+        for argument in &arguments.args {
+            self.visit_expr(argument);
+            self.record_mapping_use(argument);
+        }
+        for keyword in &arguments.keywords {
+            self.visit_keyword(keyword);
+        }
+    }
+
     fn visit_keyword(&mut self, keyword: &'ast ast::Keyword) {
         walk_keyword(self, keyword);
-
-        if keyword.arg.is_some() {
-            return;
-        }
-
-        // Record a use of all members of `x` for a splatted keyword argument `**x`.
-        let current_scope = self.current_scope();
-        let member_places = PlaceExpr::try_from_expr(&keyword.value)
-            .and_then(|value_place_expr| {
-                self.current_place_table()
-                    .place_id((&value_place_expr).into())
-            })
-            .map(|value_place_id| {
-                let place_table = &self.place_tables[current_scope];
-                place_table
-                    .associated_place_ids(value_place_id)
-                    .iter()
-                    .filter(move |key_member_id| {
-                        let key_member_expr = place_table.member(**key_member_id).expression();
-
-                        // Only include top-level keys.
-                        let Some(key_parent) = key_member_expr.as_ref().parent() else {
-                            return true;
-                        };
-                        match place_table.place(value_place_id) {
-                            PlaceExprRef::Symbol(_) => false,
-                            PlaceExprRef::Member(value_member) => {
-                                key_parent == value_member.expression()
-                            }
-                        }
-                    })
-                    .map(|key_member_id| ScopedPlaceId::from(*key_member_id))
-            });
-
-        let use_id = self.ast_ids[current_scope].record_use(keyword);
-        self.use_def_maps[current_scope]
-            .record_multi_use(member_places.into_iter().flatten(), use_id);
+        self.record_mapping_use(&keyword.value);
     }
 
     fn visit_expr(&mut self, expr: &'ast ast::Expr) {

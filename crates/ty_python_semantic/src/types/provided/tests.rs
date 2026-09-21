@@ -1,5 +1,6 @@
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::parsed_module;
+use ruff_db::source::source_text;
 use ruff_db::system::DbWithWritableSystem as _;
 use ruff_text_size::{TextLen, TextRange};
 
@@ -9,7 +10,152 @@ use crate::types::definition_resolution::definitions_for_attribute;
 use crate::types::ide_support::{
     definitions_for_keyword_argument, inlay_hint_call_argument_details,
 };
-use crate::types::{CheckedArgument, CheckedCall, KnownClass, Parameter, Parameters, Signature};
+use crate::types::{
+    CheckedArgument, CheckedCall, DictionaryItem, DictionaryItems, KnownClass, Parameter,
+    Parameters, Signature,
+};
+use crate::{HasType, SemanticModel};
+
+#[test]
+fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
+    fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        if call.declaration()?.name(db)?.as_str() != "observe" {
+            return None;
+        }
+        let Some(DictionaryItems { items, is_complete }) = call.dictionary_argument("value") else {
+            return Some(Type::string_literal(db, "unavailable"));
+        };
+        Some(describe(
+            db,
+            call.file(),
+            DictionaryItems { items, is_complete },
+        ))
+    }
+
+    fn describe<'db>(
+        db: &'db TestDb,
+        file: ProgramFile<'db>,
+        entries: DictionaryItems<'db>,
+    ) -> Type<'db> {
+        let DictionaryItems { items, is_complete } = entries;
+        let source = source_text(db, file.file(db));
+        let env = ProgramEnvironment::from_file(file);
+        let mut description = if is_complete { "complete" } else { "partial" }.to_owned();
+        // Preserve key order, values, and their source spelling through the public call view.
+        for DictionaryItem {
+            name,
+            ty,
+            source: range,
+        } in items
+        {
+            write!(
+                description,
+                "; {name}: {} at {}",
+                ty.display(db, &env),
+                &source[range]
+            )
+            .unwrap();
+        }
+        Type::string_literal(db, description.as_str())
+    }
+
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "def observe(value: object) -> str: ...\n",
+        )
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(observe)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (source, expected) in [
+        ("result = observe({})", "complete"),
+        (
+            "result = observe({'x': 1, 'y': 2, 'x': 3})",
+            "complete; x: Literal[3] at 'x'; y: Literal[2] at 'y'",
+        ),
+        (
+            "key = 'x'\nresult = observe(value={key: 1})",
+            "complete; x: Literal[1] at key",
+        ),
+        (
+            "values = {'x': 1}\nresult = observe(values)",
+            "partial; x: Literal[1] at 'x'",
+        ),
+        (
+            "values = {'x': 1}\nvalues['x'] = 'new'\nresult = observe(value=values)",
+            "partial; x: Literal[\"new\"] at 'x'",
+        ),
+        (
+            "values = {'x': 1}\nvalues = {}\nresult = observe(values)",
+            "partial",
+        ),
+        (
+            "values = {'x': 1}\ndel values['x']\nresult = observe(values)",
+            "partial",
+        ),
+        (
+            "values = {'x': 1}\nvalues.clear()\nresult = observe(values)",
+            "partial; x: Literal[1] at 'x'",
+        ),
+        (
+            "values = {'x': 1}\nif bool():\n    values['y'] = 2\nresult = observe(values)",
+            "partial; x: Literal[1] at 'x'",
+        ),
+        (
+            "values = {}\nvalues['inner'] = {'x': 1}\nvalues['inner']['y'] = 2\nresult = observe(values['inner'])",
+            "partial; x: Literal[1] at 'x'; y: Literal[2] at 'y'",
+        ),
+        (
+            "values = {'x': 1}\nresult = observe({**values})",
+            "unavailable",
+        ),
+        ("result = observe(1)", "unavailable"),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!("from native import observe\n{source}\n"),
+        )?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let result = crate::place::global_symbol(&db, db.program_file(file), "result")
+            .place
+            .expect_type();
+        assert_eq!(result.string_literal_value(&db), Some(expected), "{source}");
+    }
+    db.write_file("/src/main.py", "from native import observe\ndef nested():\n    values = {'inner': 1}\n    values['second'] = 2\n    return observe(values)\nannotation: \"{'key': int}\"\n")?;
+    let file = db.program_file(file);
+    let model = SemanticModel::new(&db, file);
+    let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
+    let [
+        ast::Stmt::ImportFrom(_),
+        ast::Stmt::FunctionDef(function),
+        ast::Stmt::AnnAssign(annotation),
+    ] = parsed.suite().as_slice()
+    else {
+        panic!("expected nested function and annotation");
+    };
+    let ast::Stmt::Return(statement) = function.body.last().unwrap() else {
+        panic!("expected return");
+    };
+    let ast::Expr::Call(call) = statement.value.as_deref().unwrap() else {
+        panic!("expected observe call");
+    };
+    let [argument] = call.arguments.args.as_ref() else {
+        panic!("expected one dictionary argument");
+    };
+    let entries = model.dictionary_items(argument).unwrap();
+    assert_eq!(
+        describe(&db, file, entries),
+        ast::ExprRef::Call(call).inferred_type(&model).unwrap(),
+    );
+    let ast::Expr::StringLiteral(annotation) = annotation.annotation.as_ref() else {
+        panic!("expected string annotation");
+    };
+    let (parsed, detached) = model.enter_string_annotation(annotation).unwrap();
+    assert!(detached.dictionary_items(&parsed.syntax().body).is_none());
+    Ok(())
+}
 
 const DECLARATIONS: &str = "\
 def make(value: object, required: int = 0) -> object: ...
@@ -751,3 +897,4 @@ fn callable_metadata_survives_signature_transforms() -> anyhow::Result<()> {
     );
     Ok(())
 }
+use std::fmt::Write;

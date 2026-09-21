@@ -1161,7 +1161,7 @@ pub fn call_signature_details<'db>(
                     .inferred_type(model)
                     .unwrap_or(Type::unknown())
             })
-            .with_literal_unpacking(&call_expr.arguments, |expression| {
+            .with_literal_unpacking(db, &call_expr.arguments, |expression| {
                 expression.inferred_type(model)
             });
         let mut bindings =
@@ -1242,7 +1242,7 @@ fn resolve_single_overload<'db>(
             .inferred_type(model)
             .unwrap_or(Type::unknown())
     })
-    .with_literal_unpacking(&call_expr.arguments, |expression| {
+    .with_literal_unpacking(db, &call_expr.arguments, |expression| {
         expression.inferred_type(model)
     });
 
@@ -1292,7 +1292,7 @@ fn full_type_bindings_for_call<'db>(
                 .inferred_type(model)
                 .unwrap_or(Type::unknown())
         })
-        .with_literal_unpacking(&call_expr.arguments, |expression| {
+        .with_literal_unpacking(db, &call_expr.arguments, |expression| {
             expression.inferred_type(model)
         });
     let constraints = ConstraintSetBuilder::new();
@@ -1637,7 +1637,7 @@ pub fn resolved_call_signature<'db>(
             .inferred_type(model)
             .unwrap_or(Type::unknown())
     })
-    .with_literal_unpacking(&call_expr.arguments, |expression| {
+    .with_literal_unpacking(db, &call_expr.arguments, |expression| {
         expression.inferred_type(model)
     });
 
