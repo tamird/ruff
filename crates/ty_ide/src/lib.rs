@@ -53,7 +53,8 @@ pub use goto_implementation::goto_implementation;
 pub use hints::{Hint, HintKind, hints};
 pub use hover::hover;
 pub use inlay_hints::{
-    InlayHintKind, InlayHintLabel, InlayHintSettings, InlayHintTextEdit, inlay_hints,
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintSettings, InlayHintTextEdit, inlay_hints,
+    inlay_hints_for_model,
 };
 pub use markup::MarkupKind;
 pub use references::{ReferencesMode, references_in_file};
@@ -81,8 +82,8 @@ use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxBuildHasher, FxHashSet};
 use std::ops::{Deref, DerefMut};
 use ty_project::Db;
-use ty_python_semantic::ProgramEnvironment;
 use ty_python_semantic::types::{Type, TypeDefinition};
+use ty_python_semantic::{Db as SemanticDb, ProgramEnvironment};
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
 
@@ -288,11 +289,19 @@ impl FromIterator<NavigationTarget> for NavigationTargets {
 }
 
 pub trait HasNavigationTargets {
-    fn navigation_targets(&self, db: &dyn Db, env: &ProgramEnvironment<'_>) -> NavigationTargets;
+    fn navigation_targets(
+        &self,
+        db: &dyn SemanticDb,
+        env: &ProgramEnvironment<'_>,
+    ) -> NavigationTargets;
 }
 
 impl HasNavigationTargets for Type<'_> {
-    fn navigation_targets(&self, db: &dyn Db, env: &ProgramEnvironment<'_>) -> NavigationTargets {
+    fn navigation_targets(
+        &self,
+        db: &dyn SemanticDb,
+        env: &ProgramEnvironment<'_>,
+    ) -> NavigationTargets {
         match self {
             Type::Union(union) => union
                 .elements(db)
@@ -340,7 +349,11 @@ impl HasNavigationTargets for Type<'_> {
 }
 
 impl HasNavigationTargets for TypeDefinition<'_> {
-    fn navigation_targets(&self, db: &dyn Db, _: &ProgramEnvironment<'_>) -> NavigationTargets {
+    fn navigation_targets(
+        &self,
+        db: &dyn SemanticDb,
+        _: &ProgramEnvironment<'_>,
+    ) -> NavigationTargets {
         let Some(full_range) = self.full_range(db) else {
             return NavigationTargets::empty();
         };
