@@ -976,15 +976,11 @@ impl<'db> GenericContext<'db> {
     /// Creates a specialization of this generic context. Panics if the length of `types` does not
     /// match the number of typevars in the generic context.
     ///
-    /// You must provide a specific type for each typevar; no defaults are used. (Use
-    /// [`specialize_partial`](Self::specialize_partial) if you might not have types for every
-    /// typevar.)
+    /// You must provide a specific type for each typevar; no defaults are used.
     ///
     /// The types you provide should not mention any of the typevars in this generic context;
-    /// otherwise, you will be left with a partial specialization. (Use
-    /// [`specialize_recursive`](Self::specialize_recursive) if your types might mention typevars
-    /// in this generic context.)
-    pub(crate) fn specialize<'t, T>(self, db: &'db dyn Db, types: T) -> Specialization<'db>
+    /// otherwise, you will be left with a partial specialization.
+    pub fn specialize<'t, T>(self, db: &'db dyn Db, types: T) -> Specialization<'db>
     where
         T: Into<Cow<'t, [Type<'db>]>>,
         'db: 't,

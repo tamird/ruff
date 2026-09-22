@@ -1047,7 +1047,7 @@ impl<'db> ClassLiteral<'db> {
     }
 
     /// Apply a specialization to this class.
-    pub(crate) fn apply_specialization(
+    pub fn apply_specialization(
         self,
         db: &'db dyn Db,
         f: impl FnOnce(GenericContext<'db>) -> Specialization<'db>,
