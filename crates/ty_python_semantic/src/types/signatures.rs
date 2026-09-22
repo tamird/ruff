@@ -1157,6 +1157,11 @@ impl<'db> Signature<'db> {
         &self.parameters
     }
 
+    /// The result type declared by this signature.
+    pub fn return_type(&self) -> Type<'db> {
+        self.return_ty
+    }
+
     /// Adds an implicit annotation to the first parameter of this signature, if that parameter is
     /// positional and does not already have an annotation. We do not check whether that's the
     /// right thing to do! The caller must determine whether the first parameter is actually a
