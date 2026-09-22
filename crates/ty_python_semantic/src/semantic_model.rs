@@ -57,13 +57,12 @@ use ty_python_core::{BindingWithConstraintsIterator, Program, ProgramFile};
 /// annotations (see [`Self::enter_string_annotation`]). When you do this you will be handling
 /// AST nodes that don't belong to the file's AST (or *any* file's AST). These kinds of nodes
 /// will result in panics and confusing results if handed to the wrong subsystem. `SemanticModel`
-/// methods will automatically handle using the string literal's AST node when necessary.
+/// methods use the annotation's enclosing scope to look up these nodes.
 pub struct SemanticModel<'db> {
     db: &'db dyn Db,
     file: ProgramFile<'db>,
-    /// If `Some` then this `SemanticModel` is for analyzing the sub-AST of a string annotation.
-    /// This expression will be used as a witness to the scope/location we're analyzing.
-    in_string_annotation_expr: Option<Box<Expr>>,
+    /// The enclosing scope when analyzing an annotation outside the module AST.
+    annotation_scope: Option<FileScopeId>,
 }
 
 impl<'db> SemanticModel<'db> {
@@ -71,7 +70,7 @@ impl<'db> SemanticModel<'db> {
         Self {
             db,
             file,
-            in_string_annotation_expr: None,
+            annotation_scope: None,
         }
     }
 
@@ -120,7 +119,7 @@ impl<'db> SemanticModel<'db> {
         call: &ast::ExprCall,
         class: ProvidedClass<'db>,
     ) -> Option<Type<'db>> {
-        if self.in_string_annotation_expr.is_some() {
+        if self.annotation_scope.is_some() {
             return None;
         }
         class.into_type_at_call(self.db, self.file, call)
@@ -131,7 +130,7 @@ impl<'db> SemanticModel<'db> {
     /// Immediate literals have a complete key set. Other indexed argument uses expose partial
     /// flow observations; expressions outside those uses can have no observed entries.
     pub fn dictionary_items(&self, expression: &Expr) -> Option<DictionaryItems<'db>> {
-        if self.in_string_annotation_expr.is_some() {
+        if self.annotation_scope.is_some() {
             return None;
         }
         DictionaryItems::literal(self.db, expression, &mut |expression| {
@@ -526,7 +525,10 @@ impl<'db> SemanticModel<'db> {
         if index.is_excluded(node.range()) {
             return None;
         }
-        match self.node_in_ast(node) {
+        if let Some(scope) = self.annotation_scope {
+            return Some(scope);
+        }
+        match node {
             ast::AnyNodeRef::Identifier(identifier) => index.try_expression_scope_id(identifier),
 
             // Nodes implementing `HasDefinition`
@@ -625,48 +627,12 @@ impl<'db> SemanticModel<'db> {
     pub(crate) fn builtin_usage(&self, node: ast::AnyNodeRef<'_>) -> crate::provided::BuiltinUsage {
         let index = semantic_index(self.db, self.program_file());
         let module = parsed_module(self.db, self.program_file().python_file(self.db)).load(self.db);
-        if self.in_string_annotation_expr.is_some()
+        if self.annotation_scope.is_some()
             || index.annotation_parent_scope_id(&module, &node).is_some()
         {
             crate::provided::BuiltinUsage::Annotation
         } else {
             crate::provided::BuiltinUsage::Runtime
-        }
-    }
-
-    /// Get a "safe" [`ast::AnyNodeRef`] to use for referring to the given (sub-)AST node.
-    ///
-    /// If we're analyzing a string annotation, it will return the string literal's node.
-    /// Otherwise it will return the input.
-    fn node_in_ast<'a>(&'a self, node: ast::AnyNodeRef<'a>) -> ast::AnyNodeRef<'a> {
-        if let Some(string_annotation) = &self.in_string_annotation_expr {
-            (&**string_annotation).into()
-        } else {
-            node
-        }
-    }
-
-    /// Get a "safe" [`Expr`] to use for referring to the given (sub-)expression.
-    ///
-    /// If we're analyzing a string annotation, it will return the string literal's expression.
-    /// Otherwise it will return the input.
-    fn expr_in_ast<'a>(&'a self, expr: &'a Expr) -> &'a Expr {
-        if let Some(string_annotation) = &self.in_string_annotation_expr {
-            string_annotation
-        } else {
-            expr
-        }
-    }
-
-    /// Get a "safe" [`ExprRef`] to use for referring to the given (sub-)expression.
-    ///
-    /// If we're analyzing a string annotation, it will return the string literal's expression.
-    /// Otherwise it will return the input.
-    fn expr_ref_in_ast<'a>(&'a self, expr: ExprRef<'a>) -> ExprRef<'a> {
-        if let Some(string_annotation) = &self.in_string_annotation_expr {
-            ExprRef::from(string_annotation)
-        } else {
-            expr
         }
     }
 
@@ -681,10 +647,8 @@ impl<'db> SemanticModel<'db> {
     ) -> Option<(Parsed<ModExpression>, Self)> {
         // Ask the inference engine whether this is actually a string annotation
         let expr = ExprRef::StringLiteral(string_expr);
-        let index = semantic_index(self.db, self.program_file());
-        // When looking up scopes, use the expr in the top-level AST
-        // (we might be trying to enter a sub-sub-AST, so this isn't silly)
-        let file_scope = index.try_expression_scope_id(&self.expr_ref_in_ast(expr))?;
+        // Nested string annotations retain the outer annotation's scope.
+        let file_scope = self.scope(expr.into())?;
         let scope = file_scope.to_scope_id(self.db, self.program_file());
         // When querying whether the expr is a string annotation, we do however use the actual expr
         // (the inference engine should record this information even for sub-nodes)
@@ -692,22 +656,14 @@ impl<'db> SemanticModel<'db> {
             return None;
         }
 
-        // Parse the sub-AST and create a semantic model that knows it's in a sub-AST
-        //
-        // The string_annotation will be used as the expr/node for any query that needs
-        // to look up a node in the AST to prevent panics, because these sub-AST nodes
-        // are not in the File's AST!
+        // Parse the sub-AST and preserve the scope that owns its inferred types.
         let source = source_text(self.db, self.file());
         let string_literal = string_expr.as_single_part_string()?;
         let ast = parsed_string_annotation(source.as_str(), string_literal).ok()?;
         let model = Self {
             db: self.db,
             file: self.file,
-            // Use expr_in_ast here because we might be entering a sub-sub-AST
-            in_string_annotation_expr: Some(Box::new(
-                self.expr_in_ast(&Expr::StringLiteral(string_expr.clone()))
-                    .clone(),
-            )),
+            annotation_scope: Some(file_scope),
         };
         Some((ast, model))
     }
@@ -839,7 +795,7 @@ impl<'db> SemanticModel<'db> {
         // Finite choices from the expected type take precedence. A string used as the complete
         // subscript key can fall back to initializer keys that fit any known expected type.
         if candidates.is_empty()
-            && self.in_string_annotation_expr.is_none()
+            && self.annotation_scope.is_none()
             && let Some(subscript) = subscript
         {
             self.dictionary_initializer_keys(
@@ -1079,8 +1035,7 @@ impl<'db> SemanticModel<'db> {
         string_expr: &ast::ExprStringLiteral,
     ) -> Option<Type<'db>> {
         let expr = ast::ExprRef::from(string_expr);
-        let index = semantic_index(self.db, self.program_file());
-        let file_scope = index.try_expression_scope_id(&self.expr_ref_in_ast(expr))?;
+        let file_scope = self.scope(expr.into())?;
         let scope = file_scope.to_scope_id(self.db, self.program_file());
 
         infer_complete_scope_types(self.db, scope).try_expected_type(expr)
@@ -1185,15 +1140,7 @@ trait HasOptionalDefinition {
 impl HasType for ast::ExprRef<'_> {
     fn inferred_type<'db>(&self, model: &SemanticModel<'db>) -> Option<Type<'db>> {
         let file = model.program_file();
-        let index = semantic_index(model.db, file);
-        if index.is_excluded(self.range()) {
-            return None;
-        }
-        // TODO(#1637): semantic tokens is making this crash even with
-        // `try_expr_ref_in_ast` guarding this, for now just use `try_expression_scope_id`.
-        // The problematic input is `x: "float` (with a dangling quote). I imagine the issue
-        // is we're too eagerly setting `is_string_annotation` in inference.
-        let file_scope = index.try_expression_scope_id(&model.expr_ref_in_ast(*self))?;
+        let file_scope = model.scope((*self).into())?;
         let scope = file_scope.to_scope_id(model.db, file);
 
         infer_complete_scope_types(model.db, scope).try_expression_type(*self)
