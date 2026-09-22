@@ -43,6 +43,18 @@ pub trait Db: PythonCoreDb {
         None
     }
 
+    /// Supplies a return contract for a function without a source annotation.
+    ///
+    /// The contract participates in ordinary signature and body checking. Native and supplied
+    /// source annotations take precedence. Implementations must read tracked inputs and must not
+    /// infer the function body or its enclosing scope while resolving this contract.
+    fn provided_return_type<'db>(
+        &'db self,
+        _definition: Definition<'db>,
+    ) -> Option<crate::provided::ProvidedReturnType<'db>> {
+        None
+    }
+
     /// Refines the result of an application-defined factory after ordinary argument checking.
     ///
     /// The declaration, bound arguments, and inferred child types come from this inference pass.
@@ -145,6 +157,14 @@ pub(crate) mod tests {
             _db: &'db TestDb,
             _definition: Definition<'db>,
         ) -> Option<crate::types::Type<'db>> {
+            None
+        }
+
+        fn return_type<'db>(
+            &self,
+            _db: &'db TestDb,
+            _definition: Definition<'db>,
+        ) -> Option<crate::provided::ProvidedReturnType<'db>> {
             None
         }
     }
@@ -331,6 +351,15 @@ pub(crate) mod tests {
             self.source_provider
                 .as_ref()
                 .and_then(|provider| provider.parameter_type(self, definition))
+        }
+
+        fn provided_return_type<'db>(
+            &'db self,
+            definition: Definition<'db>,
+        ) -> Option<crate::provided::ProvidedReturnType<'db>> {
+            self.source_provider
+                .as_ref()
+                .and_then(|provider| provider.return_type(self, definition))
         }
 
         fn check_file(&self, file: File) -> Vec<Diagnostic> {

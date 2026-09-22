@@ -16,15 +16,46 @@ use ty_python_core::{ProgramFileKind, ProvidedAnnotation, semantic_index};
 
 use super::*;
 use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
-use crate::types::KnownClass;
+use crate::types::{KnownClass, TypedDictFieldBuilder, TypedDictType};
 use crate::{HasType, ProgramEnvironment, SemanticModel};
 
 /// Pairs top-level functions by name and their ordinary parameters by position.
 /// Signature compatibility is the consumer's responsibility; this fixture exercises
 /// annotation ownership after the consumer has selected a correspondence.
+/// Functions named `provided_*` also receive a structural return contract when present.
 struct ExternalSource;
 
 impl SourceProvider for ExternalSource {
+    fn return_type<'db>(
+        &self,
+        db: &'db TestDb,
+        definition: Definition<'db>,
+    ) -> Option<ProvidedReturnType<'db>> {
+        let DefinitionKind::Function(function) = definition.kind(db) else {
+            return None;
+        };
+        let module = parsed_module(db, definition.python_file(db)).load(db);
+        if !function.node(&module).name.starts_with("provided_") {
+            return None;
+        }
+        let source = system_path_to_file(db, "/src/return.pyi").ok()?;
+        let value = ProvidedBindingValue::Export {
+            file: db.program_file(source),
+            name: Name::new_static("value"),
+        }
+        .resolve_type(db)?;
+        let schema = [(
+            Name::new_static("value"),
+            TypedDictFieldBuilder::new(value).required(true).build(),
+        )]
+        .into_iter()
+        .collect();
+        Some(ProvidedReturnType {
+            ty: Type::TypedDict(TypedDictType::from_schema_items(db, schema)),
+            source: Some(FileRange::new(source, TextRange::new(0.into(), 5.into()))),
+        })
+    }
+
     fn statements(&self, _db: &TestDb, _file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
         Vec::new()
     }
@@ -92,6 +123,100 @@ impl SourceProvider for ExternalSource {
     ) -> Option<ProvidedBindingValue<'db>> {
         None
     }
+}
+
+#[test]
+fn supplied_returns_check_bodies_and_track_contract_edits() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            "def provided_make():\n    return {'value': 1}\nobserved = provided_make()['value']\n",
+        )
+        .with_file("/src/return.pyi", "value: int\n")
+        .with_source_provider(ExternalSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for expected in ["int", "str", "int"] {
+        db.write_file("/src/return.pyi", format!("value: {expected}\n"))?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics.is_empty(),
+            expected == "int",
+            "{diagnostics:#?}"
+        );
+        let program_file = db.program_file(file);
+        let module = parsed_module(&db, program_file.python_file(&db)).load(&db);
+        let ast::Stmt::Assign(observed) = &module.suite()[1] else {
+            panic!("expected observed assignment");
+        };
+        let model = SemanticModel::new(&db, program_file);
+        assert_eq!(
+            observed
+                .value
+                .inferred_type(&model)
+                .unwrap()
+                .display(&db, &model.program_environment())
+                .to_string(),
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_returns_preserve_annotations_and_check_all_exits() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            "\
+def provided_missing():
+    return {}
+def provided_fallthrough(flag: bool):
+    if flag:
+        return {'value': 1}
+def provided_bare():
+    return
+def provided_native() -> int:
+    return 1
+def provided_external():
+    return 'ok'
+def provided_wrong():
+    return 1
+",
+        )
+        .with_file(
+            "/src/contracts.pyi",
+            "def provided_external() -> str: ...\n",
+        )
+        .with_file("/src/return.pyi", "value: int\n")
+        .with_source_provider(ExternalSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-return-type",
+            "missing-typed-dict-key",
+            "invalid-return-type",
+            "invalid-return-type",
+            "invalid-return-type"
+        ],
+        "{diagnostics:#?}"
+    );
+    let contract = system_path_to_file(&db, "/src/return.pyi")?;
+    assert!(
+        diagnostics
+            .iter()
+            .flat_map(Diagnostic::annotations)
+            .any(|annotation| annotation.get_span().file()
+                == &ruff_db::diagnostic::UnifiedFile::Ty(contract)),
+        "{diagnostics:#?}"
+    );
+    Ok(())
 }
 
 #[test]
