@@ -2359,7 +2359,9 @@ impl<'db> Type<'db> {
         })
     }
 
-    fn is_fully_static(self, db: &'db dyn Db, env: &ProgramEnvironment) -> bool {
+    /// Returns whether the stored type components contain no dynamic types.
+    /// Original function signatures and nominal members require separate analysis.
+    pub fn is_fully_static(self, db: &'db dyn Db, env: &ProgramEnvironment) -> bool {
         dynamic_content(db, env, self).is_absent()
     }
 
