@@ -61,6 +61,7 @@ pub use rename::{can_rename, rename};
 pub use selection_range::selection_range;
 pub use semantic_tokens::{
     SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, semantic_tokens,
+    semantic_tokens_for_model,
 };
 pub use signature_help::{
     ParameterDetails, SignatureDetails, SignatureHelpInfo, call_at_offset, signature_help,
