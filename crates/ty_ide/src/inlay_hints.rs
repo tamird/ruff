@@ -326,6 +326,9 @@ fn collect_inlay_hints(
 
     visitor.visit_body(ast.suite());
 
+    visitor
+        .hints
+        .retain(|hint| range.contains_inclusive(hint.position));
     visitor.hints
 }
 
@@ -405,6 +408,11 @@ impl<'a, 'db> InlayHintVisitor<'a, 'db> {
 
     fn add_type_hint(&mut self, expr: &Expr, rhs: &Expr, ty: Type<'db>, allow_edits: bool) {
         if !self.settings.variable_types {
+            return;
+        }
+
+        // Excluded hints must not reserve imports needed by hints inside the range.
+        if !self.range.contains_inclusive(expr.end()) {
             return;
         }
 
@@ -1052,6 +1060,51 @@ Source with applied edits:
                 assert_eq!(part.target(), editable_part.target());
             }
         }
+    }
+
+    #[test]
+    fn hint_positions_stay_within_the_requested_range() {
+        let test = inlay_hint_test(
+            "def combine(first: int, second: int) -> int:\n    return first\nresult = combine(1, <START>2<END>)\n",
+        );
+        let file = ProgramFile::new(
+            &test.db,
+            test.file,
+            test.db.program_environment().program(&test.db),
+        );
+        let settings = InlayHintSettings::default();
+        let model = SemanticModel::new(&test.db, file);
+
+        for hints in [
+            inlay_hints(&test.db, file, test.range, &settings),
+            inlay_hints_for_model(&model, test.range, &settings),
+        ] {
+            assert_eq!(hints.len(), 1);
+            assert_eq!(hints[0].position, test.range.start());
+            assert_eq!(hints[0].display().to_string(), "second=");
+        }
+    }
+
+    #[test]
+    fn out_of_range_hints_do_not_reserve_imports() {
+        let mut test = inlay_hint_test(
+            "from other import make\nfirst = <START>make()\nsecond = make()<END>\n",
+        );
+        test.with_extra_file("other.py", "class Item: pass\ndef make() -> Item: ...\n");
+        let file = ProgramFile::new(
+            &test.db,
+            test.file,
+            test.db.program_environment().program(&test.db),
+        );
+        let hints = inlay_hints(&test.db, file, test.range, &InlayHintSettings::default());
+
+        assert_eq!(hints.len(), 1);
+        let hint = &hints[0];
+        assert!(
+            hint.text_edits.iter().any(|edit| {
+                edit.range.start() < hint.position && edit.new_text.contains("Item")
+            })
+        );
     }
 
     #[test]
