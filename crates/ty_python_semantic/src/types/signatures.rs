@@ -5986,7 +5986,7 @@ impl<'db> Parameter<'db> {
     }
 
     /// Annotated type of the parameter. If no annotation was provided, this is `Unknown`.
-    pub(crate) fn annotated_type(&self) -> Type<'db> {
+    pub fn annotated_type(&self) -> Type<'db> {
         self.annotated_type
     }
 
@@ -6006,7 +6006,7 @@ impl<'db> Parameter<'db> {
     }
 
     /// Kind of the parameter.
-    pub(crate) fn kind(&self) -> &ParameterKind<'db> {
+    pub fn kind(&self) -> &ParameterKind<'db> {
         &self.kind
     }
 
