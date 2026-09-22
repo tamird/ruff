@@ -625,7 +625,8 @@ impl<'db> TypedDictType<'db> {
         }
     }
 
-    pub(crate) fn from_schema_items(db: &'db dyn Db, items: TypedDictSchema<'db>) -> Self {
+    /// Creates a structural dictionary type with an implicitly open schema.
+    pub fn from_schema_items(db: &'db dyn Db, items: TypedDictSchema<'db>) -> Self {
         Self::from_schema_items_with_openness(db, items, TypedDictOpenness::ImplicitlyOpen)
     }
 
@@ -3281,14 +3282,16 @@ impl<'db> TypedDictField<'db> {
     }
 }
 
-pub(super) struct TypedDictFieldBuilder<'db> {
+/// A field's value type, presence requirement, and mutation policy.
+#[must_use]
+pub struct TypedDictFieldBuilder<'db> {
     declared_ty: Type<'db>,
     flags: TypedDictFieldFlags,
     first_declaration: Option<Definition<'db>>,
 }
 
 impl<'db> TypedDictFieldBuilder<'db> {
-    pub(crate) fn new(declared_ty: Type<'db>) -> Self {
+    pub fn new(declared_ty: Type<'db>) -> Self {
         Self {
             declared_ty,
             flags: TypedDictFieldFlags::empty(),
@@ -3296,12 +3299,12 @@ impl<'db> TypedDictFieldBuilder<'db> {
         }
     }
 
-    pub(crate) fn required(mut self, yes: bool) -> Self {
+    pub fn required(mut self, yes: bool) -> Self {
         self.flags.set(TypedDictFieldFlags::REQUIRED, yes);
         self
     }
 
-    pub(crate) fn read_only(mut self, yes: bool) -> Self {
+    pub fn read_only(mut self, yes: bool) -> Self {
         self.flags.set(TypedDictFieldFlags::READ_ONLY, yes);
         self
     }
@@ -3311,7 +3314,7 @@ impl<'db> TypedDictFieldBuilder<'db> {
         self
     }
 
-    pub(crate) fn build(self) -> TypedDictField<'db> {
+    pub fn build(self) -> TypedDictField<'db> {
         TypedDictField {
             declared_ty: self.declared_ty,
             flags: self.flags,
