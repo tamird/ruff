@@ -108,7 +108,9 @@ use crate::types::special_form::TypeQualifier;
 use crate::types::tuple::TupleSpec;
 pub use crate::types::type_alias::TypeAliasType;
 pub use crate::types::type_form::TypeFormType;
-pub(crate) use crate::types::typed_dict::TypedDictType;
+pub use crate::types::typed_dict::{
+    TypedDictField, TypedDictFieldBuilder, TypedDictSchema, TypedDictType,
+};
 pub(crate) use crate::types::typevar::{
     BindingContext, BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarBoundOrConstraints,
     TypeVarNonce,
