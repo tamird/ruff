@@ -326,7 +326,8 @@ fn references_for_file(
 
 /// Find occurrences in `file` that share any of the supplied definition identities.
 ///
-/// Import aliases retain their own identities, and declarations are included.
+/// Import aliases retain their own identities. `include_declaration` controls
+/// whether declarations are included.
 /// The caller selects the definitions and their spelling; this search does not
 /// discover project files or follow fixture exposures.
 pub fn references_in_file<'db>(
@@ -334,6 +335,7 @@ pub fn references_in_file<'db>(
     file: ProgramFile<'db>,
     name: &str,
     definitions: &[ResolvedDefinition<'db>],
+    include_declaration: bool,
 ) -> Vec<ReferenceTarget> {
     let search = LocalReferenceSearch {
         target_text: name.into(),
@@ -341,7 +343,12 @@ pub fn references_in_file<'db>(
         import_alias_resolution: ImportAliasResolution::PreserveAliases,
         fixture_resolution: None,
     };
-    references_for_file(db, file, &search, ReferencesMode::DocumentHighlights)
+    let mode = if include_declaration {
+        ReferencesMode::DocumentHighlights
+    } else {
+        ReferencesMode::ReferencesSkipDeclaration
+    };
+    references_for_file(db, file, &search, mode)
 }
 
 /// Determines whether the resolved definitions can have references outside their file.
@@ -1104,7 +1111,7 @@ mod tests {
     #[test]
     fn file_references_preserve_definition_identity() {
         let test = cursor_test(
-            "value<CURSOR> = 1\nvalue\ndef shadow():\n    value = 2\n    return value\nvalue",
+            "value<CURSOR> = 1\nvalue\ndef shadow():\n    value = 2\n    return value\nvalue = 3\nvalue",
         );
         let file = test.program_file(test.cursor.file);
         let model = SemanticModel::new(&test.db, file);
@@ -1113,7 +1120,7 @@ mod tests {
             .definitions(&model, ImportAliasResolution::PreserveAliases)
             .unwrap();
         let definitions = definitions.iter().cloned().collect::<Vec<_>>();
-        let references = references_in_file(&test.db, file, "value", &definitions);
+        let references = references_in_file(&test.db, file, "value", &definitions, true);
         let actual = references
             .iter()
             .map(|reference| {
@@ -1127,11 +1134,17 @@ mod tests {
                 (0, ReferenceKind::Write),
                 (10, ReferenceKind::Read),
                 (
+                    test.cursor.source.rfind("value =").unwrap(),
+                    ReferenceKind::Write
+                ),
+                (
                     test.cursor.source.rfind("value").unwrap(),
                     ReferenceKind::Read
                 ),
             ]
         );
+        let without_declaration = references_in_file(&test.db, file, "value", &definitions, false);
+        assert_eq!(without_declaration, references[1..]);
     }
 
     #[test]
@@ -1152,10 +1165,10 @@ mod tests {
                 .definitions(&model, ImportAliasResolution::PreserveAliases)
                 .unwrap();
             let definitions = definitions.iter().cloned().collect::<Vec<_>>();
-            let references = references_in_file(&test.db, file, "value", &definitions);
+            let references = references_in_file(&test.db, file, "value", &definitions, true);
             assert_eq!(references.len(), 2, "{references:?}");
             let other = if file == source { stub } else { source };
-            let references = references_in_file(&test.db, other, "value", &definitions);
+            let references = references_in_file(&test.db, other, "value", &definitions, true);
             assert!(references.is_empty(), "{references:?}");
         }
     }
