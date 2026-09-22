@@ -198,21 +198,37 @@ pub fn semantic_tokens(
     file: ProgramFile<'_>,
     range: Option<TextRange>,
 ) -> SemanticTokens {
-    let parsed = parsed_module(db, file.python_file(db)).load(db);
     let model = SemanticModel::new(db, file);
-
-    let mut visitor = SemanticTokenVisitor::new(&model, range);
-    visitor.expecting_docstring = true;
-    visitor.visit_body(parsed.suite());
+    let mut tokens = semantic_tokens_for_model(&model, range);
 
     if let Some(tag) = script_tag(db, file.file(db)) {
-        let insertion = visitor
+        let insertion = tokens
             .tokens
             .partition_point(|token| token.start() < tag.start());
-        visitor
+        tokens
             .tokens
             .splice(insertion..insertion, script_metadata_tokens(tag, range));
     }
+
+    tokens
+}
+
+/// Classifies the source represented by a semantic model.
+///
+/// The model must describe its canonical source file, as constructed by
+/// [`SemanticModel::new`].
+///
+/// Pass `None` to classify the entire file. Embedded languages, such as Python
+/// script metadata, can supply their tokens separately.
+pub fn semantic_tokens_for_model(
+    model: &SemanticModel<'_>,
+    range: Option<TextRange>,
+) -> SemanticTokens {
+    let db = model.db();
+    let parsed = parsed_module(db, model.program_file().python_file(db)).load(db);
+    let mut visitor = SemanticTokenVisitor::new(model, range);
+    visitor.expecting_docstring = true;
+    visitor.visit_body(parsed.suite());
 
     SemanticTokens::new(visitor.tokens)
 }
@@ -825,6 +841,12 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
     }
 
     fn visit_stmt(&mut self, stmt: &Stmt) {
+        if ty_python_core::semantic_index(self.model.db(), self.model.program_file())
+            .is_excluded(stmt.range())
+        {
+            return;
+        }
+
         let expecting_docstring = self.expecting_docstring;
         self.expecting_docstring = false;
         match stmt {
@@ -1404,6 +1426,45 @@ mod tests {
         let tokens = test.highlight_file();
 
         assert_snapshot!(test.to_snapshot(&tokens), @r#""foo" @ 4..7: Function [definition]"#);
+    }
+
+    #[test]
+    fn model_tokens_leave_embedded_languages_to_the_caller() {
+        let test = SemanticTokenTest::new(
+            "# /// script\n# dependencies = [\"httpx\"]\n# ///\ndef foo(): pass\n",
+        );
+        let file = ProgramFile::new(
+            &test.db,
+            test.file,
+            test.db.program_environment().program(&test.db),
+        );
+        let model = SemanticModel::new(&test.db, file);
+        let tokens = semantic_tokens_for_model(&model, None);
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].token_type, SemanticTokenType::Function);
+        assert_eq!(tokens[0].modifiers, SemanticTokenModifier::DEFINITION);
+        let source = ruff_db::source::source_text(&test.db, test.file);
+        assert_eq!(&source[tokens[0].range()], "foo");
+    }
+
+    #[test]
+    fn range_preserves_docstring_context_from_earlier_statements() {
+        for (source, modifiers) in [
+            ("print(1)\n\"ordinary\"\n", SemanticTokenModifier::empty()),
+            (
+                "value = 1\n\"documentation\"\n",
+                SemanticTokenModifier::DOCUMENTATION,
+            ),
+        ] {
+            let test = SemanticTokenTest::new(source);
+            let start = TextSize::try_from(source.find('"').unwrap()).unwrap();
+            let range = TextRange::new(start, source.text_len());
+            let tokens = test.highlight_range(range);
+            assert_eq!(tokens.len(), 1, "{source}");
+            assert_eq!(tokens[0].token_type, SemanticTokenType::String);
+            assert_eq!(tokens[0].modifiers, modifiers, "{source}");
+        }
     }
 
     #[test]
