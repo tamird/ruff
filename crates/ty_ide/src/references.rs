@@ -18,7 +18,7 @@ use ruff_db::parsed::parsed_module;
 use ruff_python_ast::find_node::CoveringNode;
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{
-    self as ast, AnyNodeRef,
+    self as ast, AnyNodeRef, HasNodeIndex, NodeIndex,
     name::Name,
     visitor::source_order::{SourceOrderVisitor, TraversalSignal},
 };
@@ -626,6 +626,9 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
 
         match node {
             AnyNodeRef::ExprName(name_expr) => {
+                if name_expr.ctx.is_store() {
+                    self.visit_provided_annotation(name_expr.node_index().load());
+                }
                 // If the name doesn't match our target text, this isn't a match
                 if name_expr.id.as_str() != self.search.target_text {
                     return TraversalSignal::Traverse;
@@ -641,12 +644,14 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
             }
             AnyNodeRef::StmtFunctionDef(func) => {
                 self.check_declaration_identifier(&func.name);
+                self.visit_provided_annotation(func.node_index().load());
             }
             AnyNodeRef::StmtClassDef(class) => {
                 self.check_declaration_identifier(&class.name);
             }
             AnyNodeRef::Parameter(parameter) => {
                 self.check_declaration_identifier(&parameter.name);
+                self.visit_provided_annotation(parameter.node_index().load());
             }
             AnyNodeRef::Keyword(keyword) => {
                 if let Some(arg) = &keyword.arg {
@@ -701,16 +706,7 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
                 // Highlight the sub-AST of a string annotation
                 if let Some((sub_ast, sub_model)) = self.model.enter_string_annotation(string_expr)
                 {
-                    let mut sub_finder = LocalReferencesFinder {
-                        model: &sub_model,
-                        search: self.search,
-                        references: self.references,
-                        mode: self.mode,
-                        tokens: sub_ast.tokens(),
-                        fixture_match_cache: FxHashMap::default(),
-                        ancestors: Vec::new(),
-                    };
-                    sub_finder.visit_expr(sub_ast.expr());
+                    self.visit_annotation(sub_ast.expr(), sub_ast.tokens(), &sub_model);
                 }
             }
             AnyNodeRef::Alias(alias) => {
@@ -761,6 +757,30 @@ impl<'a> SourceOrderVisitor<'a> for KeywordArgumentReferencesFinder<'a> {
 }
 
 impl<'a> LocalReferencesFinder<'a> {
+    fn visit_provided_annotation(&mut self, owner: NodeIndex) {
+        if let Some((parsed, model)) = self.model.enter_provided_annotation(owner) {
+            self.visit_annotation(parsed.expr(), parsed.tokens(), &model);
+        }
+    }
+
+    fn visit_annotation(
+        &mut self,
+        expression: &ast::Expr,
+        tokens: &Tokens,
+        model: &SemanticModel<'a>,
+    ) {
+        let mut finder = LocalReferencesFinder {
+            model,
+            search: self.search,
+            references: self.references,
+            mode: self.mode,
+            tokens,
+            fixture_match_cache: FxHashMap::default(),
+            ancestors: Vec::new(),
+        };
+        finder.visit_expr(expression);
+    }
+
     fn push_ancestor(&mut self, node: AnyNodeRef<'a>) -> TraversalSignal {
         // The visitor calls leave_node even for skipped subtrees.
         self.ancestors.push(node);
