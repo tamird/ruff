@@ -15,10 +15,9 @@ use ty_python_core::definition::{DefinitionKind, ProvidedBinding, ProvidedStatem
 use ty_python_core::{ProgramFileKind, ProvidedAnnotation, semantic_index};
 
 use super::*;
-use crate::ProgramEnvironment;
-use crate::SemanticModel;
 use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
 use crate::types::KnownClass;
+use crate::{HasType, ProgramEnvironment, SemanticModel};
 
 /// Pairs top-level functions by name and their ordinary parameters by position.
 /// Signature compatibility is the consumer's responsibility; this fixture exercises
@@ -150,6 +149,16 @@ fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Re
             .count();
         // Explicit return and reassignment errors identify the declaring stub.
         assert_eq!(foreign_annotations, if scalar == "str" { 2 } else { 0 });
+    }
+    let file = db.program_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let function = module.suite()[2].as_function_def_stmt().unwrap();
+    let model = SemanticModel::new(&db, file);
+    for owner in [
+        function.node_index().load(),
+        function.parameters.args[0].parameter.node_index().load(),
+    ] {
+        assert!(model.enter_provided_annotation(owner).is_none());
     }
     Ok(())
 }
@@ -878,6 +887,68 @@ fn function_annotation_hover_uses_the_owning_signature_scope() -> anyhow::Result
                 model.provided_annotation_type_at(owner, range.end()),
                 Some(KnownClass::List.to_specialized_instance(&db, &env, &[element])),
             );
+            let (parsed, annotation_model) = model.enter_provided_annotation(owner).unwrap();
+            assert_eq!(
+                parsed.expr().inferred_type(&annotation_model),
+                Some(KnownClass::List.to_specialized_instance(&db, &env, &[element])),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_annotation_names_use_the_declaration_scope() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            "class Item: pass\ndef identity(value): # (Item) -> Item\n    Item = str\n    return value\n",
+        )
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let class = module.suite()[0].as_class_def_stmt().unwrap();
+    let function = module.suite()[1].as_function_def_stmt().unwrap();
+    let expected = semantic_index(&db, file).expect_single_definition(class);
+    let model = SemanticModel::new(&db, file);
+    for owner in [
+        function.node_index().load(),
+        function.parameters.args[0].parameter.node_index().load(),
+    ] {
+        let (parsed, annotation_model) = model.enter_provided_annotation(owner).unwrap();
+        assert_eq!(
+            crate::definitions_for_name(
+                &annotation_model,
+                "Item",
+                parsed.expr().into(),
+                crate::ImportAliasResolution::PreserveAliases,
+            ),
+            [crate::ResolvedDefinition::Definition(expected)],
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_annotation_models_require_active_valid_ranges() -> anyhow::Result<()> {
+    for source in [
+        "def identity(value: str) -> str: # (int) -> int\n    return value\n",
+        "def identity(value): # ([) -> [\n    return value\n",
+    ] {
+        let db = TestDbBuilder::new()
+            .with_file("/src/main.py", source)
+            .with_source_provider(CommentedSource)
+            .build()?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let function = module.suite()[0].as_function_def_stmt().unwrap();
+        let model = SemanticModel::new(&db, file);
+        for owner in [
+            function.node_index().load(),
+            function.parameters.args[0].parameter.node_index().load(),
+        ] {
+            assert!(model.enter_provided_annotation(owner).is_none(), "{source}");
         }
     }
     Ok(())
@@ -923,6 +994,19 @@ fn nested_supplied_annotations_follow_source_edits() -> anyhow::Result<()> {
                     &env,
                     &[expected.to_instance(&db, &env)],
                 )),
+            );
+            let (parsed, annotation_model) = model.enter_provided_annotation(owner).unwrap();
+            let string = parsed
+                .expr()
+                .as_subscript_expr()
+                .unwrap()
+                .slice
+                .as_string_literal_expr()
+                .unwrap();
+            let (quoted, quoted_model) = annotation_model.enter_string_annotation(string).unwrap();
+            assert_eq!(
+                quoted.expr().inferred_type(&quoted_model),
+                Some(expected.to_instance(&db, &env)),
             );
         }
     }

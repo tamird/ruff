@@ -1,7 +1,7 @@
 use compact_str::CompactString;
 use ruff_db::PythonFile;
 use ruff_db::files::{File, FilePath};
-use ruff_db::parsed::{parsed_module, parsed_string_annotation};
+use ruff_db::parsed::{parsed_annotation_range, parsed_module, parsed_string_annotation};
 use ruff_db::source::{line_index, source_text};
 use ruff_python_ast::find_node::{CoveringNode, covering_node};
 use ruff_python_ast::{self as ast, ExprStringLiteral, ModExpression, NodeIndex};
@@ -38,14 +38,14 @@ use crate::types::{
     binding_type, infer_complete_scope_types, infer_definition_types, inferred_declaration,
     is_discarded_dict_key_assignment,
 };
-use crate::types::{SourceAnnotation, function_signature_annotation_info};
+use crate::types::{function_signature_annotation_info, function_signature_annotation_scope};
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::place::PlaceExpr;
 use ty_python_core::place_table;
 use ty_python_core::scope::{FileScopeId, Scope};
 use ty_python_core::semantic_index;
 use ty_python_core::symbol::Symbol;
-use ty_python_core::{BindingWithConstraintsIterator, Program, ProgramFile};
+use ty_python_core::{BindingWithConstraintsIterator, Program, ProgramFile, ProvidedAnnotation};
 
 /// The primary interface the LSP should use for querying semantic information about a [`File`].
 ///
@@ -158,36 +158,99 @@ impl<'db> SemanticModel<'db> {
         owner: NodeIndex,
         offset: TextSize,
     ) -> Option<Type<'db>> {
-        let module = parsed_module(self.db, self.python_file()).load(self.db);
-        let owner = module.get_by_index(owner);
-        let annotation = SourceAnnotation::new(self.db, self.file, owner, None)?;
-        let expression = annotation.expression()?;
+        let (parsed, definition) = self.provided_annotation(owner)?;
+        let expression = parsed.expr();
         let range = TextRange::empty(offset);
         if !expression.range().contains_range(range) {
             return None;
         }
         let node = covering_node(expression.into(), range);
         let expression = node.node().as_expr_ref()?;
+        if definition.kind(self.db).is_function_def() {
+            function_signature_annotation_info(self.db, definition, expression.into()).0
+        } else {
+            infer_definition_types(self.db, definition).try_expression_type(expression)
+        }
+    }
+
+    /// Enters an active, application-supplied annotation in this file.
+    ///
+    /// `owner` must be its canonical function, parameter, or assignment target.
+    /// Use the returned model to query the parsed annotation, including nested
+    /// quoted annotations. Native annotations take precedence; externally supplied
+    /// annotations are visited in their own source file.
+    pub fn enter_provided_annotation(
+        &self,
+        owner: NodeIndex,
+    ) -> Option<(Parsed<ModExpression>, Self)> {
+        let (parsed, definition) = self.provided_annotation(owner)?;
+        let scope = if definition.kind(self.db).is_function_def() {
+            function_signature_annotation_scope(self.db, definition)
+        } else {
+            definition.scope(self.db)
+        };
+        Some((
+            parsed,
+            Self {
+                db: self.db,
+                file: self.file,
+                annotation_scope: Some(scope.file_scope_id(self.db)),
+            },
+        ))
+    }
+
+    /// Parses a local annotation and selects the declaration that owns its inference.
+    fn provided_annotation(
+        &self,
+        owner: NodeIndex,
+    ) -> Option<(Parsed<ModExpression>, Definition<'db>)> {
+        if self.annotation_scope.is_some() {
+            return None;
+        }
+        let ProvidedAnnotation::Range(range) = self.db.provided_annotation(self.file, owner)?
+        else {
+            return None;
+        };
+        let module = parsed_module(self.db, self.python_file()).load(self.db);
+        let node = module.get_by_index(owner);
         let index = semantic_index(self.db, self.file);
-        let function = match owner {
+        if index.is_excluded(node.range()) {
+            return None;
+        }
+        let definition = match node {
             ast::AnyRootNodeRef::Stmt(statement) => {
                 let ast::Stmt::FunctionDef(function) = statement else {
                     return None;
                 };
+                if function.returns.is_some() {
+                    return None;
+                }
                 index.try_definition(function)?
             }
             ast::AnyRootNodeRef::Parameter(parameter) => {
+                if parameter.annotation.is_some() {
+                    return None;
+                }
                 let definition = index.try_definition(parameter)?;
                 let function = definition.scope(self.db).node(self.db).as_function()?;
                 index.try_definition(function.node(&module))?
             }
             ast::AnyRootNodeRef::Expr(owner) => {
-                let definition = index.try_definition(owner.as_name_expr()?)?;
-                return infer_definition_types(self.db, definition).try_expression_type(expression);
+                let name = owner.as_name_expr()?;
+                let definition = index.try_definition(name)?;
+                let DefinitionKind::Assignment(assignment) = definition.kind(self.db) else {
+                    return None;
+                };
+                if assignment.unpack().is_some() {
+                    return None;
+                }
+                definition
             }
             _ => return None,
         };
-        function_signature_annotation_info(self.db, function, expression.into()).0
+        let source = source_text(self.db, self.file());
+        let parsed = parsed_annotation_range(&source, range, owner).ok()?;
+        Some((parsed, definition))
     }
 
     pub fn file_path(&self) -> &FilePath {

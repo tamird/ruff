@@ -55,7 +55,7 @@ use ruff_db::files::FileRange;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::{self as ast, name::Name};
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
-use ty_python_core::scope::{NodeWithScopeKey, NodeWithScopeKind};
+use ty_python_core::scope::{NodeWithScopeKey, NodeWithScopeKind, ScopeId};
 
 /// Selects which binding context to use for type variables that only appear in a return-position
 /// `Callable`.
@@ -77,19 +77,9 @@ pub(crate) fn function_signature_annotation_info<'db>(
     definition: Definition<'db>,
     expression: ty_python_core::ExpressionNodeKey,
 ) -> (Option<Type<'db>>, TypeExpressionFlags) {
-    let DefinitionKind::Function(function) = definition.kind(db) else {
-        unreachable!("signature annotations belong to a function");
-    };
-    let file = definition.program_file(db);
-    let index = semantic_index(db, file);
-    let body = index.node_scope_by_key(NodeWithScopeKey::Function(function.node_key()));
-    if let Some(parent) = index.scope(body).parent()
-        && matches!(
-            index.scope(parent).node(),
-            NodeWithScopeKind::FunctionTypeParameters(_)
-        )
-    {
-        let inference = infer_complete_scope_types(db, parent.to_scope_id(db, file));
+    let scope = function_signature_annotation_scope(db, definition);
+    if matches!(scope.node(db), NodeWithScopeKind::FunctionTypeParameters(_)) {
+        let inference = infer_complete_scope_types(db, scope);
         (
             inference.try_expression_type(expression),
             inference.type_expression_flags(expression),
@@ -101,6 +91,24 @@ pub(crate) fn function_signature_annotation_info<'db>(
             inference.type_expression_flags(expression),
         )
     }
+}
+
+/// Returns the scope where a function's parameter and return annotations are evaluated.
+pub(crate) fn function_signature_annotation_scope<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> ScopeId<'db> {
+    let DefinitionKind::Function(function) = definition.kind(db) else {
+        unreachable!("signature annotations belong to a function");
+    };
+    let file = definition.program_file(db);
+    let index = semantic_index(db, file);
+    let body = index.node_scope_by_key(NodeWithScopeKey::Function(function.node_key()));
+    index
+        .scope(body)
+        .parent()
+        .expect("function body has an enclosing scope")
+        .to_scope_id(db, file)
 }
 
 /// The signature of a single callable. If the callable is overloaded, there is a separate
