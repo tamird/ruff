@@ -764,11 +764,10 @@ impl<'db> OverloadLiteral<'db> {
         let span = Span::from(file);
         let module = parsed_module(db, self.python_file(db)).load(db);
         let func_def = self.node(db, file, &module);
-        let return_annotation = crate::types::string_annotation::SourceAnnotation::new(
+        let return_annotation = crate::types::string_annotation::SourceAnnotation::function_return(
             db,
             self.program_file(db),
             func_def,
-            func_def.returns.as_deref(),
         );
         let return_type_source = return_annotation.map(|annotation| annotation.source(file));
         let mut signature = func_def.name.range.cover(func_def.parameters.range);

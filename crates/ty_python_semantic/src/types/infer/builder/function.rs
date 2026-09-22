@@ -58,10 +58,7 @@ fn function_has_deferred_annotations(
     function: &ast::StmtFunctionDef,
 ) -> bool {
     function.type_params.is_none()
-        && (function.returns.is_some()
-            || db
-                .provided_annotation(file, function.node_index().load())
-                .is_some()
+        && (SourceAnnotation::function_return(db, file, function).is_some()
             || function.parameters.iter().any(|param| {
                 param.annotation().is_some()
                     || db
@@ -235,12 +232,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         self.infer_body(&function.body);
 
-        if let Some(returns) = SourceAnnotation::new(
-            db,
-            self.program_file(),
-            function,
-            function.returns.as_deref(),
-        ) {
+        if let Some(returns) = SourceAnnotation::function_return(db, self.program_file(), function)
+        {
             let has_empty_body = self.return_types_and_ranges.is_empty()
                 && function_body_kind(db, env, self.index, function, |expr| {
                     self.expression_type(expr)
@@ -575,10 +568,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             function_decorators,
             None,
             dataclass_transformer_params,
-            function.returns.is_some()
-                || db
-                    .provided_annotation(self.program_file(), function.node_index().load())
-                    .is_some(),
+            SourceAnnotation::function_return(db, self.program_file(), function).is_some(),
         );
         let function_literal = FunctionLiteral::new(db, overload_literal);
         let function_type = FunctionType::new(db, function_literal, None);
@@ -871,12 +861,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn infer_return_type_annotation(&mut self, function: &ast::StmtFunctionDef) {
-        if let Some(returns) = SourceAnnotation::new(
-            self.db(),
-            self.program_file(),
-            function,
-            function.returns.as_deref(),
-        ) {
+        if let Some(returns) =
+            SourceAnnotation::function_return(self.db(), self.program_file(), function)
+        {
             self.context.inference_flags |= InferenceFlags::IN_RETURN_TYPE;
             self.infer_function_annotation(&returns);
             self.context

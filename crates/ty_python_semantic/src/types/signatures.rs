@@ -889,14 +889,10 @@ impl<'db> Signature<'db> {
             function_node.parameters.as_ref(),
             has_implicitly_positional_first_parameter,
         );
-        let return_ty = SourceAnnotation::new(
-            db,
-            definition.program_file(db),
-            function_node,
-            function_node.returns.as_deref(),
-        )
-        .map(|annotation| annotation.inferred_type(db, definition))
-        .unwrap_or_else(Type::unknown);
+        let return_ty =
+            SourceAnnotation::function_return(db, definition.program_file(db), function_node)
+                .map(|annotation| annotation.inferred_type(db, definition))
+                .unwrap_or_else(Type::unknown);
         let legacy_generic_context =
             GenericContext::from_function_params(db, definition, &parameters, return_ty);
         let full_generic_context = GenericContext::merge_pep695_and_legacy(

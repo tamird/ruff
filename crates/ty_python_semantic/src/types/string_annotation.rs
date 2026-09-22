@@ -12,6 +12,7 @@ use ty_python_core::{ExpressionNodeKey, ProgramFile, ProvidedAnnotation, semanti
 use crate::Db;
 use crate::declare_lint;
 use crate::lint::{Level, LintStatus};
+use crate::provided::ProvidedReturnType;
 use crate::types::Type;
 use crate::types::diagnostic::INVALID_TYPE_FORM;
 use crate::types::diagnostic::autofix_with_literal;
@@ -69,9 +70,27 @@ pub(crate) enum SourceAnnotation<'a, 'db> {
         /// The local declaration is the diagnostic location for invalid annotation use.
         range: TextRange,
     },
+    Provided {
+        annotation: ProvidedReturnType<'db>,
+        range: TextRange,
+    },
 }
 
 impl<'a, 'db> SourceAnnotation<'a, 'db> {
+    pub(crate) fn function_return(
+        db: &'db dyn Db,
+        file: ProgramFile<'db>,
+        function: &'a ast::StmtFunctionDef,
+    ) -> Option<Self> {
+        Self::new(db, file, function, function.returns.as_deref()).or_else(|| {
+            let definition = semantic_index(db, file).try_definition(function)?;
+            Some(Self::Provided {
+                annotation: db.provided_return_type(definition)?,
+                range: function.name.range,
+            })
+        })
+    }
+
     pub(crate) fn new(
         db: &'db dyn Db,
         file: ProgramFile<'db>,
@@ -127,6 +146,10 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
                 annotation: _,
                 range: _,
             } => None,
+            Self::Provided {
+                annotation: _,
+                range: _,
+            } => None,
         }
     }
 
@@ -136,6 +159,9 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
                 annotation,
                 range: _,
             } => annotation.source,
+            Self::Provided { annotation, range } => annotation
+                .source
+                .unwrap_or_else(|| FileRange::new(file, *range)),
             Self::Native(_)
             | Self::Detached {
                 owner: _,
@@ -151,6 +177,10 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
                 annotation,
                 range: _,
             } => Some(annotation.inferred(db).0),
+            Self::Provided {
+                annotation,
+                range: _,
+            } => Some(annotation.ty),
             Self::Native(_)
             | Self::Detached {
                 owner: _,
@@ -166,6 +196,10 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
                 annotation,
                 range: _,
             } => annotation.starred,
+            Self::Provided {
+                annotation: _,
+                range: _,
+            } => false,
             Self::Native(_)
             | Self::Detached {
                 owner: _,
@@ -191,6 +225,13 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         {
             return annotation.inferred(db);
         }
+        if let Self::Provided {
+            annotation,
+            range: _,
+        } = self
+        {
+            return (annotation.ty, TypeExpressionFlags::empty());
+        }
         let Some(expression) = self.expression() else {
             return (Type::unknown(), TypeExpressionFlags::empty());
         };
@@ -209,6 +250,10 @@ impl Ranged for SourceAnnotation<'_, '_> {
                 parsed: _,
             } => *range,
             Self::External {
+                annotation: _,
+                range,
+            } => *range,
+            Self::Provided {
                 annotation: _,
                 range,
             } => *range,

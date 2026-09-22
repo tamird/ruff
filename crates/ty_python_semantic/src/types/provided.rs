@@ -20,6 +20,14 @@ use crate::types::class::{DynamicClassAnchor, DynamicClassLiteral, DynamicClassS
 mod data;
 pub use data::ProvidedData;
 
+/// A return contract supplied by an embedding application.
+#[derive(Clone, Copy, Debug)]
+pub struct ProvidedReturnType<'db> {
+    pub ty: Type<'db>,
+    /// The contract's declaration, used in secondary diagnostic annotations.
+    pub source: Option<FileRange>,
+}
+
 /// Instance storage supplied by a class factory. Callable values here do not bind as methods.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, get_size2::GetSize, salsa::SalsaValue, Default)]
 pub struct ProvidedInstanceFields<'db> {

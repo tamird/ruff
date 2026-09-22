@@ -81,6 +81,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 annotation: _,
                 range: _,
             } => return None,
+            SourceAnnotation::Provided {
+                annotation: _,
+                range: _,
+            } => return None,
         };
         Some((expression, state))
     }
