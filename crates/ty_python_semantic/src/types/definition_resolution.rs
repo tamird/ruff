@@ -405,6 +405,7 @@ pub(crate) fn definitions_for_attribute<'db>(
 
         let class_literal = match lookup_type {
             Type::ClassLiteral(class_literal) => class_literal,
+            Type::GenericAlias(alias) => ClassLiteral::Static(alias.origin(db)),
             Type::SubclassOf(subclass) => {
                 let Some(class_literal) = subclass_origin(subclass.subclass_of()) else {
                     continue;
@@ -436,6 +437,7 @@ pub(crate) fn definitions_for_attribute<'db>(
         if !found && meta_type != lookup_type {
             let class_literal = match meta_type {
                 Type::ClassLiteral(class_literal) => class_literal,
+                Type::GenericAlias(alias) => ClassLiteral::Static(alias.origin(db)),
                 Type::SubclassOf(subclass) => {
                     let Some(class_literal) = subclass_origin(subclass.subclass_of()) else {
                         continue;
@@ -959,6 +961,7 @@ mod tests {
     use ruff_db::testing::assert_function_query_was_not_run_by_name;
 
     use super::*;
+    use crate::HasType;
     use crate::db::tests::TestDbBuilder;
     use crate::provided::{ProvidedClass, ProvidedField, ProvidedInstanceFields};
     use ruff_python_ast::name::Name;
@@ -1012,6 +1015,66 @@ mod tests {
 
         let events = db.take_salsa_events();
         assert_function_query_was_not_run_by_name(&db, "infer_scope_types_impl", None, &events);
+        Ok(())
+    }
+
+    #[test]
+    fn final_generic_members_have_definitions() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new()
+            .with_file(
+                "/src/main.py",
+                r#"
+from typing import final
+
+@final
+class Container[T]:
+    def method(self) -> None:
+        """Describe the operation."""
+
+Container[int]().method
+Container[int].method
+
+class Meta[T](type):
+    def meta_method(cls) -> None:
+        """Describe the operation."""
+
+class WithMeta(metaclass=Meta[str]):
+    pass
+
+WithMeta.meta_method
+"#,
+            )
+            .build()?;
+        let source = system_path_to_file(&db, "/src/main.py")?;
+        let file = db.program_file(source);
+        let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
+        let model = crate::SemanticModel::new(&db, file);
+        let environment = model.program_environment();
+        let mut expressions = 0;
+        for statement in parsed.suite() {
+            let ast::Stmt::Expr(statement) = statement else {
+                continue;
+            };
+            let ast::Expr::Attribute(attribute) = statement.value.as_ref() else {
+                anyhow::bail!("expected a member access");
+            };
+            let receiver = attribute
+                .value
+                .inferred_type(&model)
+                .context("receiver type")?;
+            let name = attribute.attr.as_str();
+            let definitions = definitions_for_attribute(&db, &environment, receiver, name);
+            let [ResolvedDefinition::Definition(definition)] = definitions.as_slice() else {
+                anyhow::bail!("expected one method definition for {name}: {definitions:?}");
+            };
+            assert_eq!(definition.name(&db).as_deref(), Some(name));
+            assert_eq!(
+                definition.docstring(&db).as_deref(),
+                Some("Describe the operation.")
+            );
+            expressions += 1;
+        }
+        assert_eq!(expressions, 3);
         Ok(())
     }
 
