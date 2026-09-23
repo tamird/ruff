@@ -45,21 +45,21 @@ pub(crate) struct CallArguments<'a, 'db> {
 struct CallArgument<'a, 'db> {
     argument: Argument<'a>,
     types: CallArgumentTypes<'db>,
-    literal_unpacking: Option<LiteralUnpacking<'db>>,
+    known_unpacking: Option<KnownUnpacking<'db>>,
 }
 
-/// The exact contents of a collection constructed directly in an unpacked argument.
+/// The exact contents of an unpacked argument.
 ///
 /// These values supplement the container type: `list[int | str]` alone cannot retain the
-/// argument count or associate each element with its parameter. Names and other expressions
-/// keep their ordinary type-based unpacking, since their contents may have changed.
+/// argument count or associate each element with its parameter. Dictionary observations qualify
+/// only when their complete key set is known.
 #[derive(Clone, Debug)]
-pub(super) enum LiteralUnpacking<'db> {
+pub(super) enum KnownUnpacking<'db> {
     Positional(Box<[Type<'db>]>),
     Keywords(Box<[(Name, Type<'db>)]>),
 }
 
-impl<'db> LiteralUnpacking<'db> {
+impl<'db> KnownUnpacking<'db> {
     fn positional(
         expression: &ast::Expr,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
@@ -93,12 +93,10 @@ impl<'db> LiteralUnpacking<'db> {
         Some(Self::Positional(types))
     }
 
-    fn keywords(
-        db: &'db dyn Db,
-        expression: &ast::Expr,
-        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
-    ) -> Option<Self> {
-        let dictionary = DictionaryItems::literal(db, expression, expression_type)?;
+    fn keywords(dictionary: DictionaryItems<'db>) -> Option<Self> {
+        if !dictionary.is_complete {
+            return None;
+        }
         Some(Self::Keywords(
             dictionary
                 .items
@@ -217,7 +215,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
             call_arguments.items.push(CallArgument {
                 argument,
                 types: CallArgumentTypes::new(ty),
-                literal_unpacking: None,
+                known_unpacking: None,
             });
         }
 
@@ -257,26 +255,27 @@ impl<'a, 'db> CallArguments<'a, 'db> {
             .collect()
     }
 
-    /// Retain immediate literal contents after the argument expressions have been inferred.
+    /// Retain exact contents after the argument expressions have been inferred.
     ///
-    /// The callback reads existing child expression types; it must not infer expressions again.
+    /// The callbacks read existing types and dictionary observations; they must not infer
+    /// argument expressions again.
     #[must_use]
-    pub(crate) fn with_literal_unpacking(
+    pub(crate) fn with_known_unpacking(
         mut self,
-        db: &'db dyn Db,
         arguments: &ast::Arguments,
         mut expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+        mut dictionary_items: impl FnMut(&ast::Expr) -> Option<DictionaryItems<'db>>,
     ) -> Self {
         let Self { items } = &mut self;
         for (item, argument) in items.iter_mut().zip(arguments.iter_source_order()) {
-            item.literal_unpacking = match argument {
+            item.known_unpacking = match argument {
                 ast::ArgOrKeyword::Arg(expression) => match expression {
                     ast::Expr::Starred(ast::ExprStarred {
                         node_index: _,
                         range: _,
                         value,
                         ctx: _,
-                    }) => LiteralUnpacking::positional(value, &mut expression_type),
+                    }) => KnownUnpacking::positional(value, &mut expression_type),
                     _ => None,
                 },
                 ast::ArgOrKeyword::Keyword(ast::Keyword {
@@ -286,21 +285,21 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                     value,
                 }) => match arg {
                     Some(_) => None,
-                    None => LiteralUnpacking::keywords(db, value, &mut expression_type),
+                    None => dictionary_items(value).and_then(KnownUnpacking::keywords),
                 },
             };
         }
         self
     }
 
-    pub(super) fn literal_unpacking(&self, index: usize) -> Option<&LiteralUnpacking<'db>> {
+    pub(super) fn known_unpacking(&self, index: usize) -> Option<&KnownUnpacking<'db>> {
         let Self { items } = self;
         let CallArgument {
             argument: _,
             types: _,
-            literal_unpacking,
+            known_unpacking,
         } = items.get(index)?;
-        literal_unpacking.as_ref()
+        known_unpacking.as_ref()
     }
 
     /// Create a [`CallArguments`] with no arguments.
@@ -371,7 +370,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
             items.push(CallArgument {
                 argument: Argument::Synthetic,
                 types: CallArgumentTypes::new(bound_self),
-                literal_unpacking: None,
+                known_unpacking: None,
             });
             items.extend(self.items.iter().cloned());
             Cow::Owned(CallArguments { items })
@@ -636,10 +635,10 @@ impl<'a, 'db> CallArgumentExpansions<'_, 'a, 'db> {
                         // Tuple expansion narrows the element types. Dictionary keys are not
                         // represented in their container type and must remain available.
                         if matches!(
-                            expanded_argument.items[index].literal_unpacking,
-                            Some(LiteralUnpacking::Positional(_))
+                            expanded_argument.items[index].known_unpacking,
+                            Some(KnownUnpacking::Positional(_))
                         ) {
-                            expanded_argument.items[index].literal_unpacking = None;
+                            expanded_argument.items[index].known_unpacking = None;
                         }
                         expanded_arguments.push(expanded_argument);
                     }
@@ -691,7 +690,7 @@ impl<'a, 'db> FromIterator<(Argument<'a>, Option<Type<'db>>)> for CallArguments<
             items.push(CallArgument {
                 argument,
                 types: CallArgumentTypes::new(ty),
-                literal_unpacking: None,
+                known_unpacking: None,
             });
         }
 

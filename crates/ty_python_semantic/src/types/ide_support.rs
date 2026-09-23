@@ -1161,9 +1161,11 @@ pub fn call_signature_details<'db>(
                     .inferred_type(model)
                     .unwrap_or(Type::unknown())
             })
-            .with_literal_unpacking(db, &call_expr.arguments, |expression| {
-                expression.inferred_type(model)
-            });
+            .with_known_unpacking(
+                &call_expr.arguments,
+                |expression| expression.inferred_type(model),
+                |expression| model.dictionary_items(expression),
+            );
         let mut bindings =
             callable_type
                 .bindings(db, env)
@@ -1242,9 +1244,11 @@ fn resolve_single_overload<'db>(
             .inferred_type(model)
             .unwrap_or(Type::unknown())
     })
-    .with_literal_unpacking(db, &call_expr.arguments, |expression| {
-        expression.inferred_type(model)
-    });
+    .with_known_unpacking(
+        &call_expr.arguments,
+        |expression| expression.inferred_type(model),
+        |expression| model.dictionary_items(expression),
+    );
 
     let constraints = ConstraintSetBuilder::new();
     let mut resolved: Vec<_> = bindings
@@ -1292,9 +1296,11 @@ fn full_type_bindings_for_call<'db>(
                 .inferred_type(model)
                 .unwrap_or(Type::unknown())
         })
-        .with_literal_unpacking(db, &call_expr.arguments, |expression| {
-            expression.inferred_type(model)
-        });
+        .with_known_unpacking(
+            &call_expr.arguments,
+            |expression| expression.inferred_type(model),
+            |expression| model.dictionary_items(expression),
+        );
     let constraints = ConstraintSetBuilder::new();
 
     func_type
@@ -1637,9 +1643,11 @@ pub fn resolved_call_signature<'db>(
             .inferred_type(model)
             .unwrap_or(Type::unknown())
     })
-    .with_literal_unpacking(db, &call_expr.arguments, |expression| {
-        expression.inferred_type(model)
-    });
+    .with_known_unpacking(
+        &call_expr.arguments,
+        |expression| expression.inferred_type(model),
+        |expression| model.dictionary_items(expression),
+    );
 
     // Extract the `Bindings` regardless of whether type checking succeeded or failed.
     let constraints = ConstraintSetBuilder::new();

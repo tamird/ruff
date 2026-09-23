@@ -1330,6 +1330,51 @@ mod tests {
     }
 
     #[test]
+    fn keyword_unpacking_uses() {
+        for (body, expected) in [
+            ("values = {}\nf(**values)\nf(**values)", true),
+            ("values = {}\nf(values)\nf(**values)", false),
+            ("values = {}\nf(**values)\nalias = values", false),
+            ("values = {}\nvalues['x'] = 1\nf(**values)", false),
+            ("values = {}\nvalues.clear()\nf(**values)", false),
+            ("values = {}\nf(**(alias := values))", false),
+            ("values = {}\nf(**(values if flag else {}))", false),
+            ("values = {}\nf(**values)\ndel values", false),
+            ("values = {}\ndef nested():\n    f(**values)", false),
+            (
+                "def nested():\n    f(**values)\nvalues = {}\nf(**values)",
+                false,
+            ),
+            ("values = {}\nitems = [f(**values) for _ in xs]", false),
+            (
+                "values = {}\ntry:\n    f(**values)\nfinally:\n    save(values)",
+                false,
+            ),
+            (
+                "while flag:\n    save(values)\n    values = {}\n    f(**values)",
+                false,
+            ),
+        ] {
+            let source = format!("def outer():\n    {}\n", body.replace('\n', "\n    "));
+            let TestCase { db, file } = test_case(&source);
+            let index = semantic_index(&db, program_file(&db, file));
+            let scope = index
+                .scope_ids()
+                .find(|scope| scope.scope(&db).kind() == ScopeKind::Function)
+                .unwrap();
+            let table = index.place_table(scope.file_scope_id(&db));
+            assert_eq!(
+                table
+                    .symbol_by_name("values")
+                    .unwrap()
+                    .is_used_only_for_keyword_unpacking(),
+                expected,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
     fn import() {
         let TestCase { db, file } = test_case("import foo");
         let scope = global_scope(&db, program_file(&db, file));

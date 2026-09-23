@@ -32,7 +32,7 @@ use crate::place::{DefinedPlace, Definedness, Place};
 use crate::subscript::PyIndex;
 use crate::types::ProgramEnvironment;
 use crate::types::call::arguments::{
-    CallArgumentExpansions, CallArgumentTypes, Expansion, LiteralUnpacking,
+    CallArgumentExpansions, CallArgumentTypes, Expansion, KnownUnpacking,
 };
 use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::{
@@ -4983,7 +4983,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             })
             .collect();
         for (index, _) in arguments.iter().enumerate() {
-            if let Some(LiteralUnpacking::Keywords(keywords)) = arguments.literal_unpacking(index) {
+            if let Some(KnownUnpacking::Keywords(keywords)) = arguments.known_unpacking(index) {
                 explicit_keyword_parameters.extend(keywords.iter().filter_map(|(name, _)| {
                     parameters.keyword_by_name(name).map(|(index, _)| index)
                 }));
@@ -5181,8 +5181,8 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             None,
         }
 
-        if let Some(LiteralUnpacking::Positional(types)) =
-            self.arguments.literal_unpacking(argument_index)
+        if let Some(KnownUnpacking::Positional(types)) =
+            self.arguments.known_unpacking(argument_index)
         {
             for ty in types {
                 self.match_positional(argument_index, argument, Some(*ty), false)?;
@@ -5413,8 +5413,8 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument_index: usize,
         argument_type: Option<Type<'db>>,
     ) {
-        if let Some(LiteralUnpacking::Keywords(keywords)) =
-            self.arguments.literal_unpacking(argument_index)
+        if let Some(KnownUnpacking::Keywords(keywords)) =
+            self.arguments.known_unpacking(argument_index)
         {
             for (name, ty) in keywords {
                 let _ = self.match_keyword(
@@ -6598,8 +6598,8 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             }
 
             if matches!(argument, Argument::Variadic) {
-                if let Some(LiteralUnpacking::Positional(_)) =
-                    self.arguments.literal_unpacking(argument_index)
+                if let Some(KnownUnpacking::Positional(_)) =
+                    self.arguments.known_unpacking(argument_index)
                 {
                     for matched in matches
                         .iter()
@@ -7289,9 +7289,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             None
         };
 
-        if let Some(LiteralUnpacking::Keywords(_)) =
-            self.arguments.literal_unpacking(argument_index)
-        {
+        if let Some(KnownUnpacking::Keywords(_)) = self.arguments.known_unpacking(argument_index) {
             self.check_variadic_argument_type(
                 constraints,
                 argument_index,

@@ -1,12 +1,13 @@
 use std::collections::hash_map::Entry;
 
+use itertools::Itertools;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::{Ranged, TextRange};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use ty_python_core::ProgramFile;
-use ty_python_core::definition::{Definition, DefinitionKind};
-use ty_python_core::scope::ScopeId;
+use ty_python_core::definition::{BindingsOwner, Definition, DefinitionKind};
+use ty_python_core::scope::{ScopeId, ScopeKind};
 use ty_python_core::semantic_index;
 
 use super::arguments::CallArgumentTypes;
@@ -15,6 +16,7 @@ use crate::Db;
 use crate::place::{DefinedPlace, Definedness, Place, place_from_bindings_with_reachability_cache};
 use crate::reachability::ReachabilityEvaluationCache;
 use crate::types::class::DynamicClassAnchor;
+use crate::types::infer::infer_definition_types;
 use crate::types::{KnownClass, ProgramEnvironment, Type};
 
 /// A known string key and its observed value in a dictionary argument.
@@ -28,11 +30,11 @@ pub struct DictionaryItem<'db> {
 /// Dictionary entries available at a call argument.
 pub struct DictionaryItems<'db> {
     pub items: Box<[DictionaryItem<'db>]>,
-    /// True for an immediate literal whose entire string-key set is known.
+    /// Whether these entries describe the entire string-key set.
     ///
-    /// Otherwise, these are flow observations: additional keys and unmodeled mutations
-    /// can change the dictionary. They support narrowing and discovery of likely names,
-    /// but cannot establish required keys or reject calls based on their value types.
+    /// Immediate literals and fresh local dictionaries used exclusively through keyword
+    /// unpacking can be complete. Other observations narrow known values while preserving
+    /// the dictionary's ordinary value type for additional keys.
     pub is_complete: bool,
 }
 
@@ -108,10 +110,88 @@ impl<'db> DictionaryItems<'db> {
             }
         }
 
+        let is_complete =
+            Self::complete_initializer_keys(db, scope, expression).is_some_and(|keys| {
+                keys.len() == elements.len()
+                    && elements.iter().all(|element| keys.contains(&element.name))
+            });
         Some(DictionaryItems {
             items: elements.into_boxed_slice(),
-            is_complete: false,
+            is_complete,
         })
+    }
+
+    /// Recover a fresh allocation only when no source-level use can expose or mutate it.
+    ///
+    /// The usage check covers the whole symbol, including other bindings and nested captures.
+    /// This deliberately gives up precision after harmless reads, but also catches loop-carried
+    /// aliases without an alias or heap-effect analysis.
+    fn complete_initializer_keys(
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        expression: &ast::Expr,
+    ) -> Option<FxHashSet<Name>> {
+        if scope.scope(db).kind() != ScopeKind::Function {
+            return None;
+        }
+        let name = expression.as_name_expr()?;
+        let file = scope.program_file(db);
+        let index = semantic_index(db, file);
+        let symbol = index
+            .place_table(scope.file_scope_id(db))
+            .symbol_by_name(&name.id)?;
+        if !symbol.is_local()
+            || symbol.is_declared()
+            || !symbol.is_used_only_for_keyword_unpacking()
+        {
+            return None;
+        }
+        let use_id = index.try_expression_use_id(expression.into())?;
+        let binding = index
+            .use_def_map(scope.file_scope_id(db))
+            .bindings_at_use(use_id)
+            .exactly_one()
+            .ok()?;
+        let definition = binding.binding.definition()?;
+        let DefinitionKind::Assignment(assignment) = definition.kind(db) else {
+            return None;
+        };
+        // In particular, `alias = values = {}` does not allocate an unaliased dictionary.
+        if assignment.owner() != BindingsOwner::Definition {
+            return None;
+        }
+        let inference = infer_definition_types(db, definition);
+        if inference.discards_dict_key_assignments() {
+            return None;
+        }
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        match assignment.value(&module) {
+            ast::Expr::Dict(dictionary) => dictionary
+                .items
+                .iter()
+                .map(|item| {
+                    let key = item.key.as_ref()?.as_string_literal_expr()?;
+                    Some(Name::new(key.value.to_str()))
+                })
+                .collect(),
+            ast::Expr::Call(call) => {
+                if !call.arguments.args.is_empty() {
+                    return None;
+                }
+                let Type::ClassLiteral(class) = inference.expression_type(&*call.func) else {
+                    return None;
+                };
+                if !class.is_known(db, KnownClass::Dict) {
+                    return None;
+                }
+                call.arguments
+                    .keywords
+                    .iter()
+                    .map(|keyword| Some(keyword.arg.as_ref()?.id.clone()))
+                    .collect()
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn literal(
