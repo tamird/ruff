@@ -5208,14 +5208,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn infer_dict_key_assignment_definition(
         &mut self,
-        key: &'ast ast::Expr,
+        key: AnyNodeRef<'ast>,
         value: &'ast ast::Expr,
         assignment: Definition<'db>,
         definition: Definition<'db>,
     ) {
         let value_ty = infer_definition_types(self.db(), assignment).expression_type(value);
-        self.add_binding(key.into(), definition)
-            .insert(self, value_ty);
+        self.add_binding(key, definition).insert(self, value_ty);
     }
 
     fn infer_type_alias_statement(&mut self, node: &ast::StmtTypeAlias) {

@@ -32,9 +32,9 @@ use crate::ast_node_ref::AstNodeRef;
 use crate::definition::{
     AnnotatedAssignmentDefinitionNodeRef, AssignmentDefinitionNodeRef, BindingsOwner,
     ComprehensionDefinitionNodeRef, Definition, DefinitionCategory, DefinitionKind,
-    DefinitionNodeKey, DefinitionNodeRef, Definitions, DictKeyAssignmentNodeRef,
-    ExceptHandlerDefinitionNodeRef, ForStmtDefinitionNodeRef, ImportDefinitionNodeRef,
-    ImportFromDefinitionNodeRef, ImportFromSubmoduleDefinitionNodeRef,
+    DefinitionNodeKey, DefinitionNodeRef, Definitions, DictKeyAssignmentKeyRef,
+    DictKeyAssignmentNodeRef, ExceptHandlerDefinitionNodeRef, ForStmtDefinitionNodeRef,
+    ImportDefinitionNodeRef, ImportFromDefinitionNodeRef, ImportFromSubmoduleDefinitionNodeRef,
     LambdaParameterDefinitionNodeRef, LoopHeaderDefinitionNodeRef, LoopStmtRef,
     MatchPatternDefinitionNodeRef, NestedBindingExecution, NestedBindingsDefinitionKind,
     ParameterDefinitionNodeRef, ProvidedBinding, ProvidedBindingDefinitionKind, ProvidedStatement,
@@ -1847,6 +1847,40 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         expr: ast::ExprRef<'ast>,
         assignment: Definition<'db>,
     ) {
+        if let ast::ExprRef::Call(call) = expr {
+            // Only index likely dictionary constructors; inference verifies the callee's identity.
+            if call
+                .func
+                .as_name_expr()
+                .is_some_and(|name| name.id == "dict")
+                && call.arguments.args.is_empty()
+                && call
+                    .arguments
+                    .keywords
+                    .iter()
+                    .all(|keyword| keyword.arg.is_some())
+            {
+                for keyword in &call.arguments.keywords {
+                    let Some(name) = &keyword.arg else {
+                        continue;
+                    };
+                    let member = target.with_string_subscript(name.as_str());
+                    if let Some(place) = PlaceExpr::try_from_member_expr(member) {
+                        let place = self.add_place(place);
+                        self.add_definition(
+                            place,
+                            DictKeyAssignmentNodeRef {
+                                key: DictKeyAssignmentKeyRef::Keyword { name, call },
+                                value: &keyword.value,
+                                assignment,
+                            },
+                        );
+                    }
+                }
+            }
+            return;
+        }
+
         let ruff_python_ast::ExprRef::Dict(dict) = expr else {
             let items = match expr {
                 ruff_python_ast::ExprRef::List(list) => &list.elts,
@@ -1900,7 +1934,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 self.add_definition(
                     place_id,
                     DictKeyAssignmentNodeRef {
-                        key,
+                        key: DictKeyAssignmentKeyRef::Expression(key),
                         assignment,
                         value: &item.value,
                     },

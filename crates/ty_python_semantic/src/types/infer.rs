@@ -289,7 +289,19 @@ pub(crate) fn is_discarded_dict_key_assignment<'db>(
     };
 
     let assignment = dict_key_assignment.assignment();
-    infer_definition_types(db, assignment).discards_dict_key_assignments()
+    let inference = infer_definition_types(db, assignment);
+    if inference.discards_dict_key_assignments() {
+        return true;
+    }
+    let Some(constructor) = dict_key_assignment.constructor() else {
+        return false;
+    };
+    let module = parsed_module(db, assignment.program_file(db).python_file(db)).load(db);
+    let constructor = constructor.node(&module);
+    let Type::ClassLiteral(class) = inference.expression_type(&*constructor.func) else {
+        return true;
+    };
+    !class.is_known(db, KnownClass::Dict)
 }
 
 /// Infer decorator expression types for a function definition.

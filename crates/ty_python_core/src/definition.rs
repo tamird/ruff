@@ -575,9 +575,27 @@ pub(crate) struct AnnotatedAssignmentDefinitionNodeRef<'ast> {
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct DictKeyAssignmentNodeRef<'ast, 'db> {
-    pub(crate) key: &'ast ast::Expr,
+    pub(crate) key: DictKeyAssignmentKeyRef<'ast>,
     pub(crate) value: &'ast ast::Expr,
     pub(crate) assignment: Definition<'db>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum DictKeyAssignmentKeyRef<'ast> {
+    Expression(&'ast ast::Expr),
+    Keyword {
+        name: &'ast ast::Identifier,
+        call: &'ast ast::ExprCall,
+    },
+}
+
+impl<'ast> DictKeyAssignmentKeyRef<'ast> {
+    fn node(self) -> AnyNodeRef<'ast> {
+        match self {
+            Self::Expression(key) => key.into(),
+            Self::Keyword { name, call: _ } => name.into(),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -755,7 +773,17 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
                 value,
                 assignment,
             }) => DefinitionKind::DictKeyAssignment(DictKeyAssignmentKind {
-                key: AstNodeRef::new(parsed, key),
+                key: match key {
+                    DictKeyAssignmentKeyRef::Expression(key) => {
+                        DictKeyAssignmentKey::Expression(AstNodeRef::new(parsed, key))
+                    }
+                    DictKeyAssignmentKeyRef::Keyword { name, call } => {
+                        DictKeyAssignmentKey::Keyword {
+                            name: AstNodeRef::new(parsed, name),
+                            call: AstNodeRef::new(parsed, call),
+                        }
+                    }
+                },
                 value: AstNodeRef::new(parsed, value),
                 assignment,
             }),
@@ -888,7 +916,7 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
             }) => DefinitionNodeKey(NodeKey::from_node(target)),
             Self::AnnotatedAssignment(ann_assign) => ann_assign.node.into(),
             Self::AugmentedAssignment(node) => node.into(),
-            Self::DictKeyAssignment(node) => DefinitionNodeKey(NodeKey::from_node(node.key)),
+            Self::DictKeyAssignment(node) => DefinitionNodeKey(NodeKey::from_node(node.key.node())),
             Self::For(ForStmtDefinitionNodeRef {
                 target,
                 node: _,
@@ -1082,7 +1110,7 @@ impl<'db> DefinitionKind<'db> {
                 aug_assign.node(module).target.range()
             }
             DefinitionKind::DictKeyAssignment(dict_key_assignment) => {
-                dict_key_assignment.key.node(module).range()
+                dict_key_assignment.key(module).range()
             }
             DefinitionKind::For(for_stmt) => for_stmt.target(module).range(),
             DefinitionKind::Comprehension(comp) => comp.target(module).range(),
@@ -1144,7 +1172,7 @@ impl<'db> DefinitionKind<'db> {
             }
             DefinitionKind::AugmentedAssignment(aug_assign) => aug_assign.node(module).range(),
             DefinitionKind::DictKeyAssignment(dict_key_assignment) => {
-                dict_key_assignment.key.node(module).range()
+                dict_key_assignment.key(module).range()
             }
             DefinitionKind::For(for_stmt) => for_stmt.target(module).range(),
             DefinitionKind::Comprehension(comp) => comp.target(module).range(),
@@ -1604,14 +1632,24 @@ impl AnnotatedAssignmentDefinitionKind {
 
 #[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub struct DictKeyAssignmentKind<'db> {
-    key: AstNodeRef<ast::Expr>,
+    key: DictKeyAssignmentKey,
     value: AstNodeRef<ast::Expr>,
     assignment: Definition<'db>,
 }
 
 impl<'db> DictKeyAssignmentKind<'db> {
-    pub fn key<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::Expr {
-        self.key.node(module)
+    pub fn key<'ast>(&self, module: &'ast ParsedModuleRef) -> AnyNodeRef<'ast> {
+        match &self.key {
+            DictKeyAssignmentKey::Expression(key) => key.node(module).into(),
+            DictKeyAssignmentKey::Keyword { name, call: _ } => name.node(module).into(),
+        }
+    }
+
+    pub fn constructor(&self) -> Option<&AstNodeRef<ast::ExprCall>> {
+        match &self.key {
+            DictKeyAssignmentKey::Expression(_) => None,
+            DictKeyAssignmentKey::Keyword { name: _, call } => Some(call),
+        }
     }
 
     pub fn value<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::Expr {
@@ -1621,6 +1659,15 @@ impl<'db> DictKeyAssignmentKind<'db> {
     pub fn assignment(&self) -> Definition<'db> {
         self.assignment
     }
+}
+
+#[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
+enum DictKeyAssignmentKey {
+    Expression(AstNodeRef<ast::Expr>),
+    Keyword {
+        name: AstNodeRef<ast::Identifier>,
+        call: AstNodeRef<ast::ExprCall>,
+    },
 }
 
 #[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
