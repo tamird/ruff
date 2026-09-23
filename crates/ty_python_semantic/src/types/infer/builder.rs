@@ -8996,9 +8996,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 ty
             })
-            .with_literal_unpacking(db, arguments, |expression| {
-                self.try_expression_type(expression)
-            });
+            .with_known_unpacking(
+                arguments,
+                |expression| self.try_expression_type(expression),
+                |expression| {
+                    self.dictionary_items(expression, self.try_expression_type(expression)?)
+                },
+            );
 
         for arg in &arguments.args {
             if let ast::Expr::Starred(ast::ExprStarred { value, .. }) = arg {

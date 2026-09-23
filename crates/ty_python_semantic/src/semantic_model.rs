@@ -127,8 +127,8 @@ impl<'db> SemanticModel<'db> {
 
     /// Returns known string entries at an original call argument expression.
     ///
-    /// Immediate literals have a complete key set. Other indexed argument uses expose partial
-    /// flow observations; expressions outside those uses can have no observed entries.
+    /// Immediate literals and fresh locals used only for keyword unpacking have complete key
+    /// sets. Other indexed argument uses expose partial flow observations.
     pub fn dictionary_items(&self, expression: &Expr) -> Option<DictionaryItems<'db>> {
         if self.annotation_scope.is_some() {
             return None;
