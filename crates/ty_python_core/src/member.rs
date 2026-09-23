@@ -300,13 +300,22 @@ impl MemberExprBuilder {
         subscript_value: &MemberExprBuilder,
         subscript_slice: &ast::Expr,
     ) -> Option<MemberExprBuilder> {
-        let start_offset = subscript_value.path.text_len();
         let (kind, part) = Self::subscript_part(subscript_slice)?;
-        let path = CharStr::concat(&[subscript_value.path.as_str(), part.as_ref()]);
-        let mut segments = subscript_value.segments.clone();
+        Some(subscript_value.with_subscript(kind, part.as_ref()))
+    }
+
+    pub(super) fn with_string_subscript(&self, key: &str) -> Self {
+        self.with_subscript(SegmentKind::StringSubscript, key)
+    }
+
+    fn with_subscript(&self, kind: SegmentKind, key: &str) -> Self {
+        let Self { path, segments } = self;
+        let start_offset = path.text_len();
+        let path = CharStr::concat(&[path.as_str(), key]);
+        let mut segments = segments.clone();
         segments.push(SegmentInfo::new(kind, start_offset));
 
-        Some(MemberExprBuilder { path, segments })
+        Self { path, segments }
     }
 
     fn subscript_part(subscript_slice: &ast::Expr) -> Option<(SegmentKind, MemberPathPart<'_>)> {

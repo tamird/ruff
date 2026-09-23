@@ -63,16 +63,22 @@ impl<'db> DictionaryItems<'db> {
             let key = match definition.kind(db) {
                 DefinitionKind::DictKeyAssignment(assignment) => assignment.key(&module),
                 DefinitionKind::Assignment(assignment) => {
-                    &assignment.target(&module).as_subscript_expr()?.slice
+                    let subscript = assignment.target(&module).as_subscript_expr()?;
+                    subscript.slice.as_ref().into()
                 }
                 DefinitionKind::AnnotatedAssignment(assignment) => {
-                    &assignment.target(&module).as_subscript_expr()?.slice
+                    let subscript = assignment.target(&module).as_subscript_expr()?;
+                    subscript.slice.as_ref().into()
                 }
                 _ => return None,
             };
 
-            let literal = key.as_string_literal_expr()?;
-            Some((Name::new(literal.value.to_str()), key.range()))
+            let name = match key {
+                ast::AnyNodeRef::ExprStringLiteral(literal) => Name::new(literal.value.to_str()),
+                ast::AnyNodeRef::Identifier(identifier) => identifier.id.clone(),
+                _ => return None,
+            };
+            Some((name, key.range()))
         };
 
         // Collect the types of each distinct key.

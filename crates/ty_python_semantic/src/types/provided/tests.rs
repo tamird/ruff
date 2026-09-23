@@ -238,6 +238,10 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
             "partial; x: Literal[1] at 'x'",
         ),
         (
+            "values = dict(x=1, y='value')\nresult = observe(values)",
+            "partial; x: Literal[1] at x; y: Literal[\"value\"] at y",
+        ),
+        (
             "values = {'x': 1}\nvalues['x'] = 'new'\nresult = observe(value=values)",
             "partial; x: Literal[\"new\"] at 'x'",
         ),
