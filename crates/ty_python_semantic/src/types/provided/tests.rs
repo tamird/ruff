@@ -16,6 +16,161 @@ use crate::types::{
 };
 use crate::{HasType, SemanticModel};
 
+fn runtime_type_test<'db>(
+    db: &'db TestDb,
+    file: ProgramFile<'db>,
+    callable: Type<'db>,
+    compared_value: Type<'db>,
+) -> Option<Type<'db>> {
+    let Type::FunctionLiteral(function) = callable else {
+        return None;
+    };
+    let definition = function.definition(db);
+    let path = definition.program_file(db).file(db).path(db);
+    let path = path.as_system_path()?;
+    let name = definition.name(db)?;
+    if path.as_str() != "/src/native.pyi" || name.as_str() != "category" {
+        return None;
+    }
+    let class = match compared_value.string_literal_value(db)? {
+        "list" => KnownClass::List,
+        "str" => KnownClass::Str,
+        _ => return None,
+    };
+    Some(class.to_instance_unknown(db, &ProgramEnvironment::from_file(file)))
+}
+
+#[test]
+fn supplied_type_tests_share_flow_narrowing() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "\
+from collections.abc import Sequence
+from typing import Any
+def category(value: object, *args: object, **kwargs: object) -> str: ...
+def unknown(): ...
+value: list[int] | str
+sequence: Sequence[int]
+dynamic: Any
+tag: str
+",
+        )
+        .with_file("/src/main.py", "")
+        .with_type_test_provider(runtime_type_test)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (setup, condition, positive, negative) in [
+        ("", "category(value) == 'list'", "list[int]", "str"),
+        ("", "'list' == category(value)", "list[int]", "str"),
+        ("", "category(value) != 'list'", "str", "list[int]"),
+        ("", "'list' != category(value)", "str", "list[int]"),
+        ("", "not (category(value) != 'list')", "list[int]", "str"),
+        (
+            "",
+            "category(value) == 'list' or category(value) == 'str'",
+            "list[int] | str",
+            "Never",
+        ),
+        (
+            "",
+            "category(value) != 'str' and category(value) == 'list'",
+            "list[int]",
+            "str",
+        ),
+        (
+            "alias = category",
+            "alias(value) == 'list'",
+            "list[int]",
+            "str",
+        ),
+        (
+            "predicate = category(value) == 'list'",
+            "predicate",
+            "list[int]",
+            "str",
+        ),
+        (
+            "predicate = category(value) == 'list'\nvalue = tag",
+            "predicate",
+            "str",
+            "str",
+        ),
+        (
+            "value = sequence",
+            "category(value) == 'list'",
+            "list[int]",
+            "Sequence[int] & ~Top[list[Unknown]]",
+        ),
+        (
+            "value = dynamic",
+            "category(value) == 'list'",
+            "Any & list[Unknown]",
+            "Any & ~Top[list[Unknown]]",
+        ),
+        (
+            "value = unknown()",
+            "category(value) == 'list'",
+            "Unknown & list[Unknown]",
+            "Unknown & ~Top[list[Unknown]]",
+        ),
+        (
+            "def category(value: object) -> str:\n    return str(value)",
+            "category(value) == 'list'",
+            "list[int] | str",
+            "list[int] | str",
+        ),
+    ] {
+        let source = format!(
+            "from native import category, value, sequence, dynamic, unknown, tag\n{setup}\nif {condition}:\n    positive = value\nelse:\n    negative = value\n",
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let program_file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program_file);
+        for (name, expected) in [("positive", positive), ("negative", negative)] {
+            let actual = crate::place::global_symbol(&db, program_file, name)
+                .place
+                .expect_type();
+            assert_eq!(
+                actual.display(&db, &env).to_string(),
+                expected,
+                "{source}: {name}"
+            );
+        }
+    }
+    for condition in [
+        "category(value) == 'missing'",
+        "category(value) == tag",
+        "category(value=value) == 'list'",
+        "category(value, value) == 'list'",
+        "category(value, extra=value) == 'list'",
+        "category(value) is 'list'",
+        "category(value) < 'list'",
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!(
+                "from native import category, value, tag\nif {condition}:\n    result = value\n"
+            ),
+        )?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{condition}: {diagnostics:#?}");
+        let program_file = db.program_file(file);
+        let result = crate::place::global_symbol(&db, program_file, "result")
+            .place
+            .expect_type();
+        let env = ProgramEnvironment::from_file(program_file);
+        assert_eq!(
+            result.display(&db, &env).to_string(),
+            "list[int] | str",
+            "{condition}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
     fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {

@@ -4347,6 +4347,26 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 rhs_ty
             };
 
+            if matches!(op, ast::CmpOp::Eq | ast::CmpOp::NotEq) {
+                for (operand, compared_value) in [(left, rhs_ty), (right, lhs_ty)] {
+                    if let ast::Expr::Call(call) = operand.expression_value()
+                        && call.arguments.keywords.is_empty()
+                        && let [subject] = call.arguments.args.as_ref()
+                        && let Some(target) = PlaceExpr::try_from_expr(subject)
+                        && let Some(ty) = db.provided_type_test(
+                            self.scope().program_file(db),
+                            inference.expression_type(&*call.func),
+                            compared_value,
+                        )
+                    {
+                        let place = self.expect_place(&target);
+                        let constraint =
+                            self.type_test_constraint(ty, is_positive == (*op == ast::CmpOp::Eq));
+                        insert_narrowing_constraint(&mut constraints, place, constraint);
+                    }
+                }
+            }
+
             // Narrowing for:
             // - `if type(x) is Y`
             // - `if type(x) is not Y`
@@ -4603,6 +4623,27 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         }
     }
 
+    fn type_test_constraint(
+        &self,
+        target: Type<'db>,
+        is_positive: bool,
+    ) -> NarrowingConstraint<'db> {
+        let db = self.db;
+        if is_positive
+            && !db
+                .analysis_settings(self.scope().file(db))
+                .strict_generic_narrowing
+        {
+            NarrowingConstraint::generic_filtering(target)
+        } else {
+            NarrowingConstraint::intersection(target.top_materialization(db, &self.env).negate_if(
+                db,
+                &self.env,
+                !is_positive,
+            ))
+        }
+    }
+
     // Helper to evaluate TypeGuard/TypeIs narrowing for a call expression.
     // This is based on the call expression's return type, so it applies to any callable type.
     fn evaluate_type_guard_call(
@@ -4624,24 +4665,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                     target = target.materialization(db, &self.env, kind);
                 }
 
-                let use_generic_filtering = is_positive
-                    && !db
-                        .analysis_settings(self.scope().file(db))
-                        .strict_generic_narrowing;
-                Some((
-                    place,
-                    if use_generic_filtering {
-                        NarrowingConstraint::generic_filtering(target)
-                    } else {
-                        NarrowingConstraint::intersection(
-                            target.top_materialization(db, &self.env).negate_if(
-                                db,
-                                &self.env,
-                                !is_positive,
-                            ),
-                        )
-                    },
-                ))
+                Some((place, self.type_test_constraint(target, is_positive)))
             }
             // TypeGuard only narrows in the positive case
             Type::TypeGuard(type_guard) if is_positive => {

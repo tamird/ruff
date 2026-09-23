@@ -69,6 +69,25 @@ pub trait Db: PythonCoreDb {
         None
     }
 
+    /// Describes an exhaustive runtime type test in an embedded program.
+    ///
+    /// The comparison `callable(subject) == compared_value` must hold exactly when `subject`
+    /// belongs to the returned instance type. Equality and inequality must be complementary for
+    /// every runtime value represented by the supplied types. Ty calls this hook for one
+    /// positional argument and no keywords, and applies ordinary flow narrowing, including
+    /// retention of known generic arguments. Generic targets should use `Unknown` arguments.
+    /// Implementations must identify the resolved callable and read tracked inputs. The supplied
+    /// types come from this inference pass; implementations must not request completed inference
+    /// of the enclosing scope.
+    fn provided_type_test<'db>(
+        &'db self,
+        _file: ProgramFile<'db>,
+        _callable: crate::types::Type<'db>,
+        _compared_value: crate::types::Type<'db>,
+    ) -> Option<crate::types::Type<'db>> {
+        None
+    }
+
     fn check_file(&self, file: File) -> Vec<Diagnostic>;
 
     /// Returns the program file for `file`.
@@ -172,6 +191,12 @@ pub(crate) mod tests {
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
     type CallResultProvider =
         for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> Option<crate::types::Type<'db>>;
+    type TypeTestProvider = for<'db> fn(
+        &'db TestDb,
+        ProgramFile<'db>,
+        crate::types::Type<'db>,
+        crate::types::Type<'db>,
+    ) -> Option<crate::types::Type<'db>>;
 
     #[salsa::db]
     #[derive(Clone)]
@@ -187,6 +212,7 @@ pub(crate) mod tests {
         open_files: rustc_hash::FxHashSet<File>,
         program_settings: ProgramSettings,
         call_result_provider: Option<CallResultProvider>,
+        type_test_provider: Option<TypeTestProvider>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
@@ -213,6 +239,7 @@ pub(crate) mod tests {
                 open_files: rustc_hash::FxHashSet::default(),
                 program_settings,
                 call_result_provider: None,
+                type_test_provider: None,
                 source_provider: None,
             }
         }
@@ -344,6 +371,16 @@ pub(crate) mod tests {
                 .and_then(|provider| provider(self, call))
         }
 
+        fn provided_type_test<'db>(
+            &'db self,
+            file: ProgramFile<'db>,
+            callable: crate::types::Type<'db>,
+            compared_value: crate::types::Type<'db>,
+        ) -> Option<crate::types::Type<'db>> {
+            self.type_test_provider
+                .and_then(|provider| provider(self, file, callable, compared_value))
+        }
+
         fn provided_parameter_type<'db>(
             &'db self,
             definition: Definition<'db>,
@@ -430,6 +467,7 @@ pub(crate) mod tests {
         rule_selection: Option<RuleSelection>,
         lint_registry: Option<LintRegistry>,
         call_result_provider: Option<CallResultProvider>,
+        type_test_provider: Option<TypeTestProvider>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
@@ -445,6 +483,7 @@ pub(crate) mod tests {
                 rule_selection: None,
                 lint_registry: None,
                 call_result_provider: None,
+                type_test_provider: None,
                 source_provider: None,
             }
         }
@@ -492,6 +531,11 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_type_test_provider(mut self, provider: TypeTestProvider) -> Self {
+            self.type_test_provider = Some(provider);
+            self
+        }
+
         pub(crate) fn with_file(
             mut self,
             path: &'a (impl AsRef<SystemPath> + ?Sized),
@@ -513,6 +557,7 @@ pub(crate) mod tests {
         pub(crate) fn build(self) -> anyhow::Result<TestDb> {
             let mut db = TestDb::new(self.vendored);
             db.call_result_provider = self.call_result_provider;
+            db.type_test_provider = self.type_test_provider;
             db.source_provider = self.source_provider;
 
             if let Some(registry) = self.lint_registry {
