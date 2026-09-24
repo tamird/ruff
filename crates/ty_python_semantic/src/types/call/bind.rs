@@ -6917,13 +6917,12 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     }
 
     fn check_argument_types(&mut self, constraints: &ConstraintSetBuilder<'db>) {
-        let db = self.db;
         let paramspec = self.signature.parameters().as_paramspec_with_prefix();
         let paramspec_component_start = paramspec.and_then(|(prefix, paramspec)| {
             let prefix_len = prefix.len();
             let paramspec_argument_indices = self.paramspec_argument_indices(prefix_len);
             if paramspec_argument_indices.is_empty() {
-                self.evaluate_paramspec_sub_call(constraints, None, paramspec);
+                self.evaluate_paramspec_sub_call(constraints, None, paramspec, prefix_len);
                 return None;
             }
 
@@ -6931,19 +6930,14 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 paramspec_argument_indices
                     .iter()
                     .any(|(argument_index, _)| {
-                        let [parameter_index] =
-                            self.argument_matches[*argument_index].parameters.as_slice()
-                        else {
-                            return false;
-                        };
-
-                        let Type::TypeVar(typevar) =
-                            self.signature.parameters()[parameter_index.index].annotated_type()
-                        else {
-                            return false;
-                        };
-
-                        typevar.is_paramspec(db)
+                        let parameters = &self.argument_matches[*argument_index].parameters;
+                        parameters
+                            .iter()
+                            .all(|parameter| parameter.index >= prefix_len)
+                            || matches!(
+                                self.arguments.known_unpacking(*argument_index),
+                                Some(KnownUnpacking::Keywords(_))
+                            )
                     });
 
             if has_paramspec_component_argument
@@ -6951,11 +6945,12 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     constraints,
                     Some(&paramspec_argument_indices),
                     paramspec,
+                    prefix_len,
                 )
             {
                 Some(prefix_len)
             } else {
-                self.evaluate_paramspec_sub_call(constraints, None, paramspec);
+                self.evaluate_paramspec_sub_call(constraints, None, paramspec, prefix_len);
                 None
             }
         });
@@ -7039,6 +7034,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         constraints: &ConstraintSetBuilder<'db>,
         paramspec_arguments: Option<&[(usize, Option<usize>)]>,
         paramspec: BoundTypeVarInstance<'db>,
+        prefix_len: usize,
     ) -> bool {
         let db = self.db;
         let Some(Type::Callable(callable)) = self
@@ -7063,7 +7059,11 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     paramspec_arguments.iter().copied().unzip();
 
                 (
-                    self.arguments.select(&paramspec_argument_indices),
+                    self.arguments.select_for_paramspec(
+                        &paramspec_argument_indices,
+                        self.signature.parameters(),
+                        prefix_len,
+                    ),
                     Some(error_argument_indices),
                 )
             } else {
@@ -7120,7 +7120,12 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                             *error_parameter_source = Some(parameter_source);
                         } else if let Some(parameter_index) = argument_index
                             .and_then(|index| paramspec_arguments?.get(index))
-                            .and_then(|(index, _)| argument_matches[*index].parameters.first())
+                            .and_then(|(index, _)| {
+                                argument_matches[*index]
+                                    .parameters
+                                    .iter()
+                                    .find(|parameter| parameter.index >= prefix_len)
+                            })
                             .map(|parameter| parameter.index)
                         {
                             parameter.signature_parameter_index = parameter_index;
@@ -7763,7 +7768,11 @@ impl<'db> Binding<'db> {
             callable.signatures(db).iter().cloned(),
         );
 
-        let mut sub_arguments = arguments_types.select(&paramspec_argument_indices);
+        let mut sub_arguments = arguments_types.select_for_paramspec(
+            &paramspec_argument_indices,
+            self.signature.parameters(),
+            prefix.len(),
+        );
         // Clear the previously inferred type for this argument, if it was inferred in the previous
         // fixpoint iteration.
         sub_arguments.clear_types(sub_argument_index);

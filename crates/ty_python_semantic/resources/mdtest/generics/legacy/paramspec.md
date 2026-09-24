@@ -1353,3 +1353,58 @@ def target(first: T, values: list[T]) -> None: ...
 target("a", ["a"])
 forward(target, "a", ["a"])
 ```
+
+## Forwarding unpacked arguments
+
+A collection unpack can supply several forwarded parameters. Each element is checked against its
+parameter in the target callable.
+
+```py
+from typing import Callable, ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def forward(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    return callback(*args, **kwargs)
+
+def target(x: int, y: str) -> int:
+    return x
+
+reveal_type(forward(target, *[1, "ok"]))  # revealed: int
+reveal_type(forward(target, **{"x": 1, "y": "ok"}))  # revealed: int
+forward(target, *["bad", "ok"])  # error: [invalid-argument-type]
+forward(target, **{"x": 1})  # error: [missing-argument]
+```
+
+The wrapper consumes its own keyword parameters before forwarding the remaining keys. Both the
+wrapper and target parameter types are enforced.
+
+```py
+def with_prefix(callback: Callable[P, R], prefix: int, *args: P.args, **kwargs: P.kwargs) -> R:
+    return callback(*args, **kwargs)
+
+reveal_type(with_prefix(target, **{"prefix": 0, "x": 1, "y": "ok"}))  # revealed: int
+with_prefix(target, **{"prefix": 0, "x": 1}, y="ok")
+with_prefix(target, **{"prefix": "bad", "x": 1, "y": "ok"})  # error: [invalid-argument-type]
+with_prefix(target, **{"prefix": 0, "x": "bad", "y": "ok"})  # error: [invalid-argument-type]
+with_prefix(target, **{"prefix": 0, "x": 1})  # error: [missing-argument]
+with_prefix(target, **{"prefix": 0, "x": 1, "y": "ok", "extra": 2})  # error: [unknown-argument]
+
+def callback_target(x: int, transform: Callable[[int], str]) -> str:
+    return transform(x)
+
+with_prefix(callback_target, **{"prefix": 0, "x": 1}, transform=lambda x: str(reveal_type(x)))  # revealed: int
+```
+
+A keyword with the same name as a positional-only wrapper parameter belongs to the target.
+
+```py
+def positional_prefix(callback: Callable[P, R], prefix: int, /, *args: P.args, **kwargs: P.kwargs) -> R:
+    return callback(*args, **kwargs)
+
+def named_prefix(*, prefix: str) -> int:
+    return len(prefix)
+
+reveal_type(positional_prefix(named_prefix, 0, **{"prefix": "value"}))  # revealed: int
+```

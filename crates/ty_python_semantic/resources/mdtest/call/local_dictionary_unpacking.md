@@ -324,3 +324,29 @@ def shadowed():
     options = dict()
     required(**options)
 ```
+
+## Forwarding through a ParamSpec
+
+Known dictionary keys are divided between a wrapper's own parameters and the target callable.
+Conditional keys retain their presence and value constraints after forwarding.
+
+```py
+from typing import Callable, ParamSpec
+
+P = ParamSpec("P")
+
+def forward(callback: Callable[P, None], prefix: int, *args: P.args, **kwargs: P.kwargs) -> None:
+    callback(*args, **kwargs)
+
+def target(x: int, y: str = "", note: str = "") -> None: ...
+def required(x: int, y: str, note: str = "") -> None: ...
+def local(flag: bool):
+    options = dict(prefix=0, x=1, note="")
+    if flag:
+        options["y"] = "value"
+    forward(target, **options)
+    forward(required, **options)  # error: [missing-argument]
+    if flag:
+        options["y"] = 1
+    forward(target, **options)  # error: [invalid-argument-type]
+```
