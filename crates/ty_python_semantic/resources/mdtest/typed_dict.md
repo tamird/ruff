@@ -939,6 +939,120 @@ def return_invalid_dict() -> TD:
     return dict()
 ```
 
+## Contextual built-in dictionary copies
+
+A `dict` call in a `TypedDict` context checks a positional `TypedDict` source and its keyword
+overrides using the same field rules as the target's constructor. Without that context, the call
+continues to infer an ordinary dictionary.
+
+```py
+from typing import TypedDict
+from typing_extensions import NotRequired
+
+class Source(TypedDict):
+    name: str
+
+class OldSource(TypedDict):
+    name: int
+
+class Target(TypedDict):
+    name: str
+    enabled: bool
+
+class MaybeName(TypedDict):
+    name: NotRequired[str]
+
+def copies(source: Source, old: OldSource, maybe: MaybeName, rows: list[Source]):
+    copied: Source = dict(source)
+    changed: Target = dict(source, enabled=True)
+    repaired: Target = dict(old, name="new", enabled=True)
+    required: Target = dict(maybe, name="new", enabled=True)
+    reveal_type(copied)  # revealed: Source
+    reveal_type(changed)  # revealed: Target
+    reveal_type(dict(source, enabled=True))  # revealed: dict[str, object]
+
+    # error: [invalid-argument-type]
+    wrong_source: Target = dict(old, enabled=True)
+    # error: [invalid-argument-type]
+    wrong_override: Target = dict(source, enabled="bad")
+    # error: [invalid-argument-type]
+    missing: Target = dict(source)
+    # An optional override cannot replace every possible old value.
+    # error: [invalid-argument-type]
+    optional_override: Target = dict(old, enabled=True, **maybe)
+
+    result: list[Target] = [dict(row, enabled=True) for row in rows]
+    reveal_type(result[0]["enabled"])  # revealed: bool
+
+    constructor = dict
+    alias: Target = constructor(source, enabled=True)
+```
+
+Keyword values receive their field's type as context, including nested containers and callables.
+
+```py
+from typing import Callable
+
+class Configured(TypedDict):
+    name: str
+    values: list[int]
+    render: Callable[[int], str]
+
+def configure(source: Source):
+    configured: Configured = dict(source, values=[], render=lambda n: str(reveal_type(n)))  # revealed: int
+    reveal_type(configured["values"])  # revealed: list[int]
+```
+
+Copying creates a fresh outer dictionary; the nested values remain shared. A readonly source field
+can become writable in the copy, but a mutable list cannot acquire a wider element type.
+
+```py
+from typing_extensions import ReadOnly
+
+class ReadonlySource(TypedDict):
+    name: ReadOnly[str]
+    values: ReadOnly[list[int]]
+
+class MutableTarget(TypedDict):
+    name: str
+    values: list[int]
+
+class WiderTarget(TypedDict):
+    name: str
+    values: list[int | str]
+
+def shallow(source: ReadonlySource):
+    copied: MutableTarget = dict(source, name="new")
+    # error: [invalid-argument-type]
+    unsafe: WiderTarget = dict(source, name="new")
+```
+
+Unsupported positional sources retain ordinary constructor inference. Speculating about the source
+shape preserves diagnostics from the actual arguments, and a shadowed `dict` uses its own signature.
+
+```py
+from collections.abc import Mapping
+from typing import Any
+
+def unsupported(mapping: Mapping[str, object], dynamic: Any, source: Source):
+    # error: [invalid-assignment]
+    ordinary: Source = dict(mapping, name="new")
+    # error: [invalid-assignment]
+    gradual: Source = dict(dynamic)
+    # error: [invalid-assignment]
+    starred: Source = dict(*[source])
+    # error: [unresolved-reference]
+    # error: [invalid-assignment]
+    unresolved: Source = dict(mapping, name=missing)
+
+def shadowed(source: Source):
+    def dict(value: Source) -> int:
+        return 1
+
+    # error: [invalid-assignment]
+    copied: Source = dict(source)
+```
+
 ## Mixed positional and unpacked keyword constructors
 
 These calls mix a positional `TypedDict` argument with unpacked keyword arguments. They should

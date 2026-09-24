@@ -9265,7 +9265,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if callable_type
             .as_class_literal()
             .is_some_and(|class_literal| class_literal.is_known(self.db(), KnownClass::Dict))
-            && let Some(ty) = self.infer_keyword_only_dict_call(
+            && let Some(ty) = self.infer_dict_call(
                 func,
                 arguments,
                 (collection_initializer_class == Some(KnownClass::Dict))
