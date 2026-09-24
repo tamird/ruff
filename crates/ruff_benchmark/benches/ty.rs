@@ -12,7 +12,10 @@ use ruff_benchmark::TestFile;
 use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::source::source_text;
-use ruff_db::system::{InMemorySystem, MemoryFileSystem, SystemPath, SystemPathBuf, TestSystem};
+use ruff_db::system::{
+    DbWithWritableSystem as _, InMemorySystem, MemoryFileSystem, SystemPath, SystemPathBuf,
+    TestSystem,
+};
 use ruff_ranged_value::RangedValue;
 use ty_project::metadata::options::{AnalysisOptions, EnvironmentOptions, Options, Rules};
 use ty_project::metadata::python_version::SupportedPythonVersion;
@@ -1800,6 +1803,39 @@ fn benchmark_repeated_statement_calls(criterion: &mut Criterion) {
             );
         });
     }
+
+    let mut code = String::from("def call() -> None:\n    pass\n");
+    for index in 0..6_000 {
+        writeln!(&mut code, "call_{index} = call").unwrap();
+    }
+    code.push_str("def f(flag: int) -> None:\n");
+    for branch in 0..150 {
+        let keyword = if branch == 0 { "if" } else { "elif" };
+        writeln!(&mut code, "    {keyword} flag == {branch}:").unwrap();
+        for index in branch * 40..(branch + 1) * 40 {
+            writeln!(&mut code, "        call_{index}()").unwrap();
+        }
+    }
+
+    // Importing the function builds its semantic index without inferring its body. Distinct
+    // callee names create places whose pending call gates are materialized at branch merges.
+    criterion.bench_function("ty_micro[repeated_statement_calls_in_elif_branches]", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut case = setup_micro_case("from dependency import f");
+                case.db
+                    .write_file(SystemPath::new("/src/dependency.py"), &code)
+                    .unwrap();
+                case
+            },
+            |case| {
+                let Case { db } = case;
+                let result = db.check();
+                assert_eq!(result.len(), 0);
+            },
+            BatchSize::SmallInput,
+        );
+    });
 }
 
 /// Exercises repeated control-flow gates with and without interleaved statement-call predicates.
