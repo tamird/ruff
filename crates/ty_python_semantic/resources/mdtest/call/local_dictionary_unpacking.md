@@ -64,9 +64,9 @@ def generic():
 ## String-key assignments
 
 Direct assignments to literal string keys preserve completeness. Existing flow analysis determines
-each value and whether the key is always present. A conditional key is checked when it could be
-supplied, but cannot satisfy a required parameter. Assignments still obey the dictionary's inferred
-value type.
+each value and whether the key is always present. Like optional TypedDict keys, a conditional key
+can satisfy a required parameter. Its value is checked when it could be supplied. Assignments still
+obey the dictionary's inferred value type.
 
 ```py
 def consume(tags: list[str], testonly: bool, note: list[str] | None = None): ...
@@ -103,7 +103,7 @@ def optional_required(flag: bool):
     if flag:
         options["value"] = 1
         required(**options)
-    required(**options)  # error: [missing-argument]
+    required(**options)
     options["value"] = 2
     required(**options)
 
@@ -136,19 +136,27 @@ def generic(flag: bool):
     reveal_type(first(**options))  # revealed: str
 ```
 
-Optional keys remain possible matches alongside other unpacked inputs. Open mappings retain their
-ordinary uncertainty; definite tuple elements and explicit keywords can supply required parameters.
+Optional keys remain possible matches alongside other unpacked inputs. Duplicate arguments and
+values from later open mappings are still checked.
 
 ```py
 def single(value: int): ...
-def other_inputs(flag: bool, args: tuple[int, ...], kwargs: dict[str, int]):
+def other_inputs(
+    flag: bool,
+    args: tuple[int, ...],
+    kwargs: dict[str, int],
+    bad_kwargs: dict[str, str],
+):
     options = {}
     if flag:
         options["value"] = 1
-    single(**options)  # error: [missing-argument]
+    single(**options)
     single(*args, **options)  # error: [parameter-already-assigned]
     single(*(1,), **options)  # error: [parameter-already-assigned]
     single(**options, **kwargs)  # error: [parameter-already-assigned]
+    # error: [parameter-already-assigned]
+    # error: [invalid-argument-type]
+    single(**options, **bad_kwargs)
 ```
 
 TypedDict extra items must also be checked against parameters supplied only conditionally by an
@@ -345,7 +353,7 @@ def local(flag: bool):
     if flag:
         options["y"] = "value"
     forward(target, **options)
-    forward(required, **options)  # error: [missing-argument]
+    forward(required, **options)
     if flag:
         options["y"] = 1
     forward(target, **options)  # error: [invalid-argument-type]
