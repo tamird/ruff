@@ -406,7 +406,6 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let env = self.program_environment();
         let typed_dict = TypedDictType::new(class);
         let arguments = &call_expression.arguments;
-        let form = TypedDictConstructorForm::from_arguments(arguments);
         let error_node: AnyNodeRef = call_expression.func.as_ref().into();
         let fallback_ty = callable_type
             .to_instance_approximation(db, env)
@@ -426,7 +425,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             && self.can_infer_generic_typed_dict_constructor(class, arguments, call_expression_tcx);
 
         if !can_infer {
-            self.prepare_typed_dict_constructor(typed_dict, form, arguments, error_node);
+            self.prepare_typed_dict_constructor(typed_dict, arguments, error_node);
         }
 
         let mut call_arguments = self.prepare_call_arguments(arguments);
@@ -440,7 +439,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 .match_parameters(db, env, &call_arguments);
 
         if can_infer && !bindings.satisfies(|_| true) {
-            self.prepare_typed_dict_constructor(typed_dict, form, arguments, error_node);
+            self.prepare_typed_dict_constructor(typed_dict, arguments, error_node);
             return fallback_ty;
         }
 
@@ -562,15 +561,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     /// expression directly, while mixed dict-literal and keyword calls infer the nested key and
     /// value expressions without re-inferring the outer dict literal later during argument
     /// binding.
-    fn prepare_typed_dict_constructor<'expr>(
+    pub(super) fn prepare_typed_dict_constructor<'expr>(
         &mut self,
         typed_dict: TypedDictType<'db>,
-        form: TypedDictConstructorForm<'expr>,
         arguments: &'expr ast::Arguments,
         error_node: AnyNodeRef<'expr>,
     ) {
         let db = self.db();
-        match form {
+        match TypedDictConstructorForm::from_arguments(arguments) {
             TypedDictConstructorForm::LiteralOnly(argument) => {
                 let target_ty = Type::TypedDict(typed_dict);
                 self.get_or_infer_expression(argument, TypeContext::new(Some(target_ty)));
