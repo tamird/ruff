@@ -4893,7 +4893,10 @@ pub(crate) enum MatchingOverloadIndex {
 
 #[derive(Default, Clone, Copy)]
 struct ParameterInfo {
+    /// Any potential match, including optional dictionary keys, can collide with later inputs.
     matched: bool,
+    /// Optional observed keys alone cannot supply a required parameter.
+    satisfies_required: bool,
     suppress_missing_error: bool,
 }
 
@@ -4936,8 +4939,14 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             .collect();
         for (index, _) in arguments.iter().enumerate() {
             if let Some(KnownUnpacking::Keywords(keywords)) = arguments.known_unpacking(index) {
-                explicit_keyword_parameters.extend(keywords.iter().filter_map(|(name, _)| {
-                    parameters.keyword_by_name(name).map(|(index, _)| index)
+                explicit_keyword_parameters.extend(keywords.iter().filter_map(|item| {
+                    if item.is_required {
+                        parameters
+                            .keyword_by_name(&item.name)
+                            .map(|(index, _)| index)
+                    } else {
+                        None
+                    }
                 }));
             }
         }
@@ -4992,6 +5001,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         parameter: &Parameter<'db>,
         positional: bool,
         variable_argument_length: bool,
+        is_required: bool,
     ) {
         if self.parameter_info[parameter_index].matched
             && !parameter.is_variadic()
@@ -5028,6 +5038,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         });
         matched_argument.matched = true;
         self.parameter_info[parameter_index].matched = true;
+        self.parameter_info[parameter_index].satisfies_required |= is_required;
     }
 
     fn match_positional(
@@ -5060,6 +5071,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             parameter,
             !parameter.is_variadic(),
             variable_argument_length,
+            true,
         );
         Ok(())
     }
@@ -5070,6 +5082,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument: Argument<'a>,
         argument_type: Option<Type<'db>>,
         name: &str,
+        is_required: bool,
     ) -> Result<(), ()> {
         let Some((parameter_index, parameter)) = self
             .parameters
@@ -5102,6 +5115,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             parameter,
             false,
             false,
+            is_required,
         );
         Ok(())
     }
@@ -5368,12 +5382,13 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         if let Some(KnownUnpacking::Keywords(keywords)) =
             self.arguments.known_unpacking(argument_index)
         {
-            for (name, ty) in keywords {
+            for item in keywords {
                 let _ = self.match_keyword(
                     argument_index,
                     Argument::Keywords,
-                    Some(*ty),
-                    name.as_str(),
+                    Some(item.ty),
+                    item.name.as_str(),
+                    item.is_required,
                 );
             }
         } else if let Some(unpacked) =
@@ -5388,12 +5403,14 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     Argument::Keywords,
                     Some(unpacked_key.value_ty),
                     name.as_str(),
+                    true,
                 );
             }
             self.match_typed_dict_openness(argument_index, openness);
         } else {
             for (parameter_index, parameter) in self.parameters.iter().enumerate() {
-                if self.parameter_info[parameter_index].matched && !parameter.is_keyword_variadic()
+                if self.parameter_info[parameter_index].satisfies_required
+                    && !parameter.is_keyword_variadic()
                 {
                     continue;
                 }
@@ -5427,6 +5444,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     parameter,
                     false,
                     true,
+                    true,
                 );
             }
         }
@@ -5450,7 +5468,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
 
         if has_explicit_extra_items {
             for (parameter_index, parameter) in self.parameters.iter().enumerate() {
-                if self.parameter_info[parameter_index].matched
+                if self.parameter_info[parameter_index].satisfies_required
                     || parameter.keyword_name().is_none()
                 {
                     continue;
@@ -5478,6 +5496,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 parameter_index,
                 parameter,
                 false,
+                true,
                 true,
             );
         } else if has_explicit_extra_items {
@@ -5622,12 +5641,13 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         for (
             index,
             ParameterInfo {
-                matched,
+                matched: _,
+                satisfies_required,
                 suppress_missing_error,
             },
         ) in self.parameter_info.iter().copied().enumerate()
         {
-            if !matched {
+            if !satisfies_required {
                 if suppress_missing_error {
                     continue;
                 }
@@ -8126,7 +8146,7 @@ impl<'db> Binding<'db> {
                     let _ = matcher.match_positional(argument_index, argument, None, false);
                 }
                 Argument::Keyword(name) => {
-                    let _ = matcher.match_keyword(argument_index, argument, None, name);
+                    let _ = matcher.match_keyword(argument_index, argument, None, name, true);
                 }
                 Argument::Variadic => {
                     let _ = matcher.match_variadic(

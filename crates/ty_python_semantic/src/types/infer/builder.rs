@@ -8928,18 +8928,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         argument: &'ast ast::ArgOrKeyword,
     ) -> Option<Type<'db>> {
         let keyword = argument.as_variadic()?;
-        let elements = self.observed_dictionary_items(&keyword.value, argument_type)?;
-        if elements.items.is_empty() {
-            return None;
-        }
+        let DictionaryItems { items, is_complete } =
+            self.observed_dictionary_items(&keyword.value, argument_type)?;
+        // In a partial dictionary, a conditional write can leave an unseen prior value in place.
+        // Only a complete key set proves that the key was absent on the other path.
+        let mut elements = items
+            .into_iter()
+            .filter(|item| is_complete || item.is_required)
+            .peekable();
+        elements.peek()?;
         let db = self.db();
         let env = self.program_environment();
 
         // Synthesize overloads for `__getitem__` based on known dictionary elements.
-        let getitem_overloads = elements.items.into_iter().map(
+        let getitem_overloads = elements.map(
             |DictionaryItem {
                  name,
                  ty,
+                 is_required: _,
                  source: _,
              }| {
                 Signature::new(

@@ -61,12 +61,118 @@ def generic():
     reveal_type(first(**options))  # revealed: str
 ```
 
+## String-key assignments
+
+Direct assignments to literal string keys preserve completeness. Existing flow analysis determines
+each value and whether the key is always present. A conditional key is checked when it could be
+supplied, but cannot satisfy a required parameter. Assignments still obey the dictionary's inferred
+value type.
+
+```py
+def consume(tags: list[str], testonly: bool, note: list[str] | None = None): ...
+def conditional(note: list[str] | None):
+    options = dict(tags=["example"], testonly=True)
+    if note is not None:
+        options["note"] = note
+    consume(**options)
+
+def overwrite(flag: bool):
+    options = dict(tags=["example"], testonly=True, note=["initial"])
+    if flag:
+        options["note"] = ["replacement"]
+    consume(**options)
+    if flag:
+        options["note"] = False
+    consume(**options)  # error: [invalid-argument-type]
+
+def optional_bad_value(flag: bool):
+    options = dict(tags=["example"], testonly=True)
+    if flag:
+        options["note"] = False
+    consume(**options)  # error: [invalid-argument-type]
+
+def optional_unknown_key(flag: bool):
+    options = dict(tags=["example"], testonly=True)
+    if flag:
+        options["extra"] = True
+    consume(**options)  # error: [unknown-argument]
+
+def required(value: int, other: int = 0): ...
+def optional_required(flag: bool):
+    options = dict(other=0)
+    if flag:
+        options["value"] = 1
+        required(**options)
+    required(**options)  # error: [missing-argument]
+    options["value"] = 2
+    required(**options)
+
+def both_branches(flag: bool):
+    options = dict(other=0)
+    if flag:
+        options["value"] = 1
+    else:
+        options["value"] = 2
+    required(**options)
+
+def optional_duplicate(flag: bool):
+    options = dict(tags=["example"], testonly=True)
+    if flag:
+        options["note"] = ["value"]
+    consume(**options, note=["explicit"])  # error: [parameter-already-assigned]
+    consume(note=["explicit"], **options)  # error: [parameter-already-assigned]
+
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def first(values: list[T], note: list[str] | None = None) -> T:
+    return values[0]
+
+def generic(flag: bool):
+    options = dict(values=["example"])
+    if flag:
+        options["note"] = ["value"]
+    reveal_type(first(**options))  # revealed: str
+```
+
+Optional keys remain possible matches alongside other unpacked inputs. Open mappings retain their
+ordinary uncertainty; definite tuple elements and explicit keywords can supply required parameters.
+
+```py
+def single(value: int): ...
+def other_inputs(flag: bool, args: tuple[int, ...], kwargs: dict[str, int]):
+    options = {}
+    if flag:
+        options["value"] = 1
+    single(**options)  # error: [missing-argument]
+    single(*args, **options)  # error: [parameter-already-assigned]
+    single(*(1,), **options)  # error: [parameter-already-assigned]
+    single(**options, **kwargs)  # error: [parameter-already-assigned]
+```
+
+TypedDict extra items must also be checked against parameters supplied only conditionally by an
+earlier mapping.
+
+```py
+from typing_extensions import TypedDict
+
+class ExtraStrings(TypedDict, extra_items=str): ...
+
+def with_default(value: int = 0, **kwargs: object): ...
+def extra_items(flag: bool, extra: ExtraStrings):
+    options = {}
+    if flag:
+        options["value"] = 1
+    with_default(**options, **extra)  # error: [invalid-argument-type]
+```
+
 ## Other uses preserve partial observations
 
-Completeness requires every use of the symbol to be a direct keyword expansion, throughout the
-function. Aliases, captures, and ordinary arguments can expose the dictionary to mutation. Reads and
-direct key writes also use the existing partial observations. This is a conservative source
-analysis; dynamically accessing a function's frame or locals is outside its effect model.
+Completeness requires every use of the symbol to be a direct keyword expansion or tracked string-key
+assignment, throughout the function. Aliases, captures, and ordinary arguments can expose the
+dictionary to mutation. Reads also use the existing partial observations. This is a conservative
+source analysis; dynamically accessing a function's frame or locals is outside its effect model.
 
 ```py
 def consume(*, note: str | None = None, **kwargs: object): ...
@@ -96,6 +202,16 @@ def deletion():
 def method():
     options = dict(tags=["example"], testonly=True)
     options.update(note=True)
+    consume(**options)  # error: [invalid-argument-type]
+
+def dynamic_key(key: str):
+    options = dict(tags=["example"], testonly=True)
+    options[key] = True
+    consume(**options)  # error: [invalid-argument-type]
+
+def augmented():
+    options = dict(tags=["example"], testonly=True)
+    options["tags"] += ["other"]
     consume(**options)  # error: [invalid-argument-type]
 ```
 

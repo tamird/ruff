@@ -200,12 +200,14 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         for DictionaryItem {
             name,
             ty,
+            is_required,
             source: range,
         } in items
         {
             write!(
                 description,
-                "; {name}: {} at {}",
+                "; {name}{}: {} at {}",
+                if is_required { "" } else { "?" },
                 ty.display(db, &env),
                 &source[range]
             )
@@ -260,6 +262,10 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         (
             "values = {'x': 1}\nif bool():\n    values['y'] = 2\nresult = observe(values)",
             "partial; x: Literal[1] at 'x'",
+        ),
+        (
+            "values = {'x': 1}\nif bool(input()):\n    values['y'] = 2\nresult = observe(values)",
+            "partial; x: Literal[1] at 'x'; y?: Literal[2] at 'y'",
         ),
         (
             "values = {}\nvalues['inner'] = {'x': 1}\nvalues['inner']['y'] = 2\nresult = observe(values['inner'])",

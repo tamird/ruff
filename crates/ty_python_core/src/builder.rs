@@ -85,7 +85,7 @@ mod loop_bindings_visitor;
 #[derive(Clone, Copy)]
 enum SymbolUse {
     Value,
-    KeywordUnpacking,
+    TrackedDictionary,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1462,7 +1462,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             let symbol = self.current_place_table_mut().symbol_mut(symbol_id);
             match symbol_use {
                 SymbolUse::Value => symbol.mark_used(),
-                SymbolUse::KeywordUnpacking => symbol.mark_used_for_keyword_unpacking(),
+                SymbolUse::TrackedDictionary => symbol.mark_tracked_dictionary_use(),
             }
         }
         let use_id = self.current_ast_ids_mut().record_use(expr);
@@ -3646,7 +3646,30 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     deferred_effects = Some((place_expr, is_use, is_definition));
                 }
 
-                walk_expr(self, expr);
+                if let ast::Expr::Subscript(subscript) = expr
+                    && subscript.ctx == ast::ExprContext::Store
+                    && subscript.value.is_name_expr()
+                    && subscript.slice.is_string_literal_expr()
+                    && matches!(
+                        self.current_assignment(),
+                        Some(CurrentAssignment::Assign {
+                            node: _,
+                            unpack: None,
+                            owner: _,
+                        })
+                    )
+                {
+                    // These stores have a named member definition. They cannot expose the
+                    // dictionary itself, and reaching definitions retain their conditionality.
+                    self.visit_expr_with_symbol_use(
+                        &subscript.value,
+                        ExpressionContext::Value,
+                        SymbolUse::TrackedDictionary,
+                    );
+                    self.visit_expr(&subscript.slice);
+                } else {
+                    walk_expr(self, expr);
+                }
 
                 let is_use = deferred_effects
                     .as_ref()
@@ -5844,7 +5867,7 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
             self.visit_expr_with_symbol_use(
                 &keyword.value,
                 ExpressionContext::Value,
-                SymbolUse::KeywordUnpacking,
+                SymbolUse::TrackedDictionary,
             );
         } else {
             walk_keyword(self, keyword);

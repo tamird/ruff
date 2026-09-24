@@ -1330,12 +1330,20 @@ mod tests {
     }
 
     #[test]
-    fn keyword_unpacking_uses() {
+    fn tracked_dictionary_uses() {
         for (body, expected) in [
             ("values = {}\nf(**values)\nf(**values)", true),
             ("values = {}\nf(values)\nf(**values)", false),
             ("values = {}\nf(**values)\nalias = values", false),
-            ("values = {}\nvalues['x'] = 1\nf(**values)", false),
+            ("values = {}\nvalues['x'] = 1\nf(**values)", true),
+            (
+                "values = {}\nif flag:\n    values['x'] = 1\nf(**values)",
+                true,
+            ),
+            ("values = {}\nvalues[key] = 1\nf(**values)", false),
+            ("values = {}\nvalues['x'] += 1\nf(**values)", false),
+            ("values = {}\ndel values['x']\nf(**values)", false),
+            ("values = {}\nvalues['x']['y'] = 1\nf(**values)", false),
             ("values = {}\nvalues.clear()\nf(**values)", false),
             ("values = {}\nf(**(alias := values))", false),
             ("values = {}\nf(**(values if flag else {}))", false),
@@ -1367,7 +1375,7 @@ mod tests {
                 table
                     .symbol_by_name("values")
                     .unwrap()
-                    .is_used_only_for_keyword_unpacking(),
+                    .has_only_tracked_dictionary_uses(),
                 expected,
                 "{source}",
             );
