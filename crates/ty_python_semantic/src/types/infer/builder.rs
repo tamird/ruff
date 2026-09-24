@@ -8948,7 +8948,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Only a complete key set proves that the key was absent on the other path.
         let mut elements = items
             .into_iter()
-            .filter(|item| is_complete || item.is_required)
+            .filter(|item| is_complete || item.is_required())
             .peekable();
         elements.peek()?;
         let db = self.db();
@@ -8959,7 +8959,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             |DictionaryItem {
                  name,
                  ty,
-                 is_required: _,
+                 kind: _,
                  source: _,
              }| {
                 Signature::new(

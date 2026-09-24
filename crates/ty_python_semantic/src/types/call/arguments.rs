@@ -1,4 +1,4 @@
-use super::checked::{DictionaryExtraItems, DictionaryItem, DictionaryItems};
+use super::checked::{DictionaryExtraItems, DictionaryItem, DictionaryItemKind, DictionaryItems};
 use crate::Db;
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -12,7 +12,7 @@ use rustc_hash::FxHashMap;
 use crate::ProgramEnvironment;
 use crate::types::signatures::Parameters;
 use crate::types::typed_dict::extract_unpacked_typed_dict_keys_from_value_type;
-use crate::types::{Type, TypeContext, expand_type};
+use crate::types::{Type, TypeContext, UnionType, expand_type};
 
 /// Maximum total number of expanded argument type combinations across all arguments
 /// in [`CallArgumentExpansions::iter`].
@@ -66,6 +66,60 @@ pub(super) struct KnownKeywords<'db> {
     pub(super) extra_items: Option<Type<'db>>,
     /// Prefix parameters removed while forwarding to a `ParamSpec` remain excluded from the tail.
     pub(super) excluded_names: Vec<Name>,
+}
+
+impl<'db> KnownKeywords<'db> {
+    /// All values supplied without named-key evidence, after any `ParamSpec` projection.
+    pub(super) fn residual_values(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Type<'db> {
+        let Self {
+            items,
+            extra_items,
+            excluded_names: _,
+        } = self;
+        UnionType::from_elements(
+            db,
+            env,
+            extra_items.iter().copied().chain(
+                items.iter().filter_map(|item| {
+                    (item.kind == DictionaryItemKind::Residual).then_some(item.ty)
+                }),
+            ),
+        )
+    }
+
+    pub(super) fn residual_value(
+        &self,
+        db: &'db dyn Db,
+        name: Option<&str>,
+        all_values: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let Self {
+            items,
+            extra_items,
+            excluded_names,
+        } = self;
+        let ty = if let Some(name) = name {
+            if excluded_names.iter().any(|excluded| excluded == name) {
+                return None;
+            }
+            if let Some(item) = items.iter().find(|item| item.name == name) {
+                match item.kind {
+                    DictionaryItemKind::Required => return None,
+                    DictionaryItemKind::Optional => return None,
+                    DictionaryItemKind::Residual => item.ty,
+                }
+            } else {
+                (*extra_items)?
+            }
+        } else {
+            all_values
+        };
+        (!ty.resolve_type_alias(db).is_never()).then_some(ty)
+    }
 }
 
 impl<'db> KnownUnpacking<'db> {
@@ -751,5 +805,93 @@ impl<'a, 'db> FromIterator<(Argument<'a>, Option<Type<'db>>)> for CallArguments<
         }
 
         Self { items }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruff_db::files::system_path_to_file;
+    use ruff_text_size::TextRange;
+
+    use super::*;
+    use crate::db::tests::TestDbBuilder;
+    use crate::types::call::{Bindings, CallableBinding};
+    use crate::types::constraints::ConstraintSetBuilder;
+    use crate::types::{KnownClass, Parameter, Signature};
+
+    #[test]
+    fn residual_keywords_follow_paramspec_projection() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new().with_file("/src/main.py", "").build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let env = ProgramEnvironment::from_file(db.program_file(file));
+        let forwarded = Type::string_literal(&db, "forwarded");
+        let arguments = CallArguments {
+            items: vec![CallArgument {
+                argument: Argument::Keywords,
+                types: CallArgumentTypes::new(Some(Type::unknown())),
+                known_unpacking: Some(KnownUnpacking::Keywords(KnownKeywords {
+                    items: [
+                        DictionaryItem {
+                            name: Name::new_static("prefix"),
+                            ty: Type::int_literal(1),
+                            kind: DictionaryItemKind::Residual,
+                            source: TextRange::default(),
+                        },
+                        DictionaryItem {
+                            name: Name::new_static("value"),
+                            ty: forwarded,
+                            kind: DictionaryItemKind::Residual,
+                            source: TextRange::default(),
+                        },
+                    ]
+                    .into(),
+                    extra_items: None,
+                    excluded_names: Vec::new(),
+                })),
+            }],
+        };
+        let parameters =
+            Parameters::standard([Parameter::keyword_only(Name::new_static("prefix"))]);
+        let projected = arguments.select_for_paramspec(&[0], &parameters, 1);
+        let Some(KnownUnpacking::Keywords(keywords)) = projected.known_unpacking(0) else {
+            panic!(
+                "expected projected keywords, got {:?}",
+                projected.known_unpacking(0)
+            );
+        };
+        let values = keywords.residual_values(&db, &env);
+        assert_eq!(values, forwarded);
+        assert_eq!(keywords.residual_value(&db, None, values), Some(forwarded));
+        assert_eq!(
+            keywords.residual_value(&db, Some("value"), values),
+            Some(forwarded)
+        );
+        assert_eq!(keywords.residual_value(&db, Some("prefix"), values), None);
+        for parameter in [
+            Parameter::keyword_only(Name::new_static("value")),
+            Parameter::keyword_variadic(Name::new_static("kwargs")),
+        ] {
+            for (expected, valid) in [(KnownClass::Str, true), (KnownClass::Int, false)] {
+                let signature = Signature::new(
+                    Parameters::standard([parameter
+                        .clone()
+                        .with_annotated_type(expected.to_instance(&db, &env))]),
+                    Type::none(&db, &env),
+                );
+                let binding = CallableBinding::from_overloads(Type::unknown(), [signature]);
+                let result = Bindings::from(binding)
+                    .match_parameters(&db, &env, &projected)
+                    .check_types(
+                        &db,
+                        &env,
+                        &ConstraintSetBuilder::new(),
+                        &projected,
+                        TypeContext::default(),
+                        &[],
+                    );
+                assert_eq!(result.is_ok(), valid, "{parameter:?}: {result:?}");
+            }
+        }
+        Ok(())
     }
 }

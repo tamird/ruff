@@ -141,7 +141,8 @@ mod bool;
 mod bound_super;
 mod call;
 pub use call::{
-    CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryItem, DictionaryItems,
+    CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryItem, DictionaryItemKind,
+    DictionaryItems,
 };
 mod callable;
 mod class;

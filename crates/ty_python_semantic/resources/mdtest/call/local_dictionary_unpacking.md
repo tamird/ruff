@@ -151,6 +151,20 @@ def integer(value: int): ...
 def absent(source: Extra):
     integer(**{**source})
 
+def other_values(source: Extra, integers: dict[str, int]):
+    integer(**{**source, **integers})
+    integer(**{**integers, **source})
+    integer(**{**source, **integers, "value": "bad"})  # error: [invalid-argument-type]
+
+class AbsentOnly(TypedDict, closed=True):
+    ghost: NotRequired[Absent]
+
+def ghost(ghost: int): ...
+def absent_only(source: AbsentOnly, integers: dict[str, int]):
+    ghost(**{**source})  # error: [missing-argument]
+    ghost(**{**source, **integers})
+    ghost(**{**integers, **source})
+
 def impossible(source: Never):
     integer(**source)
     integer(**{**source})
@@ -163,6 +177,53 @@ Unpacking an unsupported source still produces its ordinary diagnostic.
 
 ```py
 integer(**{**[1], "value": 1})  # error: [invalid-argument-type]
+```
+
+## Residual key restrictions
+
+An excluded key can receive values from another mapping without becoming a known named argument. Its
+value restriction stays distinct from the other keys' values.
+
+```py
+from typing_extensions import Never, NotRequired, TypedDict
+
+class StringsExceptGhost(TypedDict, extra_items=str):
+    ghost: NotRequired[Never]
+
+class NamedGhost(TypedDict, closed=True):
+    ghost: NotRequired[int]
+
+def ghost_int(ghost: int, **other: object): ...
+def ghost_str(ghost: str, **other: object): ...
+def no_ghost(value: int = 0): ...
+def all_ints(**values: int): ...
+def overlay(excluded: StringsExceptGhost, integers: dict[str, int], named: NamedGhost):
+    ghost_int(**{**excluded, **integers})
+    ghost_int(**{**integers, **excluded})
+    ghost_str(**{**excluded, **integers})  # error: [invalid-argument-type]
+    ghost_str(**{**integers, **excluded})  # error: [invalid-argument-type]
+    all_ints(**{**excluded, **integers})  # error: [invalid-argument-type]
+    no_ghost(**{**named, **integers})  # error: [unknown-argument]
+    ghost_int(**{"ghost": 1, **excluded})
+```
+
+Union normalization retains whether a field has a named source or only restricts values from
+additional keys.
+
+```py
+class Absent(TypedDict, closed=True):
+    ghost: NotRequired[Never]
+
+class Integers(TypedDict, extra_items=int):
+    pass
+
+def normalized(source: Absent | Integers):
+    no_ghost(**{**source})
+    ghost_int(**{**source})
+    ghost_str(**{**source})  # error: [invalid-argument-type]
+
+def positive(source: NamedGhost | Integers):
+    no_ghost(**{**source})  # error: [unknown-argument]
 ```
 
 ## Complete key sets

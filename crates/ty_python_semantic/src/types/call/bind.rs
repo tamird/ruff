@@ -24,7 +24,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec, smallvec_inline};
 
 use self::constructor::{ConstructorBinding, ConstructorContext};
-use super::{Argument, CallArguments, CallError, CallErrorKind, InferContext, Signature, Type};
+use super::{
+    Argument, CallArguments, CallError, CallErrorKind, DictionaryItemKind, InferContext, Signature,
+    Type,
+};
 use crate::db::Db;
 use crate::dunder_all::dunder_all_names;
 use crate::lint::LintMetadata;
@@ -4941,7 +4944,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         for (index, _) in arguments.iter().enumerate() {
             if let Some(KnownUnpacking::Keywords(keywords)) = arguments.known_unpacking(index) {
                 explicit_keyword_parameters.extend(keywords.items.iter().filter_map(|item| {
-                    if item.is_required {
+                    if item.is_required() {
                         parameters
                             .keyword_by_name(&item.name)
                             .map(|(index, _)| index)
@@ -5384,7 +5387,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             self.arguments.known_unpacking(argument_index)
         {
             for item in &keywords.items {
-                if !item.is_required && item.ty.resolve_type_alias(db).is_never() {
+                if item.kind == DictionaryItemKind::Residual {
                     continue;
                 }
                 let _ = self.match_keyword(
@@ -5392,22 +5395,13 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     Argument::Keywords,
                     Some(item.ty),
                     item.name.as_str(),
-                    item.is_required,
+                    item.is_required(),
                 );
             }
-            if let Some(extra_items) = keywords.extra_items {
+            let residual_values = keywords.residual_values(db, env);
+            if !residual_values.is_never() {
                 self.match_mapping_keywords(argument_index, |name| {
-                    if name.is_some_and(|name| {
-                        keywords.items.iter().any(|item| item.name == name)
-                            || keywords
-                                .excluded_names
-                                .iter()
-                                .any(|excluded| excluded == name)
-                    }) {
-                        None
-                    } else {
-                        Some(extra_items)
-                    }
+                    keywords.residual_value(db, name, residual_values)
                 });
             }
         } else if let Some(unpacked) =

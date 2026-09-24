@@ -10,6 +10,7 @@ use ruff_python_ast::Arguments;
 use ruff_python_ast::{self as ast, AnyNodeRef, StmtClassDef, name::Name};
 use ruff_text_size::Ranged;
 
+use super::call::DictionaryItemKind;
 use super::class::{ClassLiteral, ClassType, CodeGeneratorKind, Field, KnownClass};
 use super::context::InferContext;
 use super::diagnostic::{
@@ -1771,7 +1772,7 @@ fn validate_typed_dict_required_keys<'db, 'ast>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UnpackedTypedDictKey<'db> {
     pub(crate) value_ty: Type<'db>,
-    pub(crate) is_required: bool,
+    pub(crate) kind: DictionaryItemKind,
     pub(crate) definition: Option<Definition<'db>>,
 }
 
@@ -1909,7 +1910,11 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
                         name.clone(),
                         UnpackedTypedDictKey {
                             value_ty: field.declared_ty,
-                            is_required: field.is_required(),
+                            kind: DictionaryItemKind::from_required(
+                                db,
+                                field.declared_ty,
+                                field.is_required(),
+                            ),
                             definition: field.first_declaration(),
                         },
                     )
@@ -1949,7 +1954,17 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
                                 existing.value_ty,
                                 unpacked_key.value_ty,
                             );
-                            existing.is_required |= unpacked_key.is_required;
+                            existing.kind = match unpacked_key.kind {
+                                DictionaryItemKind::Required => DictionaryItemKind::Required,
+                                DictionaryItemKind::Optional => {
+                                    if existing.kind.is_required() {
+                                        DictionaryItemKind::Required
+                                    } else {
+                                        DictionaryItemKind::Optional
+                                    }
+                                }
+                                DictionaryItemKind::Residual => existing.kind,
+                            };
                             existing.definition = merge_unpacked_key_definitions(
                                 existing.definition,
                                 unpacked_key.definition,
@@ -1973,6 +1988,11 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
                         );
                         unpacked_key.definition = None;
                     }
+                }
+                if !unpacked_key.kind.is_required()
+                    && unpacked_key.value_ty.resolve_type_alias(db).is_never()
+                {
+                    unpacked_key.kind = DictionaryItemKind::Residual;
                 }
             }
 
@@ -2008,6 +2028,7 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
             for key in all_keys {
                 let mut value_ty = UnionBuilder::new(db, env);
                 let mut is_required = true;
+                let mut has_named_value = false;
                 let mut definition = None;
                 let mut saw_key = false;
 
@@ -2015,7 +2036,9 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
                     if let Some(unpacked_key) = unpacked.keys.get(key.as_str()) {
                         saw_key = true;
                         value_ty.add_in_place(unpacked_key.value_ty);
-                        is_required &= unpacked_key.is_required;
+                        is_required &= unpacked_key.kind.is_required();
+                        has_named_value |= unpacked_key.kind != DictionaryItemKind::Residual
+                            && !unpacked_key.value_ty.resolve_type_alias(db).is_never();
                         definition = Some(if let Some(definition) = definition {
                             merge_unpacked_key_definitions(definition, unpacked_key.definition)
                         } else {
@@ -2037,7 +2060,13 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
                         key,
                         UnpackedTypedDictKey {
                             value_ty: value_ty.build(),
-                            is_required,
+                            kind: if is_required {
+                                DictionaryItemKind::Required
+                            } else if has_named_value {
+                                DictionaryItemKind::Optional
+                            } else {
+                                DictionaryItemKind::Residual
+                            },
                             definition: definition.flatten(),
                         },
                     );
@@ -2125,7 +2154,11 @@ pub(crate) fn extract_unpacked_typed_dict_keys_from_kwargs_annotation<'db>(
                     name.clone(),
                     UnpackedTypedDictKey {
                         value_ty: field.declared_ty,
-                        is_required: field.is_required(),
+                        kind: DictionaryItemKind::from_required(
+                            db,
+                            field.declared_ty,
+                            field.is_required(),
+                        ),
                         definition: field.first_declaration(),
                     },
                 )
@@ -2256,7 +2289,7 @@ fn collect_guaranteed_keys_from_merged_unpacked_keyword<'db>(
         extract_unpacked_typed_dict_keys_from_value_type(db, env, unpacked_type)
     {
         for (key, unpacked_key) in unpacked_keys {
-            if unpacked_key.is_required {
+            if unpacked_key.kind.is_required() {
                 provided_keys.insert(key);
             }
         }
@@ -2362,7 +2395,7 @@ fn validate_extracted_typed_dict_keys<'db, 'ast>(
         if ignored_keys.contains(key_name) {
             continue;
         }
-        if unpacked_key.is_required {
+        if unpacked_key.kind.is_required() {
             provided_keys.insert(key_name.clone());
         }
         valid &= TypedDictKeyAssignment {
@@ -3010,7 +3043,7 @@ fn validate_merged_unpacked_keyword_argument<'db, 'ast>(
         );
 
         for (key_name, unpacked_key) in unpacked.keys {
-            if unpacked_key.is_required && !ignored_keys.contains(&key_name) {
+            if unpacked_key.kind.is_required() && !ignored_keys.contains(&key_name) {
                 guaranteed_keys
                     .entry(key_name.clone())
                     .and_modify(|node| {
