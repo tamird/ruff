@@ -127,13 +127,15 @@ impl<'db> SemanticModel<'db> {
 
     /// Returns known string entries at an original call argument expression.
     ///
-    /// Immediate literals and fresh locals used only for keyword unpacking have complete key
-    /// sets. Other indexed argument uses expose partial flow observations.
+    /// Literals retain named entries and residual values from supported mapping spreads. Fresh
+    /// locals used only for keyword unpacking can have complete key sets. Other indexed argument
+    /// uses expose partial flow observations.
     pub fn dictionary_items(&self, expression: &Expr) -> Option<DictionaryItems<'db>> {
         if self.annotation_scope.is_some() {
             return None;
         }
-        DictionaryItems::literal(self.db, expression, &mut |expression| {
+        let env = ProgramEnvironment::from_file(self.file);
+        DictionaryItems::literal(self.db, &env, expression, &mut |expression| {
             expression.inferred_type(self)
         })
         .or_else(|| {

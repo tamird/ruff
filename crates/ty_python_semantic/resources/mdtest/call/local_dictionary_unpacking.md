@@ -1,4 +1,169 @@
-# Local dictionary keyword unpacking
+# Dictionary keyword unpacking
+
+## Literal spreads
+
+Dictionary literals retain each known key when unpacked at a call. Later entries replace earlier
+ones; separate call arguments still reject duplicates.
+
+```py
+def consume(value: int, note: str = ""): ...
+
+consume(**{"value": "replaced", **{"value": 1, "note": "ok"}})
+consume(**{**{"value": "replaced"}, "value": 1})
+consume(**{**{}, "value": 1})
+consume(**{**{}})  # error: [missing-argument]
+consume(**{**{"value": 1}, "extra": 0})  # error: [unknown-argument]
+consume(**{**{"value": 1}}, **{"value": 2})  # error: [parameter-already-assigned]
+```
+
+An unknown set of additional keys retains its own value type. It does not contribute the types of
+unrelated known fields to every parameter. An unpacked source can replace earlier keys, but a later
+explicit key always wins.
+
+```py
+from typing import Any
+
+def strings(value: str, count: int = 0): ...
+def residual(unknown: Any, integers: dict[str, int], strings_map: dict[str, str]):
+    strings(**{**unknown, "value": "ok"})
+    strings(**{**integers, "value": "ok"})
+    strings(**{"value": "ok", **integers})  # error: [invalid-argument-type]
+    strings(**{**strings_map, "value": "ok"})  # error: [invalid-argument-type]
+    strings(**{"value": 1, **unknown})  # error: [invalid-argument-type]
+    strings(**{**unknown, "value": 1})  # error: [invalid-argument-type]
+    strings(**{**unknown, "extra": 1})  # error: [unknown-argument]
+
+def invalid_keys(values: dict[int, int]):
+    strings(**{**values, "value": "ok"})  # error: [invalid-argument-type]
+```
+
+## TypedDict spreads
+
+Required fields overwrite prior values. Optional fields can preserve an earlier value, including one
+supplied by an earlier mapping's extra items. Their names are excluded from the same mapping's
+extra-item values, but a later separate call argument is still checked.
+
+```py
+from typing_extensions import NotRequired, TypedDict
+
+class OptionalValue(TypedDict, closed=True):
+    value: NotRequired[int]
+
+class RequiredValue(TypedDict, closed=True):
+    value: int
+
+class ExtraStrings(TypedDict, extra_items=str):
+    value: NotRequired[int]
+
+def consume(value: int, **kwargs: str): ...
+def integer(value: int): ...
+def spreads(optional: OptionalValue, required: RequiredValue, extra: ExtraStrings, other: dict[str, str]):
+    integer(**{**optional})
+    integer(**{"value": 0, **optional})
+    integer(**{"value": "bad", **optional})  # error: [invalid-argument-type]
+    integer(**{"value": "replaced", **required})
+    consume(**{**extra})
+    consume(**{**other, **optional})  # error: [invalid-argument-type]
+    # error: [parameter-already-assigned]
+    # error: [invalid-argument-type]
+    consume(**{**extra}, **other)
+```
+
+## Hidden and impossible spread keys
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+Implicitly open TypedDict sources retain ordinary dictionary inference. Their hidden fields have a
+different call policy from explicitly declared extra items, so these copies do not yet have precise
+inventories. Unsupported nested spreads also retain that fallback.
+
+```py
+from typing_extensions import Never, NotRequired, TypedDict
+
+class Open(TypedDict):
+    value: int
+
+def consume(value: int, note: str = ""): ...
+def required(value: int, needed: str): ...
+def variadic(value: int, **kwargs: int): ...
+def implicit(source: Open):
+    consume(**source)
+    consume(**{**source})
+    consume(**{**{**source}})
+    consume(**{"note": "earlier", **source})  # error: [invalid-argument-type]
+    consume(**{**source, "note": "later"})  # error: [invalid-argument-type]
+    required(**source)  # error: [missing-argument]
+    required(**{**source})
+    variadic(**source)  # error: [invalid-argument-type]
+    variadic(**{**source})
+
+class ExplicitObject(TypedDict, extra_items=object):
+    value: int
+
+def explicit(source: ExplicitObject):
+    consume(**{**source})  # error: [invalid-argument-type]
+    required(**{**source})  # error: [invalid-argument-type]
+    variadic(**{**source})  # error: [invalid-argument-type]
+
+class ExplicitInt(TypedDict, extra_items=int):
+    value: int
+
+type Mixed = Open | ExplicitInt
+
+def integers(value: int, note: int = 0): ...
+def mixed(source: Mixed):
+    integers(**{**source})
+```
+
+An intersection can constrain the hidden fields through a closed or explicit extra-item bound. An
+intersection of sources that still include implicit alternatives retains the ordinary fallback.
+
+```py
+from ty_extensions import Intersection
+
+class Closed(TypedDict, closed=True):
+    value: int
+
+def closed_intersection(source: Intersection[Mixed, Closed]):
+    consume(**{**source})
+    required(**{**source})  # error: [missing-argument]
+
+def explicit_intersection(source: Intersection[Mixed, ExplicitInt]):
+    integers(**{**source})
+    consume(**{**source})  # error: [invalid-argument-type]
+
+def implicit_intersection(source: Intersection[Mixed, Open]):
+    integers(**{**source})
+```
+
+Optional `Never` fields cannot supply an argument, and the residual still excludes their names.
+
+```py
+type Absent = Never
+
+class Extra(TypedDict, extra_items=int):
+    ghost: NotRequired[Absent]
+
+def integer(value: int): ...
+def absent(source: Extra):
+    integer(**{**source})
+
+def impossible(source: Never):
+    integer(**source)
+    integer(**{**source})
+
+def empty(source: dict[str, Never]):
+    integer(**{**source})  # error: [missing-argument]
+```
+
+Unpacking an unsupported source still produces its ordinary diagnostic.
+
+```py
+integer(**{**[1], "value": 1})  # error: [invalid-argument-type]
+```
 
 ## Complete key sets
 

@@ -2429,3 +2429,23 @@ def named_prefix(*, prefix: str) -> int:
 
 reveal_type(positional_prefix(named_prefix, 0, **{"prefix": "value"}))  # revealed: int
 ```
+
+## Forwarding dictionary spreads
+
+Known entries and additional mapping values are forwarded together. A wrapper's consumed prefix
+names remain excluded even when the mapping can contain other names.
+
+```py
+from typing import Callable
+
+def forward[**P](callback: Callable[P, None], prefix: int, *args: P.args, **kwargs: P.kwargs) -> None:
+    callback(*args, **kwargs)
+
+def target(value: str): ...
+def needs_prefix(prefix: str): ...
+def calls(values: dict[str, str]):
+    forward(target, **{**values, "prefix": 0, "value": "ok"})
+    forward(target, **{**values, "prefix": 0, "value": 1})  # error: [invalid-argument-type]
+    forward(target, **{**values, "prefix": "bad"})  # error: [invalid-argument-type]
+    forward(needs_prefix, **{**values, "prefix": 0})  # error: [missing-argument]
+```
