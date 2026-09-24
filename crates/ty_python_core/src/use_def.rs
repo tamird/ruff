@@ -1903,11 +1903,12 @@ impl PendingReachability {
 }
 
 /// A copy-on-write place state and the last reachability node materialized into it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingPlaceState {
-    state: Rc<PlaceState>,
+    // Compare the pending positions before potentially larger binding/declaration histories.
     reachability: PendingReachabilityId,
     narrowing: PendingReachabilityId,
+    state: Rc<PlaceState>,
 }
 
 impl PendingPlaceState {
@@ -1956,6 +1957,11 @@ impl PendingReachability {
         // Consecutive places often share their last applied reachability node, so their
         // merged path constraint can be reused even when they have distinct place states.
         let mut last_merged_reachability = None;
+        let mut last_merged_states: Option<(
+            PendingPlaceState,
+            PendingPlaceState,
+            PendingPlaceState,
+        )> = None;
         let mut branch_states = branch_states.into_iter();
         for current in current_states {
             let Some(mut branch_state) = branch_states.next() else {
@@ -2023,6 +2029,19 @@ impl PendingReachability {
                 continue;
             }
 
+            // Branch merges can leave many places with equal states in distinct allocations.
+            // Reuse the previous result when both complete inputs match; the branch tips remain
+            // fixed throughout this merge.
+            if let Some((previous_current, previous_branch, merged)) = &last_merged_states
+                && current == previous_current
+                && &branch_state == previous_branch
+            {
+                *current = merged.clone();
+                continue;
+            }
+            let previous_current = current.clone();
+            let previous_branch = branch_state.clone();
+
             self.materialize(
                 &mut branch_state,
                 branch,
@@ -2030,17 +2049,18 @@ impl PendingReachability {
                 reachability_constraints,
             );
             let branch_state = Rc::unwrap_or_clone(branch_state.state);
-            let current = self.materialize(
+            let merged = self.materialize(
                 current,
                 self.current,
                 narrowing_constraints,
                 reachability_constraints,
             );
-            current.merge(
+            merged.merge(
                 branch_state,
                 narrowing_constraints,
                 reachability_constraints,
             );
+            last_merged_states = Some((previous_current, previous_branch, current.clone()));
         }
     }
 }
@@ -3477,5 +3497,115 @@ impl<'db> UseDefMapBuilder<'db> {
         }
 
         interned_ids_by_snapshot
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_merge_inputs_preserve_complete_states() {
+        let mut reachability = ReachabilityConstraintsBuilder::default();
+        let mut narrowing = NarrowingConstraintsBuilder::default();
+        let a = ScopedPredicateId::new(0);
+        let b = ScopedPredicateId::new(1);
+        let reach_a = reachability.add_atom(a);
+        let reach_b = reachability.add_atom(b);
+        let not_b = reachability.add_not_constraint(reach_b);
+        let narrow_a = narrowing.add_atom(a);
+        let narrow_b = narrowing.add_atom(b);
+        let narrow_not_b = narrowing.add_negated_atom(b);
+
+        let mut pending = PendingReachability::default();
+        let root = pending.current;
+        pending.push(reach_a, narrow_a);
+        let common = pending.current;
+        pending.push(reach_b, narrow_b);
+        let current = pending.current;
+        pending.current = common;
+        pending.push(not_b, narrow_not_b);
+        let branch = pending.current;
+        pending.current = current;
+        let branch_reachability = reachability.add_and_constraint(reach_a, not_b);
+
+        let unbound = PlaceState::undefined(ScopedReachabilityConstraintId::ALWAYS_TRUE);
+        let mut inputs = vec![PendingPlaceState::new(unbound.clone(), root)];
+        let mut advanced = inputs[0].clone();
+        advanced.reachability = common;
+        inputs.push(advanced.clone());
+        advanced.narrowing = common;
+        inputs.push(advanced);
+        let mut narrowed = unbound.clone();
+        let narrow_c = narrowing.add_atom(ScopedPredicateId::new(2));
+        narrowed.record_narrowing_constraint(&mut narrowing, narrow_c);
+        inputs.push(PendingPlaceState::new(narrowed, root));
+        let mut declared = unbound.clone();
+        declared.record_declaration(ScopedDefinitionId::new(1), reach_a);
+        inputs.push(PendingPlaceState::new(declared, root));
+        for policy in [
+            FutureDefinitions::ShadowThisOne,
+            FutureDefinitions::DontShadowThisOne,
+        ] {
+            let mut bound = unbound.clone();
+            bound.record_binding(
+                ScopedDefinitionId::new(2),
+                reach_a,
+                false,
+                true,
+                PreviousDefinitions::AreShadowed,
+                policy,
+            );
+            inputs.push(PendingPlaceState::new(bound, root));
+        }
+
+        let mut current_states = IndexVec::<ScopedSymbolId, _>::new();
+        let mut branch_states = IndexVec::<ScopedSymbolId, _>::new();
+        let mut expected = IndexVec::<ScopedSymbolId, _>::new();
+        // Vary each side independently, then repeat the pair to exercise reuse.
+        let base = &inputs[0];
+        for (input, branch_input) in inputs
+            .iter()
+            .map(|input| (base, input))
+            .chain(inputs.iter().map(|input| (input, base)))
+        {
+            for _ in 0..2 {
+                // Distinct allocations take the general merge path even for equal values.
+                let other = PendingPlaceState {
+                    state: Rc::new((*branch_input.state).clone()),
+                    reachability: branch_input.reachability,
+                    narrowing: branch_input.narrowing,
+                };
+                current_states.push(input.clone());
+                branch_states.push(other.clone());
+                let mut single = IndexVec::<ScopedSymbolId, _>::from_iter([input.clone()]);
+                pending.merge_place_states(
+                    &mut single,
+                    IndexVec::from_iter([other]),
+                    branch,
+                    branch_reachability,
+                    &mut narrowing,
+                    &mut reachability,
+                );
+                expected.extend(single);
+            }
+        }
+        pending.merge_place_states(
+            &mut current_states,
+            branch_states,
+            branch,
+            branch_reachability,
+            &mut narrowing,
+            &mut reachability,
+        );
+        assert_eq!(current_states, expected);
+        assert_ne!(
+            expected[ScopedSymbolId::new(0)],
+            expected[ScopedSymbolId::new(2)]
+        );
+        assert_ne!(
+            expected[ScopedSymbolId::new(2)],
+            expected[ScopedSymbolId::new(4)]
+        );
     }
 }

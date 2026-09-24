@@ -1804,18 +1804,33 @@ fn benchmark_repeated_statement_calls(criterion: &mut Criterion) {
         });
     }
 
-    for (name, subsequent_keyword) in [
-        ("ty_micro[repeated_statement_calls_in_if_branches]", "if"),
+    for (name, subsequent_keyword, prefix_calls) in [
+        ("ty_micro[repeated_statement_calls_in_if_branches]", "if", 0),
         (
             "ty_micro[repeated_statement_calls_in_elif_branches]",
             "elif",
+            0,
+        ),
+        (
+            "ty_micro[repeated_statement_calls_before_elif_branches]",
+            "elif",
+            6_000,
         ),
     ] {
         let mut code = String::from("def call() -> None:\n    pass\n");
-        for index in 0..6_000 {
+        for index in 0..prefix_calls + 6_000 {
             writeln!(&mut code, "call_{index} = call").unwrap();
         }
-        code.push_str("def f(flag: int) -> None:\n");
+        if prefix_calls == 0 {
+            code.push_str("def f(flag: int) -> None:\n");
+        } else {
+            code.push_str(
+                "def f(flag: int, include_prefix: bool) -> None:\n    if include_prefix:\n",
+            );
+            for index in 0..prefix_calls {
+                writeln!(&mut code, "        call_{index}()").unwrap();
+            }
+        }
         for branch in 0..150 {
             let keyword = if branch == 0 {
                 "if"
@@ -1823,8 +1838,11 @@ fn benchmark_repeated_statement_calls(criterion: &mut Criterion) {
                 subsequent_keyword
             };
             writeln!(&mut code, "    {keyword} flag == {branch}:").unwrap();
-            for index in branch * 40..(branch + 1) * 40 {
+            for index in prefix_calls + branch * 40..prefix_calls + (branch + 1) * 40 {
                 writeln!(&mut code, "        call_{index}()").unwrap();
+            }
+            if prefix_calls > 0 {
+                code.push_str("        values = []\n        options = {}\n");
             }
         }
 
