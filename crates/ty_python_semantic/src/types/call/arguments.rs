@@ -9,6 +9,7 @@ use ruff_python_ast as ast;
 use rustc_hash::FxHashMap;
 
 use crate::ProgramEnvironment;
+use crate::types::signatures::Parameters;
 use crate::types::typed_dict::extract_unpacked_typed_dict_keys_from_value_type;
 use crate::types::{Type, TypeContext, expand_type};
 
@@ -379,7 +380,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
         }
     }
 
-    /// Create a new [`CallArguments`] containing only the arguments at the specified indices.
+    /// Select arguments forwarded to a `ParamSpec`, excluding the wrapper's prefix keywords.
     ///
     /// The resulting argument list preserves the order of `indices`. Unlike [`Self::start_from`],
     /// this can project a non-contiguous subset of the original call arguments. This is used to
@@ -389,11 +390,45 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     /// def wrapper[**P, R](func: Callable[P, R], **kwargs: P.kwargs) -> R: ...
     /// wrapper(TagSet=[...], func=f)  # select `TagSet=[...]`, but not the later `func=f`
     /// ```
-    pub(crate) fn select(&self, indices: &[usize]) -> Self {
+    ///
+    /// A complete keyword unpack can supply both prefix and forwarded parameters. Retain only
+    /// the forwarded entries, preserving each entry's type, presence, and source location.
+    pub(crate) fn select_for_paramspec(
+        &self,
+        indices: &[usize],
+        parameters: &Parameters<'db>,
+        prefix_len: usize,
+    ) -> Self {
         Self {
             items: indices
                 .iter()
-                .map(|index| self.items[*index].clone())
+                .map(|index| {
+                    let CallArgument {
+                        argument,
+                        types,
+                        known_unpacking,
+                    } = &self.items[*index];
+                    let known_unpacking =
+                        known_unpacking.as_ref().map(|unpacking| match unpacking {
+                            KnownUnpacking::Positional(_) => unpacking.clone(),
+                            KnownUnpacking::Keywords(items) => KnownUnpacking::Keywords(
+                                items
+                                    .iter()
+                                    .filter(|item| {
+                                        parameters
+                                            .keyword_by_name(&item.name)
+                                            .is_none_or(|(index, _)| index >= prefix_len)
+                                    })
+                                    .cloned()
+                                    .collect(),
+                            ),
+                        });
+                    CallArgument {
+                        argument: *argument,
+                        types: types.clone(),
+                        known_unpacking,
+                    }
+                })
                 .collect(),
         }
     }
