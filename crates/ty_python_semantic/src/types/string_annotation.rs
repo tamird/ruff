@@ -5,19 +5,21 @@ use ruff_db::source::source_text;
 use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex, StringFlags};
 use ruff_python_parser::{ParseError, ParseErrorType, Parsed};
 use ruff_text_size::{Ranged, TextRange};
-use ty_python_core::definition::Definition;
+use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::node_key::NodeKey;
-use ty_python_core::{ExpressionNodeKey, ProgramFile, ProvidedAnnotation, semantic_index};
+use ty_python_core::{
+    ExpressionNodeKey, ProgramFile, ProvidedAnnotation, global_scope, semantic_index,
+};
 
 use crate::Db;
 use crate::declare_lint;
 use crate::lint::{Level, LintStatus};
 use crate::provided::ProvidedReturnType;
-use crate::types::Type;
 use crate::types::diagnostic::INVALID_TYPE_FORM;
 use crate::types::diagnostic::autofix_with_literal;
-use crate::types::infer::{InferenceFlags, TypeExpressionFlags};
+use crate::types::infer::{InferenceFlags, TypeExpressionFlags, infer_definition_types};
 use crate::types::signatures::function_signature_annotation_info;
+use crate::types::{Type, TypeAndQualifiers};
 
 use super::context::InferContext;
 
@@ -103,11 +105,25 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         let range = match db.provided_annotation(file, owner.node_index().load())? {
             ProvidedAnnotation::Range(range) => range,
             ProvidedAnnotation::External {
-                file,
+                file: foreign_file,
                 owner: foreign_owner,
             } => {
+                let annotation = external_annotation(db, foreign_file, foreign_owner)?;
+                let local_module = parsed_module(db, file.python_file(db)).load(db);
+                let local_assignment = match local_module.get_by_index(owner.node_index().load()) {
+                    ast::AnyRootNodeRef::Expr(expression) => expression.is_name_expr(),
+                    _ => false,
+                };
+                if local_assignment
+                    != matches!(
+                        annotation.definition.kind(db),
+                        DefinitionKind::AnnotatedAssignment(_)
+                    )
+                {
+                    return None;
+                }
                 return Some(Self::External {
-                    annotation: external_annotation(db, file, foreign_owner)?,
+                    annotation,
                     range: owner.range(),
                 });
             }
@@ -190,6 +206,17 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         }
     }
 
+    pub(crate) fn external_declaration(&self, db: &'db dyn Db) -> Option<TypeAndQualifiers<'db>> {
+        let Self::External {
+            annotation,
+            range: _,
+        } = self
+        else {
+            return None;
+        };
+        annotation.declaration(db)
+    }
+
     pub(crate) fn is_starred(&self) -> bool {
         match self {
             Self::External {
@@ -263,26 +290,47 @@ impl Ranged for SourceAnnotation<'_, '_> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, salsa::SalsaValue)]
 pub(crate) struct ExternalAnnotation<'db> {
-    function: Definition<'db>,
+    definition: Definition<'db>,
     expression: ExpressionNodeKey,
     source: FileRange,
     starred: bool,
 }
 
 impl<'db> ExternalAnnotation<'db> {
+    fn declaration(&self, db: &'db dyn Db) -> Option<TypeAndQualifiers<'db>> {
+        if !matches!(
+            self.definition.kind(db),
+            DefinitionKind::AnnotatedAssignment(_)
+        ) {
+            return None;
+        }
+        let inference = infer_definition_types(db, self.definition);
+        // A TypeAlias declaration describes the alias binding, not an assignment annotation.
+        if inference
+            .try_expression_type(self.expression)
+            .is_some_and(|ty| ty.is_typealias_special_form())
+        {
+            return None;
+        }
+        inference.inferred_declaration(self.definition).declared()
+    }
+
     fn inferred(&self, db: &'db dyn Db) -> (Type<'db>, TypeExpressionFlags) {
         let Self {
-            function,
+            definition,
             expression,
             source: _,
             starred: _,
         } = self;
-        let (ty, flags) = function_signature_annotation_info(db, *function, *expression);
+        if !matches!(definition.kind(db), DefinitionKind::Function(_)) {
+            return (Type::unknown(), TypeExpressionFlags::empty());
+        }
+        let (ty, flags) = function_signature_annotation_info(db, *definition, *expression);
         (ty.unwrap_or_else(Type::unknown), flags)
     }
 }
 
-/// Preserve the declaring function and expression identity for lazy annotation inference.
+/// Preserve the declaring definition and expression identity for lazy annotation inference.
 /// Foreign nodes stay in their own expression table and name-resolution scope.
 #[salsa::tracked(returns(copy))]
 fn external_annotation<'db>(
@@ -292,16 +340,24 @@ fn external_annotation<'db>(
 ) -> Option<ExternalAnnotation<'db>> {
     let module = parsed_module(db, file.python_file(db)).load(db);
     let index = semantic_index(db, file);
-    let (function, expression) = match module.get_by_index(owner) {
-        ast::AnyRootNodeRef::Stmt(statement) => {
-            let ast::Stmt::FunctionDef(function) = statement else {
-                return None;
-            };
-            (
+    let (definition, expression) = match module.get_by_index(owner) {
+        ast::AnyRootNodeRef::Stmt(statement) => match statement {
+            ast::Stmt::FunctionDef(function) => (
                 index.try_definition(function)?,
                 function.returns.as_deref()?,
-            )
-        }
+            ),
+            ast::Stmt::AnnAssign(assignment) => {
+                if !assignment.target.is_name_expr() {
+                    return None;
+                }
+                let definition = index.try_definition(assignment)?;
+                if definition.scope(db) != global_scope(db, file) {
+                    return None;
+                }
+                (definition, assignment.annotation.as_ref())
+            }
+            _ => return None,
+        },
         ast::AnyRootNodeRef::Parameter(parameter) => {
             let definition = index.try_definition(parameter)?;
             let function = definition.scope(db).node(db).as_function()?;
@@ -313,7 +369,7 @@ fn external_annotation<'db>(
         _ => return None,
     };
     Some(ExternalAnnotation {
-        function,
+        definition,
         expression: expression.into(),
         source: FileRange::new(file.file(db), expression.range()),
         starred: expression.is_starred_expr(),
