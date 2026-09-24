@@ -4893,10 +4893,11 @@ pub(crate) enum MatchingOverloadIndex {
 
 #[derive(Default, Clone, Copy)]
 struct ParameterInfo {
-    /// Any potential match, including optional dictionary keys, can collide with later inputs.
+    /// Whether an input can supply this parameter, including optional dictionary keys.
     matched: bool,
-    /// Optional observed keys alone cannot supply a required parameter.
-    satisfies_required: bool,
+    /// Skip this parameter when matching later packs with unknown keyword names.
+    /// Optional observed keys leave this false so later pack values are checked.
+    skip_unknown_keywords: bool,
     suppress_missing_error: bool,
 }
 
@@ -5001,7 +5002,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         parameter: &Parameter<'db>,
         positional: bool,
         variable_argument_length: bool,
-        is_required: bool,
+        skip_unknown_keywords: bool,
     ) {
         if self.parameter_info[parameter_index].matched
             && !parameter.is_variadic()
@@ -5038,7 +5039,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         });
         matched_argument.matched = true;
         self.parameter_info[parameter_index].matched = true;
-        self.parameter_info[parameter_index].satisfies_required |= is_required;
+        self.parameter_info[parameter_index].skip_unknown_keywords |= skip_unknown_keywords;
     }
 
     fn match_positional(
@@ -5082,7 +5083,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument: Argument<'a>,
         argument_type: Option<Type<'db>>,
         name: &str,
-        is_required: bool,
+        skip_unknown_keywords: bool,
     ) -> Result<(), ()> {
         let Some((parameter_index, parameter)) = self
             .parameters
@@ -5115,7 +5116,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             parameter,
             false,
             false,
-            is_required,
+            skip_unknown_keywords,
         );
         Ok(())
     }
@@ -5409,7 +5410,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             self.match_typed_dict_openness(argument_index, openness);
         } else {
             for (parameter_index, parameter) in self.parameters.iter().enumerate() {
-                if self.parameter_info[parameter_index].satisfies_required
+                if self.parameter_info[parameter_index].skip_unknown_keywords
                     && !parameter.is_keyword_variadic()
                 {
                     continue;
@@ -5468,7 +5469,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
 
         if has_explicit_extra_items {
             for (parameter_index, parameter) in self.parameters.iter().enumerate() {
-                if self.parameter_info[parameter_index].satisfies_required
+                if self.parameter_info[parameter_index].skip_unknown_keywords
                     || parameter.keyword_name().is_none()
                 {
                     continue;
@@ -5641,13 +5642,13 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         for (
             index,
             ParameterInfo {
-                matched: _,
-                satisfies_required,
+                matched,
+                skip_unknown_keywords: _,
                 suppress_missing_error,
             },
         ) in self.parameter_info.iter().copied().enumerate()
         {
-            if !satisfies_required {
+            if !matched {
                 if suppress_missing_error {
                     continue;
                 }
