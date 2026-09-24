@@ -11,8 +11,8 @@ use crate::types::ide_support::{
     definitions_for_keyword_argument, inlay_hint_call_argument_details,
 };
 use crate::types::{
-    CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryItem, DictionaryItems,
-    KnownClass, Parameter, Parameters, Signature,
+    CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryItem, DictionaryItemKind,
+    DictionaryItems, KnownClass, Parameter, Parameters, Signature,
 };
 use crate::{HasType, SemanticModel};
 
@@ -200,14 +200,18 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         for DictionaryItem {
             name,
             ty,
-            is_required,
+            kind,
             source: range,
         } in items
         {
             write!(
                 description,
                 "; {name}{}: {} at {}",
-                if is_required { "" } else { "?" },
+                match kind {
+                    DictionaryItemKind::Required => "",
+                    DictionaryItemKind::Optional => "?",
+                    DictionaryItemKind::Residual => "~",
+                },
                 ty.display(db, &env),
                 &source[range]
             )

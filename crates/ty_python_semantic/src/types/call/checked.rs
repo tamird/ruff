@@ -21,16 +21,55 @@ use crate::types::typed_dict::{
 use crate::types::{KnownClass, ProgramEnvironment, Type, UnionType};
 use crate::{Db, FxIndexMap};
 
-/// A known string key and its observed value in a dictionary argument.
+/// A named value or per-name residual restriction in a dictionary argument.
 /// Optional entries in partial dictionaries can have unobserved values on other paths.
 #[derive(Clone, Debug)]
 pub struct DictionaryItem<'db> {
     pub name: Name,
     pub ty: Type<'db>,
-    /// Whether a definition of this key reaches the argument on every path.
-    pub is_required: bool,
+    pub kind: DictionaryItemKind,
     /// The key's definition or unpacking expression in the call's file.
     pub source: TextRange,
+}
+
+/// A dictionary entry's presence and named-value evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictionaryItemKind {
+    /// A named value is present on every path.
+    Required,
+    /// A named value may be present.
+    Optional,
+    /// A restriction on values supplied by unknown keys, not evidence of a named value.
+    /// `Never` excludes this name from the residual.
+    Residual,
+}
+
+impl DictionaryItemKind {
+    pub(crate) fn from_required<'db>(db: &'db dyn Db, ty: Type<'db>, is_required: bool) -> Self {
+        if is_required {
+            Self::Required
+        } else if ty.resolve_type_alias(db).is_never() {
+            Self::Residual
+        } else {
+            Self::Optional
+        }
+    }
+
+    pub(crate) const fn is_required(self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
+
+impl DictionaryItem<'_> {
+    pub const fn is_required(&self) -> bool {
+        let Self {
+            name: _,
+            ty: _,
+            kind,
+            source: _,
+        } = self;
+        kind.is_required()
+    }
 }
 
 /// Dictionary entries available at a call argument.
@@ -42,9 +81,10 @@ pub struct DictionaryItems<'db> {
 /// Evidence about dictionary values beyond the named entries.
 #[derive(Clone, Copy, Debug)]
 pub enum DictionaryExtraItems<'db> {
-    /// Every possible key has a named entry, which records its own presence.
+    /// Every possible key has an entry, which records its own evidence.
     Closed,
-    /// Values for additional keys. All named entries, including optional ones, are excluded.
+    /// Values for additional keys. Every represented name is excluded; its entry records the
+    /// applicable value restriction and whether a named value can supply it.
     Value(Type<'db>),
     /// Only individual writes were observed. The ordinary mapping type still applies to unseen
     /// keys and to optional observed keys on paths where their writes did not execute.
@@ -124,7 +164,11 @@ impl<'db> DictionaryItems<'db> {
                 elements.push(DictionaryItem {
                     name,
                     ty: field_ty,
-                    is_required: definedness == Definedness::AlwaysDefined,
+                    kind: DictionaryItemKind::from_required(
+                        db,
+                        field_ty,
+                        definedness == Definedness::AlwaysDefined,
+                    ),
                     source,
                 });
             }
@@ -258,7 +302,7 @@ impl<'db> DictionaryItems<'db> {
             let entry = DictionaryItem {
                 name: name.clone(),
                 ty,
-                is_required: true,
+                kind: DictionaryItemKind::Required,
                 source: key.range(),
             };
             // Repeated keys replace their values without changing insertion order.
@@ -295,13 +339,13 @@ impl<'db> DictionaryItems<'db> {
                     .map(|(name, key)| {
                         let UnpackedTypedDictKey {
                             value_ty,
-                            is_required,
+                            kind,
                             definition: _,
                         } = key;
                         DictionaryItem {
                             name,
                             ty: value_ty,
-                            is_required,
+                            kind,
                             source,
                         }
                     })
@@ -356,15 +400,22 @@ impl<'db> DictionaryItemsBuilder<'db> {
         for mut item in items {
             match self.items.entry(item.name.clone()) {
                 Entry::Occupied(mut entry) => {
-                    if !item.is_required {
+                    if !item.is_required() {
                         let previous = entry.get();
                         item.ty = UnionType::from_two_elements(db, env, previous.ty, item.ty);
-                        item.is_required = previous.is_required;
+                        if item.kind == DictionaryItemKind::Residual {
+                            item.source = previous.source;
+                        }
+                        item.kind = match previous.kind {
+                            DictionaryItemKind::Required => DictionaryItemKind::Required,
+                            DictionaryItemKind::Optional => DictionaryItemKind::Optional,
+                            DictionaryItemKind::Residual => item.kind,
+                        };
                     }
                     entry.insert(item);
                 }
                 Entry::Vacant(entry) => {
-                    if !item.is_required
+                    if !item.is_required()
                         && let Some(ty) = self.extra_items
                     {
                         item.ty = UnionType::from_two_elements(db, env, ty, item.ty);
