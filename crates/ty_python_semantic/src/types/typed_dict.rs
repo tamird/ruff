@@ -241,7 +241,7 @@ impl<'db> TypedDictType<'db> {
     ///
     /// A class-based `TypedDict` inherits the first explicit policy from its bases unless it
     /// declares its own `closed` or `extra_items` argument.
-    pub(crate) fn openness(self, db: &'db dyn Db) -> TypedDictOpenness<'db> {
+    pub fn openness(self, db: &'db dyn Db) -> TypedDictOpenness<'db> {
         #[salsa::tracked(
             returns(copy),
             cycle_initial=|_, _, _| TypedDictOpenness::ImplicitlyOpen,
