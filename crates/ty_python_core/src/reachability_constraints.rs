@@ -564,3 +564,30 @@ impl ReachabilityConstraintsBuilder {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_operations_remain_stable_at_capacity() {
+        let mut constraints = ReachabilityConstraintsBuilder::default();
+        let a = constraints.add_atom(ScopedPredicateId::new(0));
+        let b = constraints.add_atom(ScopedPredicateId::new(1));
+        let c = constraints.add_atom(ScopedPredicateId::new(2));
+        let disjunction = constraints.add_or_constraint(a, c);
+        while constraints.interiors.len() < MAX_INTERIOR_NODES - 1 {
+            constraints.add_atom(ScopedPredicateId::new(constraints.interiors.len() + 10));
+        }
+
+        // The first conjunction reaches the cap. Its completed result remains cached
+        // for later callers with identical operands.
+        let conjunction = constraints.add_and_constraint(a, b);
+        assert!(constraints.interiors.len() >= MAX_INTERIOR_NODES);
+        assert_ne!(conjunction, AMBIGUOUS);
+        assert_eq!(constraints.add_and_constraint(a, b), conjunction);
+        assert_eq!(constraints.add_or_constraint(a, c), disjunction);
+        assert_eq!(constraints.add_and_constraint(a, c), AMBIGUOUS);
+        assert_eq!(constraints.add_or_constraint(b, c), AMBIGUOUS);
+    }
+}
