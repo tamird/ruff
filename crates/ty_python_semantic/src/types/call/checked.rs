@@ -20,9 +20,13 @@ use crate::types::infer::infer_definition_types;
 use crate::types::{KnownClass, ProgramEnvironment, Type};
 
 /// A known string key and its observed value in a dictionary argument.
+/// Optional entries in partial dictionaries can have unobserved values on other paths.
+#[derive(Clone, Debug)]
 pub struct DictionaryItem<'db> {
     pub name: Name,
     pub ty: Type<'db>,
+    /// Whether a definition of this key reaches the argument on every path.
+    pub is_required: bool,
     /// The key's definition in the call's file.
     pub source: TextRange,
 }
@@ -30,10 +34,10 @@ pub struct DictionaryItem<'db> {
 /// Dictionary entries available at a call argument.
 pub struct DictionaryItems<'db> {
     pub items: Box<[DictionaryItem<'db>]>,
-    /// Whether these entries describe the entire string-key set.
+    /// Whether these entries describe every possible string key.
     ///
-    /// Immediate literals and fresh local dictionaries used exclusively through keyword
-    /// unpacking can be complete. Other observations narrow known values while preserving
+    /// Immediate literals and fresh local dictionaries with only tracked uses can be complete.
+    /// Each entry records its own presence. Other observations narrow known values while preserving
     /// the dictionary's ordinary value type for additional keys.
     pub is_complete: bool,
 }
@@ -98,22 +102,25 @@ impl<'db> DictionaryItems<'db> {
 
             if let Place::Defined(DefinedPlace {
                 ty: field_ty,
-                definedness: Definedness::AlwaysDefined,
+                definedness,
                 ..
             }) = place.place
             {
                 elements.push(DictionaryItem {
                     name,
                     ty: field_ty,
+                    is_required: definedness == Definedness::AlwaysDefined,
                     source,
                 });
             }
         }
 
         let is_complete =
-            Self::complete_initializer_keys(db, scope, expression).is_some_and(|keys| {
-                keys.len() == elements.len()
-                    && elements.iter().all(|element| keys.contains(&element.name))
+            Self::complete_initializer_keys(db, scope, expression).is_some_and(|mut keys| {
+                for element in &elements {
+                    keys.remove(&element.name);
+                }
+                keys.is_empty()
             });
         Some(DictionaryItems {
             items: elements.into_boxed_slice(),
@@ -121,7 +128,7 @@ impl<'db> DictionaryItems<'db> {
         })
     }
 
-    /// Recover a fresh allocation only when no source-level use can expose or mutate it.
+    /// Recover a fresh allocation whose key assignments are all tracked.
     ///
     /// The usage check covers the whole symbol, including other bindings and nested captures.
     /// This deliberately gives up precision after harmless reads, but also catches loop-carried
@@ -140,9 +147,7 @@ impl<'db> DictionaryItems<'db> {
         let symbol = index
             .place_table(scope.file_scope_id(db))
             .symbol_by_name(&name.id)?;
-        if !symbol.is_local()
-            || symbol.is_declared()
-            || !symbol.is_used_only_for_keyword_unpacking()
+        if !symbol.is_local() || symbol.is_declared() || !symbol.has_only_tracked_dictionary_uses()
         {
             return None;
         }
@@ -223,6 +228,7 @@ impl<'db> DictionaryItems<'db> {
             let entry = DictionaryItem {
                 name: name.clone(),
                 ty,
+                is_required: true,
                 source: key.range(),
             };
             match indexes.entry(name) {

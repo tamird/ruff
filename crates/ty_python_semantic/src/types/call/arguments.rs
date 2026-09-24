@@ -6,7 +6,6 @@ use std::fmt::Display;
 
 use itertools::{Either, Itertools};
 use ruff_python_ast as ast;
-use ruff_python_ast::name::Name;
 use rustc_hash::FxHashMap;
 
 use crate::ProgramEnvironment;
@@ -48,15 +47,15 @@ struct CallArgument<'a, 'db> {
     known_unpacking: Option<KnownUnpacking<'db>>,
 }
 
-/// The exact contents of an unpacked argument.
+/// Known elements of an unpacked argument.
 ///
 /// These values supplement the container type: `list[int | str]` alone cannot retain the
 /// argument count or associate each element with its parameter. Dictionary observations qualify
-/// only when their complete key set is known.
+/// only when every possible key is known; individual keys can be optional.
 #[derive(Clone, Debug)]
 pub(super) enum KnownUnpacking<'db> {
     Positional(Box<[Type<'db>]>),
-    Keywords(Box<[(Name, Type<'db>)]>),
+    Keywords(Box<[DictionaryItem<'db>]>),
 }
 
 impl<'db> KnownUnpacking<'db> {
@@ -97,19 +96,7 @@ impl<'db> KnownUnpacking<'db> {
         if !dictionary.is_complete {
             return None;
         }
-        Some(Self::Keywords(
-            dictionary
-                .items
-                .into_iter()
-                .map(
-                    |DictionaryItem {
-                         name,
-                         ty,
-                         source: _,
-                     }| (name, ty),
-                )
-                .collect(),
-        ))
+        Some(Self::Keywords(dictionary.items))
     }
 }
 

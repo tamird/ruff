@@ -44,7 +44,7 @@ bitflags! {
         /// true if the symbol is assigned more than once, or if it is assigned even though it is already in use
         const IS_REASSIGNED         = 1 << 5;
         const IS_PARAMETER          = 1 << 6;
-        const HAS_NON_KEYWORD_UNPACKING_USE = 1 << 7;
+        const HAS_UNTRACKED_DICTIONARY_USE = 1 << 7;
     }
 }
 
@@ -67,12 +67,13 @@ impl Symbol {
         self.flags.contains(SymbolFlags::IS_USED)
     }
 
-    /// Whether every use in this scope is a direct `**name` argument, with no nested captures.
-    pub fn is_used_only_for_keyword_unpacking(&self) -> bool {
+    /// Whether every use is a direct `**name` argument or a tracked string-key assignment.
+    /// Nested captures and uses that can expose the dictionary are excluded.
+    pub fn has_only_tracked_dictionary_uses(&self) -> bool {
         self.is_used()
             && !self
                 .flags
-                .contains(SymbolFlags::HAS_NON_KEYWORD_UNPACKING_USE)
+                .contains(SymbolFlags::HAS_UNTRACKED_DICTIONARY_USE)
     }
 
     /// Is the symbol given a value in its containing scope?
@@ -152,10 +153,10 @@ impl Symbol {
     }
 
     pub(super) fn mark_used(&mut self) {
-        self.insert_flags(SymbolFlags::IS_USED | SymbolFlags::HAS_NON_KEYWORD_UNPACKING_USE);
+        self.insert_flags(SymbolFlags::IS_USED | SymbolFlags::HAS_UNTRACKED_DICTIONARY_USE);
     }
 
-    pub(super) fn mark_used_for_keyword_unpacking(&mut self) {
+    pub(super) fn mark_tracked_dictionary_use(&mut self) {
         self.insert_flags(SymbolFlags::IS_USED);
     }
 
