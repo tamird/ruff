@@ -1,4 +1,4 @@
-use super::checked::{DictionaryItem, DictionaryItems};
+use super::checked::{DictionaryExtraItems, DictionaryItem, DictionaryItems};
 use crate::Db;
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -6,6 +6,7 @@ use std::fmt::Display;
 
 use itertools::{Either, Itertools};
 use ruff_python_ast as ast;
+use ruff_python_ast::name::Name;
 use rustc_hash::FxHashMap;
 
 use crate::ProgramEnvironment;
@@ -51,12 +52,20 @@ struct CallArgument<'a, 'db> {
 /// Known elements of an unpacked argument.
 ///
 /// These values supplement the container type: `list[int | str]` alone cannot retain the
-/// argument count or associate each element with its parameter. Dictionary observations qualify
-/// only when every possible key is known; individual keys can be optional.
+/// argument count or associate each element with its parameter. Keyword inventories may include
+/// a residual value type for additional names; individual known keys can be optional.
 #[derive(Clone, Debug)]
 pub(super) enum KnownUnpacking<'db> {
     Positional(Box<[Type<'db>]>),
-    Keywords(Box<[DictionaryItem<'db>]>),
+    Keywords(KnownKeywords<'db>),
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct KnownKeywords<'db> {
+    pub(super) items: Box<[DictionaryItem<'db>]>,
+    pub(super) extra_items: Option<Type<'db>>,
+    /// Prefix parameters removed while forwarding to a `ParamSpec` remain excluded from the tail.
+    pub(super) excluded_names: Vec<Name>,
 }
 
 impl<'db> KnownUnpacking<'db> {
@@ -94,10 +103,17 @@ impl<'db> KnownUnpacking<'db> {
     }
 
     fn keywords(dictionary: DictionaryItems<'db>) -> Option<Self> {
-        if !dictionary.is_complete {
-            return None;
-        }
-        Some(Self::Keywords(dictionary.items))
+        let DictionaryItems { items, extra_items } = dictionary;
+        let extra_items = match extra_items {
+            DictionaryExtraItems::Closed => None,
+            DictionaryExtraItems::Value(ty) => Some(ty),
+            DictionaryExtraItems::Unobserved => return None,
+        };
+        Some(Self::Keywords(KnownKeywords {
+            items,
+            extra_items,
+            excluded_names: Vec::new(),
+        }))
     }
 }
 
@@ -391,8 +407,9 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     /// wrapper(TagSet=[...], func=f)  # select `TagSet=[...]`, but not the later `func=f`
     /// ```
     ///
-    /// A complete keyword unpack can supply both prefix and forwarded parameters. Retain only
-    /// the forwarded entries, preserving each entry's type, presence, and source location.
+    /// A keyword inventory can supply both prefix and forwarded parameters. Retain only the
+    /// forwarded entries, preserving each entry's type, presence, and source location. A residual
+    /// must not supply prefix keywords again in the forwarded call.
     pub(crate) fn select_for_paramspec(
         &self,
         indices: &[usize],
@@ -411,8 +428,13 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                     let known_unpacking =
                         known_unpacking.as_ref().map(|unpacking| match unpacking {
                             KnownUnpacking::Positional(_) => unpacking.clone(),
-                            KnownUnpacking::Keywords(items) => KnownUnpacking::Keywords(
-                                items
+                            KnownUnpacking::Keywords(keywords) => {
+                                let KnownKeywords {
+                                    items,
+                                    extra_items,
+                                    excluded_names,
+                                } = keywords;
+                                let items = items
                                     .iter()
                                     .filter(|item| {
                                         parameters
@@ -420,8 +442,20 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                                             .is_none_or(|(index, _)| index >= prefix_len)
                                     })
                                     .cloned()
-                                    .collect(),
-                            ),
+                                    .collect();
+                                let mut excluded_names = excluded_names.clone();
+                                excluded_names.extend(
+                                    parameters
+                                        .iter()
+                                        .take(prefix_len)
+                                        .filter_map(|parameter| parameter.keyword_name().cloned()),
+                                );
+                                KnownUnpacking::Keywords(KnownKeywords {
+                                    items,
+                                    extra_items: *extra_items,
+                                    excluded_names,
+                                })
+                            }
                         });
                     CallArgument {
                         argument: *argument,

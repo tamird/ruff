@@ -4940,7 +4940,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             .collect();
         for (index, _) in arguments.iter().enumerate() {
             if let Some(KnownUnpacking::Keywords(keywords)) = arguments.known_unpacking(index) {
-                explicit_keyword_parameters.extend(keywords.iter().filter_map(|item| {
+                explicit_keyword_parameters.extend(keywords.items.iter().filter_map(|item| {
                     if item.is_required {
                         parameters
                             .keyword_by_name(&item.name)
@@ -5383,7 +5383,10 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         if let Some(KnownUnpacking::Keywords(keywords)) =
             self.arguments.known_unpacking(argument_index)
         {
-            for item in keywords {
+            for item in &keywords.items {
+                if !item.is_required && item.ty.resolve_type_alias(db).is_never() {
+                    continue;
+                }
                 let _ = self.match_keyword(
                     argument_index,
                     Argument::Keywords,
@@ -5391,6 +5394,21 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     item.name.as_str(),
                     item.is_required,
                 );
+            }
+            if let Some(extra_items) = keywords.extra_items {
+                self.match_mapping_keywords(argument_index, |name| {
+                    if name.is_some_and(|name| {
+                        keywords.items.iter().any(|item| item.name == name)
+                            || keywords
+                                .excluded_names
+                                .iter()
+                                .any(|excluded| excluded == name)
+                    }) {
+                        None
+                    } else {
+                        Some(extra_items)
+                    }
+                });
             }
         } else if let Some(unpacked) =
             argument_type.and_then(|ty| extract_unpacked_typed_dict_from_value_type(db, env, ty))
@@ -5409,45 +5427,52 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             }
             self.match_typed_dict_openness(argument_index, openness);
         } else {
-            for (parameter_index, parameter) in self.parameters.iter().enumerate() {
-                if self.parameter_info[parameter_index].skip_unknown_keywords
-                    && !parameter.is_keyword_variadic()
-                {
-                    continue;
-                }
-
-                if matches!(
-                    parameter.kind(),
-                    ParameterKind::PositionalOnly { .. } | ParameterKind::Variadic { .. }
-                ) {
-                    continue;
-                }
-
-                let parameter_name = self.parameters[parameter_index]
-                    .keyword_name()
-                    .map(Name::as_str);
-
-                let value_type = match argument_type {
+            self.match_mapping_keywords(argument_index, |parameter_name| {
+                Some(match argument_type {
                     Some(argument_type) => argument_type
                         .as_paramspec_typevar(db)
                         .or_else(|| argument_type.getitem_dunder_call(db, env, parameter_name))
                         .unwrap_or(Type::unknown()),
 
                     None => Type::unknown(),
-                };
+                })
+            });
+        }
+    }
 
-                self.assign_argument(
-                    argument_index,
-                    Argument::Keywords,
-                    Some(value_type),
-                    InvalidArgumentTypeProvenance::Argument,
-                    parameter_index,
-                    parameter,
-                    false,
-                    true,
-                    true,
-                );
+    /// Match an ordinary mapping's possible additional keywords. Unlike declared `TypedDict`
+    /// extras, these can satisfy required parameters and do not require a `**kwargs` parameter.
+    fn match_mapping_keywords(
+        &mut self,
+        argument_index: usize,
+        mut value_type: impl FnMut(Option<&str>) -> Option<Type<'db>>,
+    ) {
+        for (parameter_index, parameter) in self.parameters.iter().enumerate() {
+            if self.parameter_info[parameter_index].skip_unknown_keywords
+                && !parameter.is_keyword_variadic()
+            {
+                continue;
             }
+            if matches!(
+                parameter.kind(),
+                ParameterKind::PositionalOnly { .. } | ParameterKind::Variadic { .. }
+            ) {
+                continue;
+            }
+            let Some(value_type) = value_type(parameter.keyword_name().map(Name::as_str)) else {
+                continue;
+            };
+            self.assign_argument(
+                argument_index,
+                Argument::Keywords,
+                Some(value_type),
+                InvalidArgumentTypeProvenance::Argument,
+                parameter_index,
+                parameter,
+                false,
+                true,
+                true,
+            );
         }
     }
 

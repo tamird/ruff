@@ -1,10 +1,9 @@
-use std::collections::hash_map::Entry;
-
+use indexmap::map::Entry;
 use itertools::Itertools;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::{Ranged, TextRange};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use ty_python_core::ProgramFile;
 use ty_python_core::definition::{BindingsOwner, Definition, DefinitionKind};
 use ty_python_core::scope::{ScopeId, ScopeKind};
@@ -12,12 +11,15 @@ use ty_python_core::semantic_index;
 
 use super::arguments::CallArgumentTypes;
 use super::{Binding, CallArguments};
-use crate::Db;
 use crate::place::{DefinedPlace, Definedness, Place, place_from_bindings_with_reachability_cache};
 use crate::reachability::ReachabilityEvaluationCache;
 use crate::types::class::DynamicClassAnchor;
 use crate::types::infer::infer_definition_types;
-use crate::types::{KnownClass, ProgramEnvironment, Type};
+use crate::types::typed_dict::{
+    UnpackedTypedDict, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
+};
+use crate::types::{KnownClass, ProgramEnvironment, Type, UnionType};
+use crate::{Db, FxIndexMap};
 
 /// A known string key and its observed value in a dictionary argument.
 /// Optional entries in partial dictionaries can have unobserved values on other paths.
@@ -27,22 +29,35 @@ pub struct DictionaryItem<'db> {
     pub ty: Type<'db>,
     /// Whether a definition of this key reaches the argument on every path.
     pub is_required: bool,
-    /// The key's definition in the call's file.
+    /// The key's definition or unpacking expression in the call's file.
     pub source: TextRange,
 }
 
 /// Dictionary entries available at a call argument.
 pub struct DictionaryItems<'db> {
     pub items: Box<[DictionaryItem<'db>]>,
-    /// Whether these entries describe every possible string key.
-    ///
-    /// Immediate literals and fresh local dictionaries with only tracked uses can be complete.
-    /// Each entry records its own presence. Other observations narrow known values while preserving
-    /// the dictionary's ordinary value type for additional keys.
-    pub is_complete: bool,
+    pub extra_items: DictionaryExtraItems<'db>,
+}
+
+/// Evidence about dictionary values beyond the named entries.
+#[derive(Clone, Copy, Debug)]
+pub enum DictionaryExtraItems<'db> {
+    /// Every possible key has a named entry, which records its own presence.
+    Closed,
+    /// Values for additional keys. All named entries, including optional ones, are excluded.
+    Value(Type<'db>),
+    /// Only individual writes were observed. The ordinary mapping type still applies to unseen
+    /// keys and to optional observed keys on paths where their writes did not execute.
+    /// These observations cannot establish an inventory for keyword argument matching.
+    Unobserved,
 }
 
 impl<'db> DictionaryItems<'db> {
+    /// Whether the named entries account for every possible key.
+    pub const fn is_complete(&self) -> bool {
+        matches!(self.extra_items, DictionaryExtraItems::Closed)
+    }
+
     pub(crate) fn observed(
         db: &'db dyn Db,
         scope: ScopeId<'db>,
@@ -124,7 +139,11 @@ impl<'db> DictionaryItems<'db> {
             });
         Some(DictionaryItems {
             items: elements.into_boxed_slice(),
-            is_complete,
+            extra_items: if is_complete {
+                DictionaryExtraItems::Closed
+            } else {
+                DictionaryExtraItems::Unobserved
+            },
         })
     }
 
@@ -201,6 +220,7 @@ impl<'db> DictionaryItems<'db> {
 
     pub(crate) fn literal(
         db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         expression: &ast::Expr,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> Option<Self> {
@@ -212,10 +232,20 @@ impl<'db> DictionaryItems<'db> {
         else {
             return None;
         };
-        let mut entries = Vec::<DictionaryItem<'db>>::with_capacity(items.len());
-        let mut indexes = FxHashMap::<Name, usize>::default();
+        let mut dictionary = DictionaryItemsBuilder::default();
         for ast::DictItem { key, value } in items {
-            let key = key.as_ref()?;
+            let Some(key) = key else {
+                let unpacked = if value.is_dict_expr() {
+                    // An unsupported nested literal invalidates the whole inventory. Its ordinary
+                    // inferred value type must not masquerade as a proven residual here.
+                    Self::literal(db, env, value, expression_type)?
+                } else {
+                    let ty = expression_type(value)?;
+                    Self::unpacked(db, env, ty, value.range())?
+                };
+                dictionary.overlay(db, env, unpacked)?;
+                continue;
+            };
             let name = match key {
                 ast::Expr::StringLiteral(literal) => Name::new(literal.value.to_str()),
                 _ => {
@@ -231,21 +261,133 @@ impl<'db> DictionaryItems<'db> {
                 is_required: true,
                 source: key.range(),
             };
-            match indexes.entry(name) {
-                Entry::Occupied(index) => {
-                    // Repeated keys replace their values without changing insertion order.
-                    entries[*index.get()] = entry;
-                }
-                Entry::Vacant(index) => {
-                    index.insert(entries.len());
-                    entries.push(entry);
+            // Repeated keys replace their values without changing insertion order.
+            dictionary.items.insert(name, entry);
+        }
+        Some(dictionary.finish())
+    }
+
+    /// Read an unpacked source's existing type without inferring its expression again.
+    fn unpacked(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        source: TextRange,
+    ) -> Option<Self> {
+        // An unreachable source is not evidence for an inhabited, empty mapping.
+        if ty.resolve_type_alias(db).is_never() {
+            return None;
+        }
+        if let Some(unpacked) = extract_unpacked_typed_dict_from_value_type(db, env, ty) {
+            let UnpackedTypedDict {
+                keys,
+                openness,
+                has_implicit_extra_items,
+            } = unpacked;
+            // Hidden TypedDict fields follow a different call policy from ordinary mapping
+            // values. Preserve the existing literal inference until that provenance is retained.
+            if has_implicit_extra_items {
+                return None;
+            }
+            return Some(Self {
+                items: keys
+                    .into_iter()
+                    .map(|(name, key)| {
+                        let UnpackedTypedDictKey {
+                            value_ty,
+                            is_required,
+                            definition: _,
+                        } = key;
+                        DictionaryItem {
+                            name,
+                            ty: value_ty,
+                            is_required,
+                            source,
+                        }
+                    })
+                    .collect(),
+                extra_items: openness
+                    .effective_extra_items()
+                    .map_or(DictionaryExtraItems::Closed, |extra| {
+                        DictionaryExtraItems::Value(extra.declared_ty)
+                    }),
+            });
+        }
+        let (_, value_ty) = ty.unpack_keys_and_items(db, env)?;
+        Some(Self {
+            items: Box::default(),
+            extra_items: if value_ty.resolve_type_alias(db).is_never() {
+                DictionaryExtraItems::Closed
+            } else {
+                DictionaryExtraItems::Value(value_ty)
+            },
+        })
+    }
+}
+
+/// An ordered overlay of mapping sources. The residual excludes every represented name.
+#[derive(Default)]
+struct DictionaryItemsBuilder<'db> {
+    items: FxIndexMap<Name, DictionaryItem<'db>>,
+    extra_items: Option<Type<'db>>,
+}
+
+impl<'db> DictionaryItemsBuilder<'db> {
+    fn overlay(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        dictionary: DictionaryItems<'db>,
+    ) -> Option<()> {
+        let DictionaryItems { items, extra_items } = dictionary;
+        let incoming_extra = match extra_items {
+            DictionaryExtraItems::Closed => None,
+            DictionaryExtraItems::Value(ty) => Some(ty),
+            DictionaryExtraItems::Unobserved => return None,
+        };
+        if let Some(ty) = incoming_extra {
+            let names: FxHashSet<_> = items.iter().map(|item| item.name.clone()).collect();
+            for item in self.items.values_mut() {
+                if !names.contains(&item.name) {
+                    item.ty = UnionType::from_two_elements(db, env, item.ty, ty);
                 }
             }
         }
-        Some(Self {
-            items: entries.into_boxed_slice(),
-            is_complete: true,
-        })
+        for mut item in items {
+            match self.items.entry(item.name.clone()) {
+                Entry::Occupied(mut entry) => {
+                    if !item.is_required {
+                        let previous = entry.get();
+                        item.ty = UnionType::from_two_elements(db, env, previous.ty, item.ty);
+                        item.is_required = previous.is_required;
+                    }
+                    entry.insert(item);
+                }
+                Entry::Vacant(entry) => {
+                    if !item.is_required
+                        && let Some(ty) = self.extra_items
+                    {
+                        item.ty = UnionType::from_two_elements(db, env, ty, item.ty);
+                    }
+                    entry.insert(item);
+                }
+            }
+        }
+        if let Some(ty) = incoming_extra {
+            self.extra_items = Some(self.extra_items.map_or(ty, |previous| {
+                UnionType::from_two_elements(db, env, previous, ty)
+            }));
+        }
+        Some(())
+    }
+
+    fn finish(self) -> DictionaryItems<'db> {
+        let Self { items, extra_items } = self;
+        DictionaryItems {
+            items: items.into_values().collect(),
+            extra_items: extra_items
+                .map_or(DictionaryExtraItems::Closed, DictionaryExtraItems::Value),
+        }
     }
 }
 

@@ -11,8 +11,8 @@ use crate::types::ide_support::{
     definitions_for_keyword_argument, inlay_hint_call_argument_details,
 };
 use crate::types::{
-    CheckedArgument, CheckedCall, DictionaryItem, DictionaryItems, KnownClass, Parameter,
-    Parameters, Signature,
+    CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryItem, DictionaryItems,
+    KnownClass, Parameter, Parameters, Signature,
 };
 use crate::{HasType, SemanticModel};
 
@@ -177,14 +177,10 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         if call.declaration()?.name(db)?.as_str() != "observe" {
             return None;
         }
-        let Some(DictionaryItems { items, is_complete }) = call.dictionary_argument("value") else {
+        let Some(entries) = call.dictionary_argument("value") else {
             return Some(Type::string_literal(db, "unavailable"));
         };
-        Some(describe(
-            db,
-            call.file(),
-            DictionaryItems { items, is_complete },
-        ))
+        Some(describe(db, call.file(), entries))
     }
 
     fn describe<'db>(
@@ -192,10 +188,14 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         file: ProgramFile<'db>,
         entries: DictionaryItems<'db>,
     ) -> Type<'db> {
-        let DictionaryItems { items, is_complete } = entries;
+        let DictionaryItems { items, extra_items } = entries;
         let source = source_text(db, file.file(db));
         let env = ProgramEnvironment::from_file(file);
-        let mut description = if is_complete { "complete" } else { "partial" }.to_owned();
+        let mut description = match extra_items {
+            DictionaryExtraItems::Closed => "complete".to_owned(),
+            DictionaryExtraItems::Value(ty) => format!("extra: {}", ty.display(db, &env)),
+            DictionaryExtraItems::Unobserved => "partial".to_owned(),
+        };
         // Preserve key order, values, and their source spelling through the public call view.
         for DictionaryItem {
             name,
@@ -236,6 +236,10 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
             "complete; x: Literal[1] at key",
         ),
         (
+            "key = 'x'\nresult = observe({'x': 1, **{key: 2}})",
+            "complete; x: Literal[2] at key",
+        ),
+        (
             "values = {'x': 1}\nresult = observe(values)",
             "partial; x: Literal[1] at 'x'",
         ),
@@ -273,7 +277,7 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         ),
         (
             "values = {'x': 1}\nresult = observe({**values})",
-            "unavailable",
+            "extra: int",
         ),
         ("result = observe(1)", "unavailable"),
     ] {

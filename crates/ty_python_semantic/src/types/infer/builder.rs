@@ -8922,9 +8922,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expression: &ast::Expr,
         ty: Type<'db>,
     ) -> Option<DictionaryItems<'db>> {
-        DictionaryItems::literal(self.db(), expression, &mut |expression| {
-            self.try_expression_type(expression)
-        })
+        DictionaryItems::literal(
+            self.db(),
+            self.program_environment(),
+            expression,
+            &mut |expression| self.try_expression_type(expression),
+        )
         .or_else(|| self.observed_dictionary_items(expression, ty))
     }
 
@@ -8935,8 +8938,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         argument: &'ast ast::ArgOrKeyword,
     ) -> Option<Type<'db>> {
         let keyword = argument.as_variadic()?;
-        let DictionaryItems { items, is_complete } =
-            self.observed_dictionary_items(&keyword.value, argument_type)?;
+        let dictionary = self.observed_dictionary_items(&keyword.value, argument_type)?;
+        let is_complete = dictionary.is_complete();
+        let DictionaryItems {
+            items,
+            extra_items: _,
+        } = dictionary;
         // In a partial dictionary, a conditional write can leave an unseen prior value in place.
         // Only a complete key set proves that the key was absent on the other path.
         let mut elements = items

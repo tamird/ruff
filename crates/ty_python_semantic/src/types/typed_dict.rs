@@ -1784,6 +1784,10 @@ pub(crate) struct UnpackedTypedDict<'db> {
     /// Declared keys that may be present after unpacking.
     pub(crate) keys: BTreeMap<Name, UnpackedTypedDictKey<'db>>,
     pub(crate) openness: TypedDictOpenness<'db>,
+    /// Whether an implicit extra-item policy remains among the possible sources. Union
+    /// normalization can turn implicit and explicit policies into `Extra[object]`; retaining this
+    /// provenance lets consumers distinguish that result from explicitly declared object values.
+    pub(crate) has_implicit_extra_items: bool,
 }
 
 /// Combines the openness policies of intersected `TypedDict`-shaped values.
@@ -1914,6 +1918,7 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
             Some(UnpackedTypedDict {
                 keys,
                 openness: td.openness(db),
+                has_implicit_extra_items: td.openness(db).is_implicitly_open(),
             })
         }
         Type::Intersection(intersection) => {
@@ -1980,6 +1985,11 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
             Some(UnpackedTypedDict {
                 keys: result,
                 openness,
+                // One genuine closed or explicit bound restricts all intersected sources. A
+                // synthesized `Extra[object]` from a mixed union is not such a bound.
+                has_implicit_extra_items: unpacked_elements
+                    .iter()
+                    .all(|unpacked| unpacked.has_implicit_extra_items),
             })
         }
         Type::Union(union) => {
@@ -2043,6 +2053,9 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
             Some(UnpackedTypedDict {
                 keys: result,
                 openness,
+                has_implicit_extra_items: unpacked_elements
+                    .iter()
+                    .any(|unpacked| unpacked.has_implicit_extra_items),
             })
         }
         Type::TypeAlias(alias) => {
