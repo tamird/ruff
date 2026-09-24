@@ -73,9 +73,55 @@ impl SourceProvider for ExternalSource {
         let module = parsed_module(db, file.python_file(db)).load(db);
         let declarations = parsed_module(db, target.python_file(db)).load(db);
         for statement in module.suite() {
+            let target_name = match statement {
+                ast::Stmt::Assign(assignment) => match assignment.targets.as_slice() {
+                    [target] => Some(target),
+                    _ => None,
+                },
+                ast::Stmt::AnnAssign(assignment) => Some(assignment.target.as_ref()),
+                _ => None,
+            };
+            if let Some(ast::Expr::Name(name)) = target_name
+                && name.node_index().load() == owner
+            {
+                let foreign = declarations.suite().iter().find_map(|statement| {
+                    let ast::Stmt::AnnAssign(declaration) = statement else {
+                        return None;
+                    };
+                    let ast::Expr::Name(target) = declaration.target.as_ref() else {
+                        return None;
+                    };
+                    (target.id == name.id).then_some(declaration)
+                })?;
+                return Some(ProvidedAnnotation::External {
+                    file: target,
+                    owner: foreign.node_index().load(),
+                });
+            }
             let ast::Stmt::FunctionDef(function) = statement else {
                 continue;
             };
+            // Deliberately supply mismatched value/function exports to exercise recovery.
+            if (function.node_index().load() == owner
+                || function
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.as_parameter().node_index().load() == owner))
+                && let Some(foreign) = declarations.suite().iter().find_map(|statement| {
+                    let ast::Stmt::AnnAssign(declaration) = statement else {
+                        return None;
+                    };
+                    let ast::Expr::Name(target) = declaration.target.as_ref() else {
+                        return None;
+                    };
+                    (target.id == function.name.id).then_some(declaration)
+                })
+            {
+                return Some(ProvidedAnnotation::External {
+                    file: target,
+                    owner: foreign.node_index().load(),
+                });
+            }
             let Some(foreign) = declarations.suite().iter().find_map(|statement| {
                 let ast::Stmt::FunctionDef(declaration) = statement else {
                     return None;
@@ -1383,5 +1429,148 @@ fn excluded_source_has_no_bindings_or_flow_effects() -> anyhow::Result<()> {
             assert_eq!(model.scope(while_statement.into()), None);
         }
     }
+    Ok(())
+}
+
+#[test]
+fn external_assignment_annotations_keep_scope_and_edits() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            "Scalar = int\nvalues = [1]\nnative: int = 1\n",
+        )
+        .with_file("/src/contracts.pyi", "")
+        .with_source_provider(ExternalSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let stub = system_path_to_file(&db, "/src/contracts.pyi")?;
+    for scalar in ["str", "int", "str"] {
+        db.write_file(
+            "/src/contracts.pyi",
+            format!(
+                "{}Scalar = {scalar}\nvalues: list[Scalar]\nnative: str\n",
+                "# foreign declaration\n".repeat(20)
+            ),
+        )?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics.len(),
+            usize::from(scalar == "str"),
+            "{diagnostics:#?}"
+        );
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.id().as_str(), "invalid-assignment");
+            assert_eq!(
+                diagnostic.primary_annotation().unwrap().get_span().file(),
+                &ruff_db::diagnostic::UnifiedFile::Ty(file)
+            );
+            assert!(
+                diagnostic
+                    .annotations()
+                    .iter()
+                    .any(|annotation| annotation.get_span().file()
+                        == &ruff_db::diagnostic::UnifiedFile::Ty(stub)),
+                "{diagnostic:#?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn external_assignment_annotations_preserve_qualifiers() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/main.py", "value = 1\nvalue += 2\n")
+        .with_file(
+            "/src/contracts.pyi",
+            "from typing import Final\nvalue: Final[int]\n",
+        )
+        .with_source_provider(ExternalSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-assignment");
+    assert!(
+        diagnostics[0].headline_message().contains("Final"),
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn external_assignment_annotations_exclude_type_aliases() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/main.py", "value = 1\n")
+        .with_file(
+            "/src/contracts.pyi",
+            "from typing import TypeAlias\nvalue: TypeAlias = str\n",
+        )
+        .with_source_provider(ExternalSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    assert!(db.check_file(file).is_empty());
+    Ok(())
+}
+
+#[test]
+fn external_assignment_annotation_cycles_keep_initializer_evidence() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/main.py", "value = 1\n")
+        .with_file(
+            "/src/contracts.pyi",
+            "from main import value as Alias\nvalue: Alias\n",
+        )
+        .with_source_provider(ExternalSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    assert!(db.check_file(file).is_empty());
+    let file = db.program_file(file);
+    let model = SemanticModel::new(&db, file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let ast::Stmt::Assign(assignment) = &module.suite()[0] else {
+        panic!("expected assignment");
+    };
+    let ty = assignment.value.inferred_type(&model).unwrap();
+    assert_eq!(
+        ty.display(&db, &model.program_environment()).to_string(),
+        "Literal[1]"
+    );
+    Ok(())
+}
+
+#[test]
+fn external_assignment_annotations_do_not_become_signature_annotations() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            "def value(argument): return argument\nobserved = value('ok')\n",
+        )
+        .with_file(
+            "/src/contracts.pyi",
+            "from typing import Final\nvalue: Final[int]\n",
+        )
+        .with_source_provider(ExternalSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    assert!(db.check_file(file).is_empty());
+    let file = db.program_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let function = module.suite()[0].as_function_def_stmt().unwrap();
+    assert!(
+        crate::types::string_annotation::SourceAnnotation::new(&db, file, function, None).is_none()
+    );
+    assert!(
+        crate::types::string_annotation::SourceAnnotation::new(
+            &db,
+            file,
+            &function.parameters.args[0].parameter,
+            None
+        )
+        .is_none()
+    );
+    let model = SemanticModel::new(&db, file);
+    let observed = module.suite()[1].as_assign_stmt().unwrap();
+    assert_eq!(observed.value.inferred_type(&model), Some(Type::unknown()));
     Ok(())
 }

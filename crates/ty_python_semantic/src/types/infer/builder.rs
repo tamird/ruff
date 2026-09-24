@@ -3465,15 +3465,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             && let Some(annotation) =
                 SourceAnnotation::new(self.db(), self.program_file(), target, None)
         {
-            if let Some((expression, state)) = self.annotation_expression(&annotation) {
+            let declared = if let Some((expression, state)) =
+                self.annotation_expression(&annotation)
+            {
                 self.setup_dataclass_field_specifiers();
                 let declared = self.infer_annotation_expression_allow_pep_613(expression, state);
                 self.dataclass_field_specifiers.clear();
+                Some(declared)
+            } else {
+                annotation.external_declaration(self.db())
+            };
+            if let Some(declared) = declared {
                 self.infer_assignment_with_annotation(
                     definition,
                     target,
                     Some(assignment.value(self.module())),
-                    expression,
+                    &annotation,
                     declared,
                     assignment.owner(),
                 );
@@ -4581,7 +4588,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             definition,
             target,
             value,
-            annotation,
+            &SourceAnnotation::Native(annotation),
             declared,
             BindingsOwner::Definition,
         );
@@ -4593,7 +4600,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         definition: Definition<'db>,
         target: &ast::Expr,
         value: Option<&ast::Expr>,
-        annotation: &ast::Expr,
+        annotation: &SourceAnnotation<'_, 'db>,
         mut declared: TypeAndQualifiers<'db>,
         bindings_owner: BindingsOwner,
     ) {
@@ -4617,7 +4624,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     for annotating `{variadic}` function parameters",
                 ));
             }
-        } else if let ast::Expr::Attribute(attr_expr) = annotation
+        } else if let Some(ast::Expr::Attribute(attr_expr)) = annotation.expression()
             && matches!(attr_expr.attr.as_str(), "args" | "kwargs")
         {
             // Also check the AST form for cases where P isn't bound (e.g., class body
