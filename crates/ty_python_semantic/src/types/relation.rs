@@ -909,7 +909,7 @@ impl<'db> Type<'db> {
     ///
     /// This function aims to have no false positives, but might return wrong
     /// `false` answers in some cases.
-    pub(crate) fn is_disjoint_from(
+    pub fn is_disjoint_from(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
