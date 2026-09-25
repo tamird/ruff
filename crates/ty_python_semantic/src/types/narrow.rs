@@ -151,7 +151,21 @@ fn successful_subscript_constraints<'db>(
     let scope = receiver.scope(db);
     let index = semantic_index(db, receiver.program_file(db));
     let module = parsed_module(db, receiver.program_file(db).python_file(db)).load(db);
-    let Some(name) = receiver.node_ref(db).node(&module).as_name_expr() else {
+    let receiver_node = receiver.node_ref(db).node(&module);
+    let mut root = receiver_node;
+    let mut path: SmallVec<[Name; 4]> = SmallVec::new();
+    while let ast::Expr::Attribute(attribute) = root {
+        let ast::ExprAttribute {
+            value,
+            attr,
+            ctx: _,
+            range: _,
+            node_index: _,
+        } = attribute;
+        path.push(attr.id.clone());
+        root = value;
+    }
+    let Some(name) = root.as_name_expr() else {
         return unchanged;
     };
     let places = place_table(db, scope);
@@ -174,13 +188,30 @@ fn successful_subscript_constraints<'db>(
     {
         return unchanged;
     }
+    let env = ProgramEnvironment::from_scope(scope);
+    if !path.is_empty() {
+        path.reverse();
+        let root_ty = inference.expression_type(root);
+        if !root_ty.has_immutable_field_path(db, &env, &path) {
+            return unchanged;
+        }
+    }
+    let Some(place) =
+        PlaceExpr::try_from_expr(receiver_node).and_then(|place| places.place_id(&place))
+    else {
+        return unchanged;
+    };
     let key_inference = infer_expression_types(db, key, TypeContext::default());
     if key_inference.is_provisional() {
         return ExpressionNarrowingConstraints::Provisional;
     }
     let key_ty = key_inference.expression_type(key.node_ref(db));
-    let env = ProgramEnvironment::from_scope(scope);
     let narrowed = union.filter(db, |arm| {
+        // None has no subscript operation. Keep the original lookup diagnostic, but
+        // exclude this arm from the path on which the operation completed.
+        if arm.is_none(db) {
+            return false;
+        }
         if !matches!(arm, Type::NominalInstance(_)) {
             return true;
         }
@@ -192,10 +223,8 @@ fn successful_subscript_constraints<'db>(
     if narrowed == receiver_ty {
         return unchanged;
     }
-    let constraints = NarrowingConstraints::from_iter([(
-        symbol.into(),
-        NarrowingConstraint::intersection(narrowed),
-    )]);
+    let constraints =
+        NarrowingConstraints::from_iter([(place, NarrowingConstraint::intersection(narrowed))]);
     ExpressionNarrowingConstraints::Inferred {
         positive: Some(constraints.into()),
         negative: None,

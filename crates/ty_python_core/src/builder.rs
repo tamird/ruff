@@ -3658,7 +3658,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 self.scopes[self.current_scope()].kind(),
                 ScopeKind::Function | ScopeKind::Lambda
             )
-            || !value.is_name_expr()
+            || !is_dotted_name(value)
         {
             return;
         }
@@ -3679,6 +3679,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             ast::Stmt::Assign(statement) => Some(statement.value.as_ref()),
             ast::Stmt::AnnAssign(statement) => statement.value.as_deref(),
             ast::Stmt::For(statement) => Some(statement.iter.as_ref()),
+            ast::Stmt::Return(statement) => statement.value.as_deref(),
             _ => None,
         };
         if !root.is_some_and(|root| root.range().contains_range(*range)) {
