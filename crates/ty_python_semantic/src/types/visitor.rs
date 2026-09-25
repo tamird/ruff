@@ -538,7 +538,7 @@ fn dynamic_content_impl<'db>(
                 return;
             }
 
-            if matches!(self.mode, DynamicContentMode::Materialization) && ty.is_divergent() {
+            if !matches!(self.mode, DynamicContentMode::All) && ty.is_divergent() {
                 self.record(DynamicContent::Indeterminate);
                 return;
             }
@@ -1071,6 +1071,73 @@ mod tests {
         ] {
             assert!(!materialization_is_noop(&db, &env, ty));
         }
+    }
+
+    #[test]
+    fn static_except_any_preserves_unresolved_content() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+            from __future__ import annotations
+            from typing import Any, Callable, Protocol
+            from ty_extensions import Unknown
+
+            class Recursive[T](Protocol):
+                @property
+                def value(self) -> T: ...
+                @property
+                def child(self) -> Recursive[T]: ...
+
+            class Growing[T](Protocol):
+                @property
+                def child(self) -> Growing[list[T]]: ...
+
+            explicit: list[Any]
+            missing: list[Unknown]
+            callback: Callable[..., Any]
+            unresolved_callback: Callable[[Unknown], int]
+            exact: Recursive[Any]
+            unresolved: Recursive[Unknown]
+            growing: Growing[Any]
+            "#,
+        )?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/a.py")?;
+        let module = ProgramFile::new(&db, file, env.program(&db));
+        for (name, expected) in [
+            ("explicit", true),
+            ("missing", false),
+            ("callback", true),
+            ("unresolved_callback", false),
+            ("exact", true),
+            ("unresolved", false),
+            ("growing", false),
+        ] {
+            let ty = global_symbol(&db, module, name).place.expect_type();
+            assert_eq!(
+                ty.is_fully_static_except_any(&db, &env),
+                expected,
+                "{name}: {:?} in {}",
+                super::non_any_dynamic_content(&db, &env, ty),
+                ty.display(&db, &env)
+            );
+        }
+        let divergent = Type::divergent(salsa::plumbing::Id::from_bits(1));
+        for ty in [
+            divergent,
+            divergent.top_materialization(&db, &env),
+            divergent.bottom_materialization(&db, &env),
+            Type::pending_narrowing(),
+        ] {
+            assert!(!ty.is_fully_static_except_any(&db, &env));
+            let callback = Type::paramspec_value_callable(
+                &db,
+                Parameters::standard([Parameter::positional_only(None).with_annotated_type(ty)]),
+            );
+            assert!(!callback.is_fully_static_except_any(&db, &env));
+        }
+        Ok(())
     }
 
     #[test]

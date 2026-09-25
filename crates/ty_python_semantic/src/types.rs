@@ -2368,6 +2368,14 @@ impl<'db> Type<'db> {
         dynamic_content(db, env, self).is_absent()
     }
 
+    /// Returns whether the stored type components contain no dynamic types other than `Any`.
+    /// Indeterminate recursive traversal and provisional types return `false`.
+    /// Original function signatures and nominal members require separate analysis.
+    /// This checks type content, independently of annotation provenance or body checking.
+    pub fn is_fully_static_except_any(self, db: &'db dyn Db, env: &ProgramEnvironment) -> bool {
+        visitor::non_any_dynamic_content(db, env, self).is_absent()
+    }
+
     const fn as_intersection(self) -> Option<IntersectionType<'db>> {
         match self {
             Type::Intersection(intersection) => Some(intersection),
