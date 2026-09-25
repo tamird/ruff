@@ -10,10 +10,8 @@ use ruff_python_ast as ast;
 
 mod arguments;
 mod checked;
-pub use checked::{
-    CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryItem, DictionaryItemKind,
-    DictionaryItems,
-};
+pub(super) use arguments::collect_keyword_items;
+pub use checked::{CheckedArgument, CheckedCall};
 pub(crate) mod bind;
 pub(super) use arguments::{Argument, CallArguments};
 pub(super) use bind::{

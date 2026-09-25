@@ -1,4 +1,6 @@
-use super::checked::{DictionaryExtraItems, DictionaryItem, DictionaryItemKind, DictionaryItems};
+use crate::types::dictionary::{
+    DictionaryExtraItems, DictionaryItem, DictionaryItemKind, DictionaryItems,
+};
 use crate::{Db, FxIndexMap};
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -25,7 +27,7 @@ const MAX_TOTAL_EXPANSION: usize = 256;
 
 /// Combine keyword sources on paths where their call succeeds. Unlike dictionary overlays,
 /// separate keyword sources cannot overwrite a supplied name: a collision raises instead.
-pub(super) fn collect_keyword_items<'db>(
+pub(crate) fn collect_keyword_items<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     sources: impl IntoIterator<Item = Option<DictionaryItems<'db>>>,

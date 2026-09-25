@@ -24,16 +24,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec, smallvec_inline};
 
 use self::constructor::{ConstructorBinding, ConstructorContext};
-use super::{
-    Argument, CallArguments, CallError, CallErrorKind, DictionaryItemKind, InferContext, Signature,
-    Type,
-};
+use super::{Argument, CallArguments, CallError, CallErrorKind, InferContext, Signature, Type};
 use crate::db::Db;
 use crate::dunder_all::dunder_all_names;
 use crate::lint::LintMetadata;
 use crate::place::{DefinedPlace, Definedness, Place};
 use crate::subscript::PyIndex;
-use crate::types::ProgramEnvironment;
 use crate::types::call::arguments::{
     CallArgumentExpansions, CallArgumentTypes, Expansion, KnownUnpacking,
 };
@@ -82,6 +78,7 @@ use crate::types::{
     TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance, UnionAccumulator, UnionBuilder,
     UnionType, WrapperDescriptorKind, enums, is_property_method, list_members,
 };
+use crate::types::{DictionaryItemKind, ProgramEnvironment};
 use crate::{DisplaySettings, FxOrderSet};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
 use ruff_python_ast::{self as ast, AnyNodeRef, ArgOrKeyword, PythonVersion};
