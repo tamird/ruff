@@ -28,6 +28,7 @@ use expression::Expression;
 use narrowing_constraints::ScopedNarrowingConstraint;
 pub use place::{PlaceExprRef, PlaceTable};
 pub use reachability_constraints::ReachabilityConstraintsBuilder;
+use reachability_constraints::ScopedReachabilityConstraintId;
 pub use scope::FileScopeId;
 use scope::{NodeWithScopeKey, NodeWithScopeRef, Scope, ScopeId, ScopeKind, ScopeLaziness};
 use symbol::ScopedSymbolId;
@@ -146,7 +147,22 @@ pub fn use_def_map<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> Arc<UseDefMap<'
 /// in the scope's [`UseDefMap`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, get_size2::GetSize)]
 pub struct LoopHeader {
-    bindings: FxHashMap<ScopedPlaceId, SmallVec<[LiveBinding; 1]>>,
+    bindings: FxHashMap<ScopedPlaceId, LoopBindings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, get_size2::GetSize)]
+struct LoopBindings {
+    generated: SmallVec<[LiveBinding; 1]>,
+    incoming: ScopedReachabilityConstraintId,
+}
+
+impl Default for LoopBindings {
+    fn default() -> Self {
+        Self {
+            generated: SmallVec::new(),
+            incoming: ScopedReachabilityConstraintId::ALWAYS_FALSE,
+        }
+    }
 }
 
 impl LoopHeader {
@@ -157,16 +173,53 @@ impl LoopHeader {
     }
 
     fn add_binding(&mut self, place: ScopedPlaceId, binding: LiveBinding) {
-        self.bindings.entry(place).or_default().push(binding);
+        let Self { bindings } = self;
+        let LoopBindings {
+            generated,
+            incoming: _,
+        } = bindings.entry(place).or_default();
+        generated.push(binding);
+    }
+
+    fn set_incoming(&mut self, place: ScopedPlaceId, incoming: ScopedReachabilityConstraintId) {
+        let Self { bindings } = self;
+        let LoopBindings {
+            generated: _,
+            incoming: current,
+        } = bindings.entry(place).or_default();
+        *current = incoming;
+    }
+
+    /// Conditions under which this iteration preserves the place's incoming value.
+    ///
+    /// This is the surviving synthesized header binding, separate from the generated bindings
+    /// used by ordinary loop inference. Its predicates describe one iteration's transfer.
+    pub fn incoming_for_place(
+        &self,
+        place: ScopedPlaceId,
+    ) -> Option<ScopedReachabilityConstraintId> {
+        let Self { bindings } = self;
+        bindings.get(&place).map(
+            |LoopBindings {
+                 generated: _,
+                 incoming,
+             }| *incoming,
+        )
     }
 
     pub fn bindings_for_place(
         &self,
         place: ScopedPlaceId,
     ) -> impl Iterator<Item = LiveBinding> + '_ {
-        self.bindings
+        let Self { bindings } = self;
+        bindings
             .get(&place)
-            .map(|v: &SmallVec<[LiveBinding; 1]>| v.iter().copied())
+            .map(
+                |LoopBindings {
+                     generated,
+                     incoming: _,
+                 }| generated.iter().copied(),
+            )
             .into_iter()
             .flatten()
     }

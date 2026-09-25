@@ -2140,3 +2140,280 @@ def narrowed_replacement(box: Box, replacement: Box):
         box = replacement
         assert not box.value
 ```
+
+## Initial bindings surviving coordinated loop updates
+
+An initial `None` can survive this loop only while `tags` still denotes its untouched empty
+initializer. The terminating length check excludes that initial binding. This holds for zero or many
+iterations; replacement values keep their independently inferred types.
+
+```py
+def escape(value: list[str]) -> None: ...
+def number(value: int) -> None: ...
+def opaque(value):
+    return value
+
+def select(rows: list[tuple[bool, list[str], str]]) -> str:
+    tags = []
+    name = None
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    escape(tags)
+    for value in tags:
+        number(1)
+    reveal_type(name)  # revealed: str
+    number("wrong")  # error: [invalid-argument-type]
+    return name
+
+def unknown_replacement(rows: list[tuple[bool, list[str], str]]) -> str:
+    tags = []
+    name = None
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = opaque(configured)
+    if len(tags) == 0:
+        raise RuntimeError
+    reveal_type(name)  # revealed: Unknown
+    return name
+
+def safe_continue(rows: list[tuple[bool, list[str], str]]) -> str:
+    tags = []
+    name = None
+    for root, values, configured in rows:
+        if not root:
+            continue
+        tags = list(values)
+        name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name
+
+def terminating_partial_write(rows: list[tuple[bool, list[str], str]], fail: bool) -> str:
+    tags = []
+    name = None
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            if fail:
+                raise RuntimeError
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name
+```
+
+Partial writes, later assignments, and mutations or escapes of the initial allocation preserve
+possible `None` values. Unsupported exits and nested transfer shapes also use ordinary inference.
+
+```py
+def partial_continue(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            if flag:
+                continue
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def partial_break(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            if flag:
+                break
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def caught_partial(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            try:
+                if flag:
+                    raise RuntimeError
+            except RuntimeError:
+                continue
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def initial_mutation(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    tags.append("extra")
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def initial_escape(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    escape(tags)
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def initial_alias(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    alias = tags
+    alias.append("extra")
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def later_source(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    tags = ["extra"]
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def later_none(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    if flag:
+        name = None
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def guard_mutation(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    if (tags.append("extra") or len)(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def custom_len(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    def len(value: list[str]) -> int:
+        return 1
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def captured_writer(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    def reset():
+        nonlocal name
+        name = None
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    reset()
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def captured_list(rows: list[tuple[bool, list[str], str]], flag: bool) -> str:
+    tags = []
+    name = None
+    def mutate():
+        tags.append("extra")
+    mutate()
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+```
+
+Explicit namespace reads can expose the initial allocation without a direct reference to it.
+
+```py
+def local_namespace(rows: list[tuple[bool, list[str], str]]) -> str:
+    tags = []
+    name = None
+    locals()["tags"].append("extra")
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+
+def vars_namespace(rows: list[tuple[bool, list[str], str]]) -> str:
+    tags = []
+    name = None
+    vars()["tags"].append("extra")
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    return name  # error: [invalid-return-type]
+```
+
+Stable Boolean projection and the binding assumption share the same predicate evaluator.
+
+```py
+def symbolic_before_length(rows: list[tuple[bool, list[str], str]], enabled: bool) -> str:
+    tags = []
+    name = None
+    if enabled:
+        marker = 1
+    for root, values, configured in rows:
+        if root:
+            tags = list(values)
+            name = configured
+    if len(tags) == 0:
+        raise RuntimeError
+    if enabled:
+        number(marker)
+        return name
+    return "disabled"
+```

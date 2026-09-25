@@ -1874,6 +1874,18 @@ pub(crate) enum LoopStmtKind {
 }
 
 impl LoopHeaderDefinitionKind {
+    pub fn for_stmt<'ast>(&self, module: &'ast ParsedModuleRef) -> Option<&'ast ast::StmtFor> {
+        let Self {
+            loop_header_id: _,
+            loop_stmt,
+            place: _,
+        } = self;
+        match loop_stmt {
+            LoopStmtKind::For(stmt) => Some(stmt.node(module)),
+            LoopStmtKind::While(_) => None,
+        }
+    }
+
     pub fn loop_header_id(&self) -> LoopHeaderId {
         self.loop_header_id
     }

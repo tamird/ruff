@@ -47,6 +47,7 @@ use self::infer::{
 };
 pub(crate) use self::iteration::extract_fixed_length_iterable_element_types;
 pub use self::known_instance::KnownInstanceType;
+pub(crate) use self::loop_bindings::certifies_predicate as initial_binding_fixes_empty_guard;
 pub(crate) use self::match_pattern::{
     ClassPatternPositionalSource, class_pattern_positional_sources, definite_match_pattern_type,
     definite_match_pattern_type_for_subject, exact_sequence_pattern_type, mapping_pattern_type,
@@ -164,6 +165,7 @@ mod iteration;
 mod known_instance;
 pub mod list_members;
 mod literal;
+mod loop_bindings;
 mod match_pattern;
 mod member;
 mod method;
