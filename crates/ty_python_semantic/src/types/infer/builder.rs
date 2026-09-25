@@ -7666,7 +7666,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .as_deref()
             .into_iter()
             .flatten()
-            .filter(|ty| ty.class_specialization(db, env).is_some())
+            .filter(|ty| supports_collection_literal_context(db, env, **ty))
         {
             if let Some(result) = try_narrow(*narrowed_ty) {
                 return Some(result);
@@ -7788,7 +7788,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     elt_tcx_variance.insert(identity, typevar.variance(db));
                 }
             } else if let Some(tcx) = tcx.annotation
-                && tcx.class_specialization(db, env).is_some()
+                && supports_collection_literal_context(db, env, tcx)
             {
                 let db = self.db();
 
@@ -12826,6 +12826,22 @@ impl CallArgumentInferenceMode {
 enum MatchingArgumentTypeContext<'db> {
     Unique(Option<ArgumentTypeContext<'db>>),
     Many(Vec<Option<ArgumentTypeContext<'db>>>),
+}
+
+fn supports_collection_literal_context<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
+    if ty.class_specialization(db, env).is_some() {
+        return true;
+    }
+    // A nongeneric protocol can constrain collection elements through its members,
+    // even though it has no class specialization of its own.
+    match ty.resolve_type_alias(db) {
+        Type::ProtocolInstance(protocol) => protocol.class_origin(db).is_some(),
+        _ => false,
+    }
 }
 
 fn is_collection_literal(expression: &ast::Expr) -> bool {
