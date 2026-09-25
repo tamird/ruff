@@ -28,7 +28,8 @@ pub use node_key::ExpressionNodeKey;
 /// ```
 #[derive(Debug, get_size2::GetSize)]
 pub(crate) struct AstIds {
-    /// Maps expressions which "use" a place (that is, [`ast::ExprName`], [`ast::ExprAttribute`] or [`ast::ExprSubscript`]) to a use id.
+    /// Maps place expressions and synthetic identifier reads to use IDs.
+    /// Function identifiers record the previous binding when collecting overloads.
     uses_map: FrozenMap<ExpressionNodeKey, ScopedUseId>,
 }
 
@@ -56,6 +57,11 @@ impl AstIds {
 
     pub(super) fn try_use_id(&self, key: impl Into<ExpressionNodeKey>) -> Option<ScopedUseId> {
         self.uses_map.get(&key.into()).copied()
+    }
+
+    pub(super) fn uses(&self) -> impl Iterator<Item = (ExpressionNodeKey, ScopedUseId)> + '_ {
+        let Self { uses_map } = self;
+        uses_map.iter().copied()
     }
 }
 
@@ -126,7 +132,7 @@ impl AstIdsBuilder {
     }
 }
 
-/// Node key that can only be constructed for expressions.
+/// Node key for expressions and synthetic identifier reads.
 pub(crate) mod node_key {
     use ruff_python_ast as ast;
 
@@ -145,6 +151,13 @@ pub(crate) mod node_key {
         salsa::SalsaValue,
     )]
     pub struct ExpressionNodeKey(NodeKey);
+
+    impl ExpressionNodeKey {
+        pub(crate) fn index(self) -> ast::NodeIndex {
+            let Self(key) = self;
+            key.index()
+        }
+    }
 
     impl From<ast::ExprRef<'_>> for ExpressionNodeKey {
         fn from(value: ast::ExprRef<'_>) -> Self {

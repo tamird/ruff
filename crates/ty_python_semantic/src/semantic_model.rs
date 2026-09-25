@@ -39,7 +39,7 @@ use crate::types::{
     is_discarded_dict_key_assignment,
 };
 use crate::types::{function_signature_annotation_info, function_signature_annotation_scope};
-use ty_python_core::definition::{Definition, DefinitionKind};
+use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
 use ty_python_core::place::PlaceExpr;
 use ty_python_core::place_table;
 use ty_python_core::scope::{FileScopeId, Scope};
@@ -101,6 +101,164 @@ impl<'db> SemanticModel<'db> {
     /// Returns the inferred value of a binding, including application-supplied source bindings.
     pub fn definition_type(&self, definition: Definition<'db>) -> Type<'db> {
         binding_type(self.db, definition)
+    }
+
+    /// Proves that the indexed references to these names are confined to `allowed`.
+    ///
+    /// Each occurrence must belong to this model's current module AST and resolve to one
+    /// ordinary assignment in the same local scope. The returned definitions are aligned
+    /// with `allowed`, including repeated occurrences. Rebinding, deletion, loop-carried
+    /// bindings, captures, and any other possible indexed reference prevent proof.
+    ///
+    /// This checks raw lexical references indexed in the file. Callers establish any required
+    /// constraints on reflection, external aliases, and object lifetime. The check retains
+    /// possible references independently of expression types and semantic reachability.
+    pub fn confined_name_definitions(
+        &self,
+        allowed: &[&ast::ExprName],
+    ) -> Option<Vec<Definition<'db>>> {
+        if self.annotation_scope.is_some() {
+            return None;
+        }
+        let Some(first) = allowed.first() else {
+            return Some(Vec::new());
+        };
+        let index = semantic_index(self.db, self.file);
+        let scope = index.try_expression_scope_id(&ExprRef::from(*first))?;
+        let table = index.place_table(scope);
+        let use_def = index.use_def_map(scope);
+        let mut definitions = Vec::with_capacity(allowed.len());
+        let mut candidates = FxHashSet::default();
+        let mut names = FxHashSet::default();
+        let mut allowed_uses = FxHashSet::default();
+        for &name in allowed {
+            if index.try_expression_scope_id(&ExprRef::from(name))? != scope {
+                return None;
+            }
+            let symbol = table.symbol_id(&name.id)?;
+            if !table.symbol(symbol).is_local() {
+                return None;
+            }
+            let use_id = index.try_expression_use_id(name.into())?;
+            let mut bindings = use_def.bindings_at_use(use_id);
+            let DefinitionState::Defined(definition) = bindings.next()?.binding else {
+                return None;
+            };
+            if bindings.next().is_some()
+                || definition.scope(self.db).file_scope_id(self.db) != scope
+                || !matches!(definition.kind(self.db), DefinitionKind::Assignment(_))
+            {
+                return None;
+            }
+            if candidates.insert(definition) {
+                // Complete history prepends the scope-entry undefined sentinel. Every actual
+                // retained binding must be this assignment, including bindings after the use.
+                let mut history = use_def.reachable_symbol_bindings(symbol);
+                if history.next()?.binding != DefinitionState::Undefined {
+                    return None;
+                }
+                let first_binding = history.next()?.binding;
+                if first_binding != DefinitionState::Defined(definition)
+                    || history
+                        .any(|binding| binding.binding != DefinitionState::Defined(definition))
+                {
+                    return None;
+                }
+            }
+            definitions.push(definition);
+            names.insert(name.id.as_str());
+            allowed_uses.insert(ty_python_core::ExpressionNodeKey::from(ExprRef::from(name)));
+        }
+
+        let module = parsed_module(self.db, self.python_file()).load(self.db);
+        for (scope, expression, _) in index.expression_uses(&module) {
+            let ExprRef::Name(name) = expression else {
+                continue;
+            };
+            if !names.contains(name.id.as_str())
+                || allowed_uses.contains(&ty_python_core::ExpressionNodeKey::from(expression))
+            {
+                continue;
+            }
+            if self.name_may_reference_definitions(name, scope, &candidates)? {
+                return None;
+            }
+        }
+        Some(definitions)
+    }
+
+    fn name_may_reference_definitions(
+        &self,
+        name: &ast::ExprName,
+        scope: FileScopeId,
+        candidates: &FxHashSet<Definition<'db>>,
+    ) -> Option<bool> {
+        let index = semantic_index(self.db, self.file);
+        let resolution = resolve_place_load(
+            self.db,
+            index,
+            scope.to_scope_id(self.db, self.file),
+            PlaceExpr::from_expr_name(name),
+            PlaceLoadMode::AtExpression(name.into()),
+        );
+        for step in resolution {
+            let source = match step {
+                PlaceLoadResolutionStep::Source(source) => source,
+                PlaceLoadResolutionStep::MemberResolutionCondition(_) => return None,
+                PlaceLoadResolutionStep::Exhausted(_) => return Some(false),
+            };
+            let bindings = match source.kind {
+                PlaceLoadSourceKind::Bindings(bindings) => bindings,
+                PlaceLoadSourceKind::DefinitionsFromOwningScope { scope, id } => {
+                    if scope.program_file(self.db) != self.file {
+                        return None;
+                    }
+                    index
+                        .use_def_map(scope.file_scope_id(self.db))
+                        .reachable_bindings(id)
+                }
+                PlaceLoadSourceKind::Implicit(implicit) => match implicit {
+                    ImplicitPlaceLoad::ExplicitGlobalSymbol { file, name } => {
+                        if file != self.file {
+                            return None;
+                        }
+                        let symbol = index.place_table(FileScopeId::global()).symbol_id(&name)?;
+                        index
+                            .use_def_map(FileScopeId::global())
+                            .reachable_symbol_bindings(symbol)
+                    }
+                    ImplicitPlaceLoad::ClassBodySymbol(_) => continue,
+                    ImplicitPlaceLoad::DunderClass(_) => return Some(false),
+                    ImplicitPlaceLoad::ModuleImplicitGlobal { file: _, name: _ } => {
+                        return Some(false);
+                    }
+                    ImplicitPlaceLoad::Builtin(_) => return Some(false),
+                },
+            };
+            let mut bound = true;
+            let mut any_binding = false;
+            for binding in bindings {
+                any_binding = true;
+                match binding.binding {
+                    DefinitionState::Defined(definition) => {
+                        if candidates.contains(&definition) {
+                            return Some(true);
+                        }
+                        match definition.kind(self.db) {
+                            DefinitionKind::LoopHeader(_) => return None,
+                            DefinitionKind::NestedBindings(_) => return None,
+                            _ => {}
+                        }
+                    }
+                    DefinitionState::Undefined => bound = false,
+                    DefinitionState::Deleted => bound = false,
+                }
+            }
+            if any_binding && bound {
+                return Some(false);
+            }
+        }
+        Some(false)
     }
 
     /// Looks up a builtin without consulting local bindings.
@@ -1378,11 +1536,134 @@ impl HasType for ast::ExceptHandlerExceptHandler {
 #[cfg(test)]
 mod tests {
     use super::ObjectMembers;
-    use crate::db::tests::TestDbBuilder;
+    use crate::db::tests::{TestDb, TestDbBuilder};
     use crate::{Db as _, HasType, SemanticModel};
     use ruff_db::files::system_path_to_file;
     use ruff_db::parsed::parsed_module;
+    use ruff_db::system::DbWithWritableSystem as _;
+    use ruff_python_ast::ExprRef;
+    use ruff_text_size::Ranged;
     use ty_python_core::ProgramFile;
+    use ty_python_core::definition::DefinitionKind;
+    use ty_python_core::semantic_index;
+
+    fn names_are_confined(db: &TestDb, source: &str) -> anyhow::Result<bool> {
+        let file = db.program_file(system_path_to_file(db, "/src/main.py")?);
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let model = SemanticModel::new(db, file);
+        let start = source.find("ROOT =").expect("root assignment");
+        let end = source[start..]
+            .find('\n')
+            .map_or(source.len(), |end| start + end);
+        let names: Vec<_> = semantic_index(db, file)
+            .expression_uses(&module)
+            .filter_map(|(_, expression, _)| {
+                let ExprRef::Name(name) = expression else {
+                    return None;
+                };
+                (usize::from(name.start()) >= start && usize::from(name.end()) <= end)
+                    .then_some(name)
+            })
+            .collect();
+        assert!(!names.is_empty(), "root contains named leaves");
+        let Some(definitions) = model.confined_name_definitions(&names) else {
+            return Ok(false);
+        };
+        assert_eq!(definitions.len(), names.len());
+        for (definition, name) in definitions.into_iter().zip(names) {
+            let DefinitionKind::Assignment(assignment) = definition.kind(db) else {
+                panic!("confined definitions are assignments");
+            };
+            assert_eq!(
+                assignment.target(&module).as_name_expr().unwrap().id,
+                name.id
+            );
+        }
+        Ok(true)
+    }
+
+    #[test]
+    fn name_confinement_uses_raw_bindings_and_lexical_identity() -> anyhow::Result<()> {
+        for (source, expected) in [
+            ("leaf = ['a']\nROOT = [leaf, leaf]\n", true),
+            (
+                "first = ['a']\nsecond = ['b']\nROOT = [first, second, first]\n",
+                true,
+            ),
+            (
+                "leaf = ['a']\ndef other(leaf): return leaf\nROOT = [leaf]\n",
+                true,
+            ),
+            (
+                "leaf = ['a']\ndef other():\n    leaf = []\n    return leaf\nROOT = [leaf]\n",
+                true,
+            ),
+            (
+                "leaf = ['a']\nclass Other:\n    leaf = []\n    value = leaf\nROOT = [leaf]\n",
+                true,
+            ),
+            ("leaf = ['a']\ncorrupt(leaf)\nROOT = [leaf]\n", false),
+            ("leaf = ['a']\nROOT = [leaf]\ncorrupt(leaf)\n", false),
+            (
+                "leaf = ['a']\nROOT = [leaf]\nif False: corrupt(leaf)\n",
+                false,
+            ),
+            ("leaf = ['a']\nALIAS = leaf\nROOT = [leaf]\n", false),
+            ("leaf = ['a']\nmethod = leaf.append\nROOT = [leaf]\n", false),
+            (
+                "leaf = ['a']\nother = {'leaf': leaf}\nROOT = [leaf]\n",
+                false,
+            ),
+            ("leaf = ['a']\nleaf[0] = 'b'\nROOT = [leaf]\n", false),
+            ("leaf = ['a']\nROOT = [leaf]\ndel leaf\n", false),
+            ("leaf = ['a']\nROOT = [leaf]\nleaf += ['b']\n", false),
+            ("leaf = ['a']\nROOT = [leaf]\nleaf = []\n", false),
+            (
+                "for _ in range(2):\n    leaf = ['a']\n    ROOT = [leaf]\n",
+                false,
+            ),
+            ("leaf = ['a']\nROOT = [leaf]\ndef leaf(): pass\n", false),
+            (
+                "leaf = ['a']\ndef nested(): return leaf\nROOT = [leaf]\n",
+                false,
+            ),
+            (
+                "leaf = ['a']\ndef nested():\n    global leaf\n    return leaf\nROOT = [leaf]\n",
+                false,
+            ),
+            (
+                "def outer():\n    leaf = ['a']\n    def nested():\n        nonlocal leaf\n        return leaf\n    ROOT = [leaf]\n",
+                false,
+            ),
+            (
+                "leaf = ['a']\nclass Other:\n    value = leaf\n    leaf = []\nROOT = [leaf]\n",
+                false,
+            ),
+            ("if condition: leaf = ['a']\nROOT = [leaf]\n", false),
+        ] {
+            let db = TestDbBuilder::new()
+                .with_file("/src/main.py", source)
+                .build()?;
+            assert_eq!(names_are_confined(&db, source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn name_confinement_tracks_source_edits() -> anyhow::Result<()> {
+        let mut db = TestDbBuilder::new().with_file("/src/main.py", "").build()?;
+        for (source, expected) in [
+            ("leaf = ['a']\nROOT = [leaf, leaf]\n", true),
+            ("leaf = ['a']\nROOT = [leaf, leaf]\ncorrupt(leaf)\n", false),
+            ("leaf = ['a']\nROOT = [leaf, leaf]\n", true),
+            ("leaf = ['a']\nleaf = []\nROOT = [leaf, leaf]\n", false),
+            ("leaf = ['a']\nROOT = [leaf, leaf]\n", true),
+        ] {
+            db.write_file("/src/main.py", source)?;
+            assert_eq!(names_are_confined(&db, source)?, expected, "{source}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn member_completion_can_exclude_object_declarations() -> anyhow::Result<()> {
