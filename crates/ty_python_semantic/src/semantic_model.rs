@@ -64,6 +64,16 @@ pub(crate) fn explicitly_reads_local_namespace(expression: &Expr) -> bool {
     }
 }
 
+/// Facts retained by function-body and parameter-default inference in the current configuration.
+/// These do not establish static expression evidence or dependency availability.
+#[derive(Clone, Copy, Debug)]
+pub struct FunctionInferenceFacts {
+    pub has_cycle_recovery: bool,
+    pub has_errors: bool,
+    /// Includes emitted diagnostics and used suppression records.
+    pub has_diagnostics_or_suppressions: bool,
+}
+
 /// The primary interface the LSP should use for querying semantic information about a [`File`].
 ///
 /// Although you can in principle freely construct this type given a `db` and `file`, you should
@@ -113,6 +123,39 @@ impl<'db> SemanticModel<'db> {
 
     pub fn program_environment(&self) -> ProgramEnvironment<'db> {
         ProgramEnvironment::from_file(self.program_file())
+    }
+
+    /// Returns body and default checking facts for a function in the active configuration.
+    /// Returns `None` for definitions that are not ordinary function declarations.
+    pub fn function_inference_facts(
+        &self,
+        definition: Definition<'db>,
+    ) -> Option<FunctionInferenceFacts> {
+        let DefinitionKind::Function(function) = definition.kind(self.db) else {
+            return None;
+        };
+        let file = definition.program_file(self.db);
+        let parsed = parsed_module(self.db, file.python_file(self.db)).load(self.db);
+        let scope = semantic_index(self.db, file)
+            .node_scope(ty_python_core::scope::NodeWithScopeRef::Function(
+                function.node(&parsed),
+            ))
+            .to_scope_id(self.db, file);
+        let body = infer_complete_scope_types(self.db, scope);
+        let defaults = crate::types::infer_function_default_types(self.db, definition);
+        let diagnostics = [body.diagnostics(), defaults.diagnostics()];
+        Some(FunctionInferenceFacts {
+            has_cycle_recovery: body.has_cycle_recovery() || defaults.is_provisional(),
+            has_errors: diagnostics.into_iter().flatten().any(|diagnostics| {
+                diagnostics
+                    .into_iter()
+                    .any(|diagnostic| diagnostic.severity() == ruff_db::diagnostic::Severity::Error)
+            }),
+            has_diagnostics_or_suppressions: diagnostics
+                .into_iter()
+                .flatten()
+                .any(|diagnostics| !diagnostics.is_empty()),
+        })
     }
 
     /// Returns the inferred value of a binding, including application-supplied source bindings.
