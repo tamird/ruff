@@ -6,6 +6,7 @@ use std::fmt::{self, Display};
 
 use compact_str::{CompactString, ToCompactString};
 use ruff_python_ast as ast;
+use rustc_hash::FxHashSet;
 
 use crate::subscript::{PyIndex, PySlice};
 use crate::types::special_form::TypeQualifier;
@@ -52,7 +53,7 @@ impl Display for SubscriptKind {
 }
 
 /// A dunder method used for subscripting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DunderMethod {
     GetItem,
     ClassGetItem,
@@ -158,7 +159,18 @@ impl<'db> SubscriptError<'db> {
         }
     }
 
-    fn with_errors(result_ty: Type<'db>, errors: Vec<SubscriptErrorKind<'db>>) -> Self {
+    fn with_errors(result_ty: Type<'db>, mut errors: Vec<SubscriptErrorKind<'db>>) -> Self {
+        // A missing method is independent of the key. Union keys can encounter the same
+        // failure through several alternatives; retain each receiver/method failure once.
+        if errors.len() > 1 {
+            let mut missing_methods = FxHashSet::default();
+            errors.retain(|error| match error {
+                SubscriptErrorKind::NotSubscriptable { value_ty, method } => {
+                    missing_methods.insert((*value_ty, *method))
+                }
+                _ => true,
+            });
+        }
         Self { result_ty, errors }
     }
 
