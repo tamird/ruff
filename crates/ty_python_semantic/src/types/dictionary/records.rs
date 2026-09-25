@@ -271,6 +271,10 @@ where
         if !*valid {
             return;
         }
+        if crate::semantic_model::explicitly_reads_local_namespace(expression) {
+            *valid = false;
+            return;
+        }
         if matches!(expression, ast::Expr::Name(_) | ast::Expr::Subscript(_))
             && index.try_expression_use_id(expression.into()).is_some()
         {
