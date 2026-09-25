@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::hash::Hash;
 
 use ruff_index::Idx;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::Truthiness;
 use crate::interned_nodes::InternedNodes;
@@ -175,6 +175,68 @@ impl ReachabilityConstraints {
         } else {
             self.used_interiors[raw_index]
         }
+    }
+
+    /// Prove that two paths in the same transfer cannot both occur at runtime.
+    ///
+    /// Like `narrowing_gate`, this follows concrete predicate outcomes and treats an ambiguous
+    /// terminal as a possible path. Interior ambiguous edges describe static knowledge, rather
+    /// than a third runtime outcome. Callers must not identify atoms from different loop
+    /// iterations. Exhausting the pair budget declines the proof.
+    pub fn runtime_paths_are_disjoint(
+        &self,
+        left: ScopedReachabilityConstraintId,
+        right: ScopedReachabilityConstraintId,
+        max_pairs: usize,
+    ) -> bool {
+        let mut pending = vec![(left, right)];
+        let mut visited = FxHashSet::default();
+        while let Some((left, right)) = pending.pop() {
+            if left == ALWAYS_FALSE || right == ALWAYS_FALSE {
+                continue;
+            }
+            if left.is_terminal() && right.is_terminal() {
+                return false;
+            }
+            let pair = if left.as_u32() < right.as_u32() {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            if !visited.insert(pair) {
+                continue;
+            }
+            if visited.len() > max_pairs {
+                return false;
+            }
+            let left_node = (!left.is_terminal()).then(|| self.get_interior_node(left));
+            let right_node = (!right.is_terminal()).then(|| self.get_interior_node(right));
+            let atom = left_node
+                .map(InteriorNode::atom)
+                .into_iter()
+                .chain(right_node.map(InteriorNode::atom))
+                .max()
+                .expect("at least one path has an interior node");
+            let branches = |id, node: Option<InteriorNode>| {
+                if let Some(InteriorNode {
+                    atom: candidate,
+                    if_true,
+                    if_ambiguous: _,
+                    if_false,
+                }) = node
+                    && candidate == atom
+                {
+                    (if_true, if_false)
+                } else {
+                    (id, id)
+                }
+            };
+            let (left_true, left_false) = branches(left, left_node);
+            let (right_true, right_false) = branches(right, right_node);
+            pending.push((left_true, right_true));
+            pending.push((left_false, right_false));
+        }
+        true
     }
 
     /// Project a demanded constraint after semantic analysis has identified stable values.
@@ -797,6 +859,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_paths_preserve_unknowns_and_conflicting_outcomes() {
+        let mut graph = ReachabilityConstraintsBuilder::default();
+        let first = graph.add_atom(ScopedPredicateId::new(0));
+        let second = graph.add_atom(ScopedPredicateId::new(1));
+        let not_first = graph.add_not_constraint(first);
+        let disjunction = graph.add_or_constraint(first, second);
+        let neither = graph.add_not_constraint(disjunction);
+        for root in [first, second, not_first, disjunction, neither] {
+            graph.mark_used(root);
+        }
+        let graph = graph.build();
+        assert!(graph.runtime_paths_are_disjoint(first, not_first, 10));
+        assert!(graph.runtime_paths_are_disjoint(neither, disjunction, 10));
+        assert!(!graph.runtime_paths_are_disjoint(first, second, 10));
+        assert!(!graph.runtime_paths_are_disjoint(first, AMBIGUOUS, 10));
+        assert!(!graph.runtime_paths_are_disjoint(AMBIGUOUS, AMBIGUOUS, 10));
+        assert!(graph.runtime_paths_are_disjoint(ALWAYS_FALSE, AMBIGUOUS, 0));
+        assert!(!graph.runtime_paths_are_disjoint(first, not_first, 0));
+    }
+
+    #[test]
     fn projection_correlates_repeated_and_negated_values() {
         for (disjunction, second_positive, expected) in [
             (false, true, Truthiness::AlwaysFalse),
@@ -920,6 +1003,7 @@ mod tests {
     fn repeated_operations_remain_stable_at_capacity() {
         let mut constraints = ReachabilityConstraintsBuilder::default();
         let a = constraints.add_atom(ScopedPredicateId::new(0));
+        let not_a = constraints.add_not_constraint(a);
         let b = constraints.add_atom(ScopedPredicateId::new(1));
         let c = constraints.add_atom(ScopedPredicateId::new(2));
         let disjunction = constraints.add_or_constraint(a, c);
@@ -959,5 +1043,11 @@ mod tests {
             constraints.add_conditional(ScopedPredicateId::new(3), a, b, c, &mut conditionals,),
             AMBIGUOUS
         );
+        let saturated = constraints.add_and_constraint(a, c);
+        constraints.mark_used(a);
+        constraints.mark_used(not_a);
+        let constraints = constraints.build();
+        assert!(constraints.runtime_paths_are_disjoint(a, not_a, 10));
+        assert!(!constraints.runtime_paths_are_disjoint(a, saturated, 10));
     }
 }

@@ -220,7 +220,7 @@ use ty_python_core::{
     BindingWithConstraints, DeclarationWithConstraint, DeclarationsIterator, EvaluationMode,
     FileScopeId, NarrowingEvaluator, PredicateNarrowingTargets, ScopedDefinitionId, SemanticIndex,
     Truthiness, UseDefMap,
-    definition::{Definition, DefinitionState},
+    definition::{BindingsOwner, Definition, DefinitionKind, DefinitionState},
     expression::Expression,
     narrowing_constraints::{NarrowingConstraints, ScopedNarrowingConstraint},
     place::ScopedPlaceId,
@@ -709,6 +709,7 @@ fn evaluate_reachability_constraint<'db>(
         call_predicates,
         id,
         true,
+        None,
     )
 }
 
@@ -769,12 +770,17 @@ fn is_reachability_checkpoint(
 
 /// Walks a reachability decision diagram until it reaches a terminal or reusable checkpoint.
 ///
-/// `use_checkpoint` is false only when entering from a checkpoint query. In that case, the first
-/// node is evaluated directly to prevent the query from immediately calling itself again.
+/// For ordinary evaluation, `use_checkpoint` is false when entering from a checkpoint query.
+/// The first node is then evaluated directly to prevent the query from calling itself again.
+/// An initial-binding assumption disables checkpoint reuse throughout the evaluation.
 ///
 /// General checkpoints are created only after traversing a genuinely long path. Their positions
 /// depend on stable predicate IDs, so adjacent roots reuse the same suffix without requiring an
 /// additional retained scope-wide index or allocating tracked queries for short, ordinary paths.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the optional binding assumption uses the existing path evaluator without sharing its checkpoints"
+)]
 fn evaluate_reachability_path<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
@@ -783,10 +789,20 @@ fn evaluate_reachability_path<'db>(
     call_predicates: Option<&[ScopedPredicateId]>,
     mut id: ScopedReachabilityConstraintId,
     mut use_checkpoint: bool,
+    initial_binding: Option<Definition<'db>>,
 ) -> Truthiness {
     let env = ProgramEnvironment::from_scope(scope);
     let use_def = use_def_map(db, scope);
     let mut visited = 0;
+    let evaluate_atom = |atom| {
+        if let Some(binding) = initial_binding {
+            let predicate = &predicates[atom];
+            if crate::types::initial_binding_fixes_empty_guard(db, binding, predicate) {
+                return ReachabilityAtom::Known(Truthiness::from(predicate.is_positive));
+            }
+        }
+        analyze_reachability_atom(db, &env, use_def, predicates, atom)
+    };
 
     loop {
         if let Some(reachability) = terminal_reachability(id) {
@@ -794,11 +810,14 @@ fn evaluate_reachability_path<'db>(
         }
 
         let node = constraints.get_interior_node(id);
-        if use_checkpoint && is_reachability_checkpoint(call_predicates, node.atom(), visited) {
+        if initial_binding.is_none()
+            && use_checkpoint
+            && is_reachability_checkpoint(call_predicates, node.atom(), visited)
+        {
             return evaluate_reachability_checkpoint(db, scope, id);
         }
 
-        id = match analyze_reachability_atom(db, &env, use_def, predicates, node.atom()) {
+        id = match evaluate_atom(node.atom()) {
             ReachabilityAtom::Known(truthiness) => match truthiness {
                 Truthiness::AlwaysTrue => node.if_true(),
                 Truthiness::Ambiguous => node.if_ambiguous(),
@@ -810,9 +829,7 @@ fn evaluate_reachability_path<'db>(
             } => {
                 // Truthiness checkpoints discard symbolic identities. Once a stable value is
                 // encountered, finish this demanded suffix in one local projection instead.
-                return constraints.project(id, |atom| {
-                    analyze_reachability_atom(db, &env, use_def, predicates, atom)
-                });
+                return constraints.project(id, evaluate_atom);
             }
         };
         use_checkpoint = true;
@@ -852,6 +869,7 @@ fn evaluate_reachability_checkpoint<'db>(
         call_predicates,
         id,
         false,
+        None,
     )
 }
 
@@ -887,6 +905,7 @@ impl<'db> ReachabilityConstraintsExtension<'db> for ReachabilityConstraints {
             None,
             id,
             true,
+            None,
         )
     }
 }
@@ -2128,6 +2147,75 @@ pub(crate) fn evaluate_reachability(
     use_def
         .reachability_constraints()
         .evaluate(db, use_def.predicates(), reachability)
+}
+
+/// Exclude an exact initial binding when its survival fixes a later loop guard.
+/// The evaluation is local to this assumption; ordinary checkpoint results carry no binding key.
+pub(crate) fn refine_initial_binding_reachability<'db>(
+    db: &'db dyn Db,
+    binding: Definition<'db>,
+    constraints: &ReachabilityConstraints,
+    predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
+    id: ScopedReachabilityConstraintId,
+    ordinary: Truthiness,
+) -> Truthiness {
+    if !ordinary.is_ambiguous() || terminal_reachability(id).is_some() {
+        return ordinary;
+    }
+    let DefinitionKind::Assignment(assignment) = binding.kind(db) else {
+        return ordinary;
+    };
+    if assignment.owner() != BindingsOwner::Definition {
+        return ordinary;
+    }
+    let ScopedPlaceId::Symbol(symbol) = binding.place(db) else {
+        return ordinary;
+    };
+    let scope = binding.scope(db);
+    if predicate_scope(db, &predicates[constraints.get_interior_node(id).atom()]) != scope
+        || scope.node(db).as_function().is_none()
+    {
+        return ordinary;
+    }
+    let module = parsed_module(db, scope.python_file(db)).load(db);
+    if !assignment.value(&module).is_none_literal_expr() {
+        return ordinary;
+    }
+    let use_def = use_def_map(db, scope);
+    if constraints.used_interiors().len() > crate::place::MAX_EXACT_LOOP_HEADER_REACHABILITY_NODES
+        || !use_def
+            .reachable_symbol_bindings(symbol)
+            .any(|alternative| {
+                let Some(definition) = alternative.binding.definition() else {
+                    return false;
+                };
+                if !definition.kind(db).is_loop_header() {
+                    return false;
+                }
+                let mut incoming = use_def.bindings_at_definition(definition);
+                incoming
+                    .next()
+                    .is_some_and(|entry| entry.binding == DefinitionState::Defined(binding))
+                    && incoming.next().is_none()
+            })
+    {
+        return ordinary;
+    }
+    let result = evaluate_reachability_path(
+        db,
+        scope,
+        constraints,
+        predicates,
+        None,
+        id,
+        false,
+        Some(binding),
+    );
+    if result.is_always_false() {
+        result
+    } else {
+        ordinary
+    }
 }
 
 /// Inference-local cache for static reachability evaluations.

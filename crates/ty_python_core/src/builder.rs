@@ -32,13 +32,14 @@ use crate::ast_node_ref::AstNodeRef;
 use crate::definition::{
     AnnotatedAssignmentDefinitionNodeRef, AssignmentDefinitionNodeRef, BindingsOwner,
     CaptureResolution, ComprehensionDefinitionNodeRef, Definition, DefinitionCategory,
-    DefinitionKind, DefinitionNodeKey, DefinitionNodeRef, Definitions, DictKeyAssignmentKeyRef,
-    DictKeyAssignmentNodeRef, ExceptHandlerDefinitionNodeRef, ForStmtDefinitionNodeRef,
-    ImportDefinitionNodeRef, ImportFromDefinitionNodeRef, ImportFromSubmoduleDefinitionNodeRef,
-    LambdaParameterDefinitionNodeRef, LoopHeaderDefinitionNodeRef, LoopStmtRef,
-    MatchPatternDefinitionNodeRef, NestedBindingExecution, NestedBindingsDefinitionKind,
-    ParameterDefinitionNodeRef, ProvidedBinding, ProvidedBindingDefinitionKind, ProvidedStatement,
-    StarImportDefinitionNodeRef, WithItemDefinitionNodeRef,
+    DefinitionKind, DefinitionNodeKey, DefinitionNodeRef, DefinitionState, Definitions,
+    DictKeyAssignmentKeyRef, DictKeyAssignmentNodeRef, ExceptHandlerDefinitionNodeRef,
+    ForStmtDefinitionNodeRef, ImportDefinitionNodeRef, ImportFromDefinitionNodeRef,
+    ImportFromSubmoduleDefinitionNodeRef, LambdaParameterDefinitionNodeRef,
+    LoopHeaderDefinitionNodeRef, LoopStmtRef, MatchPatternDefinitionNodeRef,
+    NestedBindingExecution, NestedBindingsDefinitionKind, ParameterDefinitionNodeRef,
+    ProvidedBinding, ProvidedBindingDefinitionKind, ProvidedStatement, StarImportDefinitionNodeRef,
+    WithItemDefinitionNodeRef,
 };
 use crate::expression::{Expression, ExpressionContext, ExpressionKind};
 use crate::frozen::{FrozenMap, FrozenSet};
@@ -2081,6 +2082,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         loop_min_definition_id: ScopedDefinitionId,
     ) {
         let mut loop_header = LoopHeader::new();
+        let db = self.db;
         let use_def = self.current_use_def_map_mut();
         // Collect all the bindings within the loop that reached a loop back edge. Use the minimum
         // definition ID to filter out all the pre-loop bindings. The loop header doesn't shadow
@@ -2090,9 +2092,17 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             reason = "bindings for distinct places are collected independently"
         )]
         for place_id in loop_header_places {
-            for live_binding in use_def.current_bindings(*place_id) {
+            loop_header.set_incoming(*place_id, ScopedReachabilityConstraintId::ALWAYS_FALSE);
+            let live_bindings: SmallVec<[_; 2]> = use_def.current_bindings(*place_id).collect();
+            for live_binding in live_bindings {
                 if live_binding.binding() >= loop_min_definition_id {
                     loop_header.add_binding(*place_id, live_binding);
+                } else if let DefinitionState::Defined(definition) =
+                    use_def.definition(live_binding.binding())
+                    && let DefinitionKind::LoopHeader(header) = definition.kind(db)
+                    && header.loop_header_id() == loop_header_id
+                {
+                    loop_header.set_incoming(*place_id, live_binding.reachability_constraint());
                 }
             }
         }
@@ -2102,6 +2112,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             reason = "marking reachability constraints as used is idempotent"
         )]
         for place_id in loop_header_places {
+            if let Some(incoming) = loop_header.incoming_for_place(*place_id) {
+                use_def.reachability_constraints.mark_used(incoming);
+            }
             for live_binding in loop_header.bindings_for_place(*place_id) {
                 use_def
                     .reachability_constraints

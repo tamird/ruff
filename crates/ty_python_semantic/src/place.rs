@@ -14,7 +14,7 @@ use ty_module_resolver::{
 use crate::dunder_all::dunder_all_names;
 use crate::reachability::{
     NarrowingProjector, ReachabilityEvaluationCache, evaluate_reachability,
-    evaluate_reachability_with_cache,
+    evaluate_reachability_with_cache, refine_initial_binding_reachability,
 };
 use crate::types::{
     DynamicType, KnownClass, MemberLookupPolicy, Type, TypeAndQualifiers, TypeQualifiers,
@@ -1694,6 +1694,10 @@ fn symbol_impl<'db>(
 // approximation boundary so contents queries do not restore unbounded exact loop analysis.
 pub(crate) const MAX_EXACT_LOOP_HEADER_INFERENCE_NODES: usize = 4096;
 
+// This cutoff was chosen by benchmarking real isort to keep loop analysis
+// overhead minimal while preserving diagnostics. It also bounds conditional transfer proofs.
+pub(crate) const MAX_EXACT_LOOP_HEADER_REACHABILITY_NODES: usize = 2048;
+
 /// Pre-computed reachability analysis for loop-back bindings in a loop header.
 #[salsa::tracked(
     returns(clone),
@@ -1725,10 +1729,6 @@ fn loop_header_reachability_impl<'db>(
     definition: Definition<'db>,
     mut cycle_initial_cache: Option<&mut FxHashMap<Definition<'db>, Truthiness>>,
 ) -> LoopHeaderReachability<'db> {
-    // This cutoff was chosen by benchmarking real isort to keep loop analysis
-    // overhead minimal while preserving diagnostics.
-    const MAX_EXACT_LOOP_HEADER_REACHABILITY_NODES: usize = 2048;
-
     let DefinitionKind::LoopHeader(loop_header_definition) = definition.kind(db) else {
         unreachable!("`loop_header_reachability` called with non-loop-header definition");
     };
@@ -1974,6 +1974,15 @@ fn place_from_bindings_impl<'db>(
                 reachability_constraints,
                 predicates,
                 reachability_constraint,
+            );
+
+            let static_reachability = refine_initial_binding_reachability(
+                db,
+                binding,
+                reachability_constraints,
+                predicates,
+                reachability_constraint,
+                static_reachability,
             );
 
             if static_reachability.is_always_false() {
