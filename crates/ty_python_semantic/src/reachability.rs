@@ -551,6 +551,7 @@ fn predicate_scope<'db>(db: &'db dyn Db, predicate: &Predicate<'db>) -> ScopeId<
         | PredicateNode::ChainedComparisonCondition(expression)
         | PredicateNode::ContextManagerSuppresses { expression, .. } => expression.scope(db),
         PredicateNode::IsNonTerminalCall(call) => call.callable(db).scope(db),
+        PredicateNode::SuccessfulSubscript { receiver, key: _ } => receiver.scope(db),
         PredicateNode::Pattern(pattern) => pattern.scope(db),
         PredicateNode::FinallyNormalPathImpossible { scope, .. } => scope,
         PredicateNode::OrPatternAlternative(scope) => scope,
@@ -1969,6 +1970,10 @@ fn analyze_single(db: &dyn Db, env: &ProgramEnvironment<'_>, predicate: &Predica
         PredicateNode::IsNonTerminalCall(call) => {
             analyze_non_terminal_call(db, call).negate_if(!predicate.is_positive)
         }
+        PredicateNode::SuccessfulSubscript {
+            receiver: _,
+            key: _,
+        } => Truthiness::Ambiguous,
         PredicateNode::Pattern(inner) => analyze_pattern_predicate(db, inner),
         PredicateNode::OrPatternAlternative(_) => Truthiness::Ambiguous,
         PredicateNode::SubjectElementPattern(subject_element) => {

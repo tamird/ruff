@@ -1,5 +1,192 @@
 # Instance subscript
 
+## Successful subscription narrows the receiver
+
+A checked subscription that returns `Never` cannot describe the receiver on normal continuation.
+Errors, skipped subscriptions, and caught failures do not establish that fact.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Callable, Never, overload
+
+class Present:
+    def __getitem__(self, key: int) -> int:
+        return key
+
+class Absent:
+    def __getitem__(self, key: int) -> Never:
+        raise KeyError(key)
+
+class Inherited(Present): ...
+
+def statement(value: Present | Absent):
+    value[0]
+    reveal_type(value)  # revealed: Present
+
+def assignment(value: Present | Absent, key: int):
+    result = value[key]
+    reveal_type(result)  # revealed: int
+    reveal_type(value)  # revealed: Present
+
+def annotated(value: Inherited | Absent):
+    result: int = value[0]
+    reveal_type(value)  # revealed: Inherited
+
+def iteration(values: list[Present | Absent]):
+    for value in values:
+        reveal_type(value)  # revealed: Present | Absent
+        for item in range(value[0]):
+            pass
+        reveal_type(value)  # revealed: Present
+
+def skipped(value: Present | Absent, flag: bool):
+    flag and value[0]
+    reveal_type(value)  # revealed: Present | Absent
+    result = value[0] if flag else 0
+    reveal_type(value)  # revealed: Present | Absent
+
+def caught(value: Present | Absent):
+    try:
+        value[0]
+        reveal_type(value)  # revealed: Present
+    except KeyError:
+        reveal_type(value)  # revealed: Present | Absent
+    reveal_type(value)  # revealed: Present | Absent
+
+def reassigned(value: Present | Absent):
+    value[0]
+    value = Absent()
+    reveal_type(value)  # revealed: Absent
+
+class Invalid:
+    def __getitem__(self, key: str) -> Never:
+        raise KeyError(key)
+
+def invalid(value: Present | Invalid):
+    value[0]  # error: [invalid-argument-type]
+    reveal_type(value)  # revealed: Present | Invalid
+
+class Missing: ...
+
+def missing(value: Present | Missing):
+    value[0]  # error: [not-subscriptable]
+    reveal_type(value)  # revealed: Present | Missing
+
+class Dynamic:
+    def __getitem__(self, key: int) -> Any: ...
+
+def dynamic(value: Present | Dynamic):
+    value[0]
+    reveal_type(value)  # revealed: Present | Dynamic
+
+class Callback:
+    callback: Callable[[], None]
+    def __getitem__(self, key: int) -> int:
+        self.callback()
+        return key
+
+def captured(value: Callback | Absent):
+    # A subscription can call reset, so its success concerns the old receiver object.
+    def reset():
+        nonlocal value
+        value = Absent()
+    if isinstance(value, Callback):
+        value.callback = reset
+    value[0]
+    reveal_type(value)  # revealed: Callback | Absent
+
+def later_writer(value: Callback | Absent):
+    value[0]
+    reveal_type(value)  # revealed: Callback | Absent
+    def reset():
+        nonlocal value
+        value = Absent()
+
+def generic_subscription():
+    alias = list[int]
+    values: alias = []
+    reveal_type(values)  # revealed: list[int]
+
+def dependent(values: Present | Absent, flag: bool):
+    while flag:
+        values[0]
+        reveal_type(values)  # revealed: Present
+        values = Present() if flag else Absent()
+```
+
+## Successful subscription with specialized receivers
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Literal, Never, overload
+
+class Target[T]:
+    @overload
+    def __getitem__(self: "Target[None]", key: Literal["custom"]) -> Never: ...
+    @overload
+    def __getitem__(self, key: Literal["custom"]) -> int: ...
+    @overload
+    def __getitem__(self, key: Literal["default"]) -> int: ...
+    def __getitem__(self, key: str) -> int:
+        return 0
+
+def custom(value: Target[int] | Target[None]):
+    value["custom"]
+    reveal_type(value)  # revealed: Target[int]
+
+def default(value: Target[int] | Target[None]):
+    value["default"]
+    reveal_type(value)  # revealed: Target[int] | Target[None]
+
+def union_key(value: Target[int] | Target[None], key: Literal["custom", "default"]):
+    value[key]
+    reveal_type(value)  # revealed: Target[int] | Target[None]
+
+def gradual_key(value: Target[int] | Target[None], key: Any):
+    value[key]
+    reveal_type(value)  # revealed: Target[int] | Target[None]
+
+def loop_key(original: Target[int] | Target[None], flag: bool):
+    key: Literal["custom", "default"] = "custom"
+    while flag:
+        value = original
+        value[key]
+        reveal_type(value)  # revealed: Target[int] | Target[None]
+        key = "default"
+```
+
+## Runtime type subscriptions
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Literal, Union
+
+def aliases(bad: int):
+    one = Union[int]
+    integer = Literal[1]
+    string = Literal["x"]
+    nested_literal = Literal[Literal[1]]
+    nested_type = type[Union[int]]
+    local = Literal
+    alias = local[1]
+    type Generic[T] = list[T]
+    specialized = Generic[int]
+    doubled = specialized[str]  # error: [not-subscriptable]
+    nested = list[bad[0]]  # error: [invalid-type-form]
+```
+
 ## `__getitem__` unbound
 
 ```py
