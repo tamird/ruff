@@ -40,11 +40,10 @@ pub use self::diagnostic::{UNDEFINED_REVEAL, UNRESOLVED_REFERENCE};
 pub(crate) use self::infer::{
     InferredDeclaration, TypeContext, infer_complete_scope_types, infer_deferred_types,
     infer_definition_types, infer_expression_type, infer_expression_types,
-    infer_same_file_expression_type, infer_scope_types, is_discarded_dict_key_assignment,
+    infer_function_default_types, infer_same_file_expression_type, infer_scope_types,
+    is_discarded_dict_key_assignment,
 };
-use self::infer::{
-    implicit_alias_parameters, infer_function_default_types, infer_implicit_alias_type,
-};
+use self::infer::{implicit_alias_parameters, infer_implicit_alias_type};
 pub(crate) use self::iteration::extract_fixed_length_iterable_element_types;
 pub use self::known_instance::KnownInstanceType;
 pub(crate) use self::loop_bindings::certifies_predicate as initial_binding_fixes_empty_guard;
@@ -2767,7 +2766,7 @@ impl<'db> Type<'db> {
     /// Returns the top materialization (or upper bound materialization) of this type, which is the
     /// most general form of the type that is fully static.
     #[must_use]
-    fn top_materialization(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
+    pub fn top_materialization(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
         (*self).materialization(db, env, MaterializationKind::Top)
     }
 

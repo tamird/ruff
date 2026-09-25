@@ -269,6 +269,7 @@ const NUM_FIELD_SPECIFIERS_INLINE: usize = 1;
 /// assignment, type narrowing guard), we use the [`infer_expression_types()`] query to ensure we
 /// don't infer its types more than once.
 pub(super) struct TypeInferenceBuilder<'db, 'ast> {
+    conservative_global_reads: bool,
     context: InferContext<'db, 'ast>,
 
     index: &'db SemanticIndex<'db>,
@@ -504,6 +505,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Self {
         let scope = region.scope(db);
         Self {
+            conservative_global_reads: db.conservative_global_reads(scope),
             context: InferContext::new(db, env, scope, file, program_file, module),
             index,
             region,
@@ -10727,7 +10729,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     }
                 }
                 ImplicitPlaceLoad::ExplicitGlobalSymbol { file, name } => {
-                    explicit_global_symbol(db, file, &name)
+                    self.global_input(explicit_global_symbol(db, file, &name))
                 }
                 ImplicitPlaceLoad::ModuleImplicitGlobal { file, name } => {
                     module_type_implicit_global_symbol(db, file, &name)
@@ -10765,6 +10767,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             place.map_type(|ty| {
                 self.narrow_place_with_applicable_constraints(place_expr, ty, narrowing_constraints)
             })
+        }
+    }
+
+    fn global_input(&self, place: PlaceAndQualifiers<'db>) -> PlaceAndQualifiers<'db> {
+        if self.conservative_global_reads
+            && !self
+                .inference_flags()
+                .contains(InferenceFlags::IN_TYPE_EXPRESSION)
+        {
+            place.map_type(|ty| ty.top_materialization(self.db(), self.program_environment()))
+        } else {
+            place
         }
     }
 
@@ -12011,6 +12025,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Consume the results already collected by this builder without compacting them.
     fn into_expression_cache_entry(self) -> FullExpressionCacheEntry<'db> {
         let Self {
+            conservative_global_reads: _,
             implicit_aliases,
             context,
             expressions,
@@ -12076,6 +12091,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_region();
 
         let Self {
+            conservative_global_reads: _,
             implicit_aliases,
             context,
             expressions,
@@ -12196,6 +12212,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let Self {
+            conservative_global_reads: _,
             implicit_aliases,
             context,
             expressions,
@@ -12249,6 +12266,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn finish_inferred_definition(self, definition: Definition<'db>) -> DefinitionInference<'db> {
         let Self {
+            conservative_global_reads: _,
             implicit_aliases,
             context,
             expressions,
@@ -12395,6 +12413,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_region();
 
         let Self {
+            conservative_global_reads: _,
             implicit_aliases,
             context,
             string_annotations,
@@ -12472,6 +12491,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn speculate(&self) -> Self {
         let db = self.db();
         let Self {
+            conservative_global_reads: _,
             region,
             index,
             cycle_recovery,
@@ -12547,6 +12567,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Extend the current region with the results of a speculative [`TypeInferenceBuilder`].
     fn extend(&mut self, other: Self) {
         let Self {
+            conservative_global_reads: _,
             implicit_aliases,
             context,
             expressions,

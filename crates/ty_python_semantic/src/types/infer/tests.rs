@@ -9,6 +9,7 @@ use crate::place::{ConsideredDefinitions, Place, PlaceAndQualifiers};
 use crate::types::{KnownClass, KnownInstanceType, check_types};
 use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
+use ruff_db::source::source_text;
 use ruff_db::system::DbWithWritableSystem as _;
 use ruff_db::testing::{assert_function_query_was_not_run, assert_function_query_was_run};
 use ruff_python_ast::PythonVersion;
@@ -90,6 +91,316 @@ fn assert_revealed_type(db: &TestDb, filename: &str, expected: &str) {
             .and_then(|annotation| annotation.get_message()),
         Some(expected.as_str())
     );
+}
+
+#[test]
+fn function_inference_facts() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        unrelated: int = "bad"
+
+        def needs_int(value: int) -> int:
+            return value
+
+        def clean() -> int:
+            return 1
+
+        def bad_body() -> int:
+            return "bad"
+
+        def suppressed_body() -> int:
+            return "bad"  # ty: ignore[invalid-return-type]
+
+        def bad_default(value: int = needs_int("bad")) -> int:
+            return value
+
+        def suppressed_default(value: int = needs_int("bad")) -> int:  # ty: ignore[invalid-argument-type]
+            return value
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let model = crate::SemanticModel::new(&db, program_file(&db, file));
+    for (name, errors, diagnostics_or_suppressions) in [
+        ("clean", false, false),
+        ("bad_body", true, true),
+        ("suppressed_body", false, true),
+        ("bad_default", true, true),
+        ("suppressed_default", false, true),
+    ] {
+        let definition = first_public_binding(&db, file, name);
+        let crate::FunctionInferenceFacts {
+            has_cycle_recovery,
+            has_errors,
+            has_diagnostics_or_suppressions,
+        } = model.function_inference_facts(definition).unwrap();
+        assert_eq!(
+            (
+                has_cycle_recovery,
+                has_errors,
+                has_diagnostics_or_suppressions,
+            ),
+            (false, errors, diagnostics_or_suppressions),
+            "{name}",
+        );
+    }
+    assert!(
+        model
+            .function_inference_facts(first_public_binding(&db, file, "unrelated"))
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn conservative_global_inputs() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/dependency.pyi",
+        r#"
+        from typing import Any, Callable
+        OPAQUE: list[Any]
+        CALLBACKS: list[Callable[..., object]]
+        "#,
+    )?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from collections.abc import Iterable, Sequence
+        from dependency import OPAQUE, CALLBACKS
+
+        def collect(extra: Iterable[object] | None) -> Sequence[object]:
+            fresh = []
+            fresh.append(1)
+            if not extra:
+                return OPAQUE
+            out = list(OPAQUE)
+            for item in extra:
+                if item not in out:
+                    out.append(item)
+            return out
+
+        def mutate() -> None:
+            OPAQUE.append("x")
+            OPAQUE[0] = "x"
+
+        def invoke() -> None:
+            CALLBACKS[0]()
+            CALLBACKS[0](named=1)
+
+        def wants_int(value: int) -> int:
+            return value
+
+        def launder_argument() -> int:
+            return wants_int(OPAQUE[0])
+
+        def launder_return() -> list[object]:
+            return OPAQUE[0]
+
+        def fresh_laundering() -> int:
+            xs = []
+            xs.append(OPAQUE[0])
+            return wants_int(xs[0])
+
+        def unselected() -> None:
+            OPAQUE.append("ordinary")
+            CALLBACKS[0](ordinary=1)
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let signature = |db: &TestDb| {
+        global_symbol(db, file, "collect")
+            .place
+            .expect_type()
+            .display(db, &db.program_environment())
+            .to_string()
+    };
+    let original_signature = signature(&db);
+    let local_type = |db: &TestDb, name: &str| {
+        let module = program_file(db, file);
+        let index = semantic_index(db, module);
+        let Some((scope, _)) = index.child_scopes(FileScopeId::global()).next() else {
+            panic!("collector body scope missing");
+        };
+        symbol(
+            db,
+            scope.to_scope_id(db, module),
+            name,
+            ConsideredDefinitions::AllReachable,
+        )
+        .place
+        .expect_type()
+        .display(db, &db.program_environment())
+        .to_string()
+    };
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    assert_eq!(local_type(&db, "out"), "list[Any]");
+    let selected = [
+        "collect",
+        "mutate",
+        "invoke",
+        "launder_argument",
+        "launder_return",
+        "fresh_laundering",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    db.select_conservative_global_reads(Some((file, selected)));
+    let diagnostics = check_types(&db, program_file(&db, file));
+    let selected_out = local_type(&db, "out");
+    let selected_fresh = local_type(&db, "fresh");
+    assert_eq!(selected_out, "list[object]");
+    assert_eq!(selected_fresh, "list[int]");
+    let source = source_text(&db, file);
+    let actual: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let Some(range) = diagnostic.primary_span().and_then(|span| span.range()) else {
+                panic!("diagnostic has no source range: {diagnostic:?}");
+            };
+            let start = usize::from(range.start());
+            let line_start = source[..start].rfind('\n').map_or(0, |offset| offset + 1);
+            let line_end = source[start..]
+                .find('\n')
+                .map_or(source.len(), |offset| start + offset);
+            (
+                diagnostic.id().to_string(),
+                source[line_start..line_end].trim().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            ("invalid-argument-type", "OPAQUE.append(\"x\")"),
+            ("invalid-assignment", "OPAQUE[0] = \"x\""),
+            ("call-top-callable", "CALLBACKS[0]()"),
+            ("call-top-callable", "CALLBACKS[0](named=1)"),
+            ("invalid-argument-type", "return wants_int(OPAQUE[0])"),
+            ("invalid-return-type", "return OPAQUE[0]"),
+            ("invalid-argument-type", "return wants_int(xs[0])"),
+        ]
+        .map(|(id, line)| (id.to_owned(), line.to_owned()))
+    );
+    assert_eq!(signature(&db), original_signature);
+    assert_eq!(
+        global_symbol(&db, file, "OPAQUE")
+            .place
+            .expect_type()
+            .display(&db, &db.program_environment())
+            .to_string(),
+        "list[Any]"
+    );
+    db.select_conservative_global_reads(None);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    assert_eq!(signature(&db), original_signature);
+    assert_eq!(local_type(&db, "out"), "list[Any]");
+    Ok(())
+}
+
+#[test]
+fn conservative_source_globals() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/dependency.py",
+        r#"
+        from typing import Any
+
+        def opaque() -> Any:
+            return None
+
+        def provider(value: Any) -> int:
+            return 1
+
+        VALUES = [provider, opaque()]
+        "#,
+    )?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from collections.abc import Iterable, Sequence
+        from dependency import VALUES
+
+        def collect(extra: Iterable[object] | None) -> Sequence[object]:
+            if not extra:
+                return VALUES
+            out = list(VALUES)
+            for item in extra:
+                if item not in out:
+                    out.append(item)
+            return out
+
+        SHARED = []
+
+        def mutate_shared() -> None:
+            SHARED.append(1)
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let dependency = system_path_to_file(&db, "/src/dependency.py")?;
+    let public_types = |db: &TestDb| {
+        [(dependency, "VALUES"), (file, "SHARED"), (file, "collect")].map(|(file, name)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary = public_types(&db);
+    assert_eq!(
+        ordinary,
+        [
+            "list[((value: Any) -> int) | Any]",
+            "list[Unknown]",
+            "def collect(extra: Iterable[object] | None) -> Sequence[object]",
+        ]
+        .map(str::to_owned)
+    );
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    db.select_conservative_global_reads(Some((
+        file,
+        ["collect", "mutate_shared"].map(str::to_owned).to_vec(),
+    )));
+    let selected = public_types(&db);
+    let diagnostics = check_types(&db, program_file(&db, file));
+    let module = program_file(&db, file);
+    let index = semantic_index(&db, module);
+    let Some((scope, _)) = index.child_scopes(FileScopeId::global()).next() else {
+        panic!("collector body scope missing");
+    };
+    let out = symbol(
+        &db,
+        scope.to_scope_id(&db, module),
+        "out",
+        ConsideredDefinitions::AllReachable,
+    )
+    .place
+    .expect_type()
+    .display(&db, &db.program_environment())
+    .to_string();
+    assert_eq!(selected, ordinary);
+    let source = source_text(&db, file);
+    let failures: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let Some(range) = diagnostic.primary_span().and_then(|span| span.range()) else {
+                panic!("diagnostic has no source range: {diagnostic:?}");
+            };
+            assert!(source[..usize::from(range.start())].ends_with("SHARED.append("));
+            (diagnostic.id().to_string(), source[range].to_owned())
+        })
+        .collect();
+    assert_eq!(
+        failures,
+        [("invalid-argument-type".to_owned(), "1".to_owned())]
+    );
+    assert_eq!(out, "list[object]");
+    db.select_conservative_global_reads(None);
+    assert_eq!(public_types(&db), ordinary);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    Ok(())
 }
 
 #[test]

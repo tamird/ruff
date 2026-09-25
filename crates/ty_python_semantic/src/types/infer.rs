@@ -1147,6 +1147,10 @@ impl<'db> ScopeInference<'db> {
         self
     }
 
+    pub(crate) fn has_cycle_recovery(&self) -> bool {
+        self.fallback_type().is_some()
+    }
+
     pub(crate) fn diagnostics(&self) -> Option<&TypeCheckDiagnostics> {
         self.extra.as_deref().map(|extra| &extra.diagnostics)
     }
@@ -1848,8 +1852,24 @@ impl<'db> DefinitionInference<'db> {
             )
     }
 
+    pub(crate) fn diagnostics(&self) -> Option<&TypeCheckDiagnostics> {
+        let extra = self.extra.as_deref()?;
+        match extra {
+            DefinitionInferenceExtra::Diagnostics(diagnostics) => Some(diagnostics),
+            DefinitionInferenceExtra::Other(extra) => Some(&extra.diagnostics),
+            DefinitionInferenceExtra::Qualifiers(_) => None,
+            DefinitionInferenceExtra::Deferred(_) => None,
+            DefinitionInferenceExtra::Undecorated(_) => None,
+            DefinitionInferenceExtra::DeferredAndUndecorated(_) => None,
+            DefinitionInferenceExtra::CalledFunctions(_) => None,
+            DefinitionInferenceExtra::ExpectedTypes(_) => None,
+            DefinitionInferenceExtra::StringAnnotations(_) => None,
+            DefinitionInferenceExtra::DiscardsDictKeyAssignments => None,
+        }
+    }
+
     /// Whether this result depends on provisional types from cycle recovery.
-    pub(super) fn is_provisional(&self) -> bool {
+    pub(crate) fn is_provisional(&self) -> bool {
         self.fallback_type().is_some()
     }
 

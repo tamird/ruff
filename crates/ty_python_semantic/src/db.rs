@@ -11,6 +11,14 @@ use ty_python_core::{Db as PythonCoreDb, ProgramFile};
 /// Database giving access to semantic information about a Python program.
 #[salsa::db]
 pub trait Db: PythonCoreDb {
+    /// Selects upper-bound materialization for explicit runtime module-global reads.
+    /// This is an active inference configuration, not a simultaneous alternate view.
+    /// Implementations must read tracked inputs. Parameters, captures, local bindings, eager
+    /// snapshots and member results retain ordinary inference; this is not a body proof.
+    fn conservative_global_reads(&self, _scope: ty_python_core::scope::ScopeId<'_>) -> bool {
+        false
+    }
+
     /// Resolves a binding introduced by [`PythonCoreDb::provided_statements`].
     /// Implementations must read tracked inputs and preserve the target program's context.
     fn provided_binding<'db>(
@@ -144,6 +152,7 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     use anyhow::Context;
+    use salsa::Setter;
     use ty_python_core::platform::PythonPlatform;
 
     use crate::{ProgramEnvironment, check_file_unwrap, default_lint_registry};
@@ -209,6 +218,11 @@ pub(crate) mod tests {
     }
 
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
+    #[salsa::input]
+    struct GlobalReadSelection {
+        #[returns(ref)]
+        selected: Option<(File, Vec<String>)>,
+    }
     type CallResultProvider =
         for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> Option<crate::types::Type<'db>>;
     type DeclarationPredicate = for<'db> fn(&'db TestDb, Definition<'db>) -> bool;
@@ -222,6 +236,7 @@ pub(crate) mod tests {
     #[salsa::db]
     #[derive(Clone)]
     pub(crate) struct TestDb {
+        global_read_selection: Option<GlobalReadSelection>,
         storage: salsa::Storage<Self>,
         files: Files,
         system: TestSystem,
@@ -242,7 +257,8 @@ pub(crate) mod tests {
         fn new(vendored: VendoredFileSystem) -> Self {
             let events = Events::default();
             let program_settings = ProgramSettings::empty(&vendored);
-            Self {
+            let mut db = Self {
+                global_read_selection: None,
                 storage: salsa::Storage::new(Some(Box::new({
                     let events = events.clone();
                     move |event| {
@@ -264,6 +280,17 @@ pub(crate) mod tests {
                 type_test_provider: None,
                 getattr_presence_provider: None,
                 source_provider: None,
+            };
+            db.global_read_selection = Some(GlobalReadSelection::new(&db, None));
+            db
+        }
+
+        pub(crate) fn select_conservative_global_reads(
+            &mut self,
+            selected: Option<(File, Vec<String>)>,
+        ) {
+            if let Some(selection) = self.global_read_selection {
+                selection.set_selected(self).to(selected);
             }
         }
 
@@ -365,6 +392,22 @@ pub(crate) mod tests {
 
     #[salsa::db]
     impl Db for TestDb {
+        fn conservative_global_reads(&self, scope: ty_python_core::scope::ScopeId<'_>) -> bool {
+            let Some(selection) = self.global_read_selection else {
+                return false;
+            };
+            let Some((file, names)) = selection.selected(self) else {
+                return false;
+            };
+            if scope.program_file(self).python_file(self).file(self) != *file {
+                return false;
+            }
+            let module =
+                ruff_db::parsed::parsed_module(self, scope.program_file(self).python_file(self))
+                    .load(self);
+            names.iter().any(|name| name == scope.name(self, &module))
+        }
+
         fn provided_binding<'db>(
             &'db self,
             definition: Definition<'db>,
