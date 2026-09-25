@@ -8243,10 +8243,10 @@ impl<'db> Type<'db> {
                 CallArguments::positional([name_type]),
                 TypeContext::default(),
             ) {
-                Ok(outcome) => Place::bound(outcome.return_type(db, env)).into(),
+                Ok(outcome) => outcome.getattr_result(db, env).into(),
                 Err(CallDunderError::CallError(_, bindings, _)) => member_lookup_result(
                     db,
-                    Place::bound(bindings.return_type(db, env)).into(),
+                    bindings.getattr_result(db, env).into(),
                     Some(MemberLookupErrorKind::GetAttr {
                         receiver: self,
                         name: name_type,

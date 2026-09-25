@@ -1108,6 +1108,38 @@ impl<'db> Bindings<'db> {
         })
     }
 
+    /// The getter's ordinary result, retaining application-supplied presence information.
+    pub(crate) fn getattr_result(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Place<'db> {
+        let may_be_missing = |overload: &Binding<'db>| {
+            overload
+                .signature
+                .definition()
+                .is_some_and(|definition| db.provided_getattr_may_be_missing(definition))
+        };
+        let possibly_undefined = self.elements.iter().any(|element| {
+            element.callables().any(|binding| {
+                let mut selected = binding.selected_overloads().peekable();
+                if selected.peek().is_some() {
+                    selected.any(|(_, overload)| may_be_missing(overload))
+                } else {
+                    // Failed calls recover a sole overload's result, or Unknown for multiple
+                    // candidates. Recovery cannot guarantee presence through a marked getter.
+                    binding.overloads().iter().any(may_be_missing)
+                }
+            })
+        });
+        let definedness = if possibly_undefined {
+            Definedness::PossiblyUndefined
+        } else {
+            Definedness::AlwaysDefined
+        };
+        Place::Defined(DefinedPlace::new(self.return_type(db, env)).with_definedness(definedness))
+    }
+
     /// Maps each `CallableBinding` to a type and combines results while preserving
     /// the union-of-intersections structure:
     ///

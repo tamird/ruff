@@ -69,6 +69,17 @@ pub trait Db: PythonCoreDb {
         None
     }
 
+    /// Whether a supplied `__getattr__` declaration bounds the values of existing members
+    /// without guaranteeing that the requested member exists.
+    ///
+    /// This describes the requested attribute, not the availability of the getter itself.
+    /// Ty preserves ordinary argument checking and the specialized return type, but marks
+    /// the fallback member as possibly undefined. Implementations must identify the resolved
+    /// declaration and read tracked inputs without inferring the getter's body.
+    fn provided_getattr_may_be_missing(&self, _definition: Definition<'_>) -> bool {
+        false
+    }
+
     /// Describes an exhaustive runtime type test in an embedded program.
     ///
     /// The comparison `callable(subject) == compared_value` must hold exactly when `subject`
@@ -191,6 +202,7 @@ pub(crate) mod tests {
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
     type CallResultProvider =
         for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> Option<crate::types::Type<'db>>;
+    type DeclarationPredicate = for<'db> fn(&'db TestDb, Definition<'db>) -> bool;
     type TypeTestProvider = for<'db> fn(
         &'db TestDb,
         ProgramFile<'db>,
@@ -213,6 +225,7 @@ pub(crate) mod tests {
         program_settings: ProgramSettings,
         call_result_provider: Option<CallResultProvider>,
         type_test_provider: Option<TypeTestProvider>,
+        getattr_presence_provider: Option<DeclarationPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
@@ -240,6 +253,7 @@ pub(crate) mod tests {
                 program_settings,
                 call_result_provider: None,
                 type_test_provider: None,
+                getattr_presence_provider: None,
                 source_provider: None,
             }
         }
@@ -371,6 +385,11 @@ pub(crate) mod tests {
                 .and_then(|provider| provider(self, call))
         }
 
+        fn provided_getattr_may_be_missing(&self, definition: Definition<'_>) -> bool {
+            self.getattr_presence_provider
+                .is_some_and(|provider| provider(self, definition))
+        }
+
         fn provided_type_test<'db>(
             &'db self,
             file: ProgramFile<'db>,
@@ -468,6 +487,7 @@ pub(crate) mod tests {
         lint_registry: Option<LintRegistry>,
         call_result_provider: Option<CallResultProvider>,
         type_test_provider: Option<TypeTestProvider>,
+        getattr_presence_provider: Option<DeclarationPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
@@ -484,6 +504,7 @@ pub(crate) mod tests {
                 lint_registry: None,
                 call_result_provider: None,
                 type_test_provider: None,
+                getattr_presence_provider: None,
                 source_provider: None,
             }
         }
@@ -531,6 +552,14 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_getattr_presence_provider(
+            mut self,
+            provider: DeclarationPredicate,
+        ) -> Self {
+            self.getattr_presence_provider = Some(provider);
+            self
+        }
+
         pub(crate) fn with_type_test_provider(mut self, provider: TypeTestProvider) -> Self {
             self.type_test_provider = Some(provider);
             self
@@ -558,6 +587,7 @@ pub(crate) mod tests {
             let mut db = TestDb::new(self.vendored);
             db.call_result_provider = self.call_result_provider;
             db.type_test_provider = self.type_test_provider;
+            db.getattr_presence_provider = self.getattr_presence_provider;
             db.source_provider = self.source_provider;
 
             if let Some(registry) = self.lint_registry {
