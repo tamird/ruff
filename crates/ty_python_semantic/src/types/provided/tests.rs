@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
@@ -1605,4 +1607,137 @@ fn callable_metadata_survives_signature_transforms() -> anyhow::Result<()> {
     );
     Ok(())
 }
-use std::fmt::Write;
+
+#[test]
+fn supplied_getters_preserve_attribute_presence() -> anyhow::Result<()> {
+    fn presence(db: &TestDb, definition: ty_python_core::definition::Definition<'_>) -> bool {
+        if definition
+            .program_file(db)
+            .file(db)
+            .path(db)
+            .as_system_path()
+            .is_none_or(|path| path.as_str() != "/src/native.pyi")
+        {
+            return false;
+        }
+        let ty_python_core::definition::DefinitionKind::Function(function) = definition.kind(db)
+        else {
+            return false;
+        };
+        let module = parsed_module(db, definition.python_file(db)).load(db);
+        let function = function.node(&module);
+        if function.name.as_str() != "__getattr__" {
+            return false;
+        }
+        let Some(parameter) = function.parameters.find("name") else {
+            return false;
+        };
+        parameter
+            .annotation()
+            .and_then(ast::Expr::as_name_expr)
+            .is_some_and(|annotation| matches!(annotation.id.as_str(), "str" | "int"))
+    }
+    let original = r#"
+from typing import Literal, overload
+class Record[T]:
+    def __getattr__(self, name: str) -> T: ...
+class Selected:
+    @overload
+    def __getattr__(self, name: Literal["run"]) -> object: ...
+    @overload
+    def __getattr__(self, name: str) -> object: ...
+class Malformed:
+    def __getattr__(self, name: int) -> object: ...
+"#;
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_file("/src/native.pyi", original)
+        .with_file("/src/main.py", "")
+        .with_getattr_presence_provider(presence)
+        .build()?;
+    let source = r#"
+from typing import Protocol
+from typing_extensions import assert_type
+from native import Record, Selected, Malformed
+class Required(Protocol):
+    @property
+    def run(self) -> object: ...
+def consume(value: Required): ...
+record = Record[str]()
+assert_type(record.run, str)
+consume(record)
+if hasattr(record, "run"):
+    assert_type(record.run, str)
+    consume(record)
+class Override(Record[object]):
+    def __getattr__(self, name: str) -> int:
+        return 1
+assert_type(Override().other, int)
+class Concrete(Record[str]):
+    run: str = "ok"
+    @property
+    def field(self) -> int:
+        return 1
+consume(Concrete())
+assert_type(Concrete().field, int)
+class Intercept(Record[str]):
+    def __getattribute__(self, name: str) -> int:
+        return 1
+assert_type(Intercept().other, int)
+selected = Selected()
+consume(selected)
+assert_type(selected.run, object)
+malformed = Malformed()
+consume(malformed)
+malformed.other
+"#;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    db.write_file("/src/main.py", source)?;
+    let with_field = original.replace("class Record[T]:", "class Record[T]:\n    run: str");
+    for native in [original, with_field.as_str(), original] {
+        db.write_file("/src/native.pyi", native)?;
+        let diagnostics = db.check_file(file);
+        let expected = if native == original {
+            vec![
+                "invalid-argument-type",
+                "invalid-argument-type",
+                "invalid-attribute-access",
+            ]
+        } else {
+            vec!["invalid-argument-type", "invalid-attribute-access"]
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{diagnostics:#?}",
+        );
+        let program = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program);
+        for name in ["record", "selected", "malformed"] {
+            let ty = crate::place::global_symbol(&db, program, name)
+                .place
+                .expect_type();
+            let member = ty.member(&db, &env, "run");
+            let crate::place::Place::Defined(member) = member.place else {
+                panic!("getter supplies a value bound");
+            };
+            let expected = if name == "selected" || (name == "record" && native != original) {
+                crate::place::Definedness::AlwaysDefined
+            } else {
+                crate::place::Definedness::PossiblyUndefined
+            };
+            let crate::place::DefinedPlace {
+                ty: _,
+                origin: _,
+                definedness,
+                public_type_policy: _,
+                provenance: _,
+            } = member;
+            assert_eq!(definedness, expected, "{name}");
+        }
+    }
+    Ok(())
+}
