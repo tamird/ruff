@@ -1548,6 +1548,8 @@ pub(super) enum TypedDictAssignmentKind {
     Subscript,
     /// For constructor arguments like `MyTypedDict(key=value)`
     Constructor,
+    /// A fresh literal checked against a supplied structural value contract.
+    ValueContract,
 }
 
 impl TypedDictAssignmentKind {
@@ -1555,6 +1557,7 @@ impl TypedDictAssignmentKind {
         match self {
             Self::Subscript => "assignment",
             Self::Constructor => "argument",
+            Self::ValueContract => "argument",
         }
     }
 
@@ -1562,6 +1565,7 @@ impl TypedDictAssignmentKind {
         match self {
             Self::Subscript => &INVALID_ASSIGNMENT,
             Self::Constructor => &INVALID_ARGUMENT_TYPE,
+            Self::ValueContract => &INVALID_ARGUMENT_TYPE,
         }
     }
 
@@ -1591,6 +1595,11 @@ impl<'db> TypedDictKeyAssignment<'_, 'db, '_> {
 
         // Check if key exists in `TypedDict` or is accepted by explicit extra items.
         let Some(item) = self.typed_dict.item(db, self.key) else {
+            if matches!(self.assignment_kind, TypedDictAssignmentKind::ValueContract)
+                && self.typed_dict.openness(db).is_implicitly_open()
+            {
+                return true;
+            }
             if self.emit_diagnostic {
                 report_invalid_key_on_typed_dict(
                     self.context,
@@ -2772,6 +2781,7 @@ fn validate_from_dict_literal<'db, 'ast>(
             key: dict_node,
             value: dict_node,
         },
+        TypeContext::default(),
         &mut provided_keys,
         &mut shadowed_keys,
         expression_type_fn,
@@ -2853,6 +2863,7 @@ fn validate_from_keywords<'db, 'ast>(
                     key: keyword_node,
                     value: (&keyword.value).into(),
                 },
+                TypeContext::default(),
                 &mut unpacked_guaranteed_keys,
                 &mut shadowed_keys,
                 expression_type_fn,
@@ -2877,11 +2888,13 @@ fn validate_from_keywords<'db, 'ast>(
     guaranteed_keys.into_keys().collect()
 }
 
+#[expect(clippy::too_many_arguments)]
 fn validate_merged_dict_literal<'db, 'ast>(
     context: &InferContext<'db, 'ast>,
     typed_dict: TypedDictType<'db>,
     dict_expr: &'ast ast::ExprDict,
     nodes: TypedDictAssignmentNodes<'ast>,
+    tcx: TypeContext<'db>,
     guaranteed_keys: &mut BTreeMap<Name, Option<AnyNodeRef<'ast>>>,
     shadowed_keys: &mut OrderSet<Name>,
     expression_type_fn: &mut impl FnMut(&ast::Expr, TypeContext<'db>) -> Type<'db>,
@@ -2899,7 +2912,7 @@ fn validate_merged_dict_literal<'db, 'ast>(
                         .arbitrary_key_initialization_type_excluding(db, env, shadowed_keys)
                     {
                         let value_ty =
-                            expression_type_fn(&item.value, TypeContext::new(Some(expected_ty)));
+                            expression_type_fn(&item.value, tcx.with_annotation(Some(expected_ty)));
                         if !value_ty.is_assignable_to(db, env, expected_ty) {
                             valid = false;
                             if let Some(builder) =
@@ -2941,7 +2954,7 @@ fn validate_merged_dict_literal<'db, 'ast>(
             if !is_shadowed {
                 let value_tcx = typed_dict
                     .item(db, key.as_str())
-                    .map(|field| TypeContext::new(Some(field.declared_ty)))
+                    .map(|field| tcx.with_annotation(Some(field.declared_ty)))
                     .unwrap_or_default();
                 let value_ty = expression_type_fn(&item.value, value_tcx);
                 valid &= TypedDictKeyAssignment {
@@ -2953,7 +2966,11 @@ fn validate_merged_dict_literal<'db, 'ast>(
                     typed_dict_node: nodes.typed_dict,
                     key_node: key_expr.into(),
                     value_node: (&item.value).into(),
-                    assignment_kind: TypedDictAssignmentKind::Constructor,
+                    assignment_kind: if tcx.is_value_contract() {
+                        TypedDictAssignmentKind::ValueContract
+                    } else {
+                        TypedDictAssignmentKind::Constructor
+                    },
                     emit_diagnostic: true,
                 }
                 .validate();
@@ -2974,6 +2991,7 @@ fn validate_merged_dict_literal<'db, 'ast>(
                     key: (&item.value).into(),
                     value: (&item.value).into(),
                 },
+                tcx,
                 guaranteed_keys,
                 shadowed_keys,
                 expression_type_fn,
@@ -2993,6 +3011,7 @@ fn validate_merged_unpacked_keyword_argument<'db, 'ast>(
     expr: &'ast ast::Expr,
     unpacked_type: Type<'db>,
     nodes: TypedDictAssignmentNodes<'ast>,
+    tcx: TypeContext<'db>,
     guaranteed_keys: &mut BTreeMap<Name, Option<AnyNodeRef<'ast>>>,
     shadowed_keys: &mut OrderSet<Name>,
     expression_type_fn: &mut impl FnMut(&ast::Expr, TypeContext<'db>) -> Type<'db>,
@@ -3007,6 +3026,7 @@ fn validate_merged_unpacked_keyword_argument<'db, 'ast>(
             typed_dict,
             dict_expr,
             nodes,
+            tcx,
             guaranteed_keys,
             shadowed_keys,
             expression_type_fn,
@@ -3092,6 +3112,7 @@ pub(super) fn validate_typed_dict_dict_literal<'db>(
     typed_dict: TypedDictType<'db>,
     dict_expr: &ast::ExprDict,
     typed_dict_node: AnyNodeRef,
+    tcx: TypeContext<'db>,
     mut expression_type_fn: impl FnMut(&ast::Expr, TypeContext<'db>) -> Type<'db>,
 ) -> Result<OrderSet<Name>, OrderSet<Name>> {
     let mut provided_keys = BTreeMap::new();
@@ -3106,6 +3127,7 @@ pub(super) fn validate_typed_dict_dict_literal<'db>(
             key: typed_dict_node,
             value: typed_dict_node,
         },
+        tcx,
         &mut provided_keys,
         &mut shadowed_keys,
         &mut expression_type_fn,

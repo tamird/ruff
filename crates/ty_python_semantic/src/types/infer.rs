@@ -821,8 +821,7 @@ impl<'db> InferScope<'db> {
     }
 }
 
-/// The type context for a given expression, namely the type annotation
-/// in an annotated assignment.
+/// The expected type and checking purpose for an expression.
 ///
 /// Knowing the outer type context when inferring an expression can enable
 /// more precise inference results, aka "bidirectional type inference".
@@ -831,11 +830,51 @@ impl<'db> InferScope<'db> {
 )]
 pub(crate) struct TypeContext<'db> {
     pub(crate) annotation: Option<Type<'db>>,
+    purpose: TypeContextPurpose,
+}
+
+#[derive(
+    Default, Copy, Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue,
+)]
+pub(crate) enum TypeContextPurpose {
+    #[default]
+    Inference,
+    ValueContract,
 }
 
 impl<'db> TypeContext<'db> {
     pub(crate) fn new(annotation: Option<Type<'db>>) -> Self {
-        Self { annotation }
+        Self {
+            annotation,
+            purpose: TypeContextPurpose::Inference,
+        }
+    }
+
+    pub(crate) fn for_value_contract(annotation: Type<'db>) -> Self {
+        Self {
+            annotation: Some(annotation),
+            purpose: TypeContextPurpose::ValueContract,
+        }
+    }
+
+    /// Derive a literal child's expected type without losing the checking purpose.
+    /// An independently inferred child has the canonical empty context.
+    pub(crate) fn with_annotation(self, annotation: Option<Type<'db>>) -> Self {
+        let Self {
+            annotation: _,
+            purpose,
+        } = self;
+        match annotation {
+            Some(annotation) => Self {
+                annotation: Some(annotation),
+                purpose,
+            },
+            None => Self::default(),
+        }
+    }
+
+    pub(crate) fn is_value_contract(self) -> bool {
+        matches!(self.purpose, TypeContextPurpose::ValueContract)
     }
 
     /// If the type annotation is a specialized instance of the given `KnownClass`, returns the
@@ -851,9 +890,7 @@ impl<'db> TypeContext<'db> {
     }
 
     fn map(self, f: impl FnOnce(Type<'db>) -> Type<'db>) -> Self {
-        Self {
-            annotation: self.annotation.map(f),
-        }
+        self.with_annotation(self.annotation.map(f))
     }
 
     fn is_typealias(&self) -> bool {

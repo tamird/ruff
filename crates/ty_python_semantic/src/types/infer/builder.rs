@@ -4834,7 +4834,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // RHS (`list[T] | None`), in order to bind `T` to `OptionalList`.
             let previous_typevar_binding_context = self.typevar_binding_context.replace(definition);
 
-            let tcx = TypeContext::new(Some(declared.inner_type()));
+            let tcx = annotation.initializer_context(declared.inner_type());
             let inferred_ty = self.infer_maybe_standalone_expression_with_bindings_owner(
                 value,
                 tcx,
@@ -7260,7 +7260,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let mut speculative_builder = self.speculate();
 
             let inferred_ty = speculative_builder
-                .infer_tuple_expression_impl(tuple, TypeContext::new(Some(*narrowed_ty)));
+                .infer_tuple_expression_impl(tuple, tcx.with_annotation(Some(*narrowed_ty)));
             if inferred_ty.is_assignable_to(db, env, *narrowed_ty) {
                 self.extend(speculative_builder);
                 if teardown_expression_cache {
@@ -7353,7 +7353,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 } else {
                     annotated_elt_ty
                 };
-                TypeContext::new(expected)
+                tcx.with_annotation(expected)
             } else {
                 TypeContext::default()
             };
@@ -7524,7 +7524,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // first means a union whose arms all alias the same `TypedDict` reaches this
                 // branch rather than neither.
                 if let Some(ty) =
-                    self.infer_typed_dict_expression(dict, typed_dict, &mut item_types)
+                    self.infer_typed_dict_expression(dict, typed_dict, tcx, &mut item_types)
                 {
                     return ty;
                 }
@@ -7543,7 +7543,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         // the non-`TypedDict` arm of the union.
                         let mut speculative_builder = self.speculate_without_diagnostics();
                         has_dict_compatible_fallback = speculative_builder
-                            .infer_dict_expression(dict, TypeContext::new(Some(element)))
+                            .infer_dict_expression(dict, tcx.with_annotation(Some(element)))
                             .is_assignable_to(db, env, element);
                     }
                 }
@@ -7552,7 +7552,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     && !has_dict_compatible_fallback
                 {
                     if let Some(ty) =
-                        self.infer_typed_dict_expression(dict, *typed_dict, &mut item_types)
+                        self.infer_typed_dict_expression(dict, *typed_dict, tcx, &mut item_types)
                     {
                         return ty;
                     }
@@ -7580,7 +7580,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         // the literal.
                         if let Some(inferred_ty) = self
                             .speculate_without_diagnostics()
-                            .infer_typed_dict_expression(dict, typed_dict, &mut item_types)
+                            .infer_typed_dict_expression(dict, typed_dict, tcx, &mut item_types)
                         {
                             narrowed_tys.push(inferred_ty);
                         }
@@ -7647,7 +7647,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 collection_expr,
                 elts,
                 infer_elt_expression,
-                TypeContext::new(Some(narrowed_ty)),
+                tcx.with_annotation(Some(narrowed_ty)),
             )?;
 
             // Ensure the inferred return type is assignable to the narrowed declared type.
@@ -7919,7 +7919,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         elt_tcx
                     };
                     let inferred_elt_ty =
-                        infer_elt_expression(self, (i, elt, TypeContext::new(Some(elt_tcx))));
+                        infer_elt_expression(self, (i, elt, tcx.with_annotation(Some(elt_tcx))));
                     inferred_elt_tys[i] = Some(inferred_elt_ty);
 
                     if !inferred_elt_ty.is_assignable_to(db, env, elt_tcx) {
@@ -8106,7 +8106,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .as_ref()
                     .and_then(|inferred_elts| inferred_elts[elts_index][i])
                     .unwrap_or_else(|| {
-                        infer_elt_expression(self, (i, elt, TypeContext::new(elt_tcx)))
+                        infer_elt_expression(self, (i, elt, tcx.with_annotation(elt_tcx)))
                     });
 
                 // Simplify the inference based on a non-covariant declared type.
@@ -9238,6 +9238,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             }
         }
+
+        // Structural value checking follows fresh literal children, not arguments
+        // passed through calls (including builtin constructor inference shortcuts).
+        let call_expression_tcx = TypeContext::new(call_expression_tcx.annotation);
 
         let db = self.db();
         let env = self.program_environment();
@@ -13348,4 +13352,76 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
 enum BoundOrConstraintsNodes<'ast> {
     Bound(&'ast ast::Expr),
     Constraints(&'ast [ast::Expr]),
+}
+
+#[cfg(test)]
+mod tests {
+    use ruff_db::files::system_path_to_file;
+    use ruff_db::parsed::parsed_module;
+    use ty_python_core::{global_scope, semantic_index};
+
+    use super::*;
+    use crate::db::tests::TestDbBuilder;
+    use crate::provided::ProvidedBindingValue;
+
+    #[test]
+    fn literal_cache_separates_structural_contracts() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new()
+            .with_file("/src/main.py", "{'value': 1, 'hidden': []}\n")
+            .with_file(
+                "/src/contracts.pyi",
+                "from typing import TypedDict\nclass Row(TypedDict):\n    value: int\nshape: Row\n",
+            )
+            .build()?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let annotation = ProvidedBindingValue::Export {
+            file: db.program_file(system_path_to_file(&db, "/src/contracts.pyi")?),
+            name: Name::new_static("shape"),
+        }
+        .resolve_type(&db)
+        .expect("declared Row contract");
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let [statement] = module.suite().as_slice() else {
+            panic!("expected one statement");
+        };
+        let ast::Stmt::Expr(statement) = statement else {
+            panic!("expected an expression statement");
+        };
+        let env = ProgramEnvironment::from_file(file);
+        let mut builder = TypeInferenceBuilder::new(
+            &db,
+            &env,
+            InferenceRegion::Scope(global_scope(&db, file), TypeContext::default()),
+            file.file(&db),
+            file,
+            semantic_index(&db, file),
+            &module,
+        );
+        builder.context.defuse();
+        assert!(builder.setup_expression_cache());
+        for structural in [true, false, true, false] {
+            let tcx = if structural {
+                TypeContext::for_value_contract(annotation)
+            } else {
+                TypeContext::new(Some(annotation))
+            };
+            let mut attempt = builder.speculate();
+            let inferred = attempt.infer_expression(&statement.value, tcx);
+            let diagnostics = attempt
+                .into_expression_cache_entry()
+                .diagnostics
+                .into_diagnostics();
+            assert_eq!(inferred == annotation, structural);
+            assert_eq!(diagnostics.is_empty(), structural, "{diagnostics:#?}");
+            if !structural {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.id().as_str() == "invalid-key"),
+                    "{diagnostics:#?}"
+                );
+            }
+        }
+        Ok(())
+    }
 }

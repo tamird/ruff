@@ -18,6 +18,18 @@ pub enum ProvidedAnnotation<'db> {
         file: ProgramFile<'db>,
         owner: ruff_python_ast::NodeIndex,
     },
+    /// Checks a fresh value initializer against a structural contract declared by a
+    /// module-level annotated assignment in another source tree. Only simple-name
+    /// assignments are supported. The provider must establish independent value evidence
+    /// and fresh storage before supplying this annotation.
+    ///
+    /// Contextual dictionary literals permit hidden string keys on implicitly-open
+    /// `TypedDict` contracts. Declared fields and explicit extra-item bounds are checked
+    /// normally; ordinary constructor calls retain their initialization rules.
+    ExternalValueContract {
+        file: ProgramFile<'db>,
+        owner: ruff_python_ast::NodeIndex,
+    },
 }
 
 #[cfg(any(test, feature = "testing"))]
