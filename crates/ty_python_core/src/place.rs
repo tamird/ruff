@@ -9,6 +9,8 @@ use crate::{Db, PossiblyNarrowedPlaces};
 use ruff_db::parsed::ParsedModuleRef;
 use ruff_index::IndexVec;
 use ruff_python_ast as ast;
+use ruff_python_ast::name::Name;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::iter::FusedIterator;
@@ -78,6 +80,16 @@ impl PlaceExpr {
         }
 
         MemberExprBuilder::visit_expr(expr).and_then(Self::try_from_member_expr)
+    }
+
+    /// The contents location belonging to a mapping receiver.
+    ///
+    /// This internal member has no Python spelling. In particular, it is distinct
+    /// from empty string and bytes subscripts, and has the receiver as its parent.
+    pub fn contents<'e>(receiver: impl Into<ast::ExprRef<'e>>) -> Option<Self> {
+        let receiver = MemberExprBuilder::visit_expr(receiver.into())?;
+        let contents = receiver.with_contents()?;
+        Self::try_from_member_expr(contents)
     }
 
     /// Tries to create a `PlaceExpr` from a member expression.
@@ -196,7 +208,6 @@ impl Hash for PlaceTable {
         for symbol in self.symbols.iter() {
             symbol.name().hash(state);
             symbol.is_used().hash(state);
-            symbol.has_only_tracked_dictionary_uses().hash(state);
             symbol.is_bound().hash(state);
             symbol.is_declared().hash(state);
             symbol.is_global().hash(state);
@@ -294,6 +305,16 @@ impl PlaceTable {
     pub fn member_id_by_instance_attribute_name(&self, name: &str) -> Option<ScopedMemberId> {
         self.members.place_id_by_instance_attribute_name(name)
     }
+
+    /// Find an existing scalar key place belonging to an internal mapping-contents place.
+    pub fn contents_key(&self, contents: ScopedPlaceId, name: &str) -> Option<ScopedPlaceId> {
+        let ScopedPlaceId::Member(contents) = contents else {
+            return None;
+        };
+        let member = self.member(contents);
+        let key = member.contents_key(name)?;
+        self.members.member_id(&key).map(Into::into)
+    }
 }
 
 #[derive(Default)]
@@ -303,6 +324,9 @@ pub struct PlaceTableBuilder {
 
     associated_symbol_members: IndexVec<ScopedSymbolId, SmallVec<[ScopedMemberId; 4]>>,
     associated_sub_members: IndexVec<ScopedMemberId, SmallVec<[ScopedMemberId; 4]>>,
+    /// Internal members may be discovered before their root symbol is visited. Registering
+    /// that symbol early would change declaration order, which enum and class fields observe.
+    pending_symbol_members: FxHashMap<Name, SmallVec<[ScopedMemberId; 4]>>,
 }
 
 impl PlaceTableBuilder {
@@ -354,6 +378,16 @@ impl PlaceTableBuilder {
         }
     }
 
+    pub(crate) fn associated_symbol_members_by_name(&self, name: &str) -> &[ScopedMemberId] {
+        if let Some(symbol) = self.symbols.symbol_id(name) {
+            &self.associated_symbol_members[symbol]
+        } else {
+            self.pending_symbol_members
+                .get(name)
+                .map_or(&[], |members| members.as_slice())
+        }
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = PlaceExprRef<'_>> {
         self.symbols
             .iter()
@@ -369,7 +403,11 @@ impl PlaceTableBuilder {
         let (id, is_new) = self.symbols.add(symbol);
 
         if is_new {
-            let new_id = self.associated_symbol_members.push(SmallVec::new_const());
+            let members = self
+                .pending_symbol_members
+                .remove(self.symbols.symbol(id).name())
+                .unwrap_or_default();
+            let new_id = self.associated_symbol_members.push(members);
             debug_assert_eq!(new_id, id);
         }
 
@@ -384,6 +422,14 @@ impl PlaceTableBuilder {
             debug_assert_eq!(new_id, id);
 
             let member = self.member.member(id);
+
+            let symbol_name = member.expression().as_ref().symbol_name();
+            if self.symbols.symbol_id(symbol_name).is_none() {
+                self.pending_symbol_members
+                    .entry(Name::new(symbol_name))
+                    .or_default()
+                    .push(id);
+            }
 
             // iterate over parents
             for parent_id in
@@ -441,9 +487,16 @@ impl PlaceTableBuilder {
     }
 
     pub(crate) fn finish(self) -> PlaceTable {
+        let Self {
+            symbols,
+            member,
+            associated_symbol_members: _,
+            associated_sub_members: _,
+            pending_symbol_members: _,
+        } = self;
         PlaceTable {
-            symbols: self.symbols.build(),
-            members: self.member.build(),
+            symbols: symbols.build(),
+            members: member.build(),
         }
     }
 }
@@ -664,6 +717,12 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
                 places.insert(place);
             }
         }
+        if let ast::Expr::Subscript(subscript) = expr.expression_value()
+            && let Some(contents) = PlaceExpr::contents(subscript.value.as_ref())
+            && let Some(place) = self.places.place_id((&contents).into())
+        {
+            places.insert(place);
+        }
         places
     }
 
@@ -721,11 +780,7 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
                 .filter(|keyword| keyword.arg.is_some())
                 .map(|keyword| &keyword.value),
         ) {
-            if let Some(place_expr) = PlaceExpr::try_from_expr(argument) {
-                if let Some(place) = self.places.place_id((&place_expr).into()) {
-                    places.insert(place);
-                }
-            }
+            places.extend(self.simple_expr(argument));
         }
 
         // `bool(expr)` can delegate to narrowing `expr` itself, e.g. `bool(x is not None)`
@@ -756,29 +811,18 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
 
     /// Helper to add a potential narrowing target expression to the set.
     fn add_narrowing_target(&self, expr: &ast::Expr, places: &mut PossiblyNarrowedPlaces) {
-        if let Some(place_expr) = PlaceExpr::try_from_expr(expr)
-            && let Some(place) = self.places.place_id((&place_expr).into())
-        {
-            places.insert(place);
-        }
+        places.extend(self.simple_expr(expr));
 
         match expr.expression_value() {
             // type(x) is Y can narrow x
             ast::Expr::Call(call) if call.arguments.args.len() == 1 => {
-                if let Some(first_arg) = call.arguments.args.first()
-                    && let Some(place_expr) = PlaceExpr::try_from_expr(first_arg)
-                    && let Some(place) = self.places.place_id((&place_expr).into())
-                {
-                    places.insert(place);
+                if let Some(first_arg) = call.arguments.args.first() {
+                    places.extend(self.simple_expr(first_arg));
                 }
             }
             // x.__class__ is Y can narrow x
             ast::Expr::Attribute(attribute) if attribute.attr.as_str() == "__class__" => {
-                if let Some(place_expr) = PlaceExpr::try_from_expr(&attribute.value)
-                    && let Some(place) = self.places.place_id((&place_expr).into())
-                {
-                    places.insert(place);
-                }
+                places.extend(self.simple_expr(&attribute.value));
             }
             _ => {}
         }
@@ -794,12 +838,47 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
 
         let subject_node = subject.node_ref(self.db).node(module);
         for expression in match_subject_place_expressions(subject_node) {
-            if let Some(place) = PlaceExpr::try_from_expr(expression)
-                .and_then(|place| self.places.place_id((&place).into()))
-            {
-                places.insert(place);
-            }
+            places.extend(self.simple_expr(expression));
         }
         places
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contents_members_preserve_root_order() {
+        let expression = ruff_python_parser::parse_expression("later.child").unwrap();
+        let receiver = PlaceExpr::try_from_expr(expression.expr()).unwrap();
+        let contents = PlaceExpr::contents(expression.expr()).unwrap();
+        let mut table = PlaceTableBuilder::default();
+        let (receiver, _) = table.add_place(receiver);
+        let (contents, _) = table.add_place(contents);
+        let (ScopedPlaceId::Member(receiver_member), ScopedPlaceId::Member(contents_member)) =
+            (receiver, contents)
+        else {
+            panic!("expected member places, got {receiver:?} and {contents:?}");
+        };
+        let expected = [receiver_member, contents_member];
+        assert_eq!(table.symbols().count(), 0);
+        assert_eq!(table.associated_symbol_members_by_name("later"), expected);
+        assert_eq!(table.associated_place_ids(receiver), &[contents_member]);
+
+        table.add_symbol(Symbol::new(Name::new("earlier")));
+        let (root, is_new) = table.add_symbol(Symbol::new(Name::new("later")));
+        assert!(is_new);
+        assert_eq!(table.associated_place_ids(root.into()), expected);
+        assert_eq!(table.associated_symbol_members_by_name("later"), expected);
+        assert_eq!(
+            table
+                .symbols()
+                .map(|symbol| symbol.name().as_str())
+                .collect::<Vec<_>>(),
+            ["earlier", "later"]
+        );
+        assert!(!table.add_symbol(Symbol::new(Name::new("later"))).1);
+        assert_eq!(table.associated_place_ids(root.into()), expected);
     }
 }

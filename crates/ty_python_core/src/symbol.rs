@@ -44,7 +44,6 @@ bitflags! {
         /// true if the symbol is assigned more than once, or if it is assigned even though it is already in use
         const IS_REASSIGNED         = 1 << 5;
         const IS_PARAMETER          = 1 << 6;
-        const HAS_UNTRACKED_DICTIONARY_USE = 1 << 7;
     }
 }
 
@@ -65,15 +64,6 @@ impl Symbol {
     /// Is the symbol used in its containing scope?
     pub fn is_used(&self) -> bool {
         self.flags.contains(SymbolFlags::IS_USED)
-    }
-
-    /// Whether every use is a direct `**name` argument or a tracked string-key assignment.
-    /// Nested captures and uses that can expose the dictionary are excluded.
-    pub fn has_only_tracked_dictionary_uses(&self) -> bool {
-        self.is_used()
-            && !self
-                .flags
-                .contains(SymbolFlags::HAS_UNTRACKED_DICTIONARY_USE)
     }
 
     /// Is the symbol given a value in its containing scope?
@@ -153,10 +143,6 @@ impl Symbol {
     }
 
     pub(super) fn mark_used(&mut self) {
-        self.insert_flags(SymbolFlags::IS_USED | SymbolFlags::HAS_UNTRACKED_DICTIONARY_USE);
-    }
-
-    pub(super) fn mark_tracked_dictionary_use(&mut self) {
         self.insert_flags(SymbolFlags::IS_USED);
     }
 

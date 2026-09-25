@@ -127,28 +127,41 @@ impl<'db> SemanticModel<'db> {
 
     /// Returns known string entries at an original call argument expression.
     ///
-    /// Literals and builtin dictionary copies retain named entries and residual values. Fresh
-    /// locals used only for keyword unpacking can have complete key sets. Other indexed argument
-    /// uses expose partial flow observations.
+    /// Literals, builtin dictionary copies, and indexed mappings retain named entries and
+    /// residual values at this use. Reaching mutations update those entries; exposure weakens
+    /// presence evidence while preserving ordinary value refinements.
     pub fn dictionary_items(&self, expression: &Expr) -> Option<DictionaryItems<'db>> {
+        self.dictionary_observation(expression).ok()
+    }
+
+    pub(crate) fn dictionary_observation(
+        &self,
+        expression: &Expr,
+    ) -> crate::types::dictionary::DictionaryObservation<'db> {
         if self.annotation_scope.is_some() {
-            return None;
+            return Err(crate::types::dictionary::DictionaryFallback::Unavailable);
         }
         let env = ProgramEnvironment::from_file(self.file);
-        DictionaryItems::expression(self.db, &env, expression, &mut |expression| {
+        let index = semantic_index(self.db, self.file);
+        let Some(file_scope) = index.try_expression_scope_id(expression) else {
+            return Err(crate::types::dictionary::DictionaryFallback::Unavailable);
+        };
+        let scope = file_scope.to_scope_id(self.db, self.file);
+        match DictionaryItems::expression(self.db, &env, scope, expression, &mut |expression| {
             expression.inferred_type(self)
-        })
-        .or_else(|| {
-            let index = semantic_index(self.db, self.file);
-            let file_scope = index.try_expression_scope_id(expression)?;
-            let scope = file_scope.to_scope_id(self.db, self.file);
-            let cache = ReachabilityEvaluationCache::new(
-                scope,
-                index.use_def_map(file_scope).reachability_constraints(),
-            );
-            let ty = expression.inferred_type(self)?;
-            DictionaryItems::observed(self.db, scope, expression, ty, &cache)
-        })
+        }) {
+            Err(crate::types::dictionary::DictionaryFallback::Unavailable) => {
+                let cache = ReachabilityEvaluationCache::new(
+                    scope,
+                    index.use_def_map(file_scope).reachability_constraints(),
+                );
+                let Some(ty) = expression.inferred_type(self) else {
+                    return Err(crate::types::dictionary::DictionaryFallback::Unavailable);
+                };
+                DictionaryItems::observed(self.db, scope, expression, ty, &cache)
+            }
+            observed => observed,
+        }
     }
 
     /// Returns the type at `offset` in an application-supplied annotation.

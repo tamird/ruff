@@ -1690,6 +1690,10 @@ fn symbol_impl<'db>(
         .unwrap_or_default()
 }
 
+// Chosen by benchmarking real isort. Both scalar and mapping loop-header inference use this
+// approximation boundary so contents queries do not restore unbounded exact loop analysis.
+pub(crate) const MAX_EXACT_LOOP_HEADER_INFERENCE_NODES: usize = 4096;
+
 /// Pre-computed reachability analysis for loop-back bindings in a loop header.
 #[salsa::tracked(
     returns(clone),

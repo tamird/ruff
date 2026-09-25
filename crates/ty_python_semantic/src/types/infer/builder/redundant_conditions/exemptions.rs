@@ -774,6 +774,7 @@ fn definition_contains_special_cased_condition<'db>(
         | DefinitionKind::Class(_)
         | DefinitionKind::TypeAlias(_)
         | DefinitionKind::DictKeyAssignment(_)
+        | DefinitionKind::DictionaryContents(_)
         | DefinitionKind::Parameter(_)
         | DefinitionKind::LambdaParameter(_)
         | DefinitionKind::ExceptHandler(_)

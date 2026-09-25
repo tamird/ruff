@@ -283,6 +283,34 @@ impl<'db> DefinitionsByNode<'db> {
     }
 }
 
+fn captured_binding_scope<'a>(
+    ancestors: VisibleAncestorsIter<'_>,
+    resolution: definition::CaptureResolution,
+    symbol_at: impl Fn(FileScopeId) -> Option<&'a symbol::Symbol>,
+) -> Option<FileScopeId> {
+    if resolution == definition::CaptureResolution::ClassLocalFallback {
+        let global = FileScopeId::global();
+        return symbol_at(global)
+            .is_some_and(symbol::Symbol::is_local)
+            .then_some(global);
+    }
+    for (scope, _) in ancestors {
+        let Some(symbol) = symbol_at(scope) else {
+            continue;
+        };
+        if symbol.is_global() {
+            let global = FileScopeId::global();
+            return symbol_at(global)
+                .is_some_and(symbol::Symbol::is_local)
+                .then_some(global);
+        }
+        if symbol.is_local() {
+            return Some(scope);
+        }
+    }
+    None
+}
+
 /// The place tables and use-def maps for all scopes in a file.
 #[derive(Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub struct SemanticIndex<'db> {
@@ -666,6 +694,24 @@ impl<'db> SemanticIndex<'db> {
     /// The `method` function can see the global scope but not the class scope.
     pub fn visible_ancestor_scopes(&self, scope: FileScopeId) -> VisibleAncestorsIter<'_> {
         VisibleAncestorsIter::new(&self.scopes, scope)
+    }
+
+    /// Resolve a nested reference against the completed lexical bindings, including explicit
+    /// global forwarding and the visibility of class scopes.
+    pub fn captured_binding_scope(
+        &self,
+        nested_scope: FileScopeId,
+        name: &str,
+        resolution: definition::CaptureResolution,
+    ) -> Option<FileScopeId> {
+        captured_binding_scope(
+            self.visible_ancestor_scopes(nested_scope),
+            resolution,
+            |scope| {
+                let table = self.place_table(scope);
+                table.symbol_id(name).map(|symbol| table.symbol(symbol))
+            },
+        )
     }
 
     /// Returns the [`definition::Definition`] salsa ingredient(s) for `definition_key`.
@@ -1327,59 +1373,6 @@ mod tests {
             declaration.kind(&db),
             DefinitionKind::AnnotatedAssignment(_)
         );
-    }
-
-    #[test]
-    fn tracked_dictionary_uses() {
-        for (body, expected) in [
-            ("values = {}\nf(**values)\nf(**values)", true),
-            ("values = {}\nf(values)\nf(**values)", false),
-            ("values = {}\nf(**values)\nalias = values", false),
-            ("values = {}\nvalues['x'] = 1\nf(**values)", true),
-            (
-                "values = {}\nif flag:\n    values['x'] = 1\nf(**values)",
-                true,
-            ),
-            ("values = {}\nvalues[key] = 1\nf(**values)", false),
-            ("values = {}\nvalues['x'] += 1\nf(**values)", false),
-            ("values = {}\ndel values['x']\nf(**values)", false),
-            ("values = {}\nvalues['x']['y'] = 1\nf(**values)", false),
-            ("values = {}\nvalues.clear()\nf(**values)", false),
-            ("values = {}\nf(**(alias := values))", false),
-            ("values = {}\nf(**(values if flag else {}))", false),
-            ("values = {}\nf(**values)\ndel values", false),
-            ("values = {}\ndef nested():\n    f(**values)", false),
-            (
-                "def nested():\n    f(**values)\nvalues = {}\nf(**values)",
-                false,
-            ),
-            ("values = {}\nitems = [f(**values) for _ in xs]", false),
-            (
-                "values = {}\ntry:\n    f(**values)\nfinally:\n    save(values)",
-                false,
-            ),
-            (
-                "while flag:\n    save(values)\n    values = {}\n    f(**values)",
-                false,
-            ),
-        ] {
-            let source = format!("def outer():\n    {}\n", body.replace('\n', "\n    "));
-            let TestCase { db, file } = test_case(&source);
-            let index = semantic_index(&db, program_file(&db, file));
-            let scope = index
-                .scope_ids()
-                .find(|scope| scope.scope(&db).kind() == ScopeKind::Function)
-                .unwrap();
-            let table = index.place_table(scope.file_scope_id(&db));
-            assert_eq!(
-                table
-                    .symbol_by_name("values")
-                    .unwrap()
-                    .has_only_tracked_dictionary_uses(),
-                expected,
-                "{source}",
-            );
-        }
     }
 
     #[test]

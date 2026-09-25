@@ -913,11 +913,13 @@ impl Default for RangeInfo {
     }
 }
 
+type PlaceBindings = (ScopedPlaceId, Bindings);
+
 #[derive(Debug, PartialEq, Eq, get_size2::GetSize)]
-struct MultiBindingsByUse(ThinVec<(ScopedUseId, Box<[Bindings]>)>);
+struct MultiBindingsByUse(ThinVec<(ScopedUseId, Box<[PlaceBindings]>)>);
 
 impl MultiBindingsByUse {
-    fn from_map(map: FxHashMap<ScopedUseId, Vec<Bindings>>) -> Self {
+    fn from_map(map: FxHashMap<ScopedUseId, Vec<PlaceBindings>>) -> Self {
         let mut entries = ThinVec::with_capacity(map.len());
         entries.extend(
             map.into_iter()
@@ -927,7 +929,7 @@ impl MultiBindingsByUse {
         Self(entries)
     }
 
-    fn get(&self, use_id: ScopedUseId) -> Option<&[Bindings]> {
+    fn get(&self, use_id: ScopedUseId) -> Option<&[PlaceBindings]> {
         self.0
             .binary_search_by_key(&use_id, |(candidate, _)| *candidate)
             .ok()
@@ -1027,20 +1029,22 @@ impl<'db> UseDefMap<'db> {
     pub fn multi_bindings_at_use(
         &self,
         use_id: ScopedUseId,
-    ) -> impl Iterator<Item = BindingWithConstraintsIterator<'_, 'db>> {
+        place: ScopedPlaceId,
+    ) -> Option<BindingWithConstraintsIterator<'_, 'db>> {
         self.extra
             .as_deref()
             .and_then(|extra| extra.multi_bindings_by_use.get(use_id))
-            .map(|member_bindings| {
-                member_bindings.iter().map(|bindings| {
-                    self.bindings_iterator(
-                        bindings.as_slice(),
-                        BoundnessAnalysis::BasedOnUnboundVisibility,
-                    )
-                })
+            .and_then(|member_bindings| {
+                member_bindings
+                    .iter()
+                    .find(|(candidate, _)| *candidate == place)
             })
-            .into_iter()
-            .flatten()
+            .map(|(_, bindings)| {
+                self.bindings_iterator(
+                    bindings.as_slice(),
+                    BoundnessAnalysis::BasedOnUnboundVisibility,
+                )
+            })
     }
 
     pub fn applicable_constraints(
@@ -2097,7 +2101,7 @@ pub(super) struct UseDefMapBuilder<'db> {
     /// Unlike `bindings_by_use`, this field supports associating multiple bindings with a
     /// single use. This is only used for kwargs expressions, whose corresponding `bindings_by_use`
     /// entry is empty.
-    multi_bindings_by_use: FxHashMap<ScopedUseId, Vec<Bindings>>,
+    multi_bindings_by_use: FxHashMap<ScopedUseId, Vec<(ScopedPlaceId, Bindings)>>,
 
     /// Tracks whether or not the current point in control flow is reachable from the
     /// start of the scope.
@@ -2325,6 +2329,21 @@ impl<'db> UseDefMapBuilder<'db> {
         self.bindings_by_use[use_id].iter()
     }
 
+    /// The definitions of one additional place captured while evaluating a use.
+    pub(crate) fn multi_binding_ids_at_use(
+        &self,
+        use_id: ScopedUseId,
+        place: ScopedPlaceId,
+    ) -> SmallVec<[ScopedDefinitionId; 2]> {
+        self.multi_bindings_by_use
+            .get(&use_id)
+            .into_iter()
+            .flatten()
+            .find(|(candidate, _)| *candidate == place)
+            .map(|(_, bindings)| bindings.iter().map(LiveBinding::binding).collect())
+            .unwrap_or_default()
+    }
+
     pub(super) fn add_predicate(
         &mut self,
         predicate: PredicateOrLiteral<'db>,
@@ -2354,39 +2373,6 @@ impl<'db> UseDefMapBuilder<'db> {
 
         let atom = self.narrowing_constraints.add_atom(predicate);
         self.record_narrowing_constraint_node_for_places(atom, places);
-    }
-
-    /// Records a narrowing constraint on the current live bindings that were read by the
-    /// corresponding earlier uses.
-    pub(super) fn record_narrowing_constraint_for_bindings_at_use(
-        &mut self,
-        predicate: ScopedPredicateId,
-        place: ScopedPlaceId,
-        use_id: ScopedUseId,
-    ) {
-        if predicate == ScopedPredicateId::ALWAYS_TRUE
-            || predicate == ScopedPredicateId::ALWAYS_FALSE
-        {
-            return;
-        }
-
-        self.predicate_narrowing_targets.push((predicate, place));
-
-        let constraint = self.narrowing_constraints.add_atom(predicate);
-        let pending = self.pending_reachability.current;
-        let state =
-            pending_place_state_mut(place, &mut self.symbol_states, &mut self.member_states);
-        let state = self.pending_reachability.materialize(
-            state,
-            pending,
-            &mut self.narrowing_constraints,
-            &mut self.reachability_constraints,
-        );
-        state.record_narrowing_constraint_for_bindings_at_use(
-            &mut self.narrowing_constraints,
-            constraint,
-            &self.bindings_by_use[use_id],
-        );
     }
 
     /// Records a narrowing constraint on the current live bindings selected by definition ID.
@@ -2842,7 +2828,7 @@ impl<'db> UseDefMapBuilder<'db> {
             self.multi_bindings_by_use
                 .entry(use_id)
                 .or_default()
-                .push(bindings);
+                .push((place, bindings));
         }
     }
 
@@ -3247,7 +3233,7 @@ impl<'db> UseDefMapBuilder<'db> {
         );
         let interned_declarations =
             interned_declarations.finish(&mut self.reachability_constraints);
-        for bindings in self.multi_bindings_by_use.values_mut().flatten() {
+        for (_, bindings) in self.multi_bindings_by_use.values_mut().flatten() {
             bindings.finish(
                 &mut self.narrowing_constraints,
                 &mut self.reachability_constraints,

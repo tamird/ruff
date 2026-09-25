@@ -530,10 +530,9 @@ def extra_items(flag: bool, extra: ExtraStrings):
 
 ## Other uses preserve partial observations
 
-Completeness requires every use of the symbol to be a direct keyword expansion or tracked string-key
-assignment, throughout the function. Aliases, captures, and ordinary arguments can expose the
-dictionary to mutation. Reads also use the existing partial observations. This is a conservative
-source analysis; dynamically accessing a function's frame or locals is outside its effect model.
+Aliases, captures, and ordinary arguments can expose a dictionary to mutation. Observations retain
+individual value refinements while allowing other code to add or remove keys. Later uses do not
+retroactively change observations at an earlier call.
 
 ```py
 def consume(*, note: str | None = None, **kwargs: object): ...
@@ -541,11 +540,11 @@ def save(value: object): ...
 def argument():
     options = dict(tags=["example"], testonly=True)
     save(options)
-    consume(**options)  # error: [invalid-argument-type]
+    consume(**options)
 
 def later_alias():
     options = dict(tags=["example"], testonly=True)
-    consume(**options)  # error: [invalid-argument-type]
+    consume(**options)
     alias = options
 
 def assignment():
@@ -558,7 +557,7 @@ def assignment():
 def deletion():
     options = dict(tags=["example"], testonly=True, note="known")
     del options["note"]
-    consume(**options)  # error: [invalid-argument-type]
+    consume(**options)
 
 def method():
     options = dict(tags=["example"], testonly=True)
@@ -573,17 +572,18 @@ def dynamic_key(key: str):
 def augmented():
     options = dict(tags=["example"], testonly=True)
     options["tags"] += ["other"]
-    consume(**options)  # error: [invalid-argument-type]
+    consume(**options)
 ```
 
-Captures and loop-carried escapes apply to the whole symbol, including later allocations.
+Lazy captures can observe later allocations of the same binding. An ordinary call exposes only the
+current object; a fresh allocation starts a new lifetime.
 
 ```py
 def capture():
     def nested():
         save(options)
     options = dict(tags=["example"], testonly=True)
-    consume(**options)  # error: [invalid-argument-type]
+    consume(**options)
 
 def nonlocal_write():
     def nested():
@@ -598,13 +598,13 @@ def loop(flag: bool):
     while flag:
         save(options)
         options = dict(tags=["next"], testonly=False)
-        consume(**options)  # error: [invalid-argument-type]
+        consume(**options)
 ```
 
 ## Assignment and initializer boundaries
 
-The proof uses one reaching, accepted assignment to a single local name. An initializer with
-positional inputs, spreads, or computed keys keeps its ordinary dictionary behavior.
+Reaching assignments can merge their contents. Shared initializers have uncertain key presence, and
+explicit dictionary annotations retain their declared value contract.
 
 ```py
 def consume(*, note: str | None = None, **kwargs: object): ...
@@ -619,7 +619,7 @@ def branch(flag: bool):
         options = dict(tags=["a"], testonly=True)
     else:
         options = dict(tags=["b"], testonly=False)
-    consume(**options)  # error: [invalid-argument-type]
+    consume(**options)
 
 def within_branch(flag: bool):
     if flag:
@@ -635,35 +635,37 @@ def rejected(options: dict[str, int]):
     consume(**options)  # error: [invalid-argument-type]
 ```
 
-Additional constructor inputs and computed keys preserve partial dictionary information.
+Constructor inputs and literal spreads retain their entries. An arbitrary computed key retains the
+ordinary mapping fallback.
 
 ```py
 def positional():
     options = dict({"tags": ["example"]}, testonly=True)
-    consume(**options)  # error: [invalid-argument-type]
+    consume(**options)
 
 def spread():
     options = dict(tags=["example"], **{"testonly": True})
-    consume(**options)  # error: [invalid-argument-type]
+    consume(**options)
 
 def literal_spread():
     options = {"tags": ["example"], **{"testonly": True}}
-    consume(**options)  # error: [invalid-argument-type]
+    consume(**options)
 
 def computed_key(key: str):
     options = {"tags": ["example"], key: True}
     consume(**options)  # error: [invalid-argument-type]
 ```
 
-Module and class dictionaries are accessible from other code, as are explicit global references.
+Source-ordered observations also apply while module and class bodies execute. A nested global
+reference retains the ordinary value inference for its enclosing binding.
 
 ```py
 options = dict(tags=["example"], testonly=True)
-consume(**options)  # error: [invalid-argument-type]
+consume(**options)
 
 class Container:
     options = dict(tags=["example"], testonly=True)
-    consume(**options)  # error: [invalid-argument-type]
+    consume(**options)
 
 def global_reference():
     global options

@@ -128,16 +128,15 @@ use crate::types::unpacker::{
 };
 use crate::types::{
     BindingContext, BoundTypeVarInstance, CallDunderError, CallableBinding, CallableType,
-    ClassType, DictionaryItem, DictionaryItems, DynamicType, GeneratorTypeMode, InferenceFlags,
-    InternedConstraintSet, InternedType, IntersectionBuilder, IntersectionType,
-    KnownBoundMethodType, KnownClass, KnownInstanceType, KnownUnion, LiteralValueType,
-    LiteralValueTypeKind, MemberLookupPolicy, ParamSpecAttrKind, Parameter, Parameters,
-    ProgramEnvironment, PropertyDeprecations, SentinelInstance, Signature, SpecialFormType,
-    SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext, TypeQualifiers,
-    TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypingModule, UnionAccumulator,
-    UnionBuilder, UnionType, any_over_type, binding_type,
-    extract_fixed_length_iterable_element_types, infer_complete_scope_types, infer_scope_types,
-    is_discarded_dict_key_assignment, todo_type,
+    ClassType, DictionaryItems, DynamicType, GeneratorTypeMode, InferenceFlags,
+    InternedConstraintSet, InternedType, IntersectionBuilder, KnownBoundMethodType, KnownClass,
+    KnownInstanceType, KnownUnion, LiteralValueType, LiteralValueTypeKind, MemberLookupPolicy,
+    ParamSpecAttrKind, Parameter, Parameters, ProgramEnvironment, PropertyDeprecations,
+    SentinelInstance, Signature, SpecialFormType, SubclassOfType, Type, TypeAliasType,
+    TypeAndQualifiers, TypeContext, TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind,
+    TypeVarVariance, TypingModule, UnionAccumulator, UnionBuilder, UnionType, any_over_type,
+    binding_type, extract_fixed_length_iterable_element_types, infer_complete_scope_types,
+    infer_scope_types, is_discarded_dict_key_assignment, todo_type,
 };
 use crate::{AnalysisSettings, Db, DisplaySettings, FxIndexSet, FxOrderSet, SemanticModel};
 use ty_python_core::definition::{
@@ -1283,6 +1282,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn infer_region_definition(&mut self, definition: Definition<'db>) {
         match definition.kind(self.db()) {
+            DefinitionKind::DictionaryContents(_) => {
+                // Contents are inferred by the dictionary domain, not as Python values.
+                self.bindings.insert(definition, Type::unknown());
+            }
             DefinitionKind::ProvidedBinding(binding) => {
                 self.infer_provided_binding(binding, definition);
             }
@@ -2629,9 +2632,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         loop_header_kind: &LoopHeaderDefinitionKind,
         definition: Definition<'db>,
     ) {
-        // This cutoff was chosen by benchmarking real isort to keep loop analysis
-        // overhead minimal while preserving diagnostics.
-        const MAX_EXACT_LOOP_HEADER_REACHABILITY_NODES: usize = 4096;
         let db = self.db();
 
         let loop_header = loop_header_reachability(self.db(), definition);
@@ -2643,7 +2643,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // exact union of every visible loop-back binding can recursively force inference of large
         // boolean expressions and explode on real-world loops.
         if use_def.reachability_constraints().used_interiors().len()
-            > MAX_EXACT_LOOP_HEADER_REACHABILITY_NODES
+            > crate::place::MAX_EXACT_LOOP_HEADER_INFERENCE_NODES
         {
             self.bindings.insert(definition, Type::unknown());
             return;
@@ -8901,11 +8901,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         &self,
         expression: &ast::Expr,
         argument_type: Type<'db>,
-    ) -> Option<DictionaryItems<'db>> {
+    ) -> crate::types::dictionary::DictionaryObservation<'db> {
         // Parsed string annotations are not indexed, so their argument expressions have no
         // use-definition information from which to narrow dictionary keys.
         if self.in_detached_annotation() {
-            return None;
+            return Err(crate::types::dictionary::DictionaryFallback::Unavailable);
         }
 
         DictionaryItems::observed(
@@ -8922,77 +8922,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expression: &ast::Expr,
         ty: Type<'db>,
     ) -> Option<DictionaryItems<'db>> {
-        DictionaryItems::expression(
-            self.db(),
-            self.program_environment(),
-            expression,
-            &mut |expression| self.try_expression_type(expression),
-        )
-        .or_else(|| self.observed_dictionary_items(expression, ty))
+        self.dictionary_observation(expression, ty).ok()
     }
 
-    /// Narrow a splatted dictionary using the same key observations exposed to call refinements.
-    fn try_narrow_dict_kwargs(
+    fn dictionary_observation(
         &self,
-        argument_type: Type<'db>,
-        argument: &'ast ast::ArgOrKeyword,
-    ) -> Option<Type<'db>> {
-        let keyword = argument.as_variadic()?;
-        let dictionary = self.observed_dictionary_items(&keyword.value, argument_type)?;
-        let is_complete = dictionary.is_complete();
-        let DictionaryItems {
-            items,
-            extra_items: _,
-        } = dictionary;
-        // In a partial dictionary, a conditional write can leave an unseen prior value in place.
-        // Only a complete key set proves that the key was absent on the other path.
-        let mut elements = items
-            .into_iter()
-            .filter(|item| is_complete || item.is_required())
-            .peekable();
-        elements.peek()?;
-        let db = self.db();
-        let env = self.program_environment();
-
-        // Synthesize overloads for `__getitem__` based on known dictionary elements.
-        let getitem_overloads = elements.map(
-            |DictionaryItem {
-                 name,
-                 ty,
-                 kind: _,
-                 source: _,
-             }| {
-                Signature::new(
-                    Parameters::standard([
-                        Parameter::positional_only(Some(Name::new_static("self"))),
-                        Parameter::positional_or_keyword(Name::new_static("key"))
-                            .with_annotated_type(Type::string_literal(db, &name)),
-                    ]),
-                    ty,
-                )
-            },
-        );
-
-        let getitem_protocol = Type::protocol_with_methods(
-            db,
-            env,
-            [(
-                "__getitem__",
-                CallableType::new(
-                    db,
-                    CallableSignature::from_overloads(getitem_overloads),
-                    CallableTypeKind::FunctionLike,
-                ),
-            )],
-        );
-
-        // Note that we return an intersection to preserve the original dictionary type,
-        // as it may contain keys that were not explicitly assigned to.
-        Some(IntersectionType::from_elements(
-            db,
-            env,
-            [argument_type, getitem_protocol],
-        ))
+        expression: &ast::Expr,
+        ty: Type<'db>,
+    ) -> crate::types::dictionary::DictionaryObservation<'db> {
+        match DictionaryItems::expression(
+            self.db(),
+            self.program_environment(),
+            self.scope(),
+            expression,
+            &mut |expression| self.try_expression_type(expression),
+        ) {
+            Err(crate::types::dictionary::DictionaryFallback::Unavailable) => {
+                self.observed_dictionary_items(expression, ty)
+            }
+            observed => observed,
+        }
     }
 
     /// Infer the variadic argument types needed for call binding and emit the shared diagnostics
@@ -9010,8 +8959,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     && argument.is_starred_expr()
                 {
                     self.store_expression_type(argument, ty);
-                } else if let Some(ty) = self.try_narrow_dict_kwargs(ty, arg_or_keyword) {
-                    return ty;
                 }
 
                 ty
@@ -9020,7 +8967,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 arguments,
                 |expression| self.try_expression_type(expression),
                 |expression| {
-                    self.dictionary_items(expression, self.try_expression_type(expression)?)
+                    self.try_expression_type(expression).map_or(
+                        Err(crate::types::dictionary::DictionaryFallback::Unavailable),
+                        |ty| self.dictionary_observation(expression, ty),
+                    )
                 },
             );
 

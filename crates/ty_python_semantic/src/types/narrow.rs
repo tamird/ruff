@@ -1746,8 +1746,43 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                         is_positive,
                     )
                 {
-                    let aliased_constraints =
+                    let mut aliased_constraints =
                         self.evaluate_expression_predicate(alias_predicate.expression, is_positive);
+                    if let Some(constraints) = &mut aliased_constraints {
+                        let loop_carried = index
+                            .use_def_map(expression.scope(db).file_scope_id(db))
+                            .bindings_at_use(name.scoped_use_id(db, expression.program_file(db)))
+                            .any(|binding| {
+                                binding
+                                    .binding
+                                    .definition()
+                                    .is_some_and(|definition| definition.kind(db).is_loop_header())
+                            });
+                        constraints.retain(|place, _| {
+                            match crate::types::dictionary::contents::alias_preserves_key(
+                                db,
+                                expression.scope(db),
+                                alias_predicate.expression.node_ref(db).node(self.module),
+                                expression_node,
+                                *place,
+                                loop_carried,
+                            ) {
+                                Some(
+                                    crate::types::dictionary::contents::KeyPreservation::Changed,
+                                ) => false,
+                                Some(
+                                    crate::types::dictionary::contents::KeyPreservation::Pending,
+                                ) => {
+                                    self.is_provisional = true;
+                                    true
+                                }
+                                Some(
+                                    crate::types::dictionary::contents::KeyPreservation::Preserved,
+                                )
+                                | None => true,
+                            }
+                        });
+                    }
                     // For example, suppose we have an alias `is_none = x is None`.
                     // When this alias is used for narrowing, that is, within a block like `if is_none: ...`,
                     // both the constraint `is_none: Literal[True]` and the constraint `x: None` should be imposed.

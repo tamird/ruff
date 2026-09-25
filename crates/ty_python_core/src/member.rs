@@ -35,6 +35,28 @@ impl Member {
         &self.expression
     }
 
+    /// Whether this place describes a mapping's contents rather than a Python member.
+    pub fn is_contents(&self) -> bool {
+        self.expression
+            .segment_infos()
+            .last()
+            .is_some_and(|segment| segment.kind() == SegmentKind::Contents)
+    }
+
+    pub(crate) fn contents_key(&self, name: &str) -> Option<MemberExpr> {
+        if !self.is_contents() {
+            return None;
+        }
+        let mut segments: SmallVec<_> = self.expression.segment_infos().collect();
+        segments.pop();
+        let receiver = MemberExprBuilder {
+            path: self.expression.path.clone(),
+            segments,
+        };
+        let key = receiver.with_string_subscript(name)?;
+        MemberExpr::try_from_builder(key)
+    }
+
     /// Is the place given a value in its containing scope?
     pub(crate) const fn is_bound(&self) -> bool {
         self.flags.contains(MemberFlags::IS_BOUND)
@@ -207,13 +229,26 @@ impl MemberExpr {
 }
 
 /// A builder for a [`MemberExpr`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct MemberExprBuilder {
     path: CharStr,
     segments: SmallVec<[SegmentInfo; 8]>,
 }
 
 impl MemberExprBuilder {
+    pub(super) fn from_place(place: crate::place::PlaceExprRef<'_>) -> Self {
+        match place {
+            crate::place::PlaceExprRef::Symbol(symbol) => Self {
+                path: CharStr::from(symbol.name().clone()),
+                segments: SmallVec::new_const(),
+            },
+            crate::place::PlaceExprRef::Member(member) => Self {
+                path: member.expression.path.clone(),
+                segments: member.expression.segment_infos().collect(),
+            },
+        }
+    }
+
     pub(super) fn visit_expr(expr: ast::ExprRef) -> Option<MemberExprBuilder> {
         match expr {
             ast::ExprRef::Name(name) => {
@@ -272,7 +307,8 @@ impl MemberExprBuilder {
                 let text = attribute.attr.id.as_str();
                 *path_len += text.text_len();
                 parts.push(MemberPathPart::Borrowed(text));
-                segments.push(SegmentInfo::new(SegmentKind::Attribute, start_offset));
+                let segment = SegmentInfo::try_new(SegmentKind::Attribute, start_offset)?;
+                segments.push(segment);
 
                 Some(())
             }
@@ -288,7 +324,8 @@ impl MemberExprBuilder {
                 let (kind, part) = Self::subscript_part(&subscript.slice)?;
                 *path_len += part.as_ref().text_len();
                 parts.push(part);
-                segments.push(SegmentInfo::new(kind, start_offset));
+                let segment = SegmentInfo::try_new(kind, start_offset)?;
+                segments.push(segment);
 
                 Some(())
             }
@@ -301,21 +338,26 @@ impl MemberExprBuilder {
         subscript_slice: &ast::Expr,
     ) -> Option<MemberExprBuilder> {
         let (kind, part) = Self::subscript_part(subscript_slice)?;
-        Some(subscript_value.with_subscript(kind, part.as_ref()))
+        subscript_value.with_subscript(kind, part.as_ref())
     }
 
-    pub(super) fn with_string_subscript(&self, key: &str) -> Self {
+    pub(super) fn with_string_subscript(&self, key: &str) -> Option<Self> {
         self.with_subscript(SegmentKind::StringSubscript, key)
     }
 
-    fn with_subscript(&self, kind: SegmentKind, key: &str) -> Self {
+    pub(super) fn with_contents(&self) -> Option<Self> {
+        self.with_subscript(SegmentKind::Contents, "")
+    }
+
+    fn with_subscript(&self, kind: SegmentKind, key: &str) -> Option<Self> {
         let Self { path, segments } = self;
         let start_offset = path.text_len();
+        let segment = SegmentInfo::try_new(kind, start_offset)?;
         let path = CharStr::concat(&[path.as_str(), key]);
         let mut segments = segments.clone();
-        segments.push(SegmentInfo::new(kind, start_offset));
+        segments.push(segment);
 
-        Self { path, segments }
+        Some(Self { path, segments })
     }
 
     fn subscript_part(subscript_slice: &ast::Expr) -> Option<(SegmentKind, MemberPathPart<'_>)> {
@@ -410,6 +452,7 @@ impl std::fmt::Display for MemberExpr {
                 SegmentKind::IntSubscript => write!(f, "[{}]", segment.text)?,
                 SegmentKind::StringSubscript => write!(f, "[\"{}\"]", segment.text)?,
                 SegmentKind::BytesSubscript => write!(f, "[b\"{}\"]", segment.text)?,
+                SegmentKind::Contents => f.write_str(".<contents>")?,
             }
         }
 
@@ -449,13 +492,6 @@ pub(crate) struct MemberExprRef<'a> {
 }
 
 impl<'a> MemberExprRef<'a> {
-    pub(super) fn is_string_subscript(&self) -> bool {
-        self.segments
-            .iter()
-            .last()
-            .is_some_and(|segment| segment.kind() == SegmentKind::StringSubscript)
-    }
-
     pub(super) fn symbol_name(&self) -> &'a str {
         let end = self
             .segments
@@ -732,17 +768,24 @@ impl Segments {
 }
 
 /// Segment metadata - packed into a single u32
-/// Layout: [kind: 2 bits][offset: 30 bits]
-/// - Bits 0-1: `SegmentKind` (0=Attribute, 1=IntSubscript, 2=StringSubscript)
-/// - Bits 2-31: Absolute offset from start of path (up to 1,073,741,823 bytes)
+/// Layout: [kind: 3 bits][offset: 29 bits]. The internal contents segment needs
+/// one more kind than the four Python member forms. Ordinary small paths retain
+/// their two-bit inline encoding.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize)]
 struct SegmentInfo(u32);
 
-const KIND_MASK: u32 = 0b11;
-const OFFSET_SHIFT: u32 = 2;
-const MAX_OFFSET: u32 = (1 << 30) - 1; // 2^30 - 1
+const KIND_MASK: u32 = 0b111;
+const OFFSET_SHIFT: u32 = 3;
+const MAX_OFFSET: u32 = (1 << 29) - 1;
 
 impl SegmentInfo {
+    const fn try_new(kind: SegmentKind, offset: TextSize) -> Option<Self> {
+        if offset.to_u32() >= MAX_OFFSET {
+            return None;
+        }
+        Some(Self((offset.to_u32() << OFFSET_SHIFT) | (kind as u32)))
+    }
+
     const fn new(kind: SegmentKind, offset: TextSize) -> Self {
         assert!(offset.to_u32() < MAX_OFFSET);
 
@@ -756,6 +799,7 @@ impl SegmentInfo {
             1 => SegmentKind::IntSubscript,
             2 => SegmentKind::StringSubscript,
             3 => SegmentKind::BytesSubscript,
+            4 => SegmentKind::Contents,
             _ => panic!("Invalid SegmentKind bits"),
         }
     }
@@ -786,6 +830,7 @@ enum SegmentKind {
     IntSubscript = 1,
     StringSubscript = 2,
     BytesSubscript = 3,
+    Contents = 4,
 }
 
 /// Iterator over segments that converts `SegmentInfo` to `Segment` with text slices.
@@ -881,6 +926,9 @@ impl SmallSegments {
         let mut prev_offset = TextSize::new(0);
 
         for (i, segment) in segments.iter().enumerate() {
+            if segment.kind() == SegmentKind::Contents {
+                return None;
+            }
             // Compute relative offset on-the-fly
             let relative_offset = segment.offset() - prev_offset;
             if relative_offset > TextSize::from(INLINE_MAX_RELATIVE_OFFSET) {
@@ -1053,6 +1101,60 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+
+    #[test]
+    fn contents_is_a_distinct_terminal_member() {
+        for source in ["value", "value.child", "value['child']"] {
+            let parsed = ruff_python_parser::parse_expression(source).unwrap();
+            let receiver = MemberExprBuilder::visit_expr(parsed.expr().into()).unwrap();
+            let contents = MemberExpr::try_from_builder(receiver.with_contents().unwrap()).unwrap();
+            let string_key = MemberExpr::try_from_builder(
+                receiver
+                    .with_subscript(SegmentKind::StringSubscript, "")
+                    .unwrap(),
+            )
+            .unwrap();
+            let bytes_key = MemberExpr::try_from_builder(
+                receiver
+                    .with_subscript(SegmentKind::BytesSubscript, "")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_ne!(contents, string_key);
+            assert_ne!(contents, bytes_key);
+            assert_matches!(contents.segments, Segments::Heap(_));
+            assert!(Member::new(contents.clone()).is_contents());
+            assert_eq!(contents.as_ref().symbol_name(), "value");
+            let parent = contents.as_ref().parent();
+            if let Some(receiver) = MemberExpr::try_from_builder(receiver) {
+                assert_eq!(parent, Some(receiver.as_ref()));
+            } else {
+                assert!(parent.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn contents_preserves_small_python_paths() {
+        let parsed = ruff_python_parser::parse_expression("x.a.b.c.d.e.f.g").unwrap();
+        let receiver = MemberExprBuilder::visit_expr(parsed.expr().into()).unwrap();
+        let member = MemberExpr::try_from_builder(receiver.clone()).unwrap();
+        assert_matches!(member.segments, Segments::Small(_));
+        let contents = MemberExpr::try_from_builder(receiver.with_contents().unwrap()).unwrap();
+        assert_matches!(contents.segments, Segments::Heap(_));
+        assert_eq!(contents.as_ref().parent(), Some(member.as_ref()));
+        assert_eq!(member.num_segments(), INLINE_MAX_SEGMENTS);
+    }
+
+    #[test]
+    fn segment_offset_limit_is_fallible() {
+        for kind in [SegmentKind::StringSubscript, SegmentKind::Contents] {
+            let segment = SegmentInfo::try_new(kind, TextSize::new(MAX_OFFSET - 1)).unwrap();
+            assert_eq!(segment.kind(), kind);
+            assert_eq!(segment.offset(), TextSize::new(MAX_OFFSET - 1));
+            assert!(SegmentInfo::try_new(kind, TextSize::new(MAX_OFFSET)).is_none());
+        }
+    }
 
     #[test]
     fn test_member_expr_ref_hash_and_eq_small_heap() {
