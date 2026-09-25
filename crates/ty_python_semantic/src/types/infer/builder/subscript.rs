@@ -174,7 +174,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         &mut self,
         subscript: &ast::ExprSubscript,
     ) -> Result<Type<'db>, Type<'db>> {
-        let value_ty = self.infer_expression(&subscript.value, TypeContext::default());
+        let value_ty =
+            self.infer_maybe_standalone_expression(&subscript.value, TypeContext::default());
 
         // If we have an implicit type alias like `MyList = list[T]`, and if `MyList` is being
         // used in another implicit type alias like `Numbers = MyList[int]`, then we infer the
@@ -219,7 +220,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 {
                     // Even if we can obtain the subscript type based on the assignments, we still perform default type inference
                     // (to store the expression type and to report errors).
-                    let slice_ty = self.infer_expression(slice, TypeContext::default());
+                    let slice_ty =
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     return self
                         .infer_subscript_expression_types(
                             subscript,
@@ -363,7 +365,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         return Ok(union_type);
                     }
                     _ => {
-                        return Ok(self.infer_expression(slice, TypeContext::default()));
+                        return Ok(
+                            self.infer_maybe_standalone_expression(slice, TypeContext::default())
+                        );
                     }
                 },
                 SpecialFormType::Type => {
@@ -466,7 +470,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
             }
             Type::Dynamic(DynamicType::Unknown) => {
-                let slice_ty = self.infer_expression(slice, TypeContext::default());
+                let slice_ty =
+                    self.infer_maybe_standalone_expression(slice, TypeContext::default());
                 let mut variables = FxOrderSet::default();
                 slice_ty.bind_and_find_all_legacy_typevars(
                     db,
@@ -480,7 +485,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => {}
         }
 
-        let slice_ty = self.infer_expression(slice, TypeContext::default());
+        let slice_ty = self.infer_maybe_standalone_expression(slice, TypeContext::default());
         self.infer_subscript_expression_types(subscript, value_ty, slice_ty, ExprContext::Load)
             .map(|ty| self.narrow_expr_with_applicable_constraints(subscript, ty, &constraint_keys))
             .map_err(|recovery_ty| {
@@ -562,7 +567,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let db = self.db();
         if generic_type_alias.specialization(db).is_some() {
             if !self.in_detached_annotation() {
-                self.infer_expression(&subscript.slice, TypeContext::default());
+                self.infer_maybe_standalone_expression(&subscript.slice, TypeContext::default());
             }
             if let Some(builder) = self.context.report_lint(&NOT_SUBSCRIPTABLE, subscript) {
                 let mut diagnostic =
@@ -716,7 +721,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // If there are no typevars at all, this is not a generic type,
                 // so we should not infer excess arguments as type expressions.
                 // For example, `list[int][0]` — the `0` is not a type expression.
-                self.infer_expression(expr, TypeContext::default())
+                self.infer_maybe_standalone_expression(expr, TypeContext::default())
             } else {
                 let previously_in_valid_unpack_context = self
                     .context
@@ -1296,7 +1301,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
 
             ast::Expr::Subscript(subscript) => {
-                let value_ty = self.infer_expression(&subscript.value, TypeContext::default());
+                let value_ty = self
+                    .infer_maybe_standalone_expression(&subscript.value, TypeContext::default());
 
                 if matches!(value_ty, Type::SpecialForm(SpecialFormType::Concatenate)) {
                     return Ok(Type::paramspec_value_callable(
