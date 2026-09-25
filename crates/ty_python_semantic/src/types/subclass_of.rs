@@ -274,7 +274,7 @@ impl<'db> SubclassOfType<'db> {
         policy: MemberLookupPolicy,
     ) -> Option<PlaceAndQualifiers<'db>> {
         if let SubclassOfInner::Protocol(protocol) = self.subclass_of
-            && let Some(member) = protocol.interface(db).meta_member(db, env, name)
+            && let Some(member) = protocol.interface(db).meta_member(db, env, name, policy)
         {
             return Some(member);
         }

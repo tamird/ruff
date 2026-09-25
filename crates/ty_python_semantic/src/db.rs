@@ -80,6 +80,15 @@ pub trait Db: PythonCoreDb {
         false
     }
 
+    /// Marks a supplied function declaration as usable only for type checking.
+    ///
+    /// An embedding can describe an implicit operation without promising a runtime attribute.
+    /// This has the same effect as `@typing.type_check_only` on the declaration. Implementations
+    /// must depend on tracked declaration inputs and must not infer its signature or body.
+    fn provided_function_type_check_only(&self, _definition: Definition<'_>) -> bool {
+        false
+    }
+
     /// Describes an exhaustive runtime type test in an embedded program.
     ///
     /// The comparison `callable(subject) == compared_value` must hold exactly when `subject`
