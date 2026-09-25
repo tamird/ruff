@@ -1,5 +1,6 @@
 use crate::types::dictionary::{
-    DictionaryExtraItems, DictionaryItem, DictionaryItemKind, DictionaryItems,
+    DictionaryExtraItems, DictionaryFallback, DictionaryItem, DictionaryItemKind, DictionaryItems,
+    DictionaryObservation,
 };
 use crate::{Db, FxIndexMap};
 use std::borrow::Cow;
@@ -30,8 +31,8 @@ const MAX_TOTAL_EXPANSION: usize = 256;
 pub(crate) fn collect_keyword_items<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
-    sources: impl IntoIterator<Item = Option<DictionaryItems<'db>>>,
-) -> Option<DictionaryItems<'db>> {
+    sources: impl IntoIterator<Item = DictionaryObservation<'db>>,
+) -> DictionaryObservation<'db> {
     let mut items: FxIndexMap<Name, DictionaryItem<'db>> = FxIndexMap::default();
     let mut extra_items = None;
     for source in sources {
@@ -42,7 +43,6 @@ pub(crate) fn collect_keyword_items<'db>(
         let incoming_extra = match incoming_extra {
             DictionaryExtraItems::Closed => None,
             DictionaryExtraItems::Value(ty) => Some(ty),
-            DictionaryExtraItems::Unobserved => return None,
         };
         if let Some(ty) = incoming_extra {
             let names: FxHashSet<_> = incoming.iter().map(|item| item.name.clone()).collect();
@@ -61,7 +61,7 @@ pub(crate) fn collect_keyword_items<'db>(
                     {
                         // Decline metadata for possibly colliding named arguments. The ordinary
                         // call checker retains responsibility for their diagnostics.
-                        return None;
+                        return Err(DictionaryFallback::Unavailable);
                     }
                     if previous.is_required() {
                         continue;
@@ -91,7 +91,7 @@ pub(crate) fn collect_keyword_items<'db>(
             }));
         }
     }
-    Some(DictionaryItems {
+    Ok(DictionaryItems {
         items: items.into_values().collect(),
         extra_items: extra_items.map_or(DictionaryExtraItems::Closed, DictionaryExtraItems::Value),
     })
@@ -231,18 +231,17 @@ impl<'db> KnownUnpacking<'db> {
         Some(Self::Positional(types))
     }
 
-    fn keywords(dictionary: DictionaryItems<'db>) -> Option<Self> {
+    fn keywords(dictionary: DictionaryItems<'db>) -> Self {
         let DictionaryItems { items, extra_items } = dictionary;
         let extra_items = match extra_items {
             DictionaryExtraItems::Closed => None,
             DictionaryExtraItems::Value(ty) => Some(ty),
-            DictionaryExtraItems::Unobserved => return None,
         };
-        Some(Self::Keywords(KnownKeywords {
+        Self::Keywords(KnownKeywords {
             items,
             extra_items,
             excluded_names: Vec::new(),
-        }))
+        })
     }
 }
 
@@ -397,10 +396,14 @@ impl<'a, 'db> CallArguments<'a, 'db> {
         mut self,
         arguments: &ast::Arguments,
         mut expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
-        mut dictionary_items: impl FnMut(&ast::Expr) -> Option<DictionaryItems<'db>>,
+        mut dictionary_items: impl FnMut(&ast::Expr) -> DictionaryObservation<'db>,
     ) -> Self {
         let Self { items } = &mut self;
         for (item, argument) in items.iter_mut().zip(arguments.iter_source_order()) {
+            if item.types.get_default().is_some_and(|ty| ty.is_never()) {
+                item.known_unpacking = None;
+                continue;
+            }
             item.known_unpacking = match argument {
                 ast::ArgOrKeyword::Arg(expression) => match expression {
                     ast::Expr::Starred(ast::ExprStarred {
@@ -418,7 +421,14 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                     value,
                 }) => match arg {
                     Some(_) => None,
-                    None => dictionary_items(value).and_then(KnownUnpacking::keywords),
+                    None => match dictionary_items(value) {
+                        Err(DictionaryFallback::Unavailable) => None,
+                        Err(DictionaryFallback::Unreachable) => {
+                            item.types = CallArgumentTypes::new(Some(Type::Never));
+                            None
+                        }
+                        Ok(dictionary) => Some(KnownUnpacking::keywords(dictionary)),
+                    },
                 },
             };
         }

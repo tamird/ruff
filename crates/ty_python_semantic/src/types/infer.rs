@@ -2155,6 +2155,26 @@ pub(crate) enum StatementInference<'db> {
 }
 
 impl<'db> StatementInference<'db> {
+    pub(super) fn is_provisional(&self) -> bool {
+        match self {
+            Self::Expression(inference) => inference.fallback_type().is_some(),
+            Self::Definition(_, inference) => inference.fallback_type().is_some(),
+            Self::Other(inference) => inference.fallback_type().is_some(),
+        }
+    }
+
+    pub(super) fn try_expression_type(
+        &self,
+        expression: impl Into<ExpressionNodeKey>,
+    ) -> Option<Type<'db>> {
+        let expression = expression.into();
+        match self {
+            Self::Expression(inference) => inference.try_expression_type(expression),
+            Self::Definition(_, inference) => inference.try_expression_type(expression),
+            Self::Other(inference) => inference.try_expression_type(expression),
+        }
+    }
+
     fn expression_type(&self, expression: impl Into<ExpressionNodeKey>) -> Type<'db> {
         match self {
             StatementInference::Expression(inference) => inference.expression_type(expression),

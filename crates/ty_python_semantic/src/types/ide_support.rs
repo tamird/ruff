@@ -1164,7 +1164,7 @@ pub fn call_signature_details<'db>(
             .with_known_unpacking(
                 &call_expr.arguments,
                 |expression| expression.inferred_type(model),
-                |expression| model.dictionary_items(expression),
+                |expression| model.dictionary_observation(expression),
             );
         let mut bindings =
             callable_type
@@ -1247,7 +1247,7 @@ fn resolve_single_overload<'db>(
     .with_known_unpacking(
         &call_expr.arguments,
         |expression| expression.inferred_type(model),
-        |expression| model.dictionary_items(expression),
+        |expression| model.dictionary_observation(expression),
     );
 
     let constraints = ConstraintSetBuilder::new();
@@ -1299,7 +1299,7 @@ fn full_type_bindings_for_call<'db>(
         .with_known_unpacking(
             &call_expr.arguments,
             |expression| expression.inferred_type(model),
-            |expression| model.dictionary_items(expression),
+            |expression| model.dictionary_observation(expression),
         );
     let constraints = ConstraintSetBuilder::new();
 
@@ -1646,7 +1646,7 @@ pub fn resolved_call_signature<'db>(
     .with_known_unpacking(
         &call_expr.arguments,
         |expression| expression.inferred_type(model),
-        |expression| model.dictionary_items(expression),
+        |expression| model.dictionary_observation(expression),
     );
 
     // Extract the `Bindings` regardless of whether type checking succeeded or failed.

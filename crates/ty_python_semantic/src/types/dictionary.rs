@@ -1,26 +1,32 @@
 use indexmap::map::Entry;
-use itertools::Itertools;
-use ruff_db::parsed::parsed_module;
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
-use ty_python_core::definition::{BindingsOwner, Definition, DefinitionKind};
-use ty_python_core::scope::{ScopeId, ScopeKind};
+use ty_python_core::scope::ScopeId;
 use ty_python_core::semantic_index;
 
-use crate::place::{DefinedPlace, Definedness, Place, place_from_bindings_with_reachability_cache};
 use crate::reachability::ReachabilityEvaluationCache;
 use crate::types::call::collect_keyword_items;
-use crate::types::infer::infer_definition_types;
 use crate::types::typed_dict::{
     UnpackedTypedDict, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
 };
 use crate::types::{KnownClass, ProgramEnvironment, Type, UnionType};
 use crate::{Db, FxIndexMap};
 
+pub(crate) mod contents;
+
+/// Publication of contents evidence. An impossible mapping is not an empty mapping, and
+/// must not fall back to the receiver's ordinary type when matching a keyword argument.
+#[derive(Clone, Copy)]
+pub(crate) enum DictionaryFallback {
+    Unavailable,
+    Unreachable,
+}
+
+pub(crate) type DictionaryObservation<'db> = Result<DictionaryItems<'db>, DictionaryFallback>;
+
 /// A named value or per-name residual restriction in a dictionary argument.
-/// Optional entries in partial dictionaries can have unobserved values on other paths.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
 pub struct DictionaryItem<'db> {
     pub name: Name,
     pub ty: Type<'db>,
@@ -30,7 +36,7 @@ pub struct DictionaryItem<'db> {
 }
 
 /// A dictionary entry's presence and named-value evidence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
 pub enum DictionaryItemKind {
     /// A named value is present on every path.
     Required,
@@ -70,23 +76,20 @@ impl DictionaryItem<'_> {
 }
 
 /// Dictionary entries available at a call argument.
+#[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
 pub struct DictionaryItems<'db> {
     pub items: Box<[DictionaryItem<'db>]>,
     pub extra_items: DictionaryExtraItems<'db>,
 }
 
 /// Evidence about dictionary values beyond the named entries.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
 pub enum DictionaryExtraItems<'db> {
     /// Every possible key has an entry, which records its own evidence.
     Closed,
     /// Values for additional keys. Every represented name is excluded; its entry records the
     /// applicable value restriction and whether a named value can supply it.
     Value(Type<'db>),
-    /// Only individual writes were observed. The ordinary mapping type still applies to unseen
-    /// keys and to optional observed keys on paths where their writes did not execute.
-    /// These observations cannot establish an inventory for keyword argument matching.
-    Unobserved,
 }
 
 impl<'db> DictionaryItems<'db> {
@@ -101,172 +104,19 @@ impl<'db> DictionaryItems<'db> {
         expression: &ast::Expr,
         argument_type: Type<'db>,
         reachability: &ReachabilityEvaluationCache<'db>,
-    ) -> Option<Self> {
-        let file = scope.program_file(db);
-        let env = ProgramEnvironment::from_file(file);
-        let index = semantic_index(db, file);
-        let use_def = index.use_def_map(scope.file_scope_id(db));
-        let module = parsed_module(db, file.python_file(db)).load(db);
-
-        let use_id = index.try_expression_use_id(expression.into())?;
-
-        if !argument_type
-            .as_nominal_instance()?
-            .has_known_class(db, KnownClass::Dict)
-        {
-            return None;
-        }
-
-        let definition_key = |definition: Definition<'_>| {
-            let key = match definition.kind(db) {
-                DefinitionKind::DictKeyAssignment(assignment) => assignment.key(&module),
-                DefinitionKind::Assignment(assignment) => {
-                    let subscript = assignment.target(&module).as_subscript_expr()?;
-                    subscript.slice.as_ref().into()
-                }
-                DefinitionKind::AnnotatedAssignment(assignment) => {
-                    let subscript = assignment.target(&module).as_subscript_expr()?;
-                    subscript.slice.as_ref().into()
-                }
-                _ => return None,
-            };
-
-            let name = match key {
-                ast::AnyNodeRef::ExprStringLiteral(literal) => Name::new(literal.value.to_str()),
-                ast::AnyNodeRef::Identifier(identifier) => identifier.id.clone(),
-                _ => return None,
-            };
-            Some((name, key.range()))
-        };
-
-        // Collect the types of each distinct key.
-        let mut elements = Vec::new();
-        for bindings in use_def.multi_bindings_at_use(use_id) {
-            let place = place_from_bindings_with_reachability_cache(
-                db,
-                &env,
-                bindings.clone(),
-                reachability,
-            );
-            let Some((name, source)) = place.first_definition.and_then(definition_key) else {
-                continue;
-            };
-
-            if let Place::Defined(DefinedPlace {
-                ty: field_ty,
-                definedness,
-                ..
-            }) = place.place
-            {
-                elements.push(DictionaryItem {
-                    name,
-                    ty: field_ty,
-                    kind: DictionaryItemKind::from_required(
-                        db,
-                        field_ty,
-                        definedness == Definedness::AlwaysDefined,
-                    ),
-                    source,
-                });
-            }
-        }
-
-        let is_complete =
-            Self::complete_initializer_keys(db, scope, expression).is_some_and(|mut keys| {
-                for element in &elements {
-                    keys.remove(&element.name);
-                }
-                keys.is_empty()
-            });
-        Some(DictionaryItems {
-            items: elements.into_boxed_slice(),
-            extra_items: if is_complete {
-                DictionaryExtraItems::Closed
-            } else {
-                DictionaryExtraItems::Unobserved
-            },
-        })
-    }
-
-    /// Recover a fresh allocation whose key assignments are all tracked.
-    ///
-    /// The usage check covers the whole symbol, including other bindings and nested captures.
-    /// This deliberately gives up precision after harmless reads, but also catches loop-carried
-    /// aliases without an alias or heap-effect analysis.
-    fn complete_initializer_keys(
-        db: &'db dyn Db,
-        scope: ScopeId<'db>,
-        expression: &ast::Expr,
-    ) -> Option<FxHashSet<Name>> {
-        if scope.scope(db).kind() != ScopeKind::Function {
-            return None;
-        }
-        let name = expression.as_name_expr()?;
-        let file = scope.program_file(db);
-        let index = semantic_index(db, file);
-        let symbol = index
-            .place_table(scope.file_scope_id(db))
-            .symbol_by_name(&name.id)?;
-        if !symbol.is_local() || symbol.is_declared() || !symbol.has_only_tracked_dictionary_uses()
-        {
-            return None;
-        }
-        let use_id = index.try_expression_use_id(expression.into())?;
-        let binding = index
-            .use_def_map(scope.file_scope_id(db))
-            .bindings_at_use(use_id)
-            .exactly_one()
-            .ok()?;
-        let definition = binding.binding.definition()?;
-        let DefinitionKind::Assignment(assignment) = definition.kind(db) else {
-            return None;
-        };
-        // In particular, `alias = values = {}` does not allocate an unaliased dictionary.
-        if assignment.owner() != BindingsOwner::Definition {
-            return None;
-        }
-        let inference = infer_definition_types(db, definition);
-        if inference.discards_dict_key_assignments() {
-            return None;
-        }
-        let module = parsed_module(db, file.python_file(db)).load(db);
-        match assignment.value(&module) {
-            ast::Expr::Dict(dictionary) => dictionary
-                .items
-                .iter()
-                .map(|item| {
-                    let key = item.key.as_ref()?.as_string_literal_expr()?;
-                    Some(Name::new(key.value.to_str()))
-                })
-                .collect(),
-            ast::Expr::Call(call) => {
-                if !call.arguments.args.is_empty() {
-                    return None;
-                }
-                let Type::ClassLiteral(class) = inference.expression_type(&*call.func) else {
-                    return None;
-                };
-                if !class.is_known(db, KnownClass::Dict) {
-                    return None;
-                }
-                call.arguments
-                    .keywords
-                    .iter()
-                    .map(|keyword| Some(keyword.arg.as_ref()?.id.clone()))
-                    .collect()
-            }
-            _ => None,
-        }
+    ) -> DictionaryObservation<'db> {
+        contents::at_use(db, scope, expression, argument_type, reachability)
     }
 
     pub(crate) fn expression(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
         expression: &ast::Expr,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
-    ) -> Option<Self> {
+    ) -> DictionaryObservation<'db> {
         match expression {
-            ast::Expr::Dict(_) => Self::literal(db, env, expression, expression_type),
+            ast::Expr::Dict(_) => Self::literal(db, env, scope, expression, expression_type),
             ast::Expr::Call(call) => {
                 let ast::ExprCall {
                     node_index: _,
@@ -274,107 +124,164 @@ impl<'db> DictionaryItems<'db> {
                     func,
                     arguments,
                 } = call;
-                let Type::ClassLiteral(class) = expression_type(func)? else {
-                    return None;
+                let Type::ClassLiteral(class) =
+                    expression_type(func).ok_or(DictionaryFallback::Unavailable)?
+                else {
+                    return Err(DictionaryFallback::Unavailable);
                 };
                 if !class.is_known(db, KnownClass::Dict) {
-                    return None;
+                    return Err(DictionaryFallback::Unavailable);
                 }
                 let mut dictionary = DictionaryItemsBuilder::default();
                 match arguments.args.as_ref() {
                     [] => {}
                     [source] => {
                         if source.is_starred_expr() {
-                            return None;
+                            return Err(DictionaryFallback::Unavailable);
                         }
-                        let source = Self::unpacked_expression(db, env, source, expression_type)?;
-                        dictionary.overlay(db, env, source)?;
+                        let source = Self::positional_source(
+                            db,
+                            env,
+                            scope,
+                            expression.into(),
+                            source,
+                            expression_type,
+                        )?;
+                        dictionary.overlay(db, env, source);
                     }
-                    _ => return None,
+                    _ => return Err(DictionaryFallback::Unavailable),
                 }
-                let keywords = collect_keyword_items(
-                    db,
-                    env,
-                    arguments.keywords.iter().map(|keyword| {
-                        let ast::Keyword {
-                            node_index: _,
-                            range: _,
-                            arg,
-                            value,
-                        } = keyword;
-                        if let Some(name) = arg {
-                            let ty = expression_type(value)?;
-                            Some(Self {
-                                items: Box::new([DictionaryItem {
-                                    name: name.id.clone(),
-                                    ty,
-                                    kind: DictionaryItemKind::Required,
-                                    source: name.range(),
-                                }]),
-                                extra_items: DictionaryExtraItems::Closed,
-                            })
-                        } else {
-                            Self::unpacked_expression(db, env, value, expression_type)
-                        }
-                    }),
-                )?;
-                dictionary.overlay(db, env, keywords)?;
-                Some(dictionary.finish())
+                let keywords =
+                    Self::keywords(db, env, scope, &arguments.keywords, expression_type)?;
+                dictionary.overlay(db, env, keywords);
+                Ok(dictionary.finish())
             }
-            _ => None,
+            _ => Err(DictionaryFallback::Unavailable),
         }
+    }
+
+    fn keywords(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
+        keywords: &[ast::Keyword],
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+    ) -> DictionaryObservation<'db> {
+        collect_keyword_items(
+            db,
+            env,
+            keywords.iter().map(|keyword| {
+                let ast::Keyword {
+                    node_index: _,
+                    range: _,
+                    arg,
+                    value,
+                } = keyword;
+                if let Some(name) = arg {
+                    let ty = expression_type(value).ok_or(DictionaryFallback::Unavailable)?;
+                    Ok(Self {
+                        items: Box::new([DictionaryItem {
+                            name: name.id.clone(),
+                            ty,
+                            kind: DictionaryItemKind::Required,
+                            source: name.range(),
+                        }]),
+                        extra_items: DictionaryExtraItems::Closed,
+                    })
+                } else {
+                    Self::unpacked_expression(db, env, scope, value, expression_type)
+                }
+            }),
+        )
     }
 
     fn unpacked_expression(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
         expression: &ast::Expr,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
-    ) -> Option<Self> {
-        let observed = Self::expression(db, env, expression, expression_type);
-        if expression.is_dict_expr() {
-            // An unsupported nested literal invalidates the whole inventory. Its ordinary
-            // inferred value type must not masquerade as a proven residual here.
+    ) -> DictionaryObservation<'db> {
+        let observed = Self::expression(db, env, scope, expression, expression_type);
+        if expression.is_dict_expr() || !matches!(observed, Err(DictionaryFallback::Unavailable)) {
+            // Unsupported literals decline atomically; unreachable operands stay unreachable.
             return observed;
         }
-        observed.or_else(|| {
-            // Other expressions, including unsupported constructor forms, retain their ordinary
-            // mapping type. No partial constructor inventory escapes through this fallback.
-            let ty = expression_type(expression)?;
-            Self::unpacked(db, env, ty, expression.range())
-        })
+        let ty = expression_type(expression).ok_or(DictionaryFallback::Unavailable)?;
+        let index = semantic_index(db, scope.program_file(db));
+        let cache = ReachabilityEvaluationCache::new(
+            scope,
+            index
+                .use_def_map(scope.file_scope_id(db))
+                .reachability_constraints(),
+        );
+        match contents::at_use(db, scope, expression, ty, &cache) {
+            Err(DictionaryFallback::Unavailable) => Self::unpacked(db, env, ty, expression.range())
+                .ok_or(DictionaryFallback::Unavailable),
+            observed => observed,
+        }
+    }
+
+    fn positional_source(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
+        call: ast::ExprRef<'_>,
+        source: &ast::Expr,
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+    ) -> DictionaryObservation<'db> {
+        if ty_python_core::place::PlaceExpr::try_from_expr(source).is_none() {
+            return Self::unpacked_expression(db, env, scope, source, expression_type);
+        }
+        let ty = expression_type(source).ok_or(DictionaryFallback::Unavailable)?;
+        let index = semantic_index(db, scope.program_file(db));
+        let cache = ReachabilityEvaluationCache::new(
+            scope,
+            index
+                .use_def_map(scope.file_scope_id(db))
+                .reachability_constraints(),
+        );
+        match contents::at_snapshot(db, scope, source, call, ty, &cache) {
+            Err(DictionaryFallback::Unavailable) => {
+                Self::unpacked(db, env, ty, source.range()).ok_or(DictionaryFallback::Unavailable)
+            }
+            observed => observed,
+        }
     }
 
     fn literal(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
         expression: &ast::Expr,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
-    ) -> Option<Self> {
+    ) -> DictionaryObservation<'db> {
         let ast::Expr::Dict(ast::ExprDict {
             node_index: _,
             range: _,
             items,
         }) = expression
         else {
-            return None;
+            return Err(DictionaryFallback::Unavailable);
         };
         let mut dictionary = DictionaryItemsBuilder::default();
         for ast::DictItem { key, value } in items {
             let Some(key) = key else {
-                let unpacked = Self::unpacked_expression(db, env, value, expression_type)?;
-                dictionary.overlay(db, env, unpacked)?;
+                let unpacked = Self::unpacked_expression(db, env, scope, value, expression_type)?;
+                dictionary.overlay(db, env, unpacked);
                 continue;
             };
             let name = match key {
                 ast::Expr::StringLiteral(literal) => Name::new(literal.value.to_str()),
                 _ => {
-                    let ty = expression_type(key)?;
-                    let name = ty.string_literal_value(db)?;
+                    let ty = expression_type(key).ok_or(DictionaryFallback::Unavailable)?;
+                    let name = ty
+                        .string_literal_value(db)
+                        .ok_or(DictionaryFallback::Unavailable)?;
                     Name::new(name)
                 }
             };
-            let ty = expression_type(value)?;
+            let ty = expression_type(value).ok_or(DictionaryFallback::Unavailable)?;
             let entry = DictionaryItem {
                 name: name.clone(),
                 ty,
@@ -384,7 +291,7 @@ impl<'db> DictionaryItems<'db> {
             // Repeated keys replace their values without changing insertion order.
             dictionary.items.insert(name, entry);
         }
-        Some(dictionary.finish())
+        Ok(dictionary.finish())
     }
 
     /// Read an unpacked source's existing type without inferring its expression again.
@@ -433,7 +340,14 @@ impl<'db> DictionaryItems<'db> {
                     }),
             });
         }
-        let (_, value_ty) = ty.unpack_keys_and_items(db, env)?;
+        let (key_ty, value_ty) = ty.unpack_keys_and_items(db, env)?;
+        let str_ty = KnownClass::Str.to_instance(db, env);
+        if key_ty.is_assignable_to(db, env, str_ty) && !str_ty.is_assignable_to(db, env, key_ty) {
+            // The ordinary mapping checker handles key domains that exclude some strings.
+            // A homogeneous residual would incorrectly apply their values to other names.
+            // Non-string keys retain the call checker's separate key-type diagnostic.
+            return None;
+        }
         Some(Self {
             items: Box::default(),
             extra_items: if value_ty.resolve_type_alias(db).is_never() {
@@ -458,12 +372,11 @@ impl<'db> DictionaryItemsBuilder<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         dictionary: DictionaryItems<'db>,
-    ) -> Option<()> {
+    ) {
         let DictionaryItems { items, extra_items } = dictionary;
         let incoming_extra = match extra_items {
             DictionaryExtraItems::Closed => None,
             DictionaryExtraItems::Value(ty) => Some(ty),
-            DictionaryExtraItems::Unobserved => return None,
         };
         if let Some(ty) = incoming_extra {
             let names: FxHashSet<_> = items.iter().map(|item| item.name.clone()).collect();
@@ -505,7 +418,6 @@ impl<'db> DictionaryItemsBuilder<'db> {
                 UnionType::from_two_elements(db, env, previous, ty)
             }));
         }
-        Some(())
     }
 
     fn finish(self) -> DictionaryItems<'db> {

@@ -37,6 +37,7 @@ fn should_consider_definition(kind: &DefinitionKind<'_>) -> bool {
         | DefinitionKind::TypeAlias(_)
         | DefinitionKind::AugmentedAssignment(_)
         | DefinitionKind::DictKeyAssignment(_)
+        | DefinitionKind::DictionaryContents(_)
         | DefinitionKind::TypeVar(_)
         | DefinitionKind::ParamSpec(_)
         | DefinitionKind::TypeVarTuple(_)

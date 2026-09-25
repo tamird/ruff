@@ -107,6 +107,7 @@ fn lexical_name_path_component_for_leaf(
         | DefinitionKind::NamedExpression(_)
         | DefinitionKind::AugmentedAssignment(_)
         | DefinitionKind::DictKeyAssignment(_)
+        | DefinitionKind::DictionaryContents(_)
         | DefinitionKind::For(_)
         | DefinitionKind::Comprehension(_)
         | DefinitionKind::Parameter(_)

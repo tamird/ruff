@@ -608,24 +608,6 @@ impl PlaceState {
             .record_narrowing_constraint(narrowing_constraints, constraint);
     }
 
-    /// Add the given constraint to live bindings that were also present at an earlier use.
-    pub(super) fn record_narrowing_constraint_for_bindings_at_use(
-        &mut self,
-        narrowing_constraints: &mut NarrowingConstraintsBuilder,
-        constraint: ScopedNarrowingConstraint,
-        bindings_at_use: &Bindings,
-    ) {
-        for binding in &mut self.bindings.live_bindings {
-            if bindings_at_use
-                .iter()
-                .any(|binding_at_use| binding_at_use.binding() == binding.binding())
-            {
-                binding.narrowing_constraint = narrowing_constraints
-                    .add_and_constraint(binding.narrowing_constraint, constraint);
-            }
-        }
-    }
-
     /// Add the given constraint to live bindings selected by definition ID.
     pub(super) fn record_narrowing_constraint_for_bindings(
         &mut self,

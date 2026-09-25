@@ -1007,6 +1007,8 @@ pub enum DefinitionKind<'db> {
     AnnotatedAssignment(AnnotatedAssignmentDefinitionKind),
     AugmentedAssignment(AstNodeRef<ast::StmtAugAssign>),
     DictKeyAssignment(DictKeyAssignmentKind<'db>),
+    /// An internal transfer of a mapping's contents, with the ordinary value definition retained.
+    DictionaryContents(Box<DictionaryContentsDefinitionKind<'db>>),
     For(ForStmtDefinitionKind<'db>),
     Comprehension(ComprehensionDefinitionKind<'db>),
     Parameter(ParameterDefinitionNodeKind),
@@ -1080,12 +1082,18 @@ impl<'db> DefinitionKind<'db> {
         matches!(self, DefinitionKind::LoopHeader(_))
     }
 
+    pub const fn is_dictionary_contents(&self) -> bool {
+        matches!(self, DefinitionKind::DictionaryContents(_))
+    }
+
     /// Returns `true` if this definition is user-visible (i.e., not an internal
     /// synthetic definition like a loop header or nested bindings definition).
     pub const fn is_user_visible(&self) -> bool {
         !matches!(
             self,
-            DefinitionKind::LoopHeader(_) | DefinitionKind::NestedBindings(_)
+            DefinitionKind::LoopHeader(_)
+                | DefinitionKind::NestedBindings(_)
+                | DefinitionKind::DictionaryContents(_)
         )
     }
 
@@ -1095,6 +1103,7 @@ impl<'db> DefinitionKind<'db> {
     /// [`ast::ExprName`], [`ast::Identifier`], [`ast::ExprAttribute`] or [`ast::ExprSubscript`] but could also be other nodes.
     pub fn target_range(&self, module: &ParsedModuleRef) -> TextRange {
         match self {
+            DefinitionKind::DictionaryContents(contents) => contents.range(module),
             DefinitionKind::ProvidedBinding(binding) => binding.binding.range,
             DefinitionKind::Import(import) => import.alias(module).range(),
             DefinitionKind::ImportFrom(import) => import.alias(module).range(),
@@ -1146,6 +1155,7 @@ impl<'db> DefinitionKind<'db> {
     /// Returns the [`TextRange`] of the entire definition.
     pub fn full_range(&self, module: &ParsedModuleRef) -> TextRange {
         match self {
+            DefinitionKind::DictionaryContents(contents) => contents.range(module),
             DefinitionKind::ProvidedBinding(binding) => binding.statement.node(module).range(),
             DefinitionKind::Import(import) => import.alias(module).range(),
             DefinitionKind::ImportFrom(import) => import.alias(module).range(),
@@ -1225,6 +1235,7 @@ impl<'db> DefinitionKind<'db> {
             // all of these bind values without declaring a type
             DefinitionKind::ProvidedBinding(_)
             | DefinitionKind::DictKeyAssignment(_)
+            | DefinitionKind::DictionaryContents(_)
             | DefinitionKind::NamedExpression(_)
             | DefinitionKind::Assignment(_)
             | DefinitionKind::AugmentedAssignment(_)
@@ -1564,6 +1575,99 @@ impl ImportFromSubmoduleDefinitionKind {
         };
         TextRange::new(start, end) + module_ident.start()
     }
+}
+
+/// A source-ordered operation on a mapping receiver.
+///
+/// These definitions belong to the receiver's internal contents place. They are retrieved from
+/// reaching bindings, not from the ordinary AST definition table. Value inference continues to
+/// use the original assignment or expression owner.
+#[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
+pub enum DictionaryContentsDefinitionKind<'db> {
+    /// A value assigned to the receiver, including parameters and nested literal values.
+    Initialize {
+        definition: Definition<'db>,
+        range: TextRange,
+    },
+    /// Only the persistent capture modifier from the previous iteration, not its old contents.
+    LoopCapture {
+        header: Definition<'db>,
+        range: TextRange,
+    },
+    Operation {
+        receiver: AstNodeRef<ast::Expr>,
+        effect: DictionaryContentsEffect<'db>,
+    },
+    /// Captures have no receiver expression in the enclosing scope. Lazy captures modify every
+    /// later object assigned to the binding; eager captures expose only its current value.
+    Capture {
+        nested_scope: FileScopeId,
+        name: Name,
+        range: TextRange,
+        execution: NestedBindingExecution,
+        resolution: CaptureResolution,
+    },
+}
+
+impl DictionaryContentsDefinitionKind<'_> {
+    fn range(&self, module: &ParsedModuleRef) -> TextRange {
+        match self {
+            Self::Initialize {
+                definition: _,
+                range,
+            } => *range,
+            Self::LoopCapture { header: _, range } => *range,
+            Self::Operation {
+                receiver,
+                effect: _,
+            } => receiver.node(module).range(),
+            Self::Capture {
+                nested_scope: _,
+                name: _,
+                range,
+                execution: _,
+                resolution: _,
+            } => *range,
+        }
+    }
+}
+
+/// Lexical capture resolution, including a class-local read before its first binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
+pub enum CaptureResolution {
+    Lexical,
+    ClassLocalFallback,
+}
+
+#[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
+pub enum DictionaryContentsInferenceOwner {
+    Expression(AstNodeRef<ast::Expr>),
+    Statement(AstNodeRef<ast::Stmt>),
+}
+
+#[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
+pub enum DictionaryContentsEffect<'db> {
+    AugmentItem(Definition<'db>),
+    /// A mutation whose result has no ordinary inference owner available.
+    UnknownMutation,
+    /// A subscript assignment. Computed keys need not have an ordinary scalar place definition.
+    SetItem {
+        subscript: AstNodeRef<ast::ExprSubscript>,
+        owner: Option<DictionaryContentsInferenceOwner>,
+    },
+    DeleteItem {
+        subscript: AstNodeRef<ast::ExprSubscript>,
+        owner: Option<DictionaryContentsInferenceOwner>,
+    },
+    /// Invocation can either transfer known mapping contents or expose the receiver.
+    Call {
+        call: AstNodeRef<ast::ExprCall>,
+        owner: Option<DictionaryContentsInferenceOwner>,
+        /// A nested or named argument can retain the mapping instead of copying its entries.
+        retained: bool,
+    },
+    /// An alias, stored value, return, or escaped bound method can outlive this evaluation.
+    Expose,
 }
 
 /// The inference region that owns bindings created while evaluating an assignment's value.

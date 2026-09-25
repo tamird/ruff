@@ -194,7 +194,6 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         let mut description = match extra_items {
             DictionaryExtraItems::Closed => "complete".to_owned(),
             DictionaryExtraItems::Value(ty) => format!("extra: {}", ty.display(db, &env)),
-            DictionaryExtraItems::Unobserved => "partial".to_owned(),
         };
         // Preserve key order, values, and their source spelling through the public call view.
         for DictionaryItem {
@@ -254,43 +253,51 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         ),
         (
             "values = {'x': 1}\nresult = observe(values)",
-            "partial; x: Literal[1] at 'x'",
+            "complete; x: Literal[1] at 'x'",
         ),
         (
             "values = dict(x=1, y='value')\nresult = observe(values)",
-            "partial; x: Literal[1] at x; y: Literal[\"value\"] at y",
+            "complete; x: Literal[1] at x; y: Literal[\"value\"] at y",
+        ),
+        (
+            "copy = dict\nvalues = copy(x=1)\ncopied = copy(values, y=2)\nresult = observe(value=copied)",
+            "complete; x: Literal[1] at x; y: Literal[2] at y",
+        ),
+        (
+            "copy = dict\nvalues = copy(x=1)\nobserve(values)\ncopied = copy(values, y=2)\nresult = observe(value=copied)",
+            "extra: Unknown; x~: Literal[1] at x; y: Literal[2] at y",
         ),
         (
             "values = {'x': 1}\nvalues['x'] = 'new'\nresult = observe(value=values)",
-            "partial; x: Literal[\"new\"] at 'x'",
+            "complete; x: Literal[\"new\"] at 'x'",
         ),
         (
             "values = {'x': 1}\nvalues = {}\nresult = observe(values)",
-            "partial",
+            "complete",
         ),
         (
             "values = {'x': 1}\ndel values['x']\nresult = observe(values)",
-            "partial",
+            "complete; x~: Never at 'x'",
         ),
         (
             "values = {'x': 1}\nvalues.clear()\nresult = observe(values)",
-            "partial; x: Literal[1] at 'x'",
+            "complete",
         ),
         (
             "values = {'x': 1}\nif bool():\n    values['y'] = 2\nresult = observe(values)",
-            "partial; x: Literal[1] at 'x'",
+            "complete; x: Literal[1] at 'x'",
         ),
         (
             "values = {'x': 1}\nif bool(input()):\n    values['y'] = 2\nresult = observe(values)",
-            "partial; x: Literal[1] at 'x'; y?: Literal[2] at 'y'",
+            "complete; x: Literal[1] at 'x'; y?: Literal[2] at 'y'",
         ),
         (
             "values = {}\nvalues['inner'] = {'x': 1}\nvalues['inner']['y'] = 2\nresult = observe(values['inner'])",
-            "partial; x: Literal[1] at 'x'; y: Literal[2] at 'y'",
+            "extra: int; x~: Literal[1] at 'x'; y~: Literal[2] at 'y'",
         ),
         (
             "values = {'x': 1}\nresult = observe({**values})",
-            "extra: int",
+            "complete; x: Literal[1] at 'x'",
         ),
         ("result = observe(1)", "unavailable"),
     ] {
