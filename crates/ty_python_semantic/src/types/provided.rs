@@ -246,7 +246,7 @@ impl<'db> Type<'db> {
         result
     }
 
-    fn has_immutable_field_path(
+    pub(super) fn has_immutable_field_path(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,

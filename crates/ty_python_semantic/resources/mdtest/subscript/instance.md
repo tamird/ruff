@@ -3,7 +3,7 @@
 ## Successful subscription narrows the receiver
 
 A checked subscription that returns `Never` cannot describe the receiver on normal continuation.
-Errors, skipped subscriptions, and caught failures do not establish that fact.
+Other dispatch errors, skipped subscriptions, and caught failures do not establish that fact.
 
 ```toml
 [environment]
@@ -116,6 +116,94 @@ def dependent(values: Present | Absent, flag: bool):
         values[0]
         reveal_type(values)  # revealed: Present
         values = Present() if flag else Absent()
+```
+
+## Nullable receivers on normal continuation
+
+`None` cannot complete a subscription. The first lookup still reports its error, while subsequent
+expressions on the successful path use the continuing receiver. Other invalid dispatch alternatives
+retain their ordinary recovery types.
+
+```py
+from typing import Any, Union
+from typing_extensions import TypeForm
+
+def continued(value: list[int] | None):
+    value[0]  # error: [not-subscriptable]
+    reveal_type(value)  # revealed: list[int]
+    value[0]
+    value = None
+    value[0]  # error: [not-subscriptable]
+
+def caught(value: list[int] | None):
+    try:
+        value[0]  # error: [not-subscriptable]
+        reveal_type(value)  # revealed: list[int]
+    except TypeError:
+        reveal_type(value)  # revealed: list[int] | None
+    reveal_type(value)  # revealed: list[int] | None
+
+def combine(first: object, second: object) -> None: ...
+def returning(value: list[int] | None) -> None:
+    # Later arguments observe completion, but earlier arguments retain their evaluated type.
+    return combine(
+        reveal_type(value),  # revealed: list[int] | None
+        (
+            value[0],  # error: [not-subscriptable]
+            reveal_type(value),  # revealed: list[int]
+        ),
+    )
+
+def skipped(value: list[int] | None, flag: bool) -> None:
+    return combine(
+        flag and value[0],  # error: [not-subscriptable]
+        reveal_type(value),  # revealed: list[int] | None
+    )
+
+def conditional(value: list[int] | None, flag: bool) -> None:
+    return combine(
+        value[0] if flag else 0,  # error: [not-subscriptable]
+        reveal_type(value),  # revealed: list[int] | None
+    )
+
+def wrong_key(value: list[int] | None):
+    # error: [not-subscriptable]
+    # error: [invalid-argument-type]
+    value["key"]
+    reveal_type(value)  # revealed: list[int]
+
+class Invalid:
+    def __getitem__(self, key: str) -> int:
+        return 1
+
+def recovery(value: Invalid | None):
+    # error: [not-subscriptable]
+    # error: [invalid-argument-type]
+    value[0]
+    reveal_type(value)  # revealed: Invalid
+
+def gradual(value: Any | None):
+    value[0]  # error: [not-subscriptable]
+    reveal_type(value)  # revealed: Any
+
+def captured(value: list[int] | None):
+    def reset():
+        nonlocal value
+        value = None
+    value[0]  # error: [not-subscriptable]
+    reset()
+    reveal_type(value)  # revealed: list[int] | None
+
+def iteration(values: list[list[int] | None]):
+    for value in values:
+        value[0]  # error: [not-subscriptable]
+        reveal_type(value)  # revealed: list[int]
+
+def generic_return() -> TypeForm[list[int]]:
+    return list[int]
+
+def union_return() -> TypeForm[int | str]:
+    return Union[int, str]
 ```
 
 ## Successful subscription with specialized receivers

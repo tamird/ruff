@@ -278,6 +278,137 @@ other = record({'guard': guard, 'target': target})
 ";
 
 #[test]
+fn supplied_storage_preserves_subscript_continuation() -> anyhow::Result<()> {
+    let declarations = format!(
+        "{FIELD_IMPLICATION_DECLARATIONS}\
+class Target:
+    label: str
+    def __getitem__(self, key: int) -> int: ...
+target: Target | None
+"
+    );
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", &declarations)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(field_implication_factory)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (definition, setup, between, extra_errors) in [
+        ("", "attrs = record({'dep': target})", "", vec![]),
+        (
+            "",
+            "attrs = record({'dep': target})",
+            "    ctx = record({'attr': record({'dep': None})})\n",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "",
+            "attrs = record({'dep': target})",
+            "    ctx.attr = record({'dep': None})\n",
+            vec!["invalid-assignment", "unresolved-attribute"],
+        ),
+        (
+            "",
+            "attrs = record({'dep': target})",
+            "    ctx.attr.dep = None\n",
+            vec!["invalid-assignment", "unresolved-attribute"],
+        ),
+        (
+            "class Mutable:\n    dep: Target | None = target\n",
+            "attrs = Mutable()",
+            "",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "class Base:\n    @property\n    def dep(self) -> Target | None: return target\n",
+            "attrs = record({'dep': target}, base=Base)",
+            "",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "class Base:\n    def __getattribute__(self, name: str) -> Target | None: return target\n",
+            "attrs = record({'dep': target}, base=Base)",
+            "",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> Target | None: return target\n    def __set__(self, instance: object, value: object) -> None: pass\nclass Base:\n    dep = Descriptor()\n",
+            "attrs = record({'dep': target}, base=Base)",
+            "",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> Target | None: return target\nclass Base:\n    dep = Descriptor()\n",
+            "attrs = record({'dep': target}, base=Base)",
+            "",
+            vec![],
+        ),
+        (
+            "class Mutable:\n    dep: Target | None = target\n",
+            "attrs = record({'dep': target}) if flag else Mutable()",
+            "",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "",
+            "attrs = record({'dep': target})\n    def reset():\n        nonlocal ctx\n        ctx = record({'attr': record({'dep': None})})",
+            "    reset()\n",
+            vec!["unresolved-attribute"],
+        ),
+    ] {
+        let source = format!(
+            "from native import record, Target, target, flag\n{definition}\
+def use() -> str:
+    {setup}
+    ctx = record({{'attr': attrs}})
+    ctx.attr.dep[0]
+{between}    return ctx.attr.dep.label
+"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        let expected: Vec<_> = std::iter::once("not-subscriptable")
+            .chain(extra_errors)
+            .collect();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{source}: {diagnostics:#?}",
+        );
+        let lookup = source.find("ctx.attr.dep[0]").unwrap();
+        let first = diagnostics.first().expect("the initial lookup must fail");
+        let range = first.primary_span().unwrap().range().unwrap();
+        assert_eq!(usize::from(range.start()), lookup, "{diagnostics:#?}");
+    }
+    for lookup in [
+        "    try:\n        ctx.attr.dep[0]\n    except TypeError:\n        pass\n",
+        "    flag and ctx.attr.dep[0]\n",
+    ] {
+        let source = format!(
+            "from native import record, target, flag\n\
+def use() -> str:
+    ctx = record({{'attr': record({{'dep': target}})}})
+{lookup}    return ctx.attr.dep.label
+"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            ["not-subscriptable", "unresolved-attribute"],
+            "{source}: {diagnostics:#?}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_field_implications_share_root_narrowing() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
