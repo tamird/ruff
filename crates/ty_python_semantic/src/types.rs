@@ -3101,7 +3101,8 @@ impl<'db> Type<'db> {
             .is_some_and(LiteralValueType::is_int)
     }
 
-    fn as_int_literal(self) -> Option<i64> {
+    /// Returns the exact integer value, if this is an integer literal type.
+    pub fn as_int_literal(self) -> Option<i64> {
         match self {
             Type::LiteralValue(literal) => literal.as_int(),
             _ => None,
@@ -3179,7 +3180,7 @@ impl<'db> Type<'db> {
     }
 
     /// Create a promotable string literal.
-    pub(crate) fn string_literal<T>(db: &'db dyn Db, string: T) -> Self
+    pub fn string_literal<T>(db: &'db dyn Db, string: T) -> Self
     where
         T: salsa::Lookup<CompactString> + std::hash::Hash,
         CompactString: salsa::HashEqLike<T>,
