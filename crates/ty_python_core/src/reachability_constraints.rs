@@ -3,10 +3,12 @@
 //! See [`crate::reachability_constraints`] for more details.
 
 use std::cmp::Ordering;
+use std::hash::Hash;
 
 use ruff_index::Idx;
 use rustc_hash::FxHashMap;
 
+use crate::Truthiness;
 use crate::interned_nodes::InternedNodes;
 use crate::narrowing_constraints::{NarrowingConstraintsBuilder, ScopedNarrowingConstraint};
 use crate::predicate::ScopedPredicateId;
@@ -138,6 +140,13 @@ const SMALLEST_TERMINAL: ScopedReachabilityConstraintId = ALWAYS_FALSE;
 /// reachability analysis and type narrowing.
 const MAX_INTERIOR_NODES: usize = 512 * 1024;
 
+/// A predicate's known outcome, or a proven stable value with a query-local identity.
+#[derive(Clone, Copy)]
+pub enum ReachabilityAtom<K> {
+    Known(Truthiness),
+    Symbolic { key: K, is_positive: bool },
+}
+
 /// A collection of reachability constraints for a given scope.
 #[derive(Debug, PartialEq, Eq, get_size2::GetSize)]
 pub struct ReachabilityConstraints {
@@ -165,6 +174,132 @@ impl ReachabilityConstraints {
             self.used_interiors[index]
         } else {
             self.used_interiors[raw_index]
+        }
+    }
+
+    /// Project a demanded constraint after semantic analysis has identified stable values.
+    ///
+    /// Unknown predicates follow their ordinary ambiguous edge. Only proven identities remain
+    /// symbolic; their ordered ternary reconstruction can eliminate repeated or negated tests.
+    /// Both the projection memo and the new graph belong to this evaluation alone.
+    pub fn project<K: Copy + Eq + Hash>(
+        &self,
+        root: ScopedReachabilityConstraintId,
+        mut evaluate: impl FnMut(ScopedPredicateId) -> ReachabilityAtom<K>,
+    ) -> Truthiness {
+        enum Action {
+            Visit(ScopedReachabilityConstraintId),
+            Select(
+                ScopedReachabilityConstraintId,
+                ScopedReachabilityConstraintId,
+            ),
+            Concrete(ScopedReachabilityConstraintId, ScopedPredicateId, bool),
+            Symbolic(ScopedReachabilityConstraintId, ScopedPredicateId, bool),
+        }
+        let mut projected = FxHashMap::default();
+        let mut values = FxHashMap::default();
+        let mut outcomes = FxHashMap::default();
+        let mut conditions = FxHashMap::default();
+        let mut graph = ReachabilityConstraintsBuilder::default();
+        let mut actions = vec![Action::Visit(root)];
+        let converted = |id: ScopedReachabilityConstraintId,
+                         projected: &FxHashMap<
+            ScopedReachabilityConstraintId,
+            ScopedReachabilityConstraintId,
+        >| { if id.is_terminal() { id } else { projected[&id] } };
+        while let Some(action) = actions.pop() {
+            match action {
+                Action::Visit(id) => {
+                    if id.is_terminal() || projected.contains_key(&id) {
+                        continue;
+                    }
+                    let InteriorNode {
+                        atom,
+                        if_true,
+                        if_ambiguous,
+                        if_false,
+                    } = self.get_interior_node(id);
+                    let outcome = *outcomes.entry(atom).or_insert_with(|| evaluate(atom));
+                    match outcome {
+                        ReachabilityAtom::Known(truthiness) => {
+                            let child = match truthiness {
+                                Truthiness::AlwaysTrue => if_true,
+                                Truthiness::Ambiguous => if_ambiguous,
+                                Truthiness::AlwaysFalse => if_false,
+                            };
+                            actions.push(Action::Select(id, child));
+                            actions.push(Action::Visit(child));
+                        }
+                        ReachabilityAtom::Symbolic { key, is_positive } => {
+                            // Keep the first source atom's ordering; only its identity is reused.
+                            let atom = *values.entry(key).or_insert(atom);
+                            actions.push(Action::Concrete(id, atom, is_positive));
+                            actions.push(Action::Visit(if_false));
+                            actions.push(Action::Visit(if_true));
+                        }
+                    }
+                }
+                Action::Select(id, child) => {
+                    projected.insert(id, converted(child, &projected));
+                }
+                Action::Concrete(id, atom, is_positive) => {
+                    let InteriorNode {
+                        atom: _,
+                        if_true,
+                        if_ambiguous,
+                        if_false,
+                    } = self.get_interior_node(id);
+                    let if_true = converted(if_true, &projected);
+                    let if_false = converted(if_false, &projected);
+                    // Like the ordinary TDD operations, equal concrete outcomes discard the
+                    // ambiguous branch. Avoid demanding predicates that cannot affect the result.
+                    if if_true == if_false {
+                        projected.insert(id, if_true);
+                    } else {
+                        actions.push(Action::Symbolic(id, atom, is_positive));
+                        actions.push(Action::Visit(if_ambiguous));
+                    }
+                }
+                Action::Symbolic(id, atom, is_positive) => {
+                    let InteriorNode {
+                        atom: _,
+                        if_true,
+                        if_ambiguous,
+                        if_false,
+                    } = self.get_interior_node(id);
+                    let if_true = converted(if_true, &projected);
+                    let if_ambiguous = converted(if_ambiguous, &projected);
+                    let if_false = converted(if_false, &projected);
+                    let (if_true, if_false) = if is_positive {
+                        (if_true, if_false)
+                    } else {
+                        (if_false, if_true)
+                    };
+                    let result = graph.add_conditional(
+                        atom,
+                        if_true,
+                        if_ambiguous,
+                        if_false,
+                        &mut conditions,
+                    );
+                    projected.insert(id, result);
+                }
+            }
+        }
+        let mut id = converted(root, &projected);
+        while !id.is_terminal() {
+            let InteriorNode {
+                atom: _,
+                if_true: _,
+                if_ambiguous,
+                if_false: _,
+            } = graph.interiors[id];
+            id = if_ambiguous;
+        }
+        match id {
+            ALWAYS_TRUE => Truthiness::AlwaysTrue,
+            ALWAYS_FALSE => Truthiness::AlwaysFalse,
+            _ => Truthiness::Ambiguous,
         }
     }
 
@@ -358,6 +493,98 @@ impl ReachabilityConstraintsBuilder {
             self.interior_used.push(false);
         }
         id
+    }
+
+    /// Reconstruct a ternary test after atoms have been substituted. Child atoms may now
+    /// precede or equal `atom`, so cofactor them before using the ordinary node interner.
+    fn add_conditional(
+        &mut self,
+        atom: ScopedPredicateId,
+        if_true: ScopedReachabilityConstraintId,
+        if_ambiguous: ScopedReachabilityConstraintId,
+        if_false: ScopedReachabilityConstraintId,
+        cache: &mut FxHashMap<InteriorNode, ScopedReachabilityConstraintId>,
+    ) -> ScopedReachabilityConstraintId {
+        if if_true == if_false {
+            return if_true;
+        }
+        let key = InteriorNode {
+            atom,
+            if_true,
+            if_ambiguous,
+            if_false,
+        };
+        if let Some(result) = cache.get(&key) {
+            return *result;
+        }
+        if self.is_saturated() {
+            return AMBIGUOUS;
+        }
+        let first = [if_true, if_ambiguous, if_false]
+            .into_iter()
+            .filter(|id| !id.is_terminal())
+            .map(|id| {
+                let InteriorNode {
+                    atom,
+                    if_true: _,
+                    if_ambiguous: _,
+                    if_false: _,
+                } = self.interiors[id];
+                atom
+            })
+            .fold(atom, std::cmp::max);
+        let cofactor = |graph: &Self, id: ScopedReachabilityConstraintId, branch| {
+            if id.is_terminal() {
+                return id;
+            }
+            let InteriorNode {
+                atom,
+                if_true,
+                if_ambiguous,
+                if_false,
+            } = graph.interiors[id];
+            if atom != first {
+                return id;
+            }
+            match branch {
+                Truthiness::AlwaysTrue => if_true,
+                Truthiness::Ambiguous => if_ambiguous,
+                Truthiness::AlwaysFalse => if_false,
+            }
+        };
+        let result = if first == atom {
+            self.add_interior(InteriorNode {
+                atom,
+                if_true: cofactor(self, if_true, Truthiness::AlwaysTrue),
+                if_ambiguous: cofactor(self, if_ambiguous, Truthiness::Ambiguous),
+                if_false: cofactor(self, if_false, Truthiness::AlwaysFalse),
+            })
+        } else {
+            let mut branch = |outcome| {
+                self.add_conditional(
+                    atom,
+                    cofactor(self, if_true, outcome),
+                    cofactor(self, if_ambiguous, outcome),
+                    cofactor(self, if_false, outcome),
+                    cache,
+                )
+            };
+            let if_true = branch(Truthiness::AlwaysTrue);
+            let if_false = branch(Truthiness::AlwaysFalse);
+            let if_ambiguous = if if_true == if_false {
+                if_true
+            } else {
+                branch(Truthiness::Ambiguous)
+            };
+            self.add_interior(InteriorNode {
+                atom: first,
+                if_true,
+                if_ambiguous,
+                if_false,
+            })
+        };
+        cache.insert(key, result);
+        result
     }
 
     /// Adds a new reachability constraint that checks a single [`super::predicate::Predicate`].
@@ -570,12 +797,141 @@ mod tests {
     use super::*;
 
     #[test]
+    fn projection_correlates_repeated_and_negated_values() {
+        for (disjunction, second_positive, expected) in [
+            (false, true, Truthiness::AlwaysFalse),
+            (true, false, Truthiness::AlwaysTrue),
+        ] {
+            let mut graph = ReachabilityConstraintsBuilder::default();
+            let first = ScopedPredicateId::new(0);
+            let second = ScopedPredicateId::new(1);
+            let a = graph.add_atom(first);
+            let b = graph.add_atom(second);
+            let root = if disjunction {
+                graph.add_or_constraint(a, b)
+            } else {
+                let not_b = graph.add_not_constraint(b);
+                graph.add_and_constraint(a, not_b)
+            };
+            graph.mark_used(root);
+            let graph = graph.build();
+            assert_eq!(
+                graph.project(root, |id| ReachabilityAtom::Symbolic {
+                    key: 0,
+                    is_positive: id == first || second_positive,
+                }),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_projection_orders_and_cofactors_all_children() {
+        let mut graph = ReachabilityConstraintsBuilder::default();
+        let mut cache = FxHashMap::default();
+        let first = ScopedPredicateId::new(0);
+        let second = ScopedPredicateId::new(1);
+        let a = graph.add_atom(first);
+        let b = graph.add_atom(second);
+        let not_a = graph.add_not_constraint(a);
+        // Both concrete outcomes of the repeated value lead to true.
+        assert_eq!(
+            graph.add_conditional(first, a, AMBIGUOUS, not_a, &mut cache),
+            ALWAYS_TRUE
+        );
+        // The substituted child precedes its parent in the diagram's ordering. Its ambiguous
+        // cofactor differs from an ordinary Boolean conditional and must be preserved.
+        let filter = graph.add_interior(InteriorNode {
+            atom: first,
+            if_true: ALWAYS_TRUE,
+            if_ambiguous: ALWAYS_FALSE,
+            if_false: ALWAYS_FALSE,
+        });
+        let expected = graph.add_and_constraint(filter, b);
+        let result = graph.add_conditional(first, b, ALWAYS_FALSE, ALWAYS_FALSE, &mut cache);
+        assert_eq!(result, expected);
+        let InteriorNode {
+            atom,
+            if_true: _,
+            if_ambiguous: _,
+            if_false: _,
+        } = graph.interiors[result];
+        assert_eq!(atom, second);
+    }
+
+    #[test]
+    fn projection_preserves_existing_ambiguity() {
+        let graph = ReachabilityConstraintsBuilder::default().build();
+        assert_eq!(
+            graph.project::<usize>(AMBIGUOUS, |_| unreachable!("terminal has no predicate")),
+            Truthiness::Ambiguous
+        );
+        let mut graph = ReachabilityConstraintsBuilder::default();
+        let root = graph.add_interior(InteriorNode {
+            atom: ScopedPredicateId::new(0),
+            if_true: ALWAYS_TRUE,
+            if_ambiguous: ALWAYS_FALSE,
+            if_false: ALWAYS_FALSE,
+        });
+        graph.mark_used(root);
+        assert_eq!(
+            graph.build().project(root, |_| ReachabilityAtom::Symbolic {
+                key: 0,
+                is_positive: true
+            }),
+            Truthiness::AlwaysFalse
+        );
+    }
+
+    #[test]
+    fn projection_skips_redundant_ambiguous_branch() {
+        let mut graph = ReachabilityConstraintsBuilder::default();
+        let first = ScopedPredicateId::new(0);
+        let second = ScopedPredicateId::new(1);
+        let unused = ScopedPredicateId::new(2);
+        let parent = ScopedPredicateId::new(3);
+        let if_true = graph.add_atom(first);
+        let if_false = graph.add_atom(second);
+        let if_ambiguous = graph.add_atom(unused);
+        let root = graph.add_interior(InteriorNode {
+            atom: parent,
+            if_true,
+            if_ambiguous,
+            if_false,
+        });
+        graph.mark_used(root);
+        assert_eq!(
+            graph.build().project(root, |id| {
+                assert_ne!(id, unused, "equal outcomes do not demand this predicate");
+                if id == parent {
+                    ReachabilityAtom::Symbolic {
+                        key: 0,
+                        is_positive: true,
+                    }
+                } else {
+                    ReachabilityAtom::Known(Truthiness::AlwaysTrue)
+                }
+            }),
+            Truthiness::AlwaysTrue
+        );
+    }
+
+    #[test]
     fn repeated_operations_remain_stable_at_capacity() {
         let mut constraints = ReachabilityConstraintsBuilder::default();
         let a = constraints.add_atom(ScopedPredicateId::new(0));
         let b = constraints.add_atom(ScopedPredicateId::new(1));
         let c = constraints.add_atom(ScopedPredicateId::new(2));
         let disjunction = constraints.add_or_constraint(a, c);
+        let mut conditionals = FxHashMap::default();
+        let conditional = constraints.add_conditional(
+            ScopedPredicateId::new(3),
+            b,
+            AMBIGUOUS,
+            c,
+            &mut conditionals,
+        );
+        assert_ne!(conditional, AMBIGUOUS);
         while constraints.interiors.len() < MAX_INTERIOR_NODES - 1 {
             constraints.add_atom(ScopedPredicateId::new(constraints.interiors.len() + 10));
         }
@@ -589,5 +945,19 @@ mod tests {
         assert_eq!(constraints.add_or_constraint(a, c), disjunction);
         assert_eq!(constraints.add_and_constraint(a, c), AMBIGUOUS);
         assert_eq!(constraints.add_or_constraint(b, c), AMBIGUOUS);
+        assert_eq!(
+            constraints.add_conditional(
+                ScopedPredicateId::new(3),
+                b,
+                AMBIGUOUS,
+                c,
+                &mut conditionals,
+            ),
+            conditional
+        );
+        assert_eq!(
+            constraints.add_conditional(ScopedPredicateId::new(3), a, b, c, &mut conditionals,),
+            AMBIGUOUS
+        );
     }
 }
