@@ -1,16 +1,18 @@
 use crate::Db;
 use crate::ProgramEnvironment;
+use crate::reachability::ReachabilityEvaluationCache;
+use crate::types::dictionary::{DictionaryFallback, DictionaryItem, DictionaryItems};
 use crate::types::{
     AwaitError, Bindings, CallArguments, CallDunderError, KnownClass, LintDiagnosticGuard,
     LintDiagnosticGuardBuilder, LiteralValueTypeKind, MemberLookupPolicy, Type, TypeContext,
-    TypeVarBoundOrConstraints, UnionType,
+    TypeVarBoundOrConstraints, UnionBuilder, UnionType,
     call::CallErrorKind,
     context::InferContext,
     diagnostic::NOT_ITERABLE,
     function::function_has_stub_body,
     infer::infer_expression_types,
     todo_type,
-    tuple::{TupleSpec, TupleSpecBuilder},
+    tuple::{TupleSpec, TupleSpecBuilder, TupleType},
 };
 use compact_str::ToCompactString;
 use ruff_db::diagnostic::{Annotation, Span};
@@ -22,6 +24,7 @@ use ruff_text_size::{Ranged, TextRange};
 use std::borrow::Cow;
 use ty_module_resolver::{SearchPath, file_to_module};
 use ty_python_core::definition::{Definition, DefinitionKind};
+use ty_python_core::scope::ScopeId;
 use ty_python_core::{EvaluationMode, semantic_index};
 
 /// Points to a coroutine declaration that may have been intended to describe an async generator.
@@ -213,6 +216,155 @@ pub(crate) fn extract_fixed_length_iterable_element_types<'db>(
     let mut element_types = Vec::new();
     extend_fixed_length_iterable(db, env, iterable, &mut expression_type, &mut element_types)?;
     Some(element_types.into_boxed_slice())
+}
+
+/// Refine elements of an immediately consumed dictionary items snapshot without changing its
+/// mutable container type. Live views and saved snapshots retain ordinary iteration inference.
+pub(super) fn refine_dict_snapshot_element_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    scope: ScopeId<'db>,
+    iterable: &ast::Expr,
+    element_type: Type<'db>,
+    mode: EvaluationMode,
+    mut expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+) -> Option<Type<'db>> {
+    if mode == EvaluationMode::Async {
+        return None;
+    }
+    let ast::Expr::Call(call) = iterable else {
+        return None;
+    };
+    let ast::ExprCall {
+        node_index: _,
+        range_start: _,
+        func,
+        arguments,
+    } = call;
+    let is_list = match expression_type(func)? {
+        Type::ClassLiteral(class) => class.is_known(db, KnownClass::List),
+        _ => false,
+    };
+    let items = if is_list {
+        let [source] = arguments.args.as_ref() else {
+            return None;
+        };
+        if !arguments.keywords.is_empty() || source.is_starred_expr() {
+            return None;
+        }
+        source
+    } else {
+        iterable
+    };
+    let ast::Expr::Call(items_call) = items else {
+        return None;
+    };
+    let ast::ExprCall {
+        node_index: _,
+        range_start: _,
+        func,
+        arguments,
+    } = items_call;
+    if !arguments.args.is_empty() || !arguments.keywords.is_empty() {
+        return None;
+    }
+    let ast::Expr::Attribute(attribute) = func.as_ref() else {
+        return None;
+    };
+    let ast::ExprAttribute {
+        node_index: _,
+        range: _,
+        value: receiver,
+        attr,
+        ctx: _,
+    } = attribute;
+    if attr.id != "items" {
+        return None;
+    }
+    if !is_list {
+        // Some environments declare builtin dict.items as a list snapshot instead of a live view.
+        let Type::NominalInstance(result) = expression_type(items)? else {
+            return None;
+        };
+        if !result.has_known_class(db, KnownClass::List) {
+            return None;
+        }
+    }
+    let receiver_type = expression_type(receiver)?;
+    let Type::NominalInstance(instance) = receiver_type else {
+        return None;
+    };
+    if !instance.has_known_class(db, KnownClass::Dict) {
+        return None;
+    }
+    let Type::BoundMethod(method) = expression_type(func)? else {
+        return None;
+    };
+    let declared = KnownClass::Dict
+        .to_instance(db, env)
+        .member_lookup_with_policy(db, env, "items", MemberLookupPolicy::NO_INSTANCE_FALLBACK)
+        .place
+        .ignore_possibly_undefined()?;
+    let Type::BoundMethod(declared) = declared else {
+        return None;
+    };
+    if method.function(db)?.definition(db) != declared.function(db)?.definition(db) {
+        return None;
+    }
+    let tuple = element_type.exact_tuple_instance_spec(db)?;
+    let [_, value_type] = tuple.as_fixed_length()?.all_elements() else {
+        return None;
+    };
+    let dictionary =
+        match DictionaryItems::expression(db, env, scope, receiver, &mut expression_type) {
+            Ok(dictionary) => dictionary,
+            Err(fallback) => match fallback {
+                DictionaryFallback::Unavailable => {
+                    let index = semantic_index(db, scope.program_file(db));
+                    let cache = ReachabilityEvaluationCache::new(
+                        scope,
+                        index
+                            .use_def_map(scope.file_scope_id(db))
+                            .reachability_constraints(),
+                    );
+                    DictionaryItems::observed(db, scope, receiver, receiver_type, &cache).ok()?
+                }
+                DictionaryFallback::Unreachable => return None,
+            },
+        };
+    if !dictionary.is_complete() {
+        return None;
+    }
+    let DictionaryItems {
+        items,
+        extra_items: _,
+    } = dictionary;
+    let mut keys = UnionBuilder::new(db, env);
+    for DictionaryItem {
+        name,
+        ty,
+        kind,
+        source: _,
+    } in &items
+    {
+        if matches!(ty.resolve_type_alias(db), Type::Never) {
+            // Required bottom values make the mapping impossible, rather than excluding a key.
+            if kind.is_required() {
+                return None;
+            }
+        } else {
+            keys.add_in_place(Type::string_literal(db, name));
+        }
+    }
+    let keys = keys.build();
+    if keys.is_never() {
+        return None;
+    }
+    Some(Type::tuple(TupleType::heterogeneous(
+        db,
+        env,
+        [keys, *value_type],
+    )))
 }
 
 impl<'db> Type<'db> {

@@ -106,6 +106,7 @@ use crate::types::infer::{
     TypeExpressionFlags, infer_statement_types, nearest_enclosing_class,
     nearest_enclosing_function, original_class_type,
 };
+use crate::types::iteration::refine_dict_snapshot_element_type;
 use crate::types::match_pattern::{ClassPatternPositionalResult, class_pattern_positional_result};
 use crate::types::narrow::NarrowingEvaluatorExtension;
 use crate::types::narrow::pattern_success_types;
@@ -5249,6 +5250,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
+    fn snapshot_iterable_element_type(
+        &self,
+        iterable: &ast::Expr,
+        element: Type<'db>,
+        mode: EvaluationMode,
+        mut expression_type: impl FnMut(&ast::Expr) -> Type<'db>,
+    ) -> Type<'db> {
+        refine_dict_snapshot_element_type(
+            self.db(),
+            self.program_environment(),
+            self.index.expression(iterable).scope(self.db()),
+            iterable,
+            element,
+            mode,
+            |expression| Some(expression_type(expression)),
+        )
+        .unwrap_or(element)
+    }
+
     fn infer_for_statement(&mut self, for_statement: &ast::StmtFor) {
         let db = self.db();
         let ast::StmtFor {
@@ -5273,9 +5293,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 element_type
             } else {
                 let env = builder.program_environment();
-                iterable_type
-                    .iterate(db, env)
-                    .homogeneous_element_type(db, env)
+                iterable_type.try_iterate(db, env).map_or_else(
+                    |err| err.fallback_element_type(db, env),
+                    |tuple| {
+                        let element = tuple.homogeneous_element_type(db, env);
+                        builder.snapshot_iterable_element_type(
+                            iter,
+                            element,
+                            EvaluationMode::from_is_async(*is_async),
+                            |expression| builder.expression_type(expression),
+                        )
+                    },
+                )
             }
         });
 
@@ -5320,7 +5349,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             env,
                             EvaluationMode::from_is_async(for_stmt.is_async()),
                         )
-                        .map(|tuple| tuple.homogeneous_element_type(db, env))
+                        .map(|tuple| {
+                            let element = tuple.homogeneous_element_type(db, env);
+                            self.snapshot_iterable_element_type(
+                                iterable,
+                                element,
+                                EvaluationMode::from_is_async(for_stmt.is_async()),
+                                |expression| self.expression_type(expression),
+                            )
+                        })
                         .unwrap_or_else(|err| {
                             err.report_diagnostic(&self.context, iterable_type, iterable.into());
                             err.fallback_element_type(db, env)
@@ -8610,7 +8647,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 self.extend_expression_unchecked(result);
             }
 
-            (iterable_type, element_type)
+            (iterable_type, element_type, result)
         };
 
         let target_type = match comprehension.target_kind() {
@@ -8623,7 +8660,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 unpacked.expression_type(target)
             }
             TargetKind::Single => {
-                let (iterable_type, element_type) = infer_iterable_type();
+                let (iterable_type, element_type, result) = infer_iterable_type();
 
                 if let Some(element_type) = element_type {
                     element_type
@@ -8635,7 +8672,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             env,
                             EvaluationMode::from_is_async(comprehension.is_async()),
                         )
-                        .map(|tuple| tuple.homogeneous_element_type(db, env))
+                        .map(|tuple| {
+                            let element = tuple.homogeneous_element_type(db, env);
+                            self.snapshot_iterable_element_type(
+                                iterable,
+                                element,
+                                EvaluationMode::from_is_async(comprehension.is_async()),
+                                |expression| result.expression_type(expression),
+                            )
+                        })
                         .unwrap_or_else(|err| {
                             err.report_diagnostic(&self.context, iterable_type, iterable.into());
                             err.fallback_element_type(db, env)
