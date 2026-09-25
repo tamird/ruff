@@ -429,6 +429,8 @@ struct Candidate<'ast> {
     receiver: &'ast ast::Expr,
     dependencies: Vec<usize>,
     demanded: bool,
+    iteration_target: bool,
+    list_literal: bool,
 }
 
 /// The graph carries only place identity, and is discarded before normal indexing. A demand
@@ -452,6 +454,8 @@ impl<'ast> Candidates<'ast, '_> {
                 receiver,
                 dependencies: Vec::new(),
                 demanded: false,
+                iteration_target: false,
+                list_literal: false,
             });
             next
         });
@@ -549,6 +553,8 @@ impl<'ast> Candidates<'ast, '_> {
                     receiver,
                     dependencies: _,
                     demanded,
+                    iteration_target: _,
+                    list_literal: _,
                 } = candidate;
                 demanded.then_some(receiver)
             })
@@ -562,7 +568,24 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
             return;
         }
         match statement {
+            ast::Stmt::For(for_stmt) => {
+                if for_stmt.iter.is_name_expr()
+                    && let Some(iterable) = self.place(&for_stmt.iter)
+                    && self.nodes[iterable].list_literal
+                    && for_stmt.target.is_name_expr()
+                    && let Some(index) = self.place(&for_stmt.target)
+                {
+                    self.nodes[index].iteration_target = true;
+                }
+            }
             ast::Stmt::Assign(assign) => {
+                if let [target] = assign.targets.as_slice()
+                    && target.is_name_expr()
+                    && assign.value.is_list_expr()
+                    && let Some(index) = self.place(target)
+                {
+                    self.nodes[index].list_literal = true;
+                }
                 for target in &assign.targets {
                     self.assignment(target, &assign.value);
                 }
@@ -617,6 +640,12 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
                     ast::ExprContext::Store | ast::ExprContext::Del
                 ) {
                     self.demand(&subscript.value);
+                } else if subscript.slice.is_string_literal_expr()
+                    && subscript.value.is_name_expr()
+                    && let Some(index) = self.place(&subscript.value)
+                    && self.nodes[index].iteration_target
+                {
+                    self.nodes[index].demanded = true;
                 }
             }
             ast::Expr::Call(call) => {

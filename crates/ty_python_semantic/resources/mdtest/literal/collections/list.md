@@ -132,3 +132,55 @@ class KeywordRows(Protocol):
 # error: [invalid-assignment]
 keyword: KeywordRows = typed
 ```
+
+## Dictionary fields in confined lists
+
+Fresh dictionaries appended to a local list preserve their individual field types when the list and
+its loop variables are used only for production, iteration, truth tests, and literal-key reads. A
+field with conflicting producer values still reports an error at each incompatible use.
+
+```py
+def text(value: str) -> None: ...
+def number(value: int) -> None: ...
+def conflicting_producers(paths: list[str]) -> None:
+    entries = []
+    for path in paths:
+        entries.append({"name": path, "size": len(path)})
+    entries.append({"name": "wrong", "size": "wrong"})
+    for entry in entries:
+        text(entry["name"])
+        number(entry["size"])  # error: [invalid-argument-type]
+    for entry in entries:
+        text(entry["name"])
+        number(entry["size"])  # error: [invalid-argument-type]
+
+def impossible_guard() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    for entry in entries:
+        if isinstance(entry["name"], int):
+            reveal_type(entry["name"])  # revealed: Never
+            text(entry["name"])
+```
+
+A key absent from one producer uses ordinary dictionary inference. Invalid key types retain ordinary
+subscript diagnostics. Mutating a row prevents field observations in later loops.
+
+```py
+def missing_field() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    entries.append({"size": 1})
+    for entry in entries:
+        text(entry["name"])  # error: [invalid-argument-type]
+
+def wrong_key() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    for entry in entries:
+        entry[0]  # error: [invalid-argument-type]
+
+def mutated_row() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    for entry in entries:
+        entry["name"] = 1
+    for entry in entries:
+        text(entry["name"])  # error: [invalid-argument-type]
+```

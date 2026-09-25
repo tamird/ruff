@@ -187,7 +187,7 @@ impl<'db> SemanticModel<'db> {
         Some(definitions)
     }
 
-    fn name_may_reference_definitions(
+    pub(crate) fn name_may_reference_definitions(
         &self,
         name: &ast::ExprName,
         scope: FileScopeId,

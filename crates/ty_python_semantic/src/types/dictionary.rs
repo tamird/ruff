@@ -15,6 +15,19 @@ use crate::types::{KnownClass, ProgramEnvironment, Type, UnionType};
 use crate::{Db, FxIndexMap};
 
 pub(crate) mod contents;
+pub(crate) mod records;
+
+/// Different invariant dictionary specializations still have the same runtime behavior.
+fn is_exact_dict(db: &dyn Db, ty: Type<'_>) -> bool {
+    let is_instance = |ty: Type<'_>| {
+        ty.as_nominal_instance()
+            .is_some_and(|instance| instance.has_known_class(db, KnownClass::Dict))
+    };
+    match ty {
+        Type::Union(union) => union.elements(db).iter().copied().all(is_instance),
+        _ => is_instance(ty),
+    }
+}
 
 /// Publication of contents evidence. An impossible mapping is not an empty mapping, and
 /// must not fall back to the receiver's ordinary type when matching a keyword argument.

@@ -1811,6 +1811,10 @@ pub struct ForStmtDefinitionKind<'db> {
 }
 
 impl<'db> ForStmtDefinitionKind<'db> {
+    pub fn node<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::StmtFor {
+        self.node.node(module)
+    }
+
     pub fn iterable<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::Expr {
         &self.node.node(module).iter
     }

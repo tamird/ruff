@@ -498,6 +498,9 @@ def consume(value: int, enabled: bool = False): ...
 def finite(values: dict[Literal["value"], int]):
     consume(**values)
 
+def separate_domains(values: dict[Literal["value"], int] | dict[str, bool]):
+    consume(**values)
+
 def wrong(values: dict[Literal["value"], str]):
     consume(**values)  # error: [invalid-argument-type]
 
