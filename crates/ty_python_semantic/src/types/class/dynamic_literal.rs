@@ -3,7 +3,7 @@ use ruff_db::{diagnostic::Span, parsed::parsed_module};
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::TextRange;
 
-use crate::provided::{ProvidedField, ProvidedInstanceFields};
+use crate::provided::{ProvidedField, ProvidedFieldImplication, ProvidedInstanceFields};
 use crate::{
     Db, TypeQualifiers,
     place::{Place, PlaceAndQualifiers},
@@ -469,6 +469,7 @@ impl<'db> DynamicClassLiteral<'db> {
         let Some(ProvidedInstanceFields {
             fields,
             has_dynamic_fields,
+            implications: _,
             data: _,
         }) = self.instance_fields(db)
         else {
@@ -602,6 +603,7 @@ impl<'db> DynamicClassLiteral<'db> {
             Some(ProvidedInstanceFields {
                 fields,
                 has_dynamic_fields,
+                implications,
                 data,
             }) => {
                 let fields = fields
@@ -616,9 +618,22 @@ impl<'db> DynamicClassLiteral<'db> {
                         })
                     })
                     .collect::<Option<Box<_>>>()?;
+                let implications = implications
+                    .iter()
+                    .map(|ProvidedFieldImplication { guard, target, ty }| {
+                        let ty = ty.recursive_type_normalized_impl(db, env, div, true);
+                        let ty = if nested { ty? } else { ty.unwrap_or(div) };
+                        Some(ProvidedFieldImplication {
+                            guard: guard.clone(),
+                            target: target.clone(),
+                            ty,
+                        })
+                    })
+                    .collect::<Option<Box<_>>>()?;
                 Some(ProvidedInstanceFields {
                     fields,
                     has_dynamic_fields: *has_dynamic_fields,
+                    implications,
                     data: data.clone(),
                 })
             }

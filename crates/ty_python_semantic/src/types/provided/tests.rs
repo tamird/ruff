@@ -171,6 +171,389 @@ tag: str
     Ok(())
 }
 
+fn field_implication_factory<'db>(
+    db: &'db TestDb,
+    call: &CheckedCall<'_, 'db>,
+) -> Option<Type<'db>> {
+    let declaration = call.declaration()?;
+    if declaration
+        .program_file(db)
+        .file(db)
+        .path(db)
+        .as_system_path()?
+        .as_str()
+        != "/src/native.pyi"
+    {
+        return None;
+    }
+    let name = declaration.name(db)?;
+    if !matches!(name.as_str(), "record" | "related") {
+        return None;
+    }
+    let fields = call.dictionary_argument("fields")?;
+    if !fields.is_complete() || !fields.items.iter().all(DictionaryItem::is_required) {
+        return None;
+    }
+    let DictionaryItems {
+        items,
+        extra_items: _,
+    } = fields;
+    let fields = items
+        .into_iter()
+        .map(
+            |DictionaryItem {
+                 name,
+                 ty,
+                 source: _,
+                 kind: _,
+             }| {
+                ProvidedField {
+                    name,
+                    ty,
+                    source: None,
+                }
+            },
+        )
+        .collect();
+    let env = ProgramEnvironment::from_file(call.file());
+    let bases = match call.argument("base") {
+        CheckedArgument::Omitted => Box::default(),
+        CheckedArgument::Value { ty, expression: _ } => Box::from([ty]),
+        CheckedArgument::Indeterminate => return None,
+    };
+    let implications = if name == "related" {
+        let restriction = match call.argument("restriction") {
+            CheckedArgument::Omitted => KnownClass::Str.to_instance(db, &env),
+            CheckedArgument::Value { ty, expression: _ } => {
+                ty.to_instance_approximation(db, &env)?
+            }
+            CheckedArgument::Indeterminate => return None,
+        };
+        let first = match call.argument("key") {
+            CheckedArgument::Omitted => "first",
+            CheckedArgument::Value { ty, expression: _ } => ty.string_literal_value(db)?,
+            CheckedArgument::Indeterminate => return None,
+        };
+        [first, "second"]
+            .map(|key| ProvidedFieldImplication {
+                guard: Box::from([Name::new("guard"), Name::new(key)]),
+                target: Box::from([Name::new("target"), Name::new(key)]),
+                ty: restriction,
+            })
+            .into()
+    } else {
+        Box::default()
+    };
+    call.class_type(
+        db,
+        ProvidedClass {
+            name: Name::new(name),
+            bases,
+            class_members: Box::default(),
+            instance_fields: ProvidedInstanceFields {
+                fields,
+                has_dynamic_fields: false,
+                implications,
+                data: None,
+            },
+        },
+    )
+    .to_instance_approximation(db, &env)
+}
+
+const FIELD_IMPLICATION_DECLARATIONS: &str = "\
+from typing import Any
+def record(fields: dict[str, object], base: type = object) -> Any: ...
+def related(fields: dict[str, object], restriction: type = str, key: str = 'first', base: type = object) -> Any: ...
+flag: bool
+optional: int | str | None
+";
+
+const FIELD_IMPLICATION_SETUP: &str = "\
+from native import record, related, flag, optional
+guard = record({'first': flag, 'second': flag, 'other': flag})
+target = record({'first': optional, 'second': optional, 'other': optional})
+ctx = related({'guard': guard, 'target': target})
+other = record({'guard': guard, 'target': target})
+";
+
+#[test]
+fn supplied_field_implications_share_root_narrowing() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(field_implication_factory)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (body, expected) in [
+        (
+            "if ctx.guard.first:\n    result = ctx.target.first\n",
+            "str",
+        ),
+        (
+            "result = ctx.target.first if ctx.guard.first else ''\n",
+            "str",
+        ),
+        (
+            "if ctx.guard.first and ctx.guard.second:\n    result = (ctx.target.first, ctx.target.second)\n",
+            "tuple[str, str]",
+        ),
+        (
+            "if ctx.guard.first:\n    if ctx.guard.second:\n        result = (ctx.target.first, ctx.target.second)\n",
+            "tuple[str, str]",
+        ),
+        (
+            "if ctx.guard.first:\n    result = ctx.target.other\n",
+            "int | str | None",
+        ),
+        (
+            "if not ctx.guard.first:\n    result = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "if ctx.guard.first:\n    pass\nresult = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "if ctx.guard.first:\n    ctx = other\n    result = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "saved = bool(ctx.guard.first)\nif saved:\n    result = ctx.target.first\n",
+            "str",
+        ),
+        (
+            "saved = bool(ctx.guard.first)\nctx = other\nif saved:\n    result = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "ctx = ctx if flag else other\nif ctx.guard.first:\n    result = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "for ctx in (ctx, other):\n    if ctx.guard.first:\n        result = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "while flag:\n    if ctx.guard.first:\n        result = ctx.target.first\n    ctx = other\n",
+            "int | str | None",
+        ),
+    ] {
+        let source = format!("{FIELD_IMPLICATION_SETUP}{body}");
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{body}: {diagnostics:#?}");
+        let program_file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program_file);
+        let result = crate::place::global_symbol(&db, program_file, "result")
+            .place
+            .expect_type();
+        assert_eq!(result.display(&db, &env).to_string(), expected, "{body}");
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_require_storage() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(field_implication_factory)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (definition, receiver, expected) in [
+        (
+            "class Base:\n    @property\n    def first(self) -> bool: return True\n",
+            "guard = record({'first': flag}, base=Base)",
+            "int | str | None",
+        ),
+        (
+            "class Base:\n    @property\n    def first(self) -> int | str | None: return None\n",
+            "target = record({'first': optional}, base=Base)",
+            "int | str | None",
+        ),
+        (
+            "class Base:\n    def __getattribute__(self, name: str) -> object: return object()\n",
+            "guard = record({'first': flag}, base=Base)",
+            "int | str | None",
+        ),
+        (
+            "class Base:\n    first = property(lambda self: True) if flag else False\n",
+            "guard = record({'first': flag}, base=Base)",
+            "int | str | None",
+        ),
+        (
+            "class Base:\n    first = False\n",
+            "guard = record({'first': flag}, base=Base)",
+            "str",
+        ),
+        (
+            "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> bool: return True\nclass Base:\n    first = Descriptor()\n",
+            "guard = record({'first': flag}, base=Base)",
+            "str",
+        ),
+        (
+            "class Mutable:\n    first: bool = False\n",
+            "guard = Mutable()",
+            "int | str | None",
+        ),
+        (
+            "class Mutable:\n    first: bool = False\n",
+            "guard = guard if flag else Mutable()",
+            "int | str | None",
+        ),
+    ] {
+        let source = format!(
+            "{FIELD_IMPLICATION_SETUP}{definition}{receiver}\nctx = related({{'guard': guard, 'target': target}})\nif ctx.guard.first:\n    result = ctx.target.first\n"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let program_file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program_file);
+        let result = crate::place::global_symbol(&db, program_file, "result")
+            .place
+            .expect_type();
+        assert_eq!(result.display(&db, &env).to_string(), expected, "{source}");
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_invalidate_with_declarations() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(field_implication_factory)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (declaration, expected) in [
+        ("related({'guard': guard, 'target': target})", "str"),
+        (
+            "record({'guard': guard, 'target': target})",
+            "int | str | None",
+        ),
+        (
+            "related({'guard': guard, 'target': target}, restriction=int)",
+            "int",
+        ),
+        (
+            "related({'guard': guard, 'target': target}, key='other')",
+            "int | str | None",
+        ),
+        ("related({'guard': guard, 'target': target})", "str"),
+    ] {
+        let source = format!(
+            "{FIELD_IMPLICATION_SETUP}ctx = {declaration}\nif ctx.guard.first:\n    result = ctx.target.first\n"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let program_file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program_file);
+        let result = crate::place::global_symbol(&db, program_file, "result")
+            .place
+            .expect_type();
+        assert_eq!(result.display(&db, &env).to_string(), expected, "{source}");
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_keep_invalid_write_diagnostics() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(field_implication_factory)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for assignment in [
+        "ctx.guard = guard",
+        "ctx.target = target",
+        "ctx.target.first = 1",
+        "del ctx.guard",
+        "del ctx.target",
+    ] {
+        for condition in ["flag", "ctx.guard.first"] {
+            let source = format!(
+                "{FIELD_IMPLICATION_SETUP}if {condition}:\n    {assignment}\n    result = ctx.target.first\n"
+            );
+            db.write_file("/src/main.py", &source)?;
+            let diagnostics = db.check_file(file);
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+            assert_eq!(diagnostics[0].id().as_str(), "invalid-assignment");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_normalize_recursive_metadata() -> anyhow::Result<()> {
+    let source = "\
+from native import record, related, flag
+def requires_string(value: str) -> None: pass
+guard = record({'first': flag, 'second': flag})
+target = record({'first': object(), 'second': object()})
+ctx = related({'guard': guard, 'target': target})
+while flag:
+    ctx = related({'guard': guard, 'target': target}, restriction=type(ctx))
+    guard_value = ctx.guard.first
+    if ctx.guard.first:
+        result = ctx.target.first
+        requires_string(result)
+";
+    let db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(field_implication_factory)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+    let program_file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program_file);
+    let result = crate::place::global_symbol(&db, program_file, "result")
+        .place
+        .expect_type();
+    let guard = crate::place::global_symbol(&db, program_file, "guard_value")
+        .place
+        .expect_type();
+    assert_eq!(guard.display(&db, &env).to_string(), "bool");
+    assert_eq!(result.display(&db, &env).to_string(), "object");
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_retain_nominal_and_call_behavior() -> anyhow::Result<()> {
+    let source = format!(
+        "{FIELD_IMPLICATION_SETUP}\
+class Base: pass
+def accept_base(value: Base) -> None: pass
+def accept_string(value: str) -> None: pass
+def use() -> None:
+    replacement = related({{'guard': guard, 'target': target}}, base=Base)
+    ctx = related({{'guard': guard, 'target': target}}, base=Base)
+    def reset() -> None:
+        nonlocal ctx
+        ctx = replacement
+    if ctx.guard.first:
+        accept_base(ctx)
+        reset()
+        accept_string(ctx.target.first)
+"
+    );
+    let db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", &source)
+        .with_call_result_provider(field_implication_factory)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
 #[test]
 fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
     fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
@@ -417,6 +800,7 @@ fn factory_result<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<T
                     source: None,
                 }]),
                 has_dynamic_fields: false,
+                implications: Box::default(),
                 data: Some(ProvidedData::new(Name::new("native record"))),
             },
         },
@@ -459,6 +843,7 @@ fn source_call_class_matches_factory_result_identity() -> anyhow::Result<()> {
                         source: None,
                     }]),
                     has_dynamic_fields: false,
+                    implications: Box::default(),
                     data: Some(ProvidedData::new(Name::new("native record"))),
                 },
             },
@@ -501,6 +886,7 @@ fn supplied_instance_storage_shadows_inherited_defaults_but_not_data_descriptors
                 instance_fields: ProvidedInstanceFields {
                     fields,
                     has_dynamic_fields: name == "make_open",
+                    implications: Box::default(),
                     data: None,
                 },
             },
@@ -647,6 +1033,7 @@ fn supplied_declarations_preserve_keyword_and_attribute_navigation() -> anyhow::
                         source: (name == "make").then_some(source),
                     }]),
                     has_dynamic_fields: false,
+                    implications: Box::default(),
                     data: None,
                 },
             },
@@ -779,6 +1166,7 @@ Derived(1)
                                 source: Some(source),
                             }]),
                             has_dynamic_fields: false,
+                            implications: Box::default(),
                             data: None,
                         },
                     },

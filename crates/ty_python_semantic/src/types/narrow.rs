@@ -1879,6 +1879,10 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             ast::Expr::Attribute(attribute) => {
                 let constraints = self.evaluate_simple_expr(expression_node, is_positive);
                 let inference = infer_expression_types(db, expression, TypeContext::default());
+                if inference.is_provisional() {
+                    self.is_provisional = true;
+                    return None;
+                }
                 let nominal_constraints = self
                     .narrow_nominal_attribute_by_truthiness(
                         inference.expression_type(&*attribute.value),
@@ -1890,7 +1894,33 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                         NarrowingConstraints::from_iter([(place, constraint)])
                     });
 
-                Self::merge_optional_constraints_and(constraints, nominal_constraints)
+                let mut constraints =
+                    Self::merge_optional_constraints_and(constraints, nominal_constraints);
+                if is_positive {
+                    let mut reversed_guard = SmallVec::<[&str; 4]>::new();
+                    let mut ancestor = expression_node;
+                    while let ast::Expr::Attribute(attribute) = ancestor {
+                        reversed_guard.push(attribute.attr.as_str());
+                        ancestor = &attribute.value;
+                        let Some(place) = PlaceExpr::try_from_expr(ancestor) else {
+                            break;
+                        };
+                        if let Some(narrowed) = inference
+                            .expression_type(ancestor)
+                            .with_truthy_field_implications(db, &self.env, &reversed_guard)
+                        {
+                            let implication = NarrowingConstraints::from_iter([(
+                                self.expect_place(&place),
+                                NarrowingConstraint::intersection(narrowed),
+                            )]);
+                            constraints = Self::merge_optional_constraints_and(
+                                constraints,
+                                Some(implication),
+                            );
+                        }
+                    }
+                }
+                constraints
             }
             ast::Expr::Subscript(subscript) => {
                 let constraints = self.evaluate_simple_expr(expression_node, is_positive);
