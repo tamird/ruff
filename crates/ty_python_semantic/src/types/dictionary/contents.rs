@@ -32,7 +32,7 @@ use super::{
 /// A cycle seed, unreachable control flow, missing history, and an inhabited mapping are
 /// distinct. In particular, neither missing history nor a pending cycle proves an empty map.
 #[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
-enum ContentsValue<'db> {
+pub(super) enum ContentsValue<'db> {
     Pending,
     Unreachable,
     Unavailable,
@@ -40,14 +40,14 @@ enum ContentsValue<'db> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
-struct MappingContents<'db> {
+pub(super) struct MappingContents<'db> {
     /// All ranges belong to this file. Copying from another file rebases them to the local use.
-    file: ProgramFile<'db>,
-    dictionary: DictionaryItems<'db>,
+    pub(super) file: ProgramFile<'db>,
+    pub(super) dictionary: DictionaryItems<'db>,
     /// Other code can retain this object. Later writes refine values but cannot prove presence.
-    exposed: bool,
+    pub(super) exposed: bool,
     /// The ordinary mapping value bound for declared or external/member bindings survives exposure.
-    value_bound: Option<Type<'db>>,
+    pub(super) value_bound: Option<Type<'db>>,
 }
 
 impl<'db> MappingContents<'db> {
@@ -155,7 +155,12 @@ impl<'db> MappingContents<'db> {
         }
     }
 
-    fn join(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>, other: &Self) -> Self {
+    pub(super) fn join(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        other: &Self,
+    ) -> Self {
         let Self {
             file,
             dictionary,
@@ -245,7 +250,7 @@ impl<'db> ContentsValue<'db> {
         }
     }
 
-    fn cycle_normalized(
+    pub(super) fn cycle_normalized(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -463,16 +468,24 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         return ContentsValue::Pending;
     }
     let bound_type = inference.binding_type(definition);
-    if !bound_type
-        .as_nominal_instance()
-        .is_some_and(|instance| instance.has_known_class(db, KnownClass::Dict))
-    {
+    if !super::is_exact_dict(db, bound_type) {
         return ContentsValue::Unavailable;
     }
     let index = semantic_index(db, file);
     let place = index
         .place_table(scope.file_scope_id(db))
         .place(definition.place(db));
+    if !place.is_declared() && matches!(definition.kind(db), DefinitionKind::For(_)) {
+        match super::records::for_target(db, definition) {
+            ContentsValue::Unavailable => {}
+            contents => return contents,
+        }
+    }
+    // Ordinary dictionary bounds retain their per-alternative key domains. A union of
+    // invariant dictionaries is admitted only by the proved record seed above.
+    if bound_type.as_nominal_instance().is_none() {
+        return ContentsValue::Unavailable;
+    }
     let (owner, value, shared) = match definition.kind(db) {
         DefinitionKind::DictKeyAssignment(assignment) => (
             assignment.assignment(),
@@ -1065,9 +1078,13 @@ pub(super) fn at_snapshot<'db>(
     reachability: &ReachabilityEvaluationCache<'db>,
 ) -> DictionaryObservation<'db> {
     let observed = (|| {
-        if !argument_type
-            .as_nominal_instance()?
-            .has_known_class(db, KnownClass::Dict)
+        if !super::is_exact_dict(db, argument_type) {
+            return None;
+        }
+        // Only a proved For seed can observe an invariant dictionary union. Ordinary
+        // assignment and capture unions retain their existing argument-matching fallback.
+        if argument_type.as_nominal_instance().is_none()
+            && super::records::for_binding(db, scope, expression).is_none()
         {
             return None;
         }

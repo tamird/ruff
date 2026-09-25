@@ -29,10 +29,10 @@ use crate::types::typed_dict::{
 use crate::types::typevar::{BindingContext, TypeVarSet};
 use crate::types::{
     BoundTypeVarInstance, CallArguments, CallDunderError, CallableBinding, CycleDetector,
-    DisplaySettings, DynamicType, InternedType, KnownClass, KnownInstanceType, LintDiagnosticGuard,
-    MemberLookupPolicy, Parameter, Parameters, SpecialFormType, StaticClassLiteral, Type,
-    TypeAliasType, TypeAndQualifiers, TypeContext, TypeMapping, TypeVarBoundOrConstraints,
-    UnionType, UnionTypeInstance, any_over_type, todo_type,
+    DisplaySettings, DynamicType, InternedType, IntersectionType, KnownClass, KnownInstanceType,
+    LintDiagnosticGuard, MemberLookupPolicy, Parameter, Parameters, SpecialFormType,
+    StaticClassLiteral, Type, TypeAliasType, TypeAndQualifiers, TypeContext, TypeMapping,
+    TypeVarBoundOrConstraints, UnionType, UnionTypeInstance, any_over_type, todo_type,
 };
 use crate::{Db, FxOrderSet, ProgramEnvironment};
 use ty_python_core::definition::Definition;
@@ -222,6 +222,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // (to store the expression type and to report errors).
                     let slice_ty =
                         self.infer_maybe_standalone_expression(slice, TypeContext::default());
+                    let observed = crate::types::dictionary::records::item_type(
+                        db,
+                        self.scope(),
+                        subscript,
+                        value_ty,
+                        self.reachability_cache(),
+                    );
+                    let ty = observed.map_or(ty, |observed| {
+                        IntersectionType::from_two_elements(db, env, ty, observed)
+                    });
                     return self
                         .infer_subscript_expression_types(
                             subscript,
@@ -486,8 +496,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let slice_ty = self.infer_maybe_standalone_expression(slice, TypeContext::default());
-        self.infer_subscript_expression_types(subscript, value_ty, slice_ty, ExprContext::Load)
-            .map(|ty| self.narrow_expr_with_applicable_constraints(subscript, ty, &constraint_keys))
+        let checked =
+            self.infer_subscript_expression_types(subscript, value_ty, slice_ty, ExprContext::Load);
+        let observed = crate::types::dictionary::records::item_type(
+            db,
+            self.scope(),
+            subscript,
+            value_ty,
+            self.reachability_cache(),
+        );
+        checked
+            .map(|ty| {
+                self.narrow_expr_with_applicable_constraints(
+                    subscript,
+                    observed.map_or(ty, |observed| {
+                        IntersectionType::from_two_elements(db, env, ty, observed)
+                    }),
+                    &constraint_keys,
+                )
+            })
             .map_err(|recovery_ty| {
                 self.narrow_expr_with_applicable_constraints(
                     subscript,
