@@ -675,10 +675,14 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
         match expr {
             // Simple expressions that directly narrow a place.
             ast::Expr::Name(_) => self.simple_expr(expr),
-            // Attribute truthiness can also narrow its base (nominal tagged unions).
-            ast::Expr::Attribute(attribute) => {
+            // Attribute truthiness can narrow its base and supplied immutable ancestors.
+            ast::Expr::Attribute(_) => {
                 let mut places = self.simple_expr(expr);
-                places.extend(self.simple_expr(&attribute.value));
+                let mut ancestor = expr;
+                while let ast::Expr::Attribute(attribute) = ancestor {
+                    ancestor = &attribute.value;
+                    places.extend(self.simple_expr(ancestor));
+                }
                 places
             }
             // Subscript truthiness can also narrow its base (`TypedDict` tagged unions).

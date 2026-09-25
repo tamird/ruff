@@ -12,10 +12,11 @@ use ty_python_core::semantic_index;
 
 use crate::Db;
 use crate::ProgramEnvironment;
+use crate::place::{Place, PlaceAndQualifiers};
 use crate::types::CheckedCall;
 use crate::types::ClassLiteral;
-use crate::types::Type;
 use crate::types::class::{DynamicClassAnchor, DynamicClassLiteral, DynamicClassScopeOffset};
+use crate::types::{IntersectionBuilder, MemberLookupPolicy, Type, TypeQualifiers};
 
 mod data;
 pub use data::ProvidedData;
@@ -33,7 +34,20 @@ pub struct ProvidedReturnType<'db> {
 pub struct ProvidedInstanceFields<'db> {
     pub fields: Box<[ProvidedField<'db>]>,
     pub has_dynamic_fields: bool,
+    pub implications: Box<[ProvidedFieldImplication<'db>]>,
     pub data: Option<ProvidedData>,
+}
+
+/// A relation between immutable stored fields on the same supplied instance.
+///
+/// If the relative attribute path `guard` is truthy, `target` satisfies `ty`. Both paths
+/// must be nonempty and traverse guaranteed immutable storage. A false guard supplies no
+/// inverse relation. The embedding application guarantees the relation at runtime.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub struct ProvidedFieldImplication<'db> {
+    pub guard: Box<[Name]>,
+    pub target: Box<[Name]>,
+    pub ty: Type<'db>,
 }
 
 /// A stored instance field and the source declaration that defines it, when available.
@@ -150,6 +164,138 @@ impl<'db> CheckedCall<'_, 'db> {
 }
 
 impl<'db> Type<'db> {
+    /// Apply supplied positive field relations while retaining every unproved union arm.
+    pub(super) fn with_truthy_field_implications(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        reversed_guard: &[&str],
+    ) -> Option<Self> {
+        let mut result = self;
+        match self {
+            Self::Union(union) => {
+                result = union.map(db, env, |arm| {
+                    arm.with_truthy_field_implications(db, env, reversed_guard)
+                        .unwrap_or(*arm)
+                });
+            }
+            Self::Intersection(intersection) => {
+                for owner in intersection.positive(db) {
+                    result =
+                        result.with_nominal_field_implications(db, env, *owner, reversed_guard);
+                }
+            }
+            Self::NominalInstance(_) => {
+                result = self.with_nominal_field_implications(db, env, self, reversed_guard);
+            }
+            _ => {}
+        }
+        (result != self).then_some(result)
+    }
+
+    fn with_nominal_field_implications(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        owner: Self,
+        reversed_guard: &[&str],
+    ) -> Self {
+        let Self::NominalInstance(instance) = owner else {
+            return self;
+        };
+        let ClassLiteral::Dynamic(class) = instance.class_literal(db, env) else {
+            return self;
+        };
+        let Some(ProvidedInstanceFields {
+            fields: _,
+            has_dynamic_fields: _,
+            implications,
+            data: _,
+        }) = class.instance_fields(db)
+        else {
+            return self;
+        };
+        let mut result = self;
+        for ProvidedFieldImplication { guard, target, ty } in implications {
+            if !guard
+                .iter()
+                .rev()
+                .map(Name::as_str)
+                .eq(reversed_guard.iter().copied())
+                || !owner.has_immutable_field_path(db, env, guard)
+                || !owner.has_immutable_field_path(db, env, target)
+            {
+                continue;
+            }
+            // A completed query can retain unresolved cycle markers in its restriction.
+            // Recursively expanding aliases also lack the finite proof used here.
+            if crate::types::visitor::any_over_type_expanding_aliases(db, env, *ty, |nested| {
+                matches!(nested, Self::Divergent(_))
+            }) {
+                continue;
+            }
+            let mut restriction = *ty;
+            for name in target.iter().rev() {
+                restriction =
+                    Self::protocol_with_readonly_members(db, env, [(name.as_str(), restriction)]);
+            }
+            result = IntersectionBuilder::new(db, env)
+                .positive_elements([result, restriction])
+                .build();
+        }
+        result
+    }
+
+    fn has_immutable_field_path(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        path: &[Name],
+    ) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        let mut receiver = self;
+        for name in path {
+            receiver = receiver.resolve_type_alias(db);
+            // Qualifiers on joined alternatives do not prove storage for every alternative.
+            if !receiver.is_nominal_instance() {
+                return false;
+            }
+            let PlaceAndQualifiers { place, qualifiers } = receiver.instance_member(db, env, name);
+            let Place::Defined(storage) = place else {
+                return false;
+            };
+            if !storage.is_definitely_defined()
+                || !qualifiers
+                    .contains(TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE)
+            {
+                return false;
+            }
+            // The storage flag is consumed by descriptor lookup. Validate its precedence here,
+            // using the same class-side lookup and descriptor classifier as ordinary access.
+            if let Some(class_member) = receiver
+                .class_member(db, env, name)
+                .place
+                .ignore_possibly_undefined()
+                && !class_member.is_definitely_non_data_descriptor(db, env)
+            {
+                return false;
+            }
+            let policy = MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK
+                | MemberLookupPolicy::META_CLASS_NO_TYPE_FALLBACK;
+            if !receiver
+                .class_member_with_policy(db, env, "__getattribute__", policy)
+                .place
+                .is_undefined()
+            {
+                return false;
+            }
+            receiver = storage.ty;
+        }
+        true
+    }
+
     /// Attaches immutable application data to a synthesized callable.
     /// Returns `None` for types that are not represented by callable signatures.
     ///
