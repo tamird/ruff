@@ -350,6 +350,42 @@ impl<'db> DictionaryItems<'db> {
         Ok(dictionary.finish())
     }
 
+    /// Retain declared keys and their presence while preserving unknown hidden fields.
+    pub(crate) fn from_typed_dict(unpacked: UnpackedTypedDict<'db>, source: TextRange) -> Self {
+        let UnpackedTypedDict {
+            keys,
+            openness,
+            has_implicit_extra_items,
+        } = unpacked;
+        Self {
+            items: keys
+                .into_iter()
+                .map(|(name, key)| {
+                    let UnpackedTypedDictKey {
+                        value_ty,
+                        kind,
+                        definition: _,
+                    } = key;
+                    DictionaryItem {
+                        name,
+                        ty: value_ty,
+                        kind,
+                        source,
+                    }
+                })
+                .collect(),
+            extra_items: if has_implicit_extra_items {
+                DictionaryExtraItems::Value(Type::unknown())
+            } else {
+                openness
+                    .effective_extra_items()
+                    .map_or(DictionaryExtraItems::Closed, |extra| {
+                        DictionaryExtraItems::Value(extra.declared_ty)
+                    })
+            },
+        }
+    }
+
     /// Read an unpacked source's existing type without inferring its expression again.
     fn unpacked(
         db: &'db dyn Db,
@@ -362,39 +398,12 @@ impl<'db> DictionaryItems<'db> {
             return None;
         }
         if let Some(unpacked) = extract_unpacked_typed_dict_from_value_type(db, env, ty) {
-            let UnpackedTypedDict {
-                keys,
-                openness,
-                has_implicit_extra_items,
-            } = unpacked;
             // Hidden TypedDict fields follow a different call policy from ordinary mapping
             // values. Preserve the existing literal inference until that provenance is retained.
-            if has_implicit_extra_items {
+            if unpacked.has_implicit_extra_items {
                 return None;
             }
-            return Some(Self {
-                items: keys
-                    .into_iter()
-                    .map(|(name, key)| {
-                        let UnpackedTypedDictKey {
-                            value_ty,
-                            kind,
-                            definition: _,
-                        } = key;
-                        DictionaryItem {
-                            name,
-                            ty: value_ty,
-                            kind,
-                            source,
-                        }
-                    })
-                    .collect(),
-                extra_items: openness
-                    .effective_extra_items()
-                    .map_or(DictionaryExtraItems::Closed, |extra| {
-                        DictionaryExtraItems::Value(extra.declared_ty)
-                    }),
-            });
+            return Some(Self::from_typed_dict(unpacked, source));
         }
         let (key_ty, value_ty) = ty.unpack_keys_and_items(db, env)?;
         let str_ty = KnownClass::Str.to_instance(db, env);

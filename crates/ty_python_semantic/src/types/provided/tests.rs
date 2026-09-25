@@ -192,7 +192,7 @@ fn field_implication_factory<'db>(
     if !matches!(name.as_str(), "record" | "related") {
         return None;
     }
-    let fields = call.dictionary_argument("fields")?;
+    let fields = call.dictionary_argument(db, "fields")?;
     if !fields.is_complete() || !fields.items.iter().all(DictionaryItem::is_required) {
         return None;
     }
@@ -693,9 +693,16 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         if call.declaration()?.name(db)?.as_str() != "observe" {
             return None;
         }
-        let Some(entries) = call.dictionary_argument("value") else {
+        let Some(entries) = call.dictionary_argument(db, "value") else {
             return Some(Type::string_literal(db, "unavailable"));
         };
+        let CheckedArgument::Value { ty: _, expression } = call.argument("value") else {
+            panic!("one dictionary argument");
+        };
+        assert_eq!(
+            Some(entries.clone()),
+            call.dictionary_items(db, expression.unwrap())
+        );
         Some(describe(db, call.file(), entries))
     }
 
@@ -814,6 +821,14 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         (
             "values = {'x': 1}\nresult = observe({**values})",
             "complete; x: Literal[1] at 'x'",
+        ),
+        (
+            "from typing_extensions import TypedDict, NotRequired\nclass Row(TypedDict):\n    required: int\n    optional: NotRequired[str]\ndef make() -> Row: return {'required': 1}\nresult = observe(make())",
+            "extra: Unknown; optional?: str at make(); required: int at make()",
+        ),
+        (
+            "from typing_extensions import TypedDict, NotRequired\nclass Row(TypedDict, closed=True):\n    required: int\n    optional: NotRequired[str]\ndef make() -> Row: return {'required': 1}\nresult = observe(make())",
+            "complete; optional?: str at make(); required: int at make()",
         ),
         ("result = observe(1)", "unavailable"),
     ] {
