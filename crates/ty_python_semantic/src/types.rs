@@ -140,10 +140,7 @@ mod attribute_write;
 mod bool;
 mod bound_super;
 mod call;
-pub use call::{
-    CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryItem, DictionaryItemKind,
-    DictionaryItems,
-};
+pub use call::{CheckedArgument, CheckedCall};
 mod callable;
 mod class;
 mod class_base;
@@ -153,6 +150,8 @@ mod context_manager;
 mod cyclic;
 mod dedicated;
 mod diagnostic;
+pub(crate) mod dictionary;
+pub use dictionary::{DictionaryExtraItems, DictionaryItem, DictionaryItemKind, DictionaryItems};
 mod display;
 mod enums;
 mod equality;
