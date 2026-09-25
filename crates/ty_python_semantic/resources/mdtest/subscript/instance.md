@@ -204,6 +204,42 @@ error[not-subscriptable]: Cannot subscript object of type `NotSubscriptable` wit
   |     ^^^^^^^^^^^^^^^^^^^^^
 ```
 
+## Missing methods with union keys
+
+A missing subscript method is reported once for each receiver type, regardless of how many key
+alternatives are checked. Separate expressions and key-specific failures retain their diagnostics.
+
+```py
+from typing import Literal
+
+class Missing: ...
+
+class Present:
+    def __getitem__(self, key: int) -> str:
+        return ""
+
+def missing(value: None, key: int | str):
+    value[key]  # error: [not-subscriptable]
+    value[key]  # error: [not-subscriptable]
+
+def distinct_receivers(value: Missing | None, key: int | str):
+    # error: [not-subscriptable] "object of type `Missing`"
+    # error: [not-subscriptable] "object of type `None`"
+    value[key]
+
+def class_method(key: int | str):
+    Missing[key]  # error: [not-subscriptable] "no `__class_getitem__` method"
+
+def recovery(value: Present | None, key: Literal[0, 1]):
+    # error: [not-subscriptable]
+    reveal_type(value[key])  # revealed: str | Unknown
+
+def invalid_keys(value: Present, key: str | bytes):
+    # error: [invalid-argument-type] "key of type `str`"
+    # error: [invalid-argument-type] "key of type `bytes`"
+    value[key]
+```
+
 ## `__getitem__` not callable
 
 ```py
