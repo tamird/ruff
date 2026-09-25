@@ -37,6 +37,133 @@ def invalid_keys(values: dict[int, int]):
     strings(**{**values, "value": "ok"})  # error: [invalid-argument-type]
 ```
 
+## Dictionary constructor copies
+
+Immediate calls to the builtin `dict` retain mapping entries and keyword values. Keywords replace
+values from a positional mapping. Aliases and qualified references to the builtin behave the same.
+
+```py
+import builtins
+
+copy = dict
+
+def consume(value: int, note: str = ""): ...
+
+consume(**dict(value=1, note="ok"))
+consume(**dict({"value": "replaced"}, value=1))
+consume(**copy({"value": 1}, note="ok"))
+consume(**builtins.dict(value=1))
+consume(**dict(dict(value=1), note="ok"))
+consume(**{**dict(value=1), "note": "ok"})
+consume(**dict())  # error: [missing-argument]
+consume(**dict(value="bad"))  # error: [invalid-argument-type]
+consume(**dict(value=1, extra=0))  # error: [unknown-argument]
+```
+
+Keyword sources follow call semantics: if another keyword pack supplies an already required name,
+the constructor raises instead of replacing that value. Dictionary literal spreads allow such
+replacement.
+
+```py
+from typing import Any
+
+def integer(value: int, **other: object): ...
+def sources(strings: dict[str, str], unknown: Any):
+    integer(**dict(value=1, **strings))
+    integer(**dict(**strings, value=1))
+    integer(**dict({"value": "replaced"}, value=1, **strings))
+    integer(**dict({"value": 1}, **strings))  # error: [invalid-argument-type]
+    integer(**{"value": 1, **strings})  # error: [invalid-argument-type]
+    integer(**dict(value="bad", **unknown))  # error: [invalid-argument-type]
+    integer(**dict(**unknown, value="bad"))  # error: [invalid-argument-type]
+    integer(**dict(value="bad", **strings))  # error: [invalid-argument-type]
+```
+
+## Optional constructor keywords
+
+An optional named key may be absent, allowing another keyword source to supply its value. Required
+keys exclude those alternatives on successful calls. A per-name restriction has no named-key
+presence evidence, but still limits values supplied for that key.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing_extensions import Never, NotRequired, TypedDict
+
+class OptionalNote(TypedDict, closed=True):
+    note: NotRequired[str]
+
+class RequiredNote(TypedDict, closed=True):
+    note: str
+
+class ExceptGhost(TypedDict, extra_items=str):
+    ghost: NotRequired[Never]
+
+def note_string(note: str = "", **other: object): ...
+def ghost_int(ghost: int = 0, **other: object): ...
+def ghost_str(ghost: str = "", **other: object): ...
+def all_ints(**other: int): ...
+def combine(optional: OptionalNote, required: RequiredNote, absent: ExceptGhost, integers: dict[str, int]):
+    note_string(**dict(**optional, **integers))  # error: [invalid-argument-type]
+    note_string(**dict(**integers, **optional))  # error: [invalid-argument-type]
+    note_string(**dict(**required, **integers))
+    note_string(**dict(**integers, **required))
+    note_string(**dict(required, **integers))  # error: [invalid-argument-type]
+    ghost_int(**dict(**absent, **integers))
+    ghost_int(**dict(**integers, **absent))
+    ghost_str(**dict(**absent, **integers))  # error: [invalid-argument-type]
+    ghost_str(**dict(**integers, **absent))  # error: [invalid-argument-type]
+    all_ints(**dict(**absent, **integers))  # error: [invalid-argument-type]
+    ghost_str(**dict(**absent))
+    ghost_int(**dict(**absent, ghost=1))
+    ghost_int(**dict(ghost=1, **absent))
+    ghost_int(**dict(**absent, **{"ghost": 1}))
+```
+
+## Constructor observation fallback
+
+Other callables returning dictionaries keep their declared value types. Unsupported constructor
+forms retain ordinary inference, including when nested inside literal spreads.
+
+```py
+from typing import Any
+from typing_extensions import TypedDict
+
+def consume(value: int): ...
+def counterfeit(**kwargs: object) -> dict[str, str]:
+    return {"value": "bad"}
+
+class Custom(dict[str, str]): ...
+
+def shadow(dict: Any):
+    consume(**dict(value="bad"))
+
+def not_builtin():
+    dict = counterfeit
+    consume(**dict(value=1))  # error: [invalid-argument-type]
+    consume(**Custom(value="bad"))  # error: [invalid-argument-type]
+
+class Open(TypedDict):
+    value: int
+
+def unsupported(source: Open, pairs: list[tuple[str, int]], args: tuple[dict[str, int]], bad_keys: dict[int, int]):
+    consume(**dict(source))  # error: [invalid-argument-type]
+    consume(**{**dict(source), "value": 1})
+    consume(**{**dict(source), "value": "bad"})  # error: [invalid-argument-type]
+    consume(**{**dict(pairs), "value": 1})
+    consume(**{**dict(pairs), "value": "bad"})  # error: [invalid-argument-type]
+    consume(**dict(*args))
+    consume(**dict(bad_keys))  # error: [invalid-argument-type]
+    consume(**dict(1))  # error: [no-matching-overload]
+    consume(**dict({}, {}))  # error: [no-matching-overload]
+    # Colliding keywords decline the inventory rather than certifying the last value.
+    consume(**dict(value="bad", **{"value": 1}))  # error: [invalid-argument-type]
+    consume(**{**dict(value=1, **{"value": 2}), "value": 1})
+```
+
 ## TypedDict spreads
 
 Required fields overwrite prior values. Optional fields can preserve an earlier value, including one

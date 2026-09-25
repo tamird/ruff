@@ -9,7 +9,7 @@ use ty_python_core::definition::{BindingsOwner, Definition, DefinitionKind};
 use ty_python_core::scope::{ScopeId, ScopeKind};
 use ty_python_core::semantic_index;
 
-use super::arguments::CallArgumentTypes;
+use super::arguments::{CallArgumentTypes, collect_keyword_items};
 use super::{Binding, CallArguments};
 use crate::place::{DefinedPlace, Definedness, Place, place_from_bindings_with_reachability_cache};
 use crate::reachability::ReachabilityEvaluationCache;
@@ -262,7 +262,93 @@ impl<'db> DictionaryItems<'db> {
         }
     }
 
-    pub(crate) fn literal(
+    pub(crate) fn expression(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        expression: &ast::Expr,
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+    ) -> Option<Self> {
+        match expression {
+            ast::Expr::Dict(_) => Self::literal(db, env, expression, expression_type),
+            ast::Expr::Call(call) => {
+                let ast::ExprCall {
+                    node_index: _,
+                    range_start: _,
+                    func,
+                    arguments,
+                } = call;
+                let Type::ClassLiteral(class) = expression_type(func)? else {
+                    return None;
+                };
+                if !class.is_known(db, KnownClass::Dict) {
+                    return None;
+                }
+                let mut dictionary = DictionaryItemsBuilder::default();
+                match arguments.args.as_ref() {
+                    [] => {}
+                    [source] => {
+                        if source.is_starred_expr() {
+                            return None;
+                        }
+                        let source = Self::unpacked_expression(db, env, source, expression_type)?;
+                        dictionary.overlay(db, env, source)?;
+                    }
+                    _ => return None,
+                }
+                let keywords = collect_keyword_items(
+                    db,
+                    env,
+                    arguments.keywords.iter().map(|keyword| {
+                        let ast::Keyword {
+                            node_index: _,
+                            range: _,
+                            arg,
+                            value,
+                        } = keyword;
+                        if let Some(name) = arg {
+                            let ty = expression_type(value)?;
+                            Some(Self {
+                                items: Box::new([DictionaryItem {
+                                    name: name.id.clone(),
+                                    ty,
+                                    kind: DictionaryItemKind::Required,
+                                    source: name.range(),
+                                }]),
+                                extra_items: DictionaryExtraItems::Closed,
+                            })
+                        } else {
+                            Self::unpacked_expression(db, env, value, expression_type)
+                        }
+                    }),
+                )?;
+                dictionary.overlay(db, env, keywords)?;
+                Some(dictionary.finish())
+            }
+            _ => None,
+        }
+    }
+
+    fn unpacked_expression(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        expression: &ast::Expr,
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+    ) -> Option<Self> {
+        let observed = Self::expression(db, env, expression, expression_type);
+        if expression.is_dict_expr() {
+            // An unsupported nested literal invalidates the whole inventory. Its ordinary
+            // inferred value type must not masquerade as a proven residual here.
+            return observed;
+        }
+        observed.or_else(|| {
+            // Other expressions, including unsupported constructor forms, retain their ordinary
+            // mapping type. No partial constructor inventory escapes through this fallback.
+            let ty = expression_type(expression)?;
+            Self::unpacked(db, env, ty, expression.range())
+        })
+    }
+
+    fn literal(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         expression: &ast::Expr,
@@ -279,14 +365,7 @@ impl<'db> DictionaryItems<'db> {
         let mut dictionary = DictionaryItemsBuilder::default();
         for ast::DictItem { key, value } in items {
             let Some(key) = key else {
-                let unpacked = if value.is_dict_expr() {
-                    // An unsupported nested literal invalidates the whole inventory. Its ordinary
-                    // inferred value type must not masquerade as a proven residual here.
-                    Self::literal(db, env, value, expression_type)?
-                } else {
-                    let ty = expression_type(value)?;
-                    Self::unpacked(db, env, ty, value.range())?
-                };
+                let unpacked = Self::unpacked_expression(db, env, value, expression_type)?;
                 dictionary.overlay(db, env, unpacked)?;
                 continue;
             };
