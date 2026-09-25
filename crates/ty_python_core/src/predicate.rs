@@ -16,6 +16,7 @@ use ruff_python_ast::{self as ast, Singleton, name::Name};
 use crate::ProgramFile;
 use crate::ast_ids::ExpressionNodeKey;
 use crate::db::Db;
+use crate::definition::Definition;
 use crate::expression::Expression;
 use crate::global_scope;
 use crate::reachability_constraints::ScopedReachabilityConstraintId;
@@ -23,7 +24,9 @@ use crate::scope::{FileScopeId, ScopeId};
 use crate::symbol::ScopedSymbolId;
 
 // A scoped identifier for each `Predicate` in a scope.
-#[derive(Clone, Debug, Copy, PartialOrd, Ord, PartialEq, Eq, Hash, get_size2::GetSize)]
+#[derive(
+    Clone, Debug, Copy, PartialOrd, Ord, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue,
+)]
 pub struct ScopedPredicateId(u32);
 
 impl ScopedPredicateId {
@@ -53,6 +56,15 @@ impl Idx for ScopedPredicateId {
         debug_assert!(!self.is_terminal());
         self.0 as usize
     }
+}
+
+/// A simple local test that may share an immutable Boolean value during evaluation.
+/// The occurrence predicate continues to own narrowing and ordinary truthiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
+pub struct BooleanGuard<'db> {
+    pub definition: Definition<'db>,
+    pub expression: Expression<'db>,
+    pub is_positive: bool,
 }
 
 // A collection of predicates for a given scope.

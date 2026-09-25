@@ -2394,6 +2394,85 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         (predicate, predicate_id)
     }
 
+    /// Share a local Boolean value only for simple if/elif tests. The original predicate
+    /// still supplies occurrence-specific narrowing, including contextual constants.
+    fn record_if_reachability_constraint(
+        &mut self,
+        test: &ast::Expr,
+        predicate: PredicateOrLiteral<'db>,
+        predicate_id: ScopedPredicateId,
+    ) -> ScopedReachabilityConstraintId {
+        let candidate = || {
+            if self.scopes[self.current_scope()].kind() != ScopeKind::Function {
+                return None;
+            }
+            let mut operand = test;
+            let mut is_positive = true;
+            while let ast::Expr::UnaryOp(unary) = operand {
+                let ast::ExprUnaryOp {
+                    op,
+                    operand: inner,
+                    range: _,
+                    node_index: _,
+                } = unary;
+                if *op != ast::UnaryOp::Not {
+                    return None;
+                }
+                is_positive = !is_positive;
+                operand = inner;
+            }
+            let name = operand.as_name_expr()?;
+            // Inferring a collection literal can depend on every use in its scope. These
+            // bindings cannot supply a Boolean value and need no additional proof query.
+            if self
+                .unannotated_collection_literal_binding(operand)
+                .is_some()
+            {
+                return None;
+            }
+            let places = self.current_place_table();
+            let symbol = places.symbol_id(&name.id)?;
+            if !places.symbol(symbol).is_local() {
+                return None;
+            }
+            let use_id = self.current_ast_ids().try_use_id(operand)?;
+            let use_def = self.current_use_def_map();
+            let binding = use_def.bindings_at_use(use_id).exactly_one().ok()?;
+            let definition = use_def.definition(binding.binding()).definition()?;
+            let supported = match definition.kind(self.db) {
+                DefinitionKind::Parameter(_) => true,
+                DefinitionKind::Assignment(assignment) => {
+                    assignment.unpack().is_none() && assignment.target(self.module).is_name_expr()
+                }
+                DefinitionKind::AnnotatedAssignment(assignment) => {
+                    assignment.has_value() && assignment.target(self.module).is_name_expr()
+                }
+                _ => false,
+            };
+            if !supported {
+                return None;
+            }
+            let PredicateOrLiteral::Predicate(predicate) = predicate else {
+                return None;
+            };
+            let expression = match predicate.node {
+                PredicateNode::Expression(expression) => expression,
+                PredicateNode::Condition(expression) => expression,
+                _ => return None,
+            };
+            Some((definition, expression, is_positive))
+        };
+        if let Some((definition, expression, is_positive)) = candidate() {
+            self.current_use_def_map_mut().record_boolean_guard(
+                definition,
+                expression,
+                predicate_id,
+                is_positive,
+            );
+        }
+        self.record_reachability_constraint_id(predicate_id)
+    }
+
     fn build_predicate(
         &mut self,
         predicate_node: &'ast ast::Expr,
@@ -4797,8 +4876,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 };
                 let (mut last_predicate, mut last_narrowing_id) =
                     self.record_expression_narrowing_constraint(&node.test);
-                let mut last_reachability_constraint =
-                    self.record_reachability_constraint_id(last_narrowing_id);
+                let mut last_reachability_constraint = self.record_if_reachability_constraint(
+                    &node.test,
+                    last_predicate,
+                    last_narrowing_id,
+                );
 
                 let is_outer_block_in_type_checking = self.in_type_checking_block;
 
@@ -4860,8 +4942,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         (last_predicate, last_narrowing_id) =
                             self.record_expression_narrowing_constraint(elif_test);
 
-                        last_reachability_constraint =
-                            self.record_reachability_constraint_id(last_narrowing_id);
+                        last_reachability_constraint = self.record_if_reachability_constraint(
+                            elif_test,
+                            last_predicate,
+                            last_narrowing_id,
+                        );
 
                         Some(next_falsy)
                     } else {

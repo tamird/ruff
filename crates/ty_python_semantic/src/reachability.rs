@@ -220,16 +220,18 @@ use ty_python_core::{
     BindingWithConstraints, DeclarationWithConstraint, DeclarationsIterator, EvaluationMode,
     FileScopeId, NarrowingEvaluator, PredicateNarrowingTargets, ScopedDefinitionId, SemanticIndex,
     Truthiness, UseDefMap,
-    definition::DefinitionState,
+    definition::{Definition, DefinitionState},
     expression::Expression,
     narrowing_constraints::{NarrowingConstraints, ScopedNarrowingConstraint},
     place::ScopedPlaceId,
     place_table,
     predicate::{
-        CallableAndCallExpr, PatternPredicate, PatternPredicateKind, Predicate, PredicateNode,
-        ScopedPredicateId,
+        BooleanGuard, CallableAndCallExpr, PatternPredicate, PatternPredicateKind, Predicate,
+        PredicateNode, ScopedPredicateId,
     },
-    reachability_constraints::{ReachabilityConstraints, ScopedReachabilityConstraintId},
+    reachability_constraints::{
+        ReachabilityAtom, ReachabilityConstraints, ScopedReachabilityConstraintId,
+    },
     scope::ScopeId,
     use_def_map,
 };
@@ -783,6 +785,7 @@ fn evaluate_reachability_path<'db>(
     mut use_checkpoint: bool,
 ) -> Truthiness {
     let env = ProgramEnvironment::from_scope(scope);
+    let use_def = use_def_map(db, scope);
     let mut visited = 0;
 
     loop {
@@ -795,10 +798,22 @@ fn evaluate_reachability_path<'db>(
             return evaluate_reachability_checkpoint(db, scope, id);
         }
 
-        id = match analyze_single(db, &env, &predicates[node.atom()]) {
-            Truthiness::AlwaysTrue => node.if_true(),
-            Truthiness::Ambiguous => node.if_ambiguous(),
-            Truthiness::AlwaysFalse => node.if_false(),
+        id = match analyze_reachability_atom(db, &env, use_def, predicates, node.atom()) {
+            ReachabilityAtom::Known(truthiness) => match truthiness {
+                Truthiness::AlwaysTrue => node.if_true(),
+                Truthiness::Ambiguous => node.if_ambiguous(),
+                Truthiness::AlwaysFalse => node.if_false(),
+            },
+            ReachabilityAtom::Symbolic {
+                key: _,
+                is_positive: _,
+            } => {
+                // Truthiness checkpoints discard symbolic identities. Once a stable value is
+                // encountered, finish this demanded suffix in one local projection instead.
+                return constraints.project(id, |atom| {
+                    analyze_reachability_atom(db, &env, use_def, predicates, atom)
+                });
+            }
         };
         use_checkpoint = true;
         visited += 1;
@@ -1931,6 +1946,52 @@ fn analyze_condition<'db>(db: &'db dyn Db, expression: Expression<'db>) -> Truth
     .unwrap_or(Truthiness::Ambiguous)
 }
 
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _| false,
+    cycle_fn = |_, cycle: &salsa::Cycle, previous: &bool, result: bool, _, _| {
+        // Once the tainted iterations have resolved, losing a proof restores occurrence-local
+        // reachability permanently for this cycle. Type widening alone cannot ensure convergence.
+        if cycle.iteration() > crate::TAINTED_CYCLES {
+            *previous && result
+        } else {
+            result
+        }
+    },
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn analyze_stable_boolean_guard<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    expression: Expression<'db>,
+) -> bool {
+    crate::types::narrow::is_stable_boolean_guard(db, definition, expression)
+}
+
+fn analyze_reachability_atom<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    use_def: &UseDefMap<'db>,
+    predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
+    id: ScopedPredicateId,
+) -> ReachabilityAtom<Definition<'db>> {
+    let predicate = &predicates[id];
+    if let Some(guard) = use_def.boolean_guard(id) {
+        let BooleanGuard {
+            definition,
+            expression,
+            is_positive,
+        } = guard;
+        if analyze_stable_boolean_guard(db, definition, expression) {
+            return ReachabilityAtom::Symbolic {
+                key: definition,
+                is_positive: is_positive == predicate.is_positive,
+            };
+        }
+    }
+    ReachabilityAtom::Known(analyze_single(db, env, predicate))
+}
+
 fn analyze_single(db: &dyn Db, env: &ProgramEnvironment<'_>, predicate: &Predicate) -> Truthiness {
     let _span = tracing::trace_span!("analyze_single", ?predicate).entered();
 
@@ -2239,10 +2300,64 @@ mod tests {
     use crate::db::tests::setup_db;
     use ruff_db::files::system_path_to_file;
     use ruff_db::system::DbWithWritableSystem as _;
+    use salsa::Database as _;
     use ty_python_core::ProgramFile;
     use ty_python_core::narrowing_constraints::InteriorNode;
     use ty_python_core::predicate::Predicates;
     use ty_python_core::semantic_index;
+
+    #[test]
+    fn stable_boolean_guard_collection_cycle() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = "def f():\n    values = [False]\n    flag = values[0]\n    if flag:\n        extra = True\n    else:\n        extra = False\n    values.append(extra)\n    if flag:\n        value: int = 'bad'\n";
+        db.write_file("/src/test.py", source)?;
+        let file = system_path_to_file(&db, "/src/test.py")?;
+        let program_file = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        let index = semantic_index(&db, program_file);
+        let scope = index
+            .child_scopes(FileScopeId::global())
+            .next()
+            .expect("the fixture defines one function")
+            .0;
+        let use_def = index.use_def_map(scope);
+        let BooleanGuard {
+            definition,
+            expression,
+            is_positive: _,
+        } = use_def
+            .predicates()
+            .iter_enumerated()
+            .find_map(|(id, _)| use_def.boolean_guard(id))
+            .expect("the scalar assignment is an admitted candidate");
+        let result = analyze_stable_boolean_guard(&db, definition, expression);
+        let diagnostics = crate::check_file_unwrap(&db, program_file);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = diagnostics.first().expect("one diagnostic was checked");
+        assert_eq!(diagnostic.id().as_str(), "invalid-assignment");
+        let range = diagnostic.primary_span().unwrap().range().unwrap();
+        assert_eq!(&source[range], "'bad'");
+        let events = db.take_salsa_events();
+        let cycles: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                salsa::EventKind::WillIterateCycle {
+                    database_key,
+                    iteration,
+                } => Some((
+                    db.ingredient_debug_name(database_key.ingredient_index()),
+                    iteration,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            cycles
+                .iter()
+                .any(|(name, _)| *name == "analyze_stable_boolean_guard"),
+            "proof={result}, cycles={cycles:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn non_terminal_call_range_recovers_cross_file_cycle() -> anyhow::Result<()> {

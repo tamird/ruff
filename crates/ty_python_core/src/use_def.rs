@@ -261,13 +261,16 @@ use thin_vec::ThinVec;
 
 use crate::ast_ids::ScopedUseId;
 use crate::definition::{Definition, DefinitionCategory, DefinitionState};
+use crate::expression::Expression;
 use crate::frozen::FrozenMap;
 use crate::member::ScopedMemberId;
 use crate::narrowing_constraints::{
     ConstraintKey, NarrowingConstraints, NarrowingConstraintsBuilder, ScopedNarrowingConstraint,
 };
 use crate::place::{PlaceExprRef, ScopedPlaceId};
-use crate::predicate::{PredicateOrLiteral, Predicates, PredicatesBuilder, ScopedPredicateId};
+use crate::predicate::{
+    BooleanGuard, PredicateOrLiteral, Predicates, PredicatesBuilder, ScopedPredicateId,
+};
 use crate::reachability_constraints::{
     ReachabilityConstraints, ReachabilityConstraintsBuilder, ScopedReachabilityConstraintId,
 };
@@ -641,6 +644,7 @@ enum InternedEnclosingSnapshotId {
 struct ConstraintTables<'db> {
     predicates: Predicates<'db>,
     predicate_narrowing_targets: PredicateNarrowingTargets,
+    boolean_guards: Box<[(ScopedPredicateId, BooleanGuard<'db>)]>,
     reachability_constraints: ReachabilityConstraints,
     narrowing_constraints: NarrowingConstraints,
 }
@@ -720,6 +724,7 @@ static EMPTY_CONSTRAINT_TABLES: LazyLock<ConstraintTables<'static>> =
     LazyLock::new(|| ConstraintTables {
         predicates: IndexVec::new().into(),
         predicate_narrowing_targets: PredicateNarrowingTargets::default(),
+        boolean_guards: Box::default(),
         reachability_constraints: ReachabilityConstraintsBuilder::default().build(),
         narrowing_constraints: NarrowingConstraintsBuilder::default().build(),
     });
@@ -1101,6 +1106,16 @@ impl<'db> UseDefMap<'db> {
             .any(|&(entry_range, block)| {
                 block.in_type_checking_block && entry_range.contains_range(range)
             })
+    }
+
+    /// Candidate value identity for an occurrence, requiring a semantic stability proof.
+    pub fn boolean_guard(&self, predicate: ScopedPredicateId) -> Option<BooleanGuard<'db>> {
+        let guards = &self.constraint_tables().boolean_guards;
+        let index = guards
+            .binary_search_by_key(&predicate, |(id, _)| *id)
+            .ok()?;
+        let (_, guard) = guards[index];
+        Some(guard)
     }
 
     /// Return `true` if `node` is one of the tests recorded in
@@ -2114,6 +2129,9 @@ pub(super) struct UseDefMapBuilder<'db> {
     /// Node IDs collected for [`UseDefMapExtra::boolean_test_roots`], before sorting.
     boolean_test_roots: Vec<NodeIndex>,
 
+    /// Candidate value identities, separate from occurrence reachability and narrowing.
+    boolean_guards: Vec<(ScopedPredicateId, BooleanGuard<'db>)>,
+
     /// Identifies the current control-flow path for exception checkpoints.
     ///
     /// Unlike `reachability`, this excludes per-call gates so repeated calls with unchanged
@@ -2174,6 +2192,7 @@ impl<'db> UseDefMapBuilder<'db> {
             reachability: ScopedReachabilityConstraintId::ALWAYS_TRUE,
             range_reachability: Vec::new(),
             boolean_test_roots: Vec::new(),
+            boolean_guards: Vec::new(),
             checkpoint_flow: ScopedReachabilityConstraintId::ALWAYS_TRUE,
             checkpoint_state: ExceptionCheckpointState::default(),
             if_chain_start: None,
@@ -2353,6 +2372,24 @@ impl<'db> UseDefMapBuilder<'db> {
             PredicateOrLiteral::Literal(true) => ScopedPredicateId::ALWAYS_TRUE,
             PredicateOrLiteral::Literal(false) => ScopedPredicateId::ALWAYS_FALSE,
         }
+    }
+
+    /// Record candidate identity without expanding the occurrence's reachability graph.
+    pub(super) fn record_boolean_guard(
+        &mut self,
+        definition: Definition<'db>,
+        expression: Expression<'db>,
+        occurrence: ScopedPredicateId,
+        is_positive: bool,
+    ) {
+        self.boolean_guards.push((
+            occurrence,
+            BooleanGuard {
+                definition,
+                expression,
+                is_positive,
+            },
+        ));
     }
 
     /// Records a narrowing constraint for only the specified places.
@@ -3277,6 +3314,14 @@ impl<'db> UseDefMapBuilder<'db> {
             })
         });
         let predicates = self.predicates.build();
+        let mut boolean_guards = self.boolean_guards;
+        // A value tested only once cannot gain precision from sharing its identity.
+        let mut guard_counts = FxHashMap::default();
+        for (_, guard) in &boolean_guards {
+            *guard_counts.entry(guard.definition).or_insert(0) += 1;
+        }
+        boolean_guards.retain(|(_, guard)| guard_counts[&guard.definition] > 1);
+        boolean_guards.sort_unstable_by_key(|(predicate, _)| *predicate);
         let predicate_narrowing_targets =
             PredicateNarrowingTargets::from_entries(self.predicate_narrowing_targets);
         let reachability_constraints = self.reachability_constraints.build();
@@ -3287,6 +3332,7 @@ impl<'db> UseDefMapBuilder<'db> {
             Box::new(ConstraintTables {
                 predicates,
                 predicate_narrowing_targets,
+                boolean_guards: boolean_guards.into_boxed_slice(),
                 reachability_constraints,
                 narrowing_constraints,
             })

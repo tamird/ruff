@@ -8,7 +8,9 @@ use crate::reachability::{
 };
 use crate::subscript::PyIndex;
 use crate::types::function::KnownFunction;
-use crate::types::infer::{ExpressionInference, infer_same_file_expression_type};
+use crate::types::infer::{
+    ExpressionInference, infer_definition_types, infer_same_file_expression_type,
+};
 use crate::types::iteration::extract_literal_container_element_types;
 use crate::types::special_form::TypeQualifier;
 use crate::types::tuple::{TupleElement, TupleLength, TupleSpec, TupleSpecBuilder, TupleType};
@@ -124,6 +126,57 @@ pub(crate) fn infer_narrowing_constraints<'db>(
     } else {
         (constraints.1, constraints.0)
     }
+}
+
+/// Prove value identity separately from the ordinary narrowing at this occurrence.
+pub(crate) fn is_stable_boolean_guard<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    expression: Expression<'db>,
+) -> bool {
+    let scope = definition.scope(db);
+    let ScopedPlaceId::Symbol(symbol) = definition.place(db) else {
+        return false;
+    };
+    if !place_table(db, scope).symbol(symbol).is_local() {
+        return false;
+    }
+    let index = semantic_index(db, definition.program_file(db));
+    // Source identity is not runtime value identity for definitions executed again in a loop,
+    // or for locals that a callback can rebind. Inspect complete raw history, including writers
+    // after this use, before semantic reachability has a chance to hide such alternatives.
+    if index
+        .use_def_map(scope.file_scope_id(db))
+        .reachable_symbol_bindings(symbol)
+        .any(|binding| {
+            binding.binding.definition().is_some_and(|definition| {
+                matches!(
+                    definition.kind(db),
+                    DefinitionKind::LoopHeader(_) | DefinitionKind::NestedBindings(_)
+                )
+            })
+        })
+    {
+        return false;
+    }
+    let original = infer_definition_types(db, definition);
+    if original.is_provisional()
+        || !original
+            .binding_type(definition)
+            .resolve_type_alias(db)
+            .is_bool(db)
+    {
+        return false;
+    }
+    let occurrence = infer_expression_types(db, expression, TypeContext::default());
+    if occurrence.is_provisional() {
+        return false;
+    }
+    let env = ProgramEnvironment::from_scope(scope);
+    occurrence
+        .expression_type(expression.node_ref(db))
+        .bool_if_inhabited(db, &env)
+        == Some(Truthiness::Ambiguous)
 }
 
 #[salsa::tracked(
