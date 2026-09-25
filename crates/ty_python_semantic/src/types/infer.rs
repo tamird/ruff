@@ -1811,6 +1811,11 @@ impl<'db> DefinitionInference<'db> {
             )
     }
 
+    /// Whether this result depends on provisional types from cycle recovery.
+    pub(super) fn is_provisional(&self) -> bool {
+        self.fallback_type().is_some()
+    }
+
     fn bindings(
         &self,
         owner: Definition<'db>,
