@@ -4286,6 +4286,41 @@ def recursive_class(value: Recursive):
     reveal_type(type(value))  # revealed: type[int | type]
 ```
 
+## Custom object declarations control synthetic class attributes
+
+The precise `__class__` projection requires that attribute in the canonical `object` declaration. A
+supplied builtins module can omit that guarantee while retaining explicitly declared fields.
+
+```toml
+[environment]
+typeshed = "/typeshed"
+```
+
+`/typeshed/stdlib/builtins.pyi`:
+
+```pyi
+class object: ...
+class int: ...
+```
+
+`/typeshed/stdlib/typing_extensions.pyi`:
+
+```pyi
+def reveal_type(obj, /): ...
+```
+
+```py
+class Plain: ...
+
+class HasClass:
+    __class__: int
+
+def check(plain: Plain, explicit: HasClass, value: object):
+    plain.__class__  # error: [unresolved-attribute]
+    reveal_type(value.__class__)  # revealed: Unknown
+    reveal_type(explicit.__class__)  # revealed: int
+```
+
 ## Module attributes
 
 ### Basic

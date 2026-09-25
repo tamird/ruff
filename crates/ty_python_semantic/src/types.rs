@@ -6631,7 +6631,12 @@ impl<'db> Type<'db> {
         }
 
         if self.materialized_divergent_fallback().is_none() {
-            if name == "__class__" {
+            if name == "__class__"
+                && ClassLiteral::object(db, env)
+                    .class_member(db, env, "__class__", MemberLookupPolicy::default())
+                    .place
+                    .is_definitely_bound()
+            {
                 return Place::bound(self.dunder_class(db, env)).into();
             }
 
