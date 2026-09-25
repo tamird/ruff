@@ -28,7 +28,7 @@ use crate::{
             original_class_type,
         },
         relation::TypeRelation,
-        signatures::ReturnCallableTypeVarScope,
+        signatures::{Parameter, ReturnCallableTypeVarScope},
         tuple::{TupleSpecBuilder, TupleType},
         typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation,
         typevar::TypeVarSet,
@@ -1480,19 +1480,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             node_index: _,
         } = parameter_with_default;
 
-        let ty = if let Some(parameter_type) = self.annotated_lambda_parameter_type(index, lambda) {
-            parameter_type
-        } else if let Some(default_expr) = default {
-            let default_ty = self.file_expression_type(default_expr);
-            UnionType::from_two_elements(
+        let context = self.contextual_lambda_parameter(index, lambda);
+        let mut ty = context.map_or(
+            Type::Dynamic(DynamicType::UnknownLambdaParameter),
+            Parameter::annotated_type,
+        );
+        // A contextual callable that accepts omission must account for the source default in
+        // its actual body input. Required contextual slots do not publish that omitted call.
+        if let Some(default_expr) = default
+            && context.is_none_or(Parameter::has_default)
+        {
+            ty = UnionType::from_two_elements(
                 db,
                 self.program_environment(),
-                Type::Dynamic(DynamicType::UnknownLambdaParameter),
-                default_ty,
-            )
-        } else {
-            Type::Dynamic(DynamicType::UnknownLambdaParameter)
-        };
+                ty,
+                self.file_expression_type(default_expr),
+            );
+        }
 
         self.add_binding(parameter.into(), definition)
             .insert(self, ty);
@@ -1508,17 +1512,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         definition: Definition<'db>,
     ) {
         let db = self.db();
-        // Note that this currently always returns `None` because we do not support `Unpack`
-        // annotations for callable types.
-        let ty = if let Some(parameter_type) = self.annotated_lambda_parameter_type(index, lambda) {
-            parameter_type
-        } else {
-            Type::homogeneous_tuple(
-                db,
-                self.program_environment(),
-                Type::Dynamic(DynamicType::UnknownLambdaParameter),
-            )
-        };
+        let element_type = self.contextual_lambda_parameter(index, lambda).map_or(
+            Type::Dynamic(DynamicType::UnknownLambdaParameter),
+            Parameter::annotated_type,
+        );
+        let ty = Type::homogeneous_tuple(db, self.program_environment(), element_type);
         self.add_binding(parameter.into(), definition)
             .insert(self, ty);
     }
@@ -1545,13 +1543,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .insert(self, inferred_ty);
     }
 
-    /// Returns the annotated type of the lambda parameter at the given index in the provided
-    /// lambda expression, based on a `Callable` type annotation, if present.
-    fn annotated_lambda_parameter_type(
+    /// Returns the contextual parameter from the lambda's inferred callable, if available.
+    fn contextual_lambda_parameter(
         &mut self,
         index: u32,
         lambda: &'ast ast::ExprLambda,
-    ) -> Option<Type<'db>> {
+    ) -> Option<&'db Parameter<'db>> {
         let db = self.db();
         let enclosing_stmt = infer_statement_types(
             self.db(),
@@ -1563,8 +1560,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         };
 
-        let parameter_type = signature.parameters().as_slice()[index as usize].annotated_type();
-        (!parameter_type.has_provisional_marker(db, self.program_environment()))
-            .then_some(parameter_type)
+        let parameter = signature.parameters().get(index as usize)?;
+        (!parameter
+            .annotated_type()
+            .has_provisional_marker(db, self.program_environment()))
+        .then_some(parameter)
     }
 }

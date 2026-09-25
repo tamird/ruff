@@ -8857,86 +8857,121 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // In stub files, default values may reference names that are defined later in the file.
         let previous_deferred_state = self.replace_deferred_state(self.in_stub().into());
 
-        // TODO: We could perform multi-inference here if there are multiple `Callable` annotations
-        // in the union/intersection.
-        let callable_tcx = if let Some(tcx) = tcx.annotation
-            && let Some(callable) = tcx
-                .filter_union(db, env, Type::is_callable_type)
-                .resolve_type_alias(db)
-                .as_callable()
-        {
-            match callable.signatures(self.db()).overloads.as_slice() {
-                [signature] => Some(signature),
-                // TODO: We could similarly perform multi-inference here if there are multiple overloads.
-                _ => None,
+        // TODO: We could perform multi-inference if there are multiple useful callback contexts.
+        let callable_tcx = tcx.annotation.and_then(|annotation| {
+            let annotation = annotation
+                .filter_union(db, env, |ty| {
+                    ty.is_callable_type()
+                        || (ty.is_protocol_instance()
+                            && ty.try_upcast_to_callable(db, env).is_some())
+                })
+                .resolve_type_alias(db);
+            if !annotation.is_callable_type() && !annotation.is_protocol_instance() {
+                return None;
             }
-        } else {
-            None
+            let callables = annotation.try_upcast_to_callable(db, env)?;
+            let callable = callables.exactly_one()?;
+            let [signature] = callable.signatures(db).overloads.as_slice() else {
+                return None;
+            };
+            Some(signature)
+        });
+        let contextual_parameters = callable_tcx.map(Signature::parameters);
+        let positional_context = |index| {
+            let parameters = contextual_parameters?;
+            parameters.get_positional(index).or_else(|| {
+                if parameters.is_gradual() {
+                    parameters.variadic().map(|(_, parameter)| parameter)
+                } else {
+                    None
+                }
+            })
         };
 
-        // Extract the annotated parameter types.
-        //
-        // Note that `Callable` annotations are only valid for positional parameters.
-        let mut parameter_types = match callable_tcx {
-            None => [].iter(),
-            Some(signature) => signature.parameters().into_iter(),
-        }
-        .map(Parameter::annotated_type);
-
         let parameters = if let Some(parameters) = parameters {
-            let positional_only = parameters
-                .posonlyargs
-                .iter()
-                .map(|param| {
-                    let parameter = Parameter::positional_only(Some(param.name().id.clone()))
-                        .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
-                        .with_optional_default_type(param.default().map(|default_expr| {
-                            self.infer_expression(default_expr, TypeContext::default())
-                                .replace_parameter_defaults(db, env)
-                        }));
-
-                    if let Some(annotated_type) = parameter_types.next() {
-                        parameter.with_annotated_type(annotated_type)
-                    } else {
+            let ast::Parameters {
+                range: _,
+                node_index: _,
+                posonlyargs,
+                args,
+                vararg,
+                kwonlyargs,
+                kwarg,
+            } = parameters.as_ref();
+            let mut contextual_parameter =
+                |parameter: Parameter<'db>,
+                 source: &ast::ParameterWithDefault,
+                 context: Option<&Parameter<'db>>| {
+                    // Defaults execute in the enclosing scope even when the context restricts the
+                    // inferred callable to calls that supply this argument.
+                    let default_type = source.default().map(|default| {
+                        self.infer_expression(default, TypeContext::default())
+                            .replace_parameter_defaults(db, env)
+                    });
+                    let parameter = parameter
+                        .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter));
+                    if let Some(context) = context {
                         parameter
+                            .with_annotated_type(context.annotated_type())
+                            .with_optional_default_type(
+                                default_type
+                                    .filter(|_| context.has_default() || context.is_variadic()),
+                            )
+                    } else {
+                        parameter.with_optional_default_type(default_type)
                     }
+                };
+            let positional_only = posonlyargs
+                .iter()
+                .enumerate()
+                .map(|(index, param)| {
+                    contextual_parameter(
+                        Parameter::positional_only(Some(param.name().id.clone())),
+                        param,
+                        positional_context(index),
+                    )
                 })
                 .collect::<Vec<_>>();
-            let positional_or_keyword = parameters
-                .args
+            let positional_or_keyword = args
                 .iter()
-                .map(|param| {
-                    let parameter = Parameter::positional_or_keyword(param.name().id.clone())
-                        .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
-                        .with_optional_default_type(param.default().map(|default_expr| {
-                            self.infer_expression(default_expr, TypeContext::default())
-                                .replace_parameter_defaults(db, env)
-                        }));
-
-                    if let Some(annotated_type) = parameter_types.next() {
-                        parameter.with_annotated_type(annotated_type)
-                    } else {
-                        parameter
-                    }
+                .enumerate()
+                .map(|(index, param)| {
+                    contextual_parameter(
+                        Parameter::positional_or_keyword(param.name().id.clone()),
+                        param,
+                        positional_context(posonlyargs.len() + index),
+                    )
                 })
                 .collect::<Vec<_>>();
-            let variadic = parameters.vararg.as_ref().map(|param| {
-                Parameter::variadic(param.name().id.clone())
-                    .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
+            let keyword_only = kwonlyargs
+                .iter()
+                .map(|param| {
+                    contextual_parameter(
+                        Parameter::keyword_only(param.name().id.clone()),
+                        param,
+                        contextual_parameters.and_then(|parameters| {
+                            parameters
+                                .keyword_by_name(param.name().as_str())
+                                .map(|(_, parameter)| parameter)
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let variadic = vararg.as_ref().map(|param| {
+                let parameter = Parameter::variadic(param.name().id.clone())
+                    .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter));
+                if let Some(parameters) = contextual_parameters
+                    && parameters.is_standard()
+                    && let Some((index, context)) = parameters.variadic()
+                    && index == posonlyargs.len() + args.len()
+                    && !context.has_starred_annotation()
+                {
+                    parameter.with_annotated_type(context.annotated_type())
+                } else {
+                    parameter
+                }
             });
-            let keyword_only = parameters
-                .kwonlyargs
-                .iter()
-                .map(|param| {
-                    Parameter::keyword_only(param.name().id.clone())
-                        .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
-                        .with_optional_default_type(param.default().map(|default_expr| {
-                            self.infer_expression(default_expr, TypeContext::default())
-                                .replace_parameter_defaults(db, env)
-                        }))
-                })
-                .collect::<Vec<_>>();
-            let keyword_variadic = parameters.kwarg.as_ref().map(|param| {
+            let keyword_variadic = kwarg.as_ref().map(|param| {
                 Parameter::keyword_variadic(param.name().id.clone())
                     .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
             });
@@ -8964,8 +8999,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let scope = scope_id.to_scope_id(self.db(), self.program_file());
 
-        // If we have a direct `Callable` type context, we can infer the body with the annotated
-        // return type as type context.
+        // A single callback context also supplies a return-type hint for the body.
         let return_tcx = if let Some(signature) = callable_tcx {
             match signature.return_ty {
                 Type::Dynamic(DynamicType::Unknown) => TypeContext::new(None),
