@@ -127,7 +127,7 @@ impl<'db> SemanticModel<'db> {
 
     /// Returns known string entries at an original call argument expression.
     ///
-    /// Literals retain named entries and residual values from supported mapping spreads. Fresh
+    /// Literals and builtin dictionary copies retain named entries and residual values. Fresh
     /// locals used only for keyword unpacking can have complete key sets. Other indexed argument
     /// uses expose partial flow observations.
     pub fn dictionary_items(&self, expression: &Expr) -> Option<DictionaryItems<'db>> {
@@ -135,7 +135,7 @@ impl<'db> SemanticModel<'db> {
             return None;
         }
         let env = ProgramEnvironment::from_file(self.file);
-        DictionaryItems::literal(self.db, &env, expression, &mut |expression| {
+        DictionaryItems::expression(self.db, &env, expression, &mut |expression| {
             expression.inferred_type(self)
         })
         .or_else(|| {

@@ -8922,7 +8922,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expression: &ast::Expr,
         ty: Type<'db>,
     ) -> Option<DictionaryItems<'db>> {
-        DictionaryItems::literal(
+        DictionaryItems::expression(
             self.db(),
             self.program_environment(),
             expression,

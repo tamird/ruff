@@ -1,13 +1,14 @@
 use super::checked::{DictionaryExtraItems, DictionaryItem, DictionaryItemKind, DictionaryItems};
-use crate::Db;
+use crate::{Db, FxIndexMap};
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::fmt::Display;
 
+use indexmap::map::Entry;
 use itertools::{Either, Itertools};
 use ruff_python_ast as ast;
 use ruff_python_ast::name::Name;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ProgramEnvironment;
 use crate::types::signatures::Parameters;
@@ -21,6 +22,78 @@ use crate::types::{Type, TypeContext, UnionType, expand_type};
 ///
 /// [pyright]: https://github.com/microsoft/pyright/blob/5a325e4874e775436671eed65ad696787a1ef74b/packages/pyright-internal/src/analyzer/typeEvaluator.ts#L566
 const MAX_TOTAL_EXPANSION: usize = 256;
+
+/// Combine keyword sources on paths where their call succeeds. Unlike dictionary overlays,
+/// separate keyword sources cannot overwrite a supplied name: a collision raises instead.
+pub(super) fn collect_keyword_items<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    sources: impl IntoIterator<Item = Option<DictionaryItems<'db>>>,
+) -> Option<DictionaryItems<'db>> {
+    let mut items: FxIndexMap<Name, DictionaryItem<'db>> = FxIndexMap::default();
+    let mut extra_items = None;
+    for source in sources {
+        let DictionaryItems {
+            items: incoming,
+            extra_items: incoming_extra,
+        } = source?;
+        let incoming_extra = match incoming_extra {
+            DictionaryExtraItems::Closed => None,
+            DictionaryExtraItems::Value(ty) => Some(ty),
+            DictionaryExtraItems::Unobserved => return None,
+        };
+        if let Some(ty) = incoming_extra {
+            let names: FxHashSet<_> = incoming.iter().map(|item| item.name.clone()).collect();
+            for item in items.values_mut() {
+                if !item.is_required() && !names.contains(&item.name) {
+                    item.ty = UnionType::from_two_elements(db, env, item.ty, ty);
+                }
+            }
+        }
+        for mut item in incoming {
+            match items.entry(item.name.clone()) {
+                Entry::Occupied(mut entry) => {
+                    let previous = entry.get();
+                    if previous.kind != DictionaryItemKind::Residual
+                        && item.kind != DictionaryItemKind::Residual
+                    {
+                        // Decline metadata for possibly colliding named arguments. The ordinary
+                        // call checker retains responsibility for their diagnostics.
+                        return None;
+                    }
+                    if previous.is_required() {
+                        continue;
+                    }
+                    if !item.is_required() {
+                        item.ty = UnionType::from_two_elements(db, env, previous.ty, item.ty);
+                        if item.kind == DictionaryItemKind::Residual {
+                            item.kind = previous.kind;
+                            item.source = previous.source;
+                        }
+                    }
+                    entry.insert(item);
+                }
+                Entry::Vacant(entry) => {
+                    if !item.is_required()
+                        && let Some(ty) = extra_items
+                    {
+                        item.ty = UnionType::from_two_elements(db, env, ty, item.ty);
+                    }
+                    entry.insert(item);
+                }
+            }
+        }
+        if let Some(ty) = incoming_extra {
+            extra_items = Some(extra_items.map_or(ty, |previous| {
+                UnionType::from_two_elements(db, env, previous, ty)
+            }));
+        }
+    }
+    Some(DictionaryItems {
+        items: items.into_values().collect(),
+        extra_items: extra_items.map_or(DictionaryExtraItems::Closed, DictionaryExtraItems::Value),
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Argument<'a> {

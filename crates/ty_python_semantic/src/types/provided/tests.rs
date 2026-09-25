@@ -231,6 +231,15 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
     let file = system_path_to_file(&db, "/src/main.py")?;
     for (source, expected) in [
         ("result = observe({})", "complete"),
+        ("result = observe(dict())", "complete"),
+        (
+            "result = observe(dict({'x': 'old'}, x=1, y=2))",
+            "complete; x: Literal[1] at x; y: Literal[2] at y",
+        ),
+        (
+            "copy = dict\nresult = observe({**copy(x=1), **dict(y='new')})",
+            "complete; x: Literal[1] at x; y: Literal[\"new\"] at y",
+        ),
         (
             "result = observe({'x': 1, 'y': 2, 'x': 3})",
             "complete; x: Literal[3] at 'x'; y: Literal[2] at 'y'",
