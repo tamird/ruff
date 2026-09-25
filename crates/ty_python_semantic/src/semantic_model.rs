@@ -47,6 +47,23 @@ use ty_python_core::semantic_index;
 use ty_python_core::symbol::Symbol;
 use ty_python_core::{BindingWithConstraintsIterator, Program, ProgramFile, ProvidedAnnotation};
 
+/// Explicit namespace reads can expose locals without an indexed reference to their names.
+/// Callers using lexical confinement must decline these accesses. Callable aliases and other
+/// frame introspection remain outside this syntactic check.
+pub(crate) fn explicitly_reads_local_namespace(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    let Expr::Name(name) = call.func.as_ref() else {
+        return false;
+    };
+    match name.id.as_str() {
+        "locals" => true,
+        "vars" => call.arguments.args.iter().all(Expr::is_starred_expr),
+        _ => false,
+    }
+}
+
 /// The primary interface the LSP should use for querying semantic information about a [`File`].
 ///
 /// Although you can in principle freely construct this type given a `db` and `file`, you should

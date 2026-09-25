@@ -184,3 +184,20 @@ def mutated_row() -> None:
     for entry in entries:
         text(entry["name"])  # error: [invalid-argument-type]
 ```
+
+Reading the local namespace can expose a row without a direct name reference. Such rows use ordinary
+dictionary inference.
+
+```py
+def local_namespace_mutation() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    locals()["entries"][0]["name"] = 1
+    for entry in entries:
+        text(entry["name"])  # error: [invalid-argument-type]
+
+def vars_namespace_mutation() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    vars(*())["entries"][0]["name"] = 1
+    for entry in entries:
+        text(entry["name"])  # error: [invalid-argument-type]
+```
