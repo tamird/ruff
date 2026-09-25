@@ -404,6 +404,28 @@ impl<'db> SemanticIndex<'db> {
         self.ast_ids.try_use_id(expression)
     }
 
+    /// Iterates over indexed place-expression uses in this file.
+    ///
+    /// `module` must be from the same revision as this index. Synthetic function-identifier
+    /// reads used to collect overloads are omitted. Real deletion and augmented-assignment
+    /// reads are included regardless of the expression's AST context.
+    pub fn expression_uses<'ast>(
+        &'ast self,
+        module: &'ast ParsedModuleRef,
+    ) -> impl Iterator<Item = (FileScopeId, ast::ExprRef<'ast>, ast_ids::ScopedUseId)> + 'ast {
+        self.ast_ids
+            .uses()
+            .filter_map(|(key, use_id)| match module.get_by_index(key.index()) {
+                ast::AnyRootNodeRef::Expr(expression) => Some((
+                    self.expression_scope_id(expression),
+                    expression.into(),
+                    use_id,
+                )),
+                ast::AnyRootNodeRef::Identifier(_) => None,
+                _ => unreachable!("place uses have expression or identifier keys"),
+            })
+    }
+
     /// Returns the place table for a specific scope.
     ///
     /// Use the Salsa cached [`place_table()`] query if you only need the
