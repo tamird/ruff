@@ -2595,6 +2595,13 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         PossiblyNarrowedPlacesBuilder::new(self.db, place_table)
                             .pattern(pattern, module)
                     }
+                    PredicateNode::SuccessfulSubscript {
+                        receiver: _,
+                        key: _,
+                    } => {
+                        // The original receiver binding IDs are supplied directly.
+                        PossiblyNarrowedPlaces::default()
+                    }
                     PredicateNode::SubjectElementPattern(_)
                     | PredicateNode::IsNonTerminalCall(_)
                     | PredicateNode::ContextManagerSuppresses { .. }
@@ -3638,6 +3645,73 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .get_or_init(|| source_text(self.db, self.file.file(self.db)))
     }
 
+    fn record_successful_subscript(&mut self, subscript: &ast::ExprSubscript) {
+        let ast::ExprSubscript {
+            value,
+            slice,
+            ctx,
+            range,
+            node_index: _,
+        } = subscript;
+        if *ctx != ast::ExprContext::Load
+            || !matches!(
+                self.scopes[self.current_scope()].kind(),
+                ScopeKind::Function | ScopeKind::Lambda
+            )
+            || !value.is_name_expr()
+        {
+            return;
+        }
+        let simple_key = match slice.as_ref() {
+            ast::Expr::Name(_) => true,
+            ast::Expr::StringLiteral(_) => true,
+            ast::Expr::NumberLiteral(number) => matches!(number.value, ast::Number::Int(_)),
+            _ => false,
+        };
+        if !simple_key {
+            return;
+        }
+        let Some(statement) = self.current_statements.last() else {
+            return;
+        };
+        let root = match statement.node {
+            ast::Stmt::Expr(statement) => Some(statement.value.as_ref()),
+            ast::Stmt::Assign(statement) => Some(statement.value.as_ref()),
+            ast::Stmt::AnnAssign(statement) => statement.value.as_deref(),
+            ast::Stmt::For(statement) => Some(statement.iter.as_ref()),
+            _ => None,
+        };
+        if !root.is_some_and(|root| root.range().contains_range(*range)) {
+            return;
+        }
+        // As with terminal method calls, querying a collection literal's receiver can pull
+        // its full-scope collection inference into a cycle with all its preceding uses.
+        if self.unannotated_collection_literal_binding(value).is_some() {
+            return;
+        }
+        let Some(place) = PlaceExpr::try_from_expr(value)
+            .and_then(|place| self.current_place_table().place_id((&place).into()))
+        else {
+            return;
+        };
+        let Some(use_id) = self.current_ast_ids().try_use_id(value.as_ref()) else {
+            return;
+        };
+        let bindings: SmallVec<[ScopedDefinitionId; 2]> = self
+            .current_use_def_map()
+            .bindings_at_use(use_id)
+            .map(LiveBinding::binding)
+            .collect();
+        let receiver = self.add_standalone_expression(value);
+        let key = self.add_standalone_expression(slice);
+        let predicate = self.add_predicate(PredicateOrLiteral::Predicate(Predicate {
+            node: PredicateNode::SuccessfulSubscript { receiver, key },
+            is_positive: true,
+        }));
+        self.current_use_def_map_mut()
+            .record_narrowing_constraint_for_bindings(predicate, place, &bindings);
+    }
+
     fn visit_expr_with_context(&mut self, expr: &'ast ast::Expr, context: ExpressionContext) {
         self.with_semantic_checker(|semantic, builder| semantic.visit_expr(expr, builder));
 
@@ -3703,6 +3777,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     .is_some_and(|(_, is_use, _)| *is_use);
                 let can_raise = self.place_access_can_raise(expr, is_use);
                 self.record_exception_checkpoint_if(can_raise);
+
+                if let ast::Expr::Subscript(subscript) = expr {
+                    self.record_successful_subscript(subscript);
+                }
 
                 if let ast::Expr::Subscript(subscript) = expr
                     && subscript.ctx == ast::ExprContext::Store

@@ -205,6 +205,12 @@ pub enum PredicateNode<'db> {
     /// call is `Unknown`/`Any`, because that would result in too many false
     /// positives.
     IsNonTerminalCall(CallableAndCallExpr<'db>),
+    /// A receiver value whose subscription completed normally. This constrains only the
+    /// captured receiver bindings; it does not establish scope-wide reachability.
+    SuccessfulSubscript {
+        receiver: Expression<'db>,
+        key: Expression<'db>,
+    },
     /// Whether an iterable is statically known to yield at least one item.
     ///
     /// Currently, this predicate is only emitted for direct `range(...)` calls. It is resolved

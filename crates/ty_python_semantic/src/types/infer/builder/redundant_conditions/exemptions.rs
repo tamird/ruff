@@ -885,6 +885,10 @@ fn predicate_contains_special_cased_condition<'db>(
         | PredicateNode::FinallyNormalPathImpossible { .. }
         | PredicateNode::OrPatternAlternative(_)
         | PredicateNode::StarImportPlaceholder(_) => return false,
+        PredicateNode::SuccessfulSubscript {
+            receiver: _,
+            key: _,
+        } => return false,
     };
     let file = expression.program_file(db);
     let module = parsed_module(db, expression.python_file(db)).load(db);

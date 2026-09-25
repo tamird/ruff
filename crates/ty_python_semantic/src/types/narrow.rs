@@ -107,6 +107,10 @@ pub(crate) fn infer_narrowing_constraints<'db>(
             .and_then(|constraints| constraints.get(&place).cloned());
             (positive, None)
         }
+        PredicateNode::SuccessfulSubscript { receiver, key } => {
+            let constraints = successful_subscript_constraints(db, receiver, key);
+            (constraints.get(place, true), None)
+        }
         PredicateNode::ContextManagerSuppresses { .. }
         | PredicateNode::FinallyNormalPathImpossible { .. }
         | PredicateNode::IsNonTerminalCall(_)
@@ -119,6 +123,82 @@ pub(crate) fn infer_narrowing_constraints<'db>(
         constraints
     } else {
         (constraints.1, constraints.0)
+    }
+}
+
+#[salsa::tracked(
+    returns(ref),
+    cycle_initial=|_, _, _, _| ExpressionNarrowingConstraints::Provisional,
+    heap_size=ruff_memory_usage::heap_size,
+)]
+fn successful_subscript_constraints<'db>(
+    db: &'db dyn Db,
+    receiver: Expression<'db>,
+    key: Expression<'db>,
+) -> ExpressionNarrowingConstraints<'db> {
+    let unchanged = ExpressionNarrowingConstraints::Inferred {
+        positive: None,
+        negative: None,
+    };
+    let inference = infer_expression_types(db, receiver, TypeContext::default());
+    if inference.is_provisional() {
+        return ExpressionNarrowingConstraints::Provisional;
+    }
+    let receiver_ty = inference.expression_type(receiver.node_ref(db));
+    let Type::Union(union) = receiver_ty else {
+        return unchanged;
+    };
+    let scope = receiver.scope(db);
+    let index = semantic_index(db, receiver.program_file(db));
+    let module = parsed_module(db, receiver.program_file(db).python_file(db)).load(db);
+    let Some(name) = receiver.node_ref(db).node(&module).as_name_expr() else {
+        return unchanged;
+    };
+    let places = place_table(db, scope);
+    let Some(symbol) = places.symbol_id(&name.id) else {
+        return unchanged;
+    };
+    if !places.symbol(symbol).is_local() {
+        return unchanged;
+    }
+    // __getitem__ can invoke a callback that rebinds this local. Its successful return then
+    // describes the old object, not necessarily the receiver's continuing binding.
+    if index
+        .use_def_map(scope.file_scope_id(db))
+        .reachable_symbol_bindings(symbol)
+        .any(|binding| {
+            binding.binding.definition().is_some_and(|definition| {
+                matches!(definition.kind(db), DefinitionKind::NestedBindings(_))
+            })
+        })
+    {
+        return unchanged;
+    }
+    let key_inference = infer_expression_types(db, key, TypeContext::default());
+    if key_inference.is_provisional() {
+        return ExpressionNarrowingConstraints::Provisional;
+    }
+    let key_ty = key_inference.expression_type(key.node_ref(db));
+    let env = ProgramEnvironment::from_scope(scope);
+    let narrowed = union.filter(db, |arm| {
+        if !matches!(arm, Type::NominalInstance(_)) {
+            return true;
+        }
+        match arm.subscript(db, &env, key_ty, ast::ExprContext::Load) {
+            Ok(result) => !matches!(result.resolve_type_alias(db), Type::Never),
+            Err(_) => true,
+        }
+    });
+    if narrowed == receiver_ty {
+        return unchanged;
+    }
+    let constraints = NarrowingConstraints::from_iter([(
+        symbol.into(),
+        NarrowingConstraint::intersection(narrowed),
+    )]);
+    ExpressionNarrowingConstraints::Inferred {
+        positive: Some(constraints.into()),
+        negative: None,
     }
 }
 
@@ -1710,6 +1790,10 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             | PredicateNode::FinallyNormalPathImpossible { .. }
             | PredicateNode::IsNonTerminalCall(_) => return None,
             PredicateNode::IsNonEmptyIterable(_) => return None,
+            PredicateNode::SuccessfulSubscript {
+                receiver: _,
+                key: _,
+            } => return None,
             PredicateNode::OrPatternAlternative(_) => return None,
             PredicateNode::StarImportPlaceholder(_) => return None,
         };
@@ -3473,6 +3557,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 subject_element.pattern.scope(db)
             }
             PredicateNode::IsNonTerminalCall(call) => call.callable(db).scope(db),
+            PredicateNode::SuccessfulSubscript { receiver, key: _ } => receiver.scope(db),
             PredicateNode::IsNonEmptyIterable(expression) => expression.scope(db),
             PredicateNode::StarImportPlaceholder(definition) => definition.scope(db),
         }

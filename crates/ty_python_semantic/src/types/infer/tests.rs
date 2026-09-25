@@ -93,6 +93,36 @@ fn assert_revealed_type(db: &TestDb, filename: &str, expected: &str) {
 }
 
 #[test]
+fn successful_subscript_without_scope_inference() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "src/receivers.pyi",
+        r#"
+        from typing import NoReturn
+        class Present:
+            def __getitem__(self, key: int) -> int: ...
+        class Absent:
+            def __getitem__(self, key: int) -> NoReturn: ...
+        "#,
+    )?;
+    db.write_dedented(
+        "src/main.py",
+        r#"
+        from receivers import Present, Absent
+        def f(value: Present | Absent):
+            value[0]
+            result = value
+        "#,
+    )?;
+    let ty = get_symbol(&db, "src/main.py", &["f"], "result").expect_type();
+    assert_eq!(
+        ty.display(&db, &db.program_environment()).to_string(),
+        "Present"
+    );
+    Ok(())
+}
+
+#[test]
 fn same_file_at_different_python_versions() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_python_version(PythonVersion::PY311)
