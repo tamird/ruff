@@ -328,6 +328,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         &mut self,
         dict: &ast::ExprDict,
         typed_dict: TypedDictType<'db>,
+        tcx: TypeContext<'db>,
         item_types: &mut FxHashMap<NodeIndex, Type<'db>>,
     ) -> Option<Type<'db>> {
         let db = self.db();
@@ -351,12 +352,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 && let Some(key) = key_ty.as_string_literal()
                 && let Some(field) = typed_dict.item(self.db(), key.value(self.db()))
             {
-                self.infer_expression(&item.value, TypeContext::new(Some(field.declared_ty)))
+                self.infer_expression(&item.value, tcx.with_annotation(Some(field.declared_ty)))
             } else if let Some(key_ty) = key_ty {
                 if key_ty.is_assignable_to(db, env, KnownClass::Str.to_instance(db, env))
                     && let Some(value_ty) = typed_dict.arbitrary_key_initialization_type(db, env)
                 {
-                    self.infer_expression(&item.value, TypeContext::new(Some(value_ty)))
+                    self.infer_expression(&item.value, tcx.with_annotation(Some(value_ty)))
                 } else {
                     self.infer_expression(&item.value, TypeContext::default())
                 }
@@ -372,6 +373,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             typed_dict,
             dict,
             dict.into(),
+            tcx,
             |expr: &ast::Expr, tcx: TypeContext<'db>| {
                 item_types
                     .get(&expr.node_index().load())
