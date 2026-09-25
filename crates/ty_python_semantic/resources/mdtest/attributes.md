@@ -5264,6 +5264,135 @@ help: Function objects have an `__annotate__` attribute, but not all callable ob
 help: See this FAQ for more information: <https://docs.astral.sh/ty/reference/typing-faq/#why-does-ty-say-callable-has-no-attribute-__name__>
 ```
 
+## Typing-only operations do not provide runtime attributes
+
+A typing-only method can describe an implicit operation. Ordinary attribute and method contracts
+still require a member that is available at runtime.
+
+`operations.pyi`:
+
+```pyi
+from typing import TYPE_CHECKING, ClassVar, Protocol, type_check_only
+
+class Native:
+    @type_check_only
+    def helper(self) -> int: ...
+    @type_check_only
+    def __getitem__(self, key: int) -> int: ...
+    if TYPE_CHECKING:
+        marker: ClassVar[None]
+
+class Operation(Protocol):
+    @type_check_only
+    def __getitem__(self, key: int) -> int: ...
+
+class Helpers:
+    @type_check_only
+    class Annotation: ...
+
+flag: bool
+
+class Conditional:
+    if flag:
+        @type_check_only
+        def helper(self) -> int: ...
+
+    else:
+        @type_check_only
+        def helper(self) -> str: ...
+
+class Mixed:
+    if flag:
+        @type_check_only
+        def helper(self) -> int: ...
+
+    else:
+        def helper(self) -> str: ...
+
+class Guarded:
+    if TYPE_CHECKING:
+        marker: ClassVar[int]
+        marker = 1
+
+class Real(Native):
+    def helper(self) -> int: ...
+
+class GuardedAnnotation:
+    if TYPE_CHECKING:
+        marker: ClassVar[int]
+    marker = 1
+```
+
+`main.py`:
+
+```py
+from inspect import getattr_static
+from typing import Callable, Protocol
+from operations import Conditional, Guarded, GuardedAnnotation, Helpers, Mixed, Native, Operation, Real
+
+class Method(Protocol):
+    def __getitem__(self, key: int) -> int: ...
+
+class Field(Protocol):
+    @property
+    def helper(self) -> object: ...
+
+class Marker(Protocol):
+    @property
+    def marker(self) -> object: ...
+
+def method(value: Method) -> None: ...
+def field(value: Field) -> None: ...
+def marker(value: Marker) -> None: ...
+def operation(value: Operation) -> None: ...
+def annotation(value: Helpers.Annotation) -> None: ...
+def check(value: Native, abstract: Operation):
+    value.helper  # error: [unresolved-attribute]
+    value.__getitem__  # error: [unresolved-attribute]
+    value.marker  # error: [unresolved-attribute]
+    reveal_type(value[0])  # revealed: int
+    method(value)  # error: [invalid-argument-type]
+    field(value)  # error: [invalid-argument-type]
+    marker(value)  # error: [invalid-argument-type]
+    operation(value)
+    abstract.__getitem__  # error: [unresolved-attribute]
+    reveal_type(abstract[0])  # revealed: int
+    reveal_type(getattr_static(value, "helper", None))  # revealed: None
+    reveal_type(getattr_static(abstract, "__getitem__", None))  # revealed: None
+
+def conditional(value: Conditional, mixed: Mixed, guarded: Guarded, real: Real):
+    value.helper  # error: [unresolved-attribute]
+    mixed.helper  # error: [possibly-missing-attribute]
+    field(value)  # error: [invalid-argument-type]
+    field(mixed)  # error: [invalid-argument-type]
+    marker(guarded)  # error: [invalid-argument-type]
+    field(real)
+
+def defined(value: GuardedAnnotation):
+    marker(value)
+    reveal_type(value.marker)  # revealed: int
+
+class Callback(Protocol):
+    def __call__(self, value: int) -> int: ...
+
+def callback(value: Callback):
+    reveal_type(value.__call__(1))  # revealed: int
+
+def function(value: int) -> int:
+    return value
+
+class PythonMethod:
+    def method(self, value: int) -> int:
+        return value
+
+def ordinary_calls(value: Callable[[int], int], instance: PythonMethod):
+    reveal_type(value.__call__(1))  # revealed: int
+    reveal_type(function.__call__(1))  # revealed: int
+    reveal_type(instance.method.__call__(1))  # revealed: int
+
+reveal_type("value".__len__())  # revealed: Literal[5]
+```
+
 ## References
 
 Some of the tests in the *Class and instance variables* section draw inspiration from

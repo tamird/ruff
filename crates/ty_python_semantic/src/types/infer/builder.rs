@@ -10962,12 +10962,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             ty: Type<'db>,
             attr_name: &str,
             missing_types: &mut FxIndexSet<Type<'db>>,
+            lookup_policy: MemberLookupPolicy,
         ) {
             if let Some(union) = ty.as_union_like(db) {
                 for element in union.elements(db) {
-                    union_elements_missing_attribute(db, env, *element, attr_name, missing_types);
+                    union_elements_missing_attribute(
+                        db,
+                        env,
+                        *element,
+                        attr_name,
+                        missing_types,
+                        lookup_policy,
+                    );
                 }
-            } else if ty.member(db, env, attr_name).place.is_undefined() {
+            } else if ty
+                .member_lookup_with_policy(db, env, attr_name, lookup_policy)
+                .place
+                .is_undefined()
+            {
                 missing_types.insert(ty);
             }
         }
@@ -11009,8 +11021,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
             }
         }
+        let lookup_policy = if self.in_stub()
+            || self.is_in_type_checking_block(self.scope(), attribute)
+            || self
+                .inference_flags()
+                .contains(InferenceFlags::IN_TYPE_EXPRESSION)
+            || self.in_detached_annotation()
+            || self
+                .index
+                .annotation_parent_scope_id(self.module(), attribute)
+                .is_some()
+        {
+            MemberLookupPolicy::default()
+        } else {
+            MemberLookupPolicy::RUNTIME_ATTRIBUTE
+        };
         let member_lookup = value_type
-            .try_member_lookup(db, env, &attr.id)
+            .member_lookup_with_policy_and_receiver(db, env, &attr.id, lookup_policy, None)
             .unwrap_or_else(|error| {
                 error.report_diagnostic(
                     &self.context,
@@ -11250,6 +11277,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 *element,
                                 attr_name,
                                 &mut elements_missing_the_attribute,
+                                lookup_policy,
                             );
                         }
 

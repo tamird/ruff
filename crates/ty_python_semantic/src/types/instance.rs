@@ -1589,27 +1589,29 @@ impl<'db> ProtocolInstanceType<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
+        policy: super::MemberLookupPolicy,
     ) -> Option<PlaceAndQualifiers<'db>> {
         self.materialization_kind(db)?;
         let interface = self.interface(db);
         interface
             .includes_member(db, name)
-            .then(|| interface.instance_member(db, env, name))
+            .then(|| interface.instance_member_with_policy(db, env, name, policy))
     }
 
-    pub(crate) fn instance_member(
+    pub(crate) fn instance_member_with_policy(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
+        policy: super::MemberLookupPolicy,
     ) -> PlaceAndQualifiers<'db> {
         match self.inner {
             Protocol::FromClass(class) => class.instance_member(db, env, name),
-            Protocol::Synthesized(synthesized) => {
-                synthesized.interface().instance_member(db, env, name)
-            }
+            Protocol::Synthesized(synthesized) => synthesized
+                .interface()
+                .instance_member_with_policy(db, env, name, policy),
             Protocol::Materialized(materialized) => self
-                .materialized_interface_member(db, env, name)
+                .materialized_interface_member(db, env, name, policy)
                 .unwrap_or_else(|| materialized.origin(db).instance_member(db, env, name)),
         }
     }

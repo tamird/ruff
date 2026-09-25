@@ -550,8 +550,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let known_function = KnownFunction::try_from_definition_and_name(db, definition, name);
 
-        // `type_check_only` is itself not available at runtime
-        if known_function == Some(KnownFunction::TypeCheckOnly) {
+        // `type_check_only` itself and supplied operation declarations are not runtime values.
+        if known_function == Some(KnownFunction::TypeCheckOnly)
+            || db.provided_function_type_check_only(definition)
+        {
             function_decorators |= FunctionDecorators::TYPE_CHECK_ONLY;
         }
 

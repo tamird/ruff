@@ -309,6 +309,17 @@ pub(crate) fn binding_type<'db>(db: &'db dyn Db, definition: Definition<'db>) ->
     inference.binding_type(definition)
 }
 
+#[salsa::tracked(returns(copy))]
+fn definition_is_in_type_checking_block<'db>(db: &'db dyn Db, definition: Definition<'db>) -> bool {
+    let file = definition.program_file(db);
+    let parsed = parsed_module(db, file.python_file(db));
+    let module = parsed.load(db);
+    semantic_index(db, file).is_in_type_checking_block(
+        definition.file_scope(db),
+        definition.full_range(db, &module).range(),
+    )
+}
+
 /// Returns whether a definition may represent a value that exists at runtime.
 ///
 /// Type-checking-only decorators and guards never represent runtime values. Private type-variable
@@ -328,10 +339,7 @@ pub(crate) fn may_exist_at_runtime<'db>(db: &'db dyn Db, definition: Definition<
     let module = parsed.load(db);
 
     // Definitions inside an `if TYPE_CHECKING` block are never available at runtime.
-    if semantic_index(db, file).is_in_type_checking_block(
-        definition.file_scope(db),
-        definition.full_range(db, &module).range(),
-    ) {
+    if definition_is_in_type_checking_block(db, definition) {
         return false;
     }
 
@@ -1312,6 +1320,10 @@ bitflags! {
         /// track the owned and inherited generic contexts separately in `Signature` and not
         /// preemptively merge them.
         const NO_INHERITED_GENERIC_CONTEXT = 1 << 6;
+
+        /// Exclude class declarations that only describe typing-time operations from runtime
+        /// attribute access. Implicit operations and annotations still use those declarations.
+        const RUNTIME_ATTRIBUTE = 1 << 7;
     }
 }
 
@@ -4312,7 +4324,7 @@ impl<'db> Type<'db> {
         {
             let interface = protocol.interface(db);
             return if interface.includes_member(db, name) {
-                interface.instance_member(db, env, name)
+                interface.instance_member_with_policy(db, env, name, policy)
             } else {
                 Type::instance(db, env, *origin).class_member_with_policy(db, env, name, policy)
             };
@@ -4329,9 +4341,9 @@ impl<'db> Type<'db> {
                 class::synthesized_typed_dict_class_member(db, env, synthesized, policy, name)
             }
             // TODO: Remove this once synthesized protocols have a precise meta-type.
-            Type::ProtocolInstance(protocol) if protocol.class_origin(db).is_none() => {
-                ty.instance_member(db, env, name)
-            }
+            Type::ProtocolInstance(protocol) if protocol.class_origin(db).is_none() => protocol
+                .interface(db)
+                .instance_member_with_policy(db, env, name, policy),
 
             Type::LiteralValue(literal)
                 if name == "__len__"
@@ -4340,7 +4352,16 @@ impl<'db> Type<'db> {
                         LiteralValueTypeKind::String(string) => Some(string.python_len(db)),
                         _ => None,
                     }
-                    && let Ok(length) = i64::try_from(length) =>
+                    && let Ok(length) = i64::try_from(length)
+                    && (!policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE)
+                        || ty
+                            .literal_fallback_instance(db, env)
+                            .is_some_and(|instance| {
+                                instance
+                                    .class_member_with_policy(db, env, name, policy)
+                                    .place
+                                    .is_definitely_bound()
+                            })) =>
             {
                 let parameters = Parameters::standard([Parameter::positional_only(Some(
                     Name::new_static("self"),
@@ -4692,12 +4713,22 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         name: &str,
     ) -> PlaceAndQualifiers<'db> {
+        self.instance_member_with_policy(db, env, name, MemberLookupPolicy::default())
+    }
+
+    fn instance_member_with_policy(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+        policy: MemberLookupPolicy,
+    ) -> PlaceAndQualifiers<'db> {
         match self {
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
             Type::Union(union) => union.map_with_boundness_and_qualifiers(db, env, |elem| {
-                elem.instance_member(db, env, name)
+                elem.instance_member_with_policy(db, env, name, policy)
             }),
 
             Type::Intersection(intersection) => {
@@ -4705,7 +4736,7 @@ impl<'db> Type<'db> {
                     enums::instance_member_for_enum_complement(db, env, complement, name)
                 } else {
                     intersection.map_with_boundness_and_qualifiers(db, env, |elem| {
-                        elem.instance_member(db, env, name)
+                        elem.instance_member_with_policy(db, env, name, policy)
                     })
                 }
             }
@@ -4716,7 +4747,7 @@ impl<'db> Type<'db> {
 
             Type::Recursive(recursive) => recursive
                 .unfold(db, env)
-                .map(|unfolded| unfolded.instance_member(db, env, name))
+                .map(|unfolded| unfolded.instance_member_with_policy(db, env, name, policy))
                 .unwrap_or(Place::bound(self).into()),
 
             Type::Dynamic(_) | Type::Divergent(_) | Type::Never => Place::bound(self).into(),
@@ -4726,69 +4757,71 @@ impl<'db> Type<'db> {
             }
             Type::NewTypeInstance(newtype) => newtype
                 .concrete_base_type(db)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
 
-            Type::ProtocolInstance(protocol) => protocol.instance_member(db, env, name),
+            Type::ProtocolInstance(protocol) => {
+                protocol.instance_member_with_policy(db, env, name, policy)
+            }
 
             Type::FunctionLiteral(function) => function
                 .runtime_class(db)
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
 
             Type::BoundMethod(_) => KnownClass::MethodType
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
             Type::KnownBoundMethod(method) => method
                 .class()
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
             Type::WrapperDescriptor(_) => KnownClass::WrapperDescriptorType
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
             Type::DataclassDecorator(_) => KnownClass::FunctionType
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
             Type::Callable(_) | Type::DataclassTransformer(_) => {
-                Type::object().instance_member(db, env, name)
+                Type::object().instance_member_with_policy(db, env, name, policy)
             }
 
             Type::TypeVar(bound_typevar) => {
                 match bound_typevar.require_bound_or_constraints(db, env) {
                     TypeVarBoundOrConstraints::UpperBound(bound) => {
-                        bound.instance_member(db, env, name)
+                        bound.instance_member_with_policy(db, env, name, policy)
                     }
                     TypeVarBoundOrConstraints::Constraints(constraints) => constraints
                         .map_with_boundness_and_qualifiers(db, env, |constraint| {
-                            constraint.instance_member(db, env, name)
+                            constraint.instance_member_with_policy(db, env, name, policy)
                         }),
                 }
             }
 
             Type::TypeIs(_) | Type::TypeGuard(_) => KnownClass::Bool
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
 
             Type::LiteralValue(literal) => literal
                 .fallback_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
 
             Type::AlwaysTruthy | Type::AlwaysFalsy | Type::TypeForm(_) => {
-                Type::object().instance_member(db, env, name)
+                Type::object().instance_member_with_policy(db, env, name, policy)
             }
             Type::ModuleLiteral(_) => KnownClass::ModuleType
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
 
             Type::SpecialForm(_) | Type::KnownInstance(_) => Place::Undefined.into(),
 
             Type::PropertyInstance(property) => property
                 .instance_class(db)
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
 
             Type::SlotDescriptor(_) => KnownClass::MemberDescriptorType
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
 
             // Note: `super(pivot, owner).__dict__` refers to the `__dict__` of the `builtins.super` instance,
             // not that of the owner.
@@ -4797,7 +4830,7 @@ impl<'db> Type<'db> {
             // refer to [`Type::member`] instead.
             Type::BoundSuper(_) => KnownClass::Super
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_policy(db, env, name, policy),
 
             // TODO: we currently don't model the fact that class literals and subclass-of types have
             // a `__dict__` that is filled with class level attributes. Modeling this is currently not
@@ -4809,7 +4842,9 @@ impl<'db> Type<'db> {
 
             Type::TypedDict(_) => Place::Undefined.into(),
 
-            Type::TypeAlias(alias) => alias.value_type(db).instance_member(db, env, name),
+            Type::TypeAlias(alias) => alias
+                .value_type(db)
+                .instance_member_with_policy(db, env, name, policy),
         }
     }
 
@@ -4827,15 +4862,19 @@ impl<'db> Type<'db> {
             module
                 .static_member(db, env, name)
                 .map_or(Place::Undefined, |member| member.member(db).place)
-        } else if let place @ Place::Defined(_) = self.class_member(db, env, name).place {
+        } else if let place @ Place::Defined(_) = self
+            .class_member_with_policy(db, env, name, MemberLookupPolicy::RUNTIME_ATTRIBUTE)
+            .place
+        {
             place
         } else if let Some(place @ Place::Defined(_)) = self
-            .find_name_in_mro(db, env, name)
+            .find_name_in_mro_with_policy(db, env, name, MemberLookupPolicy::RUNTIME_ATTRIBUTE)
             .map(|inner| inner.place)
         {
             place
         } else {
-            self.instance_member(db, env, name).place
+            self.instance_member_with_policy(db, env, name, MemberLookupPolicy::RUNTIME_ATTRIBUTE)
+                .place
         }
     }
 
@@ -5916,7 +5955,7 @@ impl<'db> Type<'db> {
                     .into();
                 }
 
-                let fallback = this.instance_member(db, env, name_str);
+                let fallback = this.instance_member_with_policy(db, env, name_str, key.policy(db));
 
                 let result = Type::invoke_descriptor_protocol(
                     db,
@@ -5953,6 +5992,18 @@ impl<'db> Type<'db> {
             let name = key.name(db);
             let name_str = name.as_str();
             let policy = key.policy(db);
+            let runtime_call_is_declared = |class: KnownClass| {
+                !policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE)
+                    || class
+                        .to_class_literal(db, env)
+                        .as_class_literal()
+                        .is_some_and(|class| {
+                            class
+                                .class_member(db, env, "__call__", policy)
+                                .place
+                                .is_definitely_bound()
+                        })
+            };
 
             tracing::trace!(
                 "member_lookup_with_policy: {}.{}",
@@ -6046,7 +6097,10 @@ impl<'db> Type<'db> {
                     ))
                     .into()
                 }
-                Type::FunctionLiteral(_) if name == "__call__" => {
+                Type::FunctionLiteral(function)
+                    if name == "__call__"
+                        && runtime_call_is_declared(function.runtime_class(db)) =>
+                {
                     Place::bound(Type::KnownBoundMethod(KnownBoundMethodType::DunderCall(
                         InternedType::new(db, this),
                     )))
@@ -6204,7 +6258,10 @@ impl<'db> Type<'db> {
                 }
                 Type::KnownInstance(KnownInstanceType::MethodWrapper(wrapper)) => match name_str {
                     "__func__" | "__wrapped__" => Place::bound(wrapper.wrapped(db)).into(),
-                    "__call__" if wrapper.class(db) == KnownClass::Staticmethod => {
+                    "__call__"
+                        if wrapper.class(db) == KnownClass::Staticmethod
+                            && runtime_call_is_declared(wrapper.class(db)) =>
+                    {
                         Place::bound(Type::KnownBoundMethod(KnownBoundMethodType::DunderCall(
                             InternedType::new(db, this),
                         )))
@@ -6217,10 +6274,12 @@ impl<'db> Type<'db> {
                         ),
                 },
                 Type::BoundMethod(bound_method) => match name_str {
-                    "__call__" => Place::bound(Type::KnownBoundMethod(
-                        KnownBoundMethodType::DunderCall(InternedType::new(db, this)),
-                    ))
-                    .into(),
+                    "__call__" if runtime_call_is_declared(KnownClass::MethodType) => {
+                        Place::bound(Type::KnownBoundMethod(KnownBoundMethodType::DunderCall(
+                            InternedType::new(db, this),
+                        )))
+                        .into()
+                    }
                     "__get__" if env.python_version(db) >= ast::PythonVersion::PY313 => {
                         Place::bound(Type::KnownBoundMethod(
                             KnownBoundMethodType::MethodTypeDunderGet(bound_method),
@@ -6261,14 +6320,34 @@ impl<'db> Type<'db> {
 
                 Type::Callable(callable)
                     if name_str == "__call__"
-                        && (callable.is_function_like(db) || callable.is_staticmethod_like(db)) =>
+                        && (callable.is_function_like(db) || callable.is_staticmethod_like(db))
+                        && runtime_call_is_declared(
+                            callable
+                                .runtime_class(db)
+                                .unwrap_or(KnownClass::FunctionType),
+                        ) =>
                 {
                     Place::bound(Type::KnownBoundMethod(KnownBoundMethodType::DunderCall(
                         InternedType::new(db, this),
                     )))
                     .into()
                 }
-                Type::Callable(_) | Type::DataclassTransformer(_) if name_str == "__call__" => {
+                // An abstract callable includes ordinary functions. It cannot promise a runtime
+                // `__call__` attribute when even the canonical function declaration omits it.
+                Type::Callable(callable)
+                    if name_str == "__call__"
+                        && runtime_call_is_declared(
+                            callable
+                                .runtime_class(db)
+                                .unwrap_or(KnownClass::FunctionType),
+                        ) =>
+                {
+                    Place::bound(this).into()
+                }
+                Type::DataclassTransformer(_)
+                    if name_str == "__call__"
+                        && runtime_call_is_declared(KnownClass::FunctionType) =>
+                {
                     Place::bound(this).into()
                 }
 
@@ -6633,7 +6712,7 @@ impl<'db> Type<'db> {
         if self.materialized_divergent_fallback().is_none() {
             if name == "__class__"
                 && ClassLiteral::object(db, env)
-                    .class_member(db, env, "__class__", MemberLookupPolicy::default())
+                    .class_member(db, env, "__class__", policy)
                     .place
                     .is_definitely_bound()
             {
