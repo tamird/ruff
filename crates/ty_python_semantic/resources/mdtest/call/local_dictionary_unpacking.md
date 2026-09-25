@@ -1,5 +1,76 @@
 # Dictionary keyword unpacking
 
+## Comprehension key domains
+
+A comprehension with a finite string key type restricts which parameters its values can supply.
+Iteration and filtering do not guarantee that any particular key is present. Ordinary dictionary
+type inference and assignability remain unchanged.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Literal
+
+def consume(value: int, enabled: bool = False): ...
+def pair(left: int, right: int, enabled: bool = False): ...
+def empty(): ...
+def variadic(**kwargs: int): ...
+def finite(flag: bool, rows: tuple[tuple[Literal["value"], int | None], ...]):
+    consume(**{key: 1 for key in ("value",)})
+    values = {key: 1 for key in ("value",)}
+    consume(**values)
+    pair(**{key: 1 for key in ("left", "right")})
+    consume(**{key: value for key, value in rows if value is not None})
+    consume(**{key: "bad" for key in ("value",)})  # error: [invalid-argument-type]
+    consume(**{key: 1 for key in ("other",)})  # error: [missing-argument]
+    empty(**{key: 1 for key in ("other",) if flag})
+    empty(**{key: 1 for key in ("other",) if False})
+    empty(**{key: 1 for key in ()})
+    variadic(**{key: "bad" for key in ("value",)})  # error: [invalid-argument-type]
+    mutable: dict[str, int] = {key: 1 for key in ("value",)}
+    mutable["other"] = 2
+
+type Key = Literal["value"]
+type Recursive = Literal["value"] | list[Recursive]
+
+def aliases(keys: list[Key], recursive: list[Recursive], unknown: list[Any], strings: list[str]):
+    consume(**{key: 1 for key in keys})
+    consume(**{key: 1 for key in recursive})  # error: [invalid-argument-type]
+    consume(**{key: 1 for key in unknown})  # error: [invalid-argument-type]
+    consume(**{key: 1 for key in strings})  # error: [invalid-argument-type]
+    consume(**{key: 1 for key in (0,)})  # error: [invalid-argument-type]
+```
+
+A bottom key or value type does not establish whether constructing a comprehension reaches its
+caller: an empty iterator or a filter can skip the body. Such comprehensions retain ordinary mapping
+argument inference, as do recursive results without a finite key type.
+
+```py
+from typing import Never
+
+def bottom_consume(value: int): ...
+def bottom_empty(): ...
+def stop() -> Never:
+    raise RuntimeError
+
+def impossible(rows: list[int]):
+    bottom_empty(**{stop(): 1 for _ in rows})
+    bottom_consume(**{stop(): 1 for _ in rows})
+    bottom_consume(**{stop(): 1 for _ in [0]})
+    bottom_empty(**{"value": stop() for _ in rows})
+    bottom_consume(**{"value": stop() for _ in rows})
+    bottom_consume(**{"value": stop() for _ in [0]})
+
+def loop_carried(flag: bool):
+    values = {"value": 1}
+    while flag:
+        values = {key: 1 for key in values}
+    consume(**values)  # error: [invalid-argument-type]
+```
+
 ## Literal spreads
 
 Dictionary literals retain each known key when unpacked at a call. Later entries replace earlier
