@@ -1,5 +1,109 @@
 # Comprehensions
 
+## Immediate dictionary snapshots
+
+Iterating an immediate `list(values.items())` snapshot can retain the dictionary's possible keys.
+The list's ordinary type is unchanged, and saved lists or live views retain ordinary iteration.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Never
+from typing_extensions import NotRequired, TypedDict
+
+def consume(value: int, enabled: bool = False): ...
+def immediate(value: int | None):
+    values = {"value": 1}
+    consume(**{key: value for key, value in list(values.items())})
+    snapshot = list
+    consume(**{key: value for key, value in snapshot(values.items())})
+    for key, item_value in list(values.items()):
+        reveal_type(key)  # revealed: Literal["value"]
+    for item in list(values.items()):
+        reveal_type(item)  # revealed: tuple[Literal["value"], int]
+    consume(**{item[0]: item[1] for item in list(values.items())})
+    consume(**{key: value for key, value in list({"value": 1}.items())})
+    optional = {"value": value}
+    consume(**{key: value for key, value in list(optional.items()) if value is not None})
+    mutable: list[tuple[str, int]] = list(values.items())
+    mutable.append(("other", 1))
+    consume(**{key: value for key, value in mutable})  # error: [invalid-argument-type]
+
+def snapshot_mutation():
+    values = {"value": 1}
+    for key, value in list(values.items()):
+        values["other"] = 2
+        reveal_type(key)  # revealed: Literal["value"]
+
+def live():
+    values = {"value": 1}
+    view = values.items()
+    values["enabled"] = 2
+    consume(**{key: value for key, value in view})  # error: [invalid-argument-type]
+    consume(**{key: value for key, value in values.items()})  # error: [invalid-argument-type]
+    method = values.items
+    consume(**{key: value for key, value in list(method())})  # error: [invalid-argument-type]
+
+def bad():
+    values = {"value": "bad"}
+    consume(**{key: value for key, value in list(values.items())})  # error: [invalid-argument-type]
+
+class Custom(dict[str, int]):
+    def items(self) -> Any:
+        return [("enabled", 1)]
+
+def shadow(list: Any):
+    values = {"value": "bad"}
+    consume(**{key: value for key, value in list(values.items())})
+
+def override(values: Custom):
+    consume(**{key: value for key, value in list(values.items())})
+
+def loop_carried(flag: bool):
+    values = {"value": 1}
+    while flag:
+        values = {key: value for key, value in list(values.items())}
+    consume(**values)  # error: [invalid-argument-type]
+
+def conditional(flag: bool):
+    values = {}
+    if flag:
+        values["value"] = 1
+    consume(**{key: value for key, value in list(values.items())})
+
+type Gone = Never
+
+class Excluded(TypedDict, closed=True):
+    value: int
+    ghost: NotRequired[Gone]
+
+def excluded(source: Excluded):
+    values = dict(source)
+    for key, value in list(values.items()):
+        reveal_type(key)  # revealed: Literal["value"]
+
+def malformed():
+    values = {"value": 1}
+    for item in list(values.items(1)):  # error: [too-many-positional-arguments]
+        reveal_type(item)  # revealed: tuple[str, int]
+    for item in list(values.items(), 1):  # error: [no-matching-overload]
+        reveal_type(item)  # revealed: _T@list
+
+def stop() -> Never:
+    raise RuntimeError
+
+def bottom_consume(ghost: int, value: int): ...
+def bottom_assigned():
+    values = {"ghost": stop(), "value": 1}
+    bottom_consume(**{key: value for key, value in list(values.items())})
+
+def bottom_immediate():
+    bottom_consume(**{key: value for key, value in list({"ghost": stop(), "value": 1}.items())})
+```
+
 ## Basic comprehensions
 
 ```py

@@ -12,6 +12,7 @@ use ruff_text_size::Ranged;
 
 use crate::Db;
 use crate::types::infer::{ExpressionInference, FrozenMap};
+use crate::types::iteration::refine_dict_snapshot_element_type;
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
 use crate::types::tuple::{
     ResizeTupleError, Tuple, TupleBuilder, TupleElement, TupleLength, TupleSpec,
@@ -106,7 +107,19 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                 let env = self.context.program_environment();
                 value_type
                     .try_iterate_with_mode(db, env, mode)
-                    .map(|tuple| tuple.homogeneous_element_type(db, env))
+                    .map(|tuple| {
+                        let element = tuple.homogeneous_element_type(db, env);
+                        refine_dict_snapshot_element_type(
+                            db,
+                            env,
+                            value.expression().scope(db),
+                            value_expr,
+                            element,
+                            mode,
+                            |expression| Some(value_inference.expression_type(expression)),
+                        )
+                        .unwrap_or(element)
+                    })
                     .unwrap_or_else(|err| {
                         err.report_diagnostic(
                             &self.context,
