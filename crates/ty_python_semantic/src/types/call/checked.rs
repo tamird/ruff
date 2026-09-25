@@ -1,11 +1,14 @@
 use ruff_python_ast::{self as ast, name::Name};
+use ruff_text_size::Ranged;
 use ty_python_core::ProgramFile;
 use ty_python_core::definition::Definition;
 
 use super::arguments::CallArgumentTypes;
 use super::{Binding, CallArguments};
 use crate::types::class::DynamicClassAnchor;
+use crate::types::typed_dict::extract_unpacked_typed_dict_from_value_type;
 use crate::types::{DictionaryItems, Type};
+use crate::{Db, ProgramEnvironment};
 
 /// Whether a checked parameter was supplied by one definite argument.
 pub enum CheckedArgument<'a, 'db> {
@@ -76,12 +79,39 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
     }
 
     /// Known entries of a definitely supplied dictionary argument.
-    pub fn dictionary_argument(&self, name: &str) -> Option<DictionaryItems<'db>> {
+    pub fn dictionary_argument(&self, db: &'db dyn Db, name: &str) -> Option<DictionaryItems<'db>> {
         let CheckedArgument::Value { ty, expression } = self.argument(name) else {
             return None;
         };
         let expression = expression?;
-        (self.dictionary_items)(expression, ty)
+        self.observed_dictionary_items(db, expression, ty)
+    }
+
+    /// Dictionary entries observed for an already inferred child expression of this call.
+    /// Optional entries and residual value bounds do not establish that a key is present.
+    pub fn dictionary_items(
+        &self,
+        db: &'db dyn Db,
+        expression: &ast::Expr,
+    ) -> Option<DictionaryItems<'db>> {
+        let ty = self.expression_type(expression)?;
+        self.observed_dictionary_items(db, expression, ty)
+    }
+
+    fn observed_dictionary_items(
+        &self,
+        db: &'db dyn Db,
+        expression: &ast::Expr,
+        ty: Type<'db>,
+    ) -> Option<DictionaryItems<'db>> {
+        (self.dictionary_items)(expression, ty).or_else(|| {
+            let env = ProgramEnvironment::from_file(self.file);
+            let unpacked = extract_unpacked_typed_dict_from_value_type(db, &env, ty)?;
+            Some(DictionaryItems::from_typed_dict(
+                unpacked,
+                expression.range(),
+            ))
+        })
     }
 
     fn argument_at(&self, parameter: usize) -> CheckedArgument<'a, 'db> {
