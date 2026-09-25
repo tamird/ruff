@@ -1890,4 +1890,47 @@ from typing import Final
 UNINITIALIZED: Final[int]  # error: [final-without-value]
 ```
 
+## Final attributes on composite receivers
+
+A union must permit the write on every alternative. A protocol intersection also retains the nominal
+receiver's final attribute contract, even if another component permits that write.
+
+```py
+from typing import Final, Protocol
+from typing_extensions import TypeIs
+
+class Fixed:
+    def __init__(self) -> None:
+        self.value: Final[int] = 1
+
+class Mutable:
+    value: int = 1
+
+class Marker(Protocol):
+    @property
+    def marker(self) -> bool: ...
+
+def has_marker(value: object) -> TypeIs[Marker]:
+    return True
+
+def composite(fixed: Fixed, either: Fixed | Mutable, mutable: Mutable) -> None:
+    fixed.value = 2  # error: [invalid-assignment]
+    either.value = 2  # error: [invalid-assignment]
+    if has_marker(fixed):
+        fixed.value = 2  # error: [invalid-assignment]
+    if has_marker(either):
+        either.value = 2  # error: [invalid-assignment]
+    if has_marker(mutable):
+        mutable.value = 2
+
+def delete(fixed: Fixed, either: Fixed | Mutable, mutable: Mutable) -> None:
+    del either.value  # error: [invalid-assignment]
+    if has_marker(fixed):
+        del fixed.value  # error: [invalid-assignment]
+    if has_marker(either):
+        del either.value  # error: [invalid-assignment]
+    if has_marker(mutable):
+        del mutable.value
+```
+
 [`typing.final`]: https://docs.python.org/3/library/typing.html#typing.Final
