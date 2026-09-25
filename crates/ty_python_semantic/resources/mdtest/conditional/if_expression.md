@@ -36,6 +36,42 @@ def _(flag: bool):
     reveal_type(x)  # revealed: Literal[1] | None
 ```
 
+## Empty collection peers
+
+A nonempty branch provides element types for an empty collection branch in either position.
+
+```py
+from typing import Any
+
+def _(flag: bool, opaque: list[Any]):
+    nonempty_first = ["x"] if flag else []
+    reveal_type(nonempty_first)  # revealed: list[str]
+
+    empty_first = [] if flag else ["x"]
+    reveal_type(empty_first)  # revealed: list[str]
+
+    both_empty = [] if flag else []
+    reveal_type(both_empty)  # revealed: list[Unknown]
+
+    opaque_peer = ["x"] if flag else opaque
+    reveal_type(opaque_peer)  # revealed: list[Any]
+
+    mixed = ["x"] if flag else [1]
+    reveal_type(mixed)  # revealed: list[int | str] | list[int]
+
+    mapping = {"x": 1} if flag else {}
+    reveal_type(mapping)  # revealed: dict[str, int]
+
+    reversed_mapping = {} if flag else {"x": 1}
+    reveal_type(reversed_mapping)  # revealed: dict[str, int]
+
+    explicit: list[object] = ["x"] if flag else []
+    reveal_type(explicit)  # revealed: list[object]
+
+    # error: [invalid-assignment]
+    incompatible: list[str] = [1] if flag else []
+```
+
 ## Statically known compound conditions
 
 Short-circuit conditions can select a single branch even when an operand has mutable truthiness.
