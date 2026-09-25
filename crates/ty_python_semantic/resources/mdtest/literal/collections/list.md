@@ -91,3 +91,44 @@ reveal_type(Foo().mylist)  # revealed: list[None | Unknown]
 ```py
 reveal_type([x for x in range(42)])  # revealed: list[int]
 ```
+
+## Non-generic protocol context
+
+A protocol can provide the element type of a list literal through its method contracts, including
+when the protocol itself has no type parameters.
+
+```py
+from typing import Protocol, TypeAlias, TypedDict
+
+class Row(TypedDict):
+    value: int
+
+class Rows(Protocol):
+    def __getitem__(self, index: int, /) -> Row: ...
+
+typed: list[Row] = [{"value": 1}]
+forwarded: Rows = typed
+literal: Rows = [{"value": 1}]
+
+Alias: TypeAlias = Rows
+aliased: Alias = [{"value": 1}]
+union: Rows | list[str] = [{"value": 1}]
+other_arm: Rows | list[str] = ["value"]
+
+# error: [invalid-assignment]
+# error: [invalid-argument-type]
+wrong: Rows = [{"value": "bad"}]
+# error: [invalid-assignment]
+# error: [missing-typed-dict-key]
+missing: Rows = [{}]
+# error: [invalid-assignment]
+# error: [invalid-key]
+hidden: Rows = [{"value": 1, "hidden": 2}]
+
+class KeywordRows(Protocol):
+    def __getitem__(self, index: int) -> Row: ...
+
+# The list does not accept an index supplied by keyword.
+# error: [invalid-assignment]
+keyword: KeywordRows = typed
+```
