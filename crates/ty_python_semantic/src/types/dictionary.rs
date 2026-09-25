@@ -7,6 +7,7 @@ use ty_python_core::semantic_index;
 
 use crate::reachability::ReachabilityEvaluationCache;
 use crate::types::call::collect_keyword_items;
+use crate::types::set_theoretic::UnionBuilder;
 use crate::types::typed_dict::{
     UnpackedTypedDict, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
 };
@@ -117,6 +118,48 @@ impl<'db> DictionaryItems<'db> {
     ) -> DictionaryObservation<'db> {
         match expression {
             ast::Expr::Dict(_) => Self::literal(db, env, scope, expression, expression_type),
+            ast::Expr::DictComp(comprehension) => {
+                let ast::ExprDictComp {
+                    node_index: _,
+                    range: _,
+                    key,
+                    value,
+                    generators: _,
+                } = comprehension;
+                let key = key.as_deref().ok_or(DictionaryFallback::Unavailable)?;
+                let key_ty = expression_type(key).ok_or(DictionaryFallback::Unavailable)?;
+                let value_ty = expression_type(value).ok_or(DictionaryFallback::Unavailable)?;
+                let resolved_value = value_ty.resolve_type_alias(db);
+                if resolved_value.is_never() || resolved_value.is_divergent() {
+                    // A bottom body can be skipped by an empty iterator or a filter. It does not
+                    // establish either an unreachable comprehension or a supplied keyword.
+                    return Err(DictionaryFallback::Unavailable);
+                }
+                let key_ty = UnionBuilder::new(db, env).add(key_ty).build();
+                let keys = match &key_ty {
+                    Type::Union(union) => union.elements(db),
+                    ty => std::slice::from_ref(ty),
+                };
+                let items = keys
+                    .iter()
+                    .map(|ty| {
+                        let name = ty
+                            .string_literal_value(db)
+                            .ok_or(DictionaryFallback::Unavailable)?;
+                        Ok(DictionaryItem {
+                            name: Name::new(name),
+                            ty: value_ty,
+                            // Iteration and filtering need not supply any particular key.
+                            kind: DictionaryItemKind::Residual,
+                            source: key.range(),
+                        })
+                    })
+                    .collect::<Result<_, DictionaryFallback>>()?;
+                Ok(Self {
+                    items,
+                    extra_items: DictionaryExtraItems::Closed,
+                })
+            }
             ast::Expr::Call(call) => {
                 let ast::ExprCall {
                     node_index: _,
