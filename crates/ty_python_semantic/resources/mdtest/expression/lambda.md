@@ -175,3 +175,153 @@ reveal_type(x.__kwdefaults__)  # revealed: dict[str, Any] | None
 reveal_type(x.__module__)  # revealed: str
 reveal_type(x.__qualname__)  # revealed: str
 ```
+
+## Named callback context
+
+A callback protocol supplies parameter hints while the lambda preserves its source parameter names
+and kinds and its inferred return type. Parameter names and arity remain part of compatibility.
+
+```py
+from typing import Protocol
+
+class Transform(Protocol):
+    def __call__(self, value: int) -> int: ...
+
+transform: Transform = lambda value: (reveal_type(value), value + 1)[1]  # revealed: int
+
+# error: [invalid-assignment]
+wrong_name: Transform = lambda other: 1
+# error: [invalid-assignment]
+wrong_arity: Transform = lambda: 1
+# error: [invalid-assignment]
+wrong_result: Transform = lambda value: "bad"
+```
+
+## Callback keyword parameters
+
+Keyword-only parameters receive context from the matching parameter name.
+
+```py
+from typing import Protocol
+
+class Named(Protocol):
+    def __call__(self, *, value: str) -> str: ...
+
+named: Named = lambda *, value: (reveal_type(value), value.upper())[1]  # revealed: str
+# error: [invalid-assignment]
+wrong_keyword: Named = lambda *, other: "ok"
+```
+
+## Callback defaults
+
+An optional callback parameter includes the lambda's actual default in its body input. A callback
+that ignores a string default can still return an integer. A required callback context restricts the
+inferred callable to calls that supply the argument.
+
+```py
+from typing import Callable, Protocol
+
+class OptionalInt(Protocol):
+    def __call__(self, value: int = ...) -> int: ...
+
+# error: [invalid-assignment]
+wrong_default_result: OptionalInt = lambda value="bad": value
+ignored_default: OptionalInt = lambda value="bad": 1
+valid_default: OptionalInt = lambda value=1: value
+# error: [invalid-assignment]
+missing_default: OptionalInt = lambda value: value
+
+class RequiredInt(Protocol):
+    def __call__(self, value: int) -> int: ...
+
+required_protocol: RequiredInt = lambda value="bad": value
+reveal_type(required_protocol(1))  # revealed: int
+# error: [missing-argument]
+required_protocol()
+
+def needs_int(value: int) -> int:
+    return value
+
+# The default is still checked even though contextual calls supply the argument.
+# error: [invalid-argument-type]
+checked_default: RequiredInt = lambda value=needs_int("bad"): value
+required_callable: Callable[[int], int] = lambda value="bad": value
+reveal_type(required_callable)  # revealed: (value: int) -> int
+reveal_type(required_callable(1))  # revealed: int
+# error: [missing-argument]
+reveal_type(required_callable())  # revealed: int
+
+gradual: Callable[..., int] = lambda value="bad": 1
+reveal_type(gradual())  # revealed: Literal[1]
+```
+
+## Callback variadic parameters
+
+A matching fixed positional prefix lets a homogeneous variadic parameter describe each remaining
+argument. The parameter's value in the body is a tuple.
+
+```py
+from typing import Protocol
+
+class Collect(Protocol):
+    def __call__(self, first: int, /, *attrs: str) -> tuple[str, ...]: ...
+
+collect: Collect = lambda first, *attrs: (
+    reveal_type(first),  # revealed: int
+    reveal_type(attrs),  # revealed: tuple[str, ...]
+    attrs,
+)[2]
+collect(1)
+collect(1, "a", "b")
+# error: [invalid-argument-type]
+collect(1, "a", 2)
+
+shifted: Collect = lambda *attrs: (reveal_type(attrs), attrs)[1]  # revealed: tuple[Unknown, ...]
+```
+
+## Generic callback context
+
+Specialized callback protocols and aliases preserve their parameter types. Multiple useful callback
+alternatives remain ambiguous.
+
+```py
+from typing import Protocol, TypeAlias, TypeVar
+
+T = TypeVar("T")
+
+class Identity(Protocol[T]):
+    def __call__(self, value: T) -> T: ...
+
+IntIdentity: TypeAlias = Identity[int]
+identity: IntIdentity | None = lambda value: (reveal_type(value), value)[1]  # revealed: int
+
+class AcceptInt(Protocol):
+    def __call__(self, value: int) -> object: ...
+
+class AcceptStr(Protocol):
+    def __call__(self, value: str) -> object: ...
+
+ambiguous: AcceptInt | AcceptStr = lambda value: reveal_type(value)  # revealed: Unknown
+```
+
+## Callback context selection
+
+Non-callable protocol alternatives do not obscure a useful callable context. Multiple overloads
+retain ordinary lambda inference.
+
+```py
+from typing import Callable, Protocol, overload
+
+class HasLength(Protocol):
+    def __len__(self) -> int: ...
+
+callback: Callable[[int], int] | HasLength = lambda value: (reveal_type(value), value)[1]  # revealed: int
+
+class Overloaded(Protocol):
+    @overload
+    def __call__(self, value: int) -> int: ...
+    @overload
+    def __call__(self, value: str) -> str: ...
+
+overloaded: Overloaded = lambda value: (reveal_type(value), value)[1]  # revealed: Unknown
+```
