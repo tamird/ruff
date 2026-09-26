@@ -2387,6 +2387,13 @@ impl<'db> Type<'db> {
         visitor::non_any_dynamic_content(db, env, self).is_absent()
     }
 
+    /// Whether the outermost type resolves to explicit `Any`.
+    ///
+    /// Aliases are resolved; `Unknown` and compound gradual types are excluded.
+    pub fn is_explicit_any(self, db: &'db dyn Db) -> bool {
+        self.resolve_type_alias(db) == Type::any()
+    }
+
     const fn as_intersection(self) -> Option<IntersectionType<'db>> {
         match self {
             Type::Intersection(intersection) => Some(intersection),

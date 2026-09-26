@@ -680,11 +680,13 @@ impl<'db> Type<'db> {
         is_redundant_with_impl(db, TypePair::new(db, program, self, other))
     }
 
-    /// Return `true` if `self` is redundant with `other` under the pure redundancy relation.
+    /// Whether adding `self` preserves both materialization bounds of `other`.
     ///
-    /// Unlike [`Self::is_redundant_with`], this does not apply shortcuts intended for simplifying
-    /// unions.
-    pub(super) fn is_pure_redundant_with(
+    /// For fully static types this is subtyping. For gradual types, the upper and lower
+    /// materializations of `self | other` must correspond to those of `other`. This uses
+    /// the pure relation without union-simplification shortcuts. Reflexivity includes
+    /// unresolved types, so the result does not establish that either type is complete.
+    pub fn is_pure_redundant_with(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,

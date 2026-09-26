@@ -174,7 +174,7 @@ impl<'db> ExpectedReturnType<'db> {
     /// A bare `Any` result has no output constraint. Other declared results require
     /// correspondence independently of the conservative view used to check operations.
     fn corresponds(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
-        self.public.resolve_type_alias(db) == Type::any()
+        self.public.is_explicit_any(db)
             || self.accepts(db, env, ty, TypeRelation::Redundancy { pure: true })
     }
 
@@ -323,7 +323,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         let corresponds = assignable
                             && (!(correspondence.is_some() || check_soundness)
                                 || (correspondence.is_some()
-                                    && expected_return_ty.resolve_type_alias(db) == Type::any())
+                                    && expected_return_ty.is_explicit_any(db))
                                 || return_statement.ty.is_pure_redundant_with(
                                     db,
                                     env,
@@ -357,7 +357,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     let implicit_none = can_implicitly_return_none(db, use_def);
                     if implicit_none && let Some(corresponds) = &mut correspondence {
-                        *corresponds &= expected_return_ty.resolve_type_alias(db) == Type::any()
+                        *corresponds &= expected_return_ty.is_explicit_any(db)
                             || Type::none(db, env).is_pure_redundant_with(
                                 db,
                                 env,
