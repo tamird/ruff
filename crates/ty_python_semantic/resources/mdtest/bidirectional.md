@@ -2990,6 +2990,21 @@ x24[1] = "b"
 reveal_type(x24)  # revealed: dict[int | str, str | int]
 ```
 
+## Repeated collection uses
+
+Every occurrence of an unannotated collection can supply type context, including multiple uses in
+one statement. The readonly first tuple element leaves the element type unconstrained; the mutable
+second element supplies `str`.
+
+```py
+from collections.abc import Sequence
+
+def repeated_return() -> tuple[Sequence[object], list[str]]:
+    values = []
+    reveal_type(values)  # revealed: list[str]
+    return values, values
+```
+
 ## Unconstrained collection use-sites
 
 Calling a method that does not constrain a collection's element type does not affect its inferred
