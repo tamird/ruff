@@ -2815,6 +2815,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 ClassBase::Dynamic(_) | ClassBase::Divergent(_) => match self.relation {
                     TypeRelation::Subtyping
                     | TypeRelation::Redundancy { .. }
+                    | TypeRelation::DeclaredOutput { .. }
                     | TypeRelation::SubtypingAssuming => {
                         ConstraintSet::from_bool(self.constraints, target.is_object(db))
                     }

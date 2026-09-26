@@ -171,11 +171,10 @@ impl<'db> ExpectedReturnType<'db> {
         Self { public, lexical }
     }
 
-    /// A bare `Any` result has no output constraint. Other declared results require
-    /// correspondence independently of the conservative view used to check operations.
+    /// Compare declared output constraints independently of the conservative view used
+    /// to check operations.
     fn corresponds(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
-        self.public.is_explicit_any(db)
-            || self.accepts(db, env, ty, TypeRelation::Redundancy { pure: true })
+        self.accepts(db, env, ty, TypeRelation::DeclaredOutput { strict: false })
     }
 
     /// Returns the externally-visible return type.
@@ -321,14 +320,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         let check_soundness =
                             self.should_check_return_soundness(expected_return_ty);
                         let corresponds = assignable
-                            && (!(correspondence.is_some() || check_soundness)
-                                || (correspondence.is_some()
-                                    && expected_return_ty.is_explicit_any(db))
-                                || return_statement.ty.is_pure_redundant_with(
+                            && if check_soundness {
+                                return_statement.ty.is_pure_redundant_with(
                                     db,
                                     env,
                                     expected_return_ty,
-                                ));
+                                )
+                            } else if correspondence.is_some() {
+                                return_statement.ty.satisfies_declared_output(
+                                    db,
+                                    env,
+                                    expected_return_ty,
+                                )
+                            } else {
+                                true
+                            };
                         if let Some(aggregate) = &mut correspondence
                             && self.context.is_range_reachable(return_statement.range)
                         {
@@ -359,12 +365,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     let implicit_none = can_implicitly_return_none(db, use_def);
                     if implicit_none && let Some(corresponds) = &mut correspondence {
-                        *corresponds &= expected_return_ty.is_explicit_any(db)
-                            || Type::none(db, env).is_pure_redundant_with(
-                                db,
-                                env,
-                                expected_return_ty,
-                            );
+                        *corresponds &= Type::none(db, env).satisfies_declared_output(
+                            db,
+                            env,
+                            expected_return_ty,
+                        );
                     }
                     if implicit_none
                         && !Type::none(db, env).is_assignable_to(db, env, expected_return_ty)
@@ -408,8 +413,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
                 let check_soundness = self.should_check_return_soundness(expected_return.public);
                 let corresponds = assignable
-                    && (!(correspondence.is_some() || check_soundness)
-                        || expected_return.corresponds(db, env, return_statement.ty));
+                    && if check_soundness {
+                        expected_return.accepts(
+                            db,
+                            env,
+                            return_statement.ty,
+                            TypeRelation::Redundancy { pure: true },
+                        )
+                    } else if correspondence.is_some() {
+                        expected_return.corresponds(db, env, return_statement.ty)
+                    } else {
+                        true
+                    };
                 if let Some(aggregate) = &mut correspondence
                     && self.context.is_range_reachable(return_statement.range)
                 {

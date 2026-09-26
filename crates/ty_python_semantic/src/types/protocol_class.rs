@@ -3044,7 +3044,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     ) else {
                         return self.never();
                     };
-                    let result = self.check_type_pair(db, target, source);
+                    let result = self.check_input_type_pair(db, target, source);
                     if let Some(context) = self.report_context()
                         && result.is_never_satisfied(db, env)
                     {

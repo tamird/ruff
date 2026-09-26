@@ -675,6 +675,172 @@ def collect(values: {annotation}) -> int:
 }
 
 #[test]
+fn declared_outputs_preserve_input_and_storage_domains() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, Concatenate, Generic, Protocol, TypeVar, TypedDict, cast
+        from typing_extensions import ReadOnly
+        from ty_extensions._internal import Unknown
+
+        def finite(value: int) -> int:
+            return value
+        def object_input(value: object) -> str:
+            return str(value)
+        def string_input(value: str) -> str:
+            return value
+        def wrong(value: int) -> str:
+            return str(value)
+        def unknown(value: int) -> Unknown:
+            return value
+        def only_strings(values: list[str]) -> int:
+            return len(values[0])
+        def higher(callback: Callable[..., int]) -> int:
+            return 1
+        def higher_return(value: int) -> Callable[[int], int]:
+            return finite
+        def missing_input(value) -> int:
+            value.missing()
+            return 1
+        class OpaqueInput:
+            def __call__(self, value) -> int:
+                value.missing()
+                return 1
+        def consume(callback: Callable[[Any], int]) -> int:
+            return callback(1)
+        opaque_input = cast(OpaqueInput, None)
+        nominal_input = cast(Callable[[OpaqueInput], int], None)
+        unknown_list = cast(list[Unknown], None)
+        any_list = cast(list[Any], None)
+        T_contra = TypeVar("T_contra", contravariant=True)
+        class Consumer(Generic[T_contra]):
+            pass
+        unknown_consumer = cast(Consumer[Unknown], None)
+        any_consumer = cast(Consumer[Any], None)
+        class UnknownWrite:
+            value: Unknown
+        class AnyWrite(Protocol):
+            value: Any
+        unknown_write = cast(UnknownWrite, None)
+        any_write = cast(AnyWrite, None)
+        class NamedRemainder(Protocol):
+            def __call__(self, *, name: str, **kwargs: Any) -> int: ...
+        named_remainder = cast(NamedRemainder, None)
+
+        class Actual:
+            @property
+            def opaque(self) -> Callable[[int], int]: ...
+        class Opaque(Protocol):
+            @property
+            def opaque(self) -> Callable[..., int]: ...
+        class MixedActual:
+            @property
+            def opaque(self) -> Callable[[int], int]: ...
+            @property
+            def checked(self) -> Callable[[list[str]], int]: ...
+        class Mixed(Protocol):
+            @property
+            def opaque(self) -> Callable[..., int]: ...
+            @property
+            def checked(self) -> Callable[[list[Any]], int]: ...
+        class MutableActual:
+            opaque: Callable[[int], int]
+        class Mutable(Protocol):
+            opaque: Callable[..., int]
+        class ActualFields(TypedDict):
+            value: str
+        class ReadFields(TypedDict):
+            value: ReadOnly[Any]
+        class WriteFields(TypedDict):
+            value: Any
+        actual_fields = cast(ActualFields, None)
+        read_fields = cast(ReadFields, None)
+        write_fields = cast(WriteFields, None)
+        class Missing:
+            pass
+        class AnyRead(Protocol):
+            @property
+            def value(self) -> Any: ...
+        class ActualRead:
+            @property
+            def value(self) -> str: ...
+        missing = cast(Missing, None)
+        any_read = cast(AnyRead, None)
+        actual_read = cast(ActualRead, None)
+        unavailable = cast(Unknown, None)
+        ellipsis = cast(Callable[..., int], None)
+        ellipsis_any = cast(Callable[..., Any], None)
+        ellipsis_unknown = cast(Callable[..., Unknown], None)
+        explicit_any_result = cast(Callable[[Any], Any], None)
+        explicit_any = cast(Callable[[Any], int], None)
+        explicit_list = cast(Callable[[list[Any]], int], None)
+        tuple_actual = (finite,)
+        tuple_target = cast(tuple[Callable[..., int]], None)
+        readonly_actual = cast(Actual, None)
+        readonly_target = cast(Opaque, None)
+        mixed_actual = cast(MixedActual, None)
+        mixed_target = cast(Mixed, None)
+        mutable_actual = cast(MutableActual, None)
+        mutable_target = cast(Mutable, None)
+        list_actual = cast(list[Callable[[int], int]], None)
+        list_target = cast(list[Callable[..., int]], None)
+        higher_target = cast(Callable[[Callable[[list[Any]], int]], int], None)
+        higher_return_target = cast(Callable[[int], Callable[..., int]], None)
+        prefix_target = cast(Callable[Concatenate[str, ...], int], None)
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let env = db.program_environment();
+    for (actual, target, expected) in [
+        ("missing_input", "explicit_any", false),
+        ("missing_input", "ellipsis", true),
+        ("opaque_input", "explicit_any", false),
+        ("consume", "nominal_input", false),
+        ("opaque_input", "opaque_input", true),
+        ("unknown_list", "any_list", false),
+        ("unknown_consumer", "any_consumer", false),
+        ("unknown_write", "any_write", false),
+        ("finite", "named_remainder", false),
+        ("actual_fields", "read_fields", true),
+        ("actual_fields", "write_fields", false),
+        ("finite", "ellipsis", true),
+        ("wrong", "ellipsis", false),
+        ("unknown", "ellipsis", false),
+        ("string_input", "ellipsis_any", true),
+        ("unknown", "ellipsis_any", true),
+        ("unavailable", "ellipsis_any", false),
+        ("string_input", "ellipsis_unknown", false),
+        ("object_input", "explicit_any_result", true),
+        ("string_input", "explicit_any_result", false),
+        ("finite", "explicit_any", false),
+        ("only_strings", "explicit_list", false),
+        ("tuple_actual", "tuple_target", true),
+        ("readonly_actual", "readonly_target", true),
+        ("mixed_actual", "mixed_target", false),
+        ("mutable_actual", "mutable_target", false),
+        ("list_actual", "list_target", false),
+        ("list_target", "list_target", true),
+        ("higher", "higher_target", false),
+        ("higher_return", "higher_return_target", true),
+        ("finite", "prefix_target", false),
+        ("actual_read", "any_read", true),
+        ("missing", "any_read", false),
+    ] {
+        let actual = global_symbol(&db, file, actual).place.expect_type();
+        let target = global_symbol(&db, file, target).place.expect_type();
+        assert_eq!(
+            actual.satisfies_declared_output(&db, &env, target),
+            expected,
+            "{} -> {}",
+            actual.display(&db, &env),
+            target.display(&db, &env),
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn function_output_correspondence() -> anyhow::Result<()> {
     let registry = crate::default_lint_registry();
     let mut rules = RuleSelection::from_registry(registry);
@@ -713,7 +879,7 @@ fn function_output_correspondence() -> anyhow::Result<()> {
         def scalar() -> Unrestricted:
             return 1
 
-        # Pure redundancy conservatively leaves this compatible nested result unproved.
+        # An explicit Any output omits a value constraint inside the callable too.
         def nested_output() -> Callable[[], Any]:
             return one
 
@@ -736,6 +902,10 @@ fn function_output_correspondence() -> anyhow::Result<()> {
             yield 1
             return only_strings
 
+        def generator_omitted() -> Generator[int, None, Callable[..., Any]]:
+            yield 1
+            return one
+
         def missing():
             return 1
         "#,
@@ -751,6 +921,7 @@ fn function_output_correspondence() -> anyhow::Result<()> {
         "mixed",
         "implicit",
         "generator",
+        "generator_omitted",
         "missing",
     ];
     let signatures = |db: &TestDb| {
@@ -773,7 +944,7 @@ fn function_output_correspondence() -> anyhow::Result<()> {
     };
     let ordinary = signatures(&db);
     assert_file_diagnostics(&db, "/src/main.py", &[]);
-    assert_eq!(correspondence(&db), [None; 10]);
+    assert_eq!(correspondence(&db), [None; 11]);
     db.select_function_inference(Some((
         file,
         names.map(str::to_owned).to_vec(),
@@ -786,12 +957,13 @@ fn function_output_correspondence() -> anyhow::Result<()> {
             Some(false),
             Some(true),
             Some(true),
-            Some(false),
-            Some(false),
             Some(true),
             Some(false),
             Some(true),
             Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
             None
         ]
     );
@@ -802,11 +974,11 @@ fn function_output_correspondence() -> anyhow::Result<()> {
         crate::FunctionInferenceMode::Conservative,
     )));
     assert_file_diagnostics(&db, "/src/main.py", &[]);
-    assert_eq!(correspondence(&db), [None; 10]);
+    assert_eq!(correspondence(&db), [None; 11]);
     assert_eq!(signatures(&db), ordinary);
     db.select_function_inference(None);
     assert_file_diagnostics(&db, "/src/main.py", &[]);
-    assert_eq!(correspondence(&db), [None; 10]);
+    assert_eq!(correspondence(&db), [None; 11]);
     assert_eq!(signatures(&db), ordinary);
     Ok(())
 }

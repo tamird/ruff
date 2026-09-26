@@ -698,6 +698,14 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         if let TypedDictType::Synthesized(synthesized_target) = target
             && synthesized_target.is_patch(db)
         {
+            if matches!(
+                self.relation,
+                TypeRelation::DeclaredOutput { strict: false }
+            ) {
+                return self
+                    .with_strict_inputs()
+                    .check_typeddict_pair(db, source, target);
+            }
             let source_items = source.items(db);
             let target_items = synthesized_target.items(db);
             let target_openness = synthesized_target.openness(db);
@@ -851,13 +859,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     // invariants of self. For fully-static types, this is "equivalence".
                     // For gradual types, it depends on the relation, but mutual
                     // assignability is "consistency".
-                    self.check_type_pair(
+                    self.check_input_type_pair(
                         db,
                         source_item_field.declared_ty,
                         target_item_field.declared_ty,
                     )
                     .and(db, self.constraints, || {
-                        self.check_type_pair(
+                        self.check_input_type_pair(
                             db,
                             target_item_field.declared_ty,
                             source_item_field.declared_ty,
@@ -917,13 +925,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 
                         // As above, for mutable fields in the target, the relation needs
                         // to apply both ways.
-                        self.check_type_pair(
+                        self.check_input_type_pair(
                             db,
                             source_item_field.declared_ty,
                             target_item_field.declared_ty,
                         )
                         .and(db, self.constraints, || {
-                            self.check_type_pair(
+                            self.check_input_type_pair(
                                 db,
                                 target_item_field.declared_ty,
                                 source_item_field.declared_ty,
@@ -937,13 +945,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                         if source_extra_items.is_read_only() {
                             return self.never();
                         }
-                        self.check_type_pair(
+                        self.check_input_type_pair(
                             db,
                             source_extra_items.declared_ty,
                             target_item_field.declared_ty,
                         )
                         .and(db, self.constraints, || {
-                            self.check_type_pair(
+                            self.check_input_type_pair(
                                 db,
                                 target_item_field.declared_ty,
                                 source_extra_items.declared_ty,
@@ -991,13 +999,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 result.intersect(
                     db,
                     self.constraints,
-                    self.check_type_pair(
+                    self.check_input_type_pair(
                         db,
                         source_extra_items.declared_ty,
                         target_extra_items.declared_ty,
                     )
                     .and(db, self.constraints, || {
-                        self.check_type_pair(
+                        self.check_input_type_pair(
                             db,
                             target_extra_items.declared_ty,
                             source_extra_items.declared_ty,
@@ -1012,13 +1020,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                         result.intersect(
                             db,
                             self.constraints,
-                            self.check_type_pair(
+                            self.check_input_type_pair(
                                 db,
                                 source_item_field.declared_ty,
                                 target_extra_items.declared_ty,
                             )
                             .and(db, self.constraints, || {
-                                self.check_type_pair(
+                                self.check_input_type_pair(
                                     db,
                                     target_extra_items.declared_ty,
                                     source_item_field.declared_ty,

@@ -16,7 +16,7 @@ use super::callable::CallableTypeKind;
 use super::class::FrozenDataclassDispatch;
 use super::constraints::{ConstraintSet, IteratorConstraintsExtension, OptionConstraintsExtension};
 use super::dedicated::pydantic;
-use super::relation::TypeRelationChecker;
+use super::relation::{TypeRelation, TypeRelationChecker};
 use super::{
     BindingContext, IntersectionType, KnownClass, KnownInstanceType, MemberLookupPolicy, Parameter,
     PropertyInstanceType, SelfBinding, Signature, Type, TypeContext, TypeMapping, TypeQualifiers,
@@ -1239,6 +1239,14 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         member_name: &str,
         value_ty: Type<'db>,
     ) -> ConstraintSet<'db, 'c> {
+        if matches!(
+            self.relation,
+            TypeRelation::DeclaredOutput { strict: false }
+        ) {
+            return self
+                .with_strict_inputs()
+                .check_attribute_write(db, ty, member_name, value_ty);
+        }
         let env = self.env;
         let requirement = attribute_write_requirement(db, env, ty, member_name);
         self.check_attribute_write_requirement(db, &requirement, member_name, value_ty)
