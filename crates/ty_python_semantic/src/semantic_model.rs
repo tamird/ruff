@@ -72,7 +72,8 @@ pub struct FunctionInferenceFacts {
     /// Positive explicit `Any` and bare callable ellipsis omit value and input-shape constraints.
     /// Input domains, writes, and invariant storage require known compared types and pure
     /// correspondence under their materialization.
-    /// `TypeIs` and `TypeGuard` normalization checks only their Boolean result.
+    /// Direct `TypeIs` and `TypeGuard` return annotations yield `None` because their narrowing
+    /// postconditions require additional proof.
     /// `None` means output checking was not selected or could not be completed.
     /// This fact does not establish operation safety, defaults, or complete body evidence.
     pub return_type_correspondence: Option<bool>,

@@ -1421,14 +1421,18 @@ fn function_output_correspondence() -> anyhow::Result<()> {
         Severity::Error,
         LintSource::File,
     );
-    let mut db = TestDbBuilder::new().with_rule_selection(rules).build()?;
+    let mut db = TestDbBuilder::new()
+        .with_rule_selection(rules)
+        .with_python_version(PythonVersion::PY313)
+        .build()?;
     db.write_dedented(
         "/src/main.py",
         r#"
-        from typing import Any, Callable, Generator, Protocol, Sequence, TypeAlias
+        from typing import Any, Callable, Generator, Protocol, Sequence, TypeAlias, TypeAliasType, TypeGuard, TypeIs
         from ty_extensions._internal import Unknown
 
         Unrestricted: TypeAlias = Any
+        StringGuard = TypeAliasType("StringGuard", TypeGuard[str])
 
         class Run(Protocol):
             def __call__(self, values: list[Any]) -> int: ...
@@ -1480,6 +1484,18 @@ fn function_output_correspondence() -> anyhow::Result<()> {
 
         def missing():
             return 1
+
+        def guard(value: object) -> TypeGuard[str]:
+            return True
+
+        def predicate(value: object) -> TypeIs[str]:
+            return False
+
+        def aliased_guard(value: object) -> StringGuard:
+            return True
+
+        def as_bool(value: object) -> bool:
+            return guard(value)
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -1495,6 +1511,10 @@ fn function_output_correspondence() -> anyhow::Result<()> {
         "generator",
         "generator_omitted",
         "missing",
+        "guard",
+        "predicate",
+        "aliased_guard",
+        "as_bool",
     ];
     let signatures = |db: &TestDb| {
         names.map(|name| {
@@ -1516,7 +1536,7 @@ fn function_output_correspondence() -> anyhow::Result<()> {
     };
     let ordinary = signatures(&db);
     assert_file_diagnostics(&db, "/src/main.py", &[]);
-    assert_eq!(correspondence(&db), [None; 11]);
+    assert_eq!(correspondence(&db), names.map(|_| None));
     db.select_function_inference(Some((
         file,
         names.map(str::to_owned).to_vec(),
@@ -1536,7 +1556,11 @@ fn function_output_correspondence() -> anyhow::Result<()> {
             Some(true),
             Some(false),
             Some(true),
-            None
+            None,
+            None,
+            None,
+            None,
+            Some(true),
         ]
     );
     assert_eq!(signatures(&db), ordinary);
@@ -1546,11 +1570,11 @@ fn function_output_correspondence() -> anyhow::Result<()> {
         crate::FunctionInferenceMode::Conservative,
     )));
     assert_file_diagnostics(&db, "/src/main.py", &[]);
-    assert_eq!(correspondence(&db), [None; 11]);
+    assert_eq!(correspondence(&db), names.map(|_| None));
     assert_eq!(signatures(&db), ordinary);
     db.select_function_inference(None);
     assert_file_diagnostics(&db, "/src/main.py", &[]);
-    assert_eq!(correspondence(&db), [None; 11]);
+    assert_eq!(correspondence(&db), names.map(|_| None));
     assert_eq!(signatures(&db), ordinary);
     Ok(())
 }
