@@ -1,10 +1,11 @@
 use std::fmt::Write;
 
+use ruff_db::diagnostic::{Annotation, DiagnosticId, Severity, Span};
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_db::system::DbWithWritableSystem as _;
-use ruff_text_size::{TextLen, TextRange};
+use ruff_text_size::{Ranged, TextLen, TextRange};
 
 use super::*;
 use crate::db::tests::{TestDb, TestDbBuilder};
@@ -17,6 +18,100 @@ use crate::types::{
     DictionaryItems, KnownClass, Parameter, Parameters, Signature,
 };
 use crate::{HasType, SemanticModel};
+
+crate::declare_lint! {
+    /// An obligation supplied by an application after checking a call.
+    static PROVIDED_CALL_CHECK = {
+        summary: "reports an application-specific call check",
+        status: crate::lint::LintStatus::stable("0.0.0"),
+        default_level: crate::lint::Level::Warn,
+    }
+}
+
+#[test]
+fn supplied_call_diagnostics_follow_native_policy() -> anyhow::Result<()> {
+    fn check<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
+        if call
+            .declaration()
+            .and_then(|definition| definition.name(db))
+            .as_deref()
+            != Some("make")
+        {
+            return ProvidedCallResult::default();
+        }
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticId::Lint(PROVIDED_CALL_CHECK.name()),
+            Severity::Warning,
+            "Application call obligation",
+        );
+        diagnostic.annotate(Annotation::primary(
+            Span::from(call.file().file(db)).with_range(call.call().range()),
+        ));
+        ProvidedCallResult {
+            return_type: None,
+            diagnostics: vec![diagnostic],
+        }
+    }
+
+    for (source, enabled, expected) in [
+        ("result = make(1)\n", true, vec!["provided-call-check"]),
+        (
+            "result = make('bad')\n",
+            true,
+            vec!["invalid-argument-type", "provided-call-check"],
+        ),
+        (
+            "result = make('bad')\n",
+            false,
+            vec!["invalid-argument-type"],
+        ),
+        (
+            "result = make(1) # ty: ignore[provided-call-check]\n",
+            true,
+            vec![],
+        ),
+        ("if False:\n    make(1)\nresult: int = 1\n", true, vec![]),
+        (
+            "from typing import no_type_check\n@no_type_check\ndef skipped() -> int:\n    return make(1)\nresult: int = 1\n",
+            true,
+            vec![],
+        ),
+    ] {
+        let mut registry =
+            crate::lint::LintRegistryBuilder::from(crate::default_lint_registry().clone());
+        registry.register_lint(&PROVIDED_CALL_CHECK);
+        let registry = registry.build();
+        let mut rules = crate::lint::RuleSelection::from_registry(&registry);
+        if !enabled {
+            rules.disable(registry.get("provided-call-check").unwrap());
+        }
+        let db = TestDbBuilder::new()
+            .with_lint_registry(registry)
+            .with_rule_selection(rules)
+            .with_call_result_provider(check)
+            .with_file("/src/native.pyi", "def make(value: int) -> int: ...\n")
+            .with_file(
+                "/src/main.py",
+                &format!("from native import make\n{source}"),
+            )
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let diagnostics = db.check_file(file);
+        let mut ids: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "{source}: {diagnostics:#?}");
+        let file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(file);
+        let result = crate::place::global_symbol(&db, file, "result")
+            .place
+            .expect_type();
+        assert_eq!(result, KnownClass::Int.to_instance(&db, &env), "{source}");
+    }
+    Ok(())
+}
 
 fn runtime_type_test<'db>(
     db: &'db TestDb,
@@ -292,7 +387,7 @@ target: Target | None
     let mut db = TestDbBuilder::new()
         .with_file("/src/native.pyi", &declarations)
         .with_file("/src/main.py", "")
-        .with_call_result_provider(field_implication_factory)
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     for (definition, setup, between, extra_errors) in [
@@ -415,7 +510,7 @@ fn supplied_field_implications_share_root_narrowing() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
         .with_file("/src/main.py", "")
-        .with_call_result_provider(field_implication_factory)
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     for (body, expected) in [
@@ -491,7 +586,7 @@ fn supplied_field_implications_require_storage() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
         .with_file("/src/main.py", "")
-        .with_call_result_provider(field_implication_factory)
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     for (definition, receiver, expected) in [
@@ -557,7 +652,7 @@ fn supplied_field_implications_invalidate_with_declarations() -> anyhow::Result<
     let mut db = TestDbBuilder::new()
         .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
         .with_file("/src/main.py", "")
-        .with_call_result_provider(field_implication_factory)
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     for (declaration, expected) in [
@@ -597,7 +692,7 @@ fn supplied_field_implications_keep_invalid_write_diagnostics() -> anyhow::Resul
     let mut db = TestDbBuilder::new()
         .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
         .with_file("/src/main.py", "")
-        .with_call_result_provider(field_implication_factory)
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     for assignment in [
@@ -638,7 +733,7 @@ while flag:
     let db = TestDbBuilder::new()
         .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
         .with_file("/src/main.py", source)
-        .with_call_result_provider(field_implication_factory)
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     let diagnostics = db.check_file(file);
@@ -679,7 +774,7 @@ def use() -> None:
     let db = TestDbBuilder::new()
         .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
         .with_file("/src/main.py", &source)
-        .with_call_result_provider(field_implication_factory)
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     let diagnostics = db.check_file(file);
@@ -748,7 +843,7 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
             "def observe(value: object) -> str: ...\n",
         )
         .with_file("/src/main.py", "")
-        .with_call_result_provider(observe)
+        .with_call_result_provider(|db, call| observe(db, call).into())
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     for (source, expected) in [
@@ -964,7 +1059,7 @@ fn setup(source: &str) -> anyhow::Result<TestDb> {
     TestDbBuilder::new()
         .with_file("/src/native.pyi", DECLARATIONS)
         .with_file("/src/main.py", source)
-        .with_call_result_provider(factory_result)
+        .with_call_result_provider(|db, call| factory_result(db, call).into())
         .build()
 }
 
@@ -1059,7 +1154,7 @@ fn supplied_instance_storage_shadows_inherited_defaults_but_not_data_descriptors
                 "/src/main.py",
                 "from native import make, make_open\nstored = make()\nresult = stored.value\nopened = make_open()\nopen_result = opened.value\n",
             )
-            .with_call_result_provider(derived_factory)
+            .with_call_result_provider(|db, call| derived_factory(db, call).into())
             .build()?;
         let file = system_path_to_file(&db, "/src/main.py")?;
         let diagnostics = db.check_file(file);
@@ -1242,7 +1337,7 @@ child_property: ChildProperty
 Derived(1)
 ",
             )
-            .with_call_result_provider(factory)
+            .with_call_result_provider(|db, call| factory(db, call).into())
             .build()?;
         let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
         let env = ProgramEnvironment::from_file(file);

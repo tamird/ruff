@@ -156,6 +156,25 @@ impl<'db> From<ProvidedBindingValue<'db>> for ProvidedBindingResolution<'db> {
     }
 }
 
+/// Result refinement and diagnostics supplied after ordinary call checking.
+///
+/// Hosted diagnostics are added to ordinary argument diagnostics; `return_type`
+/// optionally refines the inferred result.
+#[derive(Default)]
+pub struct ProvidedCallResult<'db> {
+    pub return_type: Option<Type<'db>>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl<'db> From<Option<Type<'db>>> for ProvidedCallResult<'db> {
+    fn from(return_type: Option<Type<'db>>) -> Self {
+        Self {
+            return_type,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
 impl<'db> CheckedCall<'_, 'db> {
     /// Creates a class whose nominal identity is anchored to this call in the original source.
     pub fn class_type(&self, db: &'db dyn Db, class: ProvidedClass<'db>) -> Type<'db> {
