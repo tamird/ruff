@@ -3083,6 +3083,101 @@ reveal_type(x32)  # revealed: list[Unknown]
 reveal_type(x33)  # revealed: list[Unknown]
 ```
 
+## Collection context through lambda captures
+
+A helper call in a lambda can constrain a collection in its enclosing function. The lambda's
+containing statement supplies the context, even when the callback is assigned before it is called.
+The collection's own elements still participate in inference and ordinary argument checking.
+
+```py
+def consume(values: list[str]) -> None: ...
+def assigned():
+    values = []
+    callback = lambda: consume(values)
+    reveal_type(values)  # revealed: list[str]
+    callback()
+
+def returned():
+    values = []
+    reveal_type(values)  # revealed: list[str]
+    return lambda: consume(values)
+
+def populated():
+    values = [1]
+    callback = lambda: consume(values)  # error: [invalid-argument-type]
+    reveal_type(values)  # revealed: list[str | int]
+```
+
+Each captured argument supplies context even when the same collection occurs twice in a call.
+
+```py
+from collections.abc import Sequence
+
+def consume_both(first: Sequence[object], second: list[str]) -> None: ...
+def repeated():
+    values = []
+    callback = lambda: consume_both(values, values)
+    reveal_type(values)  # revealed: list[str]
+```
+
+## Captured collection identity
+
+A later rebinding or a nonlocal write prevents a captured name from identifying one initializer.
+Such captures do not contribute element context to the original empty list.
+
+```py
+def consume(values: list[str]) -> None: ...
+def rebound():
+    values = []
+    initial = values
+    callback = lambda: consume(values)  # error: [invalid-argument-type]
+    values = 1
+    reveal_type(initial)  # revealed: list[Unknown]
+
+def nonlocal_write():
+    values = []
+    initial = values
+
+    def replace():
+        nonlocal values
+        values = [1]
+
+    callback = lambda: consume(values)  # error: [invalid-argument-type]
+    reveal_type(initial)  # revealed: list[Unknown]
+```
+
+## Captured collection context boundaries
+
+Only direct non-variadic arguments in lambda bodies contribute context. A shadowing parameter and a
+function default do not identify a supported capture in the containing statement.
+
+```py
+def consume(values: list[str]) -> None: ...
+def consume_all(*values: str) -> None: ...
+def consume_keywords(**values: str) -> None: ...
+def starred():
+    values = []
+    callback = lambda: consume_all(*values)
+    reveal_type(values)  # revealed: list[Unknown]
+
+def keywords():
+    values = {}
+    callback = lambda: consume_keywords(**values)
+    reveal_type(values)  # revealed: dict[Unknown, Unknown]
+
+def shadowed():
+    values = []
+    callback = lambda values: consume(values)
+    reveal_type(values)  # revealed: list[Unknown]
+
+def function_default():
+    values = []
+
+    def invoke(callback=lambda: consume(values)): ...
+
+    reveal_type(values)  # revealed: list[Unknown]
+```
+
 ## Repeated collection uses
 
 Every occurrence of an unannotated collection can supply type context, including multiple uses in

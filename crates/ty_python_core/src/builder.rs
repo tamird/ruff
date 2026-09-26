@@ -45,8 +45,8 @@ use crate::expression::{Expression, ExpressionContext, ExpressionKind};
 use crate::frozen::{FrozenMap, FrozenSet};
 use crate::member::MemberExprBuilder;
 use crate::place::{
-    PlaceExpr, PlaceTable, PlaceTableBuilder, PossiblyNarrowedPlacesBuilder, ScopedPlaceId,
-    match_subject_place_expressions,
+    PlaceExpr, PlaceExprRef, PlaceTable, PlaceTableBuilder, PossiblyNarrowedPlacesBuilder,
+    ScopedPlaceId, match_subject_place_expressions,
 };
 use crate::predicate::{
     CallableAndCallExpr, ClassPatternKeywordPredicateKind, ClassPatternPredicateKind,
@@ -67,11 +67,11 @@ use crate::statement::StatementInner;
 use crate::symbol::{ScopedSymbolId, Symbol};
 use crate::unpack::{Unpack, UnpackKind, UnpackPosition, UnpackValue};
 use crate::use_def::{
-    EnclosingSnapshotKey, FlowSnapshot, FutureDefinitions, ImportedQualifierAction, LiveBinding,
-    LiveBindingStatus, PreviousDefinitions, ScopedDefinitionId, ScopedEnclosingSnapshotId,
-    UseDefMapBuilder, UseDefMapInterner,
+    BindingWithConstraints, EnclosingSnapshotKey, FlowSnapshot, FutureDefinitions,
+    ImportedQualifierAction, LiveBinding, LiveBindingStatus, PreviousDefinitions,
+    ScopedDefinitionId, ScopedEnclosingSnapshotId, UseDefMapBuilder, UseDefMapInterner,
 };
-use crate::{Db, Statement, StatementNodeKey};
+use crate::{Db, EnclosingSnapshotResult, Statement, StatementNodeKey};
 use crate::{
     DefinitionsByNode, EvaluationMode, ExpressionsScopeMap, LoopHeader, LoopHeaderId,
     NarrowingAliasPredicate, PossiblyNarrowedPlaces, SemanticIndex, VisibleAncestorsIter,
@@ -295,10 +295,8 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     seen_submodule_imports: FxHashSet<String>,
     // A map from a lambda expression to its enclosing statement.
     enclosing_lambda_statements: FxHashMap<ExpressionNodeKey, Statement<'db>>,
-    // A map from a constraining use of a collection initializer to its definition.
-    collections_by_use: FxHashMap<ExpressionNodeKey, Definition<'db>>,
-    // A map from a collection initializer definition to statements containing a constraining use.
-    uses_by_collection: FxHashMap<Definition<'db>, Vec<(Statement<'db>, ExpressionNodeKey)>>,
+    /// Admitted collection uses, including captures resolved after enclosing scopes finish.
+    collection_uses: Vec<(Statement<'db>, CollectionUse<'db, 'ast>)>,
     /// Hashset of all [`FileScopeId`]s that correspond to [generator functions].
     ///
     /// [generator functions]: https://docs.python.org/3/glossary.html#term-generator
@@ -380,8 +378,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             condition_flow_snapshots_by_node: FxHashMap::default(),
             statements_by_node: FxHashMap::default(),
             enclosing_lambda_statements: FxHashMap::default(),
-            collections_by_use: FxHashMap::default(),
-            uses_by_collection: FxHashMap::default(),
+            collection_uses: Vec::new(),
 
             seen_submodule_imports: FxHashSet::default(),
             imported_modules: FxHashSet::default(),
@@ -3657,12 +3654,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         semantic_syntax_errors.shrink_to_fit();
         // Node indices follow source order, while semantic visitation may not.
         self.annotations.sort_unstable();
-        let uses_by_collection = FrozenMap::from_entries(
-            self.uses_by_collection
-                .into_iter()
-                .map(|(definition, uses)| (definition, uses.into_boxed_slice()))
-                .collect(),
-        );
+        let collection_uses = self.collection_uses;
 
         let mut use_def_map_interner = UseDefMapInterner::default();
         let mut interned_place_tables: FxHashMap<u64, SmallVec<[Arc<PlaceTable>; 1]>> =
@@ -3695,7 +3687,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             })
             .collect();
 
-        SemanticIndex {
+        let mut index = SemanticIndex {
             source_exclusions: self.source_exclusions,
             place_tables,
             scopes: self.scopes.into(),
@@ -3713,8 +3705,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 .map(|builder| use_def_map_interner.intern(builder.finish()))
                 .collect(),
             enclosing_lambda_statements: FrozenMap::from(self.enclosing_lambda_statements),
-            collections_by_use: FrozenMap::from(self.collections_by_use),
-            uses_by_collection,
+            collections_by_use: FrozenMap::default(),
+            uses_by_collection: FrozenMap::default(),
             imported_modules: FrozenSet::from(self.imported_modules),
             has_future_annotations: self.has_future_annotations,
             enclosing_snapshots: FrozenMap::from(self.enclosing_snapshots),
@@ -3723,7 +3715,36 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             async_comprehensions: FrozenSet::from(self.async_comprehensions),
             annotations: self.annotations.into_boxed_slice(),
             narrowing_alias_predicates: FrozenMap::from(self.alias_predicates),
+        };
+
+        // Captures use completed snapshots: later rebindings and nonlocal writes can change
+        // which initializer is visible after the lambda expression was visited.
+        let mut collections_by_use = FxHashMap::default();
+        let mut uses_by_collection: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        let mut collection_statements = FxHashSet::default();
+        for (statement, collection_use) in collection_uses {
+            let Some((definition, expression)) =
+                collection_use.resolve(self.db, self.module, &index, statement)
+            else {
+                continue;
+            };
+            collections_by_use.insert(expression, definition);
+            // Every expression supplies context, but each statement is queried only once.
+            if collection_statements.insert((definition, statement)) {
+                uses_by_collection
+                    .entry(definition)
+                    .or_default()
+                    .push((statement, expression));
+            }
         }
+        index.collections_by_use = FrozenMap::from(collections_by_use);
+        index.uses_by_collection = FrozenMap::from_entries(
+            uses_by_collection
+                .into_iter()
+                .map(|(definition, uses)| (definition, uses.into_boxed_slice()))
+                .collect(),
+        );
+        index
     }
 
     fn with_semantic_checker(&mut self, f: impl FnOnce(&mut SemanticSyntaxChecker, &Self)) {
@@ -3912,7 +3933,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         {
                             current_statement
                                 .collection_uses
-                                .push((collection_def, expr.into()));
+                                .push(CollectionUse::Resolved {
+                                    definition: collection_def,
+                                    expression: expr.into(),
+                                });
                         }
                     }
 
@@ -4039,20 +4063,30 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     func,
                     arguments,
                 } = call;
+                let scope = self.current_scope();
+                let in_lambda = self.scopes[scope].kind() == ScopeKind::Lambda;
                 if func.is_name_expr()
                     && let Some(statement) = self.current_statements.last_mut()
-                    && !statement.collection_uses.is_empty()
+                    && (in_lambda || !statement.collection_uses.is_empty())
                 {
-                    // Only these occurrences receive collection parameter context. Keep the
-                    // nomination local until the enclosing statement is admitted below.
-                    statement.collection_call_arguments.extend(
-                        arguments
-                            .iter_source_order()
-                            .filter(|argument| !argument.is_variadic())
-                            .map(ast::ArgOrKeyword::value)
-                            .filter(|value| value.is_name_expr())
-                            .map(ExpressionNodeKey::from),
-                    );
+                    // Only direct arguments receive collection parameter context. Captures
+                    // cannot be resolved until later bindings in the enclosing scope are known.
+                    for argument in arguments
+                        .iter_source_order()
+                        .filter(|argument| !argument.is_variadic())
+                    {
+                        let Some(name) = argument.value().as_name_expr() else {
+                            continue;
+                        };
+                        statement
+                            .collection_call_arguments
+                            .insert(argument.value().into());
+                        if in_lambda {
+                            statement
+                                .collection_uses
+                                .push(CollectionUse::Captured { scope, name });
+                        }
+                    }
                 }
                 self.record_exception_checkpoint();
                 self.record_contents_call(expr, call);
@@ -6063,65 +6097,79 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
         // on collection initializers. This restriction is mostly for performance reasons, as we
         // want to avoid "reads" of a collection contributing to the complexity of the cycles
         // created by full-scope collection inference.
-        current_statement
-            .collection_uses
-            .retain(|(_, use_expression)| {
-                match stmt {
-                    // A return involving the collection object.
-                    ruff_python_ast::Stmt::Return(_) => true,
-
-                    // A subscript assignment on the collection object.
-                    ruff_python_ast::Stmt::Assign(ast::StmtAssign { targets, .. }) => {
-                        match targets.as_slice() {
-                            [ast::Expr::Subscript(ast::ExprSubscript { value, .. })] => {
-                                ExpressionNodeKey::from(value) == *use_expression
-                            }
-                            _ => false,
-                        }
-                    }
-
-                    // An annotated assignment assigning the collection object to a new binding.
-                    ruff_python_ast::Stmt::AnnAssign(_) => true,
-
-                    // A bound method on the collection, or a function that receives it.
-                    ruff_python_ast::Stmt::Expr(statement) => {
-                        let ast::StmtExpr {
-                            node_index: _,
-                            range: _,
-                            value,
-                        } = statement;
-                        match value.as_ref() {
-                            ast::Expr::Call(call) => {
-                                let ast::ExprCall {
-                                    node_index: _,
-                                    range_start: _,
-                                    func,
-                                    arguments: _,
-                                } = call;
-                                match func.as_ref() {
-                                    ast::Expr::Attribute(attribute) => {
-                                        let ast::ExprAttribute {
-                                            node_index: _,
-                                            range: _,
-                                            value,
-                                            attr: _,
-                                            ctx: _,
-                                        } = attribute;
-                                        ExpressionNodeKey::from(value) == *use_expression
-                                    }
-                                    ast::Expr::Name(_) => current_statement
-                                        .collection_call_arguments
-                                        .contains(use_expression),
-                                    _ => false,
-                                }
-                            }
-                            _ => false,
-                        }
-                    }
-
-                    _ => false,
+        current_statement.collection_uses.retain(|collection_use| {
+            let use_expression = match collection_use {
+                CollectionUse::Resolved {
+                    definition: _,
+                    expression,
+                } => expression,
+                CollectionUse::Captured { scope: _, name: _ } => {
+                    // Header/default regions are inferred separately from their statements.
+                    return matches!(
+                        stmt,
+                        ast::Stmt::Assign(_)
+                            | ast::Stmt::AnnAssign(_)
+                            | ast::Stmt::Return(_)
+                            | ast::Stmt::Expr(_)
+                    );
                 }
-            });
+            };
+            match stmt {
+                // A return involving the collection object.
+                ruff_python_ast::Stmt::Return(_) => true,
+
+                // A subscript assignment on the collection object.
+                ruff_python_ast::Stmt::Assign(ast::StmtAssign { targets, .. }) => {
+                    match targets.as_slice() {
+                        [ast::Expr::Subscript(ast::ExprSubscript { value, .. })] => {
+                            ExpressionNodeKey::from(value) == *use_expression
+                        }
+                        _ => false,
+                    }
+                }
+
+                // An annotated assignment assigning the collection object to a new binding.
+                ruff_python_ast::Stmt::AnnAssign(_) => true,
+
+                // A bound method on the collection, or a function that receives it.
+                ruff_python_ast::Stmt::Expr(statement) => {
+                    let ast::StmtExpr {
+                        node_index: _,
+                        range: _,
+                        value,
+                    } = statement;
+                    match value.as_ref() {
+                        ast::Expr::Call(call) => {
+                            let ast::ExprCall {
+                                node_index: _,
+                                range_start: _,
+                                func,
+                                arguments: _,
+                            } = call;
+                            match func.as_ref() {
+                                ast::Expr::Attribute(attribute) => {
+                                    let ast::ExprAttribute {
+                                        node_index: _,
+                                        range: _,
+                                        value,
+                                        attr: _,
+                                        ctx: _,
+                                    } = attribute;
+                                    ExpressionNodeKey::from(value) == *use_expression
+                                }
+                                ast::Expr::Name(_) => current_statement
+                                    .collection_call_arguments
+                                    .contains(use_expression),
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    }
+                }
+
+                _ => false,
+            }
+        });
 
         if current_statement.lambda_expressions.is_empty()
             && current_statement.collection_uses.is_empty()
@@ -6143,25 +6191,13 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                 .map(|lambda| (lambda.into(), standalone_statement)),
         );
 
-        // The inferred element type of a collection initializer depends on uses of
-        // the collection in its containing scope, and so each use must be part
-        // of an standalone inferable statement to avoid large scope-level cycles.
-        let mut collection_defs = FxHashSet::default();
-        for (collection_def, use_expression) in current_statement.collection_uses {
-            self.collections_by_use
-                .insert(use_expression, collection_def);
-
-            // Every expression can contribute context, but the statement's constraints
-            // only need to be queried once for each collection.
-            if !collection_defs.insert(collection_def) {
-                continue;
-            }
-
-            self.uses_by_collection
-                .entry(collection_def)
-                .or_default()
-                .push((standalone_statement, use_expression));
-        }
+        // Keep the natural standalone statement for both local uses and deferred captures.
+        self.collection_uses.extend(
+            current_statement
+                .collection_uses
+                .into_iter()
+                .map(|collection_use| (standalone_statement, collection_use)),
+        );
     }
 
     fn visit_arguments(&mut self, arguments: &'ast ast::Arguments) {
@@ -6501,13 +6537,93 @@ impl CurrentAssignment<'_, '_> {
     }
 }
 
+/// Collection identity known at the read, or a lambda capture requiring completed snapshots.
+enum CollectionUse<'db, 'ast> {
+    Resolved {
+        definition: Definition<'db>,
+        expression: ExpressionNodeKey,
+    },
+    Captured {
+        scope: FileScopeId,
+        name: &'ast ast::ExprName,
+    },
+}
+
+impl<'db> CollectionUse<'db, '_> {
+    fn resolve(
+        self,
+        db: &'db dyn Db,
+        module: &ParsedModuleRef,
+        index: &SemanticIndex<'db>,
+        statement: Statement<'db>,
+    ) -> Option<(Definition<'db>, ExpressionNodeKey)> {
+        match self {
+            Self::Resolved {
+                definition,
+                expression,
+            } => Some((definition, expression)),
+            Self::Captured { scope, name } => {
+                let ast::ExprName {
+                    node_index: _,
+                    range: _,
+                    id,
+                    ctx: _,
+                } = name;
+                let owner = index.captured_binding_scope(scope, id, CaptureResolution::Lexical)?;
+                let statement_scope = match statement {
+                    Statement::Expression(expression) => expression.scope_id(db).file_scope_id(db),
+                    Statement::Definition(definition) => definition.file_scope(db),
+                    Statement::Other(statement) => statement.file_scope(db),
+                };
+                if owner == scope
+                    || index.scopes[owner].kind() != ScopeKind::Function
+                    || statement_scope != owner
+                {
+                    return None;
+                }
+                let table = index.place_table(owner);
+                let symbol = table.symbol_id(id)?;
+                let place = PlaceExprRef::Symbol(table.symbol(symbol));
+                let EnclosingSnapshotResult::FoundBindings(bindings) =
+                    index.enclosing_snapshot(owner, place, scope)
+                else {
+                    return None;
+                };
+                // Keep undefined, deleted, and non-collection alternatives until the singleton
+                // check. A single collection among several possible cell values is insufficient.
+                let binding = bindings
+                    .filter_map(
+                        |BindingWithConstraints {
+                             binding,
+                             binding_order: _,
+                             narrowing_constraint: _,
+                             reachability_constraint,
+                         }| {
+                            (reachability_constraint
+                                != ScopedReachabilityConstraintId::ALWAYS_FALSE)
+                                .then_some(binding)
+                        },
+                    )
+                    .exactly_one()
+                    .ok()?;
+                let DefinitionState::Defined(definition) = binding else {
+                    return None;
+                };
+                let assignment = definition.kind(db).as_unannotated_assignment()?;
+                is_collection_initializer(assignment.value(module))
+                    .then_some((definition, ast::ExprRef::Name(name).into()))
+            }
+        }
+    }
+}
+
 struct CurrentStatement<'ast, 'db> {
     node: &'ast ast::Stmt,
     contains_contents: bool,
     /// A list of lambda expressions contained in this statement.
     lambda_expressions: Vec<&'ast ast::ExprLambda>,
-    /// A list of collection definitions whose uses are contained in this statement.
-    collection_uses: Vec<(Definition<'db>, ExpressionNodeKey)>,
+    /// Collection uses and deferred lambda captures contained in this statement.
+    collection_uses: Vec<CollectionUse<'db, 'ast>>,
     /// Direct non-variadic name arguments to named calls within this statement.
     collection_call_arguments: FxHashSet<ExpressionNodeKey>,
 }

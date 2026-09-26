@@ -1381,6 +1381,49 @@ fn redundant_cast_without_closing_parenthesis() -> anyhow::Result<()> {
 }
 
 // Incremental inference tests
+#[test]
+fn captured_collection_context_after_rebinding() -> anyhow::Result<()> {
+    for query_order in [["initial", "callback"], ["callback", "initial"]] {
+        let mut db = setup_db();
+        for (rebind, expected) in [
+            ("", "list[str]"),
+            ("    values = [1]\n", "list[Unknown]"),
+            ("", "list[str]"),
+        ] {
+            let source = format!(
+                r#"def outer():
+    values = []
+    initial = values
+    callback = lambda: consume(values)
+{rebind}
+def consume(values: list[str]) -> None: ...
+"#
+            );
+            db.write_file("/src/main.py", &source)?;
+            for name in query_order {
+                let ty = get_symbol(&db, "/src/main.py", &["outer"], name).expect_type();
+                let expected = if name == "initial" {
+                    expected
+                } else {
+                    "() -> None"
+                };
+                assert_eq!(
+                    ty.display(&db, &db.program_environment()).to_string(),
+                    expected,
+                    "symbol {name}, query order {query_order:?}, rebind {rebind:?}",
+                );
+            }
+            let expected_diagnostics = if rebind.is_empty() {
+                &[][..]
+            } else {
+                &["Argument to function `consume` is incorrect"]
+            };
+            assert_file_diagnostics(&db, "/src/main.py", expected_diagnostics);
+        }
+    }
+    Ok(())
+}
+
 #[track_caller]
 fn first_public_binding<'db>(db: &'db TestDb, file: File, name: &str) -> Definition<'db> {
     let scope = global_scope(db, program_file(db, file));
