@@ -280,9 +280,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .return_ty;
             let expected_return = ExpectedReturnType::from_function(db, enclosing_function);
             let expected_ty = expected_return.public();
+            // Predicate postconditions require evidence beyond a Boolean result.
             let mut correspondence = (self.function_inference_mode
-                == crate::FunctionInferenceMode::OutputProof)
-                .then_some(true);
+                == crate::FunctionInferenceMode::OutputProof
+                && !matches!(
+                    declared_ty.resolve_type_alias(db),
+                    Type::TypeIs(_) | Type::TypeGuard(_)
+                ))
+            .then_some(true);
 
             let scope_id = self.index.node_scope(NodeWithScopeRef::Function(function));
             if scope_id.is_generator_function(self.index) {
