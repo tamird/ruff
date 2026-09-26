@@ -3021,3 +3021,21 @@ def check(setter: ConstrainedSetter) -> None:
     setter.value = b"wrong"  # error: [invalid-assignment]
     writable: HasValue = setter  # error: [invalid-assignment]
 ```
+
+## Inferring collection elements from another argument
+
+A generic function can constrain an unannotated collection through a separate value argument.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def append_value(values: list[T], value: T) -> None:
+    values.append(value)
+
+def infer_elements():
+    values = []
+    append_value(values, "value")
+    reveal_type(values)  # revealed: list[str]
+```

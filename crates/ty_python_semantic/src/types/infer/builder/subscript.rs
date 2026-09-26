@@ -1694,6 +1694,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .speculate_without_diagnostics()
                     .infer_and_check_argument_types(
                         ArgumentsIter::synthesized(&ast_arguments),
+                        &[],
                         &mut call_arguments,
                         &mut |builder, (_, expr, tcx)| {
                             // TODO: The argument types have already been inferred and stored in `call_arguments`.

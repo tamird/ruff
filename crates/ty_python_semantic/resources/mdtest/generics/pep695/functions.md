@@ -3680,5 +3680,19 @@ def check(setter: ConstrainedSetter) -> None:
     writable: HasValue = setter  # error: [invalid-assignment]
 ```
 
+## Inferring collection elements from another argument
+
+A generic function can constrain an unannotated collection through a separate value argument.
+
+```py
+def append_value[T](values: list[T], value: T) -> None:
+    values.append(value)
+
+def infer_elements():
+    values = []
+    append_value(values, "value")
+    reveal_type(values)  # revealed: list[str]
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

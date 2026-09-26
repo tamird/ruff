@@ -2795,15 +2795,24 @@ def _(flag: bool):
         reveal_type(x2)  # revealed: list[str]
 ```
 
+The declared parameter type of a function call provides type context for an unannotated collection,
+whether that collection is empty or already contains compatible elements:
+
 ```py
 def takes_list_int(x: list[int]): ...
+def takes_list_object(x: list[object]): ...
 
 x3 = []
 takes_list_int(x3)
-# TODO: This should reveal `list[int]`, but we do not currently record
-# argument constraints for arbitrary function calls.
-reveal_type(x3)  # revealed: list[Unknown]
+reveal_type(x3)  # revealed: list[int]
+
+def _(value: str):
+    x1 = [value]
+    takes_list_object(x1)
+    reveal_type(x1)  # revealed: list[object]
 ```
+
+A generic call can also infer the collection's element type from its other arguments:
 
 ```py
 def append[T](x: list[T], y: T):
@@ -2812,9 +2821,7 @@ def append[T](x: list[T], y: T):
 x4 = []
 append(x4, 1)
 append(x4, "2")
-# TODO: This should reveal `list[int | str]`, but we do not currently record
-# argument constraints for arbitrary function calls.
-reveal_type(x4)  # revealed: list[Unknown]
+reveal_type(x4)  # revealed: list[int | str]
 ```
 
 ```py
@@ -2990,6 +2997,92 @@ x24[1] = "b"
 reveal_type(x24)  # revealed: dict[int | str, str | int]
 ```
 
+A generic parameter constrains the collection regardless of argument order or whether it is passed
+by keyword:
+
+```py
+def append_value[T](value: T, values: list[T]): ...
+
+x25 = []
+append_value(1, x25)
+reveal_type(x25)  # revealed: list[int]
+
+x26 = []
+append(y="foo", x=x26)
+reveal_type(x26)  # revealed: list[str]
+```
+
+Existing elements remain in the inferred union when another argument introduces a different type:
+
+```py
+x27 = [0]
+append(x27, "foo")
+reveal_type(x27)  # revealed: list[str | int]
+```
+
+Only a matching overload may constrain the collection. An incompatible overload cannot introduce its
+element type into a populated collection or prevent another argument from constraining an empty one:
+
+```py
+from collections.abc import Iterable
+from typing import overload
+
+@overload
+def first(values: Iterable[str]) -> str: ...
+@overload
+def first[T: int](values: Iterable[T]) -> T: ...
+def first(values: object) -> object: ...
+
+x28 = [1]
+first(x28)
+reveal_type(x28)  # revealed: list[int]
+
+@overload
+def append_overload(values: list[str], value: str) -> None: ...
+@overload
+def append_overload[T: int](values: list[T], value: T) -> None: ...
+def append_overload(values: object, value: object) -> None: ...
+
+x29 = []
+append_overload(x29, 1)
+reveal_type(x29)  # revealed: list[int]
+```
+
+Literal arguments are promoted before they become context for a populated nested collection:
+
+```py
+def scale[T](values: list[list[T]], factor: T): ...
+
+x30 = [[1]]
+scale(x30, 2)
+reveal_type(x30)  # revealed: list[list[int]]
+```
+
+An explicitly annotated literal remains precise because its annotation prevents promotion:
+
+```py
+from typing import Literal
+
+value: Literal[1] = 1
+x31 = []
+append(x31, value)
+reveal_type(x31)  # revealed: list[Literal[1]]
+```
+
+Generic sibling inference currently requires a single unannotated collection argument:
+
+```py
+def append_both[T](left: list[T], right: list[T], value: T): ...
+
+x32 = []
+x33 = []
+append_both(x32, x33, 1)
+
+# TODO: Both collections should be inferred as `list[int]`.
+reveal_type(x32)  # revealed: list[Unknown]
+reveal_type(x33)  # revealed: list[Unknown]
+```
+
 ## Repeated collection uses
 
 Every occurrence of an unannotated collection can supply type context, including multiple uses in
@@ -3003,6 +3096,163 @@ def repeated_return() -> tuple[Sequence[object], list[str]]:
     values = []
     reveal_type(values)  # revealed: list[str]
     return values, values
+```
+
+## Repeated collection arguments
+
+Each occurrence supplies its declared parameter context. Generic sibling inference currently
+requires a single collection argument, so repeated generic arguments remain unspecialized.
+
+```py
+from collections.abc import Sequence
+
+def consumes(left: Sequence[object], right: list[str]) -> None: ...
+def repeated_concrete():
+    values = []
+    consumes(values, values)
+    reveal_type(values)  # revealed: list[str]
+
+def append_twice[T](left: list[T], right: list[T], value: T) -> None: ...
+def repeated_generic():
+    values = []
+    append_twice(values, values, 1)
+    reveal_type(values)  # revealed: list[Unknown]
+```
+
+## Generic collection return context
+
+Expected result types can constrain collection elements without using the collection argument's
+previous inferred type. An `object` result context supplies no element constraint, and provisional
+context from an enclosing generic call must not become a collection element type. Concrete result
+context can also constrain a sibling callback, whose result supplies the collection element type.
+
+```py
+from collections.abc import Callable
+
+def identity[T](values: list[T]) -> list[T]:
+    return values
+
+def consume_object(value: object) -> None: ...
+def consume_strings(value: list[str]) -> None: ...
+def broad_context():
+    values = []
+    consume_object(identity(values))
+    reveal_type(values)  # revealed: list[Unknown]
+
+def precise_context():
+    values = []
+    consume_strings(identity(values))
+    reveal_type(values)  # revealed: list[str]
+
+def nested_generic_context():
+    values = []
+    identity(identity(values))
+    reveal_type(values)  # revealed: list[Unknown]
+
+def through_callback[T, S](values: list[T], callback: Callable[[S], T]) -> S:
+    raise NotImplementedError
+
+def consume_string(value: str) -> None: ...
+def callback_context():
+    values = []
+    consume_string(through_callback(values, lambda value: value))
+    reveal_type(values)  # revealed: list[str]
+```
+
+## Forwarded collection argument context
+
+Forwarded `ParamSpec` arguments retain ordinary call checking. They currently supply no independent
+context for an unannotated collection initializer.
+
+```py
+from collections.abc import Callable
+
+def wrapper[**P, R](fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    return fn(*args, **kwargs)
+
+def consume_strings(values: list[str]) -> None: ...
+def forwarded_empty():
+    values = []
+    wrapper(consume_strings, values)
+    reveal_type(values)  # revealed: list[Unknown]
+
+def forwarded_nonempty():
+    values = [1]
+    wrapper(consume_strings, values)  # error: [invalid-argument-type]
+    reveal_type(values)  # revealed: list[int]
+
+def ordinary_forwarding():
+    wrapper(consume_strings, [1])  # error: [invalid-argument-type]
+```
+
+## Selected overload collection context
+
+An independent tag selects the applicable overload. Compatible candidates can agree on the same
+context; incompatible candidates leave an unannotated collection unspecialized.
+
+```py
+from typing import Literal, overload
+
+@overload
+def add[T](tag: Literal["generic"], values: list[T], item: T) -> None: ...
+@overload
+def add(tag: Literal["text"], values: list[str], item: str) -> None: ...
+def add(tag: str, values: object, item: object) -> None: ...
+def selected():
+    values = []
+    add("generic", values, 1)
+    reveal_type(values)  # revealed: list[int]
+
+def matching_contexts(tag: Literal["generic", "text"]):
+    values = []
+    add(tag, values, "a")
+    reveal_type(values)  # revealed: list[str]
+
+@overload
+def choose(tag: int, values: list[str]) -> None: ...
+@overload
+def choose(tag: str, values: list[int]) -> None: ...
+def choose(tag: object, values: object) -> None: ...
+def ambiguous(tag: int | str):
+    values = []
+    choose(tag, values)
+    reveal_type(values)  # revealed: list[Unknown]
+```
+
+## Collection call constraints preserve value checks
+
+Parameter context combines with literal elements and mutations. Incompatible values and conflicting
+consumers still report argument errors.
+
+```py
+def consume_ints(values: list[int]) -> None: ...
+def consume_strings(values: list[str]) -> None: ...
+def populated():
+    values = ["wrong"]
+    consume_ints(values)  # error: [invalid-argument-type]
+
+def mutated():
+    values = []
+    consume_ints(values)  # error: [invalid-argument-type]
+    values.append("wrong")
+
+def conflicting():
+    values = []
+    consume_ints(values)  # error: [invalid-argument-type]
+    consume_strings(values)  # error: [invalid-argument-type]
+```
+
+## Calls without collection element constraints
+
+Repeated length observations add no element information and leave the collection unspecialized.
+
+```py
+def length_only():
+    values = []
+    len(values)
+    len(values)
+    len(values)
+    reveal_type(values)  # revealed: list[Unknown]
 ```
 
 ## Unconstrained collection use-sites
