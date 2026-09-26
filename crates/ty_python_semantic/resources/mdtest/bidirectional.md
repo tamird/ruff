@@ -3108,6 +3108,37 @@ def populated():
     reveal_type(values)  # revealed: list[str | int]
 ```
 
+Eager comprehensions use the same context from direct calls and captured arguments. Their own keys
+and elements still constrain the resulting collection.
+
+```py
+def consume_map(values: dict[str, object]) -> None: ...
+def consume_list(values: list[object]) -> None: ...
+def consume_set(values: set[object]) -> None: ...
+def direct_comprehension(keys: list[str]):
+    values = {key: None for key in keys}
+    if values:
+        values["key"]
+    values.clear()
+    consume_map(values)
+    reveal_type(values)  # revealed: dict[str, object]
+
+def captured_comprehensions(keys: list[str]):
+    mapping = {key: None for key in keys}
+    sequence = [None for _ in keys]
+    unique = {None for _ in keys}
+    callback = lambda: (consume_map(mapping), consume_list(sequence), consume_set(unique))
+    reveal_type(mapping)  # revealed: dict[str, object]
+    reveal_type(sequence)  # revealed: list[object]
+    reveal_type(unique)  # revealed: set[object]
+
+def consume_strings(values: dict[str, str]) -> None: ...
+def incompatible_comprehension():
+    values = {key: 1 for key in [1]}
+    callback = lambda: consume_strings(values)  # error: [invalid-argument-type]
+    reveal_type(values)  # revealed: dict[str | int, str | int]
+```
+
 Each captured argument supplies context even when the same collection occurs twice in a call.
 
 ```py
@@ -3144,6 +3175,18 @@ def nonlocal_write():
 
     callback = lambda: consume(values)  # error: [invalid-argument-type]
     reveal_type(initial)  # revealed: list[Unknown]
+```
+
+Rebinding a captured comprehension also prevents it from supplying context to the original value.
+
+```py
+def consume_map(values: dict[str, object]) -> None: ...
+def rebound_comprehension(keys: list[str]):
+    values = {key: None for key in keys}
+    initial = values
+    callback = lambda: consume_map(values)  # error: [invalid-argument-type]
+    values = 1
+    reveal_type(initial)  # revealed: dict[str, None | Unknown]
 ```
 
 ## Captured collection context boundaries
