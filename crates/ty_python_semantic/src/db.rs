@@ -77,6 +77,17 @@ pub trait Db: PythonCoreDb {
         None
     }
 
+    /// Whether a factory stores direct named keyword arguments unchanged in same-named
+    /// readable result fields.
+    ///
+    /// This declaration fact lets ordinary argument inference use the corresponding readonly
+    /// property of an expected protocol as context. It does not supply the actual result type
+    /// or replace argument checking. Implementations must identify the resolved declaration
+    /// and read tracked inputs without inferring its body or the calling scope.
+    fn provided_keyword_field_factory(&self, _definition: Definition<'_>) -> bool {
+        false
+    }
+
     /// Whether a supplied `__getattr__` declaration bounds the values of existing members
     /// without guaranteeing that the requested member exists.
     ///
@@ -250,6 +261,7 @@ pub(crate) mod tests {
         call_result_provider: Option<CallResultProvider>,
         type_test_provider: Option<TypeTestProvider>,
         getattr_presence_provider: Option<DeclarationPredicate>,
+        keyword_field_factory: Option<DeclarationPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
@@ -279,6 +291,7 @@ pub(crate) mod tests {
                 call_result_provider: None,
                 type_test_provider: None,
                 getattr_presence_provider: None,
+                keyword_field_factory: None,
                 source_provider: None,
             };
             db.global_read_selection = Some(GlobalReadSelection::new(&db, None));
@@ -437,6 +450,11 @@ pub(crate) mod tests {
                 .and_then(|provider| provider(self, call))
         }
 
+        fn provided_keyword_field_factory(&self, definition: Definition<'_>) -> bool {
+            self.keyword_field_factory
+                .is_some_and(|provider| provider(self, definition))
+        }
+
         fn provided_getattr_may_be_missing(&self, definition: Definition<'_>) -> bool {
             self.getattr_presence_provider
                 .is_some_and(|provider| provider(self, definition))
@@ -540,6 +558,7 @@ pub(crate) mod tests {
         call_result_provider: Option<CallResultProvider>,
         type_test_provider: Option<TypeTestProvider>,
         getattr_presence_provider: Option<DeclarationPredicate>,
+        keyword_field_factory: Option<DeclarationPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
@@ -557,6 +576,7 @@ pub(crate) mod tests {
                 call_result_provider: None,
                 type_test_provider: None,
                 getattr_presence_provider: None,
+                keyword_field_factory: None,
                 source_provider: None,
             }
         }
@@ -604,6 +624,11 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_keyword_field_factory(mut self, provider: DeclarationPredicate) -> Self {
+            self.keyword_field_factory = Some(provider);
+            self
+        }
+
         pub(crate) fn with_getattr_presence_provider(
             mut self,
             provider: DeclarationPredicate,
@@ -640,6 +665,7 @@ pub(crate) mod tests {
             db.call_result_provider = self.call_result_provider;
             db.type_test_provider = self.type_test_provider;
             db.getattr_presence_provider = self.getattr_presence_provider;
+            db.keyword_field_factory = self.keyword_field_factory;
             db.source_provider = self.source_provider;
 
             if let Some(registry) = self.lint_registry {
