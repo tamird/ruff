@@ -296,8 +296,9 @@ def _(x: dict[str, int | str]):
     # error: [invalid-argument-type]
     f1(**x)
 
+    # A dictionary parameter can be a subclass whose __setitem__ does not store this value.
     x["a"] = 1
-    f1(**x)  # ok
+    f1(**x)  # error: [invalid-argument-type]
 
 def _(x: dict[str, int | str], flag: bool):
     if flag:

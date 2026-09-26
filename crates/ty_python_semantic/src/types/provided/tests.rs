@@ -888,6 +888,22 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
             "complete; x: Literal[2] at key",
         ),
         (
+            "class Child(dict[str, int]):\n    def clear(self) -> None: pass\ndef extra() -> dict[str, int]: return Child(kept=1)\nvalues = extra()\nvalues.clear()\nresult = observe(values)",
+            "unavailable",
+        ),
+        (
+            "def extra() -> dict[str, int]: return {}\nvalues: dict[str, int] = extra()\nalias = values\nalias.clear()\nresult = observe(alias)",
+            "unavailable",
+        ),
+        (
+            "def extra() -> dict[str, int]: return {}\nvalues = {'x': 1}\nif bool(input()):\n    values = extra()\nvalues.clear()\nresult = observe(values)",
+            "unavailable",
+        ),
+        (
+            "values = {'x': 1}\nalias = values\nalias['y'] = 2\nresult = observe(alias)",
+            "extra: Unknown; x~: Literal[1] at 'x'; y~: Literal[2] at 'y'",
+        ),
+        (
             "values = {'x': 1}\nresult = observe(values)",
             "complete; x: Literal[1] at 'x'",
         ),
@@ -956,37 +972,59 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
             .expect_type();
         assert_eq!(result.string_literal_value(&db), Some(expected), "{source}");
     }
-    db.write_file("/src/main.py", "from native import observe\ndef nested():\n    values = {'inner': 1}\n    values['second'] = 2\n    return observe(values)\nannotation: \"{'key': int}\"\n")?;
-    let file = db.program_file(file);
-    let model = SemanticModel::new(&db, file);
-    let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
-    let [
-        ast::Stmt::ImportFrom(_),
-        ast::Stmt::FunctionDef(function),
-        ast::Stmt::AnnAssign(annotation),
-    ] = parsed.suite().as_slice()
-    else {
-        panic!("expected nested function and annotation");
-    };
-    let ast::Stmt::Return(statement) = function.body.last().unwrap() else {
-        panic!("expected return");
-    };
-    let ast::Expr::Call(call) = statement.value.as_deref().unwrap() else {
-        panic!("expected observe call");
-    };
-    let [argument] = call.arguments.args.as_ref() else {
-        panic!("expected one dictionary argument");
-    };
-    let entries = model.dictionary_items(argument).unwrap();
-    assert_eq!(
-        describe(&db, file, entries),
-        ast::ExprRef::Call(call).inferred_type(&model).unwrap(),
-    );
-    let ast::Expr::StringLiteral(annotation) = annotation.annotation.as_ref() else {
-        panic!("expected string annotation");
-    };
-    let (parsed, detached) = model.enter_string_annotation(annotation).unwrap();
-    assert!(detached.dictionary_items(&parsed.syntax().body).is_none());
+    for (source, expected) in [
+        (
+            "def nested():\n    values = {'inner': 1}\n    values['second'] = 2\n    return observe(values)",
+            "complete; inner: Literal[1] at 'inner'; second: Literal[2] at 'second'",
+        ),
+        (
+            "def merge(**values: int):\n    values['added'] = 1\n    return observe(values)",
+            "extra: int; added~: Literal[1] at 'added'",
+        ),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!("from native import observe\n{source}\nannotation: \"{{'key': int}}\"\n"),
+        )?;
+        let file = db.program_file(file);
+        let model = SemanticModel::new(&db, file);
+        let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
+        let [
+            ast::Stmt::ImportFrom(_),
+            ast::Stmt::FunctionDef(function),
+            ast::Stmt::AnnAssign(annotation),
+        ] = parsed.suite().as_slice()
+        else {
+            panic!("expected nested function and annotation");
+        };
+        let ast::Stmt::Return(statement) = function.body.last().unwrap() else {
+            panic!("expected return");
+        };
+        let ast::Expr::Call(call) = statement.value.as_deref().unwrap() else {
+            panic!("expected observe call");
+        };
+        let [argument] = call.arguments.args.as_ref() else {
+            panic!("expected one dictionary argument");
+        };
+        let entries = model.dictionary_items(argument).map_or_else(
+            || Type::string_literal(&db, "unavailable"),
+            |entries| describe(&db, file, entries),
+        );
+        assert_eq!(
+            entries.string_literal_value(&db),
+            Some(expected),
+            "{source}"
+        );
+        assert_eq!(
+            entries,
+            ast::ExprRef::Call(call).inferred_type(&model).unwrap(),
+        );
+        let ast::Expr::StringLiteral(annotation) = annotation.annotation.as_ref() else {
+            panic!("expected string annotation");
+        };
+        let (parsed, detached) = model.enter_string_annotation(annotation).unwrap();
+        assert!(detached.dictionary_items(&parsed.syntax().body).is_none());
+    }
     Ok(())
 }
 

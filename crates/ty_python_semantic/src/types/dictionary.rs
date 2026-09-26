@@ -17,8 +17,8 @@ use crate::{Db, FxIndexMap};
 pub(crate) mod contents;
 pub(crate) mod records;
 
-/// Different invariant dictionary specializations still have the same runtime behavior.
-fn is_exact_dict(db: &dyn Db, ty: Type<'_>) -> bool {
+/// The nominal type is `dict`; runtime subclasses can still override its operations.
+fn has_dict_type(db: &dyn Db, ty: Type<'_>) -> bool {
     let is_instance = |ty: Type<'_>| {
         ty.as_nominal_instance()
             .is_some_and(|instance| instance.has_known_class(db, KnownClass::Dict))
@@ -263,6 +263,16 @@ impl<'db> DictionaryItems<'db> {
             // Unsupported literals decline atomically; unreachable operands stay unreachable.
             return observed;
         }
+        Self::unpacked_value(db, env, scope, expression, expression_type)
+    }
+
+    fn unpacked_value(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
+        expression: &ast::Expr,
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+    ) -> DictionaryObservation<'db> {
         let ty = expression_type(expression).ok_or(DictionaryFallback::Unavailable)?;
         let index = semantic_index(db, scope.program_file(db));
         let cache = ReachabilityEvaluationCache::new(

@@ -335,6 +335,7 @@ fn element_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         let next = MappingContents {
             file,
             dictionary,
+            builtin: true,
             exposed: false,
             value_bound: None,
         };
@@ -455,7 +456,7 @@ pub(crate) fn item_type<'db>(
     receiver_type: Type<'db>,
     reachability: &crate::reachability::ReachabilityEvaluationCache<'db>,
 ) -> Option<Type<'db>> {
-    if !super::is_exact_dict(db, receiver_type) {
+    if !super::has_dict_type(db, receiver_type) {
         return None;
     }
     let key = subscript.slice.as_string_literal_expr()?.value.to_str();
