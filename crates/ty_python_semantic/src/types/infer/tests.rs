@@ -240,6 +240,7 @@ fn function_inference_facts() -> anyhow::Result<()> {
     ] {
         let definition = first_public_binding(&db, file, name);
         let crate::FunctionInferenceFacts {
+            return_type_correspondence: _,
             has_cycle_recovery,
             has_errors,
             has_diagnostics_or_suppressions,
@@ -355,7 +356,11 @@ fn conservative_global_inputs() -> anyhow::Result<()> {
     ]
     .map(str::to_owned)
     .to_vec();
-    db.select_conservative_global_reads(Some((file, selected)));
+    db.select_function_inference(Some((
+        file,
+        selected,
+        crate::FunctionInferenceMode::Conservative,
+    )));
     let diagnostics = check_types(&db, program_file(&db, file));
     let selected_out = local_type(&db, "out");
     let selected_fresh = local_type(&db, "fresh");
@@ -401,10 +406,147 @@ fn conservative_global_inputs() -> anyhow::Result<()> {
             .to_string(),
         "list[Any]"
     );
-    db.select_conservative_global_reads(None);
+    db.select_function_inference(None);
     assert_file_diagnostics(&db, "/src/main.py", &[]);
     assert_eq!(signature(&db), original_signature);
     assert_eq!(local_type(&db, "out"), "list[Any]");
+    Ok(())
+}
+
+#[test]
+fn function_output_correspondence() -> anyhow::Result<()> {
+    let registry = crate::default_lint_registry();
+    let mut rules = RuleSelection::from_registry(registry);
+    rules.enable(
+        registry.get("unsound-return-statement")?,
+        Severity::Error,
+        LintSource::File,
+    );
+    let mut db = TestDbBuilder::new().with_rule_selection(rules).build()?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, Generator, Protocol, Sequence, TypeAlias
+        from ty_extensions._internal import Unknown
+
+        Unrestricted: TypeAlias = Any
+
+        class Run(Protocol):
+            def __call__(self, values: list[Any]) -> int: ...
+
+        def only_strings(values: list[str]) -> int:
+            return len(values[0])
+
+        def length(values: Sequence[object]) -> int:
+            return len(values)
+
+        def one() -> int:
+            return 1
+
+        def unsafe() -> Run:
+            return only_strings
+
+        def safe() -> Run:
+            return length
+
+        def scalar() -> Unrestricted:
+            return 1
+
+        # Pure redundancy conservatively leaves this compatible nested result unproved.
+        def nested_output() -> Callable[[], Any]:
+            return one
+
+        def unknown() -> Unknown:
+            return 1
+
+        def declared() -> Run:
+            return length
+
+        def forwarded() -> Run:
+            return declared()
+
+        def mixed(flag: bool) -> Run:
+            return declared() if flag else only_strings
+
+        def implicit() -> Any:
+            pass
+
+        def generator() -> Generator[int, None, Run]:
+            yield 1
+            return only_strings
+
+        def missing():
+            return 1
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let names = [
+        "unsafe",
+        "safe",
+        "scalar",
+        "nested_output",
+        "unknown",
+        "forwarded",
+        "mixed",
+        "implicit",
+        "generator",
+        "missing",
+    ];
+    let signatures = |db: &TestDb| {
+        names.map(|name| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let correspondence = |db: &TestDb| {
+        let model = crate::SemanticModel::new(db, program_file(db, file));
+        names.map(|name| {
+            model
+                .function_inference_facts(first_public_binding(db, file, name))
+                .unwrap()
+                .return_type_correspondence
+        })
+    };
+    let ordinary = signatures(&db);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    assert_eq!(correspondence(&db), [None; 10]);
+    db.select_function_inference(Some((
+        file,
+        names.map(str::to_owned).to_vec(),
+        crate::FunctionInferenceMode::OutputProof,
+    )));
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    assert_eq!(
+        correspondence(&db),
+        [
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(false),
+            None
+        ]
+    );
+    assert_eq!(signatures(&db), ordinary);
+    db.select_function_inference(Some((
+        file,
+        names.map(str::to_owned).to_vec(),
+        crate::FunctionInferenceMode::Conservative,
+    )));
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    assert_eq!(correspondence(&db), [None; 10]);
+    assert_eq!(signatures(&db), ordinary);
+    db.select_function_inference(None);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    assert_eq!(correspondence(&db), [None; 10]);
+    assert_eq!(signatures(&db), ordinary);
     Ok(())
 }
 
@@ -468,9 +610,10 @@ fn conservative_source_globals() -> anyhow::Result<()> {
         .map(str::to_owned)
     );
     assert_file_diagnostics(&db, "/src/main.py", &[]);
-    db.select_conservative_global_reads(Some((
+    db.select_function_inference(Some((
         file,
         ["collect", "mutate_shared"].map(str::to_owned).to_vec(),
+        crate::FunctionInferenceMode::Conservative,
     )));
     let selected = public_types(&db);
     let diagnostics = check_types(&db, program_file(&db, file));
@@ -506,7 +649,7 @@ fn conservative_source_globals() -> anyhow::Result<()> {
         [("invalid-argument-type".to_owned(), "1".to_owned())]
     );
     assert_eq!(out, "list[object]");
-    db.select_conservative_global_reads(None);
+    db.select_function_inference(None);
     assert_eq!(public_types(&db), ordinary);
     assert_file_diagnostics(&db, "/src/main.py", &[]);
     Ok(())

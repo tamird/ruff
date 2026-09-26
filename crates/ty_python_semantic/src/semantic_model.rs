@@ -68,6 +68,12 @@ pub(crate) fn explicitly_reads_local_namespace(expression: &Expr) -> bool {
 /// These do not establish static expression evidence or dependency availability.
 #[derive(Clone, Copy, Debug)]
 pub struct FunctionInferenceFacts {
+    /// Whether effective returns correspond to normalized declared output types.
+    /// Bare explicit `Any` imposes no output constraint; other types use pure redundancy.
+    /// `TypeIs` and `TypeGuard` normalization checks only their Boolean result.
+    /// `None` means output checking was not selected or could not be completed.
+    /// This fact does not establish operation safety, defaults, or complete body evidence.
+    pub return_type_correspondence: Option<bool>,
     pub has_cycle_recovery: bool,
     pub has_errors: bool,
     /// Includes emitted diagnostics and used suppression records.
@@ -145,6 +151,7 @@ impl<'db> SemanticModel<'db> {
         let defaults = crate::types::infer_function_default_types(self.db, definition);
         let diagnostics = [body.diagnostics(), defaults.diagnostics()];
         Some(FunctionInferenceFacts {
+            return_type_correspondence: body.return_type_correspondence(),
             has_cycle_recovery: body.has_cycle_recovery() || defaults.is_provisional(),
             has_errors: diagnostics.into_iter().flatten().any(|diagnostics| {
                 diagnostics

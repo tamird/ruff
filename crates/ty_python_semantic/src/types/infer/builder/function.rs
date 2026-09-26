@@ -171,6 +171,13 @@ impl<'db> ExpectedReturnType<'db> {
         Self { public, lexical }
     }
 
+    /// A bare `Any` result has no output constraint. Other declared results require
+    /// correspondence independently of the conservative view used to check operations.
+    fn corresponds(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
+        self.public.resolve_type_alias(db) == Type::any()
+            || self.accepts(db, env, ty, TypeRelation::Redundancy { pure: true })
+    }
+
     /// Returns the externally-visible return type.
     fn public(self) -> Type<'db> {
         self.public
@@ -197,6 +204,11 @@ impl<'db> ExpectedReturnType<'db> {
 }
 
 impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
+    fn should_check_return_soundness(&self, expected: Type<'db>) -> bool {
+        self.context.is_lint_enabled(&UNSOUND_RETURN_STATEMENT)
+            && expected.is_fully_static(self.db(), self.program_environment())
+    }
+
     pub(super) fn infer_function_body(&mut self, function: &ast::StmtFunctionDef) {
         fn can_implicitly_return_none<'db>(db: &'db dyn Db, use_def: &UseDefMap<'db>) -> bool {
             !use_def
@@ -269,6 +281,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .return_ty;
             let expected_return = ExpectedReturnType::from_function(db, enclosing_function);
             let expected_ty = expected_return.public();
+            let mut correspondence = (self.function_inference_mode
+                == crate::FunctionInferenceMode::OutputProof)
+                .then_some(true);
 
             let scope_id = self.index.node_scope(NodeWithScopeRef::Function(function));
             if scope_id.is_generator_function(self.index) {
@@ -299,10 +314,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 if let Some(expected_return_ty) = declared_ty.generator_return_type(db, env) {
                     for &return_statement in &self.return_types_and_ranges {
-                        if !return_statement
-                            .ty
-                            .is_assignable_to(db, env, expected_return_ty)
-                        {
+                        let assignable =
+                            return_statement
+                                .ty
+                                .is_assignable_to(db, env, expected_return_ty);
+                        let check_soundness =
+                            self.should_check_return_soundness(expected_return_ty);
+                        let corresponds = assignable
+                            && (!(correspondence.is_some() || check_soundness)
+                                || (correspondence.is_some()
+                                    && expected_return_ty.resolve_type_alias(db) == Type::any())
+                                || return_statement.ty.is_pure_redundant_with(
+                                    db,
+                                    env,
+                                    expected_return_ty,
+                                ));
+                        if let Some(aggregate) = &mut correspondence {
+                            *aggregate &= corresponds;
+                        }
+                        if !assignable {
                             report_invalid_return_type(
                                 &self.context,
                                 return_statement.range,
@@ -310,14 +340,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 expected_return_ty,
                                 return_statement.ty,
                             );
-                        } else if self.context.is_lint_enabled(&UNSOUND_RETURN_STATEMENT)
-                            && expected_return_ty.is_fully_static(db, env)
-                            && !return_statement.ty.is_pure_redundant_with(
-                                db,
-                                env,
-                                expected_return_ty,
-                            )
-                        {
+                        } else if check_soundness && !corresponds {
                             // N.B. the implementation here is the ~same as for `UNSOUND_YIELD` and `UNSOUND_ASSIGNMENT`;
                             // update those too if updating this!
                             report_unsound_return_statement(
@@ -332,7 +355,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     let use_def = self.index.use_def_map(scope_id);
 
-                    if can_implicitly_return_none(db, use_def)
+                    let implicit_none = can_implicitly_return_none(db, use_def);
+                    if implicit_none && let Some(corresponds) = &mut correspondence {
+                        *corresponds &= expected_return_ty.resolve_type_alias(db) == Type::any()
+                            || Type::none(db, env).is_pure_redundant_with(
+                                db,
+                                env,
+                                expected_return_ty,
+                            );
+                    }
+                    if implicit_none
                         && !Type::none(db, env).is_assignable_to(db, env, expected_return_ty)
                     {
                         let no_return = self.return_types_and_ranges.is_empty();
@@ -345,6 +377,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             no_return,
                         );
                     }
+                    self.return_type_correspondence = correspondence;
                 }
 
                 return;
@@ -365,12 +398,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         _ => Some(ty_range),
                     })
             {
-                if !expected_return.accepts(
+                let assignable = expected_return.accepts(
                     db,
                     env,
                     return_statement.ty,
                     TypeRelation::Assignability,
-                ) {
+                );
+                let check_soundness = self.should_check_return_soundness(expected_return.public);
+                let corresponds = assignable
+                    && (!(correspondence.is_some() || check_soundness)
+                        || expected_return.corresponds(db, env, return_statement.ty));
+                if let Some(aggregate) = &mut correspondence {
+                    *aggregate &= corresponds;
+                }
+                if !assignable {
                     report_invalid_return_type(
                         &self.context,
                         return_statement.range,
@@ -378,15 +419,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         declared_ty,
                         return_statement.ty,
                     );
-                } else if self.context.is_lint_enabled(&UNSOUND_RETURN_STATEMENT)
-                    && expected_return.public.is_fully_static(db, env)
-                    && !expected_return.accepts(
-                        db,
-                        env,
-                        return_statement.ty,
-                        TypeRelation::Redundancy { pure: true },
-                    )
-                {
+                } else if check_soundness && !corresponds {
                     // N.B. the implementation here is the ~same as for `UNSOUND_YIELD` and `UNSOUND_ASSIGNMENT`;
                     // update those too if updating this!
                     report_unsound_return_statement(
@@ -400,9 +433,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
 
             let use_def = self.index.use_def_map(scope_id);
-            if can_implicitly_return_none(db, use_def)
-                && !Type::none(db, env).is_assignable_to(db, env, expected_ty)
-            {
+            let implicit_none = can_implicitly_return_none(db, use_def);
+            if implicit_none && let Some(corresponds) = &mut correspondence {
+                *corresponds &= expected_return.corresponds(db, env, Type::none(db, env));
+            }
+            self.return_type_correspondence = correspondence;
+            if implicit_none && !Type::none(db, env).is_assignable_to(db, env, expected_ty) {
                 let no_return = self.return_types_and_ranges.is_empty();
                 report_implicit_return_type(
                     &self.context,

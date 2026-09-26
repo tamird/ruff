@@ -8,15 +8,33 @@ use ruff_db::files::File;
 use ty_python_core::definition::Definition;
 use ty_python_core::{Db as PythonCoreDb, ProgramFile};
 
+/// Selects the facts and runtime input view used for a function scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FunctionInferenceMode {
+    /// Ordinary inference and diagnostics.
+    #[default]
+    Default,
+    /// Ordinary inference with retained return-type correspondence facts.
+    OutputProof,
+    /// Upper-bound materialization of explicit runtime module-global reads.
+    /// Parameters, captures, locals, eager snapshots and member results retain ordinary
+    /// inference; operations consuming a projected global use its materialized type.
+    Conservative,
+}
+
 /// Database giving access to semantic information about a Python program.
 #[salsa::db]
 pub trait Db: PythonCoreDb {
-    /// Selects upper-bound materialization for explicit runtime module-global reads.
-    /// This is an active inference configuration, not a simultaneous alternate view.
-    /// Implementations must read tracked inputs. Parameters, captures, local bindings, eager
-    /// snapshots and member results retain ordinary inference; this is not a body proof.
-    fn conservative_global_reads(&self, _scope: ty_python_core::scope::ScopeId<'_>) -> bool {
-        false
+    /// Selects function inference using tracked configuration inputs.
+    ///
+    /// This changes the active configuration, not a simultaneous alternate view.
+    /// Output facts concern declared return types; conservative inputs constrain operations.
+    /// Neither mode establishes complete implementation evidence on its own.
+    fn function_inference_mode(
+        &self,
+        _scope: ty_python_core::scope::ScopeId<'_>,
+    ) -> FunctionInferenceMode {
+        FunctionInferenceMode::Default
     }
 
     /// Resolves a binding introduced by [`PythonCoreDb::provided_statements`].
@@ -230,9 +248,9 @@ pub(crate) mod tests {
 
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
     #[salsa::input]
-    struct GlobalReadSelection {
+    struct FunctionInferenceSelection {
         #[returns(ref)]
-        selected: Option<(File, Vec<String>)>,
+        selected: Option<(File, Vec<String>, super::FunctionInferenceMode)>,
     }
     type CallResultProvider =
         for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> Option<crate::types::Type<'db>>;
@@ -247,7 +265,7 @@ pub(crate) mod tests {
     #[salsa::db]
     #[derive(Clone)]
     pub(crate) struct TestDb {
-        global_read_selection: Option<GlobalReadSelection>,
+        function_inference_selection: Option<FunctionInferenceSelection>,
         storage: salsa::Storage<Self>,
         files: Files,
         system: TestSystem,
@@ -270,7 +288,7 @@ pub(crate) mod tests {
             let events = Events::default();
             let program_settings = ProgramSettings::empty(&vendored);
             let mut db = Self {
-                global_read_selection: None,
+                function_inference_selection: None,
                 storage: salsa::Storage::new(Some(Box::new({
                     let events = events.clone();
                     move |event| {
@@ -294,15 +312,15 @@ pub(crate) mod tests {
                 keyword_field_factory: None,
                 source_provider: None,
             };
-            db.global_read_selection = Some(GlobalReadSelection::new(&db, None));
+            db.function_inference_selection = Some(FunctionInferenceSelection::new(&db, None));
             db
         }
 
-        pub(crate) fn select_conservative_global_reads(
+        pub(crate) fn select_function_inference(
             &mut self,
-            selected: Option<(File, Vec<String>)>,
+            selected: Option<(File, Vec<String>, super::FunctionInferenceMode)>,
         ) {
-            if let Some(selection) = self.global_read_selection {
+            if let Some(selection) = self.function_inference_selection {
                 selection.set_selected(self).to(selected);
             }
         }
@@ -405,20 +423,27 @@ pub(crate) mod tests {
 
     #[salsa::db]
     impl Db for TestDb {
-        fn conservative_global_reads(&self, scope: ty_python_core::scope::ScopeId<'_>) -> bool {
-            let Some(selection) = self.global_read_selection else {
-                return false;
+        fn function_inference_mode(
+            &self,
+            scope: ty_python_core::scope::ScopeId<'_>,
+        ) -> super::FunctionInferenceMode {
+            let Some(selection) = self.function_inference_selection else {
+                return super::FunctionInferenceMode::Default;
             };
-            let Some((file, names)) = selection.selected(self) else {
-                return false;
+            let Some((file, names, mode)) = selection.selected(self) else {
+                return super::FunctionInferenceMode::Default;
             };
             if scope.program_file(self).python_file(self).file(self) != *file {
-                return false;
+                return super::FunctionInferenceMode::Default;
             }
             let module =
                 ruff_db::parsed::parsed_module(self, scope.program_file(self).python_file(self))
                     .load(self);
-            names.iter().any(|name| name == scope.name(self, &module))
+            if names.iter().any(|name| name == scope.name(self, &module)) {
+                *mode
+            } else {
+                super::FunctionInferenceMode::Default
+            }
         }
 
         fn provided_binding<'db>(

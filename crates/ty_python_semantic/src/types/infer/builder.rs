@@ -269,7 +269,8 @@ const NUM_FIELD_SPECIFIERS_INLINE: usize = 1;
 /// assignment, type narrowing guard), we use the [`infer_expression_types()`] query to ensure we
 /// don't infer its types more than once.
 pub(super) struct TypeInferenceBuilder<'db, 'ast> {
-    conservative_global_reads: bool,
+    function_inference_mode: crate::FunctionInferenceMode,
+    return_type_correspondence: Option<bool>,
     context: InferContext<'db, 'ast>,
 
     index: &'db SemanticIndex<'db>,
@@ -505,7 +506,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Self {
         let scope = region.scope(db);
         Self {
-            conservative_global_reads: db.conservative_global_reads(scope),
+            function_inference_mode: db.function_inference_mode(scope),
+            return_type_correspondence: None,
             context: InferContext::new(db, env, scope, file, program_file, module),
             index,
             region,
@@ -10982,7 +10984,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn global_input(&self, place: PlaceAndQualifiers<'db>) -> PlaceAndQualifiers<'db> {
-        if self.conservative_global_reads
+        if self.function_inference_mode == crate::FunctionInferenceMode::Conservative
             && !self
                 .inference_flags()
                 .contains(InferenceFlags::IN_TYPE_EXPRESSION)
@@ -12236,7 +12238,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Consume the results already collected by this builder without compacting them.
     fn into_expression_cache_entry(self) -> FullExpressionCacheEntry<'db> {
         let Self {
-            conservative_global_reads: _,
+            function_inference_mode: _,
+            return_type_correspondence: _,
             implicit_aliases,
             context,
             expressions,
@@ -12302,7 +12305,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_region();
 
         let Self {
-            conservative_global_reads: _,
+            function_inference_mode: _,
+            return_type_correspondence: _,
             implicit_aliases,
             context,
             expressions,
@@ -12423,7 +12427,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let Self {
-            conservative_global_reads: _,
+            function_inference_mode: _,
+            return_type_correspondence: _,
             implicit_aliases,
             context,
             expressions,
@@ -12477,7 +12482,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn finish_inferred_definition(self, definition: Definition<'db>) -> DefinitionInference<'db> {
         let Self {
-            conservative_global_reads: _,
+            function_inference_mode: _,
+            return_type_correspondence: _,
             implicit_aliases,
             context,
             expressions,
@@ -12624,7 +12630,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_region();
 
         let Self {
-            conservative_global_reads: _,
+            function_inference_mode: _,
+            return_type_correspondence,
             implicit_aliases,
             context,
             string_annotations,
@@ -12667,6 +12674,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             || !expected_types.is_empty()
             || !diagnostics.is_empty()
             || cycle_recovery.is_some()
+            || return_type_correspondence.is_some()
             || !type_expression_flags.is_empty()
             || !collection_use_constraints.is_empty()
             || !qualifiers.is_empty())
@@ -12680,6 +12688,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 type_expression_flags: FrozenMap::from(type_expression_flags),
                 collection_use_constraints,
                 cycle_recovery,
+                return_type_correspondence,
                 diagnostics,
             })
         });
@@ -12702,7 +12711,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn speculate(&self) -> Self {
         let db = self.db();
         let Self {
-            conservative_global_reads: _,
+            function_inference_mode: _,
+            return_type_correspondence: _,
             region,
             index,
             cycle_recovery,
@@ -12778,7 +12788,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Extend the current region with the results of a speculative [`TypeInferenceBuilder`].
     fn extend(&mut self, other: Self) {
         let Self {
-            conservative_global_reads: _,
+            function_inference_mode: _,
+            return_type_correspondence: _,
             implicit_aliases,
             context,
             expressions,

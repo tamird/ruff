@@ -1099,6 +1099,9 @@ struct ScopeInferenceExtra<'db> {
     /// The fallback type for missing expressions/bindings/declarations or recursive type inference.
     cycle_recovery: Option<Type<'db>>,
 
+    /// Return correspondence computed by selected ordinary function inference.
+    return_type_correspondence: Option<bool>,
+
     /// The diagnostics for this region.
     diagnostics: TypeCheckDiagnostics,
 }
@@ -1146,6 +1149,12 @@ impl<'db> ScopeInference<'db> {
         }
 
         self
+    }
+
+    pub(crate) fn return_type_correspondence(&self) -> Option<bool> {
+        self.extra
+            .as_deref()
+            .and_then(|extra| extra.return_type_correspondence)
     }
 
     pub(crate) fn has_cycle_recovery(&self) -> bool {
