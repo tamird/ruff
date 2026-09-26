@@ -883,6 +883,18 @@ impl<'db> Signature<'db> {
         has_implicitly_positional_first_parameter: bool,
         return_callable_typevar_scope: ReturnCallableTypeVarScope,
     ) -> Self {
+        let (generic_definition, pep695_generic_context) = if pep695_generic_context.is_some() {
+            (definition, pep695_generic_context)
+        } else {
+            SourceAnnotation::external_function_generic_context(
+                db,
+                definition.program_file(db),
+                function_node,
+            )
+            .map_or((definition, None), |(donor, context)| {
+                (donor, Some(context))
+            })
+        };
         let parameters = Parameters::from_parameters(
             db,
             definition,
@@ -912,7 +924,7 @@ impl<'db> Signature<'db> {
                     full_generic_context,
                     &parameters,
                     return_ty,
-                    definition,
+                    generic_definition,
                 )
             }
         };

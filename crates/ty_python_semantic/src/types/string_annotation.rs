@@ -17,6 +17,7 @@ use crate::lint::{Level, LintStatus};
 use crate::provided::ProvidedReturnType;
 use crate::types::diagnostic::INVALID_TYPE_FORM;
 use crate::types::diagnostic::autofix_with_literal;
+use crate::types::generics::GenericContext;
 use crate::types::infer::{
     InferenceFlags, TypeContext, TypeContextPurpose, TypeExpressionFlags, infer_definition_types,
 };
@@ -82,6 +83,40 @@ pub(crate) enum SourceAnnotation<'a, 'db> {
 }
 
 impl<'a, 'db> SourceAnnotation<'a, 'db> {
+    /// Borrow a quantifier only when the whole signature comes from one declaration.
+    /// Parameter shape and defaults still belong to the implementation signature.
+    pub(super) fn external_function_generic_context(
+        db: &'db dyn Db,
+        file: ProgramFile<'db>,
+        function: &'a ast::StmtFunctionDef,
+    ) -> Option<(Definition<'db>, GenericContext<'db>)> {
+        let Self::External {
+            annotation,
+            purpose: _,
+            range: _,
+        } = Self::function_return(db, file, function)?
+        else {
+            return None;
+        };
+        let donor = annotation.definition;
+        let context = external_function_generic_context(db, donor)?;
+        for parameter in &function.parameters {
+            let parameter = parameter.as_parameter();
+            let Self::External {
+                annotation,
+                purpose: _,
+                range: _,
+            } = Self::new(db, file, parameter, parameter.annotation.as_deref())?
+            else {
+                return None;
+            };
+            if annotation.definition != donor {
+                return None;
+            }
+        }
+        Some((donor, context))
+    }
+
     pub(crate) fn function_return(
         db: &'db dyn Db,
         file: ProgramFile<'db>,
@@ -343,6 +378,24 @@ impl Ranged for SourceAnnotation<'_, '_> {
             } => *range,
         }
     }
+}
+
+#[salsa::tracked(returns(copy))]
+fn external_function_generic_context<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> Option<GenericContext<'db>> {
+    let DefinitionKind::Function(function) = definition.kind(db) else {
+        return None;
+    };
+    let module = parsed_module(db, definition.python_file(db)).load(db);
+    let parameters = function.node(&module).type_params.as_deref()?;
+    Some(GenericContext::from_type_params(
+        db,
+        semantic_index(db, definition.program_file(db)),
+        definition,
+        parameters,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, salsa::SalsaValue)]

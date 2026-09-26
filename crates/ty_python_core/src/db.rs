@@ -13,7 +13,9 @@ pub enum ProvidedAnnotation<'db> {
     /// owners must describe the same kind of annotation. Assignment annotations
     /// retain their qualifiers; `TypeAlias` declarations are excluded. Names and type
     /// parameters retain their declaring scope. The provider owns the correspondence
-    /// between the two declarations.
+    /// between the two declarations. A function without local type parameters borrows
+    /// the donor's type parameter list when its return and every effective parameter annotation
+    /// come from that same function.
     External {
         file: ProgramFile<'db>,
         owner: ruff_python_ast::NodeIndex,
