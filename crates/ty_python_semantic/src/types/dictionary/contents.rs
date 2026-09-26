@@ -8,7 +8,8 @@ use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
 use ty_python_core::definition::{
     Definition, DefinitionKind, DefinitionState, DictionaryContentsDefinitionKind,
-    DictionaryContentsEffect, DictionaryContentsInferenceOwner, NestedBindingExecution,
+    DictionaryContentsEffect, DictionaryContentsInferenceOwner, LambdaParameterDefinitionNodeKind,
+    NestedBindingExecution, ParameterDefinitionNodeKind,
 };
 use ty_python_core::place::ScopedPlaceId;
 use ty_python_core::place::{PlaceExpr, PlaceTable};
@@ -44,6 +45,9 @@ pub(super) struct MappingContents<'db> {
     /// All ranges belong to this file. Copying from another file rebases them to the local use.
     pub(super) file: ProgramFile<'db>,
     pub(super) dictionary: DictionaryItems<'db>,
+    /// The object was allocated by builtin dictionary construction, so its operations cannot
+    /// dispatch to subclass overrides. Exposure changes contents, not this allocation fact.
+    pub(super) builtin: bool,
     /// Other code can retain this object. Later writes refine values but cannot prove presence.
     pub(super) exposed: bool,
     /// The ordinary mapping value bound for declared or external/member bindings survives exposure.
@@ -164,12 +168,14 @@ impl<'db> MappingContents<'db> {
         let Self {
             file,
             dictionary,
+            builtin,
             exposed,
             value_bound,
         } = self;
         let Self {
             file: _,
             dictionary: other_dictionary,
+            builtin: other_builtin,
             exposed: other_exposed,
             value_bound: other_bound,
         } = other;
@@ -225,6 +231,7 @@ impl<'db> MappingContents<'db> {
             },
             exposed,
             value_bound,
+            builtin: *builtin && *other_builtin,
         }
     }
 }
@@ -468,7 +475,7 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         return ContentsValue::Pending;
     }
     let bound_type = inference.binding_type(definition);
-    if !super::is_exact_dict(db, bound_type) {
+    if !super::has_dict_type(db, bound_type) {
         return ContentsValue::Unavailable;
     }
     let index = semantic_index(db, file);
@@ -525,18 +532,73 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
     let mut mapping = MappingContents {
         file,
         dictionary,
+        builtin: match definition.kind(db) {
+            DefinitionKind::Parameter(parameter) => {
+                matches!(
+                    parameter,
+                    ParameterDefinitionNodeKind::VariadicKeywordParameter(_)
+                )
+            }
+            DefinitionKind::LambdaParameter(LambdaParameterDefinitionNodeKind {
+                index: _,
+                lambda: _,
+                parameter,
+            }) => matches!(
+                parameter,
+                ParameterDefinitionNodeKind::VariadicKeywordParameter(_)
+            ),
+            _ => false,
+        },
         exposed: bounded,
         value_bound,
     };
     if !owner_inference.discards_dict_key_assignments()
         && let Some(value) = value
     {
-        match DictionaryItems::unpacked_expression(db, &env, scope, value, &mut |expression| {
+        // A constructor establishes allocation even when its keys cannot be enumerated.
+        mapping.builtin = match value {
+            ast::Expr::Dict(_) => true,
+            ast::Expr::DictComp(_) => true,
+            ast::Expr::Call(call) => owner_inference
+                .try_expression_type(&call.func)
+                .and_then(Type::as_class_literal)
+                .is_some_and(|class| class.is_known(db, KnownClass::Dict)),
+            _ => false,
+        };
+        if PlaceExpr::try_from_expr(value).is_some() {
+            let use_def = index.use_def_map(scope.file_scope_id(db));
+            let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
+            match snapshot_contents(db, scope, value, value.into(), bound_type, &cache) {
+                ContentsValue::Mapping(source) => mapping.builtin = source.builtin,
+                ContentsValue::Pending => return ContentsValue::Pending,
+                ContentsValue::Unreachable => return ContentsValue::Unreachable,
+                ContentsValue::Unavailable => {}
+            }
+        }
+        let observed = DictionaryItems::expression(db, &env, scope, value, &mut |expression| {
             owner_inference.try_expression_type(expression)
-        }) {
-            Ok(dictionary) => mapping.dictionary = dictionary,
+        });
+        match observed {
+            Ok(dictionary) => {
+                mapping.dictionary = dictionary;
+                mapping.builtin = true;
+            }
             Err(DictionaryFallback::Unreachable) => return ContentsValue::Unreachable,
-            Err(DictionaryFallback::Unavailable) => {}
+            Err(DictionaryFallback::Unavailable) => {
+                if !value.is_dict_expr() {
+                    match DictionaryItems::unpacked_value(
+                        db,
+                        &env,
+                        scope,
+                        value,
+                        &mut |expression| owner_inference.try_expression_type(expression),
+                    ) {
+                        Ok(dictionary) => mapping.dictionary = dictionary,
+                        Err(DictionaryFallback::Unreachable) => return ContentsValue::Unreachable,
+                        Err(DictionaryFallback::Unavailable) => {}
+                    }
+                }
+            }
         }
     }
     if bounded || shared || value.is_some_and(|value| PlaceExpr::try_from_expr(value).is_some()) {
@@ -687,6 +749,31 @@ fn mapping_transfer<'db>(
     let module = parsed_module(db, file.python_file(db)).load(db);
     let unavailable = || MappingTransfer::Result(ContentsValue::Unavailable);
     let pending = || MappingTransfer::Result(ContentsValue::Pending);
+    // Nominal dict annotations can hide overridden methods and item operations. Apply this
+    // admission here because saved-key proofs also inspect the transfer before applying it.
+    if !matches!(
+        effect,
+        DictionaryContentsEffect::Expose | DictionaryContentsEffect::UnknownMutation
+    ) {
+        let index = semantic_index(db, file);
+        let use_def = index.use_def_map(scope.file_scope_id(db));
+        let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
+        match from_bindings(
+            db,
+            scope,
+            use_def.bindings_at_definition(definition),
+            &cache,
+        )
+        .value
+        {
+            ContentsValue::Mapping(mapping) => {
+                if !mapping.builtin {
+                    return unavailable();
+                }
+            }
+            result => return MappingTransfer::Result(result),
+        }
+    }
     match effect {
         DictionaryContentsEffect::Expose => MappingTransfer::Expose,
         DictionaryContentsEffect::UnknownMutation => unavailable(),
@@ -1077,8 +1164,24 @@ pub(super) fn at_snapshot<'db>(
     argument_type: Type<'db>,
     reachability: &ReachabilityEvaluationCache<'db>,
 ) -> DictionaryObservation<'db> {
+    match snapshot_contents(db, scope, expression, snapshot, argument_type, reachability) {
+        ContentsValue::Mapping(mapping) => Ok(mapping.dictionary),
+        ContentsValue::Unreachable => Err(DictionaryFallback::Unreachable),
+        ContentsValue::Pending => Err(DictionaryFallback::Unavailable),
+        ContentsValue::Unavailable => Err(DictionaryFallback::Unavailable),
+    }
+}
+
+pub(super) fn snapshot_contents<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    expression: &ast::Expr,
+    snapshot: ast::ExprRef<'_>,
+    argument_type: Type<'db>,
+    reachability: &ReachabilityEvaluationCache<'db>,
+) -> ContentsValue<'db> {
     let observed = (|| {
-        if !super::is_exact_dict(db, argument_type) {
+        if !super::has_dict_type(db, argument_type) {
             return None;
         }
         // Only a proved For seed can observe an invariant dictionary union. Ordinary
@@ -1103,17 +1206,9 @@ pub(super) fn at_snapshot<'db>(
     match observed {
         Some(ContentsValue::Mapping(mut mapping)) => {
             mapping.localize(scope.program_file(db), expression.range());
-            let MappingContents {
-                file: _,
-                dictionary,
-                exposed: _,
-                value_bound: _,
-            } = mapping;
-            Ok(dictionary)
+            ContentsValue::Mapping(mapping)
         }
-        Some(ContentsValue::Unreachable) => Err(DictionaryFallback::Unreachable),
-        Some(ContentsValue::Pending) => Err(DictionaryFallback::Unavailable),
-        Some(ContentsValue::Unavailable) => Err(DictionaryFallback::Unavailable),
-        None => Err(DictionaryFallback::Unavailable),
+        Some(contents) => contents,
+        None => ContentsValue::Unavailable,
     }
 }
