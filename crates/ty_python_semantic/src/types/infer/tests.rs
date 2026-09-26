@@ -94,6 +94,115 @@ fn assert_revealed_type(db: &TestDb, filename: &str, expected: &str) {
 }
 
 #[test]
+fn keyword_field_factory_context() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY312)
+        .with_keyword_field_factory(|db, definition| {
+            let DefinitionKind::Function(function) = definition.kind(db) else {
+                return false;
+            };
+            let module = parsed_module(db, definition.program_file(db).python_file(db)).load(db);
+            function.node(&module).name.as_str() == "record"
+        })
+        .build()?;
+    for (declaration, expected_type, argument, revealed) in [
+        (
+            r#"T = TypeVar('T')
+class Parent(Protocol[T]):
+    @property
+    def run(self) -> Callable[[T], T]: ...
+class Row(Parent[str], Protocol): ..."#,
+            "Row",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "str",
+        ),
+        (
+            r#"class Parent[T](Protocol):
+    @property
+    def run(self) -> Callable[[T], T]: ...
+class Row(Parent[str], Protocol): ..."#,
+            "Row",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "str",
+        ),
+        (
+            "class Row(Protocol):\n    @property\n    def run(self) -> Callable[[Self], str]: ...",
+            "Row",
+            "run=lambda value: (reveal_type(value), 'ok')[1]",
+            "Row",
+        ),
+        (
+            "class Row(Protocol):\n    run: Callable[[str], str]",
+            "Row",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "Unknown",
+        ),
+        (
+            "class Row(Protocol):\n    def run(self, value: str) -> str: ...",
+            "Row",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "Unknown",
+        ),
+        (
+            r#"class Row(Protocol):
+    @property
+    def run(self) -> Callable[[str], str]: ...
+    @run.setter
+    def run(self, value: Callable[[str], str]) -> None: ..."#,
+            "Row",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "Unknown",
+        ),
+        (
+            "class Row(Protocol):\n    @property\n    def run(self) -> Callable[[str], str]: ...",
+            "Row | None",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "Unknown",
+        ),
+        (
+            "class Row(Protocol):\n    @property\n    def run(self) -> Callable[[str], str]: ...",
+            "Row",
+            "other=lambda value: (reveal_type(value), value)[1]",
+            "Unknown",
+        ),
+        (
+            "class Row(Protocol):\n    @property\n    def run(self) -> Callable[[str], str]: ...",
+            "Row",
+            "**{'run': lambda value: (reveal_type(value), value)[1]}",
+            "Unknown",
+        ),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!(
+                r#"from typing import Any, Callable, Protocol, Self, TypeVar, reveal_type
+{declaration}
+def record(**fields: object) -> Any: ...
+value: {expected_type} = record({argument})
+"#
+            ),
+        )?;
+        assert_revealed_type(&db, "/src/main.py", revealed);
+    }
+    db.write_file(
+        "/src/main.py",
+        r#"from typing import Any, Callable, Protocol
+class Row(Protocol):
+    @property
+    def run(self) -> Callable[[str], str]: ...
+def record(**fields: int) -> Any: ...
+value: Row = record(run=lambda value: value.lower())
+"#,
+    )?;
+    assert_file_diagnostics(
+        &db,
+        "/src/main.py",
+        &["Argument to function `record` is incorrect"],
+    );
+    Ok(())
+}
+
+#[test]
 fn function_inference_facts() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(

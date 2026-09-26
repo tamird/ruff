@@ -498,6 +498,29 @@ impl<'db> ProtocolInterfaceView<'db> {
         self.interface.includes_member(db, name)
     }
 
+    /// Returns a readonly property's instance read type, bound to the expected receiver.
+    pub(super) fn readonly_property_type(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        receiver_ty: Type<'db>,
+        name: &str,
+    ) -> Option<Type<'db>> {
+        let member = self.member_by_name(db, name)?;
+        if !matches!(
+            member.data.kind,
+            ProtocolMemberKind::Property { read: _, write: _ }
+        ) {
+            return None;
+        }
+        let access = member.access(ProtocolMemberAccessMode::Instance);
+        if access.write().is_some() {
+            return None;
+        }
+        let read = access.read()?;
+        read.result_type(db, env, Some(receiver_ty))
+    }
+
     /// Includes inherited `object` members that are guaranteed for every instance.
     ///
     /// Subclasses can disable `__hash__`, and slotted instances can omit the `__dict__` that

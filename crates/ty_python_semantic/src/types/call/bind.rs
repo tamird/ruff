@@ -7978,6 +7978,23 @@ impl<'db> Binding<'db> {
 
         let parameter = &self.signature.parameters()[matched_parameter.index];
         let original_parameter_type = parameter.annotated_type();
+        if matches!(binding.callable_type, Type::FunctionLiteral(_))
+            && binding.overloads().len() == 1
+            && let Some(expected) = call_expression_tcx.annotation
+            && let Type::ProtocolInstance(protocol) = expected.resolve_type_alias(db)
+            && let Some((argument, _)) = arguments_types.iter().nth(argument_index)
+            && let Argument::Keyword(name) = argument
+            && let Some(definition) = self.signature.definition()
+            && db.provided_keyword_field_factory(definition)
+            && let Some(field_type) = protocol
+                .interface(db)
+                .readonly_property_type(db, env, expected, name)
+        {
+            return Some(ArgumentTypeContext::standard(
+                original_parameter_type,
+                field_type,
+            ));
+        }
         let mut parameter_type = matched_parameter
             .expected_type
             .unwrap_or(original_parameter_type);
