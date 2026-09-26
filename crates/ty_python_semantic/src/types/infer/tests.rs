@@ -420,6 +420,244 @@ fn conservative_global_inputs() -> anyhow::Result<()> {
 }
 
 #[test]
+fn conservative_lambda_inputs() -> anyhow::Result<()> {
+    use crate::HasType;
+    use ty_python_core::scope::NodeWithScopeRef;
+
+    for (
+        parameters,
+        expression,
+        ordinary_signature,
+        bounded_signature,
+        ordinary_binding,
+        bounded_binding,
+        ordinary_diagnostics,
+        bounded_diagnostics,
+    ) in [
+        (
+            Some("values: list[Any]"),
+            "lambda values: len(values)",
+            "(values: list[Any]) -> int",
+            "(values: Top[list[Any]]) -> int",
+            "list[Any]",
+            "Top[list[Any]]",
+            &[] as &[(&str, &str)],
+            &[] as &[(&str, &str)],
+        ),
+        (
+            Some("values: list[Any]"),
+            "lambda values: values.append(1)",
+            "(values: list[Any]) -> None",
+            "(values: Top[list[Any]]) -> None",
+            "list[Any]",
+            "Top[list[Any]]",
+            &[] as &[(&str, &str)],
+            &[("invalid-argument-type", "1")] as &[(&str, &str)],
+        ),
+        (
+            Some("values: list[Any]"),
+            "lambda values=DEFAULT: values",
+            "(values: list[Any]) -> list[Any]",
+            "(values: Top[list[Any]]) -> Top[list[Any]]",
+            "list[Any]",
+            "Top[list[Any]]",
+            &[] as &[(&str, &str)],
+            &[] as &[(&str, &str)],
+        ),
+        (
+            Some("values: list[Any] = ..."),
+            "lambda values=DEFAULT: values",
+            "(values: list[Any] = ...) -> list[Any]",
+            "(values: Top[list[Any]] = ...) -> Top[list[Any]]",
+            "list[Any]",
+            "Top[list[Any]]",
+            &[] as &[(&str, &str)],
+            &[] as &[(&str, &str)],
+        ),
+        (
+            Some("values: int = ..."),
+            "lambda values='bad': values + 1",
+            "(values: int = \"bad\") -> Unknown",
+            "(values: int = \"bad\") -> Unknown",
+            "int | Literal[\"bad\"]",
+            "int | Literal[\"bad\"]",
+            &[("unsupported-operator", "values + 1")] as &[(&str, &str)],
+            &[("unsupported-operator", "values + 1")] as &[(&str, &str)],
+        ),
+        (
+            Some("*values: list[Any]"),
+            "lambda *values: values[0].append(1)",
+            "(*values: list[Any]) -> None",
+            "(*values: Top[list[Any]]) -> None",
+            "tuple[list[Any], ...]",
+            "tuple[Top[list[Any]], ...]",
+            &[] as &[(&str, &str)],
+            &[("invalid-argument-type", "1")] as &[(&str, &str)],
+        ),
+        (
+            Some("**values: list[Any]"),
+            "lambda **values: values['first'].append(1)",
+            "(**values: list[Any]) -> None",
+            "(**values: Top[list[Any]]) -> None",
+            "dict[str, list[Any]]",
+            "dict[str, Top[list[Any]]]",
+            &[] as &[(&str, &str)],
+            &[("invalid-argument-type", "1")] as &[(&str, &str)],
+        ),
+        (
+            Some("**values: Any"),
+            "lambda **values: values.update(added=1)",
+            "(**values: Any) -> None",
+            "(**values: object) -> None",
+            "dict[str, Any]",
+            "dict[str, object]",
+            &[] as &[(&str, &str)],
+            &[] as &[(&str, &str)],
+        ),
+        (
+            None,
+            "lambda values: values",
+            "(values) -> Unknown",
+            "(values) -> Unknown",
+            "Unknown",
+            "Unknown",
+            &[] as &[(&str, &str)],
+            &[] as &[(&str, &str)],
+        ),
+        (
+            Some("values: Missing"),
+            "lambda values: values",
+            "(values: Unknown) -> Unknown",
+            "(values: Unknown) -> Unknown",
+            "Unknown",
+            "Unknown",
+            &[("unresolved-reference", "Missing")] as &[(&str, &str)],
+            &[("unresolved-reference", "Missing")] as &[(&str, &str)],
+        ),
+        (
+            Some("values: list[Missing]"),
+            "lambda values: values",
+            "(values: list[Unknown]) -> list[Unknown]",
+            "(values: list[Unknown]) -> list[Unknown]",
+            "list[Unknown]",
+            "list[Unknown]",
+            &[("unresolved-reference", "Missing")] as &[(&str, &str)],
+            &[("unresolved-reference", "Missing")] as &[(&str, &str)],
+        ),
+    ] {
+        let mut db = setup_db();
+        let (protocol, result) = if let Some(parameters) = parameters {
+            (
+                format!(
+                    "class Callback(Protocol):\n    def __call__(self, {parameters}) -> object: ...\n"
+                ),
+                "Callback",
+            )
+        } else {
+            (String::new(), "object")
+        };
+        db.write_file(
+            "/src/main.py",
+            format!(
+                "from typing import Any, Protocol
+DEFAULT: list[Any] = []
+{protocol}def make() -> {result}:
+    return {expression}
+"
+            ),
+        )?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let signature = |db: &TestDb| {
+            global_symbol(db, file, "make")
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        };
+        let original_signature = signature(&db);
+        for (selection, expected_signature, expected_binding, expected_diagnostics) in [
+            (
+                None,
+                ordinary_signature,
+                ordinary_binding,
+                ordinary_diagnostics,
+            ),
+            (
+                Some("<lambda>"),
+                bounded_signature,
+                bounded_binding,
+                bounded_diagnostics,
+            ),
+            (
+                None,
+                ordinary_signature,
+                ordinary_binding,
+                ordinary_diagnostics,
+            ),
+        ] {
+            db.select_function_inference(selection.map(|name| {
+                (
+                    file,
+                    vec![name.to_owned()],
+                    crate::FunctionInferenceMode::Conservative,
+                )
+            }));
+            let program = program_file(&db, file);
+            let diagnostics = check_types(&db, program);
+            let source = source_text(&db, file);
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| {
+                        let range = diagnostic
+                            .primary_span()
+                            .and_then(|span| span.range())
+                            .expect("diagnostic has a source range");
+                        (diagnostic.id().to_string(), &source[range])
+                    })
+                    .collect::<Vec<_>>(),
+                expected_diagnostics
+                    .iter()
+                    .map(|(id, source)| ((*id).to_owned(), *source))
+                    .collect::<Vec<_>>(),
+                "{expression}: {selection:?}"
+            );
+            let model = crate::SemanticModel::new(&db, program);
+            let parsed = parsed_module(&db, program.python_file(&db)).load(&db);
+            let Some(ast::Stmt::FunctionDef(function)) = parsed.suite().last() else {
+                panic!("expected make")
+            };
+            let [ast::Stmt::Return(statement)] = function.body.as_slice() else {
+                panic!("expected return")
+            };
+            let lambda_expression = statement.value.as_deref().expect("expected return value");
+            let ast::Expr::Lambda(lambda) = lambda_expression else {
+                panic!("expected lambda")
+            };
+            let actual = lambda_expression.inferred_type(&model).unwrap();
+            assert_eq!(
+                actual.display(&db, &db.program_environment()).to_string(),
+                expected_signature,
+                "{expression}: {selection:?}"
+            );
+            let scope = semantic_index(&db, program)
+                .node_scope(NodeWithScopeRef::Lambda(lambda))
+                .to_scope_id(&db, program);
+            let binding = symbol(&db, scope, "values", ConsideredDefinitions::AllReachable)
+                .place
+                .expect_type();
+            assert_eq!(
+                binding.display(&db, &db.program_environment()).to_string(),
+                expected_binding,
+                "{expression}: {selection:?}"
+            );
+            assert_eq!(signature(&db), original_signature);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn conservative_parameter_inputs() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(
@@ -454,13 +692,29 @@ fn conservative_parameter_inputs() -> anyhow::Result<()> {
             fields["added"] = 1
             return values[0]
 
+        def keyword_items(**fields: list[Any]) -> None:
+            fields["added"] = []
+            fields["first"].append(4)
+
+        def keyword_alias(values: dict[str, Any], **fields: Any) -> None:
+            fields = values
+            fields["aliased"] = 1
+
         def unselected(values: list[Any]) -> None:
             values.append(3)
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     let names = [
-        "collect", "mutate", "narrowed", "invoke", "captured", "forward", "variadic",
+        "collect",
+        "mutate",
+        "narrowed",
+        "invoke",
+        "captured",
+        "forward",
+        "variadic",
+        "keyword_items",
+        "keyword_alias",
     ];
     let signatures = |db: &TestDb| {
         names.map(|name| {
@@ -505,7 +759,8 @@ fn conservative_parameter_inputs() -> anyhow::Result<()> {
             ("invalid-argument-type", "values.append(2)"),
             ("call-top-callable", "callback()"),
             ("call-top-callable", "return lambda: callback()"),
-            ("invalid-assignment", "fields[\"added\"] = 1"),
+            ("invalid-argument-type", "fields[\"first\"].append(4)"),
+            ("invalid-assignment", "fields[\"aliased\"] = 1"),
         ]
         .map(|(id, line)| (id.to_owned(), line.to_owned()))
     );

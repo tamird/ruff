@@ -18,10 +18,12 @@ pub enum FunctionInferenceMode {
     Default,
     /// Ordinary inference with retained return-type correspondence facts.
     OutputProof,
-    /// Upper-bound materialization of initial function parameter bindings and explicit
-    /// runtime module-global reads. Parameter declarations, signatures and default checks
-    /// retain ordinary inference. Lambda parameters and local bindings are not independently
-    /// projected; captures and operations consume the types supplied by their bindings.
+    /// Upper-bound materialization of initial named-function parameter bindings and explicit
+    /// runtime module-global reads. Named parameter declarations, signatures and default checks
+    /// use ordinary inference. Contextual lambda parameter values with known types are bounded
+    /// in their signatures; body bindings consume those values through ordinary inference.
+    /// Homogeneous keyword dictionaries are fresh containers with bounded value types.
+    /// Captures and operations consume the types supplied by their bindings.
     /// Eager global snapshots and member results have no separate projection.
     /// Ordinary assignments infer values without gradual inherited annotation hints;
     /// the original declarations still govern assignment checking.

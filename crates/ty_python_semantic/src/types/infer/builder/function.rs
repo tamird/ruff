@@ -1432,6 +1432,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Set initial declared/inferred types for a `**kwargs` keyword-variadic parameter.
     ///
     /// The annotated type is implicitly wrapped in a string-keyed dictionary.
+    /// Returns its homogeneous element type for initial binding materialization.
+    /// Parameter specifications and unpacked `TypedDict` annotations use their own binding types.
     ///
     /// See [`infer_parameter_definition`] doc comment for some relevant observations about scopes.
     ///
@@ -1440,9 +1442,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         &mut self,
         parameter: &'ast ast::Parameter,
         definition: Definition<'db>,
-    ) {
+    ) -> Option<Type<'db>> {
         let env = self.program_environment();
         let db = self.db();
+        let mut keyword_element = None;
 
         if let Some((annotation, annotated_type, flags)) = self.parameter_annotation_type(parameter)
         {
@@ -1495,6 +1498,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             {
                 annotated_type
             } else {
+                keyword_element = Some(annotated_type);
                 KnownClass::Dict.to_specialized_instance(
                     db,
                     env,
@@ -1507,6 +1511,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 &DeclaredAndInferredType::are_the_same_type(ty),
             );
         } else {
+            keyword_element = Some(Type::unknown());
             let inferred_ty = KnownClass::Dict.to_specialized_instance(
                 db,
                 env,
@@ -1516,6 +1521,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.add_binding(parameter.into(), definition)
                 .insert(self, inferred_ty);
         }
+        keyword_element
     }
 
     /// Set initial declared type (if annotated) and inferred type for a lambda-parameter symbol,
