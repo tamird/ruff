@@ -76,7 +76,7 @@ pub struct FunctionInferenceFacts {
     pub return_type_correspondence: Option<bool>,
     pub has_cycle_recovery: bool,
     pub has_errors: bool,
-    /// Includes emitted diagnostics and used suppression records.
+    /// Includes emitted diagnostics and diagnostics suppressed in reachable code.
     pub has_diagnostics_or_suppressions: bool,
 }
 
@@ -158,10 +158,10 @@ impl<'db> SemanticModel<'db> {
                     .into_iter()
                     .any(|diagnostic| diagnostic.severity() == ruff_db::diagnostic::Severity::Error)
             }),
-            has_diagnostics_or_suppressions: diagnostics
-                .into_iter()
-                .flatten()
-                .any(|diagnostics| !diagnostics.is_empty()),
+            has_diagnostics_or_suppressions: diagnostics.into_iter().flatten().any(|diagnostics| {
+                diagnostics.into_iter().next().is_some()
+                    || diagnostics.has_reachable_suppressed_diagnostics()
+            }),
         })
     }
 
