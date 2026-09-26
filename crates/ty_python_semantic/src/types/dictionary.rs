@@ -130,6 +130,35 @@ impl<'db> DictionaryItems<'db> {
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
         match expression {
+            ast::Expr::BinOp(binary) => {
+                let ast::ExprBinOp {
+                    node_index: _,
+                    range: _,
+                    left,
+                    op,
+                    right,
+                } = binary;
+                if *op != ast::Operator::BitOr {
+                    return Err(DictionaryFallback::Unavailable);
+                }
+                let mut dictionary = DictionaryItemsBuilder::default();
+                for operand in [left.as_ref(), right.as_ref()] {
+                    let ty = expression_type(operand).ok_or(DictionaryFallback::Unavailable)?;
+                    if !has_dict_type(db, ty) {
+                        return Err(DictionaryFallback::Unavailable);
+                    }
+                    let source = Self::builtin_source(
+                        db,
+                        env,
+                        scope,
+                        expression.into(),
+                        operand,
+                        expression_type,
+                    )?;
+                    dictionary.overlay(db, env, source);
+                }
+                Ok(dictionary.finish())
+            }
             ast::Expr::Dict(_) => Self::literal(db, env, scope, expression, expression_type),
             ast::Expr::DictComp(comprehension) => {
                 let ast::ExprDictComp {
@@ -292,7 +321,7 @@ impl<'db> DictionaryItems<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         scope: ScopeId<'db>,
-        call: ast::ExprRef<'_>,
+        snapshot: ast::ExprRef<'_>,
         source: &ast::Expr,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
@@ -307,11 +336,45 @@ impl<'db> DictionaryItems<'db> {
                 .use_def_map(scope.file_scope_id(db))
                 .reachability_constraints(),
         );
-        match contents::at_snapshot(db, scope, source, call, ty, &cache) {
+        match contents::at_snapshot(db, scope, source, snapshot, ty, &cache) {
             Err(DictionaryFallback::Unavailable) => {
                 Self::unpacked(db, env, ty, source.range()).ok_or(DictionaryFallback::Unavailable)
             }
             observed => observed,
+        }
+    }
+
+    /// Union dispatch requires a builtin allocation, not just a nominal dictionary type.
+    fn builtin_source(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
+        snapshot: ast::ExprRef<'_>,
+        source: &ast::Expr,
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+    ) -> DictionaryObservation<'db> {
+        if ty_python_core::place::PlaceExpr::try_from_expr(source).is_none() {
+            return Self::expression(db, env, scope, source, expression_type);
+        }
+        let ty = expression_type(source).ok_or(DictionaryFallback::Unavailable)?;
+        let index = semantic_index(db, scope.program_file(db));
+        let cache = ReachabilityEvaluationCache::new(
+            scope,
+            index
+                .use_def_map(scope.file_scope_id(db))
+                .reachability_constraints(),
+        );
+        match contents::snapshot_contents(db, scope, source, snapshot, ty, &cache) {
+            contents::ContentsValue::Mapping(mapping) => {
+                if mapping.builtin {
+                    Ok(mapping.dictionary)
+                } else {
+                    Err(DictionaryFallback::Unavailable)
+                }
+            }
+            contents::ContentsValue::Unreachable => Err(DictionaryFallback::Unreachable),
+            contents::ContentsValue::Pending => Err(DictionaryFallback::Unavailable),
+            contents::ContentsValue::Unavailable => Err(DictionaryFallback::Unavailable),
         }
     }
 

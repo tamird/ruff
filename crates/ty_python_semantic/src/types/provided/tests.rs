@@ -888,6 +888,46 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
             "complete; x: Literal[2] at key",
         ),
         (
+            "result = observe({'x': 'old', 'left': 1} | {'x': 2})",
+            "complete; x: Literal[2] at 'x'; left: Literal[1] at 'left'",
+        ),
+        (
+            "left = {'x': 1}\nright = {'y': 2}\nmerged = left | right\nleft.clear()\nright.clear()\nresult = observe(merged)",
+            "complete; x: Literal[1] at 'x'; y: Literal[2] at 'y'",
+        ),
+        (
+            "result = observe(({'x': 1} | dict(y=2)) | {'z': 3})",
+            "complete; x: Literal[1] at 'x'; y: Literal[2] at y; z: Literal[3] at 'z'",
+        ),
+        (
+            "values = {'x': 1}\nresult = observe(values | values)",
+            "complete; x: Literal[1] at 'x'",
+        ),
+        (
+            "values = {'x': 1}\nresult = observe(values | {'side': values.clear()})",
+            "complete; side: None at 'side'",
+        ),
+        (
+            "values = {'x': 1}\nresult = observe(values | {'side': (values := {'y': 2})})",
+            "unavailable",
+        ),
+        (
+            "def extra() -> dict[str, int]: return {}\nresult = observe({'x': 1} | dict(extra()))",
+            "extra: int; x: int at 'x'",
+        ),
+        (
+            "class Custom:\n    def __or__(self, other: dict[str, int]) -> dict[str, int]: return {'changed': 1}\nresult = observe(Custom() | {'x': 1})",
+            "unavailable",
+        ),
+        (
+            "class Child(dict[str, int]): pass\nresult = observe(Child() | {'x': 1})",
+            "unavailable",
+        ),
+        (
+            "class Child(dict[str, int]):\n    def __ror__(self, other): return {}\ndef extra() -> dict[str, int]: return Child()\nresult = observe({'x': 1} | extra())",
+            "unavailable",
+        ),
+        (
             "class Child(dict[str, int]):\n    def clear(self) -> None: pass\ndef extra() -> dict[str, int]: return Child(kept=1)\nvalues = extra()\nvalues.clear()\nresult = observe(values)",
             "unavailable",
         ),
@@ -902,6 +942,14 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         (
             "values = {'x': 1}\nalias = values\nalias['y'] = 2\nresult = observe(alias)",
             "extra: Unknown; x~: Literal[1] at 'x'; y~: Literal[2] at 'y'",
+        ),
+        (
+            "def consume(value: object) -> None: pass\nvalues = {'x': 1}\nconsume(values)\nresult = observe(values | {'y': 2})",
+            "extra: Unknown; x~: Literal[1] at 'x'; y: Literal[2] at 'y'",
+        ),
+        (
+            "from typing import Any\ndef unknown() -> Any: ...\nresult = observe({'x': 1} | unknown())",
+            "unavailable",
         ),
         (
             "values = {'x': 1}\nresult = observe(values)",
@@ -976,6 +1024,10 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         (
             "def nested():\n    values = {'inner': 1}\n    values['second'] = 2\n    return observe(values)",
             "complete; inner: Literal[1] at 'inner'; second: Literal[2] at 'second'",
+        ),
+        (
+            "def merge(values: dict[str, int]):\n    return observe({'x': 1} | values)",
+            "unavailable",
         ),
         (
             "def merge(**values: int):\n    values['added'] = 1\n    return observe(values)",

@@ -289,19 +289,27 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .record_multi_use(places.into_iter(), use_id);
     }
 
-    pub(super) fn record_contents_call(
+    pub(super) fn record_contents_snapshot(
         &mut self,
         expression: &'ast ast::Expr,
-        call: &'ast ast::ExprCall,
+        sources: &[&'ast ast::Expr],
     ) {
-        // A positional mapping is copied by the invoked constructor after every argument has
-        // evaluated. Its earlier receiver binding must still identify the same value.
-        if let [source] = call.arguments.args.as_ref()
-            && let Some(contents) = self.contents_place(source)
-            && let Some(receiver) = PlaceExpr::try_from_expr(source)
-            && let Some(receiver) = self.current_place_table().place_id((&receiver).into())
-            && let Some(original_use) = self.ast_ids[self.current_scope()].try_use_id(source)
-        {
+        let mut places: SmallVec<[_; 2]> = SmallVec::new();
+        for &source in sources {
+            let Some(contents) = self.contents_place(source) else {
+                continue;
+            };
+            let Some(receiver) = PlaceExpr::try_from_expr(source) else {
+                continue;
+            };
+            let Some(receiver) = self.current_place_table().place_id((&receiver).into()) else {
+                continue;
+            };
+            let Some(original_use) = self.ast_ids[self.current_scope()].try_use_id(source) else {
+                continue;
+            };
+            // Operands are read before the copy executes. Later evaluation can mutate their
+            // contents, but a rebound place no longer identifies the previously read value.
             let original: SmallVec<[_; 2]> = self
                 .current_use_def_map()
                 .bindings_at_use(original_use)
@@ -312,12 +320,29 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 .current_bindings(receiver)
                 .map(|binding| binding.binding())
                 .collect();
-            if original == current {
-                let use_id = self.current_ast_ids_mut().record_use(expression);
-                self.current_use_def_map_mut().record_use(receiver, use_id);
-                self.current_use_def_map_mut()
-                    .record_multi_use(std::iter::once(contents), use_id);
+            if original == current && !places.contains(&(receiver, contents)) {
+                places.push((receiver, contents));
             }
+        }
+        let Some((receiver, _)) = places.first() else {
+            return;
+        };
+        // Each use has one indexed primary binding; contents observations read the separate
+        // multi-use entries for every operand.
+        let use_id = self.current_ast_ids_mut().record_use(expression);
+        self.current_use_def_map_mut().record_use(*receiver, use_id);
+        self.current_use_def_map_mut()
+            .record_multi_use(places.into_iter().map(|(_, contents)| contents), use_id);
+    }
+
+    pub(super) fn record_contents_call(
+        &mut self,
+        expression: &'ast ast::Expr,
+        call: &'ast ast::ExprCall,
+    ) {
+        // A positional mapping is copied after every argument has evaluated.
+        if let [source] = call.arguments.args.as_ref() {
+            self.record_contents_snapshot(expression, &[source]);
         }
 
         let mut receivers: Vec<(ScopedPlaceId, &ast::Expr, bool)> = Vec::new();
@@ -463,6 +488,12 @@ impl<'ast> Candidates<'ast, '_> {
     }
 
     fn demand(&mut self, receiver: &'ast ast::Expr) {
+        if let ast::Expr::BinOp(binary) = receiver
+            && binary.op == ast::Operator::BitOr
+        {
+            self.demand(&binary.left);
+            self.demand(&binary.right);
+        }
         if let Some(index) = self.place(receiver) {
             self.nodes[index].demanded = true;
         }
@@ -492,6 +523,12 @@ impl<'ast> Candidates<'ast, '_> {
             return;
         }
         match value {
+            ast::Expr::BinOp(binary) => {
+                if binary.op == ast::Operator::BitOr {
+                    self.source_dependencies(target, &binary.left);
+                    self.source_dependencies(target, &binary.right);
+                }
+            }
             ast::Expr::Call(call) => {
                 for argument in &call.arguments.args {
                     self.source_dependencies(target, argument);

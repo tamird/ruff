@@ -4100,9 +4100,12 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 self.record_exception_checkpoint();
                 self.record_contents_call(expr, call);
             }
-            ast::Expr::BinOp(_) => {
+            ast::Expr::BinOp(binary) => {
                 walk_expr(self, expr);
                 self.record_exception_checkpoint();
+                if binary.op == ast::Operator::BitOr {
+                    self.record_contents_snapshot(expr, &[&binary.left, &binary.right]);
+                }
             }
             ast::Expr::UnaryOp(unary) => {
                 if unary.op == ast::UnaryOp::Not {
