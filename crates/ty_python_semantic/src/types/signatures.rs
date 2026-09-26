@@ -41,7 +41,7 @@ use crate::types::relation::{
 use crate::types::tuple::{Tuple, TupleType, VariableSegment};
 use crate::types::typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation;
 use crate::types::typevar::{
-    TypeVarInstance, TypeVarSet, max_typevar_freshness_matching_generic_context,
+    TypeVarDomain, TypeVarInstance, TypeVarSet, max_typevar_freshness_matching_generic_context,
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarIdentity, BoundTypeVarInstance,
@@ -1124,6 +1124,25 @@ impl<'db> Signature<'db> {
             TypeContext::default(),
             &ApplyTypeMappingVisitor::new(env),
         )
+    }
+
+    /// Whether source specialization can use static constraints without declaration-domain solving.
+    /// The caller separately excludes generic target signatures.
+    fn supports_static_inference(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+        !self.is_paramspec_value()
+            && self.receiver_constraints().is_none()
+            && self.parameters().is_standard()
+            && self.generic_context.is_none_or(|context| {
+                context.variables(db).all(|variable| {
+                    variable.domain(db) == TypeVarDomain::Type
+                        && variable.typevar(db).bound_or_constraints(db, env).is_none()
+                })
+            })
+            && self.return_type().is_fully_static(db, env)
+            && self
+                .parameters()
+                .iter()
+                .all(|parameter| parameter.annotated_type().is_fully_static(db, env))
     }
 
     fn max_typevar_freshness_matching_generic_context(
@@ -2394,6 +2413,17 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         source_overloads: &[Signature<'db>],
         target_overloads: &[Signature<'db>],
     ) -> ConstraintSet<'db, 'c> {
+        if self.typevar_evaluation == TypeVarEvaluation::LazyStatic
+            && (target_overloads
+                .iter()
+                .any(|signature| signature.generic_context.is_some())
+                || source_overloads
+                    .iter()
+                    .chain(target_overloads)
+                    .any(|signature| !signature.supports_static_inference(db, self.env)))
+        {
+            return self.never();
+        }
         if self.typevar_evaluation == TypeVarEvaluation::Lazy {
             // TODO: Oof, maybe ParamSpec needs to live at CallableSignature, not Signature?
             let source_is_single_paramspec =
@@ -2637,7 +2667,21 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // sets are discarded when receiver constraints are merged, so presence alone is enough to
         // require lazy typevar evaluation here.
         if source.receiver_constraints().is_some() || target.receiver_constraints().is_some() {
-            checker.typevar_evaluation = TypeVarEvaluation::Lazy;
+            if checker.typevar_evaluation != TypeVarEvaluation::LazyStatic {
+                checker.typevar_evaluation = TypeVarEvaluation::Lazy;
+            }
+        } else if checker.typevar_evaluation == TypeVarEvaluation::Eager
+            && matches!(
+                checker.relation,
+                TypeRelation::Redundancy { pure: true }
+                    | TypeRelation::DeclaredOutput { strict: _ }
+            )
+            && source.generic_context.is_some()
+            && target.generic_context.is_none()
+            && source.supports_static_inference(db, env)
+            && target.supports_static_inference(db, env)
+        {
+            checker.typevar_evaluation = TypeVarEvaluation::LazyStatic;
         }
         let when = checker.with_signature_recursion_guard(source, target, || {
             source

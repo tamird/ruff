@@ -262,6 +262,10 @@ pub(crate) enum TypeVarEvaluation {
     ///
     /// This is currently opt-in, but will eventually replace eager type-variable evaluation.
     Lazy,
+
+    /// Infer static, unbounded source-signature variables for strict callable comparisons.
+    /// Unsupported nested signatures and constraint operands decline the relation.
+    LazyStatic,
 }
 
 #[salsa::tracked]
@@ -1897,7 +1901,25 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
 
         // With lazy evaluation, comparisons with a type variable are translated directly into a
         // constraint set.
-        if self.typevar_evaluation == TypeVarEvaluation::Lazy {
+        if matches!(
+            self.typevar_evaluation,
+            TypeVarEvaluation::Lazy | TypeVarEvaluation::LazyStatic
+        ) {
+            if self.typevar_evaluation == TypeVarEvaluation::LazyStatic
+                && (source.is_type_var() || target.is_type_var())
+                && [source, target].into_iter().any(|ty| {
+                    if !ty.is_fully_static(db, env) {
+                        return true;
+                    }
+                    if let Type::TypeVar(variable) = ty {
+                        return variable.domain(db) != TypeVarDomain::Type
+                            || variable.typevar(db).bound_or_constraints(db, env).is_some();
+                    }
+                    false
+                })
+            {
+                return self.never();
+            }
             // A typevar satisfies a relation when...it satisfies the relation. Yes that's a
             // tautology! We're moving the caller's subtyping/assignability requirement into a
             // constraint set. If the typevar has an upper bound or constraints, then the relation
