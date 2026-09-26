@@ -517,6 +517,109 @@ fn conservative_parameter_inputs() -> anyhow::Result<()> {
 }
 
 #[test]
+fn conservative_assignment_contexts() -> anyhow::Result<()> {
+    use crate::HasType;
+
+    for (
+        annotation,
+        body,
+        ordinary_type,
+        conservative_type,
+        ordinary_diagnostics,
+        conservative_diagnostics,
+    ) in [
+        (
+            "dict[str, list[Any]]",
+            "values = dict(values)",
+            "dict[str, list[Any]]",
+            "dict[str, Top[list[Any]]]",
+            vec![],
+            vec![],
+        ),
+        (
+            "dict[str, list[Any]]",
+            "values = dict(values)\n    values['key'].append(1)",
+            "dict[str, list[Any]]",
+            "dict[str, Top[list[Any]]]",
+            vec![],
+            vec!["invalid-argument-type"],
+        ),
+        (
+            "list[Any]",
+            "values = []\n    values.append(1)",
+            "list[Any]",
+            "list[int]",
+            vec![],
+            vec![],
+        ),
+        (
+            "list[int]",
+            "values = []\n    values.append('bad')",
+            "list[int]",
+            "list[int]",
+            vec!["invalid-argument-type"],
+            vec!["invalid-argument-type"],
+        ),
+    ] {
+        let mut db = setup_db();
+        db.write_file("/src/main.py", format!("from typing import Any\ndef collect(values: {annotation}) -> int:\n    {body}\n    return len(values)\n"))?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let signature = |db: &TestDb| {
+            global_symbol(db, file, "collect")
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        };
+        let original_signature = signature(&db);
+        for (mode, expected_type, expected_diagnostics) in [
+            (None, ordinary_type, &ordinary_diagnostics),
+            (
+                Some(crate::FunctionInferenceMode::Conservative),
+                conservative_type,
+                &conservative_diagnostics,
+            ),
+            (None, ordinary_type, &ordinary_diagnostics),
+        ] {
+            db.select_function_inference(mode.map(|mode| (file, vec!["collect".to_owned()], mode)));
+            let diagnostics = check_types(&db, program_file(&db, file));
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.id().to_string())
+                    .collect::<Vec<_>>(),
+                *expected_diagnostics,
+                "{body}"
+            );
+            let model = crate::SemanticModel::new(&db, program_file(&db, file));
+            let definition = first_public_binding(&db, file, "collect");
+            let DefinitionKind::Function(function) = definition.kind(&db) else {
+                panic!("collect is a function");
+            };
+            let parsed = parsed_module(&db, program_file(&db, file).python_file(&db)).load(&db);
+            let Some(ast::Stmt::Return(statement)) = function.node(&parsed).body.last() else {
+                panic!("collect ends with a return");
+            };
+            let Some(ast::Expr::Call(call)) = statement.value.as_deref() else {
+                panic!("collect returns len(values)");
+            };
+            let value = call.arguments.args.first().expect("len has one argument");
+            assert_eq!(
+                value
+                    .inferred_type(&model)
+                    .unwrap()
+                    .display(&db, &db.program_environment())
+                    .to_string(),
+                expected_type,
+                "{body}"
+            );
+            assert_eq!(signature(&db), original_signature);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn function_output_correspondence() -> anyhow::Result<()> {
     let registry = crate::default_lint_registry();
     let mut rules = RuleSelection::from_registry(registry);

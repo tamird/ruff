@@ -23,6 +23,8 @@ pub enum FunctionInferenceMode {
     /// retain ordinary inference. Lambda parameters and local bindings are not independently
     /// projected; captures and operations consume the types supplied by their bindings.
     /// Eager global snapshots and member results have no separate projection.
+    /// Ordinary assignments infer values without gradual inherited annotation hints;
+    /// the original declarations still govern assignment checking.
     Conservative,
 }
 

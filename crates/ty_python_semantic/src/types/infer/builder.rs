@@ -3524,8 +3524,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let add = self.add_binding(target.into(), definition);
         let mut tcx = add.type_context();
-        if tcx.annotation.is_none()
-            && assignment.unpack().is_none()
+        if let Some(annotation) = tcx.annotation {
+            // Gradual inference hints can erase conservative input bounds. The declaration
+            // still governs assignment checking.
+            if self.function_inference_mode == crate::FunctionInferenceMode::Conservative
+                && !annotation.is_fully_static(self.db(), self.program_environment())
+            {
+                tcx = tcx.with_annotation(None);
+            }
+        } else if assignment.unpack().is_none()
             && target.is_name_expr()
             && let Some((_, context)) =
                 super::returned_local::returned_local_contexts(self.db(), self.scope())
