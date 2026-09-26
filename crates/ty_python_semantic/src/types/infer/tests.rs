@@ -2641,3 +2641,55 @@ fn call_type_doesnt_rerun_when_only_callee_changed() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn function_output_correspondence_ignores_unreachable_returns() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Generator
+        def dead() -> int:
+            if False:
+                return "bad"
+            return 1
+        def live() -> int:
+            return "bad"
+        def generator() -> Generator[int, None, int]:
+            yield 1
+            if False:
+                return "bad"
+            return 1
+    "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let names = ["dead", "live", "generator"];
+    db.select_function_inference(Some((
+        file,
+        names.map(str::to_owned).to_vec(),
+        crate::FunctionInferenceMode::OutputProof,
+    )));
+    let model = crate::SemanticModel::new(&db, program_file(&db, file));
+    for (name, corresponds, has_errors) in [
+        ("dead", true, false),
+        ("live", false, true),
+        ("generator", true, false),
+    ] {
+        let facts = model
+            .function_inference_facts(first_public_binding(&db, file, name))
+            .unwrap();
+        assert_eq!(
+            facts.return_type_correspondence,
+            Some(corresponds),
+            "{name}"
+        );
+        assert_eq!(facts.has_errors, has_errors, "{name}");
+    }
+    let diagnostics = crate::types::check_types(&db, program_file(&db, file));
+    let ids: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.id().as_str())
+        .collect();
+    assert_eq!(ids, ["invalid-return-type"]);
+    Ok(())
+}

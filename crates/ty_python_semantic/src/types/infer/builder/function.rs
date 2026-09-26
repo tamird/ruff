@@ -329,7 +329,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     env,
                                     expected_return_ty,
                                 ));
-                        if let Some(aggregate) = &mut correspondence {
+                        if let Some(aggregate) = &mut correspondence
+                            && self.context.is_range_reachable(return_statement.range)
+                        {
                             *aggregate &= corresponds;
                         }
                         if !assignable {
@@ -408,7 +410,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let corresponds = assignable
                     && (!(correspondence.is_some() || check_soundness)
                         || expected_return.corresponds(db, env, return_statement.ty));
-                if let Some(aggregate) = &mut correspondence {
+                if let Some(aggregate) = &mut correspondence
+                    && self.context.is_range_reachable(return_statement.range)
+                {
                     *aggregate &= corresponds;
                 }
                 if !assignable {
