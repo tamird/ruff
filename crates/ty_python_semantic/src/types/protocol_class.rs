@@ -32,7 +32,7 @@ use crate::{
         diagnostic::{INVALID_PROTOCOL, report_undeclared_protocol_member},
         generics::Specialization,
         member::class_member,
-        signatures::{CallableSignature, walk_signature},
+        signatures::CallableSignature,
         variance::infer_protocol_variance,
     },
 };
@@ -761,9 +761,9 @@ pub(super) fn walk_protocol_instance_member<'db, V: super::visitor::TypeVisitor<
                         Some(runtime_type),
                         Some(receiver_ty),
                     );
-                    walk_signature(db, &signature, visitor);
+                    visitor.visit_signature(db, &signature);
                 } else {
-                    walk_signature(db, signature, visitor);
+                    visitor.visit_signature(db, signature);
                 }
             }
         }

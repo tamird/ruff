@@ -2835,7 +2835,7 @@ impl<'db> FmtDetailed<'db> for DisplayParameters<'_, 'db> {
         // For `Gradual` kind without prefix params (len <= 2), display as `...`.
         let multiline = if self.settings.multiline {
             match self.parameters.kind() {
-                ParametersKind::Standard => self.parameters.len() > 1,
+                ParametersKind::Standard | ParametersKind::Incomplete => self.parameters.len() > 1,
                 ParametersKind::Gradual | ParametersKind::Top | ParametersKind::ParamSpec(_) => {
                     false
                 }
@@ -2858,7 +2858,9 @@ impl<'db> FmtDetailed<'db> for DisplayParameters<'_, 'db> {
         let arg_separator = if multiline { ",\n    " } else { ", " };
 
         match self.parameters.kind() {
-            ParametersKind::Standard | ParametersKind::Concatenate(_) => {
+            ParametersKind::Standard
+            | ParametersKind::Incomplete
+            | ParametersKind::Concatenate(_) => {
                 display_parameters(self, f, self.parameters.as_slice(), arg_separator)?;
             }
             ParametersKind::Top => {

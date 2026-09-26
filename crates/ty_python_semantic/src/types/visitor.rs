@@ -10,7 +10,7 @@ use ty_python_core::definition::Definition;
 use crate::types::{
     BoundMethodType, BoundSuperType, BoundTypeVarInstance, CallableType, EnumComplementType,
     GenericAlias, IntersectionType, KnownBoundMethodType, KnownInstanceType, NominalInstanceType,
-    PropertyInstanceType, ProtocolInstanceType, RecursiveType, SlotDescriptorType,
+    PropertyInstanceType, ProtocolInstanceType, RecursiveType, Signature, SlotDescriptorType,
     StaticClassLiteral, SubclassOfType, Type, TypeAliasType, TypeFormType, TypeGuardType,
     TypeIsType, TypedDictType, UnionType,
     bound_super::walk_bound_super_type,
@@ -30,7 +30,7 @@ use crate::types::{
     type_form::walk_typeform_type,
     typed_dict::walk_typed_dict_type,
     typevar::{TypeVarInstance, walk_bound_type_var_type, walk_type_var_type},
-    walk_property_instance_type, walk_typeguard_type, walk_typeis_type,
+    walk_property_instance_type, walk_signature, walk_typeguard_type, walk_typeis_type,
 };
 
 /// A visitor trait that recurses into nested types.
@@ -61,6 +61,10 @@ pub(crate) trait TypeVisitor<'db> {
         for rest in complement.rest(db) {
             self.visit_type(db, *rest);
         }
+    }
+
+    fn visit_signature(&self, db: &'db dyn Db, signature: &Signature<'db>) {
+        walk_signature(db, signature, self);
     }
 
     fn visit_callable_type(&self, db: &'db dyn Db, callable: CallableType<'db>) {
@@ -552,6 +556,17 @@ fn dynamic_content_impl<'db>(
             }
 
             walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
+        }
+
+        fn visit_signature(&self, db: &'db dyn Db, signature: &Signature<'db>) {
+            if !self.content.get().is_absent() {
+                return;
+            }
+            if signature.parameters().is_incomplete() {
+                self.record(DynamicContent::Present);
+            } else {
+                walk_signature(db, signature, self);
+            }
         }
 
         fn visit_function_type(&self, db: &'db dyn Db, function: FunctionType<'db>) {
