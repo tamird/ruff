@@ -3512,8 +3512,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let add = self.add_binding(target.into(), definition);
-        let target_ty =
-            self.infer_assignment_definition_impl(assignment, definition, add.type_context());
+        let mut tcx = add.type_context();
+        if tcx.annotation.is_none()
+            && assignment.unpack().is_none()
+            && target.is_name_expr()
+            && let Some((_, context)) =
+                super::returned_local::returned_local_contexts(self.db(), self.scope())
+                    .iter()
+                    .find(|(candidate, _)| *candidate == definition)
+        {
+            tcx = tcx.with_annotation(Some(*context));
+        }
+        let target_ty = self.infer_assignment_definition_impl(assignment, definition, tcx);
         self.store_expression_type(target, target_ty);
         add.insert(self, target_ty);
     }

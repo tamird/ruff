@@ -1424,6 +1424,59 @@ def consume(values: list[str]) -> None: ...
     Ok(())
 }
 
+#[test]
+fn returned_local_context_after_formal_changes() -> anyhow::Result<()> {
+    for query_order in [["binding", "file"], ["file", "binding"]] {
+        let mut db = setup_db();
+        for (annotation, expected) in [
+            ("Callable[[str], str]", "(value: str) -> str"),
+            ("object", "(value) -> str"),
+            ("Callable[[str], str]", "(value: str) -> str"),
+        ] {
+            db.write_file(
+                "/src/main.py",
+                format!(
+                    r#"from collections.abc import Callable
+
+def consume(callback: {annotation}, value: str) -> str:
+    return value
+
+def factory() -> Callable[[str], str]:
+    callback = lambda value: consume(callback, value)
+    return callback
+"#,
+                ),
+            )?;
+            for query in query_order {
+                if query == "file" {
+                    assert_file_diagnostics(&db, "/src/main.py", &[]);
+                } else {
+                    let file = system_path_to_file(&db, "/src/main.py")?;
+                    let file = program_file(&db, file);
+                    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+                    let Some(ast::Stmt::FunctionDef(factory)) = module.syntax().body.last() else {
+                        panic!("expected factory as the last statement");
+                    };
+                    let Some(ast::Stmt::Assign(assignment)) = factory.body.first() else {
+                        panic!("expected callback assignment as the first statement");
+                    };
+                    let [ast::Expr::Name(target)] = assignment.targets.as_slice() else {
+                        panic!("expected a single callback name target");
+                    };
+                    let definition = semantic_index(&db, file).expect_single_definition(target);
+                    let ty = crate::types::binding_type(&db, definition);
+                    assert_eq!(
+                        ty.display(&db, &db.program_environment()).to_string(),
+                        expected,
+                        "query order {query_order:?}, formal {annotation}",
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[track_caller]
 fn first_public_binding<'db>(db: &'db TestDb, file: File, name: &str) -> Definition<'db> {
     let scope = global_scope(db, program_file(db, file));

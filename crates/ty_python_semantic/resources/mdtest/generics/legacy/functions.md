@@ -2035,3 +2035,123 @@ def infer_elements():
     append_value(values, "value")
     reveal_type(values)  # revealed: list[str]
 ```
+
+## Context for a recursively captured returned local
+
+The returned local is also passed to a helper from inside a lambda. Both uses require the same
+protocol, so its initializer receives that context. The constructor's generic field relationship
+then contextualizes the lambda, while the actual body result and collection arguments are checked.
+
+```py
+from __future__ import annotations
+from typing import Generic, Protocol, TypeVar
+
+F = TypeVar("F")
+
+class Holder(Generic[F]):
+    def __init__(self, *, reset: F) -> None:
+        self._reset = reset
+
+    @property
+    def reset(self) -> F:
+        return self._reset
+
+class Reset(Protocol):
+    def __call__(self, *attrs: str) -> Builder: ...
+
+class Builder(Protocol):
+    @property
+    def reset(self) -> Reset: ...
+
+def reset(owner: Builder, state: list[str], attrs: tuple[str, ...]) -> Builder:
+    state.extend(attrs)
+    return owner
+
+def make() -> Builder:
+    state = []
+    self = Holder(
+        reset=lambda *attrs: (
+            reveal_type(attrs),  # revealed: tuple[str, ...]
+            reveal_type(state),  # revealed: list[str]
+            reset(self, state, attrs),
+        )[2]
+    )
+    return self
+
+def wrong_element() -> Builder:
+    state = []
+    self = Holder(reset=lambda *attrs: reset(self, state, (1,)))  # error: [invalid-argument-type]
+    return self
+
+def wrong_result() -> Builder:
+    self = Holder(reset=lambda *attrs: 1)
+    return self  # error: [invalid-return-type]
+
+def rebound(replacement: Builder) -> Builder:
+    state = []
+    self = Holder(
+        reset=lambda *attrs: (
+            reveal_type(attrs),  # revealed: tuple[Unknown, ...]
+            reset(self, state, attrs),
+        )[1]
+    )
+    self = replacement
+    return self
+
+def nonlocal_rebound(replacement: Builder) -> Builder:
+    state = []
+    self = Holder(
+        reset=lambda *attrs: (
+            reveal_type(attrs),  # revealed: tuple[Unknown, ...]
+            reset(self, state, attrs),
+        )[1]
+    )
+
+    def change() -> None:
+        nonlocal self
+        self = replacement
+
+    return self
+```
+
+## Recursive calls through a returned local
+
+A member read does not supply a context for the local's initializer. The internal call below uses an
+optional argument that is absent from the required-argument interface exposed by the return. The
+local's extra call surface remains available inside its own callback.
+
+```py
+from collections.abc import Callable
+from typing import Generic, Protocol, TypeVar
+
+F = TypeVar("F")
+G = TypeVar("G")
+
+class Pair(Generic[F, G]):
+    def __init__(self, *, run: F, ping: G) -> None:
+        self._run = run
+        self._ping = ping
+
+    @property
+    def run(self) -> F:
+        return self._run
+
+    @property
+    def ping(self) -> G:
+        return self._ping
+
+class Runner(Protocol):
+    @property
+    def run(self) -> Callable[[int], int]: ...
+    @property
+    def ping(self) -> Callable[[], int]: ...
+
+def make() -> Runner:
+    self = Pair(run=lambda value="bad": 1, ping=lambda: self.run())
+    return self
+
+def aliased_child() -> Runner:
+    self = Pair(run=(alias := lambda value="bad": 1), ping=lambda: 1)
+    reveal_type(alias())  # revealed: Literal[1]
+    return self
+```

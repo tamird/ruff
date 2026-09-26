@@ -3545,3 +3545,102 @@ def _(has_td: HasTD, flag: bool):
     # error: [possibly-unresolved-reference] "Name `y` used when possibly not defined"
     has_td.td = {"bar": y}
 ```
+
+## Context for returned local values
+
+A single local assignment can use its function's return annotation when every reference to the local
+has the same independently declared context. Direct function arguments contribute their matched
+parameter annotations; other uses leave the initializer's inference unchanged.
+
+```py
+from collections.abc import Callable
+from typing import Any
+
+def consume(first: Callable[[str], str], *, second: Callable[[str], str]) -> None: ...
+def conflicting(first: Callable[[str], str], *, second: object) -> None: ...
+def lower() -> Callable[[str], str]:
+    callback = lambda value: (reveal_type(value), value.lower())[1]  # revealed: str
+    consume(callback, second=callback)
+    return callback
+
+def conflicting_use() -> Callable[[str], str]:
+    callback = lambda value: (reveal_type(value), value.lower())[1]  # revealed: Unknown
+    conflicting(callback, second=callback)
+    return callback
+
+def unmatched_call() -> Callable[[str], str]:
+    callback = lambda value: (reveal_type(value), value.lower())[1]  # revealed: Unknown
+    consume(callback)  # error: [missing-argument]
+    return callback
+
+def narrowed() -> Callable[[str | None], int]:
+    callback = lambda value: len(value) if value is not None else 0
+    return callback
+
+def wrong() -> Callable[[str], str]:
+    callback = lambda value: value + 1  # error: [unsupported-operator]
+    return callback
+
+def gradual() -> Callable[[list[Any]], int]:
+    callback = lambda value: (reveal_type(value), len(value))[1]  # revealed: list[Any]
+    return callback
+```
+
+Rebinding, deletion and references in nested function headers prevent transferring context. The
+decision uses indexed references, including a deletion after an unconditional return.
+
+```py
+def rebound() -> Callable[[str], str]:
+    callback = lambda value: (reveal_type(value), value.lower())[1]  # revealed: Unknown
+    callback = lambda value: value
+    return callback
+
+def deleted() -> Callable[[str], str]:
+    callback = lambda value: (reveal_type(value), value.lower())[1]  # revealed: Unknown
+    return callback
+    del callback
+
+def header() -> Callable[[str], str]:
+    callback = lambda value: (reveal_type(value), value.lower())[1]  # revealed: Unknown
+    def nested(value=consume(callback, second=callback)): ...
+    return callback
+```
+
+## Returned callbacks with additional call surfaces
+
+An earlier call prevents contextualizing the shared initializer. In particular, returning a
+required-argument callback must not remove a default used by that call.
+
+```py
+from collections.abc import Callable
+from typing import Protocol
+
+class OptionalInt(Protocol):
+    def __call__(self, value: int = ...) -> int: ...
+
+def compatible() -> Callable[[int], int]:
+    callback = lambda value=1: value
+    earlier = callback()
+    reveal_type(earlier)  # revealed: Unknown | Literal[1]
+    return callback
+
+def constant() -> Callable[[int], int]:
+    callback = lambda value="bad": 1
+    earlier = callback()
+    reveal_type(earlier)  # revealed: Literal[1]
+    return callback
+
+def optional() -> OptionalInt:
+    callback = lambda value="bad": value
+    return callback  # error: [invalid-return-type]
+
+def chained() -> Callable[[int], int]:
+    alias = callback = lambda value="bad": 1
+    reveal_type(alias())  # revealed: Literal[1]
+    return callback
+
+def named_expression() -> Callable[[int], int]:
+    callback = (alias := lambda value="bad": 1)
+    reveal_type(alias())  # revealed: Literal[1]
+    return callback
+```

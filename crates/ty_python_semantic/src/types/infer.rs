@@ -75,6 +75,7 @@ use ty_python_core::{ExpressionNodeKey, SemanticIndex, Statement, Truthiness, se
 
 mod builder;
 mod implicit_alias;
+mod returned_local;
 pub(super) use implicit_alias::implicit_alias_parameters;
 mod comparisons;
 #[cfg(test)]
