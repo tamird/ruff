@@ -16,9 +16,11 @@ pub enum FunctionInferenceMode {
     Default,
     /// Ordinary inference with retained return-type correspondence facts.
     OutputProof,
-    /// Upper-bound materialization of explicit runtime module-global reads.
-    /// Parameters, captures, locals, eager snapshots and member results retain ordinary
-    /// inference; operations consuming a projected global use its materialized type.
+    /// Upper-bound materialization of initial function parameter bindings and explicit
+    /// runtime module-global reads. Parameter declarations, signatures and default checks
+    /// retain ordinary inference. Lambda parameters and local bindings are not independently
+    /// projected; captures and operations consume the types supplied by their bindings.
+    /// Eager global snapshots and member results have no separate projection.
     Conservative,
 }
 
