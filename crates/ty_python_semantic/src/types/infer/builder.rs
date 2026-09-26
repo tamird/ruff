@@ -1358,29 +1358,38 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             DefinitionKind::Comprehension(comprehension) => {
                 self.infer_comprehension_definition(comprehension, definition);
             }
-            DefinitionKind::Parameter(
-                ParameterDefinitionNodeKind::VariadicPositionalParameter(parameter),
-            ) => {
-                self.infer_variadic_positional_parameter_definition(
-                    parameter.node(self.module()),
-                    definition,
-                );
-            }
-            DefinitionKind::Parameter(ParameterDefinitionNodeKind::VariadicKeywordParameter(
-                parameter,
-            )) => {
-                self.infer_variadic_keyword_parameter_definition(
-                    parameter.node(self.module()),
-                    definition,
-                );
-            }
-            DefinitionKind::Parameter(ParameterDefinitionNodeKind::Parameter(
-                parameter_with_default,
-            )) => {
-                self.infer_parameter_definition(
-                    parameter_with_default.node(self.module()),
-                    definition,
-                );
+            DefinitionKind::Parameter(parameter) => {
+                match parameter {
+                    ParameterDefinitionNodeKind::VariadicPositionalParameter(parameter) => {
+                        self.infer_variadic_positional_parameter_definition(
+                            parameter.node(self.module()),
+                            definition,
+                        );
+                    }
+                    ParameterDefinitionNodeKind::VariadicKeywordParameter(parameter) => {
+                        self.infer_variadic_keyword_parameter_definition(
+                            parameter.node(self.module()),
+                            definition,
+                        );
+                    }
+                    ParameterDefinitionNodeKind::Parameter(parameter_with_default) => {
+                        self.infer_parameter_definition(
+                            parameter_with_default.node(self.module()),
+                            definition,
+                        );
+                    }
+                }
+                if self.function_inference_mode == crate::FunctionInferenceMode::Conservative {
+                    let db = self.db();
+                    let env = self.program_environment();
+                    let binding = self
+                        .bindings
+                        .get_mut(&definition)
+                        .expect("parameter inference installs its initial binding");
+                    // Declarations and default checks retain their ordinary types. Updating
+                    // the initial binding also bounds later loads through narrowing/captures.
+                    *binding = binding.top_materialization(db, env);
+                }
             }
             DefinitionKind::LambdaParameter(LambdaParameterDefinitionNodeKind {
                 index,
@@ -13384,6 +13393,12 @@ where
     K: std::fmt::Debug,
     V: std::fmt::Debug,
 {
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.0
+            .iter_mut()
+            .find_map(|(existing, value)| (existing == key).then_some(value))
+    }
+
     fn insert(&mut self, key: K, value: V) {
         debug_assert!(
             !self.0.iter().any(|(existing, _)| existing == &key),

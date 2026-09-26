@@ -414,6 +414,103 @@ fn conservative_global_inputs() -> anyhow::Result<()> {
 }
 
 #[test]
+fn conservative_parameter_inputs() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable
+
+        def collect(values: list[Any]) -> list[object]:
+            out = list(values)
+            out.append(1)
+            return out
+
+        def mutate(values: list[Any]) -> None:
+            values.append(1)
+            values[0] = 1
+
+        def narrowed(values: list[Any] | None) -> None:
+            if values is not None:
+                values.append(2)
+
+        def invoke(callback: Callable[..., int]) -> int:
+            callback()
+            return 1
+
+        def captured(callback: Callable[..., int]) -> Callable[[], int]:
+            return lambda: callback()
+
+        def forward(callback: Callable[..., int]) -> Callable[..., int]:
+            return callback
+
+        def variadic(*values: Any, **fields: Any) -> object:
+            fields["added"] = 1
+            return values[0]
+
+        def unselected(values: list[Any]) -> None:
+            values.append(3)
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let names = [
+        "collect", "mutate", "narrowed", "invoke", "captured", "forward", "variadic",
+    ];
+    let signatures = |db: &TestDb| {
+        names.map(|name| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let original = signatures(&db);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    db.select_function_inference(Some((
+        file,
+        names.map(str::to_owned).to_vec(),
+        crate::FunctionInferenceMode::Conservative,
+    )));
+    let diagnostics = check_types(&db, program_file(&db, file));
+    let source = source_text(&db, file);
+    let actual: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let Some(range) = diagnostic.primary_span().and_then(|span| span.range()) else {
+                panic!("diagnostic has no source range: {diagnostic:?}");
+            };
+            let start = usize::from(range.start());
+            let line_start = source[..start].rfind('\n').map_or(0, |offset| offset + 1);
+            let line_end = source[start..]
+                .find('\n')
+                .map_or(source.len(), |offset| start + offset);
+            (
+                diagnostic.id().to_string(),
+                source[line_start..line_end].trim().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            ("invalid-argument-type", "values.append(1)"),
+            ("invalid-assignment", "values[0] = 1"),
+            ("invalid-argument-type", "values.append(2)"),
+            ("call-top-callable", "callback()"),
+            ("call-top-callable", "return lambda: callback()"),
+            ("invalid-assignment", "fields[\"added\"] = 1"),
+        ]
+        .map(|(id, line)| (id.to_owned(), line.to_owned()))
+    );
+    assert_eq!(signatures(&db), original);
+    db.select_function_inference(None);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    assert_eq!(signatures(&db), original);
+    Ok(())
+}
+
+#[test]
 fn function_output_correspondence() -> anyhow::Result<()> {
     let registry = crate::default_lint_registry();
     let mut rules = RuleSelection::from_registry(registry);
