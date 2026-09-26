@@ -6104,9 +6104,11 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
         // of an standalone inferable statement to avoid large scope-level cycles.
         let mut collection_defs = FxHashSet::default();
         for (collection_def, use_expression) in current_statement.collection_uses {
-            // If the same collection is referenced multiple times in this statement,
-            // we only consider the first occurrence, as collection use constraints are
-            // tracked at the statement level.
+            self.collections_by_use
+                .insert(use_expression, collection_def);
+
+            // Every expression can contribute context, but the statement's constraints
+            // only need to be queried once for each collection.
             if !collection_defs.insert(collection_def) {
                 continue;
             }
@@ -6115,9 +6117,6 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                 .entry(collection_def)
                 .or_default()
                 .push((standalone_statement, use_expression));
-
-            self.collections_by_use
-                .insert(use_expression, collection_def);
         }
     }
 
