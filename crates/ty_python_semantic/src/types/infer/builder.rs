@@ -1360,6 +1360,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 self.infer_comprehension_definition(comprehension, definition);
             }
             DefinitionKind::Parameter(parameter) => {
+                let mut keyword_element = None;
                 match parameter {
                     ParameterDefinitionNodeKind::VariadicPositionalParameter(parameter) => {
                         self.infer_variadic_positional_parameter_definition(
@@ -1368,7 +1369,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         );
                     }
                     ParameterDefinitionNodeKind::VariadicKeywordParameter(parameter) => {
-                        self.infer_variadic_keyword_parameter_definition(
+                        keyword_element = self.infer_variadic_keyword_parameter_definition(
                             parameter.node(self.module()),
                             definition,
                         );
@@ -1389,7 +1390,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .expect("parameter inference installs its initial binding");
                     // Declarations and default checks retain their ordinary types. Updating
                     // the initial binding also bounds later loads through narrowing/captures.
-                    *binding = binding.top_materialization(db, env);
+                    *binding = if let Some(element) = keyword_element {
+                        // The keyword dictionary is freshly allocated; only its values
+                        // can alias gradual inputs supplied by the caller.
+                        KnownClass::Dict.to_specialized_instance(
+                            db,
+                            env,
+                            &[
+                                KnownClass::Str.to_instance(db, env),
+                                element.top_materialization(db, env),
+                            ],
+                        )
+                    } else {
+                        binding.top_materialization(db, env)
+                    };
                 }
             }
             DefinitionKind::LambdaParameter(LambdaParameterDefinitionNodeKind {
@@ -9001,6 +9015,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             };
             Some(signature)
         });
+        let lambda_scope = self
+            .index
+            .try_node_scope(NodeWithScopeRef::Lambda(lambda_expression))
+            .map(|scope| scope.to_scope_id(db, self.program_file()));
+        let conservative_parameters = lambda_scope.is_some_and(|scope| {
+            db.function_inference_mode(scope) == crate::FunctionInferenceMode::Conservative
+        });
+        let contextual_parameter_type = |ty: Type<'db>| {
+            if conservative_parameters && ty.is_fully_static_except_any(db, env) {
+                ty.top_materialization(db, env)
+            } else {
+                ty
+            }
+        };
         let contextual_parameters = callable_tcx.map(Signature::parameters);
         let positional_context = |index| {
             let parameters = contextual_parameters?;
@@ -9037,7 +9065,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter));
                     if let Some(context) = context {
                         parameter
-                            .with_annotated_type(context.annotated_type())
+                            .with_annotated_type(contextual_parameter_type(
+                                context.annotated_type(),
+                            ))
                             .with_optional_default_type(
                                 default_type
                                     .filter(|_| context.has_default() || context.is_variadic()),
@@ -9091,7 +9121,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     && index == posonlyargs.len() + args.len()
                     && !context.has_starred_annotation()
                 {
-                    parameter.with_annotated_type(context.annotated_type())
+                    parameter
+                        .with_annotated_type(contextual_parameter_type(context.annotated_type()))
                 } else {
                     parameter
                 }
@@ -9113,7 +9144,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 {
                     // Explicit keyword inputs can have different types from the homogeneous
                     // remainder. Only parameters that accept keywords consume those inputs.
-                    parameter.with_annotated_type(context.annotated_type())
+                    parameter
+                        .with_annotated_type(contextual_parameter_type(context.annotated_type()))
                 } else {
                     parameter
                 }
@@ -9133,14 +9165,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         self.deferred_state = previous_deferred_state;
 
-        let Some(scope_id) = self
-            .index
-            .try_node_scope(NodeWithScopeRef::Lambda(lambda_expression))
-        else {
+        let Some(scope) = lambda_scope else {
             return Type::unknown();
         };
-
-        let scope = scope_id.to_scope_id(self.db(), self.program_file());
 
         // A single callback context also supplies a return-type hint for the body.
         let return_tcx = if let Some(signature) = callable_tcx {
