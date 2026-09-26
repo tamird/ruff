@@ -279,6 +279,69 @@ collect(1, "a", 2)
 shifted: Collect = lambda *attrs: (reveal_type(attrs), attrs)[1]  # revealed: tuple[Unknown, ...]
 ```
 
+## Callback keyword variadic parameters
+
+A homogeneous keyword variadic context supplies the type of each remaining value. The lambda body
+receives a dictionary with string keys.
+
+```py
+from typing import Protocol
+
+class Collect(Protocol):
+    def __call__(self, **kwargs: int) -> dict[str, int]: ...
+
+collect: Collect = lambda **kwargs: (reveal_type(kwargs), kwargs)[1]  # revealed: dict[str, int]
+reveal_type(collect)  # revealed: (**kwargs: int) -> dict[str, int]
+# error: [unresolved-attribute]
+wrong_operation: Collect = lambda **kwargs: (kwargs["value"].upper(), kwargs)[1]
+```
+
+Named keyword inputs must be consumed by explicit lambda parameters before the remaining values can
+share the variadic type. A positional-only parameter cannot consume an argument passed by keyword.
+
+```py
+class Named(Protocol):
+    def __call__(self, name: str, **kwargs: int) -> dict[str, int]: ...
+
+named: Named = lambda name, **kwargs: (reveal_type(kwargs), kwargs)[1]  # revealed: dict[str, int]
+
+class KeywordNamed(Protocol):
+    def __call__(self, *, name: str, **kwargs: int) -> dict[str, int]: ...
+
+keyword_named: KeywordNamed = lambda *, name="default", **kwargs: (
+    reveal_type(name),  # revealed: str
+    reveal_type(kwargs),  # revealed: dict[str, int]
+    kwargs,
+)[2]
+swallowed: KeywordNamed = lambda **kwargs: (reveal_type(kwargs), kwargs)[1]  # revealed: dict[str, Unknown]
+positional_only: KeywordNamed = lambda name=0, /, **kwargs: (
+    reveal_type(kwargs),  # revealed: dict[str, Unknown]
+    kwargs,
+)[1]
+```
+
+Closed unpacked fields and an unbound parameter specification do not provide a homogeneous
+remainder.
+
+```py
+from typing import Callable, ParamSpec
+from typing_extensions import TypedDict, Unpack
+
+class Options(TypedDict, closed=True):
+    name: str
+    count: int
+
+class Unpacked(Protocol):
+    def __call__(self, **kwargs: Unpack[Options]) -> object: ...
+
+unpacked: Unpacked = lambda **kwargs: reveal_type(kwargs)  # revealed: dict[str, Unknown]
+
+P = ParamSpec("P")
+
+def configure(callback: Callable[P, None]) -> None:
+    forwarded: Callable[P, None] = lambda *args, **kwargs: (reveal_type(kwargs), None)[1]  # revealed: dict[str, Unknown]
+```
+
 ## Generic callback context
 
 Specialized callback protocols and aliases preserve their parameter types. Multiple useful callback

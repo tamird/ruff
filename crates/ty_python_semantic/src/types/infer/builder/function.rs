@@ -1565,18 +1565,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// in a lambda expression.
     pub(super) fn infer_variadic_keyword_lambda_parameter_definition(
         &mut self,
+        index: u32,
         parameter: &'ast ast::Parameter,
+        lambda: &'ast ast::ExprLambda,
         definition: Definition<'db>,
     ) {
         let db = self.db();
+        let element_type = self.contextual_lambda_parameter(index, lambda).map_or(
+            Type::Dynamic(DynamicType::UnknownLambdaParameter),
+            Parameter::annotated_type,
+        );
         let env = self.program_environment();
         let inferred_ty = KnownClass::Dict.to_specialized_instance(
             db,
             env,
-            &[
-                KnownClass::Str.to_instance(db, env),
-                Type::Dynamic(DynamicType::UnknownLambdaParameter),
-            ],
+            &[KnownClass::Str.to_instance(db, env), element_type],
         );
 
         self.add_binding(parameter.into(), definition)

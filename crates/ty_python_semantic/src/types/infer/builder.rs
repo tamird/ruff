@@ -1404,11 +1404,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
             }
             DefinitionKind::LambdaParameter(LambdaParameterDefinitionNodeKind {
+                index,
+                lambda,
                 parameter: ParameterDefinitionNodeKind::VariadicKeywordParameter(parameter),
-                ..
             }) => {
                 self.infer_variadic_keyword_lambda_parameter_definition(
+                    *index,
                     parameter.node(self.module()),
+                    lambda.node(self.module()),
                     definition,
                 );
             }
@@ -9036,8 +9039,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             });
             let keyword_variadic = kwarg.as_ref().map(|param| {
-                Parameter::keyword_variadic(param.name().id.clone())
-                    .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
+                let parameter = Parameter::keyword_variadic(param.name().id.clone())
+                    .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter));
+                if let Some(parameters) = contextual_parameters
+                    && parameters.is_standard()
+                    && let Some((_, context)) = parameters.keyword_variadic()
+                    && parameters
+                        .iter()
+                        .filter_map(Parameter::keyword_name)
+                        .all(|name| {
+                            args.iter()
+                                .chain(kwonlyargs)
+                                .any(|parameter| parameter.name().as_str() == name.as_str())
+                        })
+                {
+                    // Explicit keyword inputs can have different types from the homogeneous
+                    // remainder. Only parameters that accept keywords consume those inputs.
+                    parameter.with_annotated_type(context.annotated_type())
+                } else {
+                    parameter
+                }
             });
 
             let parameters = positional_only
