@@ -26,6 +26,7 @@ use crate::{HasType, ProgramEnvironment, SemanticModel};
 enum ExternalSource {
     Annotation,
     ValueContract,
+    MixedFunctionAnnotations,
 }
 
 impl ExternalSource {
@@ -33,6 +34,7 @@ impl ExternalSource {
         match self {
             Self::Annotation => ProvidedAnnotation::External { file, owner },
             Self::ValueContract => ProvidedAnnotation::ExternalValueContract { file, owner },
+            Self::MixedFunctionAnnotations => ProvidedAnnotation::External { file, owner },
         }
     }
 }
@@ -132,7 +134,14 @@ impl SourceProvider for ExternalSource {
                 let ast::Stmt::FunctionDef(declaration) = statement else {
                     return None;
                 };
-                (declaration.name.as_str() == function.name.as_str()).then_some(declaration)
+                let name = if matches!(self, Self::MixedFunctionAnnotations)
+                    && function.node_index().load() != owner
+                {
+                    "other"
+                } else {
+                    function.name.as_str()
+                };
+                (declaration.name.as_str() == name).then_some(declaration)
             }) else {
                 continue;
             };
@@ -172,6 +181,253 @@ impl SourceProvider for ExternalSource {
     ) -> Option<ProvidedBindingValue<'db>> {
         None
     }
+}
+
+#[test]
+fn external_generic_function_annotations() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new().with_python_version(ruff_python_ast::PythonVersion::PY312)
+        .with_file(
+            "/src/main.py",
+            "def identity(value):\n    return value\nfirst = identity(1)\nsecond = identity('ok')\n",
+        )
+        .with_file("/src/contracts.pyi", "")
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (contract, expected) in [
+        (
+            "def identity[T](value: T) -> T: ...",
+            ["Literal[1]", "Literal[\"ok\"]"],
+        ),
+        (
+            "def identity[T](value: T) -> list[T]: ...",
+            ["list[int]", "list[str]"],
+        ),
+        (
+            "def identity[T](value: T) -> T: ...",
+            ["Literal[1]", "Literal[\"ok\"]"],
+        ),
+    ] {
+        db.write_file("/src/contracts.pyi", contract)?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics.len(),
+            usize::from(contract.contains("list[T]")),
+            "{diagnostics:#?}"
+        );
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.id().as_str(), "invalid-return-type");
+            assert_eq!(
+                diagnostic.primary_annotation().unwrap().get_span().file(),
+                &ruff_db::diagnostic::UnifiedFile::Ty(file)
+            );
+        }
+        let program = db.program_file(file);
+        let module = parsed_module(&db, program.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, program);
+        let observed: Vec<_> = module
+            .suite()
+            .iter()
+            .filter_map(|statement| {
+                let ast::Stmt::Assign(assignment) = statement else {
+                    return None;
+                };
+                Some(
+                    assignment
+                        .value
+                        .inferred_type(&model)
+                        .unwrap()
+                        .display(&db, &model.program_environment())
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(observed, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn external_generic_function_body_and_defaults() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new().with_python_version(ruff_python_ast::PythonVersion::PY312)
+        .with_file("/src/main.py", r#"def literal(value): return 1
+def fresh(value): return []
+def operation(value): return value.missing()
+def default(value=1): return value
+def native[T](value: T = 1) -> T: return value
+first = default()
+second = default('ok')
+third = native()
+fourth = native('ok')
+"#)
+        .with_file("/src/contracts.pyi", "def literal[T](value: T) -> T: ...\ndef fresh[T](value: T) -> T: ...\ndef operation[T](value: T) -> T: ...\ndef default[T](value: T = ...) -> T: ...\n")
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-return-type",
+            "invalid-return-type",
+            "unresolved-attribute",
+            "invalid-parameter-default",
+            "invalid-parameter-default"
+        ],
+        "{diagnostics:#?}"
+    );
+    let program = db.program_file(file);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let model = SemanticModel::new(&db, program);
+    for statement in module.suite() {
+        let ast::Stmt::FunctionDef(function) = statement else {
+            continue;
+        };
+        if function.name.as_str() != "default" && function.name.as_str() != "native" {
+            continue;
+        }
+        let definition = semantic_index(&db, program).expect_single_definition(function);
+        let function = crate::types::infer::infer_definition_types(&db, definition)
+            .function_type(definition)
+            .unwrap();
+        assert_eq!(
+            function.last_definition_signature(&db).parameters()[0].default_type(&db),
+            Some(Type::int_literal(1))
+        );
+    }
+    let observed: Vec<_> = module
+        .suite()
+        .iter()
+        .filter_map(|statement| {
+            let ast::Stmt::Assign(assignment) = statement else {
+                return None;
+            };
+            Some(
+                assignment
+                    .value
+                    .inferred_type(&model)
+                    .unwrap()
+                    .display(&db, &model.program_environment())
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        ["Unknown", "Literal[\"ok\"]", "Unknown", "Literal[\"ok\"]"]
+    );
+    Ok(())
+}
+
+#[test]
+fn external_generic_function_requires_one_complete_donor() -> anyhow::Result<()> {
+    for (source, contract, provider) in [
+        (
+            "def identity(value) -> int: return 1",
+            "def identity[T](value: T) -> T: ...",
+            ExternalSource::Annotation,
+        ),
+        (
+            "def identity(value: int): return value",
+            "def identity[T](value: T) -> T: ...",
+            ExternalSource::Annotation,
+        ),
+        (
+            "def identity(value, missing): return value",
+            "def identity[T](value: T, missing) -> T: ...",
+            ExternalSource::Annotation,
+        ),
+        (
+            "def identity(value): return value",
+            "def identity[T](value: T): ...",
+            ExternalSource::Annotation,
+        ),
+        (
+            "def identity(value): return value",
+            "def identity[T](value: T) -> T: ...\ndef other[U](value: U) -> U: ...",
+            ExternalSource::MixedFunctionAnnotations,
+        ),
+    ] {
+        let db = TestDbBuilder::new()
+            .with_python_version(ruff_python_ast::PythonVersion::PY312)
+            .with_file("/src/main.py", source)
+            .with_file("/src/contracts.pyi", contract)
+            .with_source_provider(provider)
+            .build()?;
+        let program = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let module = parsed_module(&db, program.python_file(&db)).load(&db);
+        let function = module.suite()[0].as_function_def_stmt().unwrap();
+        let definition = semantic_index(&db, program).expect_single_definition(function);
+        let function = crate::types::infer::infer_definition_types(&db, definition)
+            .function_type(definition)
+            .unwrap();
+        assert!(
+            function
+                .last_definition_signature(&db)
+                .generic_context
+                .is_none(),
+            "{source}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn external_generic_function_scopes_returned_callable() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY312)
+        .with_file(
+            "/src/main.py",
+            r#"from typing import Callable
+def make(): return lambda value: value
+def native[T]() -> Callable[[T], T]: return lambda value: value
+first = make()(1)
+second = make()('ok')
+third = native()(1)
+fourth = native()('ok')
+"#,
+        )
+        .with_file(
+            "/src/contracts.pyi",
+            "from typing import Callable\ndef make[T]() -> Callable[[T], T]: ...\n",
+        )
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    assert!(db.check_file(file).is_empty(), "{:#?}", db.check_file(file));
+    let program = db.program_file(file);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let model = SemanticModel::new(&db, program);
+    let observed: Vec<_> = module
+        .suite()
+        .iter()
+        .filter_map(|statement| {
+            let ast::Stmt::Assign(assignment) = statement else {
+                return None;
+            };
+            Some(
+                assignment
+                    .value
+                    .inferred_type(&model)
+                    .unwrap()
+                    .display(&db, &model.program_environment())
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        [
+            "Literal[1]",
+            "Literal[\"ok\"]",
+            "Literal[1]",
+            "Literal[\"ok\"]"
+        ]
+    );
+    Ok(())
 }
 
 #[test]
