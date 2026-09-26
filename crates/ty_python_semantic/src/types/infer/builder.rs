@@ -10163,7 +10163,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     /// Applications can refine factory results without replacing binding or argument inference.
     fn refine_provided_call_results(
-        &self,
+        &mut self,
         call: &ast::ExprCall,
         arguments: &CallArguments<'_, 'db>,
         bindings: &mut Bindings<'db>,
@@ -10176,6 +10176,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             offset: self.dynamic_class_scope_offset(call),
             explicit_bases,
         };
+        let mut diagnostics = Vec::new();
         for callable in bindings.iter_flat_mut() {
             let bound_receiver = callable.bound_type.is_some();
             let Some(binding) = callable.single_overload_mut() else {
@@ -10192,9 +10193,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 class_anchor: &class_anchor,
                 has_binding_errors,
             };
-            if let Some(result) = self.db().provided_call_result(&context) {
+            let crate::provided::ProvidedCallResult {
+                return_type,
+                diagnostics: supplied_diagnostics,
+            } = self.db().provided_call_result(&context);
+            diagnostics.extend(supplied_diagnostics);
+            if let Some(result) = return_type {
                 context.set_return_type(result);
             }
+        }
+        if !diagnostics.is_empty()
+            && self.context.should_collect_diagnostics()
+            && self.context.is_range_reachable(call.range())
+        {
+            self.context.extend_provided_diagnostics(diagnostics);
         }
     }
 

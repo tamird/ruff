@@ -1,6 +1,8 @@
 use crate::dependency::DependencyMetadata;
 use crate::lint::{LintRegistry, RuleSelection};
-use crate::provided::{BuiltinUsage, ProvidedBindingResolution, ProvidedBindingValue};
+use crate::provided::{
+    BuiltinUsage, ProvidedBindingResolution, ProvidedBindingValue, ProvidedCallResult,
+};
 use crate::types::CheckedCall;
 use crate::{AnalysisSettings, PythonVersionWithSource};
 use ruff_db::diagnostic::Diagnostic;
@@ -83,18 +85,21 @@ pub trait Db: PythonCoreDb {
         None
     }
 
-    /// Refines the result of an application-defined factory after ordinary argument checking.
+    /// Supplies result refinements and diagnostics after ordinary argument checking.
     ///
     /// The declaration, bound arguments, and inferred child types come from this inference pass.
     /// Implementations must identify the resolved declaration, rather than the spelling of the
     /// call, and must not request completed inference of the scope currently being inferred.
     /// Invalid calls retain their diagnostics and can supply a recovery result. Overloaded
     /// callables retain ordinary inference; this hook only handles single-signature callables.
+    /// Supplied diagnostics use the current lint rules and source suppressions and are omitted
+    /// for unreachable calls and `@no_type_check` scopes. Reporting diagnostics does not require
+    /// a return-type refinement.
     fn provided_call_result<'db>(
         &'db self,
         _call: &CheckedCall<'_, 'db>,
-    ) -> Option<crate::types::Type<'db>> {
-        None
+    ) -> ProvidedCallResult<'db> {
+        ProvidedCallResult::default()
     }
 
     /// Whether a factory stores direct named keyword arguments unchanged in same-named
@@ -255,7 +260,7 @@ pub(crate) mod tests {
         selected: Option<(File, Vec<String>, super::FunctionInferenceMode)>,
     }
     type CallResultProvider =
-        for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> Option<crate::types::Type<'db>>;
+        for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> crate::provided::ProvidedCallResult<'db>;
     type DeclarationPredicate = for<'db> fn(&'db TestDb, Definition<'db>) -> bool;
     type TypeTestProvider = for<'db> fn(
         &'db TestDb,
@@ -472,9 +477,11 @@ pub(crate) mod tests {
         fn provided_call_result<'db>(
             &'db self,
             call: &CheckedCall<'_, 'db>,
-        ) -> Option<crate::types::Type<'db>> {
+        ) -> crate::provided::ProvidedCallResult<'db> {
             self.call_result_provider
-                .and_then(|provider| provider(self, call))
+                .map_or_else(crate::provided::ProvidedCallResult::default, |provider| {
+                    provider(self, call)
+                })
         }
 
         fn provided_keyword_field_factory(&self, definition: Definition<'_>) -> bool {
