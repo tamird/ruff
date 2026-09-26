@@ -713,6 +713,7 @@ impl From<TypeRelation> for UpcastPolicy {
         match relation {
             TypeRelation::Subtyping
             | TypeRelation::Redundancy { .. }
+            | TypeRelation::DeclaredOutput { .. }
             | TypeRelation::SubtypingAssuming => UpcastPolicy::Sound,
             TypeRelation::Assignability => UpcastPolicy::Unsound,
         }
