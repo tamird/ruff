@@ -1435,6 +1435,7 @@ declare_lint! {
 pub struct TypeCheckDiagnostics {
     diagnostics: Vec<Diagnostic>,
     used_suppressions: FxHashSet<FileSuppressionId>,
+    has_reachable_suppressed_diagnostics: bool,
 }
 
 pub(crate) fn report_mismatched_type_name<'db>(
@@ -1472,6 +1473,7 @@ impl TypeCheckDiagnostics {
     pub(super) fn extend(&mut self, other: &TypeCheckDiagnostics) {
         self.diagnostics.extend_from_slice(&other.diagnostics);
         self.used_suppressions.extend(&other.used_suppressions);
+        self.has_reachable_suppressed_diagnostics |= other.has_reachable_suppressed_diagnostics;
     }
 
     /// Extend with selected diagnostics while retaining all used suppressions.
@@ -1487,6 +1489,7 @@ impl TypeCheckDiagnostics {
                 .cloned(),
         );
         self.used_suppressions.extend(&other.used_suppressions);
+        self.has_reachable_suppressed_diagnostics |= other.has_reachable_suppressed_diagnostics;
     }
 
     pub(super) fn extend_diagnostics(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
@@ -1499,6 +1502,7 @@ impl TypeCheckDiagnostics {
         db: &dyn Db,
         file: PythonFile<'_>,
         diagnostics: impl IntoIterator<Item = Diagnostic>,
+        mut should_record_suppression: impl FnMut(TextRange) -> bool,
     ) {
         for mut diagnostic in diagnostics {
             if let DiagnosticId::Lint(name) = diagnostic.id()
@@ -1515,6 +1519,9 @@ impl TypeCheckDiagnostics {
                 if let Some(range) = span.range()
                     && self.is_suppressed(db, file, range, lint)
                 {
+                    if should_record_suppression(range) {
+                        self.mark_reachable_suppression();
+                    }
                     continue;
                 }
                 if source != LintSource::Default {
@@ -1549,6 +1556,14 @@ impl TypeCheckDiagnostics {
 
     pub(crate) fn used_len(&self) -> usize {
         self.used_suppressions.len()
+    }
+
+    pub(crate) fn mark_reachable_suppression(&mut self) {
+        self.has_reachable_suppressed_diagnostics = true;
+    }
+
+    pub(crate) fn has_reachable_suppressed_diagnostics(&self) -> bool {
+        self.has_reachable_suppressed_diagnostics
     }
 
     pub(crate) fn shrink_to_fit(&mut self) {

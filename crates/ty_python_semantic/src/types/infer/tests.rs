@@ -222,6 +222,11 @@ fn function_inference_facts() -> anyhow::Result<()> {
         def suppressed_body() -> int:
             return "bad"  # ty: ignore[invalid-return-type]
 
+        def dead_body() -> int:
+            if False:
+                return "bad"  # ty: ignore[invalid-return-type]
+            return 1
+
         def bad_default(value: int = needs_int("bad")) -> int:
             return value
 
@@ -235,6 +240,7 @@ fn function_inference_facts() -> anyhow::Result<()> {
         ("clean", false, false),
         ("bad_body", true, true),
         ("suppressed_body", false, true),
+        ("dead_body", false, false),
         ("bad_default", true, true),
         ("suppressed_default", false, true),
     ] {

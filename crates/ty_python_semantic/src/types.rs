@@ -202,8 +202,18 @@ pub(crate) mod definition_resolution;
 mod property_tests;
 mod subscript;
 
+/// Diagnostics and suppression status from checking one file.
+#[derive(Debug)]
+pub struct TypeCheckResult {
+    pub diagnostics: Vec<Diagnostic>,
+    /// Whether file inference suppressed diagnostics in reachable code, including in nested
+    /// scopes, defaults, and implicit aliases. Supplemental diagnostics and checks of
+    /// suppression comments themselves do not contribute to this flag.
+    pub has_suppressed_inference_diagnostics: bool,
+}
+
 pub fn check_types(db: &dyn Db, file: ProgramFile<'_>) -> Vec<Diagnostic> {
-    check_types_with_diagnostics(db, file, [])
+    check_types_with_diagnostics(db, file, []).diagnostics
 }
 
 /// Checks a file and includes diagnostics supplied by the embedding application.
@@ -219,7 +229,7 @@ pub fn check_types_with_diagnostics(
     db: &dyn Db,
     file: ProgramFile<'_>,
     supplemental: impl IntoIterator<Item = Diagnostic>,
-) -> Vec<Diagnostic> {
+) -> TypeCheckResult {
     let source_file = file.file(db);
     let _span = tracing::trace_span!("check_types", ?source_file).entered();
     tracing::debug!("Checking file '{path}'", path = source_file.path(db));
@@ -288,7 +298,8 @@ pub fn check_types_with_diagnostics(
             .map(|error| Diagnostic::invalid_syntax(source_file, error, error)),
     );
 
-    diagnostics.extend_provided(db, file.python_file(db), supplemental);
+    let has_suppressed_inference_diagnostics = diagnostics.has_reachable_suppressed_diagnostics();
+    diagnostics.extend_provided(db, file.python_file(db), supplemental, |_| false);
     let diagnostics = check_suppressions(db, file.python_file(db), diagnostics);
 
     let elapsed = start.elapsed();
@@ -299,7 +310,10 @@ pub fn check_types_with_diagnostics(
         );
     }
 
-    diagnostics
+    TypeCheckResult {
+        diagnostics,
+        has_suppressed_inference_diagnostics,
+    }
 }
 
 /// Infer the type of a binding.

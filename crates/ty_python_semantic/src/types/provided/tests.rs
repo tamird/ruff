@@ -53,28 +53,42 @@ fn supplied_call_diagnostics_follow_native_policy() -> anyhow::Result<()> {
         }
     }
 
-    for (source, enabled, expected) in [
-        ("result = make(1)\n", true, vec!["provided-call-check"]),
+    for (source, enabled, expected, suppressed) in [
+        (
+            "result = make(1)\n",
+            true,
+            vec!["provided-call-check"],
+            false,
+        ),
         (
             "result = make('bad')\n",
             true,
             vec!["invalid-argument-type", "provided-call-check"],
+            false,
         ),
         (
             "result = make('bad')\n",
             false,
             vec!["invalid-argument-type"],
+            false,
         ),
         (
             "result = make(1) # ty: ignore[provided-call-check]\n",
             true,
             vec![],
+            true,
         ),
-        ("if False:\n    make(1)\nresult: int = 1\n", true, vec![]),
+        (
+            "if False:\n    make(1)\nresult: int = 1\n",
+            true,
+            vec![],
+            false,
+        ),
         (
             "from typing import no_type_check\n@no_type_check\ndef skipped() -> int:\n    return make(1)\nresult: int = 1\n",
             true,
             vec![],
+            false,
         ),
     ] {
         let mut registry =
@@ -96,7 +110,11 @@ fn supplied_call_diagnostics_follow_native_policy() -> anyhow::Result<()> {
             )
             .build()?;
         let file = system_path_to_file(&db, "/src/main.py")?;
-        let diagnostics = db.check_file(file);
+        let crate::types::TypeCheckResult {
+            diagnostics,
+            has_suppressed_inference_diagnostics,
+        } = crate::types::check_types_with_diagnostics(&db, db.program_file(file), []);
+        assert_eq!(has_suppressed_inference_diagnostics, suppressed, "{source}");
         let mut ids: Vec<_> = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.id().as_str())

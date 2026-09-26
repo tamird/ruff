@@ -266,9 +266,15 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
     pub(super) fn extend_provided_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
         if !self.diagnostics_suppressed {
             let file = self.python_file();
+            let db = self.db;
+            let program_file = self.program_file;
+            let scope = self.scope;
             self.diagnostics
                 .get_mut()
-                .extend_provided(self.db, file, diagnostics);
+                .extend_provided(db, file, diagnostics, |range| {
+                    let index = semantic_index(db, program_file);
+                    is_range_reachable(db, index, scope.file_scope_id(db), range)
+                });
         }
     }
 
@@ -660,18 +666,20 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
 
         let (severity, source) = Self::severity_and_source(ctx, lint_id)?;
 
-        if ctx
-            .diagnostics
-            .borrow_mut()
-            .is_suppressed(ctx.db(), ctx.python_file(), range, lint_id)
-        {
-            return None;
-        }
+        let suppressed =
+            ctx.diagnostics
+                .borrow_mut()
+                .is_suppressed(ctx.db(), ctx.python_file(), range, lint_id);
 
         // Suppress diagnostics in unreachable code. This checks both whether
         // the scope itself is unreachable and whether the specific statement or
         // expression containing this diagnostic is unreachable.
         if !ctx.is_range_reachable(range) {
+            return None;
+        }
+
+        if suppressed {
+            ctx.diagnostics.borrow_mut().mark_reachable_suppression();
             return None;
         }
 

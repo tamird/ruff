@@ -959,6 +959,42 @@ mod tests {
     }
 
     #[test]
+    fn file_check_retains_inference_suppression_status() -> anyhow::Result<()> {
+        for (source, expected, diagnostic) in [
+            ("value = 1\n", false, None),
+            (
+                "value = missing # ty: ignore[unresolved-reference]\n",
+                true,
+                None,
+            ),
+            (
+                "if False:\n    value = missing # ty: ignore[unresolved-reference]\n",
+                false,
+                None,
+            ),
+            (
+                "value = 1 # ty: ignore[unresolved-reference]\n",
+                false,
+                Some("unused-ignore-comment"),
+            ),
+        ] {
+            let db = TestDbBuilder::new()
+                .with_file("/src/main.py", source)
+                .build()?;
+            let file = system_path_to_file(&db, "/src/main.py")?;
+            let result = check_types_with_diagnostics(&db, db.program_file(file), []);
+            let actual: Vec<_> = result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            assert_eq!(actual, diagnostic.into_iter().collect::<Vec<_>>());
+            assert_eq!(result.has_suppressed_inference_diagnostics, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn supplied_diagnostics_use_registered_suppressions_before_validation() -> anyhow::Result<()> {
         for source in [
             "pass # type: ignore\n",
@@ -994,9 +1030,10 @@ mod tests {
             } else {
                 TextRange::new(0.into(), 4.into())
             };
-            let diagnostics =
+            let result =
                 check_types_with_diagnostics(&db, program_file, [provided_diagnostic(file, range)]);
-            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            assert!(!result.has_suppressed_inference_diagnostics);
+            assert!(result.diagnostics.is_empty(), "{source}: {result:?}");
         }
         Ok(())
     }
@@ -1023,7 +1060,8 @@ mod tests {
             let range = TextRange::at(source.find("pass").unwrap().try_into()?, 4.into());
             let mut expected = provided_diagnostic(file, range);
             let diagnostics =
-                check_types_with_diagnostics(&db, db.program_file(file), [expected.clone()]);
+                check_types_with_diagnostics(&db, db.program_file(file), [expected.clone()])
+                    .diagnostics;
             match setting {
                 Some(source) => {
                     if source != LintSource::Default {
@@ -1070,7 +1108,8 @@ mod tests {
             ),
         ];
         assert_eq!(
-            check_types_with_diagnostics(&db, db.program_file(file), diagnostics.clone()),
+            check_types_with_diagnostics(&db, db.program_file(file), diagnostics.clone())
+                .diagnostics,
             diagnostics
         );
         Ok(())
