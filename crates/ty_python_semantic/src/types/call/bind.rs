@@ -7978,6 +7978,15 @@ impl<'db> Binding<'db> {
 
         let parameter = &self.signature.parameters()[matched_parameter.index];
         let original_parameter_type = parameter.annotated_type();
+        if let Type::FunctionLiteral(function) = binding.callable_type
+            && let Some(context) =
+                function.conservative_contract_parameter(db, matched_parameter.index)
+        {
+            return Some(ArgumentTypeContext::standard(
+                original_parameter_type,
+                context,
+            ));
+        }
         if matches!(binding.callable_type, Type::FunctionLiteral(_))
             && binding.overloads().len() == 1
             && let Some(expected) = call_expression_tcx.annotation

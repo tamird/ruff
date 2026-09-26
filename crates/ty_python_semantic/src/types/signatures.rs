@@ -6090,7 +6090,7 @@ impl<'db> Parameter<'db> {
     }
 
     /// Name of the parameter (if it has one).
-    pub(crate) fn name(&self) -> Option<&ast::name::Name> {
+    pub fn name(&self) -> Option<&ast::name::Name> {
         match &self.kind {
             ParameterKind::PositionalOnly { name, .. } => name.as_ref(),
             ParameterKind::PositionalOrKeyword { name, .. } => Some(name),

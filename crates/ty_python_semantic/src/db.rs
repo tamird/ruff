@@ -24,6 +24,12 @@ pub enum FunctionInferenceMode {
     /// in their signatures; body bindings consume those values through ordinary inference.
     /// Homogeneous keyword dictionaries are fresh containers with bounded value types.
     /// Captures and operations consume the types supplied by their bindings.
+    /// Original selected functions with a supported fixed signature use bounded parameter
+    /// values and results as modular call contracts. Their raw parameter types supply
+    /// argument inference context. At calls using these conservative contracts, applications
+    /// must compare ordinary actual arguments with raw parameter types using
+    /// [`crate::types::Type::satisfies_declared_output`] and account for all selected body
+    /// and file obligations.
     /// Eager global snapshots and member results have no separate projection.
     /// Ordinary assignments infer values without gradual inherited annotation hints;
     /// the original declarations still govern assignment checking.

@@ -7,6 +7,7 @@ use crate::lint::{LintSource, RuleSelection};
 use crate::place::symbol;
 use crate::place::{ConsideredDefinitions, Place, PlaceAndQualifiers};
 use crate::types::{KnownClass, KnownInstanceType, check_types};
+use crate::{FunctionInferenceMode, HasType};
 use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::source::source_text;
@@ -416,6 +417,197 @@ fn conservative_global_inputs() -> anyhow::Result<()> {
     assert_file_diagnostics(&db, "/src/main.py", &[]);
     assert_eq!(signature(&db), original_signature);
     assert_eq!(local_type(&db, "out"), "list[Any]");
+    Ok(())
+}
+
+#[test]
+fn selected_function_contract_signatures() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .build()?;
+    let source = r#"
+from typing import Any, Callable, Iterator, TypeGuard, TypeIs, overload
+
+def identity[T](value: T) -> T: return value
+def plain(values: list[Any]) -> list[Any]: return values
+alias = plain
+def defaulted(values: list[Any] = []) -> list[Any]: return values
+def variadic(*values: Any) -> object: return values
+async def asynchronous(value: int) -> int: return value
+def generator() -> Iterator[int]: yield 1
+def generic[T](value: T) -> T: return value
+def predicate(value: object) -> TypeIs[int]: return False
+def guard(value: object) -> TypeGuard[int]: return False
+def unresolved(value) -> int: return 1
+@overload
+def overloaded(value: int) -> int: ...
+def overloaded(value: int | str) -> int: return 1
+"#;
+    db.write_file("/src/main.py", source)?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let names = [
+        "plain",
+        "defaulted",
+        "variadic",
+        "asynchronous",
+        "generator",
+        "generic",
+        "predicate",
+        "guard",
+        "unresolved",
+        "overloaded",
+    ];
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Conservative,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((file, names.map(str::to_owned).to_vec(), mode)));
+        for name in names.into_iter().chain(["alias"]) {
+            let ty = global_symbol(&db, file, name).place.expect_type();
+            let selected = ty
+                .as_function_literal()
+                .and_then(|function| function.selected_contract_signature(&db));
+            assert_eq!(
+                selected.is_some(),
+                mode != FunctionInferenceMode::Default && matches!(name, "plain" | "alias"),
+                "{name}: {mode:?}"
+            );
+        }
+        let plain = global_symbol(&db, file, "plain").place.expect_type();
+        assert_eq!(plain, global_symbol(&db, file, "alias").place.expect_type());
+        let altered = plain.top_materialization(&db, &db.program_environment());
+        assert!(
+            altered
+                .as_function_literal()
+                .and_then(|function| function.selected_contract_signature(&db))
+                .is_none()
+        );
+    }
+    db.select_function_inference(Some((
+        file,
+        vec!["plain".to_owned()],
+        FunctionInferenceMode::Conservative,
+    )));
+    for (source, expected) in [
+        (
+            source.replace("plain(values: list[Any])", "plain(values: list[Any] = [])"),
+            false,
+        ),
+        (source.to_owned(), true),
+        (source.replace("def plain(", "async def plain("), false),
+        (source.to_owned(), true),
+        (source.replace("def plain(", "@identity\ndef plain("), false),
+        (source.to_owned(), true),
+    ] {
+        db.write_file("/src/main.py", source)?;
+        let function = global_symbol(&db, file, "plain")
+            .place
+            .expect_type()
+            .as_function_literal()
+            .unwrap();
+        assert_eq!(
+            function.selected_contract_signature(&db).is_some(),
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn conservative_function_call_contexts() -> anyhow::Result<()> {
+    for (argument, expected) in [
+        ("callback", &[] as &[(&str, &str)]),
+        ("lambda values: len(values)", &[]),
+        (
+            "lambda values: values.append(1) or 1",
+            &[("invalid-argument-type", "1")],
+        ),
+    ] {
+        let mut db = setup_db();
+        db.write_file(
+            "/src/main.py",
+            format!(
+                "from typing import Any, Callable
+
+def forward(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]:
+    return callback
+
+def make(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]:
+    return forward({argument})
+"
+            ),
+        )?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let signature = |db: &TestDb| {
+            global_symbol(db, file, "forward")
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        };
+        let original = signature(&db);
+        for conservative in [false, true, false] {
+            db.select_function_inference(conservative.then(|| {
+                (
+                    file,
+                    vec![
+                        "forward".to_owned(),
+                        "make".to_owned(),
+                        "<lambda>".to_owned(),
+                    ],
+                    crate::FunctionInferenceMode::Conservative,
+                )
+            }));
+            let program = program_file(&db, file);
+            let diagnostics = check_types(&db, program);
+            let source = source_text(&db, file);
+            let actual = diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    let range = diagnostic
+                        .primary_span()
+                        .and_then(|span| span.range())
+                        .unwrap();
+                    (diagnostic.id().to_string(), &source[range])
+                })
+                .collect::<Vec<_>>();
+            let expected = if conservative { expected } else { &[] };
+            assert_eq!(
+                actual,
+                expected
+                    .iter()
+                    .map(|(id, source)| ((*id).to_owned(), *source))
+                    .collect::<Vec<_>>(),
+                "{argument}, conservative={conservative}"
+            );
+            assert_eq!(signature(&db), original);
+            let model = crate::SemanticModel::new(&db, program);
+            let parsed = parsed_module(&db, program.python_file(&db)).load(&db);
+            let Some(ast::Stmt::FunctionDef(function)) = parsed.suite().last() else {
+                panic!("expected make");
+            };
+            let [ast::Stmt::Return(statement)] = function.body.as_slice() else {
+                panic!("expected return");
+            };
+            let result = statement
+                .value
+                .as_deref()
+                .unwrap()
+                .inferred_type(&model)
+                .unwrap();
+            assert_eq!(
+                result.is_equivalent_to(
+                    &db,
+                    &db.program_environment(),
+                    result.top_materialization(&db, &db.program_environment())
+                ),
+                conservative,
+                "{argument}"
+            );
+        }
+    }
     Ok(())
 }
 
