@@ -53,8 +53,8 @@ use crate::types::abstract_methods::AbstractMethods;
 use crate::types::add_inferred_python_version_hint_to_diagnostic;
 use crate::types::attribute_write::{AssignmentAttributeMembers, assignment_attribute_members};
 use crate::types::call::bind::{
-    ArgumentTypeContext, CallableDescription, CheckTypesMode, OverloadSet,
-    requires_overload_evaluation,
+    ArgumentTypeContext, ArgumentTypeContextSource, CallableDescription, CheckTypesMode,
+    OverloadSet, requires_overload_evaluation,
 };
 use crate::types::call::{Binding, Bindings, CallArguments, CallError, CallErrorKind};
 use crate::types::callable::CallableTypeKind;
@@ -5803,6 +5803,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 if let Err(call_error) = self.infer_and_check_argument_types(
                     ast_arguments,
+                    &[],
                     argument_types,
                     infer_argument_ty,
                     &mut bindings,
@@ -5830,6 +5831,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn infer_and_check_argument_types(
         &mut self,
         ast_arguments: ArgumentsIter<'_>,
+        collection_arguments: &[usize],
         argument_types: &mut CallArguments<'_, 'db>,
         infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
         bindings: &mut Bindings<'db>,
@@ -5944,6 +5946,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let result = if !generic_arguments.is_empty() {
                 speculative_builder.infer_and_check_argument_types_unified(
                     &ast_arguments,
+                    collection_arguments,
                     &mut speculative_argument_types,
                     infer_argument_ty,
                     &mut speculative_bindings,
@@ -5956,6 +5959,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             } else {
                 speculative_builder.infer_and_check_argument_types_simple(
                     ast_arguments.clone(),
+                    collection_arguments,
                     &mut speculative_argument_types,
                     &initial_argument_types,
                     infer_argument_ty,
@@ -6028,6 +6032,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let result = if !generic_arguments.is_empty() {
             self.infer_and_check_argument_types_unified(
                 &ast_arguments,
+                collection_arguments,
                 argument_types,
                 infer_argument_ty,
                 bindings,
@@ -6040,6 +6045,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } else {
             self.infer_and_check_argument_types_simple(
                 ast_arguments,
+                collection_arguments,
                 argument_types,
                 &initial_argument_types,
                 infer_argument_ty,
@@ -6061,6 +6067,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn infer_and_check_argument_types_simple<'call>(
         &mut self,
         ast_arguments: ArgumentsIter<'_>,
+        collection_arguments: &[usize],
         argument_types: &mut CallArguments<'call, 'db>,
         baseline_argument_types: &CallArguments<'call, 'db>,
         infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
@@ -6073,6 +6080,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let env = self.program_environment();
         let requires_overload_evaluation = requires_overload_evaluation(candidates);
         let arguments_tcx = self.collect_call_arguments_type_context(
+            collection_arguments,
             baseline_argument_types,
             bindings,
             requires_overload_evaluation.then_some(candidates),
@@ -6131,6 +6139,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // And re-infer argument types after overload evaluation, ensuring that only
         // inferred types and diagnostics from matching overloads are preserved.
         let arguments_tcx = self.collect_call_arguments_type_context(
+            collection_arguments,
             &checked_argument_types,
             bindings,
             None,
@@ -6155,6 +6164,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn infer_and_check_argument_types_unified(
         &mut self,
         ast_arguments: &ArgumentsIter<'_>,
+        collection_arguments: &[usize],
         argument_types: &mut CallArguments<'_, 'db>,
         infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
         bindings: &mut Bindings<'db>,
@@ -6168,6 +6178,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let requires_overload_evaluation = requires_overload_evaluation(candidates);
 
         let mut arguments_tcx = self.collect_call_arguments_type_context(
+            collection_arguments,
             argument_types,
             bindings,
             Some(candidates),
@@ -6229,6 +6240,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // Collect the argument constraints based on the newly inferred types.
             let next_arguments_tcx = self.collect_call_arguments_type_context(
+                collection_arguments,
                 &next_argument_types,
                 &next_bindings,
                 Some(candidates),
@@ -6263,6 +6275,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // and inferred types are preserved.
         if requires_overload_evaluation {
             let arguments_tcx = self.collect_call_arguments_type_context(
+                collection_arguments,
                 &converged_argument_types,
                 &next_bindings,
                 None,
@@ -6292,6 +6305,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Collects the type contexts used to infer the arguments of a call expression.
     fn collect_call_arguments_type_context<'bindings>(
         &self,
+        collection_arguments: &[usize],
         argument_types: &CallArguments<'_, 'db>,
         bindings: &'bindings Bindings<'db>,
         candidates: Option<&'bindings OverloadSet>,
@@ -6301,7 +6315,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         type OverloadsWithBinding<'a, 'db> = Vec<(
             &'a Binding<'db>,
             &'a CallableBinding<'db>,
-            OnceCell<Option<Specialization<'db>>>,
+            [OnceCell<Option<Specialization<'db>>>; 2],
         )>;
 
         fn add_overloads_from_binding<'a, 'db>(
@@ -6311,12 +6325,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let mut matching_overloads = binding.matching_overloads().peekable();
             if matching_overloads.peek().is_some() {
                 overloads_with_binding.extend(
-                    matching_overloads.map(|(_, overload)| (overload, binding, OnceCell::new())),
+                    matching_overloads.map(|(_, overload)| {
+                        (overload, binding, [OnceCell::new(), OnceCell::new()])
+                    }),
                 );
             } else if let Some(overload) = binding.best_failing_overload() {
                 // If there is a single overload that does not match, we still infer the argument
                 // types for better diagnostics.
-                overloads_with_binding.push((overload, binding, OnceCell::new()));
+                overloads_with_binding.push((
+                    overload,
+                    binding,
+                    [OnceCell::new(), OnceCell::new()],
+                ));
             }
         }
         let db = self.db();
@@ -6327,7 +6347,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut overloads_with_binding: OverloadsWithBinding = Vec::new();
         if let Some(candidates) = candidates {
             bindings.visit_overload_set(candidates, &mut |overload, binding| {
-                overloads_with_binding.push((overload, binding, OnceCell::new()));
+                overloads_with_binding.push((
+                    overload,
+                    binding,
+                    [OnceCell::new(), OnceCell::new()],
+                ));
             });
         } else {
             bindings.visit_type_context_callables(&mut |binding| {
@@ -6342,30 +6366,42 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     return None;
                 }
 
-                let parameter_tcx =
-                    |overload: &Binding<'db>,
-                     binding: &CallableBinding<'db>,
-                     specialization: &OnceCell<Option<Specialization<'db>>>| {
-                        overload.argument_type_context(
-                            db,
-                            env,
-                            constraints,
-                            binding,
-                            argument_types,
-                            argument_index,
-                            call_expression_tcx,
-                            || {
-                                *specialization.get_or_init(|| {
-                                    overload.argument_type_context_specialization(
-                                        db,
-                                        env,
-                                        constraints,
-                                        call_expression_tcx,
-                                    )
-                                })
-                            },
-                        )
+                let source = if collection_arguments.contains(&argument_index) {
+                    ArgumentTypeContextSource::WithoutArguments
+                } else {
+                    ArgumentTypeContextSource::All
+                };
+                let parameter_tcx = |overload: &Binding<'db>,
+                                     binding: &CallableBinding<'db>,
+                                     specializations: &[OnceCell<Option<Specialization<'db>>>;
+                                          2]| {
+                    let [all, without_arguments] = specializations;
+                    let specialization = match source {
+                        ArgumentTypeContextSource::All => all,
+                        ArgumentTypeContextSource::WithoutArguments => without_arguments,
                     };
+                    overload.argument_type_context(
+                        db,
+                        env,
+                        constraints,
+                        binding,
+                        argument_types,
+                        argument_index,
+                        call_expression_tcx,
+                        source,
+                        || {
+                            *specialization.get_or_init(|| {
+                                overload.argument_type_context_specialization(
+                                    db,
+                                    env,
+                                    constraints,
+                                    call_expression_tcx,
+                                    source,
+                                )
+                            })
+                        },
+                    )
+                };
 
                 let parameter_contexts = if let Ok((overload, binding, specialization)) =
                     overloads_with_binding.iter().exactly_one()
@@ -9315,6 +9351,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
+        #[derive(Clone, Copy)]
+        enum CollectionConstraintSource<'ast> {
+            Receiver(&'ast ast::ExprAttribute),
+            Argument(usize),
+        }
+
         // Structural value checking follows fresh literal children, not arguments
         // passed through calls (including builtin constructor inference shortcuts).
         let call_expression_tcx = TypeContext::new(call_expression_tcx.annotation);
@@ -9758,8 +9800,53 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             &bindings,
         );
 
+        let is_named_generic_call = func.is_name_expr()
+            && bindings.iter_flat().any(|binding| {
+                binding
+                    .matching_overloads()
+                    .any(|(_, overload)| overload.signature.generic_context.is_some())
+            });
+        let collection_arguments: SmallVec<[_; 2]> = if is_named_generic_call {
+            arguments
+                .iter_source_order()
+                .enumerate()
+                .filter_map(|(argument_index, argument)| {
+                    if argument.is_variadic() {
+                        return None;
+                    }
+
+                    let value = argument.value();
+                    self.index
+                        .unannotated_collection_initializer(value)
+                        .map(|collection_def| (value, collection_def, argument_index))
+                })
+                .collect()
+        } else {
+            SmallVec::new()
+        };
+        // A collection's prior inferred element type must not constrain its own initializer.
+        // Keep formal and expected-result hints here; the identity call below extracts sibling
+        // constraints without using the collection's element type.
+        let collection_argument_indices: SmallVec<[_; 2]> = collection_arguments
+            .iter()
+            .map(|(_, _, argument_index)| *argument_index)
+            .collect();
+        let generic_collection_argument = collection_arguments.into_iter().exactly_one().ok();
+        let call_expression_tcx = if !collection_argument_indices.is_empty()
+            && call_expression_tcx.annotation.is_some_and(|annotation| {
+                annotation.has_provisional_marker(db, env)
+                    || any_over_type(db, env, annotation, false, |ty| ty.is_divergent())
+            }) {
+            // An enclosing generic call can feed a provisional argument type back through
+            // expected-result context. Neither pass may use it to constrain the initializer.
+            call_expression_tcx.with_annotation(None)
+        } else {
+            call_expression_tcx
+        };
+
         let bindings_result = self.infer_and_check_argument_types(
             ArgumentsIter::from_ast(arguments),
+            &collection_argument_indices,
             &mut call_arguments,
             &mut |builder, (_, expr, tcx)| {
                 // Permit bare ParamSpecs only in direct names and dotted attributes, so nested
@@ -9879,59 +9966,139 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
-        // Record the constraints for the receiver of a bound method call, if the receiver is an
-        // unannotated collection initializer.
-        if let ast::Expr::Attribute(attribute @ ast::ExprAttribute { value, .. }) = func.as_ref() {
-            let value_type = self.expression_type(value);
+        // Bound methods and generic calls both constrain collection elements. Generic calls
+        // currently require exactly one collection argument.
+        let collection = match func.as_ref() {
+            ast::Expr::Attribute(attribute) => {
+                let ast::ExprAttribute {
+                    node_index: _,
+                    range: _,
+                    value,
+                    attr: _,
+                    ctx: _,
+                } = attribute;
+                self.index
+                    .unannotated_collection_initializer(value)
+                    .map(|collection_def| {
+                        (
+                            value.as_ref(),
+                            collection_def,
+                            CollectionConstraintSource::Receiver(attribute),
+                        )
+                    })
+            }
+            ast::Expr::Name(_) => {
+                if bindings.iter_flat().any(|binding| {
+                    binding
+                        .matching_overloads()
+                        .any(|(_, overload)| overload.signature.generic_context.is_some())
+                }) {
+                    generic_collection_argument.map(|(value, collection_def, argument_index)| {
+                        (
+                            value,
+                            collection_def,
+                            CollectionConstraintSource::Argument(argument_index),
+                        )
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
 
-            if let Some(collection_def) = self.index.unannotated_collection_initializer(value)
-                && let Some((collection_literal, _)) = value_type.class_specialization(db, env)
-            {
-                let identity_instance =
-                    Type::instance(db, env, collection_literal.identity_specialization(db));
-                let collection_generic_context = collection_literal.generic_context(db);
-                let mut identity_bindings = self
+        if let Some((value, collection_def, source)) = collection
+            && let Some((collection_literal, _)) =
+                self.expression_type(value).class_specialization(db, env)
+        {
+            let identity_instance =
+                Type::instance(db, env, collection_literal.identity_specialization(db));
+            let collection_generic_context = collection_literal.generic_context(db);
+            let identity_callable_type = match source {
+                CollectionConstraintSource::Receiver(attribute) => self
                     .infer_attribute_load_impl(attribute, identity_instance)
                     .unwrap_or_else(|recovery_ty| recovery_ty)
-                    .inner_type()
-                    .bindings(db, env)
-                    .match_parameters(db, env, &call_arguments)
-                    // Perform inference against the type variables on the receiver's generic context.
-                    .with_generic_context(self.db(), collection_generic_context);
+                    .inner_type(),
+                CollectionConstraintSource::Argument(_) => callable_type,
+            };
+            let collection_argument_index = match source {
+                CollectionConstraintSource::Receiver(_) => None,
+                CollectionConstraintSource::Argument(index) => Some(index),
+            };
+            let mut identity_bindings = identity_callable_type
+                .bindings(db, env)
+                .match_parameters(db, env, &call_arguments)
+                // Infer constraints against the collection's own type variables.
+                .with_generic_context(self.db(), collection_generic_context);
 
-                let call_result = self
-                    .speculate_without_diagnostics()
-                    .infer_and_check_argument_types(
-                        ArgumentsIter::from_ast(arguments),
-                        &mut call_arguments,
-                        // TODO: The argument types have already been inferred and stored in `call_arguments`.
-                        // However, `value` would have been inferred to a be a collection with `Divergent`
-                        // element types, meaning the type context for a given argument, by which the inferred
-                        // type is keyed, may not be the same as the type context we get here. It is not immediately
-                        // clear how to retrieve those types, and so we just re-infer the argument expressions
-                        // for simplicity.
-                        &mut |builder, (_, expr, tcx)| builder.infer_expression(expr, tcx),
-                        &mut identity_bindings,
-                        call_expression_tcx,
-                    );
+            let call_result = self
+                .speculate_without_diagnostics()
+                .infer_and_check_argument_types(
+                    ArgumentsIter::from_ast(arguments),
+                    &[],
+                    &mut call_arguments,
+                    // TODO: Reuse the argument types stored in `call_arguments`. Collection
+                    // elements may initially be `Divergent`, so their original type context
+                    // can differ from the context used for the identity-specialized call.
+                    &mut |builder, (argument_index, expr, tcx)| {
+                        if collection_argument_index == Some(argument_index) {
+                            // Keep the collection's type variables free. Its literal elements
+                            // are incorporated separately when the initializer is inferred.
+                            identity_instance
+                        } else {
+                            builder.infer_expression(expr, tcx)
+                        }
+                    },
+                    &mut identity_bindings,
+                    call_expression_tcx,
+                );
 
-                if call_result.is_ok() {
-                    let db = self.db();
-                    for call_specialization in identity_bindings
-                        .iter_flat()
-                        .flat_map(CallableBinding::matching_overloads)
-                        .filter_map(|(_, identity_overload)| {
-                            identity_overload.partial_specialization(db, env)
-                        })
+            if call_result.is_ok() {
+                let db = self.db();
+                let mut original_bindings = bindings.iter_flat();
+                for identity_binding in identity_bindings.iter_flat() {
+                    let original_binding = match source {
+                        CollectionConstraintSource::Receiver(_) => None,
+                        CollectionConstraintSource::Argument(_) => original_bindings.next(),
+                    };
+                    for (overload_index, identity_overload) in identity_binding.matching_overloads()
                     {
-                        // Record the constraints on the receiver's generic context formed by
-                        // the arguments to this bound method call.
+                        // The identity collection can match an overload rejected by the actual
+                        // argument. Only an originally matching overload may constrain its
+                        // element type.
+                        if collection_argument_index.is_some()
+                            && original_binding.is_none_or(|binding| {
+                                !binding
+                                    .matching_overloads()
+                                    .any(|(matching_index, _)| matching_index == overload_index)
+                            })
+                        {
+                            continue;
+                        }
+
+                        let Some(call_specialization) =
+                            identity_overload.partial_specialization(db, env)
+                        else {
+                            continue;
+                        };
+
+                        // Project the call's constraints onto the collection's type variables.
                         let Some(constraints) = self.collection_use_constraint_from_specialization(
                             identity_instance,
                             collection_generic_context,
                             call_specialization,
                         ) else {
                             continue;
+                        };
+
+                        // Unannotated collection elements promote literal values. Apply the same
+                        // promotion before a sibling's literal becomes nested collection context.
+                        let constraints = if collection_argument_index.is_some()
+                            && call_expression_tcx.annotation.is_none()
+                        {
+                            constraints.promote(db, env)
+                        } else {
+                            constraints
                         };
 
                         self.collection_use_constraints

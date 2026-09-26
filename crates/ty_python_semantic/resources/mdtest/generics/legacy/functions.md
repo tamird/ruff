@@ -2017,3 +2017,21 @@ def grandchild_value(value: Levels[object, object, U]) -> U:
 def probe(value: Levels[int, str, bytes]):
     reveal_type(grandchild_value(value))  # revealed: bytes
 ```
+
+## Inferring collection elements from another argument
+
+A generic function can constrain an unannotated collection through a separate value argument.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def append_value(values: list[T], value: T) -> None:
+    values.append(value)
+
+def infer_elements():
+    values = []
+    append_value(values, "value")
+    reveal_type(values)  # revealed: list[str]
+```

@@ -260,6 +260,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 .match_parameters(db, env, &call_arguments);
         let bindings_result = self.infer_and_check_argument_types(
             ArgumentsIter::from_ast(&call_expr.arguments),
+            &[],
             &mut call_arguments,
             &mut |builder, (_, expr, tcx)| {
                 if name_node.is_some_and(|name| std::ptr::eq(expr, name)) {

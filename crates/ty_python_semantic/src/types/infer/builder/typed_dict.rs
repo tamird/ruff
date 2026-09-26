@@ -447,6 +447,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 
         let result = self.infer_and_check_argument_types(
             ArgumentsIter::from_ast(arguments),
+            &[],
             &mut call_arguments,
             &mut |builder, (_, expr, tcx)| {
                 if can_infer {

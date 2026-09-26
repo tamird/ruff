@@ -303,3 +303,71 @@ def s(value: Options[U]) -> list[U]:
     # error: [invalid-return-type]
     return result
 ```
+
+## Unconstrained collection arguments
+
+A generic call cannot constrain a collection using an element type inferred from that collection
+itself. Feeding the inferred type back into its initializer would recurse through the protocol
+without contributing an independent constraint.
+
+```py
+from collections.abc import Iterable
+from typing import Protocol, TypeAlias, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+
+class Recursive(Protocol[T_co]):
+    def nested(self): ...
+
+class Marker(Protocol):
+    def marker(self): ...
+
+Nested: TypeAlias = Iterable[T_co] | Recursive[T_co] | Marker
+
+def identity[T](x: T) -> T:
+    return x
+
+def _(value: Nested[T_co]) -> list[T_co]:
+    x1 = [value]
+    identity(x1)
+    return x1  # error: [invalid-return-type]
+```
+
+The same restriction applies when the generic parameter is explicitly a collection:
+
+```py
+def list_identity[T](x: list[T]) -> list[T]:
+    return x
+
+def _(value: Nested[T_co]) -> list[T_co]:
+    x2 = [value]
+    list_identity(x2)
+    return x2  # error: [invalid-return-type]
+```
+
+## Independently constrained collection arguments
+
+Another argument can independently constrain a collection even when its existing elements include a
+recursive protocol. The collection's inferred type must not be recorded as an additional constraint
+on itself.
+
+```py
+from collections.abc import Iterable
+from typing import Protocol, TypeAlias, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+
+class Recursive(Protocol[T_co]):
+    def nested(self): ...
+
+class Marker(Protocol):
+    def marker(self): ...
+
+Nested: TypeAlias = Iterable[T_co] | Recursive[T_co] | Marker
+
+def append[T](values: list[T], value: T) -> None: ...
+def _(value: Nested[T_co]) -> list[T_co]:
+    x1 = [value]
+    append(x1, value)
+    return x1  # error: [invalid-return-type]
+```

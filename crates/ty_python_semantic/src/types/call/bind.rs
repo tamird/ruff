@@ -7388,6 +7388,16 @@ impl<'db> MatchedArgument<'db> {
     }
 }
 
+/// Which constraints may specialize a call argument's parameter context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArgumentTypeContextSource {
+    /// Include specialization inferred from prior argument types in the call.
+    All,
+    /// Use formal parameters and the expected result, excluding this call's prior argument
+    /// specialization. This does not establish independence from enclosing inference queries.
+    WithoutArguments,
+}
+
 /// The type context to use when inferring a call-site argument, for a given binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ArgumentTypeContext<'db> {
@@ -7864,6 +7874,7 @@ impl<'db> Binding<'db> {
                 env,
                 constraints,
                 call_expression_tcx,
+                ArgumentTypeContextSource::All,
             ),
         ))
     }
@@ -7956,6 +7967,7 @@ impl<'db> Binding<'db> {
         arguments_types: &CallArguments<'_, 'db>,
         argument_index: usize,
         call_expression_tcx: TypeContext<'db>,
+        source: ArgumentTypeContextSource,
         specialization: impl Fn() -> Option<Specialization<'db>>,
     ) -> Option<ArgumentTypeContext<'db>> {
         let argument_matches =
@@ -8012,6 +8024,11 @@ impl<'db> Binding<'db> {
             // A `P.args`/`P.kwargs` parameter receives context from the `ParamSpec` specialization
             // checked during the previous fixpoint round.
             if let Some(paramspec) = paramspec {
+                // Forwarded parameter context can depend on the wrapped callable and other
+                // arguments. Decline it when those prior argument constraints are excluded.
+                if source == ArgumentTypeContextSource::WithoutArguments {
+                    return None;
+                }
                 // Specializing `P.args` or `P.kwargs` directly yields the entire parameter list,
                 // which is not a valid type context for an individual argument.
                 let callable = paramspec_callable(paramspec)?;
@@ -8065,6 +8082,7 @@ impl<'db> Binding<'db> {
         env: &ProgramEnvironment<'db>,
         constraints: &ConstraintSetBuilder<'db>,
         call_expression_tcx: TypeContext<'db>,
+        source: ArgumentTypeContextSource,
     ) -> Option<Specialization<'db>> {
         let generic_context = self.signature.generic_context?;
 
@@ -8107,7 +8125,11 @@ impl<'db> Binding<'db> {
 
         // The marker distinguishes unsolved type variables without defaults from gradual types
         // inferred from arguments. Only the former are ignored during fixpoint iteration.
-        let argument_specialization = self.inference.map(|inference| {
+        let argument_specialization = match source {
+            ArgumentTypeContextSource::All => self.inference,
+            ArgumentTypeContextSource::WithoutArguments => None,
+        }
+        .map(|inference| {
             inference.merged_specialization_with(db, |typevar, inferred| {
                 (inferred.is_none() && typevar.default_type(db).is_none())
                     .then_some(Type::Dynamic(DynamicType::UnspecializedTypeVar))

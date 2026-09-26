@@ -4033,6 +4033,27 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             }
             ast::Expr::Call(call) => {
                 walk_expr(self, expr);
+                let ast::ExprCall {
+                    node_index: _,
+                    range_start: _,
+                    func,
+                    arguments,
+                } = call;
+                if func.is_name_expr()
+                    && let Some(statement) = self.current_statements.last_mut()
+                    && !statement.collection_uses.is_empty()
+                {
+                    // Only these occurrences receive collection parameter context. Keep the
+                    // nomination local until the enclosing statement is admitted below.
+                    statement.collection_call_arguments.extend(
+                        arguments
+                            .iter_source_order()
+                            .filter(|argument| !argument.is_variadic())
+                            .map(ast::ArgOrKeyword::value)
+                            .filter(|value| value.is_name_expr())
+                            .map(ExpressionNodeKey::from),
+                    );
+                }
                 self.record_exception_checkpoint();
                 self.record_contents_call(expr, call);
             }
@@ -6033,6 +6054,7 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
             contains_contents: false,
             lambda_expressions: Vec::new(),
             collection_uses: Vec::new(),
+            collection_call_arguments: FxHashSet::default(),
         });
         self.visit_stmt_impl(stmt);
         let mut current_statement = self.pop_statement();
@@ -6061,16 +6083,38 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                     // An annotated assignment assigning the collection object to a new binding.
                     ruff_python_ast::Stmt::AnnAssign(_) => true,
 
-                    // A bound-method call on the collection object.
-                    ruff_python_ast::Stmt::Expr(ast::StmtExpr { value, .. }) => {
+                    // A bound method on the collection, or a function that receives it.
+                    ruff_python_ast::Stmt::Expr(statement) => {
+                        let ast::StmtExpr {
+                            node_index: _,
+                            range: _,
+                            value,
+                        } = statement;
                         match value.as_ref() {
-                            ast::Expr::Call(ast::ExprCall { func, .. }) => match func.as_ref() {
-                                ruff_python_ast::Expr::Attribute(ast::ExprAttribute {
-                                    value,
-                                    ..
-                                }) => ExpressionNodeKey::from(value) == *use_expression,
-                                _ => false,
-                            },
+                            ast::Expr::Call(call) => {
+                                let ast::ExprCall {
+                                    node_index: _,
+                                    range_start: _,
+                                    func,
+                                    arguments: _,
+                                } = call;
+                                match func.as_ref() {
+                                    ast::Expr::Attribute(attribute) => {
+                                        let ast::ExprAttribute {
+                                            node_index: _,
+                                            range: _,
+                                            value,
+                                            attr: _,
+                                            ctx: _,
+                                        } = attribute;
+                                        ExpressionNodeKey::from(value) == *use_expression
+                                    }
+                                    ast::Expr::Name(_) => current_statement
+                                        .collection_call_arguments
+                                        .contains(use_expression),
+                                    _ => false,
+                                }
+                            }
                             _ => false,
                         }
                     }
@@ -6464,6 +6508,8 @@ struct CurrentStatement<'ast, 'db> {
     lambda_expressions: Vec<&'ast ast::ExprLambda>,
     /// A list of collection definitions whose uses are contained in this statement.
     collection_uses: Vec<(Definition<'db>, ExpressionNodeKey)>,
+    /// Direct non-variadic name arguments to named calls within this statement.
+    collection_call_arguments: FxHashSet<ExpressionNodeKey>,
 }
 
 #[derive(Debug, PartialEq)]
