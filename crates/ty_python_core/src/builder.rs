@@ -1210,7 +1210,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .ok()
     }
 
-    fn unannotated_collection_literal_binding(
+    fn unannotated_collection_display_binding(
         &self,
         collection_use: &ast::Expr,
     ) -> Option<Definition<'db>> {
@@ -1218,7 +1218,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         definition
             .kind(self.db)
             .as_unannotated_assignment()
-            .is_some_and(|assignment| is_collection_literal(assignment.value(self.module)))
+            .is_some_and(|assignment| is_collection_display(assignment.value(self.module)))
             .then_some(definition)
     }
 
@@ -2432,10 +2432,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 operand = inner;
             }
             let name = operand.as_name_expr()?;
-            // Inferring a collection literal can depend on every use in its scope. These
+            // Inferring a collection display can depend on every use in its scope. These
             // bindings cannot supply a Boolean value and need no additional proof query.
             if self
-                .unannotated_collection_literal_binding(operand)
+                .unannotated_collection_display_binding(operand)
                 .is_some()
             {
                 return None;
@@ -3798,9 +3798,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         if !root.is_some_and(|root| root.range().contains_range(*range)) {
             return;
         }
-        // As with terminal method calls, querying a collection literal's receiver can pull
+        // As with terminal method calls, querying a collection display's receiver can pull
         // its full-scope collection inference into a cycle with all its preceding uses.
-        if self.unannotated_collection_literal_binding(value).is_some() {
+        if self.unannotated_collection_display_binding(value).is_some() {
             return;
         }
         let Some(place) = PlaceExpr::try_from_expr(value)
@@ -5991,7 +5991,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 {
                     let func = call.func.as_ref();
                     // Avoid creating reachability nodes for calls on unannotated collection
-                    // literals. Without this short-circuit, performing reachability analysis
+                    // displays. Without this short-circuit, performing reachability analysis
                     // can lead to quadratic blowup of cycle dependencies during full-scope
                     // collection inference, as Salsa flattens the dependencies of all cycle
                     // participants, and the reachability analysis of a given use of the
@@ -6006,7 +6006,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         && func
                             .as_attribute_expr()
                             .and_then(|attribute| {
-                                self.unannotated_collection_literal_binding(&attribute.value)
+                                self.unannotated_collection_display_binding(&attribute.value)
                             })
                             .is_none()
                     {
@@ -6869,9 +6869,14 @@ fn is_empty_collection_constructor_call(expr: &ast::Expr) -> bool {
 }
 
 fn is_collection_initializer(expr: &ast::Expr) -> bool {
-    is_collection_literal(expr) || is_empty_collection_constructor_call(expr)
+    is_collection_display(expr) || is_empty_collection_constructor_call(expr)
 }
 
-fn is_collection_literal(expr: &ast::Expr) -> bool {
-    expr.is_list_expr() || expr.is_set_expr() || expr.is_dict_expr()
+fn is_collection_display(expr: &ast::Expr) -> bool {
+    expr.is_list_expr()
+        || expr.is_set_expr()
+        || expr.is_dict_expr()
+        || expr.is_list_comp_expr()
+        || expr.is_set_comp_expr()
+        || expr.is_dict_comp_expr()
 }

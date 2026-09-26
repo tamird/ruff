@@ -523,6 +523,7 @@ fn conservative_assignment_contexts() -> anyhow::Result<()> {
     for (
         annotation,
         body,
+        result,
         ordinary_type,
         conservative_type,
         ordinary_diagnostics,
@@ -531,6 +532,7 @@ fn conservative_assignment_contexts() -> anyhow::Result<()> {
         (
             "dict[str, list[Any]]",
             "values = dict(values)",
+            "values",
             "dict[str, list[Any]]",
             "dict[str, Top[list[Any]]]",
             vec![],
@@ -539,14 +541,16 @@ fn conservative_assignment_contexts() -> anyhow::Result<()> {
         (
             "dict[str, list[Any]]",
             "values = dict(values)\n    values['key'].append(1)",
+            "values",
             "dict[str, list[Any]]",
             "dict[str, Top[list[Any]]]",
             vec![],
-            vec!["invalid-argument-type"],
+            vec![("invalid-argument-type", "1")],
         ),
         (
             "list[Any]",
             "values = []\n    values.append(1)",
+            "values",
             "list[Any]",
             "list[int]",
             vec![],
@@ -555,14 +559,55 @@ fn conservative_assignment_contexts() -> anyhow::Result<()> {
         (
             "list[int]",
             "values = []\n    values.append('bad')",
+            "values",
             "list[int]",
             "list[int]",
-            vec!["invalid-argument-type"],
-            vec!["invalid-argument-type"],
+            vec![("invalid-argument-type", "'bad'")],
+            vec![("invalid-argument-type", "'bad'")],
+        ),
+        (
+            "dict[str, list[Any]]",
+            "copied = {key: value for key, value in values.items()}",
+            "copied",
+            "dict[str, list[Any]]",
+            "dict[str, Top[list[Any]]]",
+            vec![],
+            vec![],
+        ),
+        (
+            "dict[str, list[Any]]",
+            "copied = {key: value for key, value in values.items()}\n    copied['key'].append(1)",
+            "copied",
+            "dict[str, list[Any]]",
+            "dict[str, Top[list[Any]]]",
+            vec![],
+            vec![("invalid-argument-type", "1")],
+        ),
+        (
+            "dict[str, list[Any]]",
+            "copied = {key: value for key, value in values.items()}\n    mutate(copied)",
+            "copied",
+            "dict[str, list[Any]]",
+            "dict[str, Top[list[Any]]]",
+            vec![],
+            vec![("invalid-argument-type", "copied")],
         ),
     ] {
         let mut db = setup_db();
-        db.write_file("/src/main.py", format!("from typing import Any\ndef collect(values: {annotation}) -> int:\n    {body}\n    return len(values)\n"))?;
+        db.write_file(
+            "/src/main.py",
+            format!(
+                r#"from typing import Any
+
+def mutate(values: dict[str, list[Any]]) -> None:
+    values["key"].append(1)
+
+def collect(values: {annotation}) -> int:
+    {body}
+    return len({result})
+"#
+            ),
+        )?;
         let file = system_path_to_file(&db, "/src/main.py")?;
         let signature = |db: &TestDb| {
             global_symbol(db, file, "collect")
@@ -583,12 +628,22 @@ fn conservative_assignment_contexts() -> anyhow::Result<()> {
         ] {
             db.select_function_inference(mode.map(|mode| (file, vec!["collect".to_owned()], mode)));
             let diagnostics = check_types(&db, program_file(&db, file));
+            let source = source_text(&db, file);
             assert_eq!(
                 diagnostics
                     .iter()
-                    .map(|diagnostic| diagnostic.id().to_string())
+                    .map(|diagnostic| {
+                        let range = diagnostic
+                            .primary_span()
+                            .and_then(|span| span.range())
+                            .expect("diagnostic has a source range");
+                        (diagnostic.id().to_string(), &source[range])
+                    })
                     .collect::<Vec<_>>(),
-                *expected_diagnostics,
+                expected_diagnostics
+                    .iter()
+                    .map(|(id, argument)| ((*id).to_owned(), *argument))
+                    .collect::<Vec<_>>(),
                 "{body}"
             );
             let model = crate::SemanticModel::new(&db, program_file(&db, file));
@@ -601,7 +656,7 @@ fn conservative_assignment_contexts() -> anyhow::Result<()> {
                 panic!("collect ends with a return");
             };
             let Some(ast::Expr::Call(call)) = statement.value.as_deref() else {
-                panic!("collect returns len(values)");
+                panic!("collect returns a collection length");
             };
             let value = call.arguments.args.first().expect("len has one argument");
             assert_eq!(
