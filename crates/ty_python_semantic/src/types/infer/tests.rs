@@ -1096,6 +1096,132 @@ fn declared_outputs_preserve_input_and_storage_domains() -> anyhow::Result<()> {
 }
 
 #[test]
+fn static_generic_callable_specializations() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .build()?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, Generic, Protocol, TypeVar, cast
+        from ty_extensions._internal import into_regular_callable
+
+        T = TypeVar("T")
+        B = TypeVar("B", bound=int)
+        C = TypeVar("C", str, bytes)
+        def identity(value: T) -> T: return value
+        def pep_identity[U](value: U) -> U: return value
+        def list_identity(value: list[T]) -> list[T]: return value
+        def wrong(value: T) -> int: return 1
+        def bounded(value: B) -> B: return value
+        def constrained(value: C) -> C: return value
+        generic_target = into_regular_callable(identity)
+        fixed = cast(Callable[[str], str], None)
+        wrong_result = cast(Callable[[str], int], None)
+        any_input = cast(Callable[[Any], int], None)
+        int_identity = cast(Callable[[int], int], None)
+        fixed_list = cast(Callable[[list[str]], list[str]], None)
+        wrong_list = cast(Callable[[list[str]], list[int]], None)
+
+        class Box(Generic[T]): pass
+        def constructor(**kwargs: T) -> Box[T]: return cast(Box[T], None)
+        class Factory(Protocol):
+            def __call__(self, **kwargs: str) -> Box[str]: ...
+        factory = cast(Factory, None)
+
+        class Required(Protocol):
+            def __call__(self, value: str) -> str: ...
+        class NarrowCallable:
+            def __call__(self, value: B) -> B: return value
+        def outer(callback: Required, value: T) -> T:
+            callback("x")
+            return value
+        nested_bound = cast(Callable[[NarrowCallable, int], int], None)
+        class GradualCallback:
+            def __call__(self, value: Any) -> Any: return value
+        class IntCallback:
+            def __call__(self, value: int) -> int: return value
+        def generic_callback(callback: Callable[[T], T]) -> T:
+            return callback(cast(T, None))
+        gradual_callback = cast(Callable[[GradualCallback], int], None)
+        static_callback = cast(Callable[[IntCallback], int], None)
+
+        T_co = TypeVar("T_co", covariant=True)
+        class ReadField(Protocol[T_co]):
+            @property
+            def field(self) -> T_co: ...
+        class AnyField:
+            field: Any
+        class IntField:
+            field: int
+        def generic_field(value: ReadField[T]) -> T: return value.field
+        gradual_field = cast(Callable[[AnyField], int], None)
+        static_field = cast(Callable[[IntField], int], None)
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let env = db.program_environment();
+    let target = global_symbol(&db, file, "generic_target")
+        .place
+        .expect_type();
+    let Type::Callable(callable) = target else {
+        panic!(
+            "expected a generic callable, got {}",
+            target.display(&db, &env)
+        );
+    };
+    let [signature] = callable.signatures(&db).overloads.as_slice() else {
+        panic!("expected one generic signature");
+    };
+    assert!(signature.generic_context.is_some());
+    for (actual, target, expected, assignable) in [
+        ("identity", "fixed", true, Some(true)),
+        ("pep_identity", "fixed", true, Some(true)),
+        ("identity", "wrong_result", false, None),
+        ("identity", "any_input", false, None),
+        ("list_identity", "fixed_list", true, Some(true)),
+        ("list_identity", "wrong_list", false, None),
+        ("wrong", "fixed", false, None),
+        ("bounded", "fixed", false, None),
+        ("constrained", "int_identity", false, None),
+        ("constructor", "factory", true, None),
+        ("outer", "nested_bound", false, None),
+        ("generic_callback", "gradual_callback", false, Some(true)),
+        ("generic_callback", "static_callback", true, None),
+        ("generic_field", "gradual_field", false, Some(true)),
+        ("generic_field", "static_field", true, None),
+        ("fixed", "generic_target", false, None),
+    ] {
+        let actual = global_symbol(&db, file, actual).place.expect_type();
+        let target = global_symbol(&db, file, target).place.expect_type();
+        if let Some(expected) = assignable {
+            assert_eq!(
+                actual.is_assignable_to(&db, &env, target),
+                expected,
+                "{} -> {}",
+                actual.display(&db, &env),
+                target.display(&db, &env),
+            );
+        }
+        assert_eq!(
+            actual.is_pure_redundant_with(&db, &env, target),
+            expected,
+            "{} -> {}",
+            actual.display(&db, &env),
+            target.display(&db, &env),
+        );
+        assert_eq!(
+            actual.satisfies_declared_output(&db, &env, target),
+            expected,
+            "{} -> {}",
+            actual.display(&db, &env),
+            target.display(&db, &env),
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn function_output_correspondence() -> anyhow::Result<()> {
     let registry = crate::default_lint_registry();
     let mut rules = RuleSelection::from_registry(registry);
