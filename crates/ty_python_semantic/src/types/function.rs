@@ -1306,6 +1306,123 @@ impl<'db> FunctionType<'db> {
         )
     }
 
+    /// Returns the original signature of a function selected for contract validation.
+    ///
+    /// The function's body scope must use `OutputProof` or `Conservative` inference. This
+    /// admits one unmodified, nongeneric signature with named required parameters and
+    /// known types. Async, generator, overloaded and narrowing-predicate functions are
+    /// excluded. At call sites using the conservative contract, applications must compare
+    /// ordinary arguments with these raw parameter types using [`Type::satisfies_declared_output`]
+    /// and account for every selected body's checking, suppression and file obligations.
+    /// This accessor identifies a modular declaration assumption.
+    pub fn selected_contract_signature(self, db: &'db dyn Db) -> Option<&'db Signature<'db>> {
+        #[salsa::tracked(returns(copy))]
+        fn supports_contract_calls<'db>(
+            db: &'db dyn Db,
+            implementation: OverloadLiteral<'db>,
+        ) -> bool {
+            let definition = implementation.definition(db);
+            let program_file = definition.program_file(db);
+            let python_file = program_file.python_file(db);
+            let module = parsed_module(db, python_file).load(db);
+            let node = implementation.node(db, python_file.file(db), &module);
+            !node.is_async
+                && node.decorator_list.is_empty()
+                && !implementation
+                    .body_scope(db)
+                    .file_scope_id(db)
+                    .is_generator_function(semantic_index(db, program_file))
+        }
+
+        if self.updated_signatures(db).is_some() || self.descriptor_kind(db).is_some() {
+            return None;
+        }
+        let literal = self.literal(db);
+        let scope = literal.last_definition.body_scope(db);
+        if db.function_inference_mode(scope) == crate::FunctionInferenceMode::Default
+            || literal.overloaded
+        {
+            return None;
+        }
+        if !supports_contract_calls(db, literal.last_definition) {
+            return None;
+        }
+        let [signature] = self.signature(db).overloads.as_slice() else {
+            return None;
+        };
+        if signature.generic_context.is_some()
+            || !signature.parameters().is_standard()
+            || signature.parameters().iter().any(|parameter| {
+                parameter.name().is_none()
+                    || parameter.has_default()
+                    || parameter.is_variadic()
+                    || parameter.is_keyword_variadic()
+            })
+            || matches!(
+                signature.return_type().resolve_type_alias(db),
+                Type::TypeIs(_) | Type::TypeGuard(_)
+            )
+        {
+            return None;
+        }
+        let env = ProgramEnvironment::from_scope(scope);
+        if !signature.return_type().is_fully_static_except_any(db, &env)
+            || signature.parameters().iter().any(|parameter| {
+                !parameter
+                    .annotated_type()
+                    .is_fully_static_except_any(db, &env)
+            })
+        {
+            return None;
+        }
+        Some(signature)
+    }
+
+    pub(crate) fn conservative_contract_view(self, db: &'db dyn Db) -> Option<Self> {
+        let scope = self.literal(db).last_definition.body_scope(db);
+        if db.function_inference_mode(scope) != crate::FunctionInferenceMode::Conservative {
+            return None;
+        }
+        let signature = self.selected_contract_signature(db)?;
+        let env = ProgramEnvironment::from_scope(scope);
+        let parameters = crate::types::Parameters::from_annotation(
+            db,
+            signature.parameters().iter().cloned().map(|parameter| {
+                let ty = parameter.annotated_type().top_materialization(db, &env);
+                parameter.with_annotated_type(ty)
+            }),
+        );
+        let signature = signature
+            .clone()
+            .with_parameters(parameters)
+            .with_return_type(signature.return_type().top_materialization(db, &env));
+        Some(Self::new(
+            db,
+            self.literal(db),
+            UpdatedFunctionSignatures::new(Some(CallableSignature::single(signature)), None),
+        ))
+    }
+
+    // Argument inference needs the raw declared domain. A bounded callback formal
+    // can otherwise supply Bottom parameter types to the lambda body.
+    pub(crate) fn conservative_contract_parameter(
+        self,
+        db: &'db dyn Db,
+        index: usize,
+    ) -> Option<Type<'db>> {
+        if self.updated_signatures(db).is_none() {
+            return None;
+        }
+        let original = Self::new_internal(db, self.literal(db), None, None);
+        let projected = original.conservative_contract_view(db)?;
+        if projected != self {
+            return None;
+        }
+        let signature = original.selected_contract_signature(db)?;
+        let parameter = signature.parameters().get(index)?;
+        Some(parameter.annotated_type())
+    }
+
     pub(crate) fn apply_type_mapping_impl<'a>(
         self,
         db: &'db dyn Db,

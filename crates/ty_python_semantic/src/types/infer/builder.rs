@@ -11161,7 +11161,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .inference_flags()
                 .contains(InferenceFlags::IN_TYPE_EXPRESSION)
         {
-            place.map_type(|ty| ty.top_materialization(self.db(), self.program_environment()))
+            place.map_type(|ty| {
+                if let Type::FunctionLiteral(function) = ty
+                    && let Some(view) = function.conservative_contract_view(self.db())
+                {
+                    return Type::FunctionLiteral(view);
+                }
+                ty.top_materialization(self.db(), self.program_environment())
+            })
         } else {
             place
         }
