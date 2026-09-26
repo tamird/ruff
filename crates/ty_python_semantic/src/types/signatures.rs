@@ -3107,6 +3107,18 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             return result;
         }
 
+        if !self.relation.is_assignability()
+            && (source_parameters.is_incomplete() || target_parameters.is_incomplete())
+        {
+            // Known rows cannot establish the domain of unseen required inputs. A universal
+            // source can accept them all; omitted target domains were handled above.
+            return if source_parameters.is_bottom() {
+                result
+            } else {
+                self.never()
+            };
+        }
+
         if self.typevar_evaluation == TypeVarEvaluation::Lazy {
             let source_paramspec = source_parameters.as_paramspec_with_prefix();
             let target_paramspec = target_parameters.as_paramspec_with_prefix();
@@ -4634,6 +4646,10 @@ pub(crate) enum ParametersKind<'db> {
     #[default]
     Standard,
 
+    /// Known parameters from an incomplete signature description. Unseen parameters can be
+    /// required, so these rows alone cannot establish the callable's full input domain.
+    Incomplete,
+
     /// Represents a gradual parameter list using `...` as the only parameter.
     ///
     /// Per [the typing specification], any signature with a variadic and a keyword-variadic
@@ -4867,6 +4883,27 @@ impl<'db> Parameters<'db> {
         )
     }
 
+    /// Mark an already normalized standard parameter list as an incomplete description.
+    ///
+    /// The existing rows and variadics define ordinary argument checks. This marker records
+    /// additional unresolved requirements, including unseen required parameters.
+    ///
+    /// Panics if this is not a standard parameter list. Gradual and generic parameter shapes
+    /// have their own normalization and binding rules.
+    #[must_use]
+    pub fn with_incomplete_shape(mut self) -> Self {
+        assert!(
+            self.is_standard(),
+            "incomplete shapes require standard parameters"
+        );
+        Arc::make_mut(&mut self.data).kind = ParametersKind::Incomplete;
+        self
+    }
+
+    pub(crate) fn is_incomplete(&self) -> bool {
+        matches!(self.data.kind, ParametersKind::Incomplete)
+    }
+
     pub(crate) fn as_slice(&self) -> &[Parameter<'db>] {
         &self.data.value
     }
@@ -4884,6 +4921,7 @@ impl<'db> Parameters<'db> {
 
         let kind = match self.data.kind {
             ParametersKind::Standard => ParametersKind::Standard,
+            ParametersKind::Incomplete => ParametersKind::Incomplete,
             ParametersKind::Gradual
                 if prefix_parameters.iter().all(Parameter::is_positional_only)
                     && matches!(
@@ -4922,6 +4960,7 @@ impl<'db> Parameters<'db> {
 
         let kind = match self.data.kind {
             ParametersKind::Standard => ParametersKind::Standard,
+            ParametersKind::Incomplete => ParametersKind::Incomplete,
             ParametersKind::Gradual
                 if variadic_index.is_some() && keyword_variadic_index.is_some() =>
             {
@@ -5014,8 +5053,8 @@ impl<'db> Parameters<'db> {
             )
     }
 
-    /// Returns `true` if the parameters are a standard parameter list (not gradual, top,
-    /// `ParamSpec`, or `Concatenate`).
+    /// Returns `true` if the parameters are a complete standard parameter list (not gradual,
+    /// top, `ParamSpec`, or `Concatenate`).
     pub(crate) fn is_standard(&self) -> bool {
         matches!(self.data.kind, ParametersKind::Standard)
     }
@@ -5295,9 +5334,14 @@ impl<'db> Parameters<'db> {
         if let TypeMapping::Materialize(materialization_kind) = type_mapping
             && matches!(
                 self.data.kind,
-                ParametersKind::Gradual | ParametersKind::Concatenate(ConcatenateTail::Gradual)
+                ParametersKind::Incomplete
+                    | ParametersKind::Gradual
+                    | ParametersKind::Concatenate(ConcatenateTail::Gradual)
             )
         {
+            // For incomplete descriptions these are conservative global bounds. They also
+            // discard known parameter restrictions, rather than treating the missing shape as
+            // a value annotation that can disappear when individual types are mapped.
             match materialization_kind {
                 MaterializationKind::Bottom => {
                     // The bottom materialization of the `...` parameters is `(*object, **object)`,
@@ -5564,6 +5608,13 @@ impl<'db> Parameters<'db> {
         let expanded = mapped_signature
             .parameters()
             .with_prefix(self.data.value[..variadic_index].iter().cloned());
+        // A resolved ParamSpec supplies more known rows, but cannot complete an independently
+        // incomplete description. Top already permits no calls and must keep that restriction.
+        let expanded = if self.is_incomplete() && !expanded.is_top() {
+            Self::new(expanded.as_slice().to_vec(), ParametersKind::Incomplete)
+        } else {
+            expanded
+        };
         if variadic_index + 2 == self.len() {
             expanded
         } else {
@@ -6432,6 +6483,157 @@ mod tests {
             assert!(
                 parameter.definition().is_some(),
                 "source-backed parameter should have a definition"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_signatures_preserve_shape_uncertainty() {
+        let db = setup_db();
+        let env = db.program_environment();
+        let name = Parameter::keyword_only(Name::new_static("name"))
+            .with_annotated_type(KnownClass::Str.to_instance(&db, &env));
+        let signature = Signature::new(
+            Parameters::standard([name.clone()])
+                .with_incomplete_shape()
+                .with_prefix([Parameter::positional_only(Some(Name::new_static("self")))
+                    .with_annotated_type(Type::object())]),
+            Type::none(&db, &env),
+        );
+        let bound = signature.bind_self(&db, &env, Some(Type::object()));
+        assert!(bound.parameters().is_incomplete());
+        assert_params(&db, &bound, &[name]);
+
+        let mapped = bound.clone().with_parameters(
+            bound.parameters().with_transformed_parameters(
+                bound
+                    .parameters()
+                    .iter()
+                    .cloned()
+                    .map(|parameter| parameter.with_annotated_type(Type::any())),
+            ),
+        );
+        for signature in [bound, mapped] {
+            assert!(signature.parameters().is_incomplete());
+            assert!(!signature.parameters().is_standard());
+            assert!(!signature.parameters().is_gradual());
+            let callable = Type::function_like_callable(&db, signature);
+            assert!(!callable.is_fully_static(&db, &env));
+            assert!(!callable.is_fully_static_except_any(&db, &env));
+            for (actual, parameters) in [
+                (callable.top_materialization(&db, &env), Parameters::top()),
+                (
+                    callable.bottom_materialization(&db, &env),
+                    Parameters::bottom(),
+                ),
+            ] {
+                let expected = Type::function_like_callable(
+                    &db,
+                    Signature::new(parameters, Type::none(&db, &env)),
+                );
+                assert_eq!(actual, expected);
+                assert!(actual.is_fully_static(&db, &env));
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "incomplete shapes require standard parameters")]
+    fn incomplete_signatures_require_standard_parameters() {
+        let _ = Parameters::gradual_form().with_incomplete_shape();
+    }
+
+    #[test]
+    fn incomplete_signatures_preserve_mapped_parameter_expansion() {
+        let db = setup_db();
+        for mapped in [
+            Parameters::empty(),
+            Parameters::gradual_form(),
+            Parameters::top(),
+        ] {
+            let is_top = mapped.is_top();
+            let value = Type::paramspec_value_callable(&db, mapped);
+            let parameters = Parameters::standard([
+                Parameter::variadic(Name::new_static("args")).with_annotated_type(value),
+                Parameter::keyword_variadic(Name::new_static("kwargs")).with_annotated_type(value),
+            ])
+            .with_incomplete_shape();
+            let expanded = parameters.expand_paramspec_variadics(&db);
+            assert_eq!(expanded.is_top(), is_top);
+            assert_eq!(expanded.is_incomplete(), !is_top);
+        }
+    }
+
+    #[test]
+    fn incomplete_signatures_require_domain_evidence() {
+        let db = setup_db();
+        let env = db.program_environment();
+        let result = Type::none(&db, &env);
+        let name = Parameter::keyword_only(Name::new_static("name"))
+            .with_annotated_type(KnownClass::Str.to_instance(&db, &env));
+        let callable = |parameters, result| {
+            Type::function_like_callable(&db, Signature::new(parameters, result))
+        };
+        let incomplete = callable(
+            Parameters::standard([name.clone()]).with_incomplete_shape(),
+            result,
+        );
+        let fixed = callable(Parameters::standard([name.clone()]), result);
+        let optional_unknown = callable(
+            Parameters::standard([
+                name,
+                Parameter::keyword_variadic(Name::new_static("kwargs")),
+            ]),
+            result,
+        );
+        let omitted = callable(Parameters::gradual_form(), result);
+        let universal = callable(Parameters::bottom(), result);
+        let top = callable(Parameters::top(), result);
+
+        // Ordinary consistency can use the known rows. Domain proof also needs the absent rows.
+        assert!(incomplete.is_assignable_to(&db, &env, fixed));
+        assert!(!incomplete.is_subtype_of(&db, &env, fixed));
+        assert!(!incomplete.is_pure_redundant_with(&db, &env, fixed));
+        assert!(!incomplete.is_redundant_with(&db, &env, fixed));
+        assert!(!fixed.is_pure_redundant_with(&db, &env, incomplete));
+        assert!(!fixed.is_redundant_with(&db, &env, incomplete));
+        assert!(incomplete.is_pure_redundant_with(&db, &env, incomplete));
+        assert!(universal.is_pure_redundant_with(&db, &env, incomplete));
+        assert!(incomplete.is_pure_redundant_with(&db, &env, top));
+
+        for (source, target, expected) in [
+            (incomplete, fixed, false),
+            (fixed, incomplete, false),
+            (optional_unknown, fixed, true),
+            (incomplete, omitted, true),
+            (
+                incomplete,
+                callable(Parameters::gradual_form(), Type::any()),
+                true,
+            ),
+            (
+                incomplete,
+                callable(
+                    Parameters::gradual_form(),
+                    KnownClass::Int.to_instance(&db, &env),
+                ),
+                false,
+            ),
+            (
+                callable(Parameters::empty().with_incomplete_shape(), Type::unknown()),
+                omitted,
+                false,
+            ),
+            (universal, incomplete, true),
+            (top, incomplete, false),
+            (incomplete, top, true),
+        ] {
+            assert_eq!(
+                source.satisfies_declared_output(&db, &env, target),
+                expected,
+                "{} -> {}",
+                source.display(&db, &env),
+                target.display(&db, &env),
             );
         }
     }
