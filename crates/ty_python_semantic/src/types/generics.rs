@@ -4241,14 +4241,23 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     return Ok(());
                 }
 
-                // Finally, if there are no bare typevars, we try to infer type mappings by
-                // checking against each union element. This handles cases like
-                // ```py
-                // def f[T](t: P[T] | Q[T]) -> T: ...
-                //
-                // reveal_type(f(P[str]()))  # revealed: str
-                // reveal_type(f(Q[int]()))  # revealed: int
-                // ```
+                // Preserve the complete composite-union relation and its polarity so later
+                // arguments constrain the same choices.
+                let has_bare_typevar = union_formal
+                    .elements(db)
+                    .iter()
+                    .any(|element| element.is_type_var());
+                let has_variadic = self
+                    .inferable
+                    .iter(db)
+                    .any(|typevar| typevar.is_paramspec(db) || typevar.is_typevartuple(db));
+                if !has_bare_typevar && !has_variadic {
+                    let when = self.constraint_for_relation(formal, actual, relation_polarity);
+                    return self.infer_from_constraint_set(when);
+                }
+
+                // Bare type variables and variadics retain the legacy mappings inferred from
+                // individual union elements.
                 let mut first_error = None;
                 let mut found_matching_element = false;
                 for formal_element in union_formal.elements(db) {
