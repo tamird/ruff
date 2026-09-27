@@ -202,7 +202,14 @@ pub(super) fn type_guard_return_implication<'db>(
     let narrowed = NarrowingConstraint::intersection(domain)
         .merge_constraint_and(test.constraint(db, &env))
         .evaluate_constraint_type(db, &env);
-    if !narrowed.is_fully_static(db, &env) {
+    // Unknown element types can still fulfill readonly output requirements.
+    // Recovery types cannot establish the predicate's implication.
+    if super::visitor::any_over_type_expanding_aliases(db, &env, narrowed, |ty| {
+        matches!(ty, Type::Divergent(_))
+            || ty
+                .as_dynamic()
+                .is_some_and(super::DynamicType::is_provisional_marker)
+    }) {
         return None;
     }
     Some(narrowed.satisfies_declared_output(db, &env, target))
