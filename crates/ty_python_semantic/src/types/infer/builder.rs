@@ -1725,6 +1725,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let slice_ty = self.get_or_infer_expression(slice, TypeContext::default());
             Some(
                 self.infer_subscript_expression_types(subscript, value_ty, slice_ty, *ctx)
+                    .map(|result| result.ty)
                     .unwrap_or_else(|recovery_ty| recovery_ty),
             )
         } else {

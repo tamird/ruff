@@ -2631,6 +2631,133 @@ fn membership_argument_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn subscript_argument_correspondence() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, Literal, TypedDict
+        from ty_extensions import Intersection
+
+        class Getter:
+            def __getitem__(self, callback: Callable[[Any], None]) -> int:
+                callback(1)
+                return 1
+
+        class Safe:
+            def __getitem__(self, value: object) -> int: return 1
+
+        class Inapplicable:
+            def __getitem__(self, value: str) -> int: return 1
+
+        def closed(getter: Getter, callback: Callable[[str], None]) -> int:
+            return getter[callback]
+
+        def known(getter: Getter, callback: Callable[[Any], None]) -> int:
+            return getter[callback]
+
+        def union_closed(getter: Getter | Safe, callback: Callable[[str], None]) -> int:
+            return getter[callback]
+
+        def discarded(getter: Intersection[Inapplicable, Safe], callback: Callable[[str], None]) -> int:
+            return getter[callback]
+
+        def contributing(getter: Intersection[Getter, Safe], callback: Callable[[str], None]) -> int:
+            return getter[callback]
+
+        class GradualResult:
+            def __getitem__(self, value: object) -> dict[str, Any]: return {}
+
+        def gradual_result(getter: GradualResult) -> None:
+            getter[0]
+
+        def dynamic(getter: Any) -> None:
+            getter[0]
+
+        def fixed() -> int: return (1, 2)[0]
+        def string() -> str: return "abc"[1:]
+        def bytes_value() -> int: return b"abc"[0]
+
+        class Row(TypedDict):
+            value: Any
+
+        def typed_dict(row: Row) -> None:
+            row["value"]
+
+        def typed_dict_dynamic(row: Row, key: Any) -> None:
+            row[key]
+
+        class NarrowIndex(tuple[int, int]):
+            def __getitem__(self, index: Literal[1]) -> int: return 1
+
+        def overridden(getter: NarrowIndex) -> int:
+            return getter[0]
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("closed", true),
+        ("known", false),
+        ("union_closed", true),
+        ("discarded", false),
+        ("contributing", true),
+        ("gradual_result", false),
+        ("dynamic", true),
+        ("fixed", false),
+        ("string", false),
+        ("bytes_value", false),
+        ("typed_dict", false),
+        ("typed_dict_dynamic", true),
+        ("overridden", true),
+    ];
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary = signatures(&db);
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((
+            file,
+            cases.map(|(name, _)| name.to_owned()).to_vec(),
+            mode,
+        )));
+        let model = crate::SemanticModel::new(&db, program_file(&db, file));
+        for (name, unproved) in cases {
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, name))
+                .unwrap();
+            assert_eq!(
+                facts.has_unproved_requirements,
+                mode == FunctionInferenceMode::OutputProof && unproved,
+                "{mode:?} {name}: {facts:?}"
+            );
+            assert!(!facts.has_errors, "{mode:?} {name}");
+            assert_eq!(
+                facts.return_type_correspondence,
+                (mode == FunctionInferenceMode::OutputProof).then_some(true),
+                "{mode:?} {name}"
+            );
+        }
+        assert_eq!(signatures(&db), ordinary);
+        assert_file_diagnostics(
+            &db,
+            "/src/main.py",
+            &["Invalid override of method `__getitem__`"],
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn parameter_default_correspondence() -> anyhow::Result<()> {
     let mut db = setup_db();
     for (body, unproved) in [
