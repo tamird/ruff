@@ -312,6 +312,17 @@ impl<'db> CallArgumentTypes<'db> {
             .map(|(tcx, ty)| (TypeContext::new(Some(*tcx)), *ty))
             .chain(self.fallback_type.map(|ty| (TypeContext::default(), ty)))
     }
+
+    pub(crate) fn has_unspecialized_nominal_type(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
+        self.iter().any(|(_, ty)| {
+            matches!(ty.resolve_type_alias(db), Type::NominalInstance(_))
+                && ty.has_unspecialized_type_var(db, env)
+        })
+    }
 }
 
 impl<'a, 'db> CallArguments<'a, 'db> {

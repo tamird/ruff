@@ -6238,6 +6238,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             requires_overload_evaluation.then_some(candidates),
             constraints,
             call_expression_tcx,
+            &[],
         );
 
         // If we are not inferring against multiple overloads, we can infer the arguments
@@ -6297,6 +6298,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             None,
             constraints,
             call_expression_tcx,
+            &[],
         );
         self.infer_all_argument_types(
             ast_arguments,
@@ -6336,6 +6338,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             Some(candidates),
             constraints,
             call_expression_tcx,
+            &[],
         );
 
         let mut iteration = 0;
@@ -6398,6 +6401,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 Some(candidates),
                 constraints,
                 call_expression_tcx,
+                &[],
             );
 
             // If the argument constraints have converged, the inferred types will be identical,
@@ -6412,6 +6416,56 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             iteration += 1;
             arguments_tcx = next_arguments_tcx;
             prev_argument_types = next_argument_types;
+        };
+
+        // Resolve remaining provisional slots before committing argument types and pruning
+        // overloads. Defaults and sibling constraints can specialize fresh empty containers;
+        // slots that remain unconstrained use ordinary Unknown context in this final replay.
+        let final_arguments: SmallVec<[usize; 2]> = converged_argument_types
+            .iter_types()
+            .enumerate()
+            .filter_map(|(index, types)| {
+                (!collection_arguments.contains(&index)
+                    && types.has_unspecialized_nominal_type(db, self.program_environment()))
+                .then_some(index)
+            })
+            .collect();
+        let (converged_builder, converged_argument_types) = if !final_arguments.is_empty() {
+            let arguments_tcx = self.collect_call_arguments_type_context(
+                collection_arguments,
+                &converged_argument_types,
+                &next_bindings,
+                Some(candidates),
+                constraints,
+                call_expression_tcx,
+                &final_arguments,
+            );
+            let mut final_builder = self.speculate();
+            let mut final_argument_types = argument_types.clone();
+            final_builder.infer_all_argument_types(
+                ast_arguments.clone(),
+                &mut final_argument_types,
+                &arguments_tcx,
+                infer_argument_ty,
+                if requires_overload_evaluation {
+                    CallArgumentInferenceMode::Speculate
+                } else {
+                    CallArgumentInferenceMode::Commit
+                },
+            );
+            next_bindings = bindings.clone();
+            let _ = next_bindings.check_types_impl(
+                db,
+                self.program_environment(),
+                constraints,
+                &final_argument_types,
+                call_expression_tcx,
+                &self.dataclass_field_specifiers,
+                CheckTypesMode::Provisional,
+            );
+            (final_builder, final_argument_types)
+        } else {
+            (converged_builder, converged_argument_types)
         };
 
         // Discard any non-matching constructors overloads now that the inferred types have converged.
@@ -6433,6 +6487,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 None,
                 constraints,
                 call_expression_tcx,
+                &final_arguments,
             );
 
             self.infer_all_argument_types(
@@ -6455,6 +6510,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     /// Collects the type contexts used to infer the arguments of a call expression.
+    #[expect(clippy::too_many_arguments)]
     fn collect_call_arguments_type_context<'bindings>(
         &self,
         collection_arguments: &[usize],
@@ -6463,11 +6519,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         candidates: Option<&'bindings OverloadSet>,
         constraints: &ConstraintSetBuilder<'db>,
         call_expression_tcx: TypeContext<'db>,
+        final_arguments: &[usize],
     ) -> Vec<Option<MatchingArgumentTypeContext<'db>>> {
         type OverloadsWithBinding<'a, 'db> = Vec<(
             &'a Binding<'db>,
             &'a CallableBinding<'db>,
-            [OnceCell<Option<Specialization<'db>>>; 2],
+            [OnceCell<Option<Specialization<'db>>>; 3],
         )>;
 
         fn add_overloads_from_binding<'a, 'db>(
@@ -6476,18 +6533,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         ) {
             let mut matching_overloads = binding.matching_overloads().peekable();
             if matching_overloads.peek().is_some() {
-                overloads_with_binding.extend(
-                    matching_overloads.map(|(_, overload)| {
-                        (overload, binding, [OnceCell::new(), OnceCell::new()])
-                    }),
-                );
+                overloads_with_binding.extend(matching_overloads.map(|(_, overload)| {
+                    (
+                        overload,
+                        binding,
+                        [OnceCell::new(), OnceCell::new(), OnceCell::new()],
+                    )
+                }));
             } else if let Some(overload) = binding.best_failing_overload() {
                 // If there is a single overload that does not match, we still infer the argument
                 // types for better diagnostics.
                 overloads_with_binding.push((
                     overload,
                     binding,
-                    [OnceCell::new(), OnceCell::new()],
+                    [OnceCell::new(), OnceCell::new(), OnceCell::new()],
                 ));
             }
         }
@@ -6502,7 +6561,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 overloads_with_binding.push((
                     overload,
                     binding,
-                    [OnceCell::new(), OnceCell::new()],
+                    [OnceCell::new(), OnceCell::new(), OnceCell::new()],
                 ));
             });
         } else {
@@ -6523,13 +6582,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 } else {
                     ArgumentTypeContextSource::All
                 };
+                let mode = if final_arguments.contains(&argument_index) {
+                    CheckTypesMode::Finalize
+                } else {
+                    CheckTypesMode::Provisional
+                };
                 let parameter_tcx = |overload: &Binding<'db>,
                                      binding: &CallableBinding<'db>,
                                      specializations: &[OnceCell<Option<Specialization<'db>>>;
-                                          2]| {
-                    let [all, without_arguments] = specializations;
+                                          3]| {
+                    let [all_provisional, all_final, without_arguments] = specializations;
                     let specialization = match source {
-                        ArgumentTypeContextSource::All => all,
+                        ArgumentTypeContextSource::All => match mode {
+                            CheckTypesMode::Provisional => all_provisional,
+                            CheckTypesMode::Finalize => all_final,
+                        },
                         ArgumentTypeContextSource::WithoutArguments => without_arguments,
                     };
                     overload.argument_type_context(
@@ -6541,6 +6608,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         argument_index,
                         call_expression_tcx,
                         source,
+                        mode,
                         || {
                             *specialization.get_or_init(|| {
                                 overload.argument_type_context_specialization(
@@ -6549,6 +6617,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     constraints,
                                     call_expression_tcx,
                                     source,
+                                    mode,
                                 )
                             })
                         },
@@ -8031,8 +8100,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             !ty.as_typevar()
                                 .is_some_and(|tv| tv.is_inferable(self.db(), inferable))
                         })
-                        .filter_union(db, env, |ty| !ty.has_unspecialized_type_var(db, env));
-                    if inferred_ty.has_unspecialized_type_var(db, env) {
+                        .filter_union(db, env, |ty| {
+                            elts.is_empty() || !ty.has_unspecialized_type_var(db, env)
+                        });
+                    if !elts.is_empty() && inferred_ty.has_unspecialized_type_var(db, env) {
                         continue;
                     }
 

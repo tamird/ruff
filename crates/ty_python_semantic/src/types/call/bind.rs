@@ -647,18 +647,18 @@ pub(crate) fn requires_overload_evaluation(candidates: &OverloadSet) -> bool {
     candidates.iter().any(|indices| indices.len() > 1)
 }
 
-/// Controls the behavior of a given call to [`Bindings::check_types`].
+/// Controls generic call checking and resolution of provisional argument contexts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CheckTypesMode {
     /// After checking, retain only the callable bindings that contribute to the call
-    /// evaluation.
+    /// evaluation. Resolve any remaining unspecialized context slots to ordinary types.
     Finalize,
 
     /// Preserve all callable bindings, regardless of whether they evaluate successfully.
     ///
     /// Generic call inference may perform fixpoint iteration in order to unify
     /// type context across call arguments, and so all callable bindings should
-    /// remain candidates until the final round is finalized.
+    /// remain candidates and context slots may stay unspecialized until the final round.
     Provisional,
 }
 
@@ -7911,6 +7911,7 @@ struct ParamSpecArgumentContext<'a, 'call, 'db> {
     arguments_types: &'a CallArguments<'call, 'db>,
     argument_index: usize,
     call_expression_tcx: TypeContext<'db>,
+    mode: CheckTypesMode,
 }
 
 /// Returns the number of occurrences of inferable type variables in the provided type.
@@ -8209,6 +8210,7 @@ impl<'db> Binding<'db> {
             arguments_types,
             argument_index,
             call_expression_tcx,
+            mode,
         } = *context;
 
         let (prefix, _) = self.signature.parameters().as_paramspec_with_prefix()?;
@@ -8271,6 +8273,7 @@ impl<'db> Binding<'db> {
                 constraints,
                 call_expression_tcx,
                 ArgumentTypeContextSource::All,
+                mode,
             ),
         ))
     }
@@ -8364,6 +8367,7 @@ impl<'db> Binding<'db> {
         argument_index: usize,
         call_expression_tcx: TypeContext<'db>,
         source: ArgumentTypeContextSource,
+        mode: CheckTypesMode,
         specialization: impl Fn() -> Option<Specialization<'db>>,
     ) -> Option<ArgumentTypeContext<'db>> {
         let argument_matches =
@@ -8464,6 +8468,7 @@ impl<'db> Binding<'db> {
                         arguments_types,
                         argument_index,
                         call_expression_tcx,
+                        mode,
                     })?;
                 return Some(ArgumentTypeContext::paramspec(
                     original_parameter_type,
@@ -8505,6 +8510,7 @@ impl<'db> Binding<'db> {
         constraints: &ConstraintSetBuilder<'db>,
         call_expression_tcx: TypeContext<'db>,
         source: ArgumentTypeContextSource,
+        mode: CheckTypesMode,
     ) -> Option<Specialization<'db>> {
         let generic_context = self.signature.generic_context?;
 
@@ -8553,7 +8559,7 @@ impl<'db> Binding<'db> {
         }
         .map(|inference| {
             inference.merged_specialization_with(db, |typevar, inferred| {
-                (inferred.is_none() && typevar.default_type(db).is_none())
+                (mode.is_provisional() && inferred.is_none() && typevar.default_type(db).is_none())
                     .then_some(Type::Dynamic(DynamicType::UnspecializedTypeVar))
             })
         });
@@ -8570,10 +8576,18 @@ impl<'db> Binding<'db> {
             generic_context.variables(db).map(|typevar| {
                 let identity = typevar.identity(db);
 
-                let call_expression_constraints = return_type_solutions.get(&identity).copied();
+                let call_expression_constraints =
+                    return_type_solutions.get(&identity).copied().filter(|ty| {
+                        mode.is_provisional()
+                            || (!ty.has_provisional_marker(db, env)
+                                && !ty.has_unspecialized_type_var(db, env))
+                    });
                 let argument_constraints = argument_specialization
                     .and_then(|specialization| specialization.get(db, typevar))
-                    .filter(|ty| !ty.has_provisional_marker(db, env))
+                    .filter(|ty| {
+                        !ty.has_provisional_marker(db, env)
+                            && !ty.has_unspecialized_type_var(db, env)
+                    })
                     .map(|ty| {
                         let promoted = ty.promote(db, env);
                         // Context for other arguments must still satisfy the type variable's
@@ -8594,10 +8608,14 @@ impl<'db> Binding<'db> {
                 Some(
                     call_expression_constraints
                         .or(argument_constraints)
-                        // Default specialize any type variables to a marker type, which will be ignored
-                        // during argument inference, allowing the concrete subset of the parameter
-                        // type to still affect argument inference.
-                        .unwrap_or(Type::Dynamic(DynamicType::UnspecializedTypeVar)),
+                        // During iteration, an unresolved slot carries no input evidence. Final
+                        // inference uses ordinary Unknown for slots that remain unresolved.
+                        .unwrap_or_else(|| match mode {
+                            CheckTypesMode::Provisional => {
+                                Type::Dynamic(DynamicType::UnspecializedTypeVar)
+                            }
+                            CheckTypesMode::Finalize => Type::unknown(),
+                        }),
                 )
             }),
         ))
