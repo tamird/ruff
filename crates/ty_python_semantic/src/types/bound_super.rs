@@ -939,10 +939,22 @@ impl<'db> BoundSuperType<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         attribute: PlaceAndQualifiers<'db>,
+        request_input_proof: bool,
     ) -> Option<MemberLookupResult<'db>> {
         let (instance, owner) = self.owner(db).descriptor_binding(db, env)?;
-        let (member, _, descriptor_error) =
-            Type::try_call_dunder_get_on_attribute(db, env, attribute, instance, owner);
+        let super::DescriptorAttributeOutcome {
+            member,
+            kind: _,
+            error: descriptor_error,
+            proof,
+        } = Type::try_call_dunder_get_on_attribute(
+            db,
+            env,
+            attribute,
+            instance,
+            owner,
+            request_input_proof,
+        );
         Some(member_lookup_result(
             db,
             member,
@@ -952,6 +964,7 @@ impl<'db> BoundSuperType<'db> {
                 .and_then(|ty| ty.property_deprecations(db))
                 // `super` delegates reads to the owner's descriptors, but not writes or deletions.
                 .map(|properties| properties.getters_only(db)),
+            proof,
         ))
     }
 

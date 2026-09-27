@@ -114,6 +114,7 @@ pub(crate) enum Argument<'a> {
 /// Arguments for a single call, in source order, along with inferred types for each argument.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CallArguments<'a, 'db> {
+    request_input_proof: bool,
     items: Vec<CallArgument<'a, 'db>>,
 }
 
@@ -335,6 +336,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     ) -> Self {
         let mut call_arguments = Self {
             items: Vec::with_capacity(arguments.len()),
+            request_input_proof: false,
         };
 
         for arg_or_keyword in arguments.iter_source_order() {
@@ -409,7 +411,10 @@ impl<'a, 'db> CallArguments<'a, 'db> {
         mut expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
         mut dictionary_items: impl FnMut(&ast::Expr) -> DictionaryObservation<'db>,
     ) -> Self {
-        let Self { items } = &mut self;
+        let Self {
+            items,
+            request_input_proof: _,
+        } = &mut self;
         for (item, argument) in items.iter_mut().zip(arguments.iter_source_order()) {
             if item.types.get_default().is_some_and(|ty| ty.is_never()) {
                 item.known_unpacking = None;
@@ -447,7 +452,10 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     }
 
     pub(super) fn known_unpacking(&self, index: usize) -> Option<&KnownUnpacking<'db>> {
-        let Self { items } = self;
+        let Self {
+            items,
+            request_input_proof: _,
+        } = self;
         let CallArgument {
             argument: _,
             types: _,
@@ -467,6 +475,20 @@ impl<'a, 'db> CallArguments<'a, 'db> {
             .into_iter()
             .map(|ty| (Argument::Positional, Some(ty)))
             .collect()
+    }
+
+    /// Request input requirements for implicit calls made while evaluating this call.
+    pub(crate) fn with_input_proof_request(mut self, requested: bool) -> Self {
+        self.request_input_proof = requested;
+        self
+    }
+
+    pub(crate) fn set_input_proof_request(&mut self, requested: bool) {
+        self.request_input_proof = requested;
+    }
+
+    pub(crate) fn requests_input_proof(&self) -> bool {
+        self.request_input_proof
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -527,7 +549,10 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                 known_unpacking: None,
             });
             items.extend(self.items.iter().cloned());
-            Cow::Owned(CallArguments { items })
+            Cow::Owned(CallArguments {
+                items,
+                request_input_proof: self.request_input_proof,
+            })
         } else {
             Cow::Borrowed(self)
         }
@@ -543,6 +568,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     fn start_from(&self, index: usize) -> Self {
         Self {
             items: self.items[index..].to_vec(),
+            request_input_proof: self.request_input_proof,
         }
     }
 
@@ -567,6 +593,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
         prefix_len: usize,
     ) -> Self {
         Self {
+            request_input_proof: self.request_input_proof,
             items: indices
                 .iter()
                 .map(|index| {
@@ -900,7 +927,10 @@ impl<'a, 'db> FromIterator<(Argument<'a>, Option<Type<'db>>)> for CallArguments<
             });
         }
 
-        Self { items }
+        Self {
+            items,
+            request_input_proof: false,
+        }
     }
 }
 
@@ -922,6 +952,7 @@ mod tests {
         let env = ProgramEnvironment::from_file(db.program_file(file));
         let forwarded = Type::string_literal(&db, "forwarded");
         let arguments = CallArguments {
+            request_input_proof: false,
             items: vec![CallArgument {
                 argument: Argument::Keywords,
                 types: CallArgumentTypes::new(Some(Type::unknown())),

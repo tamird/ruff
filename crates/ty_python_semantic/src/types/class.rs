@@ -2566,6 +2566,7 @@ impl<'db> ClassType<'db> {
             .and_then(|place_and_quals| {
                 receiver
                     .resolve_dunder_new_callable(db, env, place_and_quals.place)
+                    .0
                     .ignore_possibly_undefined()
             })
             .and_then(|ty| ty.try_upcast_to_callable(db, env));

@@ -739,7 +739,9 @@ fn membership_call<'db>(
 ) -> Result<ComparisonResult<'db>, CallDunderError<'db>> {
     let db = context.db();
     let env = context.program_environment();
-    let mut arguments = CallArguments::positional([left]);
+    let mut arguments = CallArguments::positional([left]).with_input_proof_request(
+        db.function_inference_mode(context.scope()) == crate::FunctionInferenceMode::OutputProof,
+    );
     let bindings = right.try_call_dunder_with_policy(
         db,
         env,

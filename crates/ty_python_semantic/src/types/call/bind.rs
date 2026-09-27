@@ -1044,6 +1044,15 @@ impl<'db> Bindings<'db> {
         }
     }
 
+    pub(crate) fn with_unproved_lookup_inputs(mut self, unproved: bool) -> Self {
+        if unproved {
+            for binding in self.iter_flat_mut() {
+                binding.lookup_has_unproved_inputs = true;
+            }
+        }
+        self
+    }
+
     pub(crate) fn set_dunder_call_is_possibly_unbound(&mut self) {
         for binding in self.iter_flat_mut() {
             binding.dunder_call_is_possibly_unbound = true;
@@ -1626,12 +1635,15 @@ impl<'db> Bindings<'db> {
         let Some(callable) = self.argument_correspondence_callable() else {
             return false;
         };
-        if callable.overload_call_result.is_some() {
+        if callable.lookup_has_unproved_inputs || callable.overload_call_result.is_some() {
             return false;
         }
         let Ok((_, binding)) = callable.matching_overloads().exactly_one() else {
             return false;
         };
+        if binding.nested_call_has_unproved_inputs {
+            return false;
+        }
         let parameters = binding.signature.parameters();
         if !parameters.is_standard() {
             return false;
@@ -2097,6 +2109,7 @@ impl<'db> Bindings<'db> {
         for binding in self.iter_flat_mut() {
             let binding_type = binding.callable_type;
             for (overload_index, overload) in binding.matching_overloads_mut() {
+                overload.nested_call_has_unproved_inputs = false;
                 match binding_type {
                     Type::KnownBoundMethod(KnownBoundMethodType::FunctionTypeDunderGet(
                         function,
@@ -2186,7 +2199,14 @@ impl<'db> Bindings<'db> {
                             },
                             [Some(Type::PropertyInstance(property)), Some(instance), ..] => {
                                 if let Some(getter) = property.getter(db) {
-                                    overload.check_property_getter(db, env, getter, *instance, 1);
+                                    overload.check_property_getter(
+                                        db,
+                                        env,
+                                        getter,
+                                        *instance,
+                                        1,
+                                        call_arguments.requests_input_proof(),
+                                    );
                                 } else {
                                     overload
                                         .errors
@@ -2212,7 +2232,14 @@ impl<'db> Bindings<'db> {
                             }
                             [Some(instance), ..] => {
                                 if let Some(getter) = property.getter(db) {
-                                    overload.check_property_getter(db, env, getter, *instance, 0);
+                                    overload.check_property_getter(
+                                        db,
+                                        env,
+                                        getter,
+                                        *instance,
+                                        0,
+                                        call_arguments.requests_input_proof(),
+                                    );
                                 } else {
                                     overload.set_return_type(Type::Never);
                                     overload
@@ -3754,6 +3781,7 @@ impl<'db> From<Binding<'db>> for Bindings<'db> {
             callable_type,
             signature_type,
             dunder_call_is_possibly_unbound: false,
+            lookup_has_unproved_inputs: false,
             bound_type: None,
             overload_call_result: None,
             matching_overload_before_type_checking: None,
@@ -3786,6 +3814,9 @@ pub(crate) struct CallableBinding<'db> {
     /// If this is a callable object (i.e. called via a `__call__` method), the boundness of
     /// that call method.
     dunder_call_is_possibly_unbound: bool,
+
+    /// Input requirements of the lookup that produced this callable.
+    lookup_has_unproved_inputs: bool,
 
     /// The type of the bound `self` or `cls` parameter if this signature is for a bound method.
     pub(crate) bound_type: Option<Type<'db>>,
@@ -3881,6 +3912,7 @@ impl<'db> CallableBinding<'db> {
             callable_type: signature_type,
             signature_type,
             dunder_call_is_possibly_unbound: false,
+            lookup_has_unproved_inputs: false,
             bound_type: None,
             overload_call_result: None,
             matching_overload_before_type_checking: None,
@@ -3893,6 +3925,7 @@ impl<'db> CallableBinding<'db> {
             callable_type: signature_type,
             signature_type,
             dunder_call_is_possibly_unbound: false,
+            lookup_has_unproved_inputs: false,
             bound_type: None,
             overload_call_result: None,
             matching_overload_before_type_checking: None,
@@ -8009,6 +8042,9 @@ pub(crate) struct Binding<'db> {
     /// Return type of the call.
     pub(crate) return_ty: Type<'db>,
 
+    /// Requirements of implicit calls made by a known callable during this evaluation.
+    nested_call_has_unproved_inputs: bool,
+
     /// Constructor metadata used to normalize the declared return type before type checking.
     constructor_context: Option<ConstructorContext<'db>>,
 
@@ -8046,9 +8082,18 @@ impl<'db> Binding<'db> {
         getter: Type<'db>,
         instance: Type<'db>,
         argument_index_offset: usize,
+        request_input_proof: bool,
     ) {
-        match getter.try_call(db, env, &CallArguments::positional([instance])) {
-            Ok(bindings) => self.set_return_type(bindings.return_type(db, env)),
+        let arguments =
+            CallArguments::positional([instance]).with_input_proof_request(request_input_proof);
+        self.nested_call_has_unproved_inputs = true;
+        match getter.try_call(db, env, &arguments) {
+            Ok(bindings) => {
+                self.nested_call_has_unproved_inputs = !(request_input_proof
+                    && !bindings.has_only_constructor_items()
+                    && bindings.arguments_satisfy_declared_parameters(db, env, &arguments));
+                self.set_return_type(bindings.return_type(db, env));
+            }
             Err(CallError(_, bindings)) => {
                 self.set_return_type(bindings.return_type(db, env));
                 self.errors.push(BindingError::PropertyGetterCallError(
@@ -8103,6 +8148,7 @@ impl<'db> Binding<'db> {
             signature_type,
             return_ty,
             constructor_context: None,
+            nested_call_has_unproved_inputs: false,
             inferable_typevars: TypeVarSet::None,
             inference: None,
             is_partial_application: false,
@@ -9021,6 +9067,7 @@ impl<'db> Binding<'db> {
     fn snapshot(&self) -> BindingSnapshot<'db> {
         BindingSnapshot {
             return_ty: self.return_ty,
+            nested_call_has_unproved_inputs: self.nested_call_has_unproved_inputs,
             inferable_typevars: self.inferable_typevars,
             inference: self.inference,
             argument_matches: self.argument_matches.clone(),
@@ -9032,6 +9079,7 @@ impl<'db> Binding<'db> {
     fn restore(&mut self, snapshot: BindingSnapshot<'db>) {
         let BindingSnapshot {
             return_ty,
+            nested_call_has_unproved_inputs,
             inferable_typevars,
             inference,
             argument_matches,
@@ -9040,6 +9088,7 @@ impl<'db> Binding<'db> {
         } = snapshot;
 
         self.return_ty = return_ty;
+        self.nested_call_has_unproved_inputs = nested_call_has_unproved_inputs;
         self.inferable_typevars = inferable_typevars;
         self.inference = inference;
         self.argument_matches = argument_matches;
@@ -9083,6 +9132,7 @@ impl<'db> Binding<'db> {
     /// Resets the state of this binding to its initial state.
     fn reset(&mut self, db: &'db dyn Db) {
         self.return_ty = self.initial_return_type(db);
+        self.nested_call_has_unproved_inputs = false;
         self.inferable_typevars = TypeVarSet::None;
         self.inference = None;
         self.argument_matches = Box::from([]);
@@ -9094,6 +9144,7 @@ impl<'db> Binding<'db> {
 #[derive(Clone, Debug)]
 struct BindingSnapshot<'db> {
     return_ty: Type<'db>,
+    nested_call_has_unproved_inputs: bool,
     inferable_typevars: TypeVarSet<'db>,
     inference: Option<TypeVarInference<'db>>,
     argument_matches: Box<[MatchedArgument<'db>]>,
@@ -9131,10 +9182,13 @@ impl<'db> CallableBindingSnapshot<'db> {
                 // evaluated successfully and this is the matching overload.
                 //
                 // Clear the errors from the snapshot of this overload to signal this change ...
+                let previously_matched = snapshot.errors.is_empty();
                 snapshot.errors.clear();
 
                 // ... and update the snapshot with the current state of the binding.
                 snapshot.return_ty = binding.return_ty;
+                snapshot.nested_call_has_unproved_inputs = binding.nested_call_has_unproved_inputs
+                    || (previously_matched && snapshot.nested_call_has_unproved_inputs);
                 snapshot.inferable_typevars = binding.inferable_typevars;
                 snapshot.inference = binding.inference;
                 snapshot
