@@ -2,7 +2,14 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, btree_map::Entry as BTreeEntry, hash_map::Entry};
 
-use crate::place::loop_header_reachability;
+use crate::place::{
+    implicit_builtins_symbol, loop_header_reachability, module_type_implicit_global_symbol,
+};
+use crate::place_load::{
+    ImplicitPlaceLoad, PlaceLoadMode, PlaceLoadResolutionStep, PlaceLoadSourceKind,
+    resolve_place_load,
+};
+use crate::provided::BuiltinUsage;
 use crate::reachability::{
     binding_reachability, narrow_type_by_constraint, type_narrowed_by_previous_patterns,
 };
@@ -28,7 +35,7 @@ use crate::types::{
 };
 use crate::{Db, ProgramEnvironment};
 use ty_python_core::ast_ids::HasScopedUseId;
-use ty_python_core::definition::{Definition, DefinitionKind};
+use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
 use ty_python_core::expression::Expression;
 use ty_python_core::frozen::FrozenMap;
 use ty_python_core::place::{PlaceExpr, PlaceTable, ScopedPlaceId};
@@ -38,7 +45,9 @@ use ty_python_core::predicate::{
 };
 use ty_python_core::scope::ScopeId;
 use ty_python_core::symbol::Symbol;
-use ty_python_core::{ExpressionNodeKey, NarrowingEvaluator, place_table, semantic_index};
+use ty_python_core::{
+    ExpressionNodeKey, FileScopeId, NarrowingEvaluator, place_table, semantic_index,
+};
 
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::name::Name;
@@ -125,6 +134,305 @@ pub(crate) fn infer_narrowing_constraints<'db>(
         constraints
     } else {
         (constraints.1, constraints.0)
+    }
+}
+
+/// Prove a single returned runtime type comparison from the original argument.
+///
+/// The function-body owner excludes preceding statements and branches. Operand
+/// origins are resolved separately from occurrence narrowing: a predicate call
+/// or a narrowed local alias cannot supply the classifier or comparison value.
+pub(super) fn type_guard_return_implication<'db>(
+    db: &'db dyn Db,
+    parameter: Definition<'db>,
+    domain: Type<'db>,
+    target: Type<'db>,
+    expression: &ast::Expr,
+    inferred_type: impl Fn(&ast::Expr) -> Type<'db>,
+) -> Option<bool> {
+    let scope = parameter.scope(db);
+    let env = ProgramEnvironment::from_scope(scope);
+    if [domain, target].into_iter().any(|ty| {
+        !ty.is_fully_static(db, &env)
+            || super::visitor::any_over_type_expanding_aliases(db, &env, ty, |nested| {
+                matches!(nested, Type::TypeVar(_))
+            })
+    }) {
+        return None;
+    }
+    let ast::Expr::Compare(comparison) = expression else {
+        return None;
+    };
+    let (left, op, right) = comparison.as_single()?;
+    let (call, operand, compared) = match (left, right) {
+        (ast::Expr::Call(call), other) => (call, left, other),
+        (other, ast::Expr::Call(call)) => (call, right, other),
+        _ => return None,
+    };
+    let ast::Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    let RuntimeTypeTestName::Builtin(callable) = runtime_type_test_name(db, scope, callee)? else {
+        return None;
+    };
+    let compared_type = match compared {
+        ast::Expr::StringLiteral(_) => inferred_type(compared),
+        ast::Expr::Name(name) => runtime_type_test_comparand(db, scope, name)?,
+        _ => return None,
+    };
+    let test =
+        RuntimeTypeTest::from_comparison(db, scope, operand, compared_type, *op, true, &|_| {
+            callable
+        })?;
+    // Unlike ordinary narrowing, proof admits only the canonical call spelling.
+    // In particular, a property can spoof `value.__class__`.
+    let ast::Expr::Name(subject) = test.subject else {
+        return None;
+    };
+    let file = parameter.program_file(db);
+    let index = semantic_index(db, file);
+    let use_def = index.use_def_map(scope.file_scope_id(db));
+    let mut bindings = use_def.bindings_at_use(subject.scoped_use_id(db, file));
+    if bindings.next()?.binding.definition() != Some(parameter)
+        || bindings.any(|binding| binding.binding.definition() != Some(parameter))
+    {
+        return None;
+    }
+    let narrowed = NarrowingConstraint::intersection(domain)
+        .merge_constraint_and(test.constraint(db, &env))
+        .evaluate_constraint_type(db, &env);
+    if !narrowed.is_fully_static(db, &env) {
+        return None;
+    }
+    Some(narrowed.satisfies_declared_output(db, &env, target))
+}
+
+enum RuntimeTypeTestName<'db> {
+    Builtin(Type<'db>),
+    Global(Definition<'db>),
+}
+
+/// Resolve an operand without applying flow constraints or following value aliases.
+fn runtime_type_test_name<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    name: &ast::ExprName,
+) -> Option<RuntimeTypeTestName<'db>> {
+    let file = scope.program_file(db);
+    let index = semantic_index(db, file);
+    let env = ProgramEnvironment::from_scope(scope);
+    let resolution = resolve_place_load(
+        db,
+        index,
+        scope,
+        PlaceExpr::from_expr_name(name),
+        PlaceLoadMode::AtExpression(name.into()),
+    );
+    for step in resolution {
+        let source = match step {
+            PlaceLoadResolutionStep::Source(source) => source,
+            PlaceLoadResolutionStep::MemberResolutionCondition(_)
+            | PlaceLoadResolutionStep::Exhausted(_) => return None,
+        };
+        match source.kind {
+            PlaceLoadSourceKind::Bindings(mut bindings) => {
+                if bindings.any(|binding| binding.binding != DefinitionState::Undefined) {
+                    return None;
+                }
+            }
+            PlaceLoadSourceKind::DefinitionsFromOwningScope { scope: _, id: _ } => return None,
+            PlaceLoadSourceKind::Implicit(implicit) => match implicit {
+                ImplicitPlaceLoad::Builtin(name) => {
+                    let ty = implicit_builtins_symbol(db, &env, &name, BuiltinUsage::Runtime)
+                        .place
+                        .ignore_possibly_undefined()?;
+                    return Some(RuntimeTypeTestName::Builtin(ty));
+                }
+                ImplicitPlaceLoad::ExplicitGlobalSymbol { file: _, name } => {
+                    let Some(symbol) = index.place_table(FileScopeId::global()).symbol_id(&name)
+                    else {
+                        continue;
+                    };
+                    let mut definition = None;
+                    for binding in index
+                        .use_def_map(FileScopeId::global())
+                        .reachable_symbol_bindings(symbol)
+                    {
+                        match binding.binding {
+                            DefinitionState::Undefined => {}
+                            DefinitionState::Deleted => return None,
+                            DefinitionState::Defined(current) => {
+                                if definition.is_some_and(|previous| previous != current) {
+                                    return None;
+                                }
+                                definition = Some(current);
+                            }
+                        }
+                    }
+                    if let Some(definition) = definition {
+                        return Some(RuntimeTypeTestName::Global(definition));
+                    }
+                }
+                ImplicitPlaceLoad::ModuleImplicitGlobal { file, name } => {
+                    if !module_type_implicit_global_symbol(db, file, &name)
+                        .place
+                        .is_undefined()
+                    {
+                        return None;
+                    }
+                }
+                ImplicitPlaceLoad::DunderClass(_) | ImplicitPlaceLoad::ClassBodySymbol(_) => {
+                    return None;
+                }
+            },
+        }
+    }
+    None
+}
+
+fn runtime_type_test_comparand<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    name: &ast::ExprName,
+) -> Option<Type<'db>> {
+    let definition = match runtime_type_test_name(db, scope, name)? {
+        RuntimeTypeTestName::Builtin(ty) => {
+            return matches!(ty, Type::ClassLiteral(_)).then_some(ty);
+        }
+        RuntimeTypeTestName::Global(definition) => definition,
+    };
+    // Before a global is initialized, a builtin of the same name can supply a
+    // different comparison value. Missing nonbuiltin globals instead raise and
+    // cannot produce a true predicate result.
+    let env = ProgramEnvironment::from_scope(scope);
+    if !implicit_builtins_symbol(db, &env, &name.id, BuiltinUsage::Runtime)
+        .place
+        .is_undefined()
+    {
+        return None;
+    }
+    if !definition.scope(db).scope(db).kind().is_module() {
+        return None;
+    }
+    let file = definition.program_file(db);
+    let module = parsed_module(db, file.python_file(db)).load(db);
+    // A conditional global can be absent and resolve to a builtin instead.
+    // Require the sole binding to be a direct module statement, independently
+    // of the ordinary reachability facts attached to its history.
+    let direct = match definition.kind(db) {
+        DefinitionKind::Class(class) => {
+            module
+                .syntax()
+                .body
+                .iter()
+                .any(|statement| match statement {
+                    ast::Stmt::ClassDef(node) => node.range == class.node(&module).range,
+                    _ => false,
+                })
+        }
+        DefinitionKind::Assignment(assignment) => {
+            let ast::Expr::Name(target) = assignment.target(&module) else {
+                return None;
+            };
+            module
+                .syntax()
+                .body
+                .iter()
+                .any(|statement| match statement {
+                    ast::Stmt::Assign(node) => {
+                        let [ast::Expr::Name(name)] = node.targets.as_slice() else {
+                            return false;
+                        };
+                        name.range == target.range
+                    }
+                    _ => false,
+                })
+        }
+        _ => false,
+    };
+    if !direct {
+        return None;
+    }
+    let inference = infer_definition_types(db, definition);
+    if inference.is_provisional() {
+        return None;
+    }
+    match definition.kind(db) {
+        DefinitionKind::Class(_) => {
+            let ty = inference.binding_type(definition);
+            matches!(ty, Type::ClassLiteral(_)).then_some(ty)
+        }
+        DefinitionKind::Assignment(assignment) => {
+            let value = assignment.value(&module);
+            if value.is_string_literal_expr() {
+                return Some(inference.expression_type(value));
+            }
+            let ast::Expr::Call(call) = value else {
+                return None;
+            };
+            if !call.arguments.keywords.is_empty() {
+                return None;
+            }
+            let [argument] = call.arguments.args.as_ref() else {
+                return None;
+            };
+            let ast::Expr::Name(callee) = call.func.as_ref() else {
+                return None;
+            };
+            let RuntimeTypeTestName::Builtin(callable) =
+                runtime_type_test_name(db, definition.scope(db), callee)?
+            else {
+                return None;
+            };
+            let value_type = inference.expression_type(value);
+            let canonical = match callable {
+                Type::ClassLiteral(class) => class.is_known(db, KnownClass::Type),
+                _ => db.provided_type_test(file, callable, value_type).is_some(),
+            };
+            if !canonical {
+                return None;
+            }
+            // Module tags may sample a literal or one builtin call. Its
+            // declared result is a dependency contract, just as for other builtin
+            // calls; user factories and aliases are not followed here.
+            if !runtime_type_test_literal(argument) {
+                let ast::Expr::Call(constructor) = argument else {
+                    return None;
+                };
+                let ast::Expr::Name(name) = constructor.func.as_ref() else {
+                    return None;
+                };
+                if !constructor.arguments.keywords.is_empty()
+                    || !constructor
+                        .arguments
+                        .args
+                        .iter()
+                        .all(runtime_type_test_literal)
+                    || !matches!(
+                        runtime_type_test_name(db, definition.scope(db), name)?,
+                        RuntimeTypeTestName::Builtin(_)
+                    )
+                {
+                    return None;
+                }
+            }
+            Some(value_type)
+        }
+        _ => None,
+    }
+}
+
+fn runtime_type_test_literal(expression: &ast::Expr) -> bool {
+    match expression {
+        ast::Expr::StringLiteral(_)
+        | ast::Expr::BytesLiteral(_)
+        | ast::Expr::NumberLiteral(_)
+        | ast::Expr::BooleanLiteral(_)
+        | ast::Expr::NoneLiteral(_) => true,
+        ast::Expr::List(list) => list.elts.is_empty(),
+        ast::Expr::Dict(dict) => dict.items.is_empty(),
+        ast::Expr::Tuple(tuple) => tuple.elts.is_empty(),
+        _ => false,
     }
 }
 

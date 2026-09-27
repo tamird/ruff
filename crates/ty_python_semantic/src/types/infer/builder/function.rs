@@ -208,6 +208,52 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             && expected.is_fully_static(self.db(), self.program_environment())
     }
 
+    fn type_guard_body_implication(
+        &self,
+        function: &ast::StmtFunctionDef,
+        target: Type<'db>,
+    ) -> Option<bool> {
+        if self.cycle_recovery.is_some() {
+            return None;
+        }
+        // A single return has no earlier flow assumptions or reachability facts
+        // to certify. More general predicate implementations remain unproved.
+        let body = function.body.as_ref();
+        let body = if let [ast::Stmt::Expr(docstring), rest @ ..] = body
+            && docstring.value.is_string_literal_expr()
+        {
+            rest
+        } else {
+            body
+        };
+        let [ast::Stmt::Return(returned)] = body else {
+            return None;
+        };
+        let value = returned.value.as_deref()?;
+        let db = self.db();
+        let enclosing = nearest_enclosing_function(db, self.index, self.scope())?;
+        let signature =
+            same_module_uncached_raw_signature(db, enclosing, ReturnCallableTypeVarScope::Lexical);
+        if signature.generic_context.is_some() || enclosing.has_implicit_receiver(db) {
+            return None;
+        }
+        let parameter = function
+            .parameters
+            .posonlyargs
+            .first()
+            .or_else(|| function.parameters.args.first())?;
+        let (_, domain, _) = self.parameter_annotation_type(&parameter.parameter)?;
+        let definition = self.index.expect_single_definition(&parameter.parameter);
+        crate::types::narrow::type_guard_return_implication(
+            db,
+            definition,
+            domain,
+            target,
+            value,
+            |expression| self.expression_type(expression),
+        )
+    }
+
     pub(super) fn infer_function_body(&mut self, function: &ast::StmtFunctionDef) {
         fn can_implicitly_return_none<'db>(db: &'db dyn Db, use_def: &UseDefMap<'db>) -> bool {
             !use_def
@@ -281,13 +327,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let expected_return = ExpectedReturnType::from_function(db, enclosing_function);
             let expected_ty = expected_return.public();
             // Predicate postconditions require evidence beyond a Boolean result.
-            let mut correspondence = (self.function_inference_mode
-                == crate::FunctionInferenceMode::OutputProof
-                && !matches!(
-                    declared_ty.resolve_type_alias(db),
-                    Type::TypeIs(_) | Type::TypeGuard(_)
-                ))
-            .then_some(true);
+            let mut correspondence =
+                if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
+                    match declared_ty.resolve_type_alias(db) {
+                        Type::TypeGuard(guard) => {
+                            self.type_guard_body_implication(function, guard.return_type(db))
+                        }
+                        Type::TypeIs(_) => None,
+                        _ => Some(true),
+                    }
+                } else {
+                    None
+                };
 
             let scope_id = self.index.node_scope(NodeWithScopeRef::Function(function));
             if scope_id.is_generator_function(self.index) {
