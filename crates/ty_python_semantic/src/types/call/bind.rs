@@ -668,6 +668,145 @@ impl CheckTypesMode {
     }
 }
 
+/// Prove generic transport while retaining each argument's unknown nominal type slots.
+///
+/// Captures are local rigid variables. Solving only the callee variables establishes one
+/// specialization for each possible input domain; strict replay checks the resulting pairs.
+/// Erasing captures must reproduce the specialization already chosen by ordinary inference.
+fn generic_arguments_satisfy_declared_parameters<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ordinary: Specialization<'db>,
+    pairs: &[(Type<'db>, Type<'db>)],
+) -> bool {
+    let concrete = |ty: Type<'db>| {
+        ty.is_fully_static(db, env)
+            && !any_over_type(db, env, ty, true, |ty| matches!(ty, Type::TypeVar(_)))
+    };
+    let context = ordinary.generic_context(db);
+    let mut inferable = Vec::new();
+    let mut fixed = Vec::new();
+    for (variable, solution) in context.variables(db).zip(ordinary.types(db)) {
+        if variable.is_paramspec(db) || variable.is_typevartuple(db) {
+            return false;
+        }
+        if let Some(domain) = variable.typevar(db).bound_or_constraints(db, env) {
+            let supported = match domain {
+                TypeVarBoundOrConstraints::UpperBound(bound) => concrete(bound),
+                TypeVarBoundOrConstraints::Constraints(constraints) => {
+                    constraints.elements(db).iter().copied().all(concrete)
+                }
+            };
+            if !concrete(*solution) || !supported {
+                return false;
+            }
+        }
+        if solution.is_fully_static(db, env) {
+            fixed.push(*solution);
+        } else {
+            inferable.push(variable);
+            fixed.push(Type::TypeVar(variable));
+        }
+    }
+    if inferable.is_empty() {
+        return false;
+    }
+    let fixed = context.specialize(db, fixed);
+    let mut captures = Vec::new();
+    let mut originals = Vec::new();
+    let mut captured_pairs = Vec::new();
+    for (actual, formal) in pairs {
+        if actual.has_provisional_marker(db, env) || !formal.is_fully_static_except_any(db, env) {
+            return false;
+        }
+        let captured = if actual.is_fully_static(db, env) {
+            *actual
+        } else {
+            let Type::NominalInstance(instance) = actual else {
+                return false;
+            };
+            if instance.tuple_spec(db, env).is_some() {
+                return false;
+            }
+            let Some((origin, specialization)) = actual.class_specialization(db, env) else {
+                return false;
+            };
+            if specialization.materialization_kind(db).is_some() {
+                return false;
+            }
+            let mut slots = Vec::new();
+            for (variable, slot) in specialization
+                .generic_context(db)
+                .variables(db)
+                .zip(specialization.types(db))
+            {
+                if variable.is_paramspec(db)
+                    || variable.is_typevartuple(db)
+                    || variable.typevar(db).bound_or_constraints(db, env).is_some()
+                {
+                    return false;
+                }
+                if slot.is_fully_static(db, env) {
+                    slots.push(*slot);
+                } else {
+                    // The distinct names identify occurrences within this local proof. These
+                    // variables never enter published inference results or argument caches.
+                    let capture = BoundTypeVarInstance::synthetic(
+                        db,
+                        env,
+                        Name::new(format!("$argument_input_{}", captures.len())),
+                        TypeVarVariance::Invariant,
+                    );
+                    captures.push(capture);
+                    originals.push(*slot);
+                    slots.push(Type::TypeVar(capture));
+                }
+            }
+            Type::instance(
+                db,
+                env,
+                origin.apply_specialization(db, |context| context.specialize(db, slots)),
+            )
+        };
+        captured_pairs.push((captured, formal.apply_specialization(db, fixed)));
+    }
+    if captures.is_empty() {
+        return false;
+    }
+    let constraints = ConstraintSetBuilder::new();
+    let context = GenericContext::from_typevar_instances(db, env, inferable);
+    let mut builder = SpecializationBuilder::new(db, env, &constraints, context);
+    for (actual, formal) in &captured_pairs {
+        if builder.infer(*formal, *actual).is_err() {
+            return false;
+        }
+    }
+    let Ok(inference) = builder.build_inference_with(|_, _| None) else {
+        return false;
+    };
+    if !matches!(inference.solutions(db), TypeVarInferenceSolutions::Single) {
+        return false;
+    }
+    let proof = inference.merged_specialization(db);
+    let erasure =
+        GenericContext::from_typevar_instances(db, env, captures).specialize(db, originals);
+    fixed
+        .types(db)
+        .iter()
+        .zip(ordinary.types(db))
+        .all(|(proof_type, ordinary_type)| {
+            proof_type
+                .apply_specialization(db, proof)
+                .apply_specialization(db, erasure)
+                == *ordinary_type
+        })
+        && captured_pairs.iter().all(|(actual, formal)| {
+            let expected = formal.apply_specialization(db, proof);
+            expected.is_fully_static_except_any(db, env)
+                && actual.satisfies_declared_output(db, env, expected)
+        })
+}
+
 impl<'db> Bindings<'db> {
     fn as_result(&self, db: &'db dyn Db) -> Result<(), CallErrorKind> {
         let mut all_ok = true;
@@ -1541,7 +1680,9 @@ impl<'db> Bindings<'db> {
             }
         }
         let specialization = binding.partial_specialization(db, env);
-        arguments
+        let mut pairs = Vec::new();
+        let mut capture_supported = true;
+        let matched = arguments
             .iter()
             .zip(&binding.argument_matches)
             .enumerate()
@@ -1549,6 +1690,7 @@ impl<'db> Bindings<'db> {
                 let empty_keywords = match argument {
                     Argument::Variadic => return false,
                     Argument::Keywords => {
+                        capture_supported = false;
                         // Ordinary mapping matching can assume names are present. Proof requires
                         // the existing inventory to cover the keys and every residual value.
                         if let Some(unpacking) = arguments.known_unpacking(index) {
@@ -1589,6 +1731,7 @@ impl<'db> Bindings<'db> {
                 if !matched.matched || matched.parameters.is_empty() {
                     return false;
                 }
+                capture_supported &= matched.parameters.len() == 1;
                 matched.iter().all(|matched_parameter| {
                     let Some(parameter) = parameters.get(matched_parameter.index) else {
                         return false;
@@ -1599,18 +1742,33 @@ impl<'db> Bindings<'db> {
                     let Some(mut actual) = matched_parameter.argument_type(parameter, types) else {
                         return false;
                     };
-                    let mut expected = matched_parameter
+                    let expected = matched_parameter
                         .expected_type
                         .unwrap_or_else(|| parameter.annotated_type());
                     if let Some(specialization) = specialization {
                         actual = actual.apply_specialization(db, specialization);
-                        expected = expected.apply_specialization(db, specialization);
                     }
-                    expected.is_fully_static_except_any(db, env)
-                        && !actual.has_provisional_marker(db, env)
-                        && actual.satisfies_declared_output(db, env, expected)
+                    pairs.push((actual, expected));
+                    true
                 })
-            })
+            });
+        if !matched {
+            return false;
+        }
+        let direct = pairs.iter().all(|(actual, expected)| {
+            let expected = specialization.map_or(*expected, |specialization| {
+                expected.apply_specialization(db, specialization)
+            });
+            expected.is_fully_static_except_any(db, env)
+                && !actual.has_provisional_marker(db, env)
+                && actual.satisfies_declared_output(db, env, expected)
+        });
+        direct
+            || (capture_supported
+                && binding.signature.generic_context.is_some()
+                && specialization.is_some_and(|specialization| {
+                    generic_arguments_satisfy_declared_parameters(db, env, specialization, &pairs)
+                }))
     }
 
     /// Return the sole callable covered by argument correspondence, before or after inference.
@@ -10830,6 +10988,161 @@ mod tests {
             );
             assert!(bindings.as_result(db).is_ok());
             assert_eq!(bindings.return_type(db, &env), ordinary_return);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generic_argument_correspondence_preserves_input_domains() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+from typing import Any, Callable, Mapping
+
+class Box[T]: ...
+type Identity[T] = T
+
+def list_kind[T](value: list[T]) -> str: ...
+def dict_kind[K, V](value: dict[K, V]) -> str: ...
+def select[K: str, V](value: Mapping[K, V]) -> V: ...
+def box_kind[T](value: Box[T]) -> str: ...
+def fixed(value: list) -> str: ...
+def bounded[T: int](value: list[T]) -> str: ...
+def constrained[T: (int, str)](value: list[T]) -> str: ...
+def fixed_any[T](callback: Callable[[Any], int], other: list[T]) -> None: ...
+def correlate[T](left: list[T], right: list[T]) -> None: ...
+def put[T](values: list[T], value: T) -> None: ...
+def apply[T](callback: Callable[[T], int], value: T) -> int: ...
+def identity[T](value: list[T]) -> list[T]: ...
+
+opaque_box: Box
+"#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let lookup = |name| global_symbol(db, file, name).place.expect_type();
+        let unknown = Type::unknown();
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let list = |element| KnownClass::List.to_specialized_instance(db, &env, &[element]);
+        let dict = |key, value| KnownClass::Dict.to_specialized_instance(db, &env, &[key, value]);
+        let callback = Type::function_like_callable(
+            db,
+            Signature::new(
+                Parameters::standard([
+                    Parameter::positional_only(None).with_annotated_type(unknown)
+                ]),
+                int,
+            ),
+        );
+        for (name, actuals, context, expected) in [
+            ("list_kind", vec![list(unknown)], None, true),
+            ("dict_kind", vec![dict(unknown, unknown)], None, true),
+            ("select", vec![dict(str, list(unknown))], None, true),
+            ("box_kind", vec![lookup("opaque_box")], None, true),
+            ("fixed", vec![list(unknown)], None, false),
+            ("bounded", vec![list(unknown)], None, false),
+            ("bounded", vec![list(int)], None, true),
+            ("constrained", vec![list(unknown)], None, false),
+            (
+                "fixed_any",
+                vec![
+                    Type::function_like_callable(
+                        db,
+                        Signature::new(
+                            Parameters::standard([
+                                Parameter::positional_only(None).with_annotated_type(str)
+                            ]),
+                            int,
+                        ),
+                    ),
+                    list(unknown),
+                ],
+                None,
+                false,
+            ),
+            ("correlate", vec![list(unknown), list(unknown)], None, false),
+            ("put", vec![list(unknown), int], None, false),
+            ("apply", vec![callback, unknown], None, false),
+            ("identity", vec![list(unknown)], None, true),
+            ("identity", vec![list(unknown)], Some(list(str)), false),
+        ] {
+            let arguments = CallArguments::positional(actuals);
+            let constraints = ConstraintSetBuilder::new();
+            let bindings = lookup(name)
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &constraints,
+                    &arguments,
+                    TypeContext::new(context),
+                    &[],
+                )
+                .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
+            let ordinary_return = bindings.return_type(db, &env);
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                expected,
+                "{name}, context={context:?}",
+            );
+            assert!(bindings.as_result(db).is_ok());
+            assert_eq!(bindings.return_type(db, &env), ordinary_return);
+            if name == "identity" && context.is_none() {
+                assert_eq!(ordinary_return, list(unknown));
+                assert!(!ordinary_return.satisfies_declared_output(db, &env, list(str)));
+            }
+        }
+
+        // A static solution containing a rigid variable is still conditional on that variable.
+        // Likewise, a static outer solution cannot discharge a bound that mentions an input.
+        let t = BoundTypeVarInstance::synthetic(
+            db,
+            &env,
+            Name::new_static("T"),
+            TypeVarVariance::Invariant,
+        );
+        let u = BoundTypeVarInstance::synthetic(
+            db,
+            &env,
+            Name::new_static("U"),
+            TypeVarVariance::Invariant,
+        );
+        let rigid = BoundTypeVarInstance::synthetic(
+            db,
+            &env,
+            Name::new_static("A"),
+            TypeVarVariance::Invariant,
+        );
+        let Type::KnownInstance(identity) = lookup("Identity") else {
+            panic!("expected a known alias instance");
+        };
+        let KnownInstanceType::TypeAliasType(identity) = identity else {
+            panic!("expected the identity type alias");
+        };
+        let aliased_rigid = Type::TypeAlias(identity.apply_specialization(db, |context| {
+            context.specialize(db, [Type::TypeVar(rigid)].as_slice())
+        }));
+        for (bound, solution) in [
+            (int, Type::TypeVar(rigid)),
+            (int, aliased_rigid),
+            (list(Type::TypeVar(t)), list(int)),
+        ] {
+            let bounded = u.map_bound_or_constraints(db, |_| {
+                Some(TypeVarBoundOrConstraints::UpperBound(bound))
+            });
+            let ordinary = GenericContext::from_typevar_instances(db, &env, [t, bounded])
+                .specialize(db, [unknown, solution].as_slice());
+            assert!(!generic_arguments_satisfy_declared_parameters(
+                db,
+                &env,
+                ordinary,
+                &[(list(unknown), list(Type::TypeVar(t)))],
+            ));
         }
         Ok(())
     }
