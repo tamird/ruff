@@ -2028,6 +2028,98 @@ fn constructor_storage_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn typed_dict_merge_retains_selected_requirements() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Callable, Protocol, TypedDict
+        from typing_extensions import NotRequired
+
+        class Named(Protocol):
+            def __call__(self, *, name: str) -> None: ...
+
+        class Row(TypedDict):
+            cb: Named
+
+        class OptionalRow(TypedDict):
+            cb: NotRequired[Named]
+
+        class OmittedRow(TypedDict):
+            cb: Callable[..., None]
+
+        def pass_through(callback: Named) -> Named:
+            return callback
+
+        def closed(row: Row, callback: Callable[..., None]) -> Row:
+            return row | {"cb": callback}
+
+        def known(row: Row, callback: Named) -> Row:
+            return row | {"cb": callback}
+
+        def omitted(row: OmittedRow, callback: Callable[..., None]) -> OmittedRow:
+            return row | {"cb": callback}
+
+        def overwritten(row: Row, callback: Callable[..., None]) -> Row:
+            return {"cb": callback} | row
+
+        def optional(row: OptionalRow, callback: Callable[..., None]) -> OptionalRow:
+            return {"cb": callback} | row
+
+        def executed_child(row: Row, callback: Callable[..., None]) -> Row:
+            return {"cb": pass_through(callback)} | row
+
+        def incompatible(row: Row) -> dict[str, object]:
+            return row | {"cb": 1}
+
+        def extra_key(row: Row) -> dict[str, object]:
+            return row | {"extra": 1}
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("closed", true),
+        ("known", false),
+        ("omitted", false),
+        ("overwritten", false),
+        ("optional", true),
+        ("executed_child", true),
+        ("incompatible", false),
+        ("extra_key", false),
+    ];
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((
+            file,
+            cases.map(|(name, _)| name.to_owned()).to_vec(),
+            mode,
+        )));
+        let model = crate::SemanticModel::new(&db, program_file(&db, file));
+        for (name, unproved) in cases {
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, name))
+                .unwrap();
+            assert_eq!(
+                facts.has_unproved_requirements,
+                mode == FunctionInferenceMode::OutputProof && unproved,
+                "{mode:?} {name}"
+            );
+            assert!(!facts.has_errors, "{mode:?} {name}");
+            assert_eq!(
+                facts.return_type_correspondence,
+                (mode == FunctionInferenceMode::OutputProof).then_some(true),
+                "{mode:?} {name}"
+            );
+        }
+        assert_file_diagnostics(&db, "/src/main.py", &[]);
+    }
+    Ok(())
+}
+
+#[test]
 fn augmented_storage_correspondence() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(

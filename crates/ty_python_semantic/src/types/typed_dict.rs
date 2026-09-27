@@ -636,6 +636,18 @@ impl<'db> TypedDictType<'db> {
         Self::from_patch_items_with_openness(db, items, self.openness(db))
     }
 
+    /// Returns the left operand schema for a merge whose right operand is this `TypedDict`.
+    /// Required right-hand fields replace any corresponding left-hand values.
+    pub(crate) fn to_reflected_merge_patch(self, db: &'db dyn Db) -> Self {
+        let overwritten_keys = self
+            .items(db)
+            .iter()
+            .filter(|(_, field)| field.is_required())
+            .map(|(name, _)| name.clone())
+            .collect();
+        typed_dict_with_relaxed_keys(db, self, &overwritten_keys).to_partial(db)
+    }
+
     /// Returns a patch version of this `TypedDict` for in-place mutations such as `update()` and
     /// `__ior__` (`|=`).
     ///
@@ -2336,9 +2348,9 @@ fn typed_dict_without_keys<'db>(
     TypedDictType::from_schema_items_with_openness(db, filtered_items, typed_dict.openness(db))
 }
 
-/// Returns a `TypedDict` schema for mixed positional-constructor inference.
+/// Returns a `TypedDict` schema for values whose keys are overwritten by a constructor or merge.
 ///
-/// Keys that are guaranteed to be overridden by later keyword arguments stay in the schema as
+/// Keys that are guaranteed to be overridden by later values stay in the schema as
 /// optional `object` fields. This preserves missing-key context for the remaining fields while
 /// avoiding premature validation of shadowed keys inside nested dict-literal branches.
 pub(super) fn typed_dict_with_relaxed_keys<'db>(

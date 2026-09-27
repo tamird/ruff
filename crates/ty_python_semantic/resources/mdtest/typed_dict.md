@@ -258,7 +258,6 @@ When the other operand is not compatible with the `TypedDict`, the result falls 
 ```py
 # Incompatible value type for a key
 reveal_type(bob | {"name": 42})  # revealed: dict[str, object]
-reveal_type({"name": 42} | bob)  # revealed: dict[str, object]
 
 # Key not present in the TypedDict
 reveal_type(bob | {"unknown_key": 1})  # revealed: dict[str, object]
@@ -266,6 +265,21 @@ reveal_type({"unknown_key": 1} | bob)  # revealed: dict[str, object]
 
 # error: [unsupported-operator] "Operator `|=` is not supported between objects of type `Person` and `dict[str, int]`"
 bob |= {"unknown_key": 1}
+```
+
+A required field on the right replaces the corresponding value on the left. Expressions producing
+replaced values still execute and are checked:
+
+```py
+reveal_type({"name": 42} | bob)  # revealed: Person
+
+def make_name(value: str) -> str:
+    return value
+
+# error: [invalid-argument-type]
+reveal_type(bob | {"name": make_name(42)})  # revealed: Person
+# error: [invalid-argument-type]
+reveal_type({"name": make_name(42)} | bob)  # revealed: Person
 ```
 
 `TypedDict` keys do not have to be string literals, as long as they can be statically determined

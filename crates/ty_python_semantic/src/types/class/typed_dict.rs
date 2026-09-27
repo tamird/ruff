@@ -772,7 +772,11 @@ fn synthesize_typed_dict_merge<'db>(
 
     if name != "__ior__" {
         let partial_ty = if let Type::TypedDict(td) = instance_ty {
-            Type::TypedDict(td.to_partial(db))
+            Type::TypedDict(if name == "__ror__" {
+                td.to_reflected_merge_patch(db)
+            } else {
+                td.to_partial(db)
+            })
         } else {
             instance_ty
         };
