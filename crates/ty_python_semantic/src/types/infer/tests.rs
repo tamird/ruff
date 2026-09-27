@@ -1837,6 +1837,157 @@ fn indexed_store_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn declaration_storage_correspondence() -> anyhow::Result<()> {
+    let registry = crate::default_lint_registry();
+    let mut rules = RuleSelection::from_registry(registry);
+    rules.disable(registry.get("unsound-assignment")?);
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .with_rule_selection(rules)
+        .build()?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, Final
+        from ty_extensions._internal import Unknown
+
+        def initialized(value: Callable[[str], None]) -> Callable[[Any], None]:
+            callback: Callable[[Any], None] = value
+            return callback
+
+        def known(value: Callable[[Any], None]) -> Callable[[Any], None]:
+            callback: Callable[[Any], None] = value
+            return callback
+
+        def omitted(value: Callable[[str], None]) -> Callable[..., None]:
+            callback: Callable[..., None] = value
+            return callback
+
+        def inferred(value: Callable[[str], None]) -> Callable[[str], None]:
+            callback = value
+            return callback
+
+        def later_assignment(value: Callable[[str], None]) -> Callable[[Any], None]:
+            callback: Callable[[Any], None]
+            callback = value
+            return callback
+
+        def prior_binding(value: Callable[[str], None]) -> Callable[[Any], None]:
+            callback = value
+            callback: Callable[[Any], None]
+            return callback
+
+        def typed_final(value: Callable[[str], None]) -> Callable[[Any], None]:
+            callback: Final[Callable[[Any], None]] = value
+            return callback
+
+        def typed_final_known(value: Callable[[Any], None]) -> Callable[[Any], None]:
+            callback: Final[Callable[[Any], None]] = value
+            return callback
+
+        def unknown_contract(value: object) -> object:
+            callback: Unknown = value
+            return callback
+
+        def unknown_qualified_contract(value: object) -> object:
+            callback: Final[Unknown] = value
+            return callback
+
+        def uninitialized() -> None:
+            callback: Unknown
+
+        def dead(value: Callable[[str], None]) -> None:
+            if False:
+                callback: Callable[[Any], None] = value
+
+        def static_target(value: Any) -> int:
+            callback: int = value
+            return callback
+
+        def bare_final(value: object) -> object:
+            callback: Final = value
+            return callback
+
+        def bare_later(value: object) -> object:
+            callback: Final
+            callback = value
+            return callback
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("initialized", Some(true)),
+        ("known", Some(false)),
+        ("omitted", Some(false)),
+        ("inferred", Some(false)),
+        ("later_assignment", Some(true)),
+        ("prior_binding", Some(true)),
+        ("typed_final", Some(true)),
+        ("typed_final_known", Some(false)),
+        ("unknown_contract", Some(true)),
+        ("unknown_qualified_contract", Some(true)),
+        ("uninitialized", Some(false)),
+        ("dead", Some(false)),
+        ("static_target", Some(true)),
+        // Bare qualifiers share unresolved annotation metadata. Preserve their ordinary types
+        // without promising that this proof mode can distinguish their absent value domain.
+        ("bare_final", None),
+        ("bare_later", None),
+    ];
+    let facts = |db: &TestDb, name: &str| {
+        crate::SemanticModel::new(db, program_file(db, file))
+            .function_inference_facts(first_public_binding(db, file, name))
+            .unwrap()
+    };
+    let types = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            let ty = global_symbol(db, file, name).place.expect_type();
+            let scope = ty
+                .as_function_literal()
+                .unwrap()
+                .literal(db)
+                .last_definition
+                .body_scope(db);
+            (
+                ty.display(db, &db.program_environment()).to_string(),
+                symbol(db, scope, "callback", ConsideredDefinitions::EndOfScope)
+                    .place
+                    .ignore_possibly_undefined()
+                    .map(|ty| ty.display(db, &db.program_environment()).to_string()),
+            )
+        })
+    };
+    let ordinary_types = types(&db);
+    for (name, _) in cases {
+        assert!(!facts(&db, name).has_unproved_requirements, "{name}");
+    }
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+
+    db.select_function_inference(Some((
+        file,
+        cases.map(|(name, _)| name.to_owned()).to_vec(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    for (name, unproved) in cases {
+        let result = facts(&db, name);
+        if let Some(unproved) = unproved {
+            assert_eq!(result.has_unproved_requirements, unproved, "{name}");
+        }
+        assert!(!result.has_errors, "{name}");
+    }
+    assert_eq!(types(&db), ordinary_types);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+
+    db.select_function_inference(None);
+    for (name, _) in cases {
+        assert!(!facts(&db, name).has_unproved_requirements, "{name}");
+    }
+    assert_eq!(types(&db), ordinary_types);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    Ok(())
+}
+
+#[test]
 fn contextual_literal_correspondence() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_python_version(PythonVersion::PY313)

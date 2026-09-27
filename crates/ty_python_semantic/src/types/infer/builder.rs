@@ -1858,8 +1858,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         })
         .place
-        .ignore_possibly_undefined()
-        .unwrap_or(Type::Never);
+        .ignore_possibly_undefined();
+        if let Some(inferred_ty) = inferred_ty {
+            self.record_declaration_requirement(
+                node,
+                declaration,
+                Some(ty.inner_type()),
+                inferred_ty,
+            );
+        }
+        let inferred_ty = inferred_ty.unwrap_or(Type::Never);
         let ty = if inferred_ty.is_assignable_to(db, env, ty.inner_type()) {
             ty
         } else {
@@ -1934,8 +1942,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     }
                 }
                 let declared_type = declared_ty.inner_type();
-                if self.validate_assignment_type(node, definition, None, declared_type, inferred_ty)
-                {
+                if self.validate_assignment_type(
+                    node,
+                    definition,
+                    None,
+                    Some(declared_type),
+                    inferred_ty,
+                ) {
                     // TODO We currently can't distinguish here between "no declared type" and
                     // "declared types is `Unknown` (e.g. due to a bad annotation, missing
                     // import, etc.)". Ideally we would still prefer `Unknown` declared type,
@@ -1967,6 +1980,36 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.bindings.insert(definition, inferred_ty);
     }
 
+    /// Retain a name declaration's value requirement before its public type can replace
+    /// the inferred value. Missing declarations impose no requirement; present unknown
+    /// domains remain unproved, including qualifiers whose value type is unresolved.
+    fn record_declaration_requirement(
+        &self,
+        node: AnyNodeRef,
+        definition: Definition<'db>,
+        target_ty: Option<Type<'db>>,
+        value_ty: Type<'db>,
+    ) {
+        if self.function_inference_mode != crate::FunctionInferenceMode::OutputProof {
+            return;
+        }
+        let Some(target_ty) = target_ty else {
+            return;
+        };
+        let db = self.db();
+        // Member operations require their setter or field write contract.
+        if definition.place(db).as_symbol().is_none() {
+            return;
+        }
+        let env = self.program_environment();
+        if !target_ty.is_fully_static_except_any(db, env)
+            || value_ty.has_provisional_marker(db, env)
+            || !value_ty.satisfies_declared_output(db, env, target_ty)
+        {
+            self.context.record_unproved_requirement(node);
+        }
+    }
+
     /// Checks an assigned value against its target's declared type and reports any mismatch.
     ///
     /// Returns `true` when the value is assignable, even if the stricter `unsound-assignment`
@@ -1980,11 +2023,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         target_node: AnyNodeRef,
         definition: Definition<'db>,
         declaration: Option<Definition<'db>>,
-        target_ty: Type<'db>,
+        target_ty: Option<Type<'db>>,
         value_ty: Type<'db>,
     ) -> bool {
         let db = self.db();
         let env = self.program_environment();
+        self.record_declaration_requirement(target_node, definition, target_ty, value_ty);
+        let target_ty = target_ty.unwrap_or(Type::unknown());
 
         if !value_ty.is_assignable_to(db, env, target_ty) {
             report_invalid_assignment(
@@ -13801,28 +13846,37 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
         builder: &mut TypeInferenceBuilder<'db, 'ast>,
         inferred_ty: Type<'db>,
     ) -> Type<'db> {
+        let Self {
+            declared_ty,
+            declaration,
+            binding,
+            node,
+            qualifiers,
+            is_local,
+            has_final_declaration,
+        } = self;
         let env = builder.program_environment();
-        let declared_ty = self.declared_ty.unwrap_or(Type::unknown());
+        let declared_type = declared_ty.unwrap_or(Type::unknown());
 
         let db = builder.db();
-        let file_scope_id = self.binding.file_scope(db);
+        let file_scope_id = binding.file_scope(db);
         let use_def = builder.index.use_def_map(file_scope_id);
         let place_table = builder.index.place_table(file_scope_id);
 
         let mut bound_ty = inferred_ty;
 
-        if self.qualifiers.contains(TypeQualifiers::FINAL) {
-            let mut previous_bindings = use_def.bindings_at_definition(self.binding);
+        if qualifiers.contains(TypeQualifiers::FINAL) {
+            let mut previous_bindings = use_def.bindings_at_definition(binding);
 
             // An assignment to a local `Final`-qualified symbol is only an error if there are prior bindings
 
             let previous_definition = previous_bindings.find_map(|r| r.binding.definition());
 
-            if !self.is_local || previous_definition.is_some() {
-                let place = place_table.place(self.binding.place(db));
+            if !is_local || previous_definition.is_some() {
+                let place = place_table.place(binding.place(db));
                 if let Some(diag_builder) = builder.context.report_lint(
                     &INVALID_ASSIGNMENT,
-                    self.binding.full_range(builder.db(), builder.module()),
+                    binding.full_range(builder.db(), builder.module()),
                 ) {
                     let mut diagnostic = diag_builder.into_diagnostic(format_args!(
                         "Reassignment of `Final` symbol `{place}` is not allowed"
@@ -13830,7 +13884,7 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
 
                     diagnostic.set_primary_annotation_message("Reassignment of `Final` symbol");
 
-                    if self.has_final_declaration
+                    if has_final_declaration
                         && let Some(previous_definition) = previous_definition
                         && !previous_definition.kind(db).is_import()
                     {
@@ -13855,20 +13909,14 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
             }
         }
 
-        if !builder.validate_assignment_type(
-            self.node,
-            self.binding,
-            self.declaration,
-            declared_ty,
-            bound_ty,
-        ) {
-            builder.discard_dict_key_assignments_for(self.binding);
+        if !builder.validate_assignment_type(node, binding, declaration, declared_ty, bound_ty) {
+            builder.discard_dict_key_assignments_for(binding);
 
             // Allow declarations to override inference in case of invalid assignment.
-            bound_ty = declared_ty;
+            bound_ty = declared_type;
         }
         // In the following cases, the bound type may not be the same as the RHS value type.
-        if let AnyNodeRef::ExprAttribute(ast::ExprAttribute { value, attr, .. }) = self.node {
+        if let AnyNodeRef::ExprAttribute(ast::ExprAttribute { value, attr, .. }) = node {
             let value_ty = builder.try_expression_type(value).unwrap_or_else(|| {
                 builder.infer_maybe_standalone_expression(value, TypeContext::default())
             });
@@ -13881,21 +13929,21 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
                     ty.may_be_data_descriptor(db, env) && !matches!(ty, Type::SlotDescriptor(_))
                 })
             {
-                builder.discard_dict_key_assignments_for(self.binding);
-                bound_ty = declared_ty;
+                builder.discard_dict_key_assignments_for(binding);
+                bound_ty = declared_type;
             }
-        } else if let AnyNodeRef::ExprSubscript(ast::ExprSubscript { value, .. }) = self.node {
+        } else if let AnyNodeRef::ExprSubscript(ast::ExprSubscript { value, .. }) = node {
             let value_ty = builder
                 .try_expression_type(value)
                 .unwrap_or_else(|| builder.infer_expression(value, TypeContext::default()));
 
             if !value_ty.is_typed_dict() && !Self::is_safe_mutable_class(db, env, value_ty) {
-                builder.discard_dict_key_assignments_for(self.binding);
-                bound_ty = declared_ty;
+                builder.discard_dict_key_assignments_for(binding);
+                bound_ty = declared_type;
             }
         }
 
-        builder.bindings.insert(self.binding, bound_ty);
+        builder.bindings.insert(binding, bound_ty);
 
         inferred_ty
     }
