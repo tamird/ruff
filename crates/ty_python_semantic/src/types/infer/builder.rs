@@ -5920,7 +5920,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .with_unproved_lookup_inputs(!member.inputs_proved(db))
                     .match_parameters(db, env, argument_types);
 
-                let single_argument_context = bindings.argument_correspondence_callable().is_some();
+                let argument_context_supported = bindings
+                    .argument_correspondence_callables(argument_types)
+                    .is_some();
                 if let Err(call_error) = self.infer_and_check_argument_types(
                     ast_arguments,
                     &[],
@@ -5944,7 +5946,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
                 let arguments_proved = self.function_inference_mode
                     != crate::FunctionInferenceMode::OutputProof
-                    || (single_argument_context
+                    || (argument_context_supported
                         && bindings.arguments_satisfy_declared_parameters(db, env, argument_types));
                 Ok(DunderCallOutcome {
                     bindings,
@@ -10290,7 +10292,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // Intersections and constructor stages can discard contextual child statuses before
         // pruning to one binding.
-        let single_argument_context = bindings.argument_correspondence_callable().is_some();
+        let argument_context_supported = bindings
+            .argument_correspondence_callables(&call_arguments)
+            .is_some();
         let bindings_result = self.infer_and_check_argument_types(
             ArgumentsIter::from_ast(arguments),
             &collection_argument_indices,
@@ -10329,7 +10333,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Argument replay is committed here. Proof failures must not change overload selection,
         // contextual hints, or the result chosen by ordinary checking.
         if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
-            && (!single_argument_context
+            && (!argument_context_supported
                 || !bindings.arguments_satisfy_declared_parameters(db, env, &call_arguments))
         {
             self.context.record_unproved_requirement(call_expression);
