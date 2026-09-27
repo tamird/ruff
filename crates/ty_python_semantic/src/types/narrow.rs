@@ -128,6 +128,153 @@ pub(crate) fn infer_narrowing_constraints<'db>(
     }
 }
 
+/// A runtime type comparison, before applying a caller's narrowing policy.
+struct RuntimeTypeTest<'db, 'ast> {
+    subject: &'ast ast::Expr,
+    target: Type<'db>,
+    is_positive: bool,
+    kind: RuntimeTypeTestKind,
+}
+
+enum RuntimeTypeTestKind {
+    Native,
+    ExactClass,
+}
+
+impl<'db, 'ast> RuntimeTypeTest<'db, 'ast> {
+    fn from_comparison(
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        operand: &'ast ast::Expr,
+        compared_value: Type<'db>,
+        op: ast::CmpOp,
+        is_positive: bool,
+        inferred_type: &impl Fn(&ast::Expr) -> Type<'db>,
+    ) -> Option<Self> {
+        match op {
+            ast::CmpOp::Eq | ast::CmpOp::NotEq => {
+                let ast::Expr::Call(call) = operand.expression_value() else {
+                    return None;
+                };
+                if !call.arguments.keywords.is_empty() {
+                    return None;
+                }
+                let [subject] = call.arguments.args.as_ref() else {
+                    return None;
+                };
+                let target = db.provided_type_test(
+                    scope.program_file(db),
+                    inferred_type(&call.func),
+                    compared_value,
+                )?;
+                Some(Self {
+                    subject,
+                    target,
+                    is_positive: is_positive == (op == ast::CmpOp::Eq),
+                    kind: RuntimeTypeTestKind::Native,
+                })
+            }
+            ast::CmpOp::Is | ast::CmpOp::IsNot => {
+                let env = ProgramEnvironment::from_scope(scope);
+                let subject = exact_class_narrowing_target(db, inferred_type, operand)?;
+                let class = find_underlying_class(db, &env, compared_value)?;
+                let is_positive = is_positive == (op == ast::CmpOp::Is);
+                // Excluding one runtime class excludes its entire instance domain
+                // only when that class cannot have subclasses.
+                if !is_positive && !class.is_final(db) {
+                    return None;
+                }
+                Some(Self {
+                    subject,
+                    target: Type::instance(db, &env, class.top_materialization(db)),
+                    is_positive,
+                    kind: RuntimeTypeTestKind::ExactClass,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn constraint(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> NarrowingConstraint<'db> {
+        let target = match self.kind {
+            RuntimeTypeTestKind::Native => self.target.top_materialization(db, env),
+            RuntimeTypeTestKind::ExactClass => self.target,
+        };
+        NarrowingConstraint::intersection(target.negate_if(db, env, !self.is_positive))
+    }
+}
+
+/// Attempt to find an underlying class literal for purposes of `if type(x) is Y` narrowing.
+///
+/// We deliberately return `None` for generic-alias types, since narrowing based
+/// on `if type(x) is Y[int]` isn't valid (this expression will never return `true`
+/// at runtime). Similarly, we return `None` for `type[Y[int]]`, type variables
+/// bound to `type[Y[int]]`, and type aliases where the underlying value is a
+/// generic class.
+fn find_underlying_class<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> Option<ClassLiteral<'db>> {
+    match ty {
+        Type::ClassLiteral(class) => Some(class),
+        Type::SubclassOf(subclass_of) => {
+            match subclass_of.subclass_of().with_transposed_type_var(db, env) {
+                SubclassOfInner::Class(ClassType::NonGeneric(class)) => Some(class),
+                SubclassOfInner::Class(ClassType::Generic(_))
+                | SubclassOfInner::Dynamic(_)
+                | SubclassOfInner::Protocol(_) => None,
+                SubclassOfInner::TypeVar(tvar) => {
+                    find_underlying_class(db, env, tvar.typevar(db).upper_bound(db, env)?)
+                }
+            }
+        }
+        Type::TypeVar(tvar) => {
+            find_underlying_class(db, env, tvar.typevar(db).upper_bound(db, env)?)
+        }
+        Type::TypeAlias(alias) => find_underlying_class(db, env, alias.value_type(db)),
+        _ => None,
+    }
+}
+
+/// Return the expression being tested by an exact runtime-class check.
+///
+/// `x.__class__` is modeled as equivalent to `type(x)` by [`Type::dunder_class`], so class
+/// identity checks against either expression can narrow `x`.
+fn exact_class_narrowing_target<'a, 'db>(
+    db: &'db dyn Db,
+    inferred_type: &impl Fn(&ast::Expr) -> Type<'db>,
+    expr: &'a ast::Expr,
+) -> Option<&'a ast::Expr> {
+    match expr.expression_value() {
+        ast::Expr::Call(ast::ExprCall {
+            func,
+            arguments: ast::Arguments { args, keywords, .. },
+            ..
+        }) => {
+            if keywords.is_empty()
+                && let [single_argument] = &**args
+                && let Type::ClassLiteral(called_class) = inferred_type(func)
+                && called_class.is_known(db, KnownClass::Type)
+            {
+                Some(single_argument)
+            } else {
+                None
+            }
+        }
+        ast::Expr::Attribute(ast::ExprAttribute { value, attr, .. })
+            if attr.as_str() == "__class__" =>
+        {
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
 /// Prove value identity separately from the ordinary narrowing at this occurrence.
 pub(crate) fn is_stable_boolean_guard<'db>(
     db: &'db dyn Db,
@@ -4192,72 +4339,6 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             )
         }
 
-        /// Attempt to find an underlying class literal for purposes of `if type(x) is Y` narrowing.
-        ///
-        /// We deliberately return `None` for generic-alias types, since narrowing based
-        /// on `if type(x) is Y[int]` isn't valid (this expression will never return `true`
-        /// at runtime). Similarly, we return `None` for `type[Y[int]]`, type variables
-        /// bound to `type[Y[int]]`, and type aliases where the underlying value is a
-        /// generic class.
-        fn find_underlying_class<'db>(
-            db: &'db dyn Db,
-            env: &ProgramEnvironment<'db>,
-            ty: Type<'db>,
-        ) -> Option<ClassLiteral<'db>> {
-            match ty {
-                Type::ClassLiteral(class) => Some(class),
-                Type::SubclassOf(subclass_of) => {
-                    match subclass_of.subclass_of().with_transposed_type_var(db, env) {
-                        SubclassOfInner::Class(ClassType::NonGeneric(class)) => Some(class),
-                        SubclassOfInner::Class(ClassType::Generic(_))
-                        | SubclassOfInner::Dynamic(_)
-                        | SubclassOfInner::Protocol(_) => None,
-                        SubclassOfInner::TypeVar(tvar) => {
-                            find_underlying_class(db, env, tvar.typevar(db).upper_bound(db, env)?)
-                        }
-                    }
-                }
-                Type::TypeVar(tvar) => {
-                    find_underlying_class(db, env, tvar.typevar(db).upper_bound(db, env)?)
-                }
-                Type::TypeAlias(alias) => find_underlying_class(db, env, alias.value_type(db)),
-                _ => None,
-            }
-        }
-
-        /// Return the expression being tested by an exact runtime-class check.
-        ///
-        /// `x.__class__` is modeled as equivalent to `type(x)` by [`Type::dunder_class`], so class
-        /// identity checks against either expression can narrow `x`.
-        fn exact_class_narrowing_target<'a, 'db>(
-            db: &'db dyn Db,
-            inference: &ExpressionInference<'db>,
-            expr: &'a ast::Expr,
-        ) -> Option<&'a ast::Expr> {
-            match expr.expression_value() {
-                ast::Expr::Call(ast::ExprCall {
-                    func,
-                    arguments: ast::Arguments { args, keywords, .. },
-                    ..
-                }) => {
-                    if keywords.is_empty()
-                        && let [single_argument] = &**args
-                        && let Type::ClassLiteral(called_class) = inference.expression_type(func)
-                        && called_class.is_known(db, KnownClass::Type)
-                    {
-                        Some(single_argument)
-                    } else {
-                        None
-                    }
-                }
-                ast::Expr::Attribute(ast::ExprAttribute { value, attr, .. })
-                    if attr.as_str() == "__class__" =>
-                {
-                    Some(value)
-                }
-                _ => None,
-            }
-        }
         let db = self.db;
 
         let ast::ExprCompare {
@@ -4579,77 +4660,28 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 rhs_ty
             };
 
-            if matches!(op, ast::CmpOp::Eq | ast::CmpOp::NotEq) {
-                for (operand, compared_value) in [(left, rhs_ty), (right, lhs_ty)] {
-                    if let ast::Expr::Call(call) = operand.expression_value()
-                        && call.arguments.keywords.is_empty()
-                        && let [subject] = call.arguments.args.as_ref()
-                        && let Some(target) = PlaceExpr::try_from_expr(subject)
-                        && let Some(ty) = db.provided_type_test(
-                            self.scope().program_file(db),
-                            inference.expression_type(&*call.func),
-                            compared_value,
-                        )
-                    {
-                        let place = self.expect_place(&target);
-                        let constraint =
-                            self.type_test_constraint(ty, is_positive == (*op == ast::CmpOp::Eq));
-                        insert_narrowing_constraint(&mut constraints, place, constraint);
-                    }
-                }
-            }
-
-            // Narrowing for:
-            // - `if type(x) is Y`
-            // - `if type(x) is not Y`
-            // - `if Y is type(x)`
-            // - `if Y is not type(x)`
-            // - `if type(x) is type(y)`
-            // - `if type(x) is not type(y)`
-            // - `if x.__class__ is Y`
-            // - `if x.__class__ is not Y`
-            // - `if Y is x.__class__`
-            // - `if Y is not x.__class__`
-            // - `if x.__class__ is y.__class__`
-            // - `if x.__class__ is not y.__class__`
-            let exact_class_checks = match (
-                exact_class_narrowing_target(db, inference, left),
-                exact_class_narrowing_target(db, inference, right),
-            ) {
-                (Some(left_target), Some(right_target)) => {
-                    [Some((left_target, rhs_ty)), Some((right_target, lhs_ty))]
-                }
-                (Some(target), None) => [Some((target, rhs_ty)), None],
-                (None, Some(target)) => [Some((target, lhs_ty)), None],
-                (None, None) => [None, None],
-            };
-            for (target_expr, other) in exact_class_checks.into_iter().flatten() {
-                // If this is `None`, it indicates that we cannot do `if type(x) is Y`
-                // narrowing: we can only do narrowing for `if type(x) is Y` and
-                // `if type(x) is not Y`, not for `if type(x) == Y` or `if type(x) != Y`.
-                let is_positive = match op {
-                    ast::CmpOp::Is => Some(is_positive),
-                    ast::CmpOp::IsNot => Some(!is_positive),
-                    _ => None,
-                };
-
-                if let Some(is_positive) = is_positive
-                    && let Some(target) = PlaceExpr::try_from_expr(target_expr)
-                    && let Some(other_class) =
-                        find_underlying_class(db, &self.env, other,
-                        )
-                    // `else`-branch narrowing for `if type(x) is Y` can only be done
-                    // if `Y` is a final class
-                    && (is_positive || other_class.is_final(db))
+            for (operand, compared_value) in [(left, rhs_ty), (right, lhs_ty)] {
+                if let Some(test) = RuntimeTypeTest::from_comparison(
+                    db,
+                    self.scope(),
+                    operand,
+                    compared_value,
+                    *op,
+                    is_positive,
+                    &|expression| inference.expression_type(expression),
+                ) && let Some(target) = PlaceExpr::try_from_expr(test.subject)
                 {
                     let place = self.expect_place(&target);
-                    constraints.insert(
-                        place,
-                        NarrowingConstraint::intersection(
-                            Type::instance(db, &self.env, other_class.top_materialization(db))
-                                .negate_if(db, &self.env, !is_positive),
-                        ),
-                    );
+                    match test.kind {
+                        RuntimeTypeTestKind::Native => {
+                            let constraint =
+                                self.type_test_constraint(test.target, test.is_positive);
+                            insert_narrowing_constraint(&mut constraints, place, constraint);
+                        }
+                        RuntimeTypeTestKind::ExactClass => {
+                            constraints.insert(place, test.constraint(db, &self.env));
+                        }
+                    }
                 }
             }
 
