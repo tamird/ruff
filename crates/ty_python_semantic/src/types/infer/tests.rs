@@ -4389,3 +4389,139 @@ fn function_output_correspondence_ignores_unreachable_returns() -> anyhow::Resul
     assert_eq!(ids, ["invalid-return-type"]);
     Ok(())
 }
+
+#[test]
+fn keyword_unpack_correspondence() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .build()?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Callable, Protocol
+        from typing_extensions import TypedDict
+
+        class Named(Protocol):
+            def __call__(self, *, name: str) -> None: ...
+
+        class Closed(TypedDict, closed=True):
+            run: Named
+
+        class Opaque(TypedDict, closed=True):
+            run: Callable[..., None]
+
+        class Optional(TypedDict, total=False, closed=True):
+            run: Named
+
+        class Open(TypedDict):
+            run: Named
+
+        def callback(*, name: str) -> None: pass
+        def consume(*, run: Named = callback) -> None: pass
+        def consume_omitted(*, run: Callable[..., None]) -> None: pass
+        def consume_objects(**kwargs: object) -> None: pass
+        def consume_named(**kwargs: Named) -> None: pass
+        def empty() -> None: pass
+
+        class Consumer:
+            def accept(self, *, run: Named) -> None: pass
+
+        def pass_through(value: Named) -> Named:
+            return value
+
+        def known(value: Closed) -> None:
+            consume(**value)
+
+        def opaque(value: Opaque) -> None:
+            consume(**value)
+
+        def omitted(value: Opaque) -> None:
+            consume_omitted(**value)
+
+        def literal() -> None:
+            consume(**{'run': callback})
+
+        def empty_literal() -> None:
+            empty(**{})
+
+        def optional(value: Optional) -> None:
+            consume(**value)
+
+        def mapping(value: dict[str, Named]) -> None:
+            consume_named(**value)
+
+        def open_objects(value: Open) -> None:
+            consume_objects(**value)
+
+        def open_named(value: Open) -> None:
+            consume_named(**value)
+
+        def method(consumer: Consumer, value: Closed) -> None:
+            consumer.accept(**value)
+
+        def child(value: Callable[..., None]) -> None:
+            consume(**{'run': pass_through(value)})
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("known", false),
+        ("opaque", true),
+        ("omitted", false),
+        ("literal", false),
+        ("empty_literal", false),
+        ("optional", true),
+        ("mapping", true),
+        ("open_objects", false),
+        ("open_named", true),
+        ("method", false),
+        ("child", true),
+    ];
+    let facts = |db: &TestDb, name: &str| {
+        crate::SemanticModel::new(db, program_file(db, file))
+            .function_inference_facts(first_public_binding(db, file, name))
+            .unwrap()
+    };
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary_signatures = signatures(&db);
+    let ordinary = cases.map(|(name, _)| facts(&db, name));
+    assert!(ordinary.iter().all(|fact| !fact.has_unproved_requirements));
+    db.select_function_inference(Some((
+        file,
+        cases.map(|(name, _)| name.to_owned()).to_vec(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    for ((name, unproved), ordinary) in cases.into_iter().zip(ordinary) {
+        let selected = facts(&db, name);
+        assert_eq!(selected.has_unproved_requirements, unproved, "{name}");
+        assert_eq!(selected.return_type_correspondence, Some(true), "{name}");
+        assert_eq!(
+            (
+                selected.has_errors,
+                selected.has_diagnostics_or_suppressions
+            ),
+            (
+                ordinary.has_errors,
+                ordinary.has_diagnostics_or_suppressions
+            ),
+            "{name}",
+        );
+    }
+    assert_eq!(signatures(&db), ordinary_signatures);
+    db.select_function_inference(None);
+    assert!(
+        cases
+            .iter()
+            .all(|(name, _)| !facts(&db, name).has_unproved_requirements)
+    );
+    assert_eq!(signatures(&db), ordinary_signatures);
+    Ok(())
+}
