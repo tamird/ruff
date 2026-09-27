@@ -19,7 +19,7 @@ pub enum FunctionInferenceMode {
     /// Ordinary inference with retained return-type correspondence facts and unresolved
     /// requirements from explicit calls, including constructors with one `__new__` or `__init__`
     /// stage, descriptor getters, indexed reads and writes, arithmetic and bitwise unary
-    /// operators, binary and augmented operators, membership, name declarations, source-annotated
+    /// operators, binary and augmented operators, comparisons, name declarations, source-annotated
     /// defaults, contextual collection elements and supported `TypedDict` construction and storage.
     /// These checks use the ordinary selected binding, field, declared domain or element type
     /// without changing inference or branch selection. Unsupported binding, merged field and

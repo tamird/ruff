@@ -2860,6 +2860,132 @@ fn unary_argument_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn rich_comparison_argument_correspondence() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from __future__ import annotations
+        from typing import Any, Callable
+        from ty_extensions import Intersection
+
+        type Named = Callable[[str], None]
+        class Bad:
+            def __lt__(self, callback: Callable[[Any], None]) -> dict[str, Any]: return {}
+            __le__ = __lt__
+        class Known:
+            def __lt__(self, callback: Named) -> dict[str, Any]: return {}
+        class BooleanKnown:
+            def __lt__(self, callback: Named) -> bool: return True
+        class Reflected:
+            def __gt__(self, callback: Callable[[Any], None]) -> dict[str, Any]: return {}
+        class KnownReflected:
+            def __gt__(self, callback: Named) -> dict[str, Any]: return {}
+        class Missing: pass
+        class Factory:
+            def __init__(self, callback: Named) -> None: pass
+        class Constructor:
+            __lt__ = Factory
+        class Base:
+            def __lt__(self, other: object) -> bool: return True
+        class Child[T](Base):
+            def __gt__(self: Child[Callable[[Any], None]], other: object) -> bool: return True
+        class KnownChild[T](Base):
+            def __gt__(self: KnownChild[Named], other: object) -> bool: return True
+        class FailedChild(Base):
+            def __gt__(self, other: str) -> bool: return True
+
+        def bad(value: Bad, callback: Named) -> None: value < callback
+        def less_equal(value: Bad, callback: Named) -> None: value <= callback
+        def known(value: Known, callback: Named) -> None: value < callback
+        def reflected(value: Reflected, callback: Named) -> None: callback < value
+        def known_reflected(value: KnownReflected, callback: Named) -> None: callback < value
+        def union(value: Bad | Known, callback: Named) -> None: value < callback
+        def discarded(value: Intersection[Missing, Known], callback: Named) -> None: value < callback
+        def contributing(value: Intersection[Bad, Known], callback: Named) -> None: value < callback
+        def chain(value: Known, callback: Named, other: KnownReflected) -> None: value < callback < other
+        def boolean_chain(value: BooleanKnown, callback: Named, other: KnownReflected) -> None: value < callback < other
+        def dynamic(value: Any, callback: Named) -> None: value < callback
+        def constructor(value: Constructor, callback: Named) -> None: value < callback
+        def pragmatic(value: int) -> None: value == 'x'
+        def tuple_elements(value: Bad, callback: Named) -> None: (value,) < (callback,)
+        def reflected_contributor(left: Base, right: Child[Named]) -> None: left < right
+        def known_contributor(left: Base, right: KnownChild[Named]) -> None: left < right
+        def failed_contributor(left: Base, right: FailedChild) -> None: left < right
+        def identity(value: Any, callback: Named) -> None: value is callback
+        def literals() -> None:
+            1 < 2
+            'x' == 'x'
+            b'x' != b'y'
+            False < True
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("bad", true),
+        ("less_equal", true),
+        ("known", false),
+        ("reflected", true),
+        ("known_reflected", false),
+        ("union", true),
+        ("discarded", false),
+        ("contributing", true),
+        ("chain", true),
+        ("boolean_chain", false),
+        ("dynamic", true),
+        ("constructor", true),
+        ("pragmatic", true),
+        ("tuple_elements", true),
+        ("reflected_contributor", true),
+        ("known_contributor", false),
+        ("failed_contributor", true),
+        ("identity", false),
+        ("literals", false),
+    ];
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary = signatures(&db);
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((
+            file,
+            cases.map(|(name, _)| name.to_owned()).to_vec(),
+            mode,
+        )));
+        let model = crate::SemanticModel::new(&db, program_file(&db, file));
+        for (name, unproved) in cases {
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, name))
+                .unwrap();
+            assert_eq!(
+                facts.has_unproved_requirements,
+                mode == FunctionInferenceMode::OutputProof && unproved,
+                "{mode:?} {name}: {facts:?}"
+            );
+            assert!(!facts.has_errors, "{mode:?} {name}");
+            assert_eq!(
+                facts.return_type_correspondence,
+                (mode == FunctionInferenceMode::OutputProof).then_some(true),
+                "{mode:?} {name}"
+            );
+        }
+        assert_eq!(signatures(&db), ordinary);
+        assert_file_diagnostics(&db, "/src/main.py", &[]);
+    }
+    Ok(())
+}
+
+#[test]
 fn descriptor_argument_correspondence() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(
