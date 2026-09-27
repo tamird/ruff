@@ -1837,6 +1837,177 @@ fn indexed_store_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn contextual_literal_correspondence() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .build()?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, Literal, Protocol
+        from typing_extensions import TypedDict
+
+        class Named(Protocol):
+            def __call__(self, *, name: str) -> None: ...
+
+        class Bag(TypedDict):
+            run: Named
+
+        class OmittedBag(TypedDict):
+            run: Callable[..., None]
+
+        class ClosedChoice(TypedDict):
+            callbacks: list[Named]
+            tag: Literal[0]
+
+        class OmittedChoice(TypedDict):
+            callbacks: list[Callable[..., None]]
+            tag: Literal[1]
+
+        def pass_through(value: Named) -> Named:
+            return value
+
+        def source(value: Named) -> list[int]:
+            return [1]
+
+        def list_closed(value: Callable[..., None]) -> Named:
+            values: list[Named] = [value]
+            return values[0]
+
+        def list_known(value: Named) -> Named:
+            values: list[Named] = [value]
+            return values[0]
+
+        def list_omitted(value: Callable[..., None]) -> Callable[..., None]:
+            values: list[Callable[..., None]] = [value]
+            return values[0]
+
+        def dict_closed(value: Callable[..., None]) -> dict[str, Named]:
+            values: dict[str, Named] = {"run": value}
+            return values
+
+        def dict_slow(value: Callable[..., None]) -> dict[str, Named]:
+            empty: dict[str, Named] = {}
+            values: dict[str, Named] = {**empty, "run": value}
+            return values
+
+        def dict_unpack(value: dict[str, Callable[..., None]]) -> dict[str, Named]:
+            return {**value}
+
+        def td_closed(value: Callable[..., None]) -> Bag:
+            return {"run": value}
+
+        def td_known(value: Named) -> Bag:
+            return {"run": value}
+
+        def td_omitted(value: Callable[..., None]) -> OmittedBag:
+            return {"run": value}
+
+        def td_overwritten(value: Callable[..., None], known: Named) -> Bag:
+            return {"run": value, "run": known}
+
+        def td_overwritten_child(value: Callable[..., None], known: Named) -> Bag:
+            return {"run": pass_through(value), "run": known}
+
+        def td_arbitrary(key: str, value: Callable[..., None], known: Named) -> Bag:
+            return {"run": known, key: value}
+
+        def td_spread(value: Any) -> Bag:
+            return {**value}
+
+        def td_candidates(value: Callable[..., None]) -> ClosedChoice | OmittedChoice:
+            return {"callbacks": [value], "tag": 0}
+
+        def td_fallback(value: Callable[..., None]) -> Bag | dict[str, Any]:
+            return {"run": value}
+
+        def union_candidate(value: Callable[..., None]) -> list[Named] | list[Callable[..., None] | int]:
+            return [value, 1]
+
+        def comp_live(value: Callable[..., None]) -> list[Named]:
+            return [value for item in (1,)]
+
+        def comp_dead(value: Callable[..., None]) -> list[Named]:
+            return [value for item in (1,) if False]
+
+        def comp_iterator(value: Callable[..., None]) -> list[Named]:
+            return [value for item in source(value) if False]
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("list_closed", true),
+        ("list_known", false),
+        ("list_omitted", false),
+        ("dict_closed", true),
+        ("dict_slow", true),
+        ("td_closed", true),
+        ("td_known", false),
+        ("td_omitted", false),
+        ("td_overwritten", false),
+        ("td_overwritten_child", true),
+        ("td_arbitrary", true),
+        ("td_spread", true),
+        ("td_candidates", true),
+        ("td_fallback", true),
+        ("union_candidate", false),
+        ("comp_live", true),
+        ("comp_dead", false),
+        ("comp_iterator", true),
+    ];
+    let facts = |db: &TestDb, name: &str| {
+        crate::SemanticModel::new(db, program_file(db, file))
+            .function_inference_facts(first_public_binding(db, file, name))
+            .unwrap()
+    };
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary_signatures = signatures(&db);
+    for (name, _) in cases {
+        assert!(!facts(&db, name).has_unproved_requirements, "{name}");
+    }
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+
+    db.select_function_inference(Some((
+        file,
+        cases
+            .map(|(name, _)| name.to_owned())
+            .into_iter()
+            .chain(["dict_unpack".to_owned()])
+            .collect(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    for (name, unproved) in cases {
+        let result = facts(&db, name);
+        assert_eq!(result.has_unproved_requirements, unproved, "{name}");
+        assert_eq!(result.return_type_correspondence, Some(true), "{name}");
+        assert!(!result.has_errors, "{name}");
+    }
+    // Unpacked values keep their inference constraints instead of adopting element contexts.
+    assert_eq!(
+        facts(&db, "dict_unpack").return_type_correspondence,
+        Some(false)
+    );
+    assert_eq!(signatures(&db), ordinary_signatures);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+
+    db.select_function_inference(None);
+    for (name, _) in cases {
+        assert!(!facts(&db, name).has_unproved_requirements, "{name}");
+    }
+    assert_eq!(signatures(&db), ordinary_signatures);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    Ok(())
+}
+
+#[test]
 fn conservative_source_globals() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(

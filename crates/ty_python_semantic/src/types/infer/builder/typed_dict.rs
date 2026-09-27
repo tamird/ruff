@@ -1,5 +1,6 @@
 use ruff_python_ast::name::Name;
 use ruff_python_ast::{self as ast, AnyNodeRef, HasNodeIndex, NodeIndex, PythonVersion};
+use ruff_text_size::Ranged;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use strum::IntoEnumIterator;
@@ -342,6 +343,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let key_tcx =
             TypeContext::new(self.typed_dict_key_expected_type(Type::TypedDict(typed_dict)));
 
+        let mut has_direct_field_pairs = true;
         for item in items {
             let key_ty = self.infer_optional_expression(item.key.as_ref(), key_tcx);
             if let Some((key, key_ty)) = item.key.as_ref().zip(key_ty) {
@@ -350,10 +352,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 
             let value_ty = if let Some(key_ty) = key_ty
                 && let Some(key) = key_ty.as_string_literal()
-                && let Some(field) = typed_dict.item(self.db(), key.value(self.db()))
             {
-                self.infer_expression(&item.value, tcx.with_annotation(Some(field.declared_ty)))
+                let value_tcx = typed_dict
+                    .item(db, key.value(db))
+                    .map_or_else(TypeContext::default, |field| {
+                        tcx.with_annotation(Some(field.declared_ty))
+                    });
+                self.infer_expression(&item.value, value_tcx)
             } else if let Some(key_ty) = key_ty {
+                has_direct_field_pairs = false;
                 if key_ty.is_assignable_to(db, env, KnownClass::Str.to_instance(db, env))
                     && let Some(value_ty) = typed_dict.arbitrary_key_initialization_type(db, env)
                 {
@@ -362,12 +369,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     self.infer_expression(&item.value, TypeContext::default())
                 }
             } else {
+                has_direct_field_pairs = false;
                 self.infer_expression(&item.value, TypeContext::default())
             };
 
             item_types.insert(item.value.node_index().load(), value_ty);
         }
 
+        let mut unproved_element = None;
         validate_typed_dict_dict_literal(
             &self.context,
             typed_dict,
@@ -375,17 +384,31 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             dict.into(),
             tcx,
             |expr: &ast::Expr, tcx: TypeContext<'db>| {
-                item_types
+                let actual = item_types
                     .get(&expr.node_index().load())
                     .copied()
-                    .unwrap_or_else(|| {
-                        let _ = tcx;
-                        Type::unknown()
-                    })
+                    .unwrap_or_else(Type::unknown);
+                // The validator visits only effective field values after rightmost overwrites.
+                if unproved_element.is_none()
+                    && let Some(expected) = tcx.annotation
+                    && self.literal_element_has_unproved_requirement(expr, actual, expected)
+                {
+                    unproved_element = Some(expr.range());
+                }
+                actual
             },
         )
-        .ok()
-        .map(|_| Type::TypedDict(typed_dict))
+        .ok()?;
+        if !has_direct_field_pairs
+            && self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+        {
+            // Unpacked and arbitrary-key validation checks extracted types outside the
+            // expression callback, so its complete storage requirements are unavailable here.
+            self.context.record_unproved_requirement(dict);
+        } else if let Some(element) = unproved_element {
+            self.context.record_unproved_requirement(element);
+        }
+        Some(Type::TypedDict(typed_dict))
     }
 
     /// Infers and validates a `TypedDict` constructor through one call-binding pipeline.
