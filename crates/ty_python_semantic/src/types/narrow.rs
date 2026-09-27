@@ -44,8 +44,9 @@ use ty_python_core::predicate::{
     ClassPatternPredicateKind, MappingPatternPredicateKind, PatternPredicate, PatternPredicateKind,
     Predicate, PredicateNode, SequencePatternPredicateKind, SubjectElementPatternPredicate,
 };
-use ty_python_core::scope::ScopeId;
+use ty_python_core::scope::{ScopeId, ScopeKind};
 use ty_python_core::symbol::Symbol;
+use ty_python_core::unpack::UnpackKind;
 use ty_python_core::{
     ExpressionNodeKey, FileScopeId, NarrowingEvaluator, place_table, semantic_index,
 };
@@ -65,7 +66,7 @@ use super::match_pattern::is_typed_dict_runtime_domain;
 use itertools::{Either, Itertools};
 use ruff_python_ast as ast;
 use ruff_python_ast::{BoolOp, ExprBoolOp};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec, smallvec_inline};
 
 mod containment;
@@ -2391,6 +2392,11 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             ast::Expr::Name(name) => {
                 let index = semantic_index(db, expression.program_file(db));
                 let constraints = self.evaluate_simple_expr(expression_node, is_positive);
+                let unpacked_constraints = constraints.as_ref().and_then(|constraints| {
+                    self.narrow_unpacked_local(name, expression, constraints)
+                });
+                let constraints =
+                    Self::merge_optional_constraints_and(constraints, unpacked_constraints);
                 if let Some(alias_predicate) = index.narrowing_alias_predicate(expression_node)
                     && self.is_valid_alias(
                         name,
@@ -4205,6 +4211,108 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         self.places()
             .place_id(place_expr)
             .expect("We should always have a place for every `PlaceExpr`")
+    }
+
+    /// Recover relationships between flat locals assigned by one unpacking. Whole binding
+    /// histories deliberately exclude later writes too, without maintaining another alias graph.
+    fn narrow_unpacked_local(
+        &mut self,
+        name: &ast::ExprName,
+        expression: Expression<'db>,
+        constraints: &NarrowingConstraints<'db>,
+    ) -> Option<NarrowingConstraints<'db>> {
+        let db = self.db;
+        let scope = expression.scope(db);
+        if scope.node(db).scope_kind() != ScopeKind::Function {
+            return None;
+        }
+        let file = expression.program_file(db);
+        let index = semantic_index(db, file);
+        let use_def = index.use_def_map(scope.file_scope_id(db));
+        let places = place_table(db, scope);
+        let mut bindings = use_def.bindings_at_use(name.scoped_use_id(db, file));
+        let definition = bindings.next()?.binding.definition()?;
+        if bindings.any(|binding| binding.binding != DefinitionState::Defined(definition)) {
+            return None;
+        }
+        let DefinitionKind::Assignment(assignment) = definition.kind(db) else {
+            return None;
+        };
+        let unpack = assignment.unpack()?;
+        if unpack.target_scope(db) != scope
+            || !matches!(unpack.value(db).kind(), UnpackKind::Assign)
+        {
+            return None;
+        }
+        let target = unpack.target(db, self.module);
+        let targets = match target {
+            ast::Expr::Tuple(tuple) => &tuple.elts,
+            ast::Expr::List(list) => &list.elts,
+            _ => return None,
+        };
+        let mut names = FxHashSet::default();
+        let mut tested_index = None;
+        let mut siblings = Vec::with_capacity(targets.len());
+        for (position, target) in targets.iter().enumerate() {
+            let ast::Expr::Name(sibling) = target else {
+                return None;
+            };
+            if !names.insert(&sibling.id) {
+                return None;
+            }
+            let original = index.try_definition(sibling)?;
+            let symbol = places.symbol_id(&sibling.id)?;
+            if !places.symbol(symbol).is_local()
+                || use_def
+                    .reachable_symbol_bindings(symbol)
+                    .any(|binding| match binding.binding {
+                        DefinitionState::Undefined => false,
+                        DefinitionState::Deleted => true,
+                        DefinitionState::Defined(other) => other != original,
+                    })
+            {
+                return None;
+            }
+            if original == definition {
+                tested_index = Some(position);
+            }
+            siblings.push((target, ScopedPlaceId::Symbol(symbol)));
+        }
+        let tested_index = tested_index?;
+        let constraint = constraints.get(&definition.place(db))?;
+        let value = unpack.value(db);
+        let inference = infer_expression_types(db, value.expression(), TypeContext::default());
+        if inference.is_provisional()
+            || inference
+                .expression_type(value.expression().node_ref(db))
+                .has_provisional_marker(db, &self.env)
+        {
+            self.is_provisional = true;
+            return None;
+        }
+        let projected = super::unpacker::Unpacker::new(db, &self.env, scope, file, self.module)
+            .unpack_filtered(target, value, inference, tested_index, &|ty| {
+                !NarrowingConstraint::intersection(ty)
+                    .merge_constraint_and(constraint.clone())
+                    .evaluate_constraint_type(db, &self.env)
+                    .is_never()
+            });
+        let projected = match projected {
+            Ok(projected) => projected,
+            Err(super::unpacker::UnpackFilterError::Unsupported) => return None,
+            Err(super::unpacker::UnpackFilterError::Provisional) => {
+                self.is_provisional = true;
+                return None;
+            }
+        };
+        Some(NarrowingConstraints::from_iter(siblings.into_iter().map(
+            |(target, place)| {
+                (
+                    place,
+                    NarrowingConstraint::intersection(projected.expression_type(target)),
+                )
+            },
+        )))
     }
 
     /// Check if a type is directly narrowable by `len()` (without considering unions or intersections).

@@ -1409,6 +1409,50 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         });
     }
 
+    /// A test of one unpacked local can also constrain its sibling targets.
+    /// Inference checks their complete binding histories before using the relationship.
+    fn add_unpack_narrowed_places(&self, expr: &ast::Expr, places: &mut PossiblyNarrowedPlaces) {
+        if self.scopes[self.current_scope()].node().scope_kind() != ScopeKind::Function {
+            return;
+        }
+        Self::walk_narrowing_alias_predicate(expr, &mut |leaf| {
+            if !leaf.is_name_expr() {
+                return;
+            }
+            let Some(use_id) = self.current_ast_ids().try_use_id(leaf) else {
+                return;
+            };
+            let use_def = self.current_use_def_map();
+            for binding in use_def.bindings_at_use(use_id) {
+                let Some(definition) = use_def.definition(binding.binding()).definition() else {
+                    continue;
+                };
+                let DefinitionKind::Assignment(assignment) = definition.kind(self.db) else {
+                    continue;
+                };
+                let Some(unpack) = assignment.unpack() else {
+                    continue;
+                };
+                if !matches!(unpack.value(self.db).kind(), UnpackKind::Assign) {
+                    continue;
+                }
+                let targets = match unpack.target(self.db, self.module) {
+                    ast::Expr::Tuple(tuple) => &tuple.elts,
+                    ast::Expr::List(list) => &list.elts,
+                    _ => continue,
+                };
+                for target in targets {
+                    if target.is_name_expr() {
+                        places.extend(
+                            PossiblyNarrowedPlacesBuilder::new(self.db, self.current_place_table())
+                                .expression(target),
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     fn flow_snapshot(&self) -> FlowSnapshot {
         self.current_use_def_map().snapshot()
     }
@@ -2686,6 +2730,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         let mut places = PossiblyNarrowedPlacesBuilder::new(self.db, place_table)
                             .expression(expression_node);
                         self.add_alias_narrowed_places(expression_node, &mut places);
+                        self.add_unpack_narrowed_places(expression_node, &mut places);
                         places
                     }
                     PredicateNode::Pattern(pattern) => {
