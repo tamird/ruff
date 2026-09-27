@@ -1590,6 +1590,19 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         r#"
         from typing import Any, Callable, no_type_check
 
+        class Factory:
+            def __init__(self, cls: object, callback: Callable[..., None]) -> None:
+                pass
+
+        class Wrapped:
+            __new__ = Factory
+
+            def __init__(self, callback: Callable[[int], None]) -> None:
+                pass
+
+        def wrapped(callback: Callable[..., None]) -> object:
+            return Wrapped(callback)
+
         def narrow(values: list[str]) -> None:
             pass
 
@@ -1618,7 +1631,7 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
-    let names = ["bad", "good", "dead", "suppressed", "unchecked"];
+    let names = ["bad", "good", "dead", "suppressed", "unchecked", "wrapped"];
     let signatures = |db: &TestDb| {
         names.map(|name| {
             global_symbol(db, file, name)
@@ -1640,7 +1653,7 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
     let ordinary = facts(&db);
     assert_eq!(
         ordinary.map(|fact| fact.has_unproved_requirements),
-        [false; 5]
+        names.map(|_| false)
     );
     assert_file_diagnostics(&db, "/src/main.py", &[]);
 
@@ -1652,7 +1665,7 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
     let selected = facts(&db);
     assert_eq!(
         selected.map(|fact| fact.has_unproved_requirements),
-        [true, false, false, true, true]
+        [true, false, false, true, true, true]
     );
     assert_eq!(
         selected.map(|fact| (fact.has_errors, fact.has_diagnostics_or_suppressions)),

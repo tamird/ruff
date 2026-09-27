@@ -1493,8 +1493,9 @@ impl<'db> Bindings<'db> {
     /// Check the committed actual arguments against the selected parameter contracts.
     ///
     /// This query leaves ordinary overload selection and results unchanged. Multiple callable
-    /// contributors, expanded or ambiguous overloads, constructor stages, and unresolved generic
-    /// solutions for supplied values need additional coverage to establish requirements.
+    /// contributors, expanded or ambiguous overloads, multiple or omitted constructor stages, and
+    /// unresolved generic solutions for supplied values need additional coverage to establish
+    /// requirements.
     /// The caller must also establish that argument inference committed the selected contexts;
     /// final binding pruning alone does not establish that child proof statuses were retained.
     pub(crate) fn arguments_satisfy_declared_parameters(
@@ -1506,10 +1507,7 @@ impl<'db> Bindings<'db> {
         if self.as_result(db).is_err() {
             return false;
         }
-        let Some(item) = self.single_item() else {
-            return false;
-        };
-        let CallableItem::Regular(callable) = item else {
+        let Some(callable) = self.argument_correspondence_callable() else {
             return false;
         };
         if callable.overload_call_result.is_some() {
@@ -1575,6 +1573,27 @@ impl<'db> Bindings<'db> {
                         && actual.satisfies_declared_output(db, env, expected)
                 })
             })
+    }
+
+    /// Return the sole callable covered by argument correspondence, before or after inference.
+    /// Constructor entry and downstream contexts must both be accounted for before checking.
+    pub(crate) fn argument_correspondence_callable(&self) -> Option<&CallableBinding<'db>> {
+        let item = self.single_item()?;
+        match item {
+            CallableItem::Regular(callable) => Some(callable),
+            CallableItem::Constructor(constructor) => {
+                if matches!(
+                    constructor.context().kind(),
+                    ConstructorCallableKind::Init | ConstructorCallableKind::New
+                ) && constructor.downstream_constructor.is_none()
+                    && !constructor.has_omitted_stage
+                {
+                    Some(constructor.callable())
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// Returns true if this is a single callable (not a union or intersection).
@@ -10648,6 +10667,40 @@ mod tests {
             class Named(Protocol):
                 def __call__(self, *, name: str) -> None: ...
 
+            class Closed:
+                def __init__(self, callback: Named) -> None: ...
+
+            class Omitted:
+                def __init__(self, callback: Callable[..., None]) -> None: ...
+
+            class TwoStages:
+                def __new__(cls, callback: Callable[..., None]) -> TwoStages: ...
+                def __init__(self, callback: Named) -> None: ...
+
+            class Factory:
+                def __init__(self, cls: object, callback: Callable[..., None]) -> None: ...
+
+            class Wrapped:
+                __new__ = Factory
+                def __init__(self, callback: Named) -> None: ...
+
+            class NewClosed:
+                def __new__(cls, callback: Named) -> NewClosed: ...
+
+            class NewOmitted:
+                def __new__(cls, callback: Callable[..., None]) -> NewOmitted: ...
+
+            class NewFactory:
+                def __new__(cls, outer: object, callback: Callable[..., None]) -> NewFactory: ...
+                def __init__(self, outer: object, callback: Named) -> None: ...
+
+            class NewWrapped:
+                __new__ = NewFactory
+
+            integer = int
+            numeric_range = range
+            string = str
+
             def closed(callback: Named) -> None: ...
             def omitted(callback: Callable[..., None]) -> None: ...
             values: list[Named] = []
@@ -10669,19 +10722,55 @@ mod tests {
             db,
             Signature::new(parameters.with_incomplete_shape(), Type::none(db, &env)),
         );
-        for (name, argument, expected) in [
-            ("closed", complete, true),
-            ("closed", incomplete, false),
-            ("omitted", incomplete, true),
-            ("append", complete, true),
-            ("append", incomplete, false),
+        for (name, argument, expected, return_type, single_entry) in [
+            ("closed", complete, true, Some("None"), true),
+            ("closed", incomplete, false, Some("None"), true),
+            ("omitted", incomplete, true, Some("None"), true),
+            ("append", complete, true, Some("None"), true),
+            ("append", incomplete, false, Some("None"), true),
+            ("Closed", complete, true, Some("Closed"), true),
+            ("Closed", incomplete, false, Some("Closed"), true),
+            ("Omitted", incomplete, true, Some("Omitted"), true),
+            ("TwoStages", incomplete, false, Some("TwoStages"), false),
+            ("Wrapped", incomplete, true, None, false),
+            ("NewClosed", complete, true, Some("NewClosed"), true),
+            ("NewClosed", incomplete, false, Some("NewClosed"), true),
+            ("NewOmitted", incomplete, true, Some("NewOmitted"), true),
+            ("NewWrapped", incomplete, false, None, false),
+            (
+                "integer",
+                KnownClass::Str.to_instance(db, &env),
+                true,
+                Some("int"),
+                true,
+            ),
+            (
+                "numeric_range",
+                KnownClass::Int.to_instance(db, &env),
+                true,
+                Some("range"),
+                true,
+            ),
+            (
+                "string",
+                KnownClass::Object.to_instance(db, &env),
+                true,
+                Some("str"),
+                true,
+            ),
         ] {
             let callable = global_symbol(db, file, name).place.expect_type();
             let arguments = CallArguments::positional([argument]);
             let constraints = ConstraintSetBuilder::new();
             let bindings = callable
                 .bindings(db, &env)
-                .match_parameters(db, &env, &arguments)
+                .match_parameters(db, &env, &arguments);
+            assert_eq!(
+                bindings.argument_correspondence_callable().is_some(),
+                single_entry,
+                "{name}",
+            );
+            let bindings = bindings
                 .check_types(
                     db,
                     &env,
@@ -10691,7 +10780,10 @@ mod tests {
                     &[],
                 )
                 .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
-            assert_eq!(bindings.return_type(db, &env), Type::none(db, &env));
+            let ordinary_return = bindings.return_type(db, &env);
+            if let Some(return_type) = return_type {
+                assert_eq!(ordinary_return.display(db, &env).to_string(), return_type);
+            }
             assert_eq!(
                 bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
                 expected,
@@ -10699,7 +10791,7 @@ mod tests {
                 argument.display(db, &env),
             );
             assert!(bindings.as_result(db).is_ok());
-            assert_eq!(bindings.return_type(db, &env), Type::none(db, &env));
+            assert_eq!(bindings.return_type(db, &env), ordinary_return);
         }
         Ok(())
     }

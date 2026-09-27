@@ -56,6 +56,9 @@ pub(super) struct ConstructorBinding<'db> {
     /// The next downstream constructor method, if any, to be (conditionally) checked after this
     /// one.
     pub(super) downstream_constructor: Option<Box<Bindings<'db>>>,
+    /// Whether constructing these bindings discarded a constructor stage before retaining its
+    /// argument requirements.
+    pub(super) has_omitted_stage: bool,
 }
 
 impl<'db> ConstructorBinding<'db> {
@@ -67,6 +70,7 @@ impl<'db> ConstructorBinding<'db> {
             entry,
             constructor_context,
             downstream_constructor: None,
+            has_omitted_stage: false,
         }
     }
 
@@ -347,10 +351,17 @@ impl<'db> ConstructorBinding<'db> {
         // TODO: Model the nested constructor chain if we want to support class objects assigned to
         // `__new__`. For now, map the callable itself and drop its downstream constructor checks
         // instead of panicking.
+        let Self {
+            entry,
+            constructor_context,
+            downstream_constructor,
+            has_omitted_stage,
+        } = self;
         ConstructorBinding {
-            entry: f(self.entry),
-            constructor_context: self.constructor_context,
+            entry: f(entry),
+            constructor_context,
             downstream_constructor: None,
+            has_omitted_stage: has_omitted_stage || downstream_constructor.is_some(),
         }
     }
 
