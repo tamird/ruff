@@ -212,6 +212,26 @@ named: Named = lambda *, value: (reveal_type(value), value.upper())[1]  # reveal
 wrong_keyword: Named = lambda *, other: "ok"
 ```
 
+## Callbacks in function defaults and decorators
+
+A default lambda's body uses the context from its function's default expressions. Decorator lambdas
+use the function definition's decorator expressions.
+
+```py
+from typing import Callable
+
+def accepted(callback: Callable[[int], int] = lambda value: value + 1): ...
+
+# error: [unsupported-operator]
+def rejected(callback: Callable[[int], int] = lambda value: value + "bad"): ...
+def observed(callback: Callable[[int], int] = lambda value: reveal_type(value)): ...  # revealed: int
+def decorate(callback: Callable[[int], int]) -> Callable[[Callable[[], None]], Callable[[], None]]:
+    return lambda function: function
+
+@decorate(lambda value: reveal_type(value))  # revealed: int
+def decorated() -> None: ...
+```
+
 ## Callback defaults
 
 An optional callback parameter includes the lambda's actual default in its body input. A callback
