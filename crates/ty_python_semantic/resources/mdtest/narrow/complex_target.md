@@ -286,6 +286,104 @@ def _(t9: tuple[int | None, str] | tuple[str, int]):
         reveal_type(t9)  # revealed: tuple[int | None, str] | tuple[str, int]
 ```
 
+### Unpacked Boolean tags
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+A truthiness test on stable local unpack targets preserves the relationship between a Boolean tag
+and its payload. Reassigning either target must not restore the original relationship.
+
+```py
+from typing import Literal
+
+def unpacked(item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], str]):
+    flag, payload = item
+    if flag:
+        reveal_type(payload)  # revealed: dict[str, int]
+    else:
+        reveal_type(payload)  # revealed: str
+
+type Tagged = tuple[Literal[True], dict[str, int]] | tuple[Literal[False], str]
+
+def aliased(item: Tagged):
+    flag, payload = item
+    if flag:
+        reveal_type(payload)  # revealed: dict[str, int]
+    else:
+        reveal_type(payload)  # revealed: str
+
+def replaced_source(item: Tagged):
+    flag, payload = item
+    item = (False, "replacement")
+    if flag:
+        reveal_type(payload)  # revealed: dict[str, int]
+    else:
+        reveal_type(payload)  # revealed: str
+
+def ambiguous(item: tuple[Literal[True], dict[str, int]] | tuple[bool, str]):
+    flag, payload = item
+    if flag:
+        reveal_type(payload)  # revealed: dict[str, int] | str
+    else:
+        reveal_type(payload)  # revealed: str
+
+def recovery(item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], str, int]):
+    flag, payload = item  # error: [invalid-assignment]
+    if flag:
+        reveal_type(payload)  # revealed: dict[str, int] | Unknown
+
+def replaced_flag(
+    item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], object],
+) -> dict[str, int]:
+    flag, payload = item
+    flag = True
+    if flag:
+        return payload  # error: [invalid-return-type]
+    return {}
+
+def replaced_payload(
+    item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], object],
+) -> dict[str, int]:
+    flag, payload = item
+    payload = object()
+    if flag:
+        return payload  # error: [invalid-return-type]
+    return {}
+
+def duplicate_targets(
+    item: tuple[Literal[True], Literal[False], dict[str, int]] | tuple[Literal[False], Literal[True], str],
+) -> dict[str, int]:
+    flag, flag, payload = item
+    if flag:
+        return payload  # error: [invalid-return-type]
+    return {}
+
+def loop_write(
+    item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], object],
+) -> dict[str, int]:
+    flag, payload = item
+    for index in range(2):
+        if index and flag:
+            return payload  # error: [invalid-return-type]
+        payload = object()
+    return {}
+
+def nested_write(
+    item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], object],
+) -> dict[str, int]:
+    flag, payload = item
+    def replace():
+        nonlocal payload
+        payload = object()
+    replace()
+    if flag:
+        return payload  # error: [invalid-return-type]
+    return {}
+```
+
 ### Tagged unions of tuples (equality narrowing)
 
 Narrow unions of tuples based on literal tag elements using `==` comparison:

@@ -36,6 +36,11 @@ pub(crate) struct Unpacker<'db, 'ast> {
     targets: FxHashMap<ExpressionNodeKey, Type<'db>>,
 }
 
+pub(super) enum UnpackFilterError {
+    Unsupported,
+    Provisional,
+}
+
 /// Records an `Unknown` type for every expression in a malformed unpack target subtree.
 struct UnknownTargetCollector<'db, 'map> {
     targets: &'map mut FxHashMap<ExpressionNodeKey, Type<'db>>,
@@ -79,7 +84,6 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
 
     /// Unpack the value to the target expression.
     pub(crate) fn unpack(&mut self, target: &ast::Expr, value: UnpackValue<'db>) {
-        let db = self.db();
         debug_assert_matches!(
             target,
             ast::Expr::List(_) | ast::Expr::Tuple(_),
@@ -91,6 +95,34 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             value.expression(),
             TypeContext::default(),
         );
+        let result = self.unpack_inferred(target, value, value_inference, None);
+        debug_assert!(result.is_ok());
+    }
+
+    /// Project the original unpacking after a constraint rules out some matched rows.
+    /// Only complete, fixed-size rows can contribute to this additional narrowing.
+    pub(super) fn unpack_filtered(
+        mut self,
+        target: &ast::Expr,
+        value: UnpackValue<'db>,
+        value_inference: &ExpressionInference<'db>,
+        tested_index: usize,
+        keep: &dyn Fn(Type<'db>) -> bool,
+    ) -> Result<UnpackResult<'db>, UnpackFilterError> {
+        let result =
+            self.unpack_inferred(target, value, value_inference, Some((tested_index, keep)));
+        let unpacked = self.finish();
+        result.map(|()| unpacked)
+    }
+
+    fn unpack_inferred(
+        &mut self,
+        target: &ast::Expr,
+        value: UnpackValue<'db>,
+        value_inference: &ExpressionInference<'db>,
+        filter: Option<(usize, &dyn Fn(Type<'db>) -> bool)>,
+    ) -> Result<(), UnpackFilterError> {
+        let db = self.db();
         let value_expr = value.expression().node_ref(self.db()).node(self.module());
 
         let value_type = value_inference.expression_type(value_expr);
@@ -153,7 +185,8 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                 promote_literals: false,
             },
             value_inference,
-        );
+            filter,
+        )
     }
 
     /// Records `Unknown` for a malformed unpack target and all of its descendant expressions.
@@ -189,17 +222,17 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
         value_expr: AnyNodeRef<'_>,
         value: UnpackElement<'db, 'ast>,
         value_inference: &ExpressionInference<'db>,
-    ) {
+        filter: Option<(usize, &dyn Fn(Type<'db>) -> bool)>,
+    ) -> Result<(), UnpackFilterError> {
         let db = self.db();
         let env = self.context.program_environment();
         let targets = match target {
             ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Subscript(_) => {
                 self.targets.insert(target.into(), value.ty);
-                return;
+                return Ok(());
             }
             ast::Expr::Starred(starred) => {
-                self.unpack_inner(&starred.value, value_expr, value, value_inference);
-                return;
+                return self.unpack_inner(&starred.value, value_expr, value, value_inference, None);
             }
             ast::Expr::List(ast::ExprList { elts, .. })
             | ast::Expr::Tuple(ast::ExprTuple { elts, .. }) => elts,
@@ -208,7 +241,11 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                 // malformed targets. Give the whole subtree an unknown type so later lookups
                 // don't panic.
                 self.record_unknown_target_subtree(target);
-                return;
+                return if filter.is_none() {
+                    Ok(())
+                } else {
+                    Err(UnpackFilterError::Unsupported)
+                };
             }
         };
         let target_len = target_length(targets);
@@ -241,6 +278,7 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             )
         });
 
+        let mut complete = true;
         let sequences = if let Some(literal) = literal {
             vec![literal]
         } else {
@@ -258,6 +296,7 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                 .iter()
                 .map(|ty| {
                     let tuple = ty.try_iterate(db, env).unwrap_or_else(|err| {
+                        complete = false;
                         err.report_diagnostic(&self.context, *ty, value_expr);
                         Cow::Owned(TupleSpec::homogeneous(err.fallback_element_type(db, env)))
                     });
@@ -265,6 +304,30 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                 })
                 .collect()
         };
+        if filter.is_some() {
+            let is_provisional = |element: UnpackElement<'db, 'ast>| {
+                super::visitor::any_over_type_expanding_aliases(db, env, element.ty, |ty| {
+                    matches!(ty, Type::Divergent(_))
+                        || ty
+                            .as_dynamic()
+                            .is_some_and(super::DynamicType::is_provisional_marker)
+                })
+            };
+            if sequences.iter().any(|sequence| {
+                sequence.fixed_elements().copied().any(is_provisional)
+                    || match sequence {
+                        Tuple::Fixed(_) => false,
+                        Tuple::Variable(tuple) => {
+                            tuple.variable_ref().iter().copied().any(is_provisional)
+                        }
+                    }
+            }) {
+                return Err(UnpackFilterError::Provisional);
+            }
+            if !complete {
+                return Err(UnpackFilterError::Unsupported);
+            }
+        }
 
         let mut inferred_targets: Vec<_> = targets
             .iter()
@@ -277,6 +340,9 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             })
             .collect();
         for sequence in sequences {
+            if filter.is_some() && sequence.is_variadic() {
+                return Err(UnpackFilterError::Unsupported);
+            }
             let matched = sequence.unpack(target_len, Clone::clone, |elements| {
                 UnpackElement::from_type(UnionType::from_elements_leave_aliases(
                     db,
@@ -286,6 +352,14 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             });
             match matched {
                 Ok(matched) => {
+                    if let Some((tested_index, keep)) = filter {
+                        let Some(tested) = matched.fixed_elements().nth(tested_index) else {
+                            return Err(UnpackFilterError::Unsupported);
+                        };
+                        if !keep(tested.ty) {
+                            continue;
+                        }
+                    }
                     for ((inferred, expression, promote_literals), element) in inferred_targets
                         .iter_mut()
                         .zip(matched.into_all_elements_with_kind())
@@ -310,6 +384,9 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                     }
                 }
                 Err(err) => {
+                    if filter.is_some() {
+                        return Err(UnpackFilterError::Unsupported);
+                    }
                     // A length mismatch has no valid correspondence, e.g. `a, *b, c = [1]`.
                     // Recover every target at this level, without discarding sibling literals
                     // handled by the enclosing recursive call.
@@ -356,8 +433,10 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                     promote_literals,
                 },
                 value_inference,
-            );
+                None,
+            )?;
         }
+        Ok(())
     }
 
     pub(crate) fn finish(self) -> UnpackResult<'db> {

@@ -1217,6 +1217,10 @@ impl<T, V> VariableLengthTuple<T, V> {
         self.variable_segment
     }
 
+    pub(super) fn variable_ref(&self) -> &V {
+        &self.variable_segment
+    }
+
     pub(crate) fn prefix_elements(&self) -> &[T] {
         &self.fixed_elements[..self.prefix_len]
     }
