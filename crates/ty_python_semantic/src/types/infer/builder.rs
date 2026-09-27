@@ -5895,7 +5895,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     argument_types,
                 );
 
-                let single_argument_context = bindings.is_single();
+                let single_argument_context = bindings.argument_correspondence_callable().is_some();
                 if let Err(call_error) = self.infer_and_check_argument_types(
                     ast_arguments,
                     &[],
@@ -10053,8 +10053,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             call_expression_tcx
         };
 
-        // Intersections can discard contextual child statuses before pruning to one binding.
-        let single_argument_context = bindings.is_single();
+        // Intersections and constructor stages can discard contextual child statuses before
+        // pruning to one binding.
+        let single_argument_context = bindings.argument_correspondence_callable().is_some();
         let bindings_result = self.infer_and_check_argument_types(
             ArgumentsIter::from_ast(arguments),
             &collection_argument_indices,
