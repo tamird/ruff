@@ -898,9 +898,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 self.program_file(),
                 &param_with_default.parameter,
                 param_with_default.annotation(),
-            )
-            .map(|annotation| annotation.inferred_type(db, definition));
-            self.infer_expression(default, TypeContext::new(annotation));
+            );
+            let annotated_ty = annotation
+                .as_ref()
+                .map(|annotation| annotation.inferred_type(db, definition));
+            let actual = self.infer_expression(default, TypeContext::new(annotated_ty));
+            if let Some(annotation) = annotation
+                && !matches!(
+                    annotation,
+                    SourceAnnotation::External {
+                        annotation: _,
+                        purpose: _,
+                        range: _
+                    }
+                )
+                && let Some(expected) = annotated_ty
+                && self.expression_has_unproved_requirement(default, actual, expected)
+            {
+                self.context.record_unproved_requirement(default);
+            }
         }
 
         self.deferred_state = previous_deferred_state;
@@ -1193,10 +1209,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Set initial declared type (if annotated) and inferred type for a function-parameter symbol,
     /// in the function body scope.
     ///
-    /// The declared type is the annotated type, if any, or `Unknown`.
+    /// The declared type is the annotated type, if any, or `Unknown`. An external interface
+    /// describes supplied arguments, so its implementation entry type also includes the default.
     ///
-    /// The inferred type is the annotated type, if any. If there is no annotation, it is the union
-    /// of `Unknown` and the type of the default value, if any.
+    /// The inferred type follows the declared entry type. If there is no annotation, it is the
+    /// union of `Unknown` and the type of the default value, if any.
     ///
     /// Parameter definitions are odd in that they define a symbol in the function-body scope, so
     /// the Definition belongs to the function body scope, but the expressions (annotation and
@@ -1247,35 +1264,47 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             }
 
+            let mut entry_ty = declared_ty;
             if let Some(default_expr) = default_expr {
                 let default_expr = default_expr.as_ref();
                 let default_ty = self.file_expression_type(default_expr);
 
-                // Avoid duplicate diagnostics: invalid TypedDict literals already emit specific errors.
-                let suppress_invalid_default =
-                    is_invalid_typed_dict_literal(db, env, declared_ty, default_expr.into());
-                if !default_ty.is_assignable_to(db, env, declared_ty)
-                    && !suppress_invalid_default
-                    && !((self.in_stub()
-                        || self.in_function_overload_or_abstractmethod()
-                        || self.is_in_type_checking_block(self.scope(), default_expr)
-                        || self
-                            .class_context_of_current_method()
-                            .is_some_and(|class| class.is_protocol(db)))
-                        && default
-                            .as_ref()
-                            .is_some_and(|d| d.is_ellipsis_literal_expr()))
-                {
-                    if let Some(builder) = self
-                        .context
-                        .report_lint(&INVALID_PARAMETER_DEFAULT, parameter_with_default)
+                if matches!(
+                    annotation,
+                    SourceAnnotation::External {
+                        annotation: _,
+                        purpose: _,
+                        range: _
+                    }
+                ) {
+                    entry_ty = UnionType::from_two_elements(db, env, declared_ty, default_ty);
+                } else {
+                    // Avoid duplicate diagnostics: invalid TypedDict literals already emit specific errors.
+                    let suppress_invalid_default =
+                        is_invalid_typed_dict_literal(db, env, declared_ty, default_expr.into());
+                    if !default_ty.is_assignable_to(db, env, declared_ty)
+                        && !suppress_invalid_default
+                        && !((self.in_stub()
+                            || self.in_function_overload_or_abstractmethod()
+                            || self.is_in_type_checking_block(self.scope(), default_expr)
+                            || self
+                                .class_context_of_current_method()
+                                .is_some_and(|class| class.is_protocol(db)))
+                            && default
+                                .as_ref()
+                                .is_some_and(|d| d.is_ellipsis_literal_expr()))
                     {
-                        builder.into_diagnostic(format_args!(
-                            "Default value of type `{}` is not assignable \
-                             to annotated parameter type `{}`",
-                            default_ty.display(db, env),
-                            declared_ty.display(db, env)
-                        ));
+                        if let Some(builder) = self
+                            .context
+                            .report_lint(&INVALID_PARAMETER_DEFAULT, parameter_with_default)
+                        {
+                            builder.into_diagnostic(format_args!(
+                                "Default value of type `{}` is not assignable \
+                                 to annotated parameter type `{}`",
+                                default_ty.display(db, env),
+                                declared_ty.display(db, env)
+                            ));
+                        }
                     }
                 }
             }
@@ -1283,7 +1312,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.add_declaration_with_binding(
                 parameter.into(),
                 definition,
-                &DeclaredAndInferredType::are_the_same_type(declared_ty),
+                &DeclaredAndInferredType::are_the_same_type(entry_ty),
             );
         } else {
             let ty = if let Some(default_expr) = default_expr {

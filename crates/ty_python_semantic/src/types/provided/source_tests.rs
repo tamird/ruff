@@ -274,7 +274,7 @@ fourth = native('ok')
             "invalid-return-type",
             "invalid-return-type",
             "unresolved-attribute",
-            "invalid-parameter-default",
+            "invalid-return-type",
             "invalid-parameter-default"
         ],
         "{diagnostics:#?}"
@@ -527,7 +527,7 @@ def provided_wrong():
 #[test]
 fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
-        .with_file("/src/main.py", "Scalar = int\ndef helper():\n    return 1\ndef compute(value=1):\n    value = 1\n    return 1\ndef implicit(value):\n    print(value)\ndef native(value: int) -> int:\n    return value\n")
+        .with_file("/src/main.py", "Scalar = int\ndef helper():\n    return 1\ndef compute(value=1):\n    value = 2\n    return 1\ndef implicit(value):\n    print(value)\ndef native(value: int) -> int:\n    return value\n")
         .with_file("/src/contracts.pyi", "")
         .with_source_provider(ExternalSource::Annotation)
         .build()?;
@@ -538,7 +538,6 @@ fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Re
             "str",
             vec![
                 "invalid-assignment",
-                "invalid-parameter-default",
                 "invalid-return-type",
                 "invalid-return-type",
             ],
@@ -548,7 +547,6 @@ fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Re
             "str",
             vec![
                 "invalid-assignment",
-                "invalid-parameter-default",
                 "invalid-return-type",
                 "invalid-return-type",
             ],
