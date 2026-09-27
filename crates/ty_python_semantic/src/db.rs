@@ -17,10 +17,11 @@ pub enum FunctionInferenceMode {
     #[default]
     Default,
     /// Ordinary inference with retained return-type correspondence facts and unresolved
-    /// requirements from explicit calls and indexed writes. These checks use the ordinary
-    /// selected binding or field without changing inference or branch selection. Unsupported
-    /// binding and contextual replay cases remain unproved. Function and file facts expose
-    /// this status independently of diagnostic rule selection and source suppressions.
+    /// requirements from explicit calls, indexed writes and contextual collection elements.
+    /// These checks use the ordinary selected binding, field or element type without changing
+    /// inference or branch selection. Unsupported binding, merged field and contextual replay
+    /// cases remain unproved. Function and file facts expose this status independently of
+    /// diagnostic rule selection and source suppressions.
     OutputProof,
     /// Upper-bound materialization of initial named-function parameter bindings and explicit
     /// runtime module-global reads. Named parameter declarations, signatures and default checks

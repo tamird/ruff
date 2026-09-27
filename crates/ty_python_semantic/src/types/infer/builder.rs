@@ -7688,6 +7688,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     // Successfully narrowed to a subset of typed dicts.
                     if !narrowed_tys.is_empty() {
+                        // Candidate inference retains narrowed types without committing the
+                        // contextual child requirements from its suppressed inference.
+                        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+                        {
+                            self.context.record_unproved_requirement(dict);
+                        }
                         return UnionType::from_elements(db, env, narrowed_tys);
                     }
                 }
@@ -7775,6 +7781,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             infer_elt_expression,
             tcx,
         )
+    }
+
+    /// Check an adopted element type in its execution scope. Comprehension specialization
+    /// can run in the parent scope even when the element itself is unreachable in the child.
+    fn literal_element_has_unproved_requirement(
+        &self,
+        element: &ast::Expr,
+        actual: Type<'db>,
+        expected: Type<'db>,
+    ) -> bool {
+        if self.function_inference_mode != crate::FunctionInferenceMode::OutputProof {
+            return false;
+        }
+        let db = self.db();
+        let env = self.program_environment();
+        if expected.is_fully_static_except_any(db, env)
+            && !actual.has_provisional_marker(db, env)
+            && actual.satisfies_declared_output(db, env, expected)
+        {
+            return false;
+        }
+        let scope = self
+            .index
+            .try_expression_scope_id(&ast::ExprRef::from(element))
+            .unwrap_or_else(|| self.scope().file_scope_id(db));
+        crate::reachability::is_range_reachable(db, self.index, scope, element.range())
     }
 
     // Infer the type of a collection literal expression.
@@ -8002,6 +8034,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // does not recursively re-infer nested collection literals on the slow path.
             let mut inferred_elts = Vec::with_capacity(elts.len());
             let mut compatible = true;
+            let mut unproved_element = None;
 
             for elts in elts {
                 let mut inferred_elt_tys = [None; N];
@@ -8019,6 +8052,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     if !inferred_elt_ty.is_assignable_to(db, env, elt_tcx) {
                         compatible = false;
+                    } else if unproved_element.is_none()
+                        && self.literal_element_has_unproved_requirement(
+                            elt,
+                            inferred_elt_ty,
+                            elt_tcx,
+                        )
+                    {
+                        unproved_element = Some(elt.range());
                     }
                 }
                 inferred_elts.push(inferred_elt_tys);
@@ -8032,11 +8073,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             .specialize_recursive(db, specialization.into_iter().map(Some))
                     },
                 );
-                return Type::from(class_type).to_instance_approximation(db, env);
+                let result = Type::from(class_type).to_instance_approximation(db, env)?;
+                if let Some(element) = unproved_element {
+                    self.context.record_unproved_requirement(element);
+                }
+                return Some(result);
             }
 
             pre_inferred_elt_tys = Some(inferred_elts);
         }
+
+        // Publish requirements only after this contextual specialization is adopted.
+        let mut unproved_element = None;
 
         // Create a set of constraints to infer a precise type for `T`.
         let mut tuple_size_promotion_constraints = TupleSizePromotionConstraints::default();
@@ -8209,6 +8257,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     elt_tcx.filter(|_| !elt_tcx_variance[&elt_ty_identity].is_covariant())
                     && inferred_elt_ty.is_assignable_to(db, env, elt_tcx)
                 {
+                    if unproved_element.is_none()
+                        && self.literal_element_has_unproved_requirement(
+                            elt,
+                            inferred_elt_ty,
+                            elt_tcx,
+                        )
+                    {
+                        unproved_element = Some(elt.range());
+                    }
                     continue;
                 }
 
@@ -8266,7 +8323,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 })
             });
 
-        Type::from(class_type).to_instance_approximation(db, env)
+        let result = Type::from(class_type).to_instance_approximation(db, env)?;
+        if let Some(element) = unproved_element {
+            self.context.record_unproved_requirement(element);
+        }
+        Some(result)
     }
 
     /// Infer the type of the `iter` expression of the first comprehension.
@@ -13869,60 +13930,79 @@ mod tests {
 
     #[test]
     fn literal_cache_separates_structural_contracts() -> anyhow::Result<()> {
-        let db = TestDbBuilder::new()
-            .with_file("/src/main.py", "{'value': 1, 'hidden': []}\n")
-            .with_file(
-                "/src/contracts.pyi",
-                "from typing import TypedDict\nclass Row(TypedDict):\n    value: int\nshape: Row\n",
-            )
-            .build()?;
-        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
-        let annotation = ProvidedBindingValue::Export {
-            file: db.program_file(system_path_to_file(&db, "/src/contracts.pyi")?),
-            name: Name::new_static("shape"),
-        }
-        .resolve_type(&db)
-        .expect("declared Row contract");
-        let module = parsed_module(&db, file.python_file(&db)).load(&db);
-        let [statement] = module.suite().as_slice() else {
-            panic!("expected one statement");
-        };
-        let ast::Stmt::Expr(statement) = statement else {
-            panic!("expected an expression statement");
-        };
-        let env = ProgramEnvironment::from_file(file);
-        let mut builder = TypeInferenceBuilder::new(
-            &db,
-            &env,
-            InferenceRegion::Scope(global_scope(&db, file), TypeContext::default()),
-            file.file(&db),
-            file,
-            semantic_index(&db, file),
-            &module,
-        );
-        builder.context.defuse();
-        assert!(builder.setup_expression_cache());
-        for structural in [true, false, true, false] {
-            let tcx = if structural {
-                TypeContext::for_value_contract(annotation)
-            } else {
-                TypeContext::new(Some(annotation))
-            };
-            let mut attempt = builder.speculate();
-            let inferred = attempt.infer_expression(&statement.value, tcx);
-            let diagnostics = attempt
-                .into_expression_cache_entry()
-                .diagnostics
-                .into_diagnostics();
-            assert_eq!(inferred == annotation, structural);
-            assert_eq!(diagnostics.is_empty(), structural, "{diagnostics:#?}");
-            if !structural {
-                assert!(
-                    diagnostics
-                        .iter()
-                        .any(|diagnostic| diagnostic.id().as_str() == "invalid-key"),
-                    "{diagnostics:#?}"
+        for (value, field_type, unproved) in [
+            ("1", "int", false),
+            ("opaque", "Callable[[Any], None]", true),
+            ("opaque", "Callable[..., None]", false),
+        ] {
+            let mut db = TestDbBuilder::new()
+                .with_file(
+                    "/src/main.py",
+                    &format!("from contracts import opaque\n{{'value': {value}, 'hidden': []}}\n"),
+                )
+                .with_file(
+                    "/src/contracts.pyi",
+                    &format!("from typing import Any, Callable, TypedDict\ndef opaque(value: str) -> None: ...\nclass Row(TypedDict):\n    value: {field_type}\nshape: Row\n"),
+                )
+                .build()?;
+            let source = system_path_to_file(&db, "/src/main.py")?;
+            for mode in [
+                crate::FunctionInferenceMode::Default,
+                crate::FunctionInferenceMode::OutputProof,
+            ] {
+                db.select_function_inference(Some((source, vec!["<module>".to_owned()], mode)));
+                let file = db.program_file(source);
+                let annotation = ProvidedBindingValue::Export {
+                    file: db.program_file(system_path_to_file(&db, "/src/contracts.pyi")?),
+                    name: Name::new_static("shape"),
+                }
+                .resolve_type(&db)
+                .expect("declared Row contract");
+                let module = parsed_module(&db, file.python_file(&db)).load(&db);
+                let [_, statement] = module.suite().as_slice() else {
+                    panic!("expected import and expression statements");
+                };
+                let ast::Stmt::Expr(statement) = statement else {
+                    panic!("expected an expression statement");
+                };
+                let env = ProgramEnvironment::from_file(file);
+                let mut builder = TypeInferenceBuilder::new(
+                    &db,
+                    &env,
+                    InferenceRegion::Scope(global_scope(&db, file), TypeContext::default()),
+                    source,
+                    file,
+                    semantic_index(&db, file),
+                    &module,
                 );
+                builder.context.defuse();
+                assert!(builder.setup_expression_cache());
+                for structural in [true, false, true, false] {
+                    let tcx = if structural {
+                        TypeContext::for_value_contract(annotation)
+                    } else {
+                        TypeContext::new(Some(annotation))
+                    };
+                    let mut attempt = builder.speculate();
+                    let inferred = attempt.infer_expression(&statement.value, tcx);
+                    let diagnostics = attempt.into_expression_cache_entry().diagnostics;
+                    assert_eq!(
+                        diagnostics.has_unproved_requirements(),
+                        mode == crate::FunctionInferenceMode::OutputProof && structural && unproved,
+                        "{field_type}, structural={structural}, mode={mode:?}",
+                    );
+                    let diagnostics = diagnostics.into_diagnostics();
+                    assert_eq!(inferred == annotation, structural);
+                    assert_eq!(diagnostics.is_empty(), structural, "{diagnostics:#?}");
+                    if !structural {
+                        assert!(
+                            diagnostics
+                                .iter()
+                                .any(|diagnostic| diagnostic.id().as_str() == "invalid-key"),
+                            "{diagnostics:#?}"
+                        );
+                    }
+                }
             }
         }
         Ok(())
