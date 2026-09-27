@@ -48,7 +48,8 @@ use crate::place_load::{
     PlaceLoadResolutionStep, PlaceLoadSource, PlaceLoadSourceKind, resolve_place_load,
 };
 use crate::reachability::{
-    ReachabilityEvaluationCache, analyze_condition_expression, evaluate_reachability_with_cache,
+    BooleanIdentity, ReachabilityEvaluationCache, analyze_condition_expression,
+    evaluate_reachability_with_cache,
 };
 use crate::types::abstract_methods::AbstractMethods;
 use crate::types::add_inferred_python_version_hint_to_diagnostic;
@@ -7656,17 +7657,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 return None;
             };
             let symbol = places.symbol_id(&name.id)?;
-            if !places.symbol(symbol).is_local()
-                || use_def.reachable_symbol_bindings(symbol).any(|binding| {
-                    binding.binding.definition().is_some_and(|definition| {
-                        matches!(
-                            definition.kind(db),
-                            DefinitionKind::LoopHeader(_) | DefinitionKind::NestedBindings(_)
-                        )
-                    })
-                })
-            {
+            if !places.symbol(symbol).is_local() {
                 return None;
+            }
+            let mut has_loop_history = false;
+            for binding in use_def.reachable_symbol_bindings(symbol) {
+                let Some(definition) = binding.binding.definition() else {
+                    continue;
+                };
+                match definition.kind(db) {
+                    DefinitionKind::LoopHeader(_) => has_loop_history = true,
+                    DefinitionKind::NestedBindings(_) => return None,
+                    _ => {}
+                }
             }
             let ordinary = self.expression_type(element);
             if is_provisional(ordinary) {
@@ -7676,8 +7679,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let bindings = use_def.bindings_at_use(use_id);
             let mut sole_definition = None;
             let mut has_multiple = false;
+            let mut has_current_header = false;
             for binding in bindings {
                 let definition = binding.binding.definition()?;
+                has_current_header |= matches!(definition.kind(db), DefinitionKind::LoopHeader(_));
                 if infer_definition_types(db, definition).is_provisional() {
                     return None;
                 }
@@ -7686,22 +7691,37 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
                 sole_definition = Some(definition);
             }
-            if tag.is_none() && !has_multiple && ordinary.resolve_type_alias(db).is_bool(db) {
-                tag = Some((position, sole_definition?));
+            if tag.is_none() && ordinary.resolve_type_alias(db).is_bool(db) {
+                let stable_definition = if !has_multiple && !has_loop_history {
+                    sole_definition
+                } else {
+                    None
+                };
+                tag = BooleanIdentity::at_use(db, scope, name, stable_definition)
+                    .map(|identity| (position, identity));
             }
-            names.push((use_id, ordinary));
+            names.push((use_id, ordinary, has_current_header));
         }
-        let (tag_index, definition) = tag?;
+        let (tag_index, identity) = tag?;
+        // Project only current-iteration payload bindings. Header inference summarizes other
+        // iterations and must not receive the tag value captured by this tuple.
+        if names
+            .iter()
+            .enumerate()
+            .any(|(position, &(_, _, has_header))| position != tag_index && has_header)
+        {
+            return None;
+        }
         let mut refined_payload = false;
         let mut rows = UnionBuilder::new(db, env);
         for value in [true, false] {
             let mut row = Vec::with_capacity(elements.len());
-            for (position, &(use_id, ordinary)) in names.iter().enumerate() {
+            for (position, &(use_id, ordinary, _)) in names.iter().enumerate() {
                 let place = place_from_bindings_assuming_boolean(
                     db,
                     env,
                     use_def.bindings_at_use(use_id),
-                    definition,
+                    identity,
                     value,
                 )
                 .place;

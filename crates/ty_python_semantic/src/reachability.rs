@@ -213,13 +213,14 @@ use ruff_db::parsed::parsed_module;
 use ruff_index::{Idx, IndexSlice};
 use ruff_python_ast as ast;
 use ruff_python_ast::name::Name;
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use ty_python_core::{
     BindingWithConstraints, DeclarationWithConstraint, DeclarationsIterator, EvaluationMode,
     FileScopeId, NarrowingEvaluator, PredicateNarrowingTargets, ScopedDefinitionId, SemanticIndex,
     Truthiness, UseDefMap,
+    ast_ids::HasScopedUseId,
     definition::{BindingsOwner, Definition, DefinitionKind, DefinitionState},
     expression::Expression,
     narrowing_constraints::{NarrowingConstraints, ScopedNarrowingConstraint},
@@ -2149,22 +2150,137 @@ pub(crate) fn evaluate_reachability(
         .evaluate(db, use_def.predicates(), reachability)
 }
 
-/// Project a path under one stable Boolean value without reusing ordinary checkpoints.
+/// A Boolean identity used only while projecting the bindings of one tuple expression.
+#[derive(Clone, Copy)]
+pub(crate) struct BooleanIdentity<'ast, 'db> {
+    scope: ScopeId<'db>,
+    name: &'ast ast::ExprName,
+    loop_body: Option<TextRange>,
+    stable_definition: Option<Definition<'db>>,
+}
+
+impl<'ast, 'db> BooleanIdentity<'ast, 'db> {
+    /// Admit a passive local read without identifying values across loop backedges.
+    /// The caller checks its committed Boolean type and all current binding results. An optional
+    /// stable definition retains the earlier proof for a sole binding with no loop or captured writes.
+    pub(crate) fn at_use(
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        name: &'ast ast::ExprName,
+        stable_definition: Option<Definition<'db>>,
+    ) -> Option<Self> {
+        let mut loop_body: Option<TextRange> = None;
+        if stable_definition.is_none() {
+            let places = place_table(db, scope);
+            let symbol = places.symbol_id(&name.id)?;
+            let use_def = use_def_map(db, scope);
+            let module = parsed_module(db, scope.python_file(db)).load(db);
+            // This history retains even headers shadowed at the current use. Every loop that can
+            // write the tag must contain both reads in its body, excluding its iterator and else suite.
+            for binding in use_def.reachable_symbol_bindings(symbol) {
+                let Some(definition) = binding.binding.definition() else {
+                    continue;
+                };
+                match definition.kind(db) {
+                    DefinitionKind::LoopHeader(header) => {
+                        let body = &header.for_stmt(&module)?.body;
+                        let range = TextRange::new(body.first()?.start(), body.last()?.end());
+                        if !range.contains_range(name.range()) {
+                            return None;
+                        }
+                        loop_body = Some(match loop_body {
+                            Some(previous) => previous.intersect(range)?,
+                            None => range,
+                        });
+                    }
+                    DefinitionKind::NestedBindings(_) => return None,
+                    _ => {}
+                }
+            }
+        }
+        Some(Self {
+            scope,
+            name,
+            loop_body,
+            stable_definition,
+        })
+    }
+}
+
+/// Project a path under one Boolean value without reusing ordinary checkpoints.
 pub(crate) fn evaluate_reachability_assuming_boolean<'db>(
     db: &'db dyn Db,
     constraints: &ReachabilityConstraints,
     predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
     reachability: ScopedReachabilityConstraintId,
-    definition: Definition<'db>,
+    identity: BooleanIdentity<'_, 'db>,
     value: bool,
 ) -> Truthiness {
-    let scope = definition.scope(db);
+    let BooleanIdentity {
+        scope,
+        name,
+        loop_body,
+        stable_definition,
+    } = identity;
     let env = ProgramEnvironment::from_scope(scope);
     let use_def = use_def_map(db, scope);
     constraints.project(reachability, |atom| {
+        let predicate = &predicates[atom];
+        let expression = match predicate.node {
+            PredicateNode::Expression(expression) => Some(expression),
+            PredicateNode::Condition(expression) => Some(expression),
+            _ => None,
+        };
+        if let Some(expression) = expression
+            && expression.scope(db) == scope
+        {
+            let module = parsed_module(db, expression.python_file(db)).load(db);
+            let current_use = name.scoped_use_id(db, scope.program_file(db));
+            let truthiness =
+                analyze_condition_expression(expression.node_ref(db).node(&module), &|leaf| {
+                    let ast::Expr::Name(guard) = leaf else {
+                        return Some(Truthiness::Ambiguous);
+                    };
+                    if guard.id != name.id
+                        || guard.end() > name.start()
+                        || loop_body.is_some_and(|body| !body.contains_range(guard.range()))
+                    {
+                        return Some(Truthiness::Ambiguous);
+                    }
+                    let guard_use = guard.scoped_use_id(db, scope.program_file(db));
+                    let record = |BindingWithConstraints {
+                                      binding,
+                                      binding_order,
+                                      narrowing_constraint,
+                                      reachability_constraint,
+                                  }| {
+                        (
+                            binding,
+                            binding_order,
+                            narrowing_constraint.constraint(),
+                            reachability_constraint,
+                        )
+                    };
+                    // Equality is useful only within the region above: the same static records
+                    // may otherwise denote values produced by different loop iterations.
+                    let same_value = use_def
+                        .bindings_at_use(current_use)
+                        .map(record)
+                        .eq(use_def.bindings_at_use(guard_use).map(record));
+                    Some(if same_value {
+                        Truthiness::from(value)
+                    } else {
+                        Truthiness::Ambiguous
+                    })
+                })
+                .unwrap_or(Truthiness::Ambiguous);
+            if !truthiness.is_ambiguous() {
+                return ReachabilityAtom::Known(truthiness.negate_if(!predicate.is_positive));
+            }
+        }
         match analyze_reachability_atom(db, &env, use_def, predicates, atom) {
             ReachabilityAtom::Symbolic { key, is_positive } => {
-                if key == definition {
+                if stable_definition == Some(key) {
                     ReachabilityAtom::Known(Truthiness::from(value == is_positive))
                 } else {
                     ReachabilityAtom::Symbolic { key, is_positive }
