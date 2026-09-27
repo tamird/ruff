@@ -716,7 +716,7 @@ pub(crate) struct UnsupportedComparisonError<'db> {
     pub(crate) right_ty: Type<'db>,
 }
 
-/// Keep membership input evidence with the result chosen by comparison dispatch.
+/// Keep input evidence with the result chosen by comparison dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ComparisonResult<'db> {
     pub(super) ty: Type<'db>,
@@ -932,12 +932,43 @@ fn infer_binary_type_comparison_inner<'db>(
         _ => Truthiness::Ambiguous,
     };
     if comparison_truthiness != Truthiness::Ambiguous {
+        let is_intrinsic = |ty: Type<'db>| {
+            ty.is_none(db) || crate::types::equality::is_builtin_literal_type(db, ty)
+        };
+        let inputs_proved = if is_intrinsic(left) && is_intrinsic(right) {
+            true
+        } else if db.function_inference_mode(context.scope())
+            == crate::FunctionInferenceMode::OutputProof
+        {
+            // Input correspondence alone does not justify a pragmatic literal result. Prove
+            // that result only when conservative equality agrees and the selected calls prove
+            // every input, including descriptor requirements.
+            let conservative_truthiness = match op {
+                NonIdentityOperator::Rich(RichCompareOperator::Eq) => equality_truthiness(
+                    db,
+                    env,
+                    left,
+                    right,
+                    ComparisonSoundnessPolicy::CONSERVATIVE,
+                ),
+                NonIdentityOperator::Rich(RichCompareOperator::Ne) => inequality_truthiness(
+                    db,
+                    env,
+                    left,
+                    right,
+                    ComparisonSoundnessPolicy::CONSERVATIVE,
+                ),
+                _ => Truthiness::Ambiguous,
+            };
+            conservative_truthiness == comparison_truthiness
+                && try_dunder(MemberLookupPolicy::default())
+                    .is_ok_and(|result| result.inputs_proved)
+        } else {
+            false
+        };
         return Ok(ComparisonResult {
             ty: Type::from_truthiness(db, env, comparison_truthiness),
-            // Ordinary equality also makes pragmatic assumptions about overridable methods.
-            // Only exact builtin values establish intrinsic input semantics here.
-            inputs_proved: crate::types::equality::is_builtin_literal_type(db, left)
-                && crate::types::equality::is_builtin_literal_type(db, right),
+            inputs_proved,
         });
     }
 

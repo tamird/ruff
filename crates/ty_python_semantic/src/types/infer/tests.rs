@@ -2866,7 +2866,8 @@ fn rich_comparison_argument_correspondence() -> anyhow::Result<()> {
         "/src/main.py",
         r#"
         from __future__ import annotations
-        from typing import Any, Callable
+        from enum import Enum
+        from typing import Any, Callable, Literal, final, overload
         from ty_extensions import Intersection
 
         type Named = Callable[[str], None]
@@ -2895,6 +2896,25 @@ fn rich_comparison_argument_correspondence() -> anyhow::Result<()> {
         class FailedChild(Base):
             def __gt__(self, other: str) -> bool: return True
 
+        @final
+        class FinalInt(int): pass
+        class CallableEnum(Enum):
+            A = 1
+            def __call__(self, value: str) -> None: pass
+            @overload
+            def __eq__(self, other: Callable[[Any], None]) -> Literal[False]: ...
+            @overload
+            def __eq__(self, other: object) -> Literal[False]: ...
+            def __eq__(self, other: object) -> Literal[False]: return False
+
+        def constant_equality() -> None: CallableEnum.A == CallableEnum.A
+        def none_literals() -> None:
+            None == None
+            None != 1
+        def final_scalar(value: FinalInt) -> None:
+            value == None
+            value != None
+
         def bad(value: Bad, callback: Named) -> None: value < callback
         def less_equal(value: Bad, callback: Named) -> None: value <= callback
         def known(value: Known, callback: Named) -> None: value < callback
@@ -2922,6 +2942,9 @@ fn rich_comparison_argument_correspondence() -> anyhow::Result<()> {
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     let cases = [
+        ("constant_equality", true),
+        ("none_literals", false),
+        ("final_scalar", false),
         ("bad", true),
         ("less_equal", true),
         ("known", false),
