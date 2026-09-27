@@ -79,7 +79,7 @@ use crate::types::{
     TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance, UnionAccumulator, UnionBuilder,
     UnionType, WrapperDescriptorKind, enums, is_property_method, list_members,
 };
-use crate::types::{DictionaryItem, DictionaryItemKind, ProgramEnvironment};
+use crate::types::{DictionaryItemKind, ProgramEnvironment};
 use crate::{DisplaySettings, FxOrderSet};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
 use ruff_python_ast::{self as ast, AnyNodeRef, ArgOrKeyword, PythonVersion};
@@ -1668,6 +1668,7 @@ impl<'db> Bindings<'db> {
             return true;
         }
         let mut pairs = Vec::new();
+        let mut definitely_supplied = vec![false; parameters.len()];
         let mut supplied_keywords = FxHashSet::default();
         let mut has_keyword_remainder = false;
         let mut capture_supported = true;
@@ -1676,6 +1677,7 @@ impl<'db> Bindings<'db> {
             .zip(&binding.argument_matches)
             .enumerate()
             .all(|(index, ((argument, types), matched))| {
+                let mut required_keywords = None;
                 let mut keyword_names = FxHashSet::default();
                 let mut keyword_remainder = false;
                 let empty_keywords = match argument {
@@ -1688,13 +1690,24 @@ impl<'db> Bindings<'db> {
                             let KnownUnpacking::Keywords(keywords) = unpacking else {
                                 return false;
                             };
-                            if !keywords.items.iter().all(DictionaryItem::is_required)
+                            if keywords
+                                .items
+                                .iter()
+                                .any(|item| item.kind == DictionaryItemKind::Residual)
                                 || !keywords.residual_values(db, env).is_never()
                             {
                                 return false;
                             }
                             keyword_names
                                 .extend(keywords.items.iter().map(|item| item.name.clone()));
+                            required_keywords = Some(
+                                keywords
+                                    .items
+                                    .iter()
+                                    .filter(|item| item.is_required())
+                                    .map(|item| item.name.clone())
+                                    .collect::<FxHashSet<_>>(),
+                            );
                             keywords.items.is_empty()
                         } else {
                             let Some(unpacked) = types.get_default().and_then(|ty| {
@@ -1702,10 +1715,10 @@ impl<'db> Bindings<'db> {
                             }) else {
                                 return false;
                             };
-                            if !unpacked
+                            if unpacked
                                 .keys
                                 .values()
-                                .all(|key| key.kind == DictionaryItemKind::Required)
+                                .any(|key| key.kind == DictionaryItemKind::Residual)
                                 || (!unpacked.openness.is_closed()
                                     && parameters.keyword_variadic().is_none())
                             {
@@ -1713,6 +1726,14 @@ impl<'db> Bindings<'db> {
                             }
                             keyword_names.extend(unpacked.keys.keys().cloned());
                             keyword_remainder = !unpacked.openness.is_closed();
+                            required_keywords = Some(
+                                unpacked
+                                    .keys
+                                    .iter()
+                                    .filter(|(_, key)| key.kind == DictionaryItemKind::Required)
+                                    .map(|(name, _)| name.clone())
+                                    .collect::<FxHashSet<_>>(),
+                            );
                             unpacked.keys.is_empty() && unpacked.openness.is_closed()
                         }
                     }
@@ -1751,6 +1772,12 @@ impl<'db> Bindings<'db> {
                     {
                         keyword_names.insert(name.clone());
                     }
+                    definitely_supplied[matched_parameter.index] |=
+                        required_keywords.as_ref().is_none_or(|required| {
+                            parameter
+                                .keyword_name()
+                                .is_some_and(|name| required.contains(name))
+                        });
                     if parameter.has_starred_annotation() {
                         return false;
                     }
@@ -1778,6 +1805,16 @@ impl<'db> Bindings<'db> {
                 true
             });
         if !matched {
+            return false;
+        }
+        // Ordinary binding accepts possibly present keyword fields. Input proof additionally
+        // requires every parameter without a default to be supplied on every represented path.
+        if parameters.iter().enumerate().any(|(index, parameter)| {
+            !parameter.has_default()
+                && !parameter.is_variadic()
+                && !parameter.is_keyword_variadic()
+                && !definitely_supplied[index]
+        }) {
             return false;
         }
         let complete_inference = match binding.inference {
