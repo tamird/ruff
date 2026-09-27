@@ -301,17 +301,8 @@ impl<'db> Type<'db> {
                     && bindings.arguments_satisfy_declared_parameters(db, env, &arguments));
             Ok::<_, CallDunderError<'db>>((bindings, arguments_proved))
         };
-        // Ordinary dispatch currently omits possibly-unbound candidates. They can still execute,
-        // so a proof must retain that missing contributor even when the fallback succeeds.
-        let is_possibly_unbound = |error: &CallDunderError<'db>| {
-            matches!(
-                error,
-                CallDunderError::PossiblyUnbound {
-                    bindings: _,
-                    unbound_on: _
-                }
-            )
-        };
+        // A rejected or possibly-unbound call can still execute at runtime. Only an absent
+        // method lets the fallback prove every possible input requirement.
 
         let left_class = left_ty.to_meta_type(db, env);
         let right_class = right_ty.to_meta_type(db, env);
@@ -329,7 +320,10 @@ impl<'db> Type<'db> {
                 if reflected_priority == ReflectedMethodPriority::Definitely {
                     return Ok(call_on_right_instance.or_else(|error| {
                         call_dunder(left_ty, op.dunder(), right_ty).map(|(bindings, proved)| {
-                            (bindings, proved && !is_possibly_unbound(&error))
+                            (
+                                bindings,
+                                proved && matches!(error, CallDunderError::MethodNotAvailable),
+                            )
                         })
                     })?);
                 }
@@ -349,7 +343,10 @@ impl<'db> Type<'db> {
                         ))
                     }
                     (Ok((bindings, proved)), Err(error)) | (Err(error), Ok((bindings, proved))) => {
-                        Ok((bindings, proved && !is_possibly_unbound(&error)))
+                        Ok((
+                            bindings,
+                            proved && matches!(error, CallDunderError::MethodNotAvailable),
+                        ))
                     }
                     (Err(_), Err(error)) => Err(error.into()),
                 };
@@ -361,7 +358,10 @@ impl<'db> Type<'db> {
                 Err(CallBinOpError::NotSupported)
             } else {
                 let (bindings, proved) = call_dunder(right_ty, op.reflected_dunder(), left_ty)?;
-                Ok((bindings, proved && !is_possibly_unbound(&error)))
+                Ok((
+                    bindings,
+                    proved && matches!(error, CallDunderError::MethodNotAvailable),
+                ))
             }
         })
     }
