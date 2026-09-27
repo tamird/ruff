@@ -5178,6 +5178,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
                 match call {
                     Ok(outcome) => {
+                        let DunderCallOutcome {
+                            bindings: outcome,
+                            arguments_proved: _,
+                        } = outcome;
                         state.deprecated_functions.extend(
                             outcome
                                 .deprecated_functions(db)
@@ -5861,7 +5865,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         argument_types: &mut CallArguments<'_, 'db>,
         infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
         call_expression_tcx: TypeContext<'db>,
-    ) -> Result<Bindings<'db>, CallDunderError<'db>> {
+    ) -> Result<DunderCallOutcome<'db>, CallDunderError<'db>> {
         let db = self.db();
         let env = self.program_environment();
         match object
@@ -5880,6 +5884,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     argument_types,
                 );
 
+                let single_argument_context = bindings.is_single();
                 if let Err(call_error) = self.infer_and_check_argument_types(
                     ast_arguments,
                     &[],
@@ -5901,7 +5906,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         unbound_on: None,
                     });
                 }
-                Ok(bindings)
+                let arguments_proved = self.function_inference_mode
+                    != crate::FunctionInferenceMode::OutputProof
+                    || (single_argument_context
+                        && bindings.arguments_satisfy_declared_parameters(db, env, argument_types));
+                Ok(DunderCallOutcome {
+                    bindings,
+                    arguments_proved,
+                })
             }
             Place::Undefined => Err(CallDunderError::MethodNotAvailable),
         }
@@ -13238,6 +13250,16 @@ impl<'db> FullExpressionCacheEntry<'db> {
             scope: self.scope,
         }
     }
+}
+
+/// A successful implicit call and its selected argument requirements.
+///
+/// The caller owns commitment of child inference: supplied argument-inference closures may
+/// run silently while choosing an ordinary operation branch. The caller publishes status
+/// after committing the selected inference.
+struct DunderCallOutcome<'db> {
+    bindings: Bindings<'db>,
+    arguments_proved: bool,
 }
 
 /// Manages the inference of a given expression.
