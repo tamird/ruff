@@ -847,7 +847,10 @@ pub(super) fn infer_binary_type_comparison<'db>(
             let truthiness = left
                 .identity_comparison_truthiness(db, env, right)
                 .negate_if(op == ast::CmpOp::IsNot);
-            return Ok(Type::from_truthiness(db, env, truthiness).into());
+            return Ok(ComparisonResult {
+                ty: Type::from_truthiness(db, env, truthiness),
+                inputs_proved: true,
+            });
         }
         ast::CmpOp::Eq => NonIdentityOperator::Rich(RichCompareOperator::Eq),
         ast::CmpOp::NotEq => NonIdentityOperator::Rich(RichCompareOperator::Ne),
@@ -887,7 +890,7 @@ fn infer_binary_type_comparison_inner<'db>(
         };
 
         match op {
-            NonIdentityOperator::Rich(rich_op) => rich_comparison(rich_op).map(Into::into),
+            NonIdentityOperator::Rich(rich_op) => rich_comparison(rich_op),
             NonIdentityOperator::Membership(membership_op) => {
                 membership_test_comparison(membership_op, range)
             }
@@ -929,7 +932,13 @@ fn infer_binary_type_comparison_inner<'db>(
         _ => Truthiness::Ambiguous,
     };
     if comparison_truthiness != Truthiness::Ambiguous {
-        return Ok(Type::from_truthiness(db, env, comparison_truthiness).into());
+        return Ok(ComparisonResult {
+            ty: Type::from_truthiness(db, env, comparison_truthiness),
+            // Ordinary equality also makes pragmatic assumptions about overridable methods.
+            // Only exact builtin values establish intrinsic input semantics here.
+            inputs_proved: crate::types::equality::is_builtin_literal_type(db, left)
+                && crate::types::equality::is_builtin_literal_type(db, right),
+        });
     }
 
     let comparison_result = match (left, right) {
@@ -1189,32 +1198,38 @@ fn infer_binary_type_comparison_inner<'db>(
             }
             match (left_literal.kind(), right_literal.kind()) {
                 (LiteralValueTypeKind::Int(n), LiteralValueTypeKind::Int(m)) => {
-                    Some(match op {
-                        NonIdentityOperator::Rich(RichCompareOperator::Eq) => {
-                            Ok(Type::bool_literal(n == m).into())
-                        }
-                        NonIdentityOperator::Rich(RichCompareOperator::Ne) => {
-                            Ok(Type::bool_literal(n != m).into())
-                        }
-                        NonIdentityOperator::Rich(RichCompareOperator::Lt) => {
-                            Ok(Type::bool_literal(n < m).into())
-                        }
-                        NonIdentityOperator::Rich(RichCompareOperator::Le) => {
-                            Ok(Type::bool_literal(n <= m).into())
-                        }
-                        NonIdentityOperator::Rich(RichCompareOperator::Gt) => {
-                            Ok(Type::bool_literal(n > m).into())
-                        }
-                        NonIdentityOperator::Rich(RichCompareOperator::Ge) => {
-                            Ok(Type::bool_literal(n >= m).into())
-                        }
-                        // Undefined for (int, int)
-                        NonIdentityOperator::Membership(_) => Err(UnsupportedComparisonError {
-                            op: op.into(),
-                            left_ty: left,
-                            right_ty: right,
+                    Some(
+                        (match op {
+                            NonIdentityOperator::Rich(RichCompareOperator::Eq) => {
+                                Ok(Type::bool_literal(n == m))
+                            }
+                            NonIdentityOperator::Rich(RichCompareOperator::Ne) => {
+                                Ok(Type::bool_literal(n != m))
+                            }
+                            NonIdentityOperator::Rich(RichCompareOperator::Lt) => {
+                                Ok(Type::bool_literal(n < m))
+                            }
+                            NonIdentityOperator::Rich(RichCompareOperator::Le) => {
+                                Ok(Type::bool_literal(n <= m))
+                            }
+                            NonIdentityOperator::Rich(RichCompareOperator::Gt) => {
+                                Ok(Type::bool_literal(n > m))
+                            }
+                            NonIdentityOperator::Rich(RichCompareOperator::Ge) => {
+                                Ok(Type::bool_literal(n >= m))
+                            }
+                            // Undefined for (int, int)
+                            NonIdentityOperator::Membership(_) => Err(UnsupportedComparisonError {
+                                op: op.into(),
+                                left_ty: left,
+                                right_ty: right,
+                            }),
+                        })
+                        .map(|ty| ComparisonResult {
+                            ty,
+                            inputs_proved: true,
                         }),
-                    })
+                    )
                 }
                 // Booleans are coded as integers (False = 0, True = 1)
                 (LiteralValueTypeKind::Int(n), LiteralValueTypeKind::Bool(b)) => Some(
@@ -1582,7 +1597,7 @@ fn infer_rich_comparison<'db>(
     right: Type<'db>,
     op: RichCompareOperator,
     policy: MemberLookupPolicy,
-) -> Result<Type<'db>, UnsupportedComparisonError<'db>> {
+) -> Result<ComparisonResult<'db>, UnsupportedComparisonError<'db>> {
     let db = context.db();
     let env = &context.program_environment();
     Type::try_call_rich_comparison_dunder(
@@ -1590,10 +1605,11 @@ fn infer_rich_comparison<'db>(
         env,
         left,
         right,
-        op.dunder(),
-        op.reflect().dunder(),
+        (op.dunder(), op.reflect().dunder()),
         policy,
+        db.function_inference_mode(context.scope()) == crate::FunctionInferenceMode::OutputProof,
     )
+    .map(|(ty, inputs_proved)| ComparisonResult { ty, inputs_proved })
     .or_else(|| {
         // When no appropriate method returns any value other than NotImplemented,
         // the `==` and `!=` operators will fall back to `is` and `is not`, respectively.
@@ -1603,7 +1619,7 @@ fn infer_rich_comparison<'db>(
             // on `object`, so it does not apply if we skip looking up attributes on `object`.
             && !policy.mro_no_object_fallback()
         {
-            Some(KnownClass::Bool.to_instance(db, env))
+            Some(KnownClass::Bool.to_instance(db, env).into())
         } else {
             None
         }

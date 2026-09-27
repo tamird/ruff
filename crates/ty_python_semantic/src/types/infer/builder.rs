@@ -12684,9 +12684,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } = self.infer_chained_boolean_types(
             ast::BoolOp::And,
             false,
-            compare.iter(),
+            compare.iter().enumerate(),
             |_| false,
-            |builder, (left, op, right), _peer_ty| {
+            |builder, (comparison_index, (left, op, right)), _peer_ty| {
                 let left_ty = builder.expression_type(left);
                 let right_ty = builder.infer_expression(right, TypeContext::default());
 
@@ -12711,8 +12711,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         range,
                     ),
                 };
-                if matches!(op, ast::CmpOp::In | ast::CmpOp::NotIn)
-                    && !comparison.as_ref().is_ok_and(|result| result.inputs_proved)
+                if builder.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+                    && !comparison.as_ref().is_ok_and(|result| {
+                        result.inputs_proved
+                            && (comparison_index + 1 == compare.ops.len()
+                                || (result.ty.is_fully_static(db, builder.program_environment())
+                                    && result.ty.is_subtype_of(
+                                        db,
+                                        builder.program_environment(),
+                                        KnownClass::Bool
+                                            .to_instance(db, builder.program_environment()),
+                                    )))
+                    })
                 {
                     builder.context.record_unproved_requirement(range);
                 }

@@ -326,14 +326,14 @@ impl<'db> ContainerElementEqualityEvaluator<'db> {
             return Ok(truthiness);
         }
 
-        let Some(result) = Type::try_call_rich_comparison_dunder(
+        let Some((result, _inputs_proved)) = Type::try_call_rich_comparison_dunder(
             db,
             &self.evaluator.env,
             left,
             right,
-            "__eq__",
-            "__eq__",
+            ("__eq__", "__eq__"),
             MemberLookupPolicy::default(),
+            false,
         ) else {
             return Ok(Truthiness::Ambiguous);
         };
@@ -836,7 +836,7 @@ fn all_values_compare_equal<'db>(
 ///
 /// This includes `int`, `bool`, `str`, and `bytes` literals, along with `bool` itself because its
 /// only possible values are `Literal[True]` and `Literal[False]`.
-fn is_builtin_literal_type(db: &dyn Db, ty: Type) -> bool {
+pub(super) fn is_builtin_literal_type(db: &dyn Db, ty: Type) -> bool {
     match ty.resolve_type_alias(db) {
         Type::LiteralValue(literal) => matches!(
             literal.kind(),

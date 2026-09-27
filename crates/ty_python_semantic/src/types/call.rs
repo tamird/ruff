@@ -125,42 +125,65 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         left: Type<'db>,
         right: Type<'db>,
-        dunder: &'static str,
-        reflected_dunder: &'static str,
+        (dunder, reflected_dunder): (&'static str, &'static str),
         policy: MemberLookupPolicy,
-    ) -> Option<Type<'db>> {
+        prove_arguments: bool,
+    ) -> Option<(Type<'db>, bool)> {
         let call_dunder = |name, receiver: Type<'db>, argument: Type<'db>| {
-            receiver
-                .try_call_dunder_with_policy(
-                    db,
-                    env,
-                    name,
-                    &mut CallArguments::positional([argument]),
-                    TypeContext::default(),
-                    policy,
-                )
-                .map(|outcome| outcome.return_type(db, env))
-                .ok()
+            let mut arguments =
+                CallArguments::positional([argument]).with_input_proof_request(prove_arguments);
+            let bindings = receiver.try_call_dunder_with_policy(
+                db,
+                env,
+                name,
+                &mut arguments,
+                TypeContext::default(),
+                policy,
+            )?;
+            let inputs_proved = prove_arguments
+                && !bindings.has_only_constructor_items()
+                && bindings.arguments_satisfy_declared_parameters(db, env, &arguments);
+            Ok::<_, CallDunderError<'db>>((bindings.return_type(db, env), inputs_proved))
         };
+        // A rejected or possibly-unbound call can still execute at runtime. Only an absent
+        // method lets the fallback prove every possible input requirement.
 
         match reflected_method_priority(db, env, left, right) {
-            ReflectedMethodPriority::Never => call_dunder(dunder, left, right)
-                .or_else(|| call_dunder(reflected_dunder, right, left)),
+            ReflectedMethodPriority::Never => call_dunder(dunder, left, right).or_else(|error| {
+                call_dunder(reflected_dunder, right, left).map(|(ty, proved)| {
+                    (
+                        ty,
+                        proved && matches!(error, CallDunderError::MethodNotAvailable),
+                    )
+                })
+            }),
             ReflectedMethodPriority::Possibly => {
                 match (
                     call_dunder(dunder, left, right),
                     call_dunder(reflected_dunder, right, left),
                 ) {
-                    (Some(normal), Some(reflected)) => {
-                        Some(UnionType::from_two_elements(db, env, normal, reflected))
-                    }
-                    (Some(result), None) | (None, Some(result)) => Some(result),
-                    (None, None) => None,
+                    (Ok((normal, normal_proved)), Ok((reflected, reflected_proved))) => Ok((
+                        UnionType::from_two_elements(db, env, normal, reflected),
+                        normal_proved && reflected_proved,
+                    )),
+                    (Ok((ty, proved)), Err(error)) | (Err(error), Ok((ty, proved))) => Ok((
+                        ty,
+                        proved && matches!(error, CallDunderError::MethodNotAvailable),
+                    )),
+                    (Err(error), Err(_)) => Err(error),
                 }
             }
             ReflectedMethodPriority::Definitely => call_dunder(reflected_dunder, right, left)
-                .or_else(|| call_dunder(dunder, left, right)),
+                .or_else(|error| {
+                    call_dunder(dunder, left, right).map(|(ty, proved)| {
+                        (
+                            ty,
+                            proved && matches!(error, CallDunderError::MethodNotAvailable),
+                        )
+                    })
+                }),
         }
+        .ok()
     }
 
     /// Memoize the return type and deprecations from binary dunder resolution, without retaining
