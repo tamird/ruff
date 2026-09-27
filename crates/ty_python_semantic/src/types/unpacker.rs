@@ -137,9 +137,8 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             }
             UnpackKind::Iterable { mode } => {
                 let env = self.context.program_environment();
-                value_type
-                    .try_iterate_with_mode(db, env, mode)
-                    .map(|tuple| {
+                match value_type.try_iterate_with_mode(db, env, mode) {
+                    Ok(tuple) => {
                         let element = tuple.homogeneous_element_type(db, env);
                         refine_dict_snapshot_element_type(
                             db,
@@ -151,15 +150,21 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                             |expression| Some(value_inference.expression_type(expression)),
                         )
                         .unwrap_or(element)
-                    })
-                    .unwrap_or_else(|err| {
+                    }
+                    Err(err) => {
+                        // Recovery can yield a complete tuple even when iteration failed.
+                        // It cannot establish a relationship between the unpacked targets.
+                        if filter.is_some() {
+                            return Err(UnpackFilterError::Unsupported);
+                        }
                         err.report_diagnostic(
                             &self.context,
                             value_type,
                             value.as_any_node_ref(self.db(), self.module()),
                         );
                         err.fallback_element_type(db, env)
-                    })
+                    }
+                }
             }
             UnpackKind::ContextManager { mode } => {
                 let env = self.context.program_environment();

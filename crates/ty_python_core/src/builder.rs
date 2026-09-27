@@ -39,7 +39,7 @@ use crate::definition::{
     LoopHeaderDefinitionNodeRef, LoopStmtRef, MatchPatternDefinitionNodeRef,
     NestedBindingExecution, NestedBindingsDefinitionKind, ParameterDefinitionNodeRef,
     ProvidedBinding, ProvidedBindingDefinitionKind, ProvidedStatement, StarImportDefinitionNodeRef,
-    WithItemDefinitionNodeRef,
+    TargetKind, WithItemDefinitionNodeRef,
 };
 use crate::expression::{Expression, ExpressionContext, ExpressionKind};
 use crate::frozen::{FrozenMap, FrozenSet};
@@ -1403,7 +1403,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     /// A test of one unpacked local can also constrain its sibling targets.
     /// Inference checks their complete binding histories before using the relationship.
     fn add_unpack_narrowed_places(&self, expr: &ast::Expr, places: &mut PossiblyNarrowedPlaces) {
-        if self.scopes[self.current_scope()].node().scope_kind() != ScopeKind::Function {
+        let scope_kind = self.scopes[self.current_scope()].node().scope_kind();
+        if !matches!(scope_kind, ScopeKind::Function | ScopeKind::Comprehension) {
             return;
         }
         Self::walk_narrowing_alias_predicate(expr, &mut |leaf| {
@@ -1418,13 +1419,28 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 let Some(definition) = use_def.definition(binding.binding()).definition() else {
                     continue;
                 };
-                let DefinitionKind::Assignment(assignment) = definition.kind(self.db) else {
-                    continue;
+                let unpack = match (scope_kind, definition.kind(self.db)) {
+                    (ScopeKind::Function, DefinitionKind::Assignment(assignment)) => {
+                        let Some(unpack) = assignment.unpack() else {
+                            continue;
+                        };
+                        if !matches!(unpack.value(self.db).kind(), UnpackKind::Assign) {
+                            continue;
+                        }
+                        unpack
+                    }
+                    (ScopeKind::Comprehension, DefinitionKind::Comprehension(comprehension)) => {
+                        let TargetKind::Sequence(_, unpack) = comprehension.target_kind() else {
+                            continue;
+                        };
+                        if !matches!(unpack.value(self.db).kind(), UnpackKind::Iterable { .. }) {
+                            continue;
+                        }
+                        unpack
+                    }
+                    _ => continue,
                 };
-                let Some(unpack) = assignment.unpack() else {
-                    continue;
-                };
-                if !matches!(unpack.value(self.db).kind(), UnpackKind::Assign) {
+                if unpack.target_file_scope(self.db) != self.current_scope() {
                     continue;
                 }
                 let targets = match unpack.target(self.db, self.module) {
