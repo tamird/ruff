@@ -1644,19 +1644,6 @@ impl<'db> Bindings<'db> {
         if arguments.len() == 0 {
             return true;
         }
-        match binding.inference {
-            Some(inference) => {
-                if !matches!(inference.solutions(db), TypeVarInferenceSolutions::Single) {
-                    return false;
-                }
-            }
-            None => {
-                if binding.signature.generic_context.is_some() {
-                    return false;
-                }
-            }
-        }
-        let specialization = binding.partial_specialization(db, env);
         let mut pairs = Vec::new();
         let mut capture_supported = true;
         let matched = arguments
@@ -1716,21 +1703,45 @@ impl<'db> Bindings<'db> {
                     if parameter.has_starred_annotation() {
                         return false;
                     }
-                    let Some(mut actual) = matched_parameter.argument_type(parameter, types) else {
+                    let Some(actual) = matched_parameter.argument_type(parameter, types) else {
                         return false;
                     };
                     let expected = matched_parameter
                         .expected_type
                         .unwrap_or_else(|| parameter.annotated_type());
-                    if let Some(specialization) = specialization {
-                        actual = actual.apply_specialization(db, specialization);
-                    }
                     pairs.push((actual, expected));
                     true
                 })
             });
         if !matched {
             return false;
+        }
+        let complete_inference = match binding.inference {
+            Some(inference) => {
+                matches!(inference.solutions(db), TypeVarInferenceSolutions::Single)
+            }
+            None => binding.signature.generic_context.is_none(),
+        };
+        if !complete_inference {
+            // Omitted parameters and result-only variables need no supplied-value proof. Check
+            // independent raw pairs before applying any recovery specialization.
+            return pairs.iter().all(|(actual, expected)| {
+                [*actual, *expected].into_iter().all(|ty| {
+                    !any_over_type(db, env, ty, true, |ty| {
+                        ty.as_typevar().is_some_and(|typevar| {
+                            typevar.is_inferable(db, binding.inferable_typevars)
+                        })
+                    })
+                }) && expected.is_fully_static_except_any(db, env)
+                    && !actual.has_provisional_marker(db, env)
+                    && actual.satisfies_declared_output(db, env, *expected)
+            });
+        }
+        let specialization = binding.partial_specialization(db, env);
+        if let Some(specialization) = specialization {
+            for (actual, _) in &mut pairs {
+                *actual = actual.apply_specialization(db, specialization);
+            }
         }
         let direct = pairs.iter().all(|(actual, expected)| {
             let expected = specialization.map_or(*expected, |specialization| {
@@ -10810,6 +10821,72 @@ mod tests {
             );
             assert!(bindings.as_result(db).is_ok());
             assert_eq!(bindings.return_type(db, &env), ordinary_return);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn independent_arguments_do_not_require_generic_solutions() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.pyi",
+            r#"
+            from typing import Any, Callable
+
+            def produce[T](value: object, unused: T = ...) -> T: ...
+            def bounded[T: int](value: object, unused: T = ...) -> T: ...
+            def closed[T](callback: Callable[[Any], None], unused: T = ...) -> T: ...
+            def dependent[T](value: T) -> T: ...
+            def narrow(value: str) -> None: ...
+            "#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.pyi")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let narrow = global_symbol(db, file, "narrow").place.expect_type();
+        for (name, argument, expected) in [
+            ("produce", Type::int_literal(1), true),
+            ("bounded", Type::int_literal(1), true),
+            ("closed", narrow, false),
+            ("dependent", Type::unknown(), false),
+        ] {
+            let callable = global_symbol(db, file, name).place.expect_type();
+            let arguments = CallArguments::positional([argument]);
+            let constraints = ConstraintSetBuilder::new();
+            let bindings = callable
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &constraints,
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                )
+                .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
+            let ordinary_return = bindings.return_type(db, &env);
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                expected,
+                "{name}",
+            );
+            assert_eq!(bindings.return_type(db, &env), ordinary_return);
+            let callable = bindings.argument_correspondence_callable().unwrap();
+            let Ok((_, binding)) = callable.matching_overloads().exactly_one() else {
+                panic!("expected one matching overload for {name}");
+            };
+            let solutions = binding.inference.unwrap().solutions(db);
+            if name == "produce" {
+                assert!(ordinary_return.is_unknown());
+                assert!(matches!(
+                    solutions,
+                    TypeVarInferenceSolutions::Unavailable(_)
+                ));
+            } else if name == "dependent" {
+                assert!(matches!(solutions, TypeVarInferenceSolutions::Single));
+            }
         }
         Ok(())
     }
