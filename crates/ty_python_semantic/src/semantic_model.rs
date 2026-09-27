@@ -34,9 +34,9 @@ use crate::types::list_members::{
     all_members, all_members_with_object_policy, all_reachable_members,
 };
 use crate::types::{
-    CycleDetector, DictionaryItems, ProgramEnvironment, SpecialFormType, Type, TypeQualifiers,
-    binding_type, infer_complete_scope_types, infer_definition_types, inferred_declaration,
-    is_discarded_dict_key_assignment,
+    CycleDetector, DictionaryItems, ProgramEnvironment, SpecialFormType, Type,
+    TypeCheckDiagnostics, TypeQualifiers, binding_type, infer_complete_scope_types,
+    infer_definition_types, inferred_declaration, is_discarded_dict_key_assignment,
 };
 use crate::types::{function_signature_annotation_info, function_signature_annotation_scope};
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
@@ -67,6 +67,10 @@ pub(crate) fn explicitly_reads_local_namespace(expression: &Expr) -> bool {
 /// Facts retained by function-body and parameter-default inference in the current configuration.
 /// These do not establish static expression evidence or dependency availability.
 #[derive(Clone, Copy, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Callers inspect these separate inference outcomes to apply their validation policy."
+)]
 pub struct FunctionInferenceFacts {
     /// Whether effective returns correspond to normalized declared output types.
     /// Positive explicit `Any` and bare callable ellipsis omit value and input-shape constraints.
@@ -81,6 +85,10 @@ pub struct FunctionInferenceFacts {
     pub has_errors: bool,
     /// Includes emitted diagnostics and diagnostics suppressed in reachable code.
     pub has_diagnostics_or_suppressions: bool,
+    /// Whether selected input checks encountered a reachable requirement they could not prove.
+    /// Diagnostic rule selection and source suppressions do not clear this status. It covers
+    /// failures among selected checks; check selection and complete body evidence are separate.
+    pub has_unproved_requirements: bool,
 }
 
 /// The primary interface the LSP should use for querying semantic information about a [`File`].
@@ -165,6 +173,10 @@ impl<'db> SemanticModel<'db> {
                 diagnostics.into_iter().next().is_some()
                     || diagnostics.has_reachable_suppressed_diagnostics()
             }),
+            has_unproved_requirements: diagnostics
+                .into_iter()
+                .flatten()
+                .any(TypeCheckDiagnostics::has_unproved_requirements),
         })
     }
 

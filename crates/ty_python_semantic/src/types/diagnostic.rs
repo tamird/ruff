@@ -1446,6 +1446,7 @@ pub struct TypeCheckDiagnostics {
     diagnostics: Vec<Diagnostic>,
     used_suppressions: FxHashSet<FileSuppressionId>,
     has_reachable_suppressed_diagnostics: bool,
+    has_unproved_requirements: bool,
 }
 
 pub(crate) fn report_mismatched_type_name<'db>(
@@ -1484,6 +1485,7 @@ impl TypeCheckDiagnostics {
         self.diagnostics.extend_from_slice(&other.diagnostics);
         self.used_suppressions.extend(&other.used_suppressions);
         self.has_reachable_suppressed_diagnostics |= other.has_reachable_suppressed_diagnostics;
+        self.has_unproved_requirements |= other.has_unproved_requirements;
     }
 
     /// Extend with selected diagnostics while retaining all used suppressions.
@@ -1500,6 +1502,7 @@ impl TypeCheckDiagnostics {
         );
         self.used_suppressions.extend(&other.used_suppressions);
         self.has_reachable_suppressed_diagnostics |= other.has_reachable_suppressed_diagnostics;
+        self.has_unproved_requirements |= other.has_unproved_requirements;
     }
 
     pub(super) fn extend_diagnostics(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
@@ -1585,8 +1588,20 @@ impl TypeCheckDiagnostics {
         self.diagnostics
     }
 
+    pub(crate) fn mark_unproved_requirement(&mut self) {
+        self.has_unproved_requirements = true;
+    }
+
+    pub(crate) fn has_unproved_requirements(&self) -> bool {
+        self.has_unproved_requirements
+    }
+
+    pub(crate) fn has_diagnostics_or_used_suppressions(&self) -> bool {
+        !self.diagnostics.is_empty() || !self.used_suppressions.is_empty()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.diagnostics.is_empty() && self.used_suppressions.is_empty()
+        !self.has_diagnostics_or_used_suppressions() && !self.has_unproved_requirements
     }
 
     fn iter(&self) -> std::slice::Iter<'_, Diagnostic> {
