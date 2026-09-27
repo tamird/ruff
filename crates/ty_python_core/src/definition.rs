@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 
 use crate::LoopHeaderId;
 use crate::ProgramFile;
+use crate::ProvidedAnnotation;
 use crate::ast_node_ref::AstNodeRef;
 use crate::member::ScopedMemberId;
 use crate::node_key::NodeKey;
@@ -90,12 +91,19 @@ impl<'db> Definition<'db> {
             _ => None,
         };
         if let Some(owner) = annotation_owner
-            && db
-                .provided_annotation(self.program_file(db), owner)
-                .is_some()
+            && let Some(annotation) = db.provided_annotation(self.program_file(db), owner)
+            && !matches!(
+                (kind, annotation),
+                (
+                    DefinitionKind::Parameter(_),
+                    ProvidedAnnotation::External { file: _, owner: _ }
+                )
+            )
         {
             return DefinitionCategory::DeclarationAndBinding;
         }
+        // External parameter contracts describe entry values. The ordinary category
+        // still preserves any annotation written on the parameter itself.
         kind.category(self.program_file(db).is_stub(db), module)
     }
 

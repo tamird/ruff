@@ -534,23 +534,9 @@ fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Re
     let file = system_path_to_file(&db, "/src/main.py")?;
     let stub = system_path_to_file(&db, "/src/contracts.pyi")?;
     for (scalar, expected) in [
-        (
-            "str",
-            vec![
-                "invalid-assignment",
-                "invalid-return-type",
-                "invalid-return-type",
-            ],
-        ),
+        ("str", vec!["invalid-return-type", "invalid-return-type"]),
         ("int", vec!["invalid-return-type"]),
-        (
-            "str",
-            vec![
-                "invalid-assignment",
-                "invalid-return-type",
-                "invalid-return-type",
-            ],
-        ),
+        ("str", vec!["invalid-return-type", "invalid-return-type"]),
     ] {
         // Deliberately place the foreign annotations past the end of the implementation.
         db.write_file("/src/contracts.pyi", format!("{}Scalar = {scalar}\ndef compute(value: Scalar = ...) -> Scalar: ...\ndef implicit(value: Scalar) -> Scalar: ...\ndef native(value: str) -> str: ...\n", "# declarations\n".repeat(30)))?;
@@ -575,8 +561,8 @@ fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Re
                 annotation.get_span().file() == &ruff_db::diagnostic::UnifiedFile::Ty(stub)
             })
             .count();
-        // Explicit return and reassignment errors identify the declaring stub.
-        assert_eq!(foreign_annotations, if scalar == "str" { 2 } else { 0 });
+        // Explicit return errors identify the declaring stub.
+        assert_eq!(foreign_annotations, usize::from(scalar == "str"));
     }
     let file = db.program_file(file);
     let module = parsed_module(&db, file.python_file(&db)).load(&db);
@@ -592,10 +578,56 @@ fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Re
 }
 
 #[test]
+fn external_parameter_contracts_allow_local_rebinding() -> anyhow::Result<()> {
+    for (parameter, entry, result, call, expected) in [
+        ("value", "int", "str", "", vec![]),
+        (
+            "value: int",
+            "int",
+            "str",
+            "",
+            vec!["invalid-assignment", "invalid-return-type"],
+        ),
+        ("value", "str", "str", "", vec!["unsupported-operator"]),
+        ("value", "int", "int", "", vec!["invalid-return-type"]),
+        (
+            "value",
+            "int",
+            "str",
+            "convert('bad')",
+            vec!["invalid-argument-type"],
+        ),
+    ] {
+        let db = TestDbBuilder::new()
+            .with_file(
+                "/src/main.py",
+                &format!("def convert({parameter}):\n    before = value + 1\n    value = str(before)\n    return value\n{call}\n"),
+            )
+            .with_file(
+                "/src/contracts.pyi",
+                &format!("def convert(value: {entry}) -> {result}: ...\n"),
+            )
+            .with_source_provider(ExternalSource::Annotation)
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{parameter}, {entry} -> {result}, {call}: {diagnostics:#?}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn external_annotations_preserve_variadic_and_nominal_types() -> anyhow::Result<()> {
     let db = TestDbBuilder::new()
-        .with_file("/src/main.py", "class Item: pass\ndef collect(*items, **labels):\n    labels = 1\n    return items[0]\ndef echo(value):\n    return value\ncollect(Item(), bad=1)\necho([Item()])\necho([1])\n")
-        .with_file("/src/contracts.pyi", "from main import Item\ndef collect(*items: Item, **labels: str) -> Item: ...\ndef echo(value: list[Item] | None) -> list[Item] | None: ...\n")
+        .with_file("/src/main.py", "from typing_extensions import assert_type\nclass Item: pass\ndef collect(*items, **labels):\n    first = items[0]\n    name = labels['name']\n    assert_type(first, Item)\n    assert_type(name, str)\n    items = 1\n    labels = 1\n    return first, name\ndef echo(value):\n    return value\ncollect(Item(), bad=1)\necho([Item()])\necho([1])\n")
+        .with_file("/src/contracts.pyi", "from main import Item\ndef collect(*items: Item, **labels: str) -> tuple[Item, str]: ...\ndef echo(value: list[Item] | None) -> list[Item] | None: ...\n")
         .with_source_provider(ExternalSource::Annotation)
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -605,11 +637,7 @@ fn external_annotations_preserve_variadic_and_nominal_types() -> anyhow::Result<
             .iter()
             .map(|diagnostic| diagnostic.id().as_str())
             .collect::<Vec<_>>(),
-        [
-            "invalid-assignment",
-            "invalid-argument-type",
-            "invalid-argument-type"
-        ],
+        ["invalid-argument-type", "invalid-argument-type"],
         "{diagnostics:#?}"
     );
     Ok(())
