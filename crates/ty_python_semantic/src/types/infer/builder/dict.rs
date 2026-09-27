@@ -68,7 +68,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             };
 
             if supports_typed_dict_context {
-                self.prepare_typed_dict_constructor(typed_dict, arguments, func.into());
+                let requirements_proved =
+                    self.prepare_typed_dict_constructor(typed_dict, arguments, func.into());
+                if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+                    && !requirements_proved
+                {
+                    self.context.record_unproved_requirement(func);
+                }
 
                 return Some(Type::TypedDict(typed_dict));
             }

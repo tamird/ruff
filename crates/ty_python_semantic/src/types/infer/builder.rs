@@ -7828,9 +7828,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         )
     }
 
-    /// Check an adopted element type in its execution scope. Comprehension specialization
+    /// Check an adopted expression type in its execution scope. Comprehension specialization
     /// can run in the parent scope even when the element itself is unreachable in the child.
-    fn literal_element_has_unproved_requirement(
+    fn expression_has_unproved_requirement(
         &self,
         element: &ast::Expr,
         actual: Type<'db>,
@@ -8098,11 +8098,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     if !inferred_elt_ty.is_assignable_to(db, env, elt_tcx) {
                         compatible = false;
                     } else if unproved_element.is_none()
-                        && self.literal_element_has_unproved_requirement(
-                            elt,
-                            inferred_elt_ty,
-                            elt_tcx,
-                        )
+                        && self.expression_has_unproved_requirement(elt, inferred_elt_ty, elt_tcx)
                     {
                         unproved_element = Some(elt.range());
                     }
@@ -8303,11 +8299,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     && inferred_elt_ty.is_assignable_to(db, env, elt_tcx)
                 {
                     if unproved_element.is_none()
-                        && self.literal_element_has_unproved_requirement(
-                            elt,
-                            inferred_elt_ty,
-                            elt_tcx,
-                        )
+                        && self.expression_has_unproved_requirement(elt, inferred_elt_ty, elt_tcx)
                     {
                         unproved_element = Some(elt.range());
                     }
@@ -9761,6 +9753,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     Type::TypedDict(typed_dict_ty).display(db, env),
                                 ));
                             }
+                            if method_name == "setdefault"
+                                && self.function_inference_mode
+                                    == crate::FunctionInferenceMode::OutputProof
+                            {
+                                self.context.record_unproved_requirement(call_expression);
+                            }
                             return Type::unknown();
                         }
                     }
@@ -9796,7 +9794,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     default,
                                     TypeContext::new(Some(field.declared_ty)),
                                 );
-                                TypedDictKeyAssignment {
+                                let valid = TypedDictKeyAssignment {
                                     context: &self.context,
                                     typed_dict: typed_dict_ty,
                                     full_object_ty: None,
@@ -9809,12 +9807,29 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     emit_diagnostic: true,
                                 }
                                 .validate();
+                                if self.function_inference_mode
+                                    == crate::FunctionInferenceMode::OutputProof
+                                    && (!valid
+                                        || !first_arg.is_string_literal_expr()
+                                        || self.expression_has_unproved_requirement(
+                                            default,
+                                            default_ty,
+                                            field.declared_ty,
+                                        ))
+                                {
+                                    self.context.record_unproved_requirement(call_expression);
+                                }
                                 return field.declared_ty;
                             }
                             _ => {}
                         }
                     }
                 } else if method_name != "get" {
+                    if method_name == "setdefault"
+                        && self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+                    {
+                        self.context.record_unproved_requirement(call_expression);
+                    }
                     // Key not found, report error with suggestion and return early
                     let key_ty = Type::string_literal(self.db(), key);
                     report_invalid_key_on_typed_dict(
