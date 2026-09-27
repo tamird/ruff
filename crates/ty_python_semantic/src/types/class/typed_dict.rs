@@ -781,10 +781,19 @@ fn synthesize_typed_dict_merge<'db>(
             instance_ty
         };
 
+        let value_typevar = BoundTypeVarInstance::synthetic(
+            db,
+            env,
+            Name::new_static("V"),
+            TypeVarVariance::Invariant,
+        );
         let dict_param_ty = KnownClass::Dict.to_specialized_instance(
             db,
             env,
-            &[KnownClass::Str.to_instance(db, env), Type::any()],
+            &[
+                KnownClass::Str.to_instance(db, env),
+                Type::TypeVar(value_typevar),
+            ],
         );
 
         let dict_return_ty = KnownClass::Dict.to_specialized_instance(
@@ -813,7 +822,12 @@ fn synthesize_typed_dict_merge<'db>(
             Parameter::positional_only(Some(Name::new_static("value")))
                 .with_annotated_type(dict_param_ty),
         ];
-        overloads.push(Signature::new(
+        overloads.push(Signature::new_generic(
+            Some(GenericContext::from_typevar_instances(
+                db,
+                env,
+                [value_typevar],
+            )),
             Parameters::standard(overload_three_parameters),
             dict_return_ty,
         ));
