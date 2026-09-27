@@ -1645,12 +1645,16 @@ impl<'db> Bindings<'db> {
             return true;
         }
         let mut pairs = Vec::new();
+        let mut supplied_keywords = FxHashSet::default();
+        let mut has_keyword_remainder = false;
         let mut capture_supported = true;
         let matched = arguments
             .iter()
             .zip(&binding.argument_matches)
             .enumerate()
             .all(|(index, ((argument, types), matched))| {
+                let mut keyword_names = FxHashSet::default();
+                let mut keyword_remainder = false;
                 let empty_keywords = match argument {
                     Argument::Variadic => return false,
                     Argument::Keywords => {
@@ -1666,6 +1670,8 @@ impl<'db> Bindings<'db> {
                             {
                                 return false;
                             }
+                            keyword_names
+                                .extend(keywords.items.iter().map(|item| item.name.clone()));
                             keywords.items.is_empty()
                         } else {
                             let Some(unpacked) = types.get_default().and_then(|ty| {
@@ -1682,12 +1688,17 @@ impl<'db> Bindings<'db> {
                             {
                                 return false;
                             }
+                            keyword_names.extend(unpacked.keys.keys().cloned());
+                            keyword_remainder = !unpacked.openness.is_closed();
                             unpacked.keys.is_empty() && unpacked.openness.is_closed()
                         }
                     }
                     Argument::Synthetic => false,
                     Argument::Positional => false,
-                    Argument::Keyword(_) => false,
+                    Argument::Keyword(name) => {
+                        keyword_names.insert(Name::new(name));
+                        false
+                    }
                 };
                 if empty_keywords {
                     return matched.parameters.is_empty();
@@ -1695,11 +1706,28 @@ impl<'db> Bindings<'db> {
                 if !matched.matched || matched.parameters.is_empty() {
                     return false;
                 }
+                // An implicit open tail is matched only to **kwargs by ordinary checking.
+                // Decline if it can also reach a named formal without a retained value pair.
+                if keyword_remainder
+                    && parameters.iter().enumerate().any(|(index, parameter)| {
+                        parameter.keyword_name().is_some_and(|name| {
+                            !keyword_names.contains(name)
+                                && !matched.iter().any(|matched| matched.index == index)
+                        })
+                    })
+                {
+                    return false;
+                }
                 capture_supported &= matched.parameters.len() == 1;
-                matched.iter().all(|matched_parameter| {
+                let valid_pairs = matched.iter().all(|matched_parameter| {
                     let Some(parameter) = parameters.get(matched_parameter.index) else {
                         return false;
                     };
+                    if matches!(argument, Argument::Synthetic | Argument::Positional)
+                        && let Some(name) = parameter.keyword_name()
+                    {
+                        keyword_names.insert(name.clone());
+                    }
                     if parameter.has_starred_annotation() {
                         return false;
                     }
@@ -1711,7 +1739,20 @@ impl<'db> Bindings<'db> {
                         .unwrap_or_else(|| parameter.annotated_type());
                     pairs.push((actual, expected));
                     true
-                })
+                });
+                // Different keyword sources must be disjoint even when they all feed **kwargs.
+                // An open remainder can overlap any name supplied by another source.
+                if !valid_pairs
+                    || (keyword_remainder && !supplied_keywords.is_empty())
+                    || (has_keyword_remainder && (keyword_remainder || !keyword_names.is_empty()))
+                    || keyword_names
+                        .into_iter()
+                        .any(|name| !supplied_keywords.insert(name))
+                {
+                    return false;
+                }
+                has_keyword_remainder |= keyword_remainder;
+                true
             });
         if !matched {
             return false;

@@ -4956,10 +4956,17 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
         class Open(TypedDict):
             run: Named
 
+        class Tag(TypedDict, closed=True):
+            tag: str
+
         def callback(*, name: str) -> None: pass
         def consume(*, run: Named = callback) -> None: pass
         def consume_omitted(*, run: Callable[..., None]) -> None: pass
         def consume_objects(**kwargs: object) -> None: pass
+        def consume_open(*, name: str, **kwargs: object) -> None: pass
+        def consume_positional_only(name: str, /, **kwargs: object) -> None: pass
+        def consume_positional_name(name: str, **kwargs: object) -> None: pass
+        def consume_open_default(*, name: str = "target", **kwargs: object) -> None: pass
         def consume_named(**kwargs: Named) -> None: pass
         def empty() -> None: pass
 
@@ -4993,6 +5000,24 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
         def open_objects(value: Open) -> None:
             consume_objects(**value)
 
+        def open_direct(value: Open) -> None:
+            consume_open(name="target", **value)
+
+        def open_positional_only(value: Open) -> None:
+            consume_positional_only("target", **value)
+
+        def open_positional_name(value: Open) -> None:
+            consume_positional_name("target", **value)
+
+        def open_hidden_name(value: Open) -> None:
+            consume_open_default(**value)
+
+        def duplicate_packs(left: Closed, right: Closed) -> None:
+            consume_objects(**left, **right)
+
+        def disjoint_packs(left: Closed, right: Tag) -> None:
+            consume_objects(**left, **{}, **right)
+
         def open_named(value: Open) -> None:
             consume_named(**value)
 
@@ -5013,6 +5038,12 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
         ("optional", true),
         ("mapping", true),
         ("open_objects", false),
+        ("open_direct", true),
+        ("open_positional_only", false),
+        ("open_positional_name", true),
+        ("open_hidden_name", true),
+        ("duplicate_packs", true),
+        ("disjoint_packs", false),
         ("open_named", true),
         ("method", false),
         ("child", true),
@@ -5033,15 +5064,19 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
     };
     let ordinary_signatures = signatures(&db);
     let ordinary = cases.map(|(name, _)| facts(&db, name));
+    for ((name, _), fact) in cases.into_iter().zip(&ordinary) {
+        assert_eq!(fact.has_errors, name == "open_named", "{name}");
+    }
     assert!(ordinary.iter().all(|fact| !fact.has_unproved_requirements));
     db.select_function_inference(Some((
         file,
         cases.map(|(name, _)| name.to_owned()).to_vec(),
         FunctionInferenceMode::OutputProof,
     )));
-    for ((name, unproved), ordinary) in cases.into_iter().zip(ordinary) {
+    let mut requirements = Vec::new();
+    for ((name, _), ordinary) in cases.into_iter().zip(ordinary) {
         let selected = facts(&db, name);
-        assert_eq!(selected.has_unproved_requirements, unproved, "{name}");
+        requirements.push((name, selected.has_unproved_requirements));
         assert_eq!(selected.return_type_correspondence, Some(true), "{name}");
         assert_eq!(
             (
@@ -5055,6 +5090,7 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
             "{name}",
         );
     }
+    assert_eq!(requirements, cases);
     assert_eq!(signatures(&db), ordinary_signatures);
     db.select_function_inference(None);
     assert!(
