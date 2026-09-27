@@ -939,3 +939,77 @@ def missing_payload(flag: bool):
         payload = 1
     return flag, payload  # error: [possibly-unresolved-reference]
 ```
+
+## Constructing tagged tuples within a loop iteration
+
+```py
+from typing import Literal
+
+LoopTagged = tuple[Literal[True], int] | tuple[Literal[False], object]
+
+def consume_loop(value: LoopTagged) -> None: ...
+def compound_joined(selected: bool, brace: bool) -> None:
+    if selected or brace:
+        payload = 1
+    else:
+        payload = "x"
+    consume_loop((selected, payload))
+
+def loop_joined(signals: list[bool], brace: bool) -> None:
+    selected = False
+    for signal in signals:
+        if signal:
+            selected = True
+        if selected or brace:
+            payload = 1
+        else:
+            payload = "x"
+        consume_loop((selected, payload))
+        selected = False
+
+def loop_changed(signals: list[bool], brace: bool, replacement: bool) -> None:
+    selected = False
+    for signal in signals:
+        if signal:
+            selected = True
+        if selected or brace:
+            payload = 1
+        else:
+            payload = "x"
+        selected = replacement
+        consume_loop((selected, payload))  # error: [invalid-argument-type]
+        selected = False
+
+def carried_payload(signals: list[bool], refresh: bool) -> None:
+    payload: int | str = "x"
+    for selected in signals:
+        if refresh:
+            if selected:
+                payload = 1
+            else:
+                payload = "x"
+        consume_loop((selected, payload))  # error: [invalid-argument-type]
+
+def after_while(signals: list[bool], running: bool) -> None:
+    payload: int | str = "x"
+    selected = False
+    while (selected := signals.pop()) == running:
+        if selected:
+            payload = 1
+        else:
+            payload = "x"
+    consume_loop((selected, payload))  # error: [invalid-argument-type]
+
+def nested_loop(signals: list[bool], replacements: list[bool]) -> None:
+    selected = False
+    for signal in signals:
+        if signal:
+            selected = True
+        if selected:
+            payload = 1
+        else:
+            payload = "x"
+        for selected in replacements:
+            pass
+        consume_loop((selected, payload))  # error: [invalid-argument-type]
+```

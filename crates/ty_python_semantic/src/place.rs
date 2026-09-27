@@ -13,7 +13,7 @@ use ty_module_resolver::{
 
 use crate::dunder_all::dunder_all_names;
 use crate::reachability::{
-    NarrowingProjector, ReachabilityEvaluationCache, evaluate_reachability,
+    BooleanIdentity, NarrowingProjector, ReachabilityEvaluationCache, evaluate_reachability,
     evaluate_reachability_assuming_boolean, evaluate_reachability_with_cache,
     refine_initial_binding_reachability,
 };
@@ -892,7 +892,7 @@ pub(super) fn place_from_bindings_assuming_boolean<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     bindings: BindingWithConstraintsIterator<'_, 'db>,
-    definition: Definition<'db>,
+    identity: BooleanIdentity<'_, 'db>,
     value: bool,
 ) -> PlaceWithDefinition<'db> {
     place_from_bindings_impl(
@@ -901,7 +901,7 @@ pub(super) fn place_from_bindings_assuming_boolean<'db>(
         bindings,
         RequiresExplicitReExport::No,
         None,
-        Some((definition, value)),
+        Some((identity, value)),
     )
 }
 
@@ -1945,20 +1945,20 @@ fn place_from_bindings_impl<'db>(
     bindings_with_constraints: BindingWithConstraintsIterator<'_, 'db>,
     requires_explicit_reexport: RequiresExplicitReExport,
     reachability_cache: Option<&ReachabilityEvaluationCache<'db>>,
-    boolean_assumption: Option<(Definition<'db>, bool)>,
+    boolean_assumption: Option<(BooleanIdentity<'_, 'db>, bool)>,
 ) -> PlaceWithDefinition<'db> {
     let predicates = bindings_with_constraints.predicates();
     let reachability_constraints = bindings_with_constraints.reachability_constraints();
     let boundness_analysis = bindings_with_constraints.boundness_analysis();
     let mut bindings_with_constraints = bindings_with_constraints.peekable();
     let visibility = |constraint| {
-        if let Some((definition, value)) = boolean_assumption {
+        if let Some((identity, value)) = boolean_assumption {
             evaluate_reachability_assuming_boolean(
                 db,
                 reachability_constraints,
                 predicates,
                 constraint,
-                definition,
+                identity,
                 value,
             )
         } else {
