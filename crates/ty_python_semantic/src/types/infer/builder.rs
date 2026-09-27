@@ -12231,6 +12231,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Type<'db> {
         let db = self.db();
         let env = self.program_environment();
+        let call_unary = |operand_type: Type<'db>, unary_dunder_method: &str| {
+            let mut arguments = CallArguments::none();
+            let result = operand_type.try_call_dunder_with_policy(
+                db,
+                env,
+                unary_dunder_method,
+                &mut arguments,
+                TypeContext::default(),
+                MemberLookupPolicy::default(),
+            );
+            if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+                && !result.as_ref().is_ok_and(|bindings| {
+                    !bindings.has_only_constructor_items()
+                        && bindings.arguments_satisfy_declared_parameters(db, env, &arguments)
+                })
+            {
+                self.context.record_unproved_requirement(unary);
+            }
+            result
+        };
         let fallback_unary_expression_type = || {
             let unary_dunder_method = match op {
                 ast::UnaryOp::Invert => "__invert__",
@@ -12241,13 +12261,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             };
 
-            match operand_type.try_call_dunder(
-                db,
-                env,
-                unary_dunder_method,
-                CallArguments::none(),
-                TypeContext::default(),
-            ) {
+            match call_unary(operand_type, unary_dunder_method) {
                 Ok(outcome) => {
                     self.check_deprecated_bindings(unary, &outcome);
                     outcome.return_type(db, env)
@@ -12288,7 +12302,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
             (ast::UnaryOp::Invert | ast::UnaryOp::UAdd | ast::UnaryOp::USub, Type::Dynamic(_))
-            | (_, Type::Divergent(_)) => operand_type,
+            | (_, Type::Divergent(_)) => {
+                if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+                    && matches!(
+                        op,
+                        ast::UnaryOp::UAdd | ast::UnaryOp::USub | ast::UnaryOp::Invert
+                    )
+                {
+                    self.context.record_unproved_requirement(unary);
+                }
+                operand_type
+            }
             (_, Type::Never) => Type::Never,
 
             (_, Type::TypeAlias(alias)) => {
@@ -12380,15 +12404,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         let outcomes: Vec<_> = constraints
                             .elements(db)
                             .iter()
-                            .map(|constraint| {
-                                constraint.try_call_dunder(
-                                    db,
-                                    env,
-                                    unary_dunder_method,
-                                    CallArguments::none(),
-                                    TypeContext::default(),
-                                )
-                            })
+                            .map(|constraint| call_unary(*constraint, unary_dunder_method))
                             .collect();
                         self.report_deprecated_functions(
                             unary,
@@ -12433,18 +12449,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     unary_dunder_method,
                                     None,
                                 );
-                                operand_type
-                                    .try_call_dunder(
-                                        db,
-                                        env,
-                                        unary_dunder_method,
-                                        CallArguments::none(),
-                                        TypeContext::default(),
-                                    )
-                                    .map_or_else(
-                                        |e| e.fallback_return_type(db, env),
-                                        |b| b.return_type(db, env),
-                                    )
+                                call_unary(operand_type, unary_dunder_method).map_or_else(
+                                    |e| e.fallback_return_type(db, env),
+                                    |b| b.return_type(db, env),
+                                )
                             }
                         }
                     }
@@ -12454,27 +12462,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         self.infer_unary_expression_type(op, bound, unary)
                     }
                     // For unconstrained TypeVars, fall through to default handling.
-                    None => {
-                        match operand_type.try_call_dunder(
-                            db,
-                            env,
-                            unary_dunder_method,
-                            CallArguments::none(),
-                            TypeContext::default(),
-                        ) {
-                            Ok(outcome) => outcome.return_type(db, env),
-                            Err(e) => {
-                                self.report_unsupported_unary_operator(
-                                    unary,
-                                    op,
-                                    operand_type,
-                                    unary_dunder_method,
-                                    Some(&e),
-                                );
-                                e.fallback_return_type(db, env)
-                            }
+                    None => match call_unary(operand_type, unary_dunder_method) {
+                        Ok(outcome) => outcome.return_type(db, env),
+                        Err(e) => {
+                            self.report_unsupported_unary_operator(
+                                unary,
+                                op,
+                                operand_type,
+                                unary_dunder_method,
+                                Some(&e),
+                            );
+                            e.fallback_return_type(db, env)
                         }
-                    }
+                    },
                 }
             }
 

@@ -2758,6 +2758,107 @@ fn subscript_argument_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn unary_argument_correspondence() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from __future__ import annotations
+        from typing import Any, Callable
+
+        class Closed[T]:
+            def __pos__(self: Closed[Callable[[Any], None]]) -> int: return 1
+            def __neg__(self: Closed[Callable[[Any], None]]) -> int: return 1
+            def __invert__(self: Closed[Callable[[Any], None]]) -> int: return 1
+
+        class Known[T]:
+            def __pos__(self: Known[Callable[[str], None]]) -> int: return 1
+
+        def positive(value: Closed[Callable[[str], None]]) -> int: return +value
+        def negative(value: Closed[Callable[[str], None]]) -> int: return -value
+        def inverted(value: Closed[Callable[[str], None]]) -> int: return ~value
+        def known(value: Known[Callable[[str], None]]) -> int: return +value
+        def union(value: Closed[Callable[[str], None]] | Known[Callable[[str], None]]) -> int:
+            return +value
+        def constrained[T: (Closed[Callable[[str], None]], Known[Callable[[str], None]])](value: T) -> int:
+            return +value
+        def bounded[T: Closed[Callable[[str], None]]](value: T) -> int:
+            return +value
+
+        class GradualResult:
+            def __pos__(self) -> dict[str, Any]: return {}
+
+        def gradual_result(value: GradualResult) -> None: +value
+        def dynamic(value: Any) -> None: +value
+        def literal() -> int: return -1 + ~2
+
+        class Constructed:
+            def __init__(self) -> None: pass
+
+        class ClassValued:
+            __pos__ = Constructed
+
+        def constructor(value: ClassValued) -> None: +value
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("positive", true),
+        ("negative", true),
+        ("inverted", true),
+        ("known", false),
+        ("union", true),
+        ("constrained", true),
+        ("bounded", true),
+        ("gradual_result", false),
+        ("dynamic", true),
+        ("literal", false),
+        ("constructor", true),
+    ];
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary = signatures(&db);
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((
+            file,
+            cases.map(|(name, _)| name.to_owned()).to_vec(),
+            mode,
+        )));
+        let model = crate::SemanticModel::new(&db, program_file(&db, file));
+        for (name, unproved) in cases {
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, name))
+                .unwrap();
+            assert_eq!(
+                facts.has_unproved_requirements,
+                mode == FunctionInferenceMode::OutputProof && unproved,
+                "{mode:?} {name}: {facts:?}"
+            );
+            assert!(!facts.has_errors, "{mode:?} {name}");
+            assert_eq!(
+                facts.return_type_correspondence,
+                (mode == FunctionInferenceMode::OutputProof).then_some(true),
+                "{mode:?} {name}"
+            );
+        }
+        assert_eq!(signatures(&db), ordinary);
+        assert_file_diagnostics(&db, "/src/main.py", &[]);
+    }
+    Ok(())
+}
+
+#[test]
 fn parameter_default_correspondence() -> anyhow::Result<()> {
     let mut db = setup_db();
     for (body, unproved) in [
