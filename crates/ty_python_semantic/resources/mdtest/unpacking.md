@@ -1152,6 +1152,36 @@ reveal_type(b)  # revealed: list[int]
 
 ## Union
 
+### Aliased union
+
+Aliases preserve each alternative's unpacked positions and length errors.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+type Pair = tuple[int, str] | tuple[bytes, bool]
+
+def pair(value: Pair):
+    first, second = value
+    reveal_type(first)  # revealed: int | bytes
+    reveal_type(second)  # revealed: str | bool
+
+type DifferentLengths = tuple[int, str] | tuple[bytes, bool, float]
+
+def different_lengths(value: DifferentLengths):
+    first, second = value  # error: [invalid-assignment] "Too many values to unpack"
+    reveal_type(first)  # revealed: int | Unknown
+    reveal_type(second)  # revealed: str | Unknown
+
+type Scalar = int
+
+def scalar(value: Scalar):
+    first, second = value  # error: [not-iterable] "Object of type `Scalar` is not iterable"
+```
+
 ### Same types
 
 Union of two tuples of equal length and each element is of the same type.
