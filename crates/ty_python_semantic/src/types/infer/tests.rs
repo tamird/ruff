@@ -1606,6 +1606,15 @@ fn function_output_correspondence() -> anyhow::Result<()> {
 
         def effectful_operand(value: object, change: Callable[[object], type[Guarded]]) -> TypeGuard[Guarded]:
             return type(value) is change(value)
+
+        def readonly_list(value: object) -> TypeGuard[Sequence[object]]:
+            return type(value) is list
+
+        def typed_list(value: object) -> TypeGuard[Sequence[int]]:
+            return type(value) is list
+
+        def writable_list(value: object) -> TypeGuard[list[object]]:
+            return type(value) is list
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -1649,6 +1658,9 @@ fn function_output_correspondence() -> anyhow::Result<()> {
         "conditional_class",
         "conditional_constant",
         "late_builtin_class",
+        "readonly_list",
+        "typed_list",
+        "writable_list",
     ];
     let signatures = |db: &TestDb| {
         names.map(|name| {
@@ -1719,6 +1731,9 @@ fn function_output_correspondence() -> anyhow::Result<()> {
             None,
             None,
             None,
+            Some(true),
+            Some(false),
+            Some(false),
         ]
     );
     assert_eq!(signatures(&db), ordinary);
