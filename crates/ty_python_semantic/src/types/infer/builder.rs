@@ -8059,13 +8059,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .variables(self.db())
                 .map(|typevar| {
                     let identity = typevar.identity(self.db());
-                    // Keep this parallel with the slow path below: a covariant context provides
-                    // only an upper bound, which does not determine the specialization for an empty
-                    // literal. A contravariant context provides a lower bound, for which inference
-                    // selects the narrowest valid solution.
-                    if elt_tcx_variance
-                        .get(&identity)
-                        .is_some_and(|variance| variance.is_covariant())
+                    // Covariant contexts supply only an upper bound. Nonempty literals retain
+                    // their element inference on the general path; empty literals can choose a
+                    // complete contextual specialization. Contravariant contexts provide lower
+                    // bounds, for which inference selects the narrowest valid solution.
+                    if !elts.is_empty()
+                        && elt_tcx_variance
+                            .get(&identity)
+                            .is_some_and(|variance| variance.is_covariant())
                     {
                         return None;
                     }
@@ -8073,8 +8074,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 })
                 .collect::<Option<Vec<_>>>()
         {
-            // The slow path below adds the contextual specialization as an invariant mapping,
-            // then discards every element constraint that is already assignable to its context.
+            // For nonempty literals, the slow path adds the contextual specialization as an
+            // invariant mapping, then discards every compatible element constraint.
             // Infer the elements once here and retain their types so that a failed fast-path check
             // does not recursively re-infer nested collection literals on the slow path.
             let mut inferred_elts = Vec::with_capacity(elts.len());
@@ -14067,6 +14068,112 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn empty_collection_context_preserves_element_evidence() -> anyhow::Result<()> {
+        for (expression, context, expected, correspondence) in [
+            ("[]", Some("Sequence[str]"), "list[str]", Some(true)),
+            ("['x']", Some("Sequence[str]"), "list[str]", Some(true)),
+            (
+                "[]",
+                Some("Sequence[str] | dict[Any, Any] | None"),
+                "list[str]",
+                Some(true),
+            ),
+            (
+                "['x']",
+                Some("Sequence[str] | dict[Any, Any] | None"),
+                "list[str]",
+                Some(true),
+            ),
+            (
+                "[opaque]",
+                Some("Sequence[Named]"),
+                "list[(...) -> None]",
+                Some(false),
+            ),
+            (
+                "[*opaque_values]",
+                Some("Sequence[Named]"),
+                "list[(...) -> None]",
+                Some(false),
+            ),
+            ("[]", None, "list[Unknown]", None),
+        ] {
+            let mut db = TestDbBuilder::new()
+                .with_file(
+                    "/src/main.py",
+                    &format!(
+                        r#"
+from contracts import opaque, opaque_values
+{expression}
+"#,
+                    ),
+                )
+                .with_file(
+                    "/src/contracts.pyi",
+                    &format!(
+                        r#"
+from typing import Any, Callable, Protocol, Sequence
+class Named(Protocol):
+    def __call__(self, *, name: str) -> None: ...
+opaque: Callable[..., None]
+opaque_values: list[Callable[..., None]]
+target: {}
+"#,
+                        context.unwrap_or("object"),
+                    ),
+                )
+                .build()?;
+            let source = system_path_to_file(&db, "/src/main.py")?;
+            for mode in [
+                crate::FunctionInferenceMode::Default,
+                crate::FunctionInferenceMode::OutputProof,
+            ] {
+                db.select_function_inference(Some((source, vec!["<module>".to_owned()], mode)));
+                let file = db.program_file(source);
+                let target = ProvidedBindingValue::Export {
+                    file: db.program_file(system_path_to_file(&db, "/src/contracts.pyi")?),
+                    name: Name::new_static("target"),
+                }
+                .resolve_type(&db)
+                .unwrap();
+                let module = parsed_module(&db, file.python_file(&db)).load(&db);
+                let [_, ast::Stmt::Expr(statement)] = module.suite().as_slice() else {
+                    panic!("import and expression required")
+                };
+                let env = ProgramEnvironment::from_file(file);
+                let mut builder = TypeInferenceBuilder::new(
+                    &db,
+                    &env,
+                    InferenceRegion::Scope(global_scope(&db, file), TypeContext::default()),
+                    source,
+                    file,
+                    semantic_index(&db, file),
+                    &module,
+                );
+                builder.context.defuse();
+                let actual = builder
+                    .infer_expression(&statement.value, TypeContext::new(context.map(|_| target)));
+                let diagnostics = builder.into_expression_cache_entry().diagnostics;
+                assert_eq!(
+                    actual.display(&db, &env).to_string(),
+                    expected,
+                    "{expression}, {context:?}, {mode:?}"
+                );
+                if let Some(correspondence) = correspondence {
+                    assert_eq!(
+                        actual.satisfies_declared_output(&db, &env, target),
+                        correspondence,
+                        "{expression}, {context:?}, {mode:?}"
+                    );
+                }
+                assert!(!diagnostics.has_unproved_requirements());
+                let diagnostics = diagnostics.into_diagnostics();
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
             }
         }
         Ok(())

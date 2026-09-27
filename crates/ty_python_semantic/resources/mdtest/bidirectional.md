@@ -1201,7 +1201,24 @@ x12: Iterable[list[Any]] = [[i] for i in [1, 2, 3]]
 reveal_type(x12)  # revealed: list[list[Any]]
 ```
 
-As well as generic calls, and constructors of generic classes:
+Empty literals can use a complete contextual specialization even when the context is covariant:
+
+```py
+empty_sequence: Sequence[str] = []
+reveal_type(empty_sequence)  # revealed: list[str]
+
+empty_union: Sequence[str] | dict[Any, Any] | None = []
+reveal_type(empty_union)  # revealed: list[str]
+
+unconstrained = []
+reveal_type(unconstrained)  # revealed: list[Unknown]
+
+def unpack_callbacks(callbacks: list[Callable[..., None]]):
+    values: Sequence[Callable[[int], None]] = [*callbacks]
+    reveal_type(values)  # revealed: list[(...) -> None]
+```
+
+Declared type preference also applies to generic calls and constructors:
 
 ```py
 class X[T]:
