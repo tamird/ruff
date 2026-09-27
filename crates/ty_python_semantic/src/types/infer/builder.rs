@@ -5138,6 +5138,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         match target_type {
             Type::Union(union) => {
+                // Silent member contexts do not retain complete child requirements.
+                state.retain_argument_proof(false);
                 let mut infer_value_ty = MultiInferenceGuard::new(infer_value_ty);
 
                 // Perform loud inference without type context, as there may be multiple
@@ -5178,6 +5180,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         infer_value_ty,
                     )
                 {
+                    state.retain_argument_proof(false);
                     return Ok(typed_dict_update_ty);
                 }
 
@@ -5197,8 +5200,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     Ok(outcome) => {
                         let DunderCallOutcome {
                             bindings: outcome,
-                            arguments_proved: _,
+                            arguments_proved,
                         } = outcome;
+                        state.retain_argument_proof(arguments_proved);
                         state.deprecated_functions.extend(
                             outcome
                                 .deprecated_functions(db)
@@ -5211,8 +5215,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         binary_return_ty(self, value_ty, state)
                     }
                     Err(CallDunderError::PossiblyUnbound {
-                        bindings: outcome, ..
+                        bindings: outcome,
+                        unbound_on: _,
                     }) => {
+                        state.retain_argument_proof(false);
                         state.deprecated_functions.extend(
                             outcome
                                 .deprecated_functions(db)
@@ -5300,6 +5306,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let target_type = target_result.unwrap_or_else(|recovery_ty| recovery_ty);
         let mut state = BinaryInferenceState::default();
+        state.arguments_proved = (self.function_inference_mode
+            == crate::FunctionInferenceMode::OutputProof)
+            .then_some(true);
         let operation_result = self.infer_augmented_op(
             assignment,
             target_type,
@@ -5307,6 +5316,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             &mut |builder, tcx| builder.infer_expression(value, tcx),
             &mut state,
         );
+        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+            && (state.arguments_proved == Some(false)
+                || target_result.is_err()
+                || operation_result.is_err())
+        {
+            self.context.record_unproved_requirement(assignment);
+        }
         self.report_deprecated_functions(assignment, state.deprecated_functions);
 
         match (target_result, operation_result) {

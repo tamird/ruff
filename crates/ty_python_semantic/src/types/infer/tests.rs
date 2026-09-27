@@ -2028,6 +2028,172 @@ fn constructor_storage_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn augmented_storage_correspondence() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, Protocol
+
+        class Named(Protocol):
+            def __call__(self, *, name: str) -> None: ...
+
+        def closed(values: list[Callable[..., None]]) -> Named:
+            callbacks: list[Named] = []
+            callbacks += values
+            return callbacks[0]
+
+        def known(values: list[Named]) -> Named:
+            callbacks: list[Named] = []
+            callbacks += values
+            return callbacks[0]
+
+        def omitted(values: list[Callable[..., None]]) -> Callable[..., None]:
+            callbacks: list[Callable[..., None]] = []
+            callbacks += values
+            return callbacks[0]
+
+        def numeric(value: int) -> int:
+            value += 1
+            return value
+
+        def dynamic(value: Any) -> Any:
+            value += 1
+            return value
+
+        class Normal:
+            def __add__(self, callback: Callable[[Any], None]) -> int: return 1
+
+        class Reflected:
+            def __radd__(self, callback: Callable[[Any], None]) -> int: return 1
+
+        def normal_closed(left: Normal, callback: Callable[[str], None]) -> int:
+            result = left
+            result += callback
+            return result
+
+        def normal_known(left: Normal, callback: Callable[[Any], None]) -> int:
+            result = left
+            result += callback
+            return result
+
+        def reflected_closed(right: Reflected, callback: Callable[[str], None]) -> int:
+            result = callback
+            result += right
+            return result
+
+        def reflected_known(right: Reflected, callback: Callable[[Any], None]) -> int:
+            result = callback
+            result += right
+            return result
+
+        class Rejected:
+            def __add__(self, value: bytes) -> int: return 1
+
+        class Accepted:
+            def __radd__(self, value: Rejected) -> int: return 1
+
+        def discarded(left: Rejected, right: Accepted) -> int:
+            result = left
+            result += right
+            return result
+
+        class Base:
+            def __call__(self, value: str) -> None: pass
+            def __add__(self, right: object) -> int: return 1
+
+        class ClosedChild(Base):
+            def __radd__(self, callback: Callable[[Any], None]) -> int: return 1
+
+        class KnownChild(Base):
+            def __radd__(self, left: Base) -> int: return 1
+
+        def conditional_closed(left: Base, right: ClosedChild) -> int:
+            result = left
+            result += right
+            return result
+
+        def conditional_known(left: Base, right: KnownChild) -> int:
+            result = left
+            result += right
+            return result
+
+        class Factory:
+            def __init__(self, cls: object, callback: Callable[..., None]) -> None: pass
+
+        class Wrapped:
+            __new__ = Factory
+            def __init__(self, callback: Callable[[Any], None]) -> None: pass
+
+        class Operator:
+            __add__ = Wrapped
+
+        def class_valued(left: Operator, callback: Callable[[str], None]) -> object:
+            result = left
+            result += callback
+            return result
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("closed", true),
+        ("known", false),
+        ("omitted", false),
+        ("numeric", false),
+        ("dynamic", true),
+        ("normal_closed", true),
+        ("normal_known", false),
+        ("reflected_closed", true),
+        ("reflected_known", false),
+        ("discarded", false),
+        ("conditional_closed", true),
+        ("conditional_known", false),
+        ("class_valued", true),
+    ];
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary = signatures(&db);
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((
+            file,
+            cases.map(|(name, _)| name.to_owned()).to_vec(),
+            mode,
+        )));
+        let model = crate::SemanticModel::new(&db, program_file(&db, file));
+        for (name, unproved) in cases {
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, name))
+                .unwrap();
+            assert_eq!(
+                facts.has_unproved_requirements,
+                mode == FunctionInferenceMode::OutputProof && unproved,
+                "{mode:?} {name}"
+            );
+            assert!(!facts.has_errors, "{mode:?} {name}");
+            assert_eq!(
+                facts.return_type_correspondence,
+                (mode == FunctionInferenceMode::OutputProof).then_some(true),
+                "{mode:?} {name}"
+            );
+        }
+        assert_eq!(signatures(&db), ordinary);
+        assert_file_diagnostics(&db, "/src/main.py", &[]);
+    }
+    Ok(())
+}
+
+#[test]
 fn parameter_default_correspondence() -> anyhow::Result<()> {
     let mut db = setup_db();
     for (body, unproved) in [
