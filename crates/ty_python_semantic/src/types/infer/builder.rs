@@ -23,6 +23,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use strum::IntoEnumIterator;
 use ty_module_resolver::{ImportingFile, ModuleName, resolve_module};
+use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::statement::StatementInner;
 
 use super::{
@@ -39,8 +40,8 @@ use crate::place::{
     RequiresExplicitReExport, TypeOrigin, builtins_module_scope, class_body_implicit_symbol,
     explicit_global_symbol, implicit_builtins_symbol, loop_header_reachability,
     module_type_implicit_global_declaration, module_type_implicit_global_symbol, place_by_id,
-    place_from_bindings_with_reachability_cache, place_from_declarations_with_reachability_cache,
-    typing_extensions_symbol,
+    place_from_bindings_assuming_boolean, place_from_bindings_with_reachability_cache,
+    place_from_declarations_with_reachability_cache, typing_extensions_symbol,
 };
 use crate::place_load::{
     ImplicitPlaceLoad, PlaceExprPrefixLoad, PlaceExprPrefixLoads, PlaceLoadFailure, PlaceLoadMode,
@@ -156,7 +157,7 @@ use ty_python_core::predicate::PatternPredicate;
 use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, NodeWithScopeRef, ScopeId, ScopeKind};
 use ty_python_core::symbol::ScopedSymbolId;
 use ty_python_core::{
-    ApplicableConstraints, EvaluationMode, ProgramFile, SemanticIndex, Truthiness,
+    ApplicableConstraints, EvaluationMode, ProgramFile, SemanticIndex, Truthiness, place_table,
     unpack::UnpackPosition,
 };
 use ty_python_core::{ExpressionNodeKey, Statement};
@@ -7655,6 +7656,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.infer_expression(elt, element_tcx);
         }
 
+        if let Some(correlated) = self.joined_tuple_type(elts) {
+            return correlated;
+        }
+
         // Infer expressions once, in evaluation order and with their type context, before
         // recovering literal positions. For `(*[(item := 1), item],)`, both list elements
         // must be inferred before the traversal reads their types.
@@ -7678,6 +7683,118 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             &|builder, unpacked| builder.concat(db, env, unpacked),
         );
         Type::tuple(TupleType::new(db, env, &spec))
+    }
+
+    /// Retain two Boolean paths when constructing a tuple from passive local reads.
+    fn joined_tuple_type(&self, elements: &[ast::Expr]) -> Option<Type<'db>> {
+        let db = self.db();
+        let env = self.program_environment();
+        let scope = self.scope();
+        if scope.node(db).scope_kind() != ScopeKind::Function
+            || elements.len() < 2
+            || tuple_literal_needs_promotion(elements)
+            || !elements.iter().all(ast::Expr::is_name_expr)
+            || !elements.iter().any(|element| {
+                self.expression_type(element)
+                    .resolve_type_alias(db)
+                    .is_bool(db)
+            })
+        {
+            return None;
+        }
+        let places = place_table(db, scope);
+        let use_def = self.index.use_def_map(scope.file_scope_id(db));
+        let mut names = Vec::with_capacity(elements.len());
+        let mut tag = None;
+        let is_provisional = |ty| {
+            crate::types::visitor::any_over_type_expanding_aliases(db, env, ty, |ty| {
+                matches!(ty, Type::Divergent(_))
+                    || ty
+                        .as_dynamic()
+                        .is_some_and(DynamicType::is_provisional_marker)
+            })
+        };
+        for (position, element) in elements.iter().enumerate() {
+            let ast::Expr::Name(name) = element else {
+                return None;
+            };
+            let symbol = places.symbol_id(&name.id)?;
+            if !places.symbol(symbol).is_local()
+                || use_def.reachable_symbol_bindings(symbol).any(|binding| {
+                    binding.binding.definition().is_some_and(|definition| {
+                        matches!(
+                            definition.kind(db),
+                            DefinitionKind::LoopHeader(_) | DefinitionKind::NestedBindings(_)
+                        )
+                    })
+                })
+            {
+                return None;
+            }
+            let ordinary = self.expression_type(element);
+            if is_provisional(ordinary) {
+                return None;
+            }
+            let use_id = name.scoped_use_id(db, self.program_file());
+            let bindings = use_def.bindings_at_use(use_id);
+            let mut sole_definition = None;
+            let mut has_multiple = false;
+            for binding in bindings {
+                let definition = binding.binding.definition()?;
+                if infer_definition_types(db, definition).is_provisional() {
+                    return None;
+                }
+                if sole_definition.is_some_and(|previous| previous != definition) {
+                    has_multiple = true;
+                }
+                sole_definition = Some(definition);
+            }
+            if tag.is_none() && !has_multiple && ordinary.resolve_type_alias(db).is_bool(db) {
+                tag = Some((position, sole_definition?));
+            }
+            names.push((use_id, ordinary));
+        }
+        let (tag_index, definition) = tag?;
+        let mut refined_payload = false;
+        let mut rows = UnionBuilder::new(db, env);
+        for value in [true, false] {
+            let mut row = Vec::with_capacity(elements.len());
+            for (position, &(use_id, ordinary)) in names.iter().enumerate() {
+                let place = place_from_bindings_assuming_boolean(
+                    db,
+                    env,
+                    use_def.bindings_at_use(use_id),
+                    definition,
+                    value,
+                )
+                .place;
+                if !place.is_definitely_bound() {
+                    return None;
+                }
+                let projected = place.raw_type()?;
+                if is_provisional(projected) {
+                    return None;
+                }
+                if position == tag_index {
+                    row.push(Type::bool_literal(value));
+                } else {
+                    if projected != ordinary {
+                        if !projected.is_subtype_of(db, env, ordinary) {
+                            return None;
+                        }
+                        refined_payload = true;
+                    }
+                    row.push(projected);
+                }
+            }
+            rows.add_in_place(Type::tuple(TupleType::new(
+                db,
+                env,
+                &Tuple::heterogeneous(row),
+            )));
+        }
+        // Splitting the tag alone does not retain any additional relationship.
+        refined_payload.then(|| rows.build())
     }
 
     fn infer_list_expression(&mut self, list: &ast::ExprList, tcx: TypeContext<'db>) -> Type<'db> {

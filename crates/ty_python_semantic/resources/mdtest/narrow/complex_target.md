@@ -865,3 +865,77 @@ def _(c: Container):
     if c.data[b"key"] is not None:
         reveal_type(c.data[b"key"])  # revealed: int
 ```
+
+## Constructing tagged tuples after a branch join
+
+```py
+from typing import Literal
+
+Tagged = tuple[Literal[True], int] | tuple[Literal[False], str]
+
+def joined(flag: bool) -> Tagged:
+    if flag:
+        payload = 1
+    else:
+        payload = "x"
+    reveal_type((flag, payload))  # revealed: tuple[Literal[True], Literal[1]] | tuple[Literal[False], Literal["x"]]
+    return flag, payload
+
+def branch_local(flag: bool) -> Tagged:
+    if flag:
+        return True, 1
+    else:
+        return False, "x"
+
+def narrowed_payload(flag: bool, integer: int | None, text: str | None) -> Tagged:
+    if flag:
+        payload = integer
+    else:
+        payload = text
+    assert payload is not None
+    return flag, payload
+```
+
+Reassigning either field or using an independent payload does not establish the tagged contract. A
+captured writer can also replace a local after its branch assignment.
+
+```py
+from typing import Literal
+
+Tagged = tuple[Literal[True], int] | tuple[Literal[False], str]
+
+def unrelated(flag: bool, payload: int | str) -> Tagged:
+    return flag, payload  # error: [invalid-return-type]
+
+def changed_tag(flag: bool) -> Tagged:
+    if flag:
+        payload = 1
+    else:
+        payload = "x"
+    flag = not flag
+    return flag, payload  # error: [invalid-return-type]
+
+def changed_payload(flag: bool, other: int | str) -> Tagged:
+    if flag:
+        payload = 1
+    else:
+        payload = "x"
+    payload = other
+    return flag, payload  # error: [invalid-return-type]
+
+def captured_payload(flag: bool, other: int | str) -> Tagged:
+    if flag:
+        payload = 1
+    else:
+        payload = "x"
+    def replace():
+        nonlocal payload
+        payload = other
+    replace()
+    return flag, payload  # error: [invalid-return-type]
+
+def missing_payload(flag: bool):
+    if flag:
+        payload = 1
+    return flag, payload  # error: [possibly-unresolved-reference]
+```

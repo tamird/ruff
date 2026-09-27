@@ -2149,6 +2149,32 @@ pub(crate) fn evaluate_reachability(
         .evaluate(db, use_def.predicates(), reachability)
 }
 
+/// Project a path under one stable Boolean value without reusing ordinary checkpoints.
+pub(crate) fn evaluate_reachability_assuming_boolean<'db>(
+    db: &'db dyn Db,
+    constraints: &ReachabilityConstraints,
+    predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
+    reachability: ScopedReachabilityConstraintId,
+    definition: Definition<'db>,
+    value: bool,
+) -> Truthiness {
+    let scope = definition.scope(db);
+    let env = ProgramEnvironment::from_scope(scope);
+    let use_def = use_def_map(db, scope);
+    constraints.project(reachability, |atom| {
+        match analyze_reachability_atom(db, &env, use_def, predicates, atom) {
+            ReachabilityAtom::Symbolic { key, is_positive } => {
+                if key == definition {
+                    ReachabilityAtom::Known(Truthiness::from(value == is_positive))
+                } else {
+                    ReachabilityAtom::Symbolic { key, is_positive }
+                }
+            }
+            ReachabilityAtom::Known(truthiness) => ReachabilityAtom::Known(truthiness),
+        }
+    })
+}
+
 /// Exclude an exact initial binding when its survival fixes a later loop guard.
 /// The evaluation is local to this assumption; ordinary checkpoint results carry no binding key.
 pub(crate) fn refine_initial_binding_reachability<'db>(
