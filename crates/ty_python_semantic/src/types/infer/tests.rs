@@ -1714,6 +1714,130 @@ fn function_argument_correspondence_with_disabled_diagnostics() -> anyhow::Resul
 }
 
 #[test]
+fn indexed_store_correspondence() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .build()?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, Literal, Protocol
+        from typing_extensions import TypedDict
+
+        class Named(Protocol):
+            def __call__(self, *, name: str) -> None: ...
+
+        class Bag(TypedDict):
+            run: Named
+
+        class OpenBag(TypedDict, extra_items=Named):
+            run: Named
+
+        class Pair(TypedDict):
+            a: Named
+            b: Named
+
+        class First:
+            def __setitem__(self, index: str, value: bytes) -> None: ...
+
+        class Second:
+            def __setitem__(self, index: int, value: Named) -> None: ...
+
+        def list_closed(values: list[Named], value: Callable[..., None]) -> None:
+            values[0] = value
+
+        def list_known(values: list[Named], value: Named) -> None:
+            values[0] = value
+
+        def list_omitted(values: list[Callable[..., None]], value: Callable[..., None]) -> None:
+            values[0] = value
+
+        def dict_closed(values: dict[str, Named], value: Callable[..., None]) -> None:
+            values["run"] = value
+
+        def td_closed(values: Bag, value: Callable[..., None]) -> None:
+            values["run"] = value
+
+        def td_known(values: Bag, value: Named) -> None:
+            values["run"] = value
+
+        def td_extra(values: OpenBag, key: str, value: Callable[..., None]) -> None:
+            values[key] = value
+
+        def td_extra_known(values: OpenBag, key: str, value: Named) -> None:
+            values[key] = value
+
+        def td_extra_gradual(values: OpenBag, key: str | Any, value: Named) -> None:
+            values[key] = value
+
+        def td_dynamic(values: Bag, key: Any, value: Named) -> None:
+            values[key] = value
+
+        def td_multiple(values: Pair, key: Literal["a", "b"], value: Callable[..., None]) -> None:
+            values[key] = value
+
+        def union(values: list[Named] | dict[int, Named], value: Callable[..., None]) -> None:
+            values[0] = value
+
+        def intersection(values: First, value: Named) -> None:
+            if isinstance(values, Second):
+                values[0] = value
+
+        def intersection_closed(values: First, value: Callable[..., None]) -> None:
+            if isinstance(values, Second):
+                values[0] = value
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("list_closed", true),
+        ("list_known", false),
+        ("list_omitted", false),
+        ("dict_closed", true),
+        ("td_closed", true),
+        ("td_known", false),
+        ("td_extra", true),
+        ("td_extra_known", false),
+        ("td_extra_gradual", true),
+        // Gradual keys and callback domains do not establish the destination requirements.
+        ("td_dynamic", true),
+        ("td_multiple", true),
+        ("union", true),
+        ("intersection", false),
+        ("intersection_closed", true),
+    ];
+    let facts = |db: &TestDb, name: &str| {
+        crate::SemanticModel::new(db, program_file(db, file))
+            .function_inference_facts(first_public_binding(db, file, name))
+            .unwrap()
+    };
+    for (name, _) in cases {
+        assert!(!facts(&db, name).has_unproved_requirements, "{name}");
+    }
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+
+    db.select_function_inference(Some((
+        file,
+        cases.map(|(name, _)| name.to_owned()).to_vec(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    for (name, unproved) in cases {
+        let result = facts(&db, name);
+        assert_eq!(result.has_unproved_requirements, unproved, "{name}");
+        assert_eq!(result.return_type_correspondence, Some(true), "{name}");
+        assert!(!result.has_errors, "{name}");
+    }
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+
+    db.select_function_inference(None);
+    for (name, _) in cases {
+        assert!(!facts(&db, name).has_unproved_requirements, "{name}");
+    }
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    Ok(())
+}
+
+#[test]
 fn conservative_source_globals() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(

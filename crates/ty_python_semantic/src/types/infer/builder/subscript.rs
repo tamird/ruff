@@ -18,7 +18,9 @@ use crate::types::diagnostic::{
 };
 use crate::types::generics::{GenericContext, bind_typevar};
 use crate::types::infer::builder::annotation_expression::PEP613Policy;
-use crate::types::infer::builder::{ArgExpr, ArgumentsIter, MultiInferenceGuard};
+use crate::types::infer::builder::{
+    ArgExpr, ArgumentsIter, DunderCallOutcome, MultiInferenceGuard,
+};
 use crate::types::infer::{InferenceFlags, TypeExpressionFlags};
 use crate::types::special_form::AliasSpec;
 use crate::types::subscript::{LegacyGenericOrigin, SubscriptError, SubscriptErrorKind};
@@ -39,6 +41,19 @@ use ty_python_core::definition::Definition;
 use ty_python_core::place::PlaceExpr;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::{SemanticIndex, place_table};
+
+/// Ordinary assignment validity and the requirements of the selected write.
+struct SubscriptAssignmentOutcome {
+    valid: bool,
+    requirements_proved: bool,
+}
+
+impl SubscriptAssignmentOutcome {
+    const INVALID: Self = Self {
+        valid: false,
+        requirements_proved: false,
+    };
+}
 
 /// Given a string literal or a union of string literals, return an iterator over the contained
 /// strings, or `None` if the type is neither.
@@ -1644,7 +1659,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         self.store_typed_dict_key_expected_type(slice, object_ty);
 
-        let is_valid_assignment = self.validate_subscript_assignment_impl(
+        let SubscriptAssignmentOutcome {
+            valid: is_valid_assignment,
+            requirements_proved,
+        } = self.validate_subscript_assignment_impl(
             target,
             None,
             object_ty,
@@ -1653,6 +1671,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             infer_rhs_value,
             true,
         );
+
+        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+            && !requirements_proved
+        {
+            self.context.record_unproved_requirement(target);
+        }
 
         // Record the constraints for the object of the subscript assignment, if the object is an
         // unannotated collection initializer.
@@ -1749,9 +1773,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         rhs_value_node: &ast::Expr,
         infer_rhs_value: &mut dyn FnMut(&mut Self, TypeContext<'db>) -> Type<'db>,
         emit_diagnostic: bool,
-    ) -> bool {
+    ) -> SubscriptAssignmentOutcome {
         let env = self.program_environment();
         let db = self.db();
+
+        let check_requirements =
+            self.function_inference_mode == crate::FunctionInferenceMode::OutputProof;
+        let proves_value = |actual: Type<'db>, expected: Type<'db>| {
+            !check_requirements
+                || (expected.is_fully_static_except_any(db, env)
+                    && !actual.has_provisional_marker(db, env)
+                    && actual.satisfies_declared_output(db, env, expected))
+        };
 
         let attach_original_type_info = |diagnostic: &mut LintDiagnosticGuard| {
             if let Some(full_object_ty) = full_object_ty {
@@ -1777,18 +1810,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // We need to keep iterating to emit all diagnostics.
                 let mut valid = true;
                 for element_ty in union.elements(db) {
-                    valid &= self.validate_subscript_assignment_impl(
-                        target,
-                        full_object_ty.or(Some(object_ty)),
-                        *element_ty,
-                        &mut |builder, tcx| infer_slice_ty.infer_silent(builder, tcx),
-                        rhs_value_node,
-                        &mut |builder, tcx| infer_rhs_value.infer_silent(builder, tcx),
-                        emit_diagnostic,
-                    );
+                    valid &= self
+                        .validate_subscript_assignment_impl(
+                            target,
+                            full_object_ty.or(Some(object_ty)),
+                            *element_ty,
+                            &mut |builder, tcx| infer_slice_ty.infer_silent(builder, tcx),
+                            rhs_value_node,
+                            &mut |builder, tcx| infer_rhs_value.infer_silent(builder, tcx),
+                            emit_diagnostic,
+                        )
+                        .valid;
                 }
 
-                valid
+                // Contextual child results from the silent union checks are not committed.
+                SubscriptAssignmentOutcome {
+                    valid,
+                    requirements_proved: false,
+                }
             }
 
             Type::Intersection(intersection) => {
@@ -1796,39 +1835,51 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let mut infer_rhs_value = MultiInferenceGuard::new(infer_rhs_value);
 
                 let mut check_positive_elements = |emit_diagnostic_and_short_circuit| {
-                    let mut valid = false;
+                    let mut outcome = SubscriptAssignmentOutcome::INVALID;
                     for element_ty in intersection.positive(db) {
-                        valid |= self.validate_subscript_assignment_impl(
+                        let mut slice_ty = None;
+                        let mut rhs_ty = None;
+                        outcome = self.validate_subscript_assignment_impl(
                             target,
                             full_object_ty.or(Some(object_ty)),
                             *element_ty,
-                            &mut |builder, tcx| infer_slice_ty.infer_silent(builder, tcx),
+                            &mut |builder, tcx| {
+                                let ty = infer_slice_ty.infer_silent(builder, tcx);
+                                slice_ty = Some(ty);
+                                ty
+                            },
                             rhs_value_node,
-                            &mut |builder, tcx| infer_rhs_value.infer_silent(builder, tcx),
+                            &mut |builder, tcx| {
+                                let ty = infer_rhs_value.infer_silent(builder, tcx);
+                                rhs_ty = Some(ty);
+                                ty
+                            },
                             emit_diagnostic_and_short_circuit,
                         );
 
-                        if valid || emit_diagnostic_and_short_circuit {
-                            // Otherwise, perform loud inference with the narrowed type context, or the
-                            // type context of the first failing element.
-                            infer_slice_ty.infer_loud(self, infer_slice_ty.last_tcx());
-                            infer_rhs_value.infer_loud(self, infer_rhs_value.last_tcx());
+                        if outcome.valid || emit_diagnostic_and_short_circuit {
+                            // Commit the context selected by ordinary checking. A different
+                            // committed type cannot reuse the silent branch's argument proof.
+                            let committed_slice =
+                                infer_slice_ty.infer_loud(self, infer_slice_ty.last_tcx());
+                            let committed_rhs =
+                                infer_rhs_value.infer_loud(self, infer_rhs_value.last_tcx());
+                            outcome.requirements_proved &=
+                                slice_ty == Some(committed_slice) && rhs_ty == Some(committed_rhs);
                             break;
                         }
                     }
 
-                    valid
+                    outcome
                 };
 
-                // Perform an initial check of all elements. If the assignment is valid
-                // for at least one element, we do not emit any diagnostics. Otherwise,
-                // we re-run the check and emit a diagnostic on the first failing element.
-                let valid = check_positive_elements(false);
-                if !valid {
+                // Proof does not select the ordinary branch or trigger diagnostic replay.
+                let outcome = check_positive_elements(false);
+                if !outcome.valid {
                     check_positive_elements(true);
                 }
 
-                valid
+                outcome
             }
 
             Type::EnumComplement(complement) => self.validate_subscript_assignment_impl(
@@ -1855,16 +1906,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // fail to provide the "can only be subscripted with a string literal key" hint in that case.
 
                     if slice_ty.is_dynamic() {
-                        return true;
+                        return SubscriptAssignmentOutcome {
+                            valid: true,
+                            requirements_proved: false,
+                        };
                     }
 
-                    if slice_ty.is_assignable_to(db, env, KnownClass::Str.to_instance(db, env))
+                    let string_ty = KnownClass::Str.to_instance(db, env);
+                    if slice_ty.is_assignable_to(db, env, string_ty)
                         && let Some(expected_ty) = typed_dict.arbitrary_key_mutation_type(db, env)
                     {
                         let rhs_value_ty =
                             infer_rhs_value(self, TypeContext::new(Some(expected_ty)));
                         if rhs_value_ty.is_assignable_to(db, env, expected_ty) {
-                            return true;
+                            return SubscriptAssignmentOutcome {
+                                valid: true,
+                                requirements_proved: proves_value(slice_ty, string_ty)
+                                    && proves_value(rhs_value_ty, expected_ty),
+                            };
                         }
 
                         if emit_diagnostic
@@ -1885,7 +1944,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             ));
                             attach_original_type_info(&mut diagnostic);
                         }
-                        return false;
+                        return SubscriptAssignmentOutcome::INVALID;
                     }
 
                     let rhs_value_ty = infer_rhs_value(self, TypeContext::default());
@@ -1920,14 +1979,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         }
                     }
 
-                    return false;
+                    return SubscriptAssignmentOutcome::INVALID;
                 };
 
                 // We may need to infer the value multiple times for distinct keys.
                 let mut key_count = 0;
+                let mut possible_key_count = 0;
+                let mut last_rhs_ty = None;
+                let mut requirements_proved = true;
                 let mut infer_rhs_value = MultiInferenceGuard::new(infer_rhs_value);
 
                 for key in keys {
+                    possible_key_count += 1;
                     // Infer the value with type context.
                     let item = typed_dict.item(db, key);
                     let value_ty = infer_rhs_value.infer_silent(
@@ -1935,6 +1998,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         TypeContext::new(item.as_ref().map(|item| item.declared_ty)),
                     );
 
+                    last_rhs_ty = Some(value_ty);
+                    requirements_proved &= item
+                        .as_ref()
+                        .is_some_and(|item| proves_value(value_ty, item.declared_ty));
                     if item.is_some() {
                         key_count += 1;
                     }
@@ -1954,13 +2021,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
 
                 // Perform loud inference with type context if there is a single key.
-                if key_count == 1 {
-                    infer_rhs_value.infer_loud(self, infer_rhs_value.last_tcx());
+                let committed_rhs = if key_count == 1 {
+                    infer_rhs_value.infer_loud(self, infer_rhs_value.last_tcx())
                 } else {
-                    infer_rhs_value.infer_loud(self, TypeContext::default());
-                }
+                    infer_rhs_value.infer_loud(self, TypeContext::default())
+                };
 
-                valid
+                SubscriptAssignmentOutcome {
+                    valid,
+                    requirements_proved: valid
+                        && requirements_proved
+                        && possible_key_count == 1
+                        && last_rhs_ty == Some(committed_rhs),
+                }
             }
 
             _ => {
@@ -1981,7 +2054,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         }
                     };
 
-                let Err(call_dunder_err) = self.infer_and_try_call_dunder(
+                let call_result = self.infer_and_try_call_dunder(
                     object_ty,
                     "__setitem__",
                     MemberLookupPolicy::NO_INSTANCE_FALLBACK,
@@ -1989,11 +2062,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     &mut call_arguments,
                     &mut infer_argument_ty,
                     TypeContext::default(),
-                ) else {
-                    return true;
+                );
+                let call_dunder_err = match call_result {
+                    Ok(outcome) => {
+                        let DunderCallOutcome {
+                            bindings: _,
+                            arguments_proved,
+                        } = outcome;
+                        return SubscriptAssignmentOutcome {
+                            valid: true,
+                            requirements_proved: arguments_proved,
+                        };
+                    }
+                    Err(error) => error,
                 };
 
-                match call_dunder_err {
+                let valid = match call_dunder_err {
                     CallDunderError::PossiblyUnbound { .. } => {
                         if emit_diagnostic
                             && let Some(builder) = self
@@ -2164,6 +2248,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         }
                         false
                     }
+                };
+                SubscriptAssignmentOutcome {
+                    valid,
+                    requirements_proved: false,
                 }
             }
         }
