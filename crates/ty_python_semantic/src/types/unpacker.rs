@@ -249,7 +249,8 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             // if we manually map over the union and call `try_iterate` on each union element.
             // See <https://github.com/astral-sh/ruff/pull/20377#issuecomment-3401380305>
             // for more discussion.
-            let unpack_types = match value.ty {
+            let unpack_type = value.ty.resolve_type_alias(db);
+            let unpack_types = match unpack_type {
                 Type::Union(union_ty) => union_ty.elements(db),
                 _ => std::slice::from_ref(&value.ty),
             };
