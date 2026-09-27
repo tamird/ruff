@@ -10791,6 +10791,60 @@ bound = holder.read
     }
 
     #[test]
+    fn composite_union_inference_retains_alternatives() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+from _typeshed import SupportsKeysAndGetItem
+from typing import Iterable
+
+def copy[K, V](source: SupportsKeysAndGetItem[K, V] | Iterable[tuple[K, V]]) -> dict[K, V]:
+    raise NotImplementedError
+
+def correlate[K, V](
+    source: SupportsKeysAndGetItem[K, V] | Iterable[tuple[K, V]], target: dict[K, V]
+) -> dict[K, V]:
+    raise NotImplementedError
+
+mapping: dict[str, int]
+pairs: list[tuple[str, int]]
+wrong_values: dict[str, bytes]
+"#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let lookup = |name| global_symbol(db, file, name).place.expect_type();
+        let copy = lookup("copy");
+        let correlate = lookup("correlate");
+        let mapping = lookup("mapping");
+        let str = KnownClass::Str.to_instance(db, &env);
+        let int = KnownClass::Int.to_instance(db, &env);
+        for argument in [mapping, lookup("pairs")] {
+            for inference in [
+                call_inference(db, copy, [argument], TypeContext::default())?,
+                call_inference(db, correlate, [argument, mapping], TypeContext::default())?,
+            ] {
+                assert_eq!(inference.solutions(db), &TypeVarInferenceSolutions::Single);
+                assert_eq!(inference.merged_specialization(db).types(db), &[str, int]);
+            }
+        }
+        assert!(call_inference(db, copy, [str], TypeContext::default()).is_err());
+        assert!(
+            call_inference(
+                db,
+                correlate,
+                [mapping, lookup("wrong_values")],
+                TypeContext::default(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn overloaded_argument_retains_correlated_inference() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(

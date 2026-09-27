@@ -1023,8 +1023,8 @@ Passing anything else results in an error:
 reveal_type(extract_optional_t(Q[str]()))  # revealed: Unknown
 ```
 
-If the union contains contains parent and child of a generic class, we ideally pick the union
-element that is more precise:
+When a union contains a generic class and its subclass, inference can retain the subclass arm's more
+precise constraint:
 
 ```py
 class Base(Generic[T]):
@@ -1036,8 +1036,7 @@ def f(t: Base[T] | Sub[T | None]) -> T:
     raise NotImplementedError
 
 reveal_type(f(Base[int]()))  # revealed: int
-# TODO: Should ideally be `str`
-reveal_type(f(Sub[str | None]()))  # revealed: str | None
+reveal_type(f(Sub[str | None]()))  # revealed: str
 ```
 
 If we have a case like the following, where only one of the union elements matches due to the
