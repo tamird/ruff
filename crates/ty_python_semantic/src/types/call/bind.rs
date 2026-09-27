@@ -68,16 +68,17 @@ use crate::types::typed_dict::{TypedDictOpenness, extract_unpacked_typed_dict_fr
 use crate::types::typevar::{BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVarSet};
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
-    TypeCollector, TypeKind, TypeVisitor, any_over_type, walk_non_atomic_type,
-    walk_type_with_recursion_guard,
+    TypeCollector, TypeKind, TypeVisitor, any_over_type, any_over_type_expanding_aliases,
+    walk_non_atomic_type, walk_type_with_recursion_guard,
 };
 use crate::types::{
     BindingContext, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
     DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType, GenericAlias,
     InternedConstraintSet, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
-    LiteralValueTypeKind, NominalInstanceType, PropertyInstanceType, TypeContext, TypeIdentity,
-    TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance, UnionAccumulator, UnionBuilder,
-    UnionType, WrapperDescriptorKind, enums, is_property_method, list_members,
+    LiteralValueTypeKind, MemberLookupPolicy, NominalInstanceType, PropertyInstanceType,
+    TypeContext, TypeIdentity, TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance,
+    UnionAccumulator, UnionBuilder, UnionType, WrapperDescriptorKind, enums, is_property_method,
+    list_members,
 };
 use crate::types::{DictionaryItemKind, ProgramEnvironment};
 use crate::{DisplaySettings, FxOrderSet};
@@ -2951,6 +2952,10 @@ impl<'db> Bindings<'db> {
                                     ),
                                 );
                             }
+                        }
+
+                        Some(KnownFunction::GetAttr) => {
+                            overload.infer_getattr(db, env, call_arguments.requests_input_proof());
                         }
 
                         Some(KnownFunction::GetattrStatic) => {
@@ -8074,6 +8079,77 @@ pub(crate) struct Binding<'db> {
 }
 
 impl<'db> Binding<'db> {
+    /// Infers finite runtime lookups while retaining their implicit call requirements.
+    fn infer_getattr(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        request_input_proof: bool,
+    ) {
+        self.nested_call_has_unproved_inputs = true;
+        let (instance, names, default) = match self.parameter_types() {
+            [Some(instance), Some(names)] => (*instance, *names, Type::Never),
+            [Some(instance), Some(names), Some(default)] => (*instance, *names, *default),
+            _ => return,
+        };
+        let names = match names.resolve_type_alias(db) {
+            Type::Union(union) => union.expand_aliases(db, env),
+            names => names,
+        };
+        let mut policy = MemberLookupPolicy::RUNTIME_ATTRIBUTE;
+        if request_input_proof {
+            policy |= MemberLookupPolicy::PROVE_GETTER_INPUTS;
+        }
+        let mut inputs_proved = true;
+        let mut lookup = |name: &Type<'db>| {
+            let name = name.as_string_literal()?;
+            let member = instance
+                .member_lookup_with_policy_and_receiver(db, env, name.value(db), policy, None)
+                .ok()?;
+            let Place::Defined(DefinedPlace {
+                ty,
+                origin: _,
+                definedness: Definedness::AlwaysDefined,
+                public_type_policy: _,
+                provenance: _,
+            }) = member.member(db).place
+            else {
+                return None;
+            };
+            if any_over_type_expanding_aliases(db, env, ty, |nested| {
+                matches!(nested, Type::Divergent(_))
+                    || nested
+                        .as_dynamic()
+                        .is_some_and(DynamicType::is_provisional_marker)
+            }) {
+                return None;
+            }
+            let resolved = match ty.resolve_type_alias(db) {
+                Type::Union(union) => union.expand_aliases(db, env),
+                resolved => resolved,
+            };
+            let dynamic = match resolved {
+                Type::Union(union) => union.elements(db).iter().any(Type::is_dynamic),
+                resolved => resolved.is_dynamic(),
+            };
+            if dynamic {
+                return None;
+            }
+            inputs_proved &= member.inputs_proved(db);
+            Some(ty)
+        };
+        let result = match names {
+            Type::Union(union) => union.try_map(db, env, lookup),
+            name => lookup(&name),
+        };
+        if let Some(result) = result {
+            // A present descriptor can raise AttributeError, causing getattr to return
+            // the supplied default. Static boundness does not establish getter totality.
+            self.set_return_type(UnionType::from_two_elements(db, env, result, default));
+            self.nested_call_has_unproved_inputs = !(request_input_proof && inputs_proved);
+        }
+    }
+
     /// Checks the getter invoked by `property.__get__`, retaining its error and recovery type.
     fn check_property_getter(
         &mut self,

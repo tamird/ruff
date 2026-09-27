@@ -3063,7 +3063,7 @@ fn descriptor_argument_correspondence() -> anyhow::Result<()> {
         "/src/main.py",
         r#"
         from __future__ import annotations
-        from typing import Any, Callable
+        from typing import Any, Callable, Literal
         from ty_extensions import Intersection
 
         class Descriptor:
@@ -3071,6 +3071,7 @@ fn descriptor_argument_correspondence() -> anyhow::Result<()> {
 
         class Box[T]:
             field = Descriptor()
+            plain: int = 1
 
         class KnownDescriptor:
             def __get__(self, instance: KnownBox[Callable[[str], None]], owner: object = None) -> dict[str, Any]: return {}
@@ -3124,6 +3125,16 @@ fn descriptor_argument_correspondence() -> anyhow::Result<()> {
         class Ordinary:
             def method(self) -> int: return 1
         def method(value: Ordinary) -> int: return value.method()
+
+        def getattr_custom(value: Box[Callable[[str], None]]) -> None: getattr(value, "field")
+        def getattr_known(value: KnownBox[Callable[[str], None]]) -> None: getattr(value, "field")
+        def getattr_property(value: PropertyBox[Callable[[str], None]]) -> None: getattr(value, "field", None)
+        def getattr_known_property(value: KnownPropertyBox[Callable[[str], None]]) -> None: getattr(value, "field", None)
+        def getattr_names(value: Box[Callable[[str], None]], name: Literal["plain", "field"]) -> None: getattr(value, name)
+        def getattr_missing(value: Ordinary) -> None: getattr(value, "missing", None)
+        def getattr_broad(value: Ordinary, name: str) -> None: getattr(value, name)
+        def getattr_union(value: Box[Callable[[str], None]] | KnownBox[Callable[[str], None]]) -> None: getattr(value, "field")
+        def getattr_partial(value: KnownBox[Callable[[str], None]] | Missing) -> None: getattr(value, "field", None)
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -3144,6 +3155,15 @@ fn descriptor_argument_correspondence() -> anyhow::Result<()> {
         ("method", false),
         ("fallback", true),
         ("intercepted", true),
+        ("getattr_custom", true),
+        ("getattr_known", false),
+        ("getattr_property", true),
+        ("getattr_known_property", false),
+        ("getattr_names", true),
+        ("getattr_missing", true),
+        ("getattr_broad", true),
+        ("getattr_union", true),
+        ("getattr_partial", true),
     ];
     let signatures = |db: &TestDb| {
         cases.map(|(name, _)| {
