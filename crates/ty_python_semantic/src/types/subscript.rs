@@ -617,7 +617,8 @@ impl<'db> Type<'db> {
         slice_ty: Type<'db>,
         mode: FunctionInferenceMode,
     ) -> Result<SubscriptResult<'db>, CallDunderError<'db>> {
-        let mut arguments = CallArguments::positional([slice_ty]);
+        let mut arguments = CallArguments::positional([slice_ty])
+            .with_input_proof_request(mode == FunctionInferenceMode::OutputProof);
         let bindings = self.try_call_dunder_with_policy(
             db,
             env,

@@ -263,7 +263,8 @@ impl<'db> Type<'db> {
         // establish that priority conditionally.
         let reflected_priority = reflected_method_priority(db, env, left_ty, right_ty);
         let call_dunder = |receiver: Type<'db>, name, argument| {
-            let mut arguments = CallArguments::positional([argument]);
+            let mut arguments =
+                CallArguments::positional([argument]).with_input_proof_request(prove_arguments);
             let bindings = receiver.try_call_dunder_with_policy(
                 db,
                 env,

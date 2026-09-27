@@ -2859,6 +2859,142 @@ fn unary_argument_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn descriptor_argument_correspondence() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from __future__ import annotations
+        from typing import Any, Callable
+        from ty_extensions import Intersection
+
+        class Descriptor:
+            def __get__(self, instance: Box[Callable[[Any], None]], owner: object = None) -> dict[str, Any]: return {}
+
+        class Box[T]:
+            field = Descriptor()
+
+        class KnownDescriptor:
+            def __get__(self, instance: KnownBox[Callable[[str], None]], owner: object = None) -> dict[str, Any]: return {}
+
+        class KnownBox[T]:
+            field = KnownDescriptor()
+
+        class PropertyBox[T]:
+            @property
+            def field(self: PropertyBox[Callable[[Any], None]]) -> dict[str, Any]: return {}
+
+        class KnownPropertyBox[T]:
+            @property
+            def field(self: KnownPropertyBox[Callable[[str], None]]) -> dict[str, Any]: return {}
+
+        class MethodDescriptor:
+            def __get__(self, instance: Container[Callable[[Any], None]], owner: object = None) -> Callable[[object], bool]:
+                return lambda value: True
+
+        class Container[T]:
+            __contains__ = MethodDescriptor()
+
+        class Missing: pass
+
+        def custom(value: Box[Callable[[str], None]]) -> None: value.field
+        def shadowed(value: Box[Callable[[str], None]]) -> None:
+            value.field = Descriptor()
+            value.field
+        def known_custom(value: KnownBox[Callable[[str], None]]) -> None: value.field
+        def property_read(value: PropertyBox[Callable[[str], None]]) -> None: value.field
+        def known_property(value: KnownPropertyBox[Callable[[str], None]]) -> None: value.field
+        def explicit_property(value: PropertyBox[Callable[[str], None]]) -> None:
+            PropertyBox.field.__get__(value)
+        def known_explicit_property(value: KnownPropertyBox[Callable[[str], None]]) -> None:
+            KnownPropertyBox.field.__get__(value)
+        def class_property() -> object: return PropertyBox.field
+        def implicit(value: Container[Callable[[str], None]]) -> bool: return 'x' in value
+        def union(value: Box[Callable[[str], None]] | KnownBox[Callable[[str], None]]) -> None: value.field
+        def discarded(value: Intersection[Missing, KnownBox[Callable[[str], None]]]) -> None: value.field
+        def contributing(value: Intersection[Box[Callable[[str], None]], KnownBox[Callable[[str], None]]]) -> None: value.field
+
+        class Fallback[T]:
+            def __getattr__(self: Fallback[Callable[[Any], None]], name: str) -> dict[str, Any]: return {}
+        class Interception[T]:
+            field: dict[str, Any]
+            def __getattribute__(self: Interception[Callable[[Any], None]], name: str) -> dict[str, Any]: return {}
+
+        def fallback(value: Fallback[Callable[[str], None]]) -> None: value.missing
+        def intercepted(value: Interception[Callable[[str], None]]) -> None: value.field
+
+        class Ordinary:
+            def method(self) -> int: return 1
+        def method(value: Ordinary) -> int: return value.method()
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("custom", true),
+        ("known_custom", false),
+        // Observed storage refines the ordinary type but does not discharge getter proof.
+        ("shadowed", true),
+        ("property_read", true),
+        ("known_property", false),
+        ("explicit_property", true),
+        ("known_explicit_property", false),
+        ("class_property", false),
+        ("implicit", true),
+        ("union", true),
+        ("discarded", false),
+        ("contributing", true),
+        ("method", false),
+        ("fallback", true),
+        ("intercepted", true),
+    ];
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary = signatures(&db);
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((
+            file,
+            cases.map(|(name, _)| name.to_owned()).to_vec(),
+            mode,
+        )));
+        let model = crate::SemanticModel::new(&db, program_file(&db, file));
+        for (name, unproved) in cases {
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, name))
+                .unwrap();
+            assert_eq!(
+                facts.has_unproved_requirements,
+                mode == FunctionInferenceMode::OutputProof && unproved,
+                "{mode:?} {name}: {facts:?}"
+            );
+            assert!(!facts.has_errors, "{mode:?} {name}");
+            assert_eq!(
+                facts.return_type_correspondence,
+                (mode == FunctionInferenceMode::OutputProof).then_some(true),
+                "{mode:?} {name}"
+            );
+        }
+        assert_eq!(signatures(&db), ordinary);
+        assert_file_diagnostics(
+            &db,
+            "/src/main.py",
+            &["Invalid override of method `__getattribute__`"],
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn parameter_default_correspondence() -> anyhow::Result<()> {
     let mut db = setup_db();
     for (body, unproved) in [

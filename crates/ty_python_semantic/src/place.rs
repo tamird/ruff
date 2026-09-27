@@ -350,16 +350,19 @@ impl<'db> Place<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         owner: Type<'db>,
-    ) -> Place<'db> {
-        match self {
+    ) -> (Place<'db>, bool) {
+        let mut inputs_proved = true;
+        let place = match self {
             Place::Defined(
                 place @ DefinedPlace {
                     ty: Type::Union(union),
                     ..
                 },
             ) => union.map_with_boundness(db, env, |elem| {
-                Place::Defined(DefinedPlace { ty: *elem, ..place })
-                    .try_call_dunder_get(db, env, owner)
+                let (place, proved) = Place::Defined(DefinedPlace { ty: *elem, ..place })
+                    .try_call_dunder_get(db, env, owner);
+                inputs_proved &= proved;
+                place
             }),
 
             Place::Defined(
@@ -368,14 +371,19 @@ impl<'db> Place<'db> {
                     ..
                 },
             ) => intersection.map_with_boundness(db, env, |elem| {
-                Place::Defined(DefinedPlace { ty: *elem, ..place })
-                    .try_call_dunder_get(db, env, owner)
+                let (place, proved) = Place::Defined(DefinedPlace { ty: *elem, ..place })
+                    .try_call_dunder_get(db, env, owner);
+                inputs_proved &= proved;
+                place
             }),
 
             Place::Defined(defined) => {
-                let result = defined
+                let outcome = defined
                     .ty
-                    .try_call_dunder_get(db, env, None, owner)
+                    .try_call_dunder_get_with_proof(db, env, None, owner, false);
+                inputs_proved &= outcome.inputs_proved();
+                let result = outcome
+                    .result
                     .unwrap_or_else(|error| Some(error.fallback()));
                 if let Some(result) = result {
                     Place::Defined(DefinedPlace {
@@ -389,7 +397,8 @@ impl<'db> Place<'db> {
             }
 
             Place::Undefined => Place::Undefined,
-        }
+        };
+        (place, inputs_proved)
     }
 
     pub(crate) const fn is_definitely_bound(&self) -> bool {

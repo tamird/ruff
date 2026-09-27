@@ -5931,21 +5931,27 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Result<DunderCallOutcome<'db>, CallDunderError<'db>> {
         let db = self.db();
         let env = self.program_environment();
-        match object
-            .member_lookup_with_policy(db, env, name, lookup_policy)
-            .place
-        {
+        let requested = self.function_inference_mode == crate::FunctionInferenceMode::OutputProof;
+        argument_types.set_input_proof_request(requested);
+        let lookup_policy = if requested {
+            lookup_policy | MemberLookupPolicy::PROVE_GETTER_INPUTS
+        } else {
+            lookup_policy
+        };
+        let member = object
+            .member_lookup_with_policy_and_receiver(db, env, name, lookup_policy, None)
+            .unwrap_or_else(|error| error.fallback_member(db));
+        match member.member(db).place {
             Place::Defined(DefinedPlace {
                 ty: dunder_callable,
                 definedness: boundness,
                 provenance,
                 ..
             }) => {
-                let mut bindings = self.bindings_for_call(dunder_callable).match_parameters(
-                    db,
-                    env,
-                    argument_types,
-                );
+                let mut bindings = self
+                    .bindings_for_call(dunder_callable)
+                    .with_unproved_lookup_inputs(!member.inputs_proved(db))
+                    .match_parameters(db, env, argument_types);
 
                 let single_argument_context = bindings.argument_correspondence_callable().is_some();
                 if let Err(call_error) = self.infer_and_check_argument_types(
@@ -9584,6 +9590,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         |ty| self.dictionary_observation(expression, ty),
                     )
                 },
+            )
+            .with_input_proof_request(
+                self.function_inference_mode == crate::FunctionInferenceMode::OutputProof,
             );
 
         for arg in &arguments.args {
@@ -11818,7 +11827,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
             }
         }
-        let lookup_policy = if self.in_stub()
+        let mut lookup_policy = if self.in_stub()
             || self.is_in_type_checking_block(self.scope(), attribute)
             || self
                 .inference_flags()
@@ -11833,6 +11842,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } else {
             MemberLookupPolicy::RUNTIME_ATTRIBUTE
         };
+        let prove_getter_inputs = self.function_inference_mode
+            == crate::FunctionInferenceMode::OutputProof
+            && attribute.ctx != ExprContext::Del
+            && lookup_policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE);
+        if prove_getter_inputs {
+            lookup_policy |= MemberLookupPolicy::PROVE_GETTER_INPUTS;
+        }
         let member_lookup = value_type
             .member_lookup_with_policy_and_receiver(db, env, &attr.id, lookup_policy, None)
             .unwrap_or_else(|error| {
@@ -11844,6 +11860,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
                 error.fallback_member(db)
             });
+        if prove_getter_inputs && !member_lookup.inputs_proved(db) {
+            self.context.record_unproved_requirement(attribute);
+        }
         let fallback_place = member_lookup.member(db).map_type(|ty| {
             self.narrow_expr_with_applicable_constraints(attribute, ty, &constraint_keys)
         });
@@ -12232,7 +12251,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let db = self.db();
         let env = self.program_environment();
         let call_unary = |operand_type: Type<'db>, unary_dunder_method: &str| {
-            let mut arguments = CallArguments::none();
+            let mut arguments = CallArguments::none().with_input_proof_request(
+                self.function_inference_mode == crate::FunctionInferenceMode::OutputProof,
+            );
             let result = operand_type.try_call_dunder_with_policy(
                 db,
                 env,
