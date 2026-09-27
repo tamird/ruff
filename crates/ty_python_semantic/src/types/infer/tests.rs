@@ -1760,7 +1760,8 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
     db.write_dedented(
         "/src/main.py",
         r#"
-        from typing import Any, Callable, no_type_check
+        from typing import Any, Callable, Literal, no_type_check
+        from ty_extensions import Intersection
 
         class Factory:
             def __init__(self, cls: object, callback: Callable[..., None]) -> None:
@@ -1774,6 +1775,45 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
 
         def wrapped(callback: Callable[..., None]) -> object:
             return Wrapped(callback)
+
+        class Choices[T]:
+            def first(self, unused: Any = None) -> int: return 1
+            def second(self, unused: object = None) -> str: return ""
+            def strict(self: "Choices[Callable[[Any], None]]") -> str: return ""
+            def required(self, value: int) -> str: return ""
+
+        def empty(value: Choices[int], name: Literal["first", "second"]) -> int | str:
+            return getattr(value, name)()
+
+        def receiver(value: Choices[Callable[[str], None]], name: Literal["first", "strict"]) -> int | str:
+            return getattr(value, name)()
+
+        def nonempty(value: Choices[int], name: Literal["first", "second"]) -> int | str:
+            return getattr(value, name)(1)
+
+        def missing(value: Choices[int], name: Literal["first", "required"]) -> int | str:
+            return getattr(value, name)()  # ty: ignore[missing-argument]
+
+        class First:
+            def __call__(self) -> int: return 1
+
+        class Second:
+            def __call__(self) -> str: return ""
+
+        def intersection(value: Intersection[First, Second]) -> object:
+            return value()
+
+        class Initial:
+            def __init__(self) -> None: pass
+
+        class Other:
+            def __init__(self) -> None: pass
+
+        def constructor(value: type[Initial] | type[Other]) -> object:
+            return value()
+
+        def singleton() -> Initial:
+            return Initial()
 
         def narrow(values: list[str]) -> None:
             pass
@@ -1803,7 +1843,22 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
-    let names = ["bad", "good", "dead", "suppressed", "unchecked", "wrapped"];
+    let cases = [
+        ("bad", true),
+        ("good", false),
+        ("dead", false),
+        ("suppressed", true),
+        ("unchecked", true),
+        ("wrapped", true),
+        ("empty", false),
+        ("receiver", true),
+        ("nonempty", true),
+        ("missing", true),
+        ("intersection", true),
+        ("constructor", true),
+        ("singleton", false),
+    ];
+    let names = cases.map(|(name, _)| name);
     let signatures = |db: &TestDb| {
         names.map(|name| {
             global_symbol(db, file, name)
@@ -1837,7 +1892,7 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
     let selected = facts(&db);
     assert_eq!(
         selected.map(|fact| fact.has_unproved_requirements),
-        [true, false, false, true, true, true]
+        cases.map(|(_, unproved)| unproved)
     );
     assert_eq!(
         selected.map(|fact| (fact.has_errors, fact.has_diagnostics_or_suppressions)),
