@@ -79,7 +79,7 @@ use crate::types::{
     TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance, UnionAccumulator, UnionBuilder,
     UnionType, WrapperDescriptorKind, enums, is_property_method, list_members,
 };
-use crate::types::{DictionaryItemKind, ProgramEnvironment};
+use crate::types::{DictionaryItem, DictionaryItemKind, ProgramEnvironment};
 use crate::{DisplaySettings, FxOrderSet};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
 use ruff_python_ast::{self as ast, AnyNodeRef, ArgOrKeyword, PythonVersion};
@@ -1544,11 +1544,49 @@ impl<'db> Bindings<'db> {
         arguments
             .iter()
             .zip(&binding.argument_matches)
-            .all(|((argument, types), matched)| {
-                if matches!(argument, Argument::Variadic | Argument::Keywords)
-                    || !matched.matched
-                    || matched.parameters.is_empty()
-                {
+            .enumerate()
+            .all(|(index, ((argument, types), matched))| {
+                let empty_keywords = match argument {
+                    Argument::Variadic => return false,
+                    Argument::Keywords => {
+                        // Ordinary mapping matching can assume names are present. Proof requires
+                        // the existing inventory to cover the keys and every residual value.
+                        if let Some(unpacking) = arguments.known_unpacking(index) {
+                            let KnownUnpacking::Keywords(keywords) = unpacking else {
+                                return false;
+                            };
+                            if !keywords.items.iter().all(DictionaryItem::is_required)
+                                || !keywords.residual_values(db, env).is_never()
+                            {
+                                return false;
+                            }
+                            keywords.items.is_empty()
+                        } else {
+                            let Some(unpacked) = types.get_default().and_then(|ty| {
+                                extract_unpacked_typed_dict_from_value_type(db, env, ty)
+                            }) else {
+                                return false;
+                            };
+                            if !unpacked
+                                .keys
+                                .values()
+                                .all(|key| key.kind == DictionaryItemKind::Required)
+                                || (!unpacked.openness.is_closed()
+                                    && parameters.keyword_variadic().is_none())
+                            {
+                                return false;
+                            }
+                            unpacked.keys.is_empty() && unpacked.openness.is_closed()
+                        }
+                    }
+                    Argument::Synthetic => false,
+                    Argument::Positional => false,
+                    Argument::Keyword(_) => false,
+                };
+                if empty_keywords {
+                    return matched.parameters.is_empty();
+                }
+                if !matched.matched || matched.parameters.is_empty() {
                     return false;
                 }
                 matched.iter().all(|matched_parameter| {
