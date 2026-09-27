@@ -12579,6 +12579,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     left_ty,
                     *op,
                     right,
+                    right_ty,
                     |element| builder.expression_type(element),
                 );
 
@@ -12592,7 +12593,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         range,
                     ),
                 };
-                let ty = comparison.unwrap_or_else(|error| {
+                if matches!(op, ast::CmpOp::In | ast::CmpOp::NotIn)
+                    && !comparison.as_ref().is_ok_and(|result| result.inputs_proved)
+                {
+                    builder.context.record_unproved_requirement(range);
+                }
+                let ty = comparison.map(|result| result.ty).unwrap_or_else(|error| {
                     report_unsupported_comparison(
                         &builder.context,
                         &error,

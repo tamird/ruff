@@ -2481,6 +2481,157 @@ fn binary_and_augmented_argument_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn membership_argument_correspondence() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, Iterator, Literal, TypedDict
+        from ty_extensions import Intersection
+
+        class Container:
+            def __contains__(self, callback: Callable[[Any], None]) -> bool:
+                callback(1)
+                return True
+
+        class Safe:
+            def __contains__(self, value: object) -> bool: return True
+
+        class Decisive:
+            def __contains__(self, value: object) -> Literal[True]: return True
+
+        class DecisiveClosed:
+            def __contains__(self, callback: Callable[[Any], None]) -> Literal[True]:
+                callback(1)
+                return True
+
+        def closed(container: Container, callback: Callable[[str], None]) -> bool:
+            return callback in container
+
+        def not_closed(container: Container, callback: Callable[[str], None]) -> bool:
+            return callback not in container
+
+        def known(container: Container, callback: Callable[[Any], None]) -> bool:
+            return callback in container
+
+        def union_closed(container: Container | Safe, callback: Callable[[str], None]) -> bool:
+            return callback in container
+
+        def union_known(container: Safe | Decisive, value: object) -> bool:
+            return value in container
+
+        def discarded(container: Intersection[Container, Decisive], callback: Callable[[str], None]) -> bool:
+            return callback in container
+
+        def selected(container: Intersection[Safe, DecisiveClosed], callback: Callable[[str], None]) -> bool:
+            return callback in container
+
+        def contributing(container: Intersection[Container, Safe], callback: Callable[[str], None]) -> bool:
+            return callback in container
+
+        class IterableOnly:
+            def __iter__(self) -> Iterator[object]: return iter(())
+
+        def fallback(container: IterableOnly, value: object) -> bool:
+            return value in container
+
+        class Truthy:
+            def __bool__(self) -> bool: return True
+
+        class ArbitraryResult:
+            def __contains__(self, value: object) -> Truthy: return Truthy()
+
+        def arbitrary_result(container: ArbitraryResult, value: object) -> bool:
+            return value in container
+
+        def dynamic(container: Any, value: object) -> bool:
+            return value in container
+
+        def fixed(value: int) -> bool:
+            return value in (1, 2)
+
+        def display(value: int) -> bool:
+            return value in [1, 2]
+
+        class Row(TypedDict):
+            value: Any
+
+        def typed_dict(row: Row) -> bool:
+            return "value" in row
+
+        class ListConsumer:
+            def __contains__(self, values: list[Any]) -> bool: return True
+
+        def mixed_chain(value: int, checker: ListConsumer) -> bool:
+            return value == ["present"] in checker
+
+        def executed(checker: ListConsumer) -> bool:
+            return "present" in ["present"] in checker
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("closed", true),
+        ("not_closed", true),
+        ("known", false),
+        ("union_closed", true),
+        ("union_known", false),
+        ("discarded", false),
+        ("selected", true),
+        ("contributing", true),
+        ("fallback", true),
+        ("arbitrary_result", true),
+        ("dynamic", true),
+        ("fixed", false),
+        ("display", false),
+        ("typed_dict", false),
+        ("executed", true),
+        ("mixed_chain", true),
+    ];
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary = signatures(&db);
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((
+            file,
+            cases.map(|(name, _)| name.to_owned()).to_vec(),
+            mode,
+        )));
+        let model = crate::SemanticModel::new(&db, program_file(&db, file));
+        for (name, unproved) in cases {
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, name))
+                .unwrap();
+            assert_eq!(
+                facts.has_unproved_requirements,
+                mode == FunctionInferenceMode::OutputProof && unproved,
+                "{mode:?} {name}: {facts:?}"
+            );
+            assert!(!facts.has_errors, "{mode:?} {name}");
+            assert_eq!(
+                facts.return_type_correspondence,
+                (mode == FunctionInferenceMode::OutputProof).then_some(true),
+                "{mode:?} {name}"
+            );
+        }
+        assert_eq!(signatures(&db), ordinary);
+        assert_file_diagnostics(&db, "/src/main.py", &[]);
+    }
+    Ok(())
+}
+
+#[test]
 fn parameter_default_correspondence() -> anyhow::Result<()> {
     let mut db = setup_db();
     for (body, unproved) in [
