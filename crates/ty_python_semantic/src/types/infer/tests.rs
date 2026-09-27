@@ -4938,8 +4938,8 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
     db.write_dedented(
         "/src/main.py",
         r#"
-        from typing import Callable, Protocol
-        from typing_extensions import TypedDict
+        from typing import Any, Callable, Protocol
+        from typing_extensions import NotRequired, TypedDict, Unpack
 
         class Named(Protocol):
             def __call__(self, *, name: str) -> None: ...
@@ -4959,19 +4959,39 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
         class Tag(TypedDict, closed=True):
             tag: str
 
+        class Forward(TypedDict, closed=True):
+            name: str
+            run: NotRequired[Named]
+
+        class OptionalOpaque(TypedDict, total=False, closed=True):
+            run: Callable[..., None]
+
+        class OptionalNarrow(TypedDict, total=False, closed=True):
+            run: Callable[[str], None]
+
+        class OpenForward(TypedDict):
+            name: str
+            run: NotRequired[Named]
+
         def callback(*, name: str) -> None: pass
         def consume(*, run: Named = callback) -> None: pass
         def consume_omitted(*, run: Callable[..., None]) -> None: pass
-        def consume_objects(**kwargs: object) -> None: pass
+        def consume_required(*, run: Named) -> None: pass
+        def consume_forward(*, name: str, run: Named = callback) -> None: pass
         def consume_open(*, name: str, **kwargs: object) -> None: pass
         def consume_positional_only(name: str, /, **kwargs: object) -> None: pass
         def consume_positional_name(name: str, **kwargs: object) -> None: pass
         def consume_open_default(*, name: str = "target", **kwargs: object) -> None: pass
+        def wide(value: Any) -> None: pass
+        def consume_wide(*, run: Callable[[Any], None] = wide) -> None: pass
+        def consume_optional_omitted(*, run: Callable[..., None] = wide) -> None: pass
+        def consume_objects(**kwargs: object) -> None: pass
         def consume_named(**kwargs: Named) -> None: pass
         def empty() -> None: pass
 
         class Consumer:
             def accept(self, *, run: Named) -> None: pass
+            def forward(self, *, name: str, run: Named = callback) -> None: pass
 
         def pass_through(value: Named) -> Named:
             return value
@@ -4993,6 +5013,36 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
 
         def optional(value: Optional) -> None:
             consume(**value)
+
+        def optional_required(value: Optional) -> None:
+            consume_required(**value)
+
+        def optional_union(value: Closed | Optional) -> None:
+            consume_required(**value)
+
+        def forward(value: Forward) -> None:
+            consume_forward(**value)
+
+        def direct_and_optional(value: Optional) -> None:
+            consume_forward(name="target", **value)
+
+        def optional_literal(value: Optional) -> None:
+            consume(**{**value})
+
+        def optional_narrow(value: OptionalNarrow) -> None:
+            consume_wide(**value)
+
+        def optional_omitted(value: OptionalOpaque) -> None:
+            consume_optional_omitted(**value)
+
+        def open_forward(value: OpenForward) -> None:
+            consume_open(**value)
+
+        def forward_unpacked(**kwargs: Unpack[Forward]) -> None:
+            consume_forward(**kwargs)
+
+        def method_optional(consumer: Consumer, value: Forward) -> None:
+            consumer.forward(**value)
 
         def mapping(value: dict[str, Named]) -> None:
             consume_named(**value)
@@ -5035,7 +5085,17 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
         ("omitted", false),
         ("literal", false),
         ("empty_literal", false),
-        ("optional", true),
+        ("optional", false),
+        ("optional_required", true),
+        ("optional_union", true),
+        ("forward", false),
+        ("direct_and_optional", false),
+        ("optional_literal", false),
+        ("optional_narrow", true),
+        ("optional_omitted", false),
+        ("open_forward", false),
+        ("forward_unpacked", false),
+        ("method_optional", false),
         ("mapping", true),
         ("open_objects", false),
         ("open_direct", true),
