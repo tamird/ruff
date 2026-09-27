@@ -391,7 +391,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 // The validator visits only effective field values after rightmost overwrites.
                 if unproved_element.is_none()
                     && let Some(expected) = tcx.annotation
-                    && self.literal_element_has_unproved_requirement(expr, actual, expected)
+                    && self.expression_has_unproved_requirement(expr, actual, expected)
                 {
                     unproved_element = Some(expr.range());
                 }
@@ -449,9 +449,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let can_infer = is_generic
             && self.can_infer_generic_typed_dict_constructor(class, arguments, call_expression_tcx);
 
-        if !can_infer {
-            self.prepare_typed_dict_constructor(typed_dict, arguments, error_node);
-        }
+        let requirements_proved =
+            !can_infer && self.prepare_typed_dict_constructor(typed_dict, arguments, error_node);
+        let requirements_proved = requirements_proved && !is_generic;
 
         let mut call_arguments = self.prepare_call_arguments(arguments);
         let binding_callable = if is_generic && !can_infer {
@@ -465,6 +465,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 
         if can_infer && !bindings.satisfies(|_| true) {
             self.prepare_typed_dict_constructor(typed_dict, arguments, error_node);
+            if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
+                self.context.record_unproved_requirement(call_expression);
+            }
             return fallback_ty;
         }
 
@@ -506,12 +509,20 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     error_node,
                     |expr, _| self.expression_type(expr),
                 );
+                if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
+                    self.context.record_unproved_requirement(call_expression);
+                }
                 return fallback_ty;
             }
 
             bindings.report_diagnostics(&self.context, call_expression.into());
         }
 
+        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+            && (!requirements_proved || result.is_err())
+        {
+            self.context.record_unproved_requirement(call_expression);
+        }
         bindings.return_type(db, env)
     }
 
@@ -586,23 +597,26 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     /// call once when needed. A lone positional dict literal is inferred as a `TypedDict`
     /// expression directly, while mixed dict-literal and keyword calls infer the nested key and
     /// value expressions without re-inferring the outer dict literal later during argument
-    /// binding.
+    /// binding. Returns whether the committed field requirements are proved; the caller combines
+    /// this result with ordinary call validity before publishing the constructor's status.
     pub(super) fn prepare_typed_dict_constructor<'expr>(
         &mut self,
         typed_dict: TypedDictType<'db>,
         arguments: &'expr ast::Arguments,
         error_node: AnyNodeRef<'expr>,
-    ) {
+    ) -> bool {
         let db = self.db();
-        match TypedDictConstructorForm::from_arguments(arguments) {
+        let mut has_direct_field_pairs = match TypedDictConstructorForm::from_arguments(arguments) {
             TypedDictConstructorForm::LiteralOnly(argument) => {
                 let target_ty = Type::TypedDict(typed_dict);
-                self.get_or_infer_expression(argument, TypeContext::new(Some(target_ty)));
-                return;
+                let actual =
+                    self.get_or_infer_expression(argument, TypeContext::new(Some(target_ty)));
+                return !self.expression_has_unproved_requirement(argument, actual, target_ty);
             }
             TypedDictConstructorForm::SinglePositional(argument) => {
                 let target_ty = Type::TypedDict(typed_dict);
                 self.get_or_infer_expression(argument, TypeContext::new(Some(target_ty)));
+                false
             }
             TypedDictConstructorForm::MixedPositionalAndKeywords => {
                 let unpacked_keyword_types =
@@ -620,27 +634,40 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 let positional_target = typed_dict_with_relaxed_keys(db, typed_dict, &keyword_keys);
                 let target_ty = Type::TypedDict(positional_target);
                 self.get_or_infer_expression(&arguments.args[0], TypeContext::new(Some(target_ty)));
+                false
             }
             TypedDictConstructorForm::MixedLiteralAndKeywords(dict_expr) => {
-                self.infer_typed_dict_constructor_dict_literal_values(typed_dict, dict_expr);
+                let has_direct_field_pairs =
+                    self.infer_typed_dict_constructor_dict_literal_values(typed_dict, dict_expr);
                 self.store_expression_type(&arguments.args[0], Type::unknown());
+                has_direct_field_pairs
             }
-            TypedDictConstructorForm::KeywordOnly
-            | TypedDictConstructorForm::VariadicPositional
-            | TypedDictConstructorForm::MultiplePositionalArguments => {}
-        }
+            TypedDictConstructorForm::KeywordOnly => true,
+            TypedDictConstructorForm::VariadicPositional
+            | TypedDictConstructorForm::MultiplePositionalArguments => false,
+        };
 
         if !arguments.keywords.is_empty() {
-            self.infer_typed_dict_constructor_keyword_values(typed_dict, arguments);
+            has_direct_field_pairs &=
+                self.infer_typed_dict_constructor_keyword_values(typed_dict, arguments);
         }
 
-        validate_typed_dict_constructor(
+        let mut requirements_proved = has_direct_field_pairs;
+        let valid = validate_typed_dict_constructor(
             &self.context,
             typed_dict,
             arguments,
             error_node,
-            |expr, _| self.expression_type(expr),
+            |expr, tcx| {
+                let actual = self.expression_type(expr);
+                if let Some(expected) = tcx.annotation {
+                    requirements_proved &=
+                        !self.expression_has_unproved_requirement(expr, actual, expected);
+                }
+                actual
+            },
         );
+        valid && requirements_proved
     }
 
     /// Infer keyword argument values for a `TypedDict` constructor.
@@ -652,16 +679,21 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         &mut self,
         typed_dict: TypedDictType<'db>,
         arguments: &ast::Arguments,
-    ) {
+    ) -> bool {
+        let mut has_direct_field_pairs = true;
         for keyword in &arguments.keywords {
             let value_tcx = keyword
                 .arg
                 .as_ref()
                 .and_then(|arg_name| typed_dict.item(self.db(), arg_name.id.as_str()))
                 .map(|field| TypeContext::new(Some(field.declared_ty)))
-                .unwrap_or_default();
+                .unwrap_or_else(|| {
+                    has_direct_field_pairs = false;
+                    TypeContext::default()
+                });
             self.get_or_infer_expression(&keyword.value, value_tcx);
         }
+        has_direct_field_pairs
     }
 
     /// Infer the key and value expressions of a positional dict literal passed to a
@@ -674,12 +706,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         &mut self,
         typed_dict: TypedDictType<'db>,
         dict_expr: &ast::ExprDict,
-    ) {
+    ) -> bool {
         let db = self.db();
         let env = self.program_environment();
         let key_tcx =
             TypeContext::new(self.typed_dict_key_expected_type(Type::TypedDict(typed_dict)));
 
+        let mut has_direct_field_pairs = true;
         for item in &dict_expr.items {
             let key_ty = item
                 .key
@@ -690,16 +723,19 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             {
                 TypeContext::new(Some(field.declared_ty))
             } else if let Some(key_ty) = key_ty {
+                has_direct_field_pairs = false;
                 if key_ty.is_assignable_to(db, env, KnownClass::Str.to_instance(db, env)) {
                     TypeContext::new(typed_dict.arbitrary_key_initialization_type(db, env))
                 } else {
                     TypeContext::default()
                 }
             } else {
+                has_direct_field_pairs = false;
                 TypeContext::default()
             };
             self.get_or_infer_expression(&item.value, value_tcx);
         }
+        has_direct_field_pairs
     }
 
     /// Infer the `TypedDictSchema` for an "inlined"/"dangling" functional `TypedDict` definition,

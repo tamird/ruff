@@ -1837,6 +1837,183 @@ fn indexed_store_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn constructor_storage_correspondence() -> anyhow::Result<()> {
+    let registry = crate::default_lint_registry();
+    let mut rules = RuleSelection::from_registry(registry);
+    for rule in [
+        "invalid-argument-type",
+        "invalid-key",
+        "missing-argument",
+        "missing-typed-dict-key",
+        "unknown-argument",
+    ] {
+        rules.disable(registry.get(rule)?);
+    }
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .with_rule_selection(rules)
+        .build()?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Callable, Literal, Protocol
+        from typing_extensions import TypedDict
+
+        class Named(Protocol):
+            def __call__(self, *, name: str) -> None: ...
+
+        class Bag(TypedDict):
+            run: Named
+
+        class OmittedBag(TypedDict):
+            run: Callable[..., None]
+
+        class OpenBag(TypedDict, extra_items=Named):
+            pass
+
+        class OpenOmittedBag(TypedDict, extra_items=Callable[..., None]):
+            pass
+
+        def pass_through(value: Named) -> Named:
+            return value
+
+        def key_from(value: Named) -> Literal["run"]:
+            return "run"
+
+        def context_closed(value: Callable[..., None]) -> Bag:
+            return dict(run=value)
+
+        def context_known(value: Named) -> Bag:
+            return dict(run=value)
+
+        def context_omitted(value: Callable[..., None]) -> OmittedBag:
+            return dict(run=value)
+
+        def class_closed(value: Callable[..., None]) -> Bag:
+            return Bag(run=value)
+
+        def class_known(value: Named) -> Bag:
+            return Bag(run=value)
+
+        def class_omitted(value: Callable[..., None]) -> OmittedBag:
+            return OmittedBag(run=value)
+
+        def literal_closed(value: Callable[..., None]) -> Bag:
+            return Bag({"run": value})
+
+        def literal_known(value: Named) -> Bag:
+            return Bag({"run": value})
+
+        def literal_omitted(value: Callable[..., None]) -> OmittedBag:
+            return OmittedBag({"run": value})
+
+        def mixed_overwritten(value: Callable[..., None], known: Named) -> Bag:
+            return Bag({"run": value}, run=known)
+
+        def mixed_child(value: Callable[..., None], known: Named) -> Bag:
+            return Bag({"run": pass_through(value)}, run=known)
+
+        def context_missing() -> Bag:
+            return dict()
+
+        def class_missing() -> Bag:
+            return Bag()
+
+        def literal_missing() -> Bag:
+            return Bag({})
+
+        def literal_invalid() -> Bag:
+            return Bag({"run": 1})
+
+        def context_unknown(value: Named) -> Bag:
+            return dict(other=value)
+
+        def mapping_closed(value: OmittedBag) -> Bag:
+            return Bag(value)
+
+        def default_closed(values: OpenBag, value: Callable[..., None]) -> Named:
+            return values.setdefault("run", value)
+
+        def default_known(values: OpenBag, value: Named) -> Named:
+            return values.setdefault("run", value)
+
+        def default_omitted(values: OpenOmittedBag, value: Callable[..., None]) -> Callable[..., None]:
+            return values.setdefault("run", value)
+
+        def default_key_child(values: OpenBag, value: Callable[..., None], known: Named) -> Named:
+            return values.setdefault(key_from(value), known)
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("context_closed", true),
+        ("context_known", false),
+        ("context_omitted", false),
+        ("class_closed", true),
+        ("class_known", false),
+        ("class_omitted", false),
+        ("literal_closed", true),
+        ("literal_known", false),
+        ("literal_omitted", false),
+        ("mixed_overwritten", false),
+        ("mixed_child", true),
+        ("context_missing", true),
+        ("class_missing", true),
+        ("literal_missing", true),
+        ("literal_invalid", true),
+        ("context_unknown", true),
+        ("mapping_closed", true),
+        ("default_closed", true),
+        ("default_known", false),
+        ("default_omitted", false),
+        ("default_key_child", true),
+    ];
+    let facts = |db: &TestDb, name: &str| {
+        crate::SemanticModel::new(db, program_file(db, file))
+            .function_inference_facts(first_public_binding(db, file, name))
+            .unwrap()
+    };
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary = cases.map(|(name, _)| facts(&db, name).return_type_correspondence);
+    let ordinary_signatures = signatures(&db);
+    for (name, _) in cases {
+        assert!(!facts(&db, name).has_unproved_requirements, "{name}");
+    }
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+
+    db.select_function_inference(Some((
+        file,
+        cases.map(|(name, _)| name.to_owned()).to_vec(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    for (name, unproved) in cases {
+        let result = facts(&db, name);
+        assert_eq!(result.has_unproved_requirements, unproved, "{name}");
+        assert!(!result.has_errors, "{name}");
+    }
+    assert_eq!(signatures(&db), ordinary_signatures);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+
+    db.select_function_inference(None);
+    for ((name, _), output) in cases.into_iter().zip(ordinary) {
+        let result = facts(&db, name);
+        assert!(!result.has_unproved_requirements, "{name}");
+        assert_eq!(result.return_type_correspondence, output, "{name}");
+    }
+    assert_eq!(signatures(&db), ordinary_signatures);
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    Ok(())
+}
+
+#[test]
 fn declaration_storage_correspondence() -> anyhow::Result<()> {
     let registry = crate::default_lint_registry();
     let mut rules = RuleSelection::from_registry(registry);
