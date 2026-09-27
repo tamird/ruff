@@ -31,7 +31,7 @@ use crate::{
         },
         generics::{enclosing_generic_contexts, typing_self},
         infer::{
-            InferenceFlags, TypeExpressionFlags, TypeInferenceBuilder,
+            InferenceFlags, StatementInference, TypeExpressionFlags, TypeInferenceBuilder,
             builder::{DeclaredAndInferredType, TypeAndRange, validate_paramspec_components},
             function_known_decorator_flags, function_known_decorators, infer_deferred_types,
             infer_function_default_types, infer_statement_types, nearest_enclosing_function,
@@ -1672,7 +1672,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.db(),
             self.index.enclosing_lambda_statement(lambda.into())?,
         );
-        let callable = enclosing_stmt.expression_type(lambda).as_callable()?;
+        let lambda_ty = enclosing_stmt.try_expression_type(lambda).or_else(|| {
+            let StatementInference::Definition(definition, _) = enclosing_stmt else {
+                return None;
+            };
+            if !matches!(definition.kind(db), DefinitionKind::Function(_)) {
+                return None;
+            }
+            infer_function_default_types(db, definition).try_expression_type(lambda)
+        })?;
+        let callable = lambda_ty.as_callable()?;
         let [signature] = callable.signatures(self.db()).overloads.as_slice() else {
             // TODO: If there are multiple applicable overloads, we could attempt multi-inference.
             return None;
