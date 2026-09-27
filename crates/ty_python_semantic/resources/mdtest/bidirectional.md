@@ -2552,6 +2552,19 @@ def _[T](key: Callable[[T], str]) -> list[T]:
     return f(key=key, extract=lambda x: x, store=lambda x: x)
 ```
 
+An independent empty argument can finish inference while the callbacks retain their mutually
+dependent parameter context:
+
+```py
+def with_empty[T, U, V, W](
+    extract: Callable[[U], V], store: Callable[[V], U], key: Callable[[T], str], empty: list[W]
+) -> list[V]:
+    raise NotImplementedError
+
+def _[T](key: Callable[[T], str]) -> list[T]:
+    return with_empty(key=key, extract=lambda x: x, store=lambda x: x, empty=[])
+```
+
 Gradual types from arguments still propagate through an identity lambda:
 
 ```py

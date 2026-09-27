@@ -4870,3 +4870,149 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
     assert_eq!(signatures(&db), ordinary_signatures);
     Ok(())
 }
+
+#[test]
+fn empty_generic_arguments_use_final_context() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .build()?;
+    db.write_dedented(
+        "/src/declarations.pyi",
+        r#"
+        from typing import Callable, overload
+        from typing_extensions import TypeVar
+
+        T = TypeVar("T")
+        D = TypeVar("D", default=str)
+        S = TypeVar("S", bound=str, default=str)
+        I = TypeVar("I", bound=int)
+        V = TypeVar("V", bound=int, default=int)
+        C = TypeVar("C", str, int, default=int)
+        type Items[T] = list[T]
+
+        def identity(value: list[T]) -> list[T]: ...
+        def defaulted(value: list[D]) -> list[D]: ...
+        def bounded(value: list[I]) -> list[I]: ...
+        def attrs(value: dict[S, V]) -> dict[S, V]: ...
+        def pair(values: list[D], item: D) -> list[D]: ...
+        def reverse(item: D, values: list[D]) -> list[D]: ...
+        def nested(value: dict[str, list[D]]) -> dict[str, list[D]]: ...
+        def fixed(value: list) -> list: ...
+        def constrained(value: list[C]) -> list[C]: ...
+        def aliased(value: Items[D]) -> Items[D]: ...
+        def callback_then_empty(callback: Callable[[str], str], value: list[T]) -> list[T]: ...
+        @overload
+        def choose(value: list[D]) -> list[D]: ...
+        @overload
+        def choose(value: int) -> int: ...
+        opaque_list: list
+        opaque_dict: dict
+        "#,
+    )?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from declarations import (
+            identity, defaulted, bounded, attrs, pair, reverse, nested, fixed,
+            opaque_list, opaque_dict, constrained, aliased, choose, callback_then_empty,
+        )
+        default_list = defaulted([])
+        default_dict = attrs({})
+        bounded_list = bounded([])
+        peer = pair([], 1)
+        reversed_peer = reverse(1, [])
+        contextual: list[str] = identity([])
+        unresolved = identity([])
+        unresolved.append(1)
+        opaque = defaulted(opaque_list)
+        opaque_attributes = attrs(opaque_dict)
+        fixed_unknown = fixed([])
+        no_context = []
+        spread = defaulted([*opaque_list])
+        nested_empty = nested({"key": []})
+        nested_call = defaulted(identity([]))
+        constrained_default = constrained([])
+        alias_context = defaulted(aliased([]))
+        overloaded = choose([])
+        mixed_contexts = callback_then_empty(lambda value: value, [])
+        wrong = attrs({1: "wrong"})
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let expected = [
+        ("default_list", "list[str]"),
+        ("default_dict", "dict[str, int]"),
+        ("bounded_list", "list[Unknown]"),
+        ("peer", "list[int]"),
+        ("reversed_peer", "list[int]"),
+        ("contextual", "list[str]"),
+        ("unresolved", "list[Unknown]"),
+        ("opaque", "list[Unknown]"),
+        ("opaque_attributes", "dict[Unknown, Unknown]"),
+        ("fixed_unknown", "list[Unknown]"),
+        ("no_context", "list[Unknown]"),
+        ("spread", "list[Unknown]"),
+        ("nested_empty", "dict[str, list[Unknown]]"),
+        ("nested_call", "list[Unknown]"),
+        ("constrained_default", "list[int]"),
+        ("alias_context", "list[str]"),
+        ("overloaded", "list[str]"),
+        ("mixed_contexts", "list[Unknown]"),
+        ("wrong", "dict[str, int]"),
+    ];
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((file, vec!["<module>".to_owned()], mode)));
+        let program_file = program_file(&db, file);
+        let model = crate::SemanticModel::new(&db, program_file);
+        let env = db.program_environment();
+        let parsed = parsed_module(&db, program_file.python_file(&db)).load(&db);
+        let mut checked = 0;
+        for statement in parsed.suite() {
+            let (name, expression) = match statement {
+                ast::Stmt::Assign(assignment) => {
+                    let [ast::Expr::Name(name)] = assignment.targets.as_slice() else {
+                        continue;
+                    };
+                    (name.id.as_str(), assignment.value.as_ref())
+                }
+                ast::Stmt::AnnAssign(assignment) => {
+                    let ast::Expr::Name(name) = assignment.target.as_ref() else {
+                        continue;
+                    };
+                    let Some(value) = assignment.value.as_deref() else {
+                        continue;
+                    };
+                    (name.id.as_str(), value)
+                }
+                _ => continue,
+            };
+            let Some((_, expected)) = expected.iter().find(|(case, _)| *case == name) else {
+                continue;
+            };
+            checked += 1;
+            let result = expression.inferred_type(&model).unwrap();
+            assert_eq!(result.display(&db, &env).to_string(), *expected, "{name}");
+            assert!(!result.has_provisional_marker(&db, &env), "{name}");
+            assert!(!result.has_unspecialized_type_var(&db, &env), "{name}");
+            if let ast::Expr::Call(call) = expression {
+                for argument in &call.arguments.args {
+                    let actual = argument.inferred_type(&model).unwrap();
+                    assert!(!actual.has_provisional_marker(&db, &env), "{name}");
+                    assert!(!actual.has_unspecialized_type_var(&db, &env), "{name}");
+                }
+            }
+        }
+        assert_eq!(checked, expected.len());
+        let diagnostics = crate::check_file_unwrap(&db, program_file);
+        let ids: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect();
+        assert_eq!(ids, ["invalid-argument-type"]);
+    }
+    Ok(())
+}

@@ -12,7 +12,7 @@ use crate::types::constraints::{
     SourceOrderId, max_constructor_and_typevar_depth, wobble_index,
 };
 use crate::types::typevar::{BoundTypeVarInstance, TypeVarDomain, TypeVarSet};
-use crate::types::{ApplyTypeMappingVisitor, Type, TypeContext, TypeMapping};
+use crate::types::{ApplyTypeMappingVisitor, DynamicType, Type, TypeContext, TypeMapping};
 use crate::{Db, ProgramEnvironment};
 
 /// The _provenance_ of a BDD constraint.
@@ -120,6 +120,10 @@ impl<'db> Constraint<'db> {
     ) -> impl Iterator<Item = Result<Self, UnsatisfiableBound>> {
         let choose_lower_bound = move |bound: Type<'db>| {
             let bound = Self::normalize_bound(db, typevar, bound);
+            // A provisional contextual slot provides no evidence for this bound.
+            if bound == Type::Dynamic(DynamicType::UnspecializedTypeVar) {
+                return None;
+            }
             match bound {
                 // Two identical typevars must always solve to the same type, so it is not useful to
                 // have a lower bound that is the typevar being constrained.
@@ -209,6 +213,9 @@ impl<'db> Constraint<'db> {
     ) -> impl Iterator<Item = Result<Self, UnsatisfiableBound>> {
         let choose_upper_bound = move |bound: Type<'db>| {
             let bound = Self::normalize_bound(db, typevar, bound);
+            if bound == Type::Dynamic(DynamicType::UnspecializedTypeVar) {
+                return None;
+            }
             match bound {
                 // Two identical typevars must always solve to the same type, so it is not useful to
                 // have an upper bound that is the typevar being constrained.
@@ -308,6 +315,7 @@ impl<'db> Constraint<'db> {
 
         let normalized_bound = Self::normalize_bound(db, typevar, bound);
         let constraint = match normalized_bound {
+            Type::Dynamic(DynamicType::UnspecializedTypeVar) => None,
             // Two identical typevars must always solve to the same type, so it is not useful to
             // have an equivalence bound that is the typevar being constrained.
             Type::TypeVar(bound_typevar) if typevar.is_same_typevar_as(db, bound_typevar) => None,

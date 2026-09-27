@@ -3502,6 +3502,10 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         ty: Type<'db>,
         variance: TypeVarVariance,
     ) {
+        // A provisional contextual slot carries no evidence about the argument's type.
+        if ty == Type::Dynamic(crate::types::DynamicType::UnspecializedTypeVar) {
+            return;
+        }
         self.insert_hash_map_type_mapping(bound_typevar, ty);
         self.insert_pending_type_mapping(bound_typevar, ty, variance);
     }
@@ -3999,6 +4003,12 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         visitor: &InferSpecializationVisitor<'db>,
     ) -> Result<(), SpecializationError<'db>> {
         let db = self.db;
+        // A provisional leaf must not select a constraint or override a declared default.
+        if [formal, actual].contains(&Type::Dynamic(
+            crate::types::DynamicType::UnspecializedTypeVar,
+        )) {
+            return Ok(());
+        }
         // TODO: Eventually, the builder will maintain a constraint set, instead of a hash-map of
         // type mappings, to represent the specialization that we are building up. At that point,
         // this method will just need to compare `actual ≤ formal`, using constraint set
