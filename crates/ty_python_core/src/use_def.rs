@@ -3315,12 +3315,8 @@ impl<'db> UseDefMapBuilder<'db> {
         });
         let predicates = self.predicates.build();
         let mut boolean_guards = self.boolean_guards;
-        // A value tested only once cannot gain precision from sharing its identity.
-        let mut guard_counts = FxHashMap::default();
-        for (_, guard) in &boolean_guards {
-            *guard_counts.entry(guard.definition).or_insert(0) += 1;
-        }
-        boolean_guards.retain(|(_, guard)| guard_counts[&guard.definition] > 1);
+        // Tuple construction can condition fields on a guard tested only once, so retain
+        // those identities as well as guards shared by repeated tests.
         boolean_guards.sort_unstable_by_key(|(predicate, _)| *predicate);
         let predicate_narrowing_targets =
             PredicateNarrowingTargets::from_entries(self.predicate_narrowing_targets);
