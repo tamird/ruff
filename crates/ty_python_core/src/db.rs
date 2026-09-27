@@ -8,14 +8,17 @@ use ty_module_resolver::Db as ModuleResolverDb;
 pub enum ProvidedAnnotation<'db> {
     /// One type expression in the declaration's physical source file.
     Range(ruff_text_size::TextRange),
-    /// Supplies a native annotation from another canonical source tree. The foreign owner
+    /// Supplies an annotation from another canonical source tree. The foreign owner
     /// is a function, parameter, or module-level simple-name annotated assignment. Both
-    /// owners must describe the same kind of annotation. Assignment annotations
-    /// retain their qualifiers; `TypeAlias` declarations are excluded. Names and type
-    /// parameters retain their declaring scope. The provider owns the correspondence
-    /// between the two declarations. A function without local type parameters borrows
-    /// the donor's type parameter list when its return and every effective parameter annotation
-    /// come from that same function.
+    /// owners must describe the same kind of annotation. Parameter annotations describe
+    /// the callable's input domain and the implementation's initial binding, allowing
+    /// subsequent local assignments to infer their own types. Source-authored parameter
+    /// annotations retain precedence and declare the local variable's type. Assignment
+    /// annotations retain their declarations and qualifiers; `TypeAlias` declarations
+    /// are excluded. Names and type parameters retain their declaring scope. The provider
+    /// owns the correspondence between the two declarations. A function without local type
+    /// parameters borrows the donor's type parameter list when its return and every effective
+    /// parameter annotation come from that same function.
     External {
         file: ProgramFile<'db>,
         owner: ruff_python_ast::NodeIndex,

@@ -1257,13 +1257,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         Some((annotation, ty, flags))
     }
 
-    /// Set initial declared type (if annotated) and inferred type for a function-parameter symbol,
+    /// Set the initial binding and any source-declared type for a function-parameter symbol
     /// in the function body scope.
     ///
-    /// The declared type is the annotated type, if any, or `Unknown`. An external interface
-    /// describes supplied arguments, so its implementation entry type also includes the default.
+    /// Source annotations declare the local variable's type. An external interface describes
+    /// supplied arguments and supplies only the initial binding, including the default's type.
     ///
-    /// The inferred type follows the declared entry type. If there is no annotation, it is the
+    /// The inferred type follows the annotated entry type. If there is no annotation, it is the
     /// union of `Unknown` and the type of the default value, if any.
     ///
     /// Parameter definitions are odd in that they define a symbol in the function-body scope, so
@@ -1360,11 +1360,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             }
 
-            self.add_declaration_with_binding(
-                parameter.into(),
-                definition,
-                &DeclaredAndInferredType::are_the_same_type(entry_ty),
-            );
+            self.add_parameter_binding(parameter, definition, entry_ty);
         } else {
             let ty = if let Some(default_expr) = default_expr {
                 let default_ty = self.file_expression_type(default_expr);
@@ -1447,16 +1443,33 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 _ => Type::homogeneous_tuple(db, self.program_environment(), annotated_type),
             };
 
+            self.add_parameter_binding(parameter, definition, ty);
+        } else {
+            let inferred_ty =
+                Type::homogeneous_tuple(db, self.program_environment(), Type::unknown());
+            self.add_binding(parameter.into(), definition)
+                .insert(self, inferred_ty);
+        }
+    }
+
+    fn add_parameter_binding(
+        &mut self,
+        parameter: &'ast ast::Parameter,
+        definition: Definition<'db>,
+        ty: Type<'db>,
+    ) {
+        if definition
+            .category(self.db(), self.module())
+            .is_declaration()
+        {
             self.add_declaration_with_binding(
                 parameter.into(),
                 definition,
                 &DeclaredAndInferredType::are_the_same_type(ty),
             );
         } else {
-            let inferred_ty =
-                Type::homogeneous_tuple(db, self.program_environment(), Type::unknown());
             self.add_binding(parameter.into(), definition)
-                .insert(self, inferred_ty);
+                .insert(self, ty);
         }
     }
 
@@ -1590,11 +1603,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     &[KnownClass::Str.to_instance(db, env), annotated_type],
                 )
             };
-            self.add_declaration_with_binding(
-                parameter.into(),
-                definition,
-                &DeclaredAndInferredType::are_the_same_type(ty),
-            );
+            self.add_parameter_binding(parameter, definition, ty);
         } else {
             keyword_element = Some(Type::unknown());
             let inferred_ty = KnownClass::Dict.to_specialized_instance(
