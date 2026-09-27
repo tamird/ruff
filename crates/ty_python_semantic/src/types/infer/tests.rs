@@ -1497,6 +1497,115 @@ fn function_output_correspondence() -> anyhow::Result<()> {
 
         def as_bool(value: object) -> bool:
             return guard(value)
+
+        def checked_guard(value: object) -> TypeGuard[str]:
+            return type(value) is str
+
+        def documented_guard(value: object) -> TypeGuard[str]:
+            """Recognize strings."""
+            return str is type(value)
+
+        def wrong_target(value: object) -> TypeGuard[int]:
+            return type(value) is str
+
+        def prior_equality(value: int | str) -> TypeGuard[str]:
+            assert value == "x"
+            return value is value
+
+        def prior_predicate(value: object) -> TypeGuard[str]:
+            if guard(value):
+                return value is value
+            return type(value) is str
+
+        _STRING_CLASS = type("")
+        _CONSTRUCTED_CLASS = type(str())
+        _ALIASED_CLASS = str
+
+        def constant_class(value: object) -> TypeGuard[str]:
+            return type(value) is _STRING_CLASS
+
+        def constructed_class(value: object) -> TypeGuard[str]:
+            return type(value) is _CONSTRUCTED_CLASS
+
+        def aliased_class(value: object) -> TypeGuard[str]:
+            return type(value) is _ALIASED_CLASS
+
+        def local_class(value: object, tag: type[str]) -> TypeGuard[str]:
+            return type(value) is tag
+
+        def shadowed_classifier(value: object, type: Callable[[object], type[str]]) -> TypeGuard[str]:
+            return type(value) is str
+
+        def unsafe_equality(value: int | str) -> TypeGuard[str]:
+            return value == "x"
+
+        def rebound_guard(value: object) -> TypeGuard[str]:
+            value = "x"
+            return type(value) is str
+
+        def alias_subject(value: object) -> TypeGuard[str]:
+            alias = value
+            return type(alias) is str
+
+        def other_subject(value: object, other: object) -> TypeGuard[str]:
+            return type(other) is str
+
+        def unchecked_guard(value: object) -> TypeGuard[str]:
+            return guard(value)
+
+        def dead_return(value: object) -> TypeGuard[str]:
+            if False:
+                return True
+            return type(value) is str
+
+        def not_implemented_guard(value: object) -> TypeGuard[str]:
+            return NotImplemented
+
+        class Spoofed:
+            @property
+            def __class__(self) -> type[str]:
+                return str
+
+        def class_attribute(value: Spoofed) -> TypeGuard[str]:
+            return value.__class__ is str
+
+        def nested_writer(value: object) -> TypeGuard[str]:
+            def rebind() -> None:
+                nonlocal value
+                value = "x"
+            rebind()
+            return type(value) is str
+
+        class Guarded:
+            pass
+
+        def checked_class(value: object) -> TypeGuard[Guarded]:
+            return type(value) is Guarded
+
+        def condition() -> bool:
+            return True
+
+        if condition():
+            class bytes(int):
+                pass
+            complex = type("")
+
+        def conditional_class(value: object) -> TypeGuard[int]:
+            return type(value) is bytes
+
+        def conditional_constant(value: object) -> TypeGuard[str]:
+            return type(value) is complex
+
+        def late_builtin_class(value: object) -> TypeGuard[int]:
+            return type(value) is float
+
+        late_builtin_class(1.0)
+
+        class float(int):
+            pass
+
+        def effectful_operand(value: object, change: Callable[[object], type[Guarded]]) -> TypeGuard[Guarded]:
+            return type(value) is change(value)
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -1516,6 +1625,30 @@ fn function_output_correspondence() -> anyhow::Result<()> {
         "predicate",
         "aliased_guard",
         "as_bool",
+        "checked_guard",
+        "documented_guard",
+        "wrong_target",
+        "prior_equality",
+        "prior_predicate",
+        "constant_class",
+        "constructed_class",
+        "aliased_class",
+        "local_class",
+        "shadowed_classifier",
+        "unsafe_equality",
+        "rebound_guard",
+        "alias_subject",
+        "other_subject",
+        "unchecked_guard",
+        "dead_return",
+        "not_implemented_guard",
+        "class_attribute",
+        "nested_writer",
+        "effectful_operand",
+        "checked_class",
+        "conditional_class",
+        "conditional_constant",
+        "late_builtin_class",
     ];
     let signatures = |db: &TestDb| {
         names.map(|name| {
@@ -1562,6 +1695,30 @@ fn function_output_correspondence() -> anyhow::Result<()> {
             None,
             None,
             Some(true),
+            Some(true),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            Some(true),
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
         ]
     );
     assert_eq!(signatures(&db), ordinary);
