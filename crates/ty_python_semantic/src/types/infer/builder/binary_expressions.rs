@@ -278,9 +278,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         if op == ast::Operator::BitOr && matches!(left, ast::Expr::Dict(_)) {
             let right_ty = self.infer_expression(right, operand_tcx(right));
             if let Type::TypedDict(typed_dict) = right_ty
-                && let Some(ty) = self.try_typed_dict_pep_584_dunder(
+                && let Some(ty) = self.try_infer_typed_dict_merge(
                     left,
-                    typed_dict.to_partial(db),
+                    typed_dict.to_reflected_merge_patch(db),
                     typed_dict,
                     "__ror__",
                 )
@@ -300,7 +300,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         if op == ast::Operator::BitOr
             && let Type::TypedDict(typed_dict) = left_ty
             && matches!(right, ast::Expr::Dict(_))
-            && let Some(ty) = self.try_typed_dict_pep_584_dunder(
+            && let Some(ty) = self.try_infer_typed_dict_merge(
                 right,
                 typed_dict.to_partial(db),
                 typed_dict,
@@ -316,15 +316,40 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         )
     }
 
+    fn try_infer_typed_dict_merge(
+        &mut self,
+        update: &ast::Expr,
+        update_context: TypedDictType<'db>,
+        result_typed_dict: TypedDictType<'db>,
+        dunder_name: &str,
+    ) -> Option<Type<'db>> {
+        let mut candidate = self.speculate();
+        let (update_ty, result) = candidate.try_typed_dict_pep_584_dunder(
+            update,
+            update_context,
+            result_typed_dict,
+            dunder_name,
+        )?;
+        // A rejected TypedDict context can still call the generic dict overload. Its ordinary
+        // operand inference owns that fallback; only an adopted TypedDict commits this candidate.
+        if update_ty != Type::TypedDict(update_context)
+            || result != Type::TypedDict(result_typed_dict)
+        {
+            return None;
+        }
+        self.extend(candidate);
+        Some(result)
+    }
+
     fn try_typed_dict_pep_584_dunder(
         &mut self,
         update: &ast::Expr,
         update_context_typed_dict: TypedDictType<'db>,
         result_typed_dict: TypedDictType<'db>,
         dunder_name: &str,
-    ) -> Option<Type<'db>> {
+    ) -> Option<(Type<'db>, Type<'db>)> {
         let db = self.db();
-        let update_ty = self.speculate_without_diagnostics().infer_expression(
+        let update_ty = self.infer_expression(
             update,
             TypeContext::new(Some(Type::TypedDict(update_context_typed_dict))),
         );
@@ -339,7 +364,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 TypeContext::default(),
             )
             .ok()
-            .map(|bindings| bindings.return_type(db, env))
+            .map(|bindings| (update_ty, bindings.return_type(db, env)))
     }
 
     /// Handle `TypedDict |= value` before the normal `__ior__` path runs.
@@ -370,6 +395,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         // Prefer the full TypedDict as context when possible so exact-shape literals preserve the
         // named type in bidirectional inference.
         if self
+            .speculate_without_diagnostics()
             .try_typed_dict_pep_584_dunder(value_expr, typed_dict, typed_dict, "__ior__")
             .is_some()
         {
@@ -380,6 +406,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         // Subset updates use the mutation-safe patch as context.
         let update_patch = typed_dict.to_update_patch(db);
         if self
+            .speculate_without_diagnostics()
             .try_typed_dict_pep_584_dunder(value_expr, update_patch, typed_dict, "__ior__")
             .is_some()
         {
