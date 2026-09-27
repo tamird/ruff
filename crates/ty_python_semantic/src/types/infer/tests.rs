@@ -2027,6 +2027,93 @@ fn constructor_storage_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn parameter_default_correspondence() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    for (body, unproved) in [
+        (
+            "def make(callback: Callable[[Any], None] = narrow): pass",
+            true,
+        ),
+        (
+            "def make(callback: Callable[[str], None] = narrow): pass",
+            false,
+        ),
+        (
+            "def make(callback: Callable[..., None] = narrow): pass",
+            false,
+        ),
+        (
+            "def make(callback: Callable[[Any], None] = wide): pass",
+            false,
+        ),
+        ("def make(callback=narrow): pass", false),
+        ("def make(callback: Unknown = narrow): pass", true),
+        (
+            "if False:\n    def make(callback: Callable[[Any], None] = narrow): pass",
+            false,
+        ),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!(
+                r#"from typing import Any, Callable
+from ty_extensions._internal import Unknown
+def narrow(value: str) -> None: pass
+def wide(value: Any) -> None: pass
+{body}
+"#
+            ),
+        )?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let facts = |db: &TestDb| {
+            let file = program_file(db, file);
+            let module = parsed_module(db, file.python_file(db)).load(db);
+            let [_, _, _, _, statement] = module.syntax().body.as_slice() else {
+                panic!("expected imports, callbacks and one default declaration");
+            };
+            let function = match statement {
+                ast::Stmt::FunctionDef(function) => function,
+                ast::Stmt::If(branch) => {
+                    let [ast::Stmt::FunctionDef(function)] = branch.body.as_slice() else {
+                        panic!("expected an unreachable default declaration");
+                    };
+                    function
+                }
+                _ => panic!("expected a default declaration"),
+            };
+            let definition = semantic_index(db, file).expect_single_definition(function);
+            let facts = crate::SemanticModel::new(db, file)
+                .function_inference_facts(definition)
+                .unwrap();
+            let signature = infer_definition_types(db, definition)
+                .binding_type(definition)
+                .display(db, &db.program_environment())
+                .to_string();
+            (facts, signature)
+        };
+        let (ordinary, signature) = facts(&db);
+        assert!(!ordinary.has_unproved_requirements, "{body}");
+        assert_file_diagnostics(&db, "/src/main.py", &[]);
+        db.select_function_inference(Some((
+            file,
+            vec!["<module>".to_owned()],
+            FunctionInferenceMode::OutputProof,
+        )));
+        let (selected, selected_signature) = facts(&db);
+        assert_eq!(selected.has_unproved_requirements, unproved, "{body}");
+        assert!(!selected.has_errors, "{body}");
+        assert_eq!(selected.return_type_correspondence, None, "{body}");
+        assert_eq!(selected_signature, signature, "{body}");
+        assert_file_diagnostics(&db, "/src/main.py", &[]);
+        db.select_function_inference(None);
+        let (restored, restored_signature) = facts(&db);
+        assert!(!restored.has_unproved_requirements, "{body}");
+        assert_eq!(restored_signature, signature, "{body}");
+    }
+    Ok(())
+}
+
+#[test]
 fn declaration_storage_correspondence() -> anyhow::Result<()> {
     let registry = crate::default_lint_registry();
     let mut rules = RuleSelection::from_registry(registry);

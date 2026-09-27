@@ -18,11 +18,11 @@ pub enum FunctionInferenceMode {
     Default,
     /// Ordinary inference with retained return-type correspondence facts and unresolved
     /// requirements from explicit calls, including constructors with one `__new__` or `__init__`
-    /// stage, indexed writes, name declarations, contextual collection elements and supported
-    /// `TypedDict` construction and storage. These checks use the ordinary selected binding, field,
-    /// declared domain or element type without changing inference or branch selection. Unsupported
-    /// binding, merged field and contextual replay cases remain unproved. Function and file facts
-    /// expose this status independently of
+    /// stage, indexed writes, name declarations, source-annotated defaults, contextual collection
+    /// elements and supported `TypedDict` construction and storage. These checks use the ordinary
+    /// selected binding, field, declared domain or element type without changing inference or
+    /// branch selection. Unsupported binding, merged field and contextual replay cases remain
+    /// unproved. Function and file facts expose this status independently of
     /// diagnostic rule selection and source suppressions.
     OutputProof,
     /// Upper-bound materialization of initial named-function parameter bindings and explicit
