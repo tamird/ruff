@@ -724,8 +724,14 @@ fn successful_subscript_constraints<'db>(
         if !matches!(arm, Type::NominalInstance(_)) {
             return true;
         }
-        match arm.subscript(db, &env, key_ty, ast::ExprContext::Load) {
-            Ok(result) => !matches!(result.resolve_type_alias(db), Type::Never),
+        match arm.subscript(
+            db,
+            &env,
+            key_ty,
+            ast::ExprContext::Load,
+            crate::FunctionInferenceMode::Default,
+        ) {
+            Ok(result) => !matches!(result.ty.resolve_type_alias(db), Type::Never),
             Err(_) => true,
         }
     });
