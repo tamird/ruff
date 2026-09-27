@@ -251,6 +251,7 @@ fn function_inference_facts() -> anyhow::Result<()> {
             has_cycle_recovery,
             has_errors,
             has_diagnostics_or_suppressions,
+            has_unproved_requirements: _,
         } = model.function_inference_facts(definition).unwrap();
         assert_eq!(
             (
@@ -1577,6 +1578,138 @@ fn function_output_correspondence() -> anyhow::Result<()> {
     assert_file_diagnostics(&db, "/src/main.py", &[]);
     assert_eq!(correspondence(&db), names.map(|_| None));
     assert_eq!(signatures(&db), ordinary);
+    Ok(())
+}
+
+#[test]
+fn function_argument_correspondence_status() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .build()?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, no_type_check
+
+        def narrow(values: list[str]) -> None:
+            pass
+
+        def accept(callback: Callable[[list[Any]], None]) -> None:
+            pass
+
+        def needs_int(value: int) -> None:
+            pass
+
+        def bad() -> None:
+            accept(narrow)
+
+        def good() -> None:
+            accept(lambda values: None)
+
+        def dead() -> None:
+            if False:
+                accept(narrow)
+
+        def suppressed() -> None:
+            needs_int("bad")  # ty: ignore[invalid-argument-type]
+
+        @no_type_check
+        def unchecked() -> None:
+            needs_int("bad")
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let names = ["bad", "good", "dead", "suppressed", "unchecked"];
+    let signatures = |db: &TestDb| {
+        names.map(|name| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let facts = |db: &TestDb| {
+        let model = crate::SemanticModel::new(db, program_file(db, file));
+        names.map(|name| {
+            model
+                .function_inference_facts(first_public_binding(db, file, name))
+                .unwrap()
+        })
+    };
+    let ordinary_signatures = signatures(&db);
+    let ordinary = facts(&db);
+    assert_eq!(
+        ordinary.map(|fact| fact.has_unproved_requirements),
+        [false; 5]
+    );
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+
+    db.select_function_inference(Some((
+        file,
+        names.map(str::to_owned).to_vec(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    let selected = facts(&db);
+    assert_eq!(
+        selected.map(|fact| fact.has_unproved_requirements),
+        [true, false, false, true, true]
+    );
+    assert_eq!(
+        selected.map(|fact| (fact.has_errors, fact.has_diagnostics_or_suppressions)),
+        ordinary.map(|fact| (fact.has_errors, fact.has_diagnostics_or_suppressions))
+    );
+    assert_eq!(signatures(&db), ordinary_signatures);
+    let file_result = crate::types::check_types_with_diagnostics(&db, program_file(&db, file), []);
+    assert!(file_result.diagnostics.is_empty());
+    assert!(file_result.has_unproved_requirements);
+    // Repeat the queries after scope results have been cached.
+    assert_eq!(
+        facts(&db).map(|fact| fact.has_unproved_requirements),
+        selected.map(|fact| fact.has_unproved_requirements)
+    );
+    assert!(
+        crate::types::check_types_with_diagnostics(&db, program_file(&db, file), [])
+            .has_unproved_requirements
+    );
+
+    db.select_function_inference(None);
+    assert_eq!(
+        facts(&db).map(|fact| fact.has_unproved_requirements),
+        ordinary.map(|fact| fact.has_unproved_requirements)
+    );
+    assert_eq!(signatures(&db), ordinary_signatures);
+    assert!(
+        !crate::types::check_types_with_diagnostics(&db, program_file(&db, file), [])
+            .has_unproved_requirements
+    );
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    Ok(())
+}
+
+#[test]
+fn function_argument_correspondence_with_disabled_diagnostics() -> anyhow::Result<()> {
+    let registry = crate::default_lint_registry();
+    let mut rules = RuleSelection::from_registry(registry);
+    rules.disable(registry.get("invalid-argument-type")?);
+    let mut db = TestDbBuilder::new()
+        .with_rule_selection(rules)
+        .with_file(
+            "/src/main.py",
+            "def needs_int(value: int) -> None: ...\n\
+             def bad() -> None:\n    needs_int('bad')\n",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    db.select_function_inference(Some((
+        file,
+        vec!["bad".to_owned()],
+        FunctionInferenceMode::OutputProof,
+    )));
+    let result = crate::types::check_types_with_diagnostics(&db, program_file(&db, file), []);
+    assert!(result.diagnostics.is_empty());
+    assert!(!result.has_suppressed_inference_diagnostics);
+    assert!(result.has_unproved_requirements);
     Ok(())
 }
 

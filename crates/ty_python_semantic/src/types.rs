@@ -210,6 +210,9 @@ pub struct TypeCheckResult {
     /// scopes, defaults, and implicit aliases. Supplemental diagnostics and checks of
     /// suppression comments themselves do not contribute to this flag.
     pub has_suppressed_inference_diagnostics: bool,
+    /// Whether selected inference encountered reachable input requirements it could not prove.
+    /// Includes committed nested scopes and defaults, independently of diagnostic display policy.
+    pub has_unproved_requirements: bool,
 }
 
 pub fn check_types(db: &dyn Db, file: ProgramFile<'_>) -> Vec<Diagnostic> {
@@ -299,6 +302,7 @@ pub fn check_types_with_diagnostics(
     );
 
     let has_suppressed_inference_diagnostics = diagnostics.has_reachable_suppressed_diagnostics();
+    let has_unproved_requirements = diagnostics.has_unproved_requirements();
     diagnostics.extend_provided(db, file.python_file(db), supplemental, |_| false);
     let diagnostics = check_suppressions(db, file.python_file(db), diagnostics);
 
@@ -313,6 +317,7 @@ pub fn check_types_with_diagnostics(
     TypeCheckResult {
         diagnostics,
         has_suppressed_inference_diagnostics,
+        has_unproved_requirements,
     }
 }
 

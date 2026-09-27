@@ -9920,6 +9920,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             call_expression_tcx
         };
 
+        // Intersections can discard contextual child statuses before pruning to one binding.
+        let single_argument_context = bindings.is_single();
         let bindings_result = self.infer_and_check_argument_types(
             ArgumentsIter::from_ast(arguments),
             &collection_argument_indices,
@@ -9954,6 +9956,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             &mut bindings,
             call_expression_tcx,
         );
+
+        // Argument replay is committed here. Proof failures must not change overload selection,
+        // contextual hints, or the result chosen by ordinary checking.
+        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+            && (!single_argument_context
+                || !bindings.arguments_satisfy_declared_parameters(db, env, &call_arguments))
+        {
+            self.context.record_unproved_requirement(call_expression);
+        }
 
         let mut bindings = match bindings_result {
             Ok(()) => bindings,
@@ -13763,6 +13774,76 @@ mod tests {
     use super::*;
     use crate::db::tests::TestDbBuilder;
     use crate::provided::ProvidedBindingValue;
+
+    #[test]
+    fn argument_proof_survives_expression_cache() -> anyhow::Result<()> {
+        let mut db = TestDbBuilder::new()
+            .with_file(
+                "/src/main.py",
+                "from typing import Any, Callable\n\
+                 def consume(callback: Callable[[list[Any]], int]) -> None: ...\n\
+                 def narrow(values: list[str]) -> int: return 1\n\
+                 def make() -> None:\n    return consume(narrow)\n",
+            )
+            .build()?;
+        let source = system_path_to_file(&db, "/src/main.py")?;
+        db.select_function_inference(Some((
+            source,
+            vec!["make".to_owned()],
+            crate::FunctionInferenceMode::OutputProof,
+        )));
+        let file = db.program_file(source);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let function = module.suite().last().unwrap();
+        let ast::Stmt::FunctionDef(function) = function else {
+            panic!("expected make function, got {function:?}");
+        };
+        let [ast::Stmt::Return(statement)] = function.body.as_slice() else {
+            panic!("expected one return statement, got {:?}", function.body);
+        };
+        let expression = statement.value.as_deref().expect("return value");
+        let index = semantic_index(&db, file);
+        let scope = index
+            .try_expression_scope_id(&ast::ExprRef::from(expression))
+            .unwrap()
+            .to_scope_id(&db, file);
+        let env = ProgramEnvironment::from_file(file);
+        let mut builder = TypeInferenceBuilder::new(
+            &db,
+            &env,
+            InferenceRegion::Scope(scope, TypeContext::default()),
+            source,
+            file,
+            index,
+            &module,
+        );
+        builder.context.defuse();
+        assert!(builder.setup_expression_cache());
+        let mut discarded = builder.speculate_without_diagnostics();
+        assert_eq!(
+            discarded.infer_expression(expression, TypeContext::default()),
+            Type::none(&db, &env),
+        );
+        drop(discarded.into_expression_cache_entry());
+        assert!(!builder.context.has_diagnostics());
+
+        let mut committed = builder.speculate();
+        assert_eq!(
+            committed.infer_expression(expression, TypeContext::default()),
+            Type::none(&db, &env),
+        );
+        assert!(!committed.context.has_diagnostics());
+        let cached = committed.into_expression_cache_entry();
+        assert!(cached.diagnostics.has_unproved_requirements());
+        assert!(cached.diagnostics.into_diagnostics().is_empty());
+        assert!(
+            !builder
+                .into_expression_cache_entry()
+                .diagnostics
+                .has_unproved_requirements()
+        );
+        Ok(())
+    }
 
     #[test]
     fn literal_cache_separates_structural_contracts() -> anyhow::Result<()> {

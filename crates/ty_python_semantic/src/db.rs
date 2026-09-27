@@ -16,7 +16,11 @@ pub enum FunctionInferenceMode {
     /// Ordinary inference and diagnostics.
     #[default]
     Default,
-    /// Ordinary inference with retained return-type correspondence facts.
+    /// Ordinary inference with retained return-type correspondence facts and unresolved
+    /// argument requirements from explicit calls. These requirements use the final ordinary
+    /// binding without changing argument inference or the call result. Unsupported binding
+    /// cases remain unproved. Function and file facts expose this status independently of
+    /// diagnostic rule selection and source suppressions.
     OutputProof,
     /// Upper-bound materialization of initial named-function parameter bindings and explicit
     /// runtime module-global reads. Named parameter declarations, signatures and default checks
@@ -42,7 +46,8 @@ pub trait Db: PythonCoreDb {
     /// Selects function inference using tracked configuration inputs.
     ///
     /// This changes the active configuration, not a simultaneous alternate view.
-    /// Output facts concern declared return types; conservative inputs constrain operations.
+    /// Output facts concern declared return types and selected argument checks; conservative
+    /// inputs constrain operations.
     /// Neither mode establishes complete implementation evidence on its own.
     fn function_inference_mode(
         &self,

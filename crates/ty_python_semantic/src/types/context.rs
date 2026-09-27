@@ -279,7 +279,23 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
     }
 
     pub(super) fn has_diagnostics(&self) -> bool {
-        !self.diagnostics.borrow().is_empty()
+        self.diagnostics
+            .borrow()
+            .has_diagnostics_or_used_suppressions()
+    }
+
+    /// Record a reachable selected requirement independently of diagnostic display policy.
+    /// The result travels with committed inference, including cached expression results.
+    pub(super) fn record_unproved_requirement(&self, node: impl Ranged) {
+        if self.diagnostics_suppressed
+            || !self.db.should_check_file(self.file)
+            || self.db.function_inference_mode(self.scope)
+                != crate::FunctionInferenceMode::OutputProof
+            || !self.is_range_reachable(node.range())
+        {
+            return;
+        }
+        self.diagnostics.borrow_mut().mark_unproved_requirement();
     }
 
     /// Prevents diagnostic construction for this inference context.

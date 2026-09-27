@@ -53,6 +53,7 @@ use crate::types::function::{
 };
 use crate::types::generics::{
     GenericContext, Specialization, SpecializationBuilder, SpecializationError, TypeVarInference,
+    TypeVarInferenceSolutions,
 };
 use crate::types::infer::original_class_type;
 use crate::types::known_instance::{
@@ -1464,6 +1465,93 @@ impl<'db> Bindings<'db> {
         }
 
         self.as_result(db)
+    }
+
+    /// Check the committed actual arguments against the selected parameter contracts.
+    ///
+    /// This query leaves ordinary overload selection and results unchanged. Multiple callable
+    /// contributors, expanded or ambiguous overloads, constructor stages, and unresolved generic
+    /// solutions for supplied values need additional coverage to establish requirements.
+    /// The caller must also establish that argument inference committed the selected contexts;
+    /// final binding pruning alone does not establish that child proof statuses were retained.
+    pub(crate) fn arguments_satisfy_declared_parameters(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        arguments: &CallArguments<'_, 'db>,
+    ) -> bool {
+        if self.as_result(db).is_err() {
+            return false;
+        }
+        let Some(item) = self.single_item() else {
+            return false;
+        };
+        let CallableItem::Regular(callable) = item else {
+            return false;
+        };
+        if callable.overload_call_result.is_some() {
+            return false;
+        }
+        let Ok((_, binding)) = callable.matching_overloads().exactly_one() else {
+            return false;
+        };
+        let parameters = binding.signature.parameters();
+        if !parameters.is_standard() {
+            return false;
+        }
+        let arguments = arguments.with_self(callable.bound_type);
+        if arguments.len() != binding.argument_matches.len() {
+            return false;
+        }
+        // With no supplied values or implicit receiver, no input pair needs specialization.
+        if arguments.len() == 0 {
+            return true;
+        }
+        match binding.inference {
+            Some(inference) => {
+                if !matches!(inference.solutions(db), TypeVarInferenceSolutions::Single) {
+                    return false;
+                }
+            }
+            None => {
+                if binding.signature.generic_context.is_some() {
+                    return false;
+                }
+            }
+        }
+        let specialization = binding.partial_specialization(db, env);
+        arguments
+            .iter()
+            .zip(&binding.argument_matches)
+            .all(|((argument, types), matched)| {
+                if matches!(argument, Argument::Variadic | Argument::Keywords)
+                    || !matched.matched
+                    || matched.parameters.is_empty()
+                {
+                    return false;
+                }
+                matched.iter().all(|matched_parameter| {
+                    let Some(parameter) = parameters.get(matched_parameter.index) else {
+                        return false;
+                    };
+                    if parameter.has_starred_annotation() {
+                        return false;
+                    }
+                    let Some(mut actual) = matched_parameter.argument_type(parameter, types) else {
+                        return false;
+                    };
+                    let mut expected = matched_parameter
+                        .expected_type
+                        .unwrap_or_else(|| parameter.annotated_type());
+                    if let Some(specialization) = specialization {
+                        actual = actual.apply_specialization(db, specialization);
+                        expected = expected.apply_specialization(db, specialization);
+                    }
+                    expected.is_fully_static_except_any(db, env)
+                        && !actual.has_provisional_marker(db, env)
+                        && actual.satisfies_declared_output(db, env, expected)
+                })
+            })
     }
 
     /// Returns true if this is a single callable (not a union or intersection).
@@ -5921,12 +6009,8 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                         }
 
                         let parameter = &parameters[parameter_index];
-                        let declared_type = matched_parameter
-                            .expected_type
-                            .unwrap_or_else(|| parameter.annotated_type());
-                        let argument_type = matched_parameter
-                            .argument_type
-                            .or_else(|| argument_types.try_get_for_declared_type(declared_type))?;
+                        let argument_type =
+                            matched_parameter.argument_type(parameter, argument_types)?;
 
                         Some(ArgumentRelation::new(
                             argument_index,
@@ -7379,6 +7463,21 @@ pub struct MatchedParameter<'db> {
 
     /// Why this parameter match exists.
     provenance: InvalidArgumentTypeProvenance,
+}
+
+impl<'db> MatchedParameter<'db> {
+    /// Resolve the actual type using the same formal key as contextual argument inference.
+    fn argument_type(
+        self,
+        parameter: &Parameter<'db>,
+        types: &CallArgumentTypes<'db>,
+    ) -> Option<Type<'db>> {
+        let expected = self
+            .expected_type
+            .unwrap_or_else(|| parameter.annotated_type());
+        self.argument_type
+            .or_else(|| types.try_get_for_declared_type(expected))
+    }
 }
 
 impl<'db> MatchedArgument<'db> {
@@ -10359,6 +10458,183 @@ mod tests {
     use crate::place::global_symbol;
     use crate::types::constraints::resolution::SolutionType::Resolved;
     use crate::types::generics::TypeVarInferenceSolutions;
+
+    #[test]
+    fn call_argument_correspondence_preserves_ordinary_binding() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+            from typing import Callable, Protocol
+
+            class Named(Protocol):
+                def __call__(self, *, name: str) -> None: ...
+
+            def closed(callback: Named) -> None: ...
+            def omitted(callback: Callable[..., None]) -> None: ...
+            values: list[Named] = []
+            append = values.append
+            "#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let name = Parameter::keyword_only(Name::new_static("name"))
+            .with_annotated_type(KnownClass::Str.to_instance(db, &env));
+        let parameters = Parameters::standard([name]);
+        let complete = Type::function_like_callable(
+            db,
+            Signature::new(parameters.clone(), Type::none(db, &env)),
+        );
+        let incomplete = Type::function_like_callable(
+            db,
+            Signature::new(parameters.with_incomplete_shape(), Type::none(db, &env)),
+        );
+        for (name, argument, expected) in [
+            ("closed", complete, true),
+            ("closed", incomplete, false),
+            ("omitted", incomplete, true),
+            ("append", complete, true),
+            ("append", incomplete, false),
+        ] {
+            let callable = global_symbol(db, file, name).place.expect_type();
+            let arguments = CallArguments::positional([argument]);
+            let constraints = ConstraintSetBuilder::new();
+            let bindings = callable
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &constraints,
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                )
+                .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
+            assert_eq!(bindings.return_type(db, &env), Type::none(db, &env));
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                expected,
+                "{name}: {}",
+                argument.display(db, &env),
+            );
+            assert!(bindings.as_result(db).is_ok());
+            assert_eq!(bindings.return_type(db, &env), Type::none(db, &env));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_argument_correspondence_preserves_call_guards() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+from typing import overload
+
+def produce[T]() -> T: ...
+def required[T](value: T) -> T: ...
+
+@overload
+def ambiguous(value: int) -> int: ...
+@overload
+def ambiguous(value: str) -> str: ...
+def ambiguous(value: int | str) -> int | str: ...
+
+class Holder[T]:
+    def read(self) -> T: ...
+holder: Holder
+bound = holder.read
+"#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let lookup = |name| global_symbol(db, file, name).place.expect_type();
+        let incomplete = Type::function_like_callable(
+            db,
+            Signature::new(
+                Parameters::standard([]).with_incomplete_shape(),
+                Type::none(db, &env),
+            ),
+        );
+        for (name, callable, arguments, accepted, proved) in [
+            (
+                "produce",
+                lookup("produce"),
+                CallArguments::default(),
+                true,
+                true,
+            ),
+            (
+                "missing",
+                lookup("required"),
+                CallArguments::default(),
+                false,
+                false,
+            ),
+            (
+                "incomplete",
+                incomplete,
+                CallArguments::default(),
+                true,
+                false,
+            ),
+            (
+                "ambiguous",
+                lookup("ambiguous"),
+                CallArguments::positional([Type::any()]),
+                true,
+                false,
+            ),
+            (
+                "bound",
+                lookup("bound"),
+                CallArguments::default(),
+                true,
+                false,
+            ),
+            (
+                "unknown",
+                lookup("required"),
+                CallArguments::positional([Type::unknown()]),
+                true,
+                false,
+            ),
+        ] {
+            let constraints = ConstraintSetBuilder::new();
+            let result = callable
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &constraints,
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                );
+            assert_eq!(result.is_ok(), accepted, "{name}");
+            let bindings = match result {
+                Ok(bindings) => bindings,
+                Err(CallError(_, bindings)) => *bindings,
+            };
+            let return_type = bindings.return_type(db, &env);
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                proved,
+                "{name}",
+            );
+            assert_eq!(bindings.return_type(db, &env), return_type);
+            if name == "produce" {
+                assert!(return_type.is_unknown());
+            }
+        }
+        Ok(())
+    }
 
     fn call_inference<'db>(
         db: &'db TestDb,
