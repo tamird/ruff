@@ -59,10 +59,17 @@ const MAX_TUPLE_ADDITION_ELEMENTS: usize = 4096;
 pub(super) struct BinaryInferenceState<'db> {
     emitted_division_by_zero_diagnostic: bool,
     pub(super) deprecated_functions: Vec<OverloadLiteral<'db>>,
+    pub(super) arguments_proved: Option<bool>,
     used_tuple_addition: bool,
 }
 
 impl<'db> BinaryInferenceState<'db> {
+    pub(super) fn retain_argument_proof(&mut self, proved: bool) {
+        if let Some(arguments_proved) = &mut self.arguments_proved {
+            *arguments_proved &= proved;
+        }
+    }
+
     fn tuple_alternative_count(db: &'db dyn Db, ty: Type<'db>) -> usize {
         match ty {
             Type::Union(union) => union
@@ -430,7 +437,10 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             left_ty,
             op,
             right_ty,
+            MemberLookupPolicy::default(),
+            state.arguments_proved.is_some(),
         )?;
+        state.retain_argument_proof(result.arguments_proved);
         state
             .deprecated_functions
             .extend(&result.deprecated_functions);
@@ -481,6 +491,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         {
             state.emitted_division_by_zero_diagnostic =
                 self.check_division_by_zero(node, op, left_ty);
+        }
+
+        if state.arguments_proved.is_some()
+            && (left_ty.is_dynamic()
+                || right_ty.is_dynamic()
+                || left_ty.has_provisional_marker(db, env)
+                || right_ty.has_provisional_marker(db, env))
+        {
+            state.retain_argument_proof(false);
         }
 
         match (left_ty, right_ty, op) {
@@ -553,12 +572,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             (Type::TypedDict(left_typed_dict), rhs, ast::Operator::BitOr)
                 if rhs.is_assignable_to(db, env, Type::TypedDict(left_typed_dict)) =>
             {
+                state.retain_argument_proof(false);
                 Some(Type::TypedDict(left_typed_dict))
             }
 
             (lhs, Type::TypedDict(right_typed_dict), ast::Operator::BitOr)
                 if lhs.is_assignable_to(db, env, Type::TypedDict(right_typed_dict)) =>
             {
+                state.retain_argument_proof(false);
                 Some(Type::TypedDict(right_typed_dict))
             }
 
@@ -1134,22 +1155,21 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 _,
                 Type::ClassLiteral(..) | Type::GenericAlias(..) | Type::SubclassOf(..),
                 ast::Operator::BitOr,
-            ) => Type::try_call_bin_op_with_policy(
+            ) => Type::try_call_bin_op_result(
                 db,
                 env,
                 left_ty,
                 ast::Operator::BitOr,
                 right_ty,
                 MemberLookupPolicy::META_CLASS_NO_TYPE_FALLBACK,
+                state.arguments_proved.is_some(),
             )
-            .ok()
-            .map(|binding| {
-                state.deprecated_functions.extend(
-                    binding
-                        .deprecated_functions(db)
-                        .map(|(_, function)| function),
-                );
-                binding.return_type(db, env)
+            .map(|result| {
+                state.retain_argument_proof(result.arguments_proved);
+                state
+                    .deprecated_functions
+                    .extend(&result.deprecated_functions);
+                result.return_type
             }),
 
             // We've handled all of the special cases that we support for literals, so we need to
