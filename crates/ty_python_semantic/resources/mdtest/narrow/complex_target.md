@@ -384,6 +384,36 @@ def nested_write(
     return {}
 ```
 
+Comprehension targets retain the relationship within each unpacked item. Rebinding a target in a
+later generator prevents projection, and failed outer iteration cannot provide narrowing evidence.
+
+```py
+from collections.abc import Iterator
+
+def consume_dict(value: dict[str, int]) -> None: ...
+def consume_str(value: str) -> None: ...
+def comprehensions(items: list[Tagged]):
+    [consume_dict(payload) if flag else consume_str(payload) for flag, payload in items]
+    reveal_type([payload for flag, payload in items if flag])  # revealed: list[dict[str, int]]
+    reveal_type([payload for flag, payload in items if not flag])  # revealed: list[str]
+
+def replaced_comprehension_flag(items: list[Tagged], flags: list[bool]):
+    # error: [invalid-argument-type]
+    [consume_dict(payload) for flag, payload in items for flag in flags if flag]
+
+def replaced_comprehension_payload(items: list[Tagged], replacements: list[dict[str, int] | str]):
+    # error: [invalid-argument-type]
+    [consume_dict(payload) for flag, payload in items for payload in replacements if flag]
+
+class Broken:
+    def __iter__(self, required: object) -> Iterator[Tagged]:
+        return iter(())
+
+def failed_outer_iteration():
+    # error: [not-iterable]
+    reveal_type([payload for flag, payload in Broken() if flag])  # revealed: list[dict[str, int] | str]
+```
+
 ### Tagged unions of tuples (equality narrowing)
 
 Narrow unions of tuples based on literal tag elements using `==` comparison:

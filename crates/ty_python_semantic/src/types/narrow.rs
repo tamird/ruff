@@ -36,7 +36,7 @@ use crate::types::{
 };
 use crate::{Db, ProgramEnvironment};
 use ty_python_core::ast_ids::HasScopedUseId;
-use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
+use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState, TargetKind};
 use ty_python_core::expression::Expression;
 use ty_python_core::frozen::FrozenMap;
 use ty_python_core::place::{PlaceExpr, PlaceTable, ScopedPlaceId};
@@ -4219,7 +4219,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             .expect("We should always have a place for every `PlaceExpr`")
     }
 
-    /// Recover relationships between flat locals assigned by one unpacking. Whole binding
+    /// Recover relationships between flat locals bound by one unpacking. Whole binding
     /// histories deliberately exclude later writes too, without maintaining another alias graph.
     fn narrow_unpacked_local(
         &mut self,
@@ -4229,7 +4229,8 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
     ) -> Option<NarrowingConstraints<'db>> {
         let db = self.db;
         let scope = expression.scope(db);
-        if scope.node(db).scope_kind() != ScopeKind::Function {
+        let scope_kind = scope.node(db).scope_kind();
+        if !matches!(scope_kind, ScopeKind::Function | ScopeKind::Comprehension) {
             return None;
         }
         let file = expression.program_file(db);
@@ -4241,13 +4242,26 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         if bindings.any(|binding| binding.binding != DefinitionState::Defined(definition)) {
             return None;
         }
-        let DefinitionKind::Assignment(assignment) = definition.kind(db) else {
-            return None;
+        let unpack = match (scope_kind, definition.kind(db)) {
+            (ScopeKind::Function, DefinitionKind::Assignment(assignment)) => {
+                let unpack = assignment.unpack()?;
+                if !matches!(unpack.value(db).kind(), UnpackKind::Assign) {
+                    return None;
+                }
+                unpack
+            }
+            (ScopeKind::Comprehension, DefinitionKind::Comprehension(comprehension)) => {
+                let TargetKind::Sequence(_, unpack) = comprehension.target_kind() else {
+                    return None;
+                };
+                if !matches!(unpack.value(db).kind(), UnpackKind::Iterable { .. }) {
+                    return None;
+                }
+                unpack
+            }
+            _ => return None,
         };
-        let unpack = assignment.unpack()?;
-        if unpack.target_scope(db) != scope
-            || !matches!(unpack.value(db).kind(), UnpackKind::Assign)
-        {
+        if unpack.target_scope(db) != scope {
             return None;
         }
         let target = unpack.target(db, self.module);
