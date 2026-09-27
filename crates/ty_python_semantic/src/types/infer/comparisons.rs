@@ -905,8 +905,18 @@ fn infer_binary_type_comparison_inner<'db>(
         && let Some(right_tuple) = right.tuple_instance_spec(db, env)
     {
         return visitor.visit(db, (left, op, right), || {
-            infer_tuple_rich_comparison(context, &left_tuple, rich_op, &right_tuple, range, visitor)
-                .map(Into::into)
+            let mut result = infer_tuple_rich_comparison(
+                context,
+                &left_tuple,
+                rich_op,
+                &right_tuple,
+                range,
+                visitor,
+            )?;
+            // Tuple subclasses may override the methods bypassed by this ordinary shortcut.
+            result.inputs_proved &= left.exact_tuple_instance_spec(db).is_some()
+                && right.exact_tuple_instance_spec(db).is_some();
+            Ok(result)
         });
     }
 
@@ -1741,9 +1751,25 @@ fn infer_tuple_rich_comparison<'db>(
     right: &TupleSpec<'db>,
     range: TextRange,
     visitor: &BinaryComparisonVisitor<'db>,
-) -> Result<Type<'db>, UnsupportedComparisonError<'db>> {
+) -> Result<ComparisonResult<'db>, UnsupportedComparisonError<'db>> {
     let db = context.db();
     let env = &context.program_environment();
+    // The existing variable-pair inventory does not cover all cross prefix/suffix
+    // alignments. Use it as proof only for homogeneous variable tuples.
+    let supported_shape = |tuple: &TupleSpec<'db>| match tuple {
+        TupleSpec::Fixed(_) => true,
+        TupleSpec::Variable(tuple) => {
+            tuple.prefix_elements().is_empty() && tuple.suffix_elements().is_empty()
+        }
+    };
+    let prove_inputs = db.function_inference_mode(context.scope())
+        == crate::FunctionInferenceMode::OutputProof
+        && supported_shape(left)
+        && supported_shape(right);
+    let soundness_policy =
+        ComparisonSoundnessPolicy::from_analysis_settings(db.analysis_settings(context.file()));
+    let mut equality = ContainerElementEqualityEvaluator::new(db, env, soundness_policy);
+    let mut inputs_proved = prove_inputs;
     match (left, right) {
         // Both fixed-length: perform full lexicographic comparison.
         (TupleSpec::Fixed(left), TupleSpec::Fixed(right)) => {
@@ -1751,20 +1777,16 @@ fn infer_tuple_rich_comparison<'db>(
             let right_iter = right.iter_all_elements();
 
             let mut builder = UnionBuilder::new(db, env);
-            let soundness_policy = ComparisonSoundnessPolicy::from_analysis_settings(
-                db.analysis_settings(context.file()),
-            );
-            let mut equality = ContainerElementEqualityEvaluator::new(db, env, soundness_policy);
-
             for (l_ty, r_ty) in left_iter.zip(right_iter) {
-                let eq_truthiness = equality
-                    .element_truthiness(l_ty, r_ty)
+                let (eq_truthiness, equality_inputs_proved) = equality
+                    .element_truthiness_with_input_proof(l_ty, r_ty, prove_inputs)
                     .unwrap_or_else(|err| {
                         // TODO: We should, whenever possible, pass the range of the left and right elements
                         //   instead of the range of the whole tuple.
                         err.report_diagnostic(context, range);
-                        Truthiness::Ambiguous
+                        (Truthiness::Ambiguous, false)
                     });
+                inputs_proved &= equality_inputs_proved;
 
                 match eq_truthiness {
                     // - AlwaysTrue : Continue to the next pair for lexicographic comparison
@@ -1782,15 +1804,16 @@ fn infer_tuple_rich_comparison<'db>(
                             | RichCompareOperator::Le
                             | RichCompareOperator::Gt
                             | RichCompareOperator::Ge => {
-                                infer_binary_type_comparison_inner(
+                                let result = infer_binary_type_comparison_inner(
                                     context,
                                     l_ty,
                                     NonIdentityOperator::Rich(op),
                                     r_ty,
                                     range,
                                     visitor,
-                                )?
-                                .ty
+                                )?;
+                                inputs_proved &= result.inputs_proved;
+                                result.ty
                             }
                             // For `==` and `!=`, the equality evaluator has already determined
                             // that these elements may differ.
@@ -1806,7 +1829,10 @@ fn infer_tuple_rich_comparison<'db>(
                             continue;
                         }
 
-                        return Ok(builder.build());
+                        return Ok(ComparisonResult {
+                            ty: builder.build(),
+                            inputs_proved,
+                        });
                     }
                 }
             }
@@ -1823,7 +1849,10 @@ fn infer_tuple_rich_comparison<'db>(
                 RichCompareOperator::Ge => left_len >= right_len,
             }));
 
-            Ok(builder.build())
+            Ok(ComparisonResult {
+                ty: builder.build(),
+                inputs_proved,
+            })
         }
 
         // At least one tuple is variable-length. We can make no assumptions about
@@ -1836,7 +1865,20 @@ fn infer_tuple_rich_comparison<'db>(
         (TupleSpec::Variable(_), _) | (_, TupleSpec::Variable(_))
             if matches!(op, RichCompareOperator::Eq | RichCompareOperator::Ne) =>
         {
-            Ok(KnownClass::Bool.to_instance(db, env))
+            if prove_inputs {
+                // Equality remains a bool even when an element's comparison cannot be proved.
+                // This inventory is additional proof work, so it emits no new diagnostics.
+                left.try_for_each_element_pair(db, right, |l_ty, r_ty| {
+                    inputs_proved &= equality
+                        .element_truthiness_with_input_proof(l_ty, r_ty, true)
+                        .is_ok_and(|(_, proved)| proved);
+                    Ok::<_, UnsupportedComparisonError<'db>>(())
+                })?;
+            }
+            Ok(ComparisonResult {
+                ty: KnownClass::Bool.to_instance(db, env),
+                inputs_proved,
+            })
         }
 
         // At least one variable-length: check all elements that could potentially be compared.
@@ -1844,17 +1886,21 @@ fn infer_tuple_rich_comparison<'db>(
         (left @ TupleSpec::Variable(_), right) | (left, right @ TupleSpec::Variable(_)) => {
             let mut results = SmallVec::<[Type<'db>; 8]>::new();
             left.try_for_each_element_pair(db, right, |l_ty, r_ty| {
-                results.push(
-                    infer_binary_type_comparison_inner(
-                        context,
-                        l_ty,
-                        NonIdentityOperator::Rich(op),
-                        r_ty,
-                        range,
-                        visitor,
-                    )?
-                    .ty,
-                );
+                if prove_inputs {
+                    inputs_proved &= equality
+                        .element_truthiness_with_input_proof(l_ty, r_ty, true)
+                        .is_ok_and(|(_, proved)| proved);
+                }
+                let result = infer_binary_type_comparison_inner(
+                    context,
+                    l_ty,
+                    NonIdentityOperator::Rich(op),
+                    r_ty,
+                    range,
+                    visitor,
+                )?;
+                inputs_proved &= result.inputs_proved;
+                results.push(result.ty);
                 Ok::<_, UnsupportedComparisonError<'db>>(())
             })?;
 
@@ -1865,7 +1911,10 @@ fn infer_tuple_rich_comparison<'db>(
             // Length comparison (when all elements are equal) returns bool.
             builder = builder.add(KnownClass::Bool.to_instance(db, env));
 
-            Ok(builder.build())
+            Ok(ComparisonResult {
+                ty: builder.build(),
+                inputs_proved,
+            })
         }
     }
 }

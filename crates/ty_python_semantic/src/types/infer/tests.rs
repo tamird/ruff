@@ -2899,6 +2899,8 @@ fn rich_comparison_argument_correspondence() -> anyhow::Result<()> {
         class FinalInt(int): pass
         class CallableEnum(Enum):
             A = 1
+            B = 2
+            def __lt__(self, other: object) -> bool: return True
             def __call__(self, value: str) -> None: pass
             @overload
             def __eq__(self, other: Callable[[Any], None]) -> Literal[False]: ...
@@ -2928,6 +2930,27 @@ fn rich_comparison_argument_correspondence() -> anyhow::Result<()> {
         def constructor(value: Constructor, callback: Named) -> None: value < callback
         def pragmatic(value: int) -> None: value == 'x'
         def tuple_elements(value: Bad, callback: Named) -> None: (value,) < (callback,)
+        def tuple_scalars(left: tuple[int, str], right: tuple[int, str]) -> None:
+            left < right
+            left == right
+            left != right
+        def tuple_prefix() -> None: (CallableEnum.A, 1) < (CallableEnum.B, 2)
+        def tuple_identity() -> None: (CallableEnum.A, 1) < (CallableEnum.A, 2)
+        def tuple_nested_inputs() -> None: ((CallableEnum.A,),) == ((CallableEnum.B,),)
+        type Nested = tuple[CallableEnum]
+        def tuple_alias_inputs(left: Nested, right: Nested) -> None: (left,) == (right,)
+        def tuple_cross_inputs(left: tuple[CallableEnum, *tuple[int, ...]], right: tuple[*tuple[int, ...], CallableEnum]) -> None: left == right
+        def tuple_variable(left: tuple[int, ...], right: tuple[int, ...]) -> None:
+            left == right
+            left < right
+        def tuple_variable_inputs(left: tuple[CallableEnum, ...], right: tuple[CallableEnum, ...]) -> None: left != right
+        class TupleOverride(tuple[int, ...]):
+            def __eq__(self, other: object) -> bool: return True
+        def tuple_override(left: TupleOverride, right: tuple[int, ...]) -> None: left == right
+        class GradualEquality:
+            def __eq__(self, other: object) -> Any: return True
+            def __lt__(self, other: object) -> bool: return True
+        def tuple_truth(value: GradualEquality, other: object) -> None: (value,) < (other,)
         def reflected_contributor(left: Base, right: Child[Named]) -> None: left < right
         def known_contributor(left: Base, right: KnownChild[Named]) -> None: left < right
         def failed_contributor(left: Base, right: FailedChild) -> None: left < right
@@ -2958,6 +2981,16 @@ fn rich_comparison_argument_correspondence() -> anyhow::Result<()> {
         ("constructor", true),
         ("pragmatic", true),
         ("tuple_elements", true),
+        ("tuple_scalars", false),
+        ("tuple_prefix", true),
+        ("tuple_identity", false),
+        ("tuple_nested_inputs", true),
+        ("tuple_alias_inputs", true),
+        ("tuple_cross_inputs", true),
+        ("tuple_variable", false),
+        ("tuple_variable_inputs", true),
+        ("tuple_override", true),
+        ("tuple_truth", true),
         ("reflected_contributor", true),
         ("known_contributor", false),
         ("failed_contributor", true),

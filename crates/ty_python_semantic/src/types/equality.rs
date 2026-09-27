@@ -320,29 +320,83 @@ impl<'db> ContainerElementEqualityEvaluator<'db> {
         left: Type<'db>,
         right: Type<'db>,
     ) -> Result<Truthiness, BoolError<'db>> {
+        self.element_truthiness_with_input_proof(left, right, false)
+            .map(|(truthiness, _)| truthiness)
+    }
+
+    /// Retain the input requirements of the selected equality call and its truth conversion.
+    /// The ordinary path performs no additional input proof or conservative evaluation.
+    pub(super) fn element_truthiness_with_input_proof(
+        &mut self,
+        left: Type<'db>,
+        right: Type<'db>,
+        prove_inputs: bool,
+    ) -> Result<(Truthiness, bool), BoolError<'db>> {
         let db = self.evaluator.db;
         let truthiness = evaluate_container_element_equality(&mut self.evaluator, left, right);
+        let env = &self.evaluator.env;
+        // A tuple's outer equality signature does not cover its element calls. Keep
+        // nested tuple prefixes unproved until their equality owner retains those inputs.
+        let prove_inputs = prove_inputs
+            && [left, right].into_iter().all(|ty| {
+                let ty = ty.resolve_type_alias(db);
+                !matches!(
+                    ty,
+                    Type::TypeVar(_)
+                        | Type::Union(_)
+                        | Type::Intersection(_)
+                        | Type::NewTypeInstance(_)
+                        | Type::Recursive(_)
+                        | Type::RecursiveVar(_)
+                ) && ty.tuple_instance_spec(db, env).is_none()
+            });
         if !truthiness.is_ambiguous() {
-            return Ok(truthiness);
+            if !prove_inputs {
+                return Ok((truthiness, false));
+            }
+            // Container equality first checks identity, so a shared singleton never calls
+            // its custom equality method. Exact builtin values also have intrinsic inputs.
+            if (left == right && left.is_singleton(db, env))
+                || [left, right]
+                    .into_iter()
+                    .all(|ty| ty.is_none(db) || is_builtin_literal_type(db, ty))
+            {
+                return Ok((truthiness, true));
+            }
+            let mut conservative = ComparisonEvaluator::for_truthiness(
+                db,
+                env,
+                ComparisonSoundnessPolicy::CONSERVATIVE,
+            );
+            if evaluate_container_element_equality(&mut conservative, left, right) != truthiness {
+                return Ok((truthiness, false));
+            }
         }
 
-        let Some((result, _inputs_proved)) = Type::try_call_rich_comparison_dunder(
+        let Some((result, inputs_proved)) = Type::try_call_rich_comparison_dunder(
             db,
-            &self.evaluator.env,
+            env,
             left,
             right,
             ("__eq__", "__eq__"),
             MemberLookupPolicy::default(),
-            false,
+            prove_inputs,
         ) else {
-            return Ok(Truthiness::Ambiguous);
+            return Ok((truthiness, false));
         };
+        let inputs_proved = inputs_proved
+            && result.is_fully_static(db, env)
+            && result.is_subtype_of(db, env, KnownClass::Bool.to_instance(db, env));
+        if !truthiness.is_ambiguous() {
+            return Ok((truthiness, inputs_proved));
+        }
 
         // Identity can turn a false equality result true, but cannot turn a true result false.
-        Ok(match result.try_bool(db, &self.evaluator.env)? {
+        let truthiness = match result.try_bool(db, env)? {
             Truthiness::AlwaysTrue => Truthiness::AlwaysTrue,
             Truthiness::AlwaysFalse | Truthiness::Ambiguous => Truthiness::Ambiguous,
-        })
+        };
+        Ok((truthiness, inputs_proved))
     }
 }
 
