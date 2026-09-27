@@ -186,9 +186,19 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 BinaryExpressionOperandTypes::Inferred(left_ty, right_ty) => (left_ty, right_ty),
             };
 
-        let mut state = BinaryInferenceState::default();
+        let mut state = BinaryInferenceState {
+            arguments_proved: (self.function_inference_mode
+                == crate::FunctionInferenceMode::OutputProof)
+                .then_some(true),
+            ..BinaryInferenceState::default()
+        };
         let return_type =
             self.infer_binary_expression_type(binary.into(), left_ty, right_ty, *op, &mut state);
+        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+            && (state.arguments_proved == Some(false) || return_type.is_none())
+        {
+            self.context.record_unproved_requirement(binary);
+        }
         self.report_deprecated_functions(binary, state.deprecated_functions);
         return_type.unwrap_or_else(|| {
             report_unsupported_binary_operation(&self.context, binary, left_ty, right_ty, *op);

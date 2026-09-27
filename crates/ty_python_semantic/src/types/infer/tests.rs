@@ -2119,7 +2119,7 @@ fn typed_dict_merge_retains_selected_requirements() -> anyhow::Result<()> {
 }
 
 #[test]
-fn augmented_storage_correspondence() -> anyhow::Result<()> {
+fn binary_and_augmented_argument_correspondence() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(
         "/src/main.py",
@@ -2153,7 +2153,9 @@ fn augmented_storage_correspondence() -> anyhow::Result<()> {
             return value
 
         class Normal:
-            def __add__(self, callback: Callable[[Any], None]) -> int: return 1
+            def __add__(self, callback: Callable[[Any], None]) -> int:
+                callback(1)
+                return 1
 
         class Reflected:
             def __radd__(self, callback: Callable[[Any], None]) -> int: return 1
@@ -2223,6 +2225,33 @@ fn augmented_storage_correspondence() -> anyhow::Result<()> {
             result = left
             result += callback
             return result
+
+        def ordinary_normal_closed(left: Normal, callback: Callable[[str], None]) -> int:
+            return left + callback
+
+        def ordinary_normal_known(left: Normal, callback: Callable[[Any], None]) -> int:
+            return left + callback
+
+        def ordinary_reflected_closed(right: Reflected, callback: Callable[[str], None]) -> int:
+            return callback + right
+
+        def ordinary_reflected_known(right: Reflected, callback: Callable[[Any], None]) -> int:
+            return callback + right
+
+        def ordinary_discarded(left: Rejected, right: Accepted) -> int:
+            return left + right
+
+        def ordinary_conditional_closed(left: Base, right: ClosedChild) -> int:
+            return left + right
+
+        def ordinary_conditional_known(left: Base, right: KnownChild) -> int:
+            return left + right
+
+        def ordinary_class_valued(left: Operator, callback: Callable[[str], None]) -> object:
+            return left + callback
+
+        def ordinary_numeric(value: int) -> int:
+            return value + 1
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -2240,6 +2269,15 @@ fn augmented_storage_correspondence() -> anyhow::Result<()> {
         ("conditional_closed", true),
         ("conditional_known", false),
         ("class_valued", true),
+        ("ordinary_normal_closed", true),
+        ("ordinary_normal_known", false),
+        ("ordinary_reflected_closed", true),
+        ("ordinary_reflected_known", false),
+        ("ordinary_discarded", false),
+        ("ordinary_conditional_closed", true),
+        ("ordinary_conditional_known", false),
+        ("ordinary_class_valued", true),
+        ("ordinary_numeric", false),
     ];
     let signatures = |db: &TestDb| {
         cases.map(|(name, _)| {
