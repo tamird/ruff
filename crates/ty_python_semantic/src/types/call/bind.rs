@@ -31,7 +31,7 @@ use crate::lint::LintMetadata;
 use crate::place::{DefinedPlace, Definedness, Place};
 use crate::subscript::PyIndex;
 use crate::types::call::arguments::{
-    CallArgumentExpansions, CallArgumentTypes, Expansion, KnownUnpacking,
+    CallArgumentExpansions, CallArgumentTypes, CallArgumentsSnapshot, Expansion, KnownUnpacking,
 };
 use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::{
@@ -1619,7 +1619,7 @@ impl<'db> Bindings<'db> {
     /// Check the committed actual arguments against the selected parameter contracts.
     ///
     /// This query leaves ordinary overload selection and results unchanged. Multiple callable
-    /// contributors with explicit arguments, expanded or ambiguous overloads, multiple or omitted
+    /// contributors with explicit arguments, ambiguous overloads, multiple or omitted
     /// constructor stages, and unresolved generic solutions for supplied values need additional
     /// coverage to establish requirements.
     /// The caller must also establish that argument inference committed the selected contexts;
@@ -1911,6 +1911,10 @@ impl<'db> Bindings<'db> {
         // Each special case listed here should have a corresponding clause in `Type::bindings`.
         for binding in self.iter_flat_mut() {
             let binding_type = binding.callable_type;
+            // Expanded bindings retain only one parameter state per overload. That state
+            // cannot establish implicit-call requirements for every expanded alternative.
+            let request_input_proof =
+                call_arguments.requests_input_proof() && binding.overload_call_result.is_none();
             for (overload_index, overload) in binding.matching_overloads_mut() {
                 overload.nested_call_has_unproved_inputs = false;
                 match binding_type {
@@ -2008,7 +2012,7 @@ impl<'db> Bindings<'db> {
                                         getter,
                                         *instance,
                                         1,
-                                        call_arguments.requests_input_proof(),
+                                        request_input_proof,
                                     );
                                 } else {
                                     overload
@@ -2041,7 +2045,7 @@ impl<'db> Bindings<'db> {
                                         getter,
                                         *instance,
                                         0,
-                                        call_arguments.requests_input_proof(),
+                                        request_input_proof,
                                     );
                                 } else {
                                     overload.set_return_type(Type::Never);
@@ -2757,7 +2761,7 @@ impl<'db> Bindings<'db> {
                         }
 
                         Some(KnownFunction::GetAttr) => {
-                            overload.infer_getattr(db, env, call_arguments.requests_input_proof());
+                            overload.infer_getattr(db, env, request_input_proof);
                         }
 
                         Some(KnownFunction::GetattrStatic) => {
@@ -3691,218 +3695,30 @@ impl<'db> CallableBinding<'db> {
         env: &ProgramEnvironment<'db>,
         arguments: &CallArguments<'_, 'db>,
     ) -> bool {
-        if self.lookup_has_unproved_inputs || self.overload_call_result.is_some() {
+        if self.lookup_has_unproved_inputs {
             return false;
+        }
+        let arguments = arguments.with_self(self.bound_type);
+        if let Some(result) = &self.overload_call_result {
+            if self
+                .matching_overloads()
+                .any(|(_, binding)| binding.nested_call_has_unproved_inputs)
+            {
+                return false;
+            }
+            return match result {
+                OverloadCallResult::ArgumentTypeExpansion(expanded) => expanded
+                    .proved_arguments
+                    .as_ref()
+                    .is_some_and(|proved| proved.matches(&arguments)),
+                OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => false,
+                OverloadCallResult::Ambiguous => false,
+            };
         }
         let Ok((_, binding)) = self.matching_overloads().exactly_one() else {
             return false;
         };
-        if binding.nested_call_has_unproved_inputs {
-            return false;
-        }
-        let parameters = binding.signature.parameters();
-        if !parameters.is_standard() {
-            return false;
-        }
-        let arguments = arguments.with_self(self.bound_type);
-        if arguments.len() != binding.argument_matches.len() {
-            return false;
-        }
-        // With no supplied values or implicit receiver, no input pair needs specialization.
-        if arguments.len() == 0 {
-            return true;
-        }
-        let mut pairs = Vec::new();
-        let mut definitely_supplied = vec![false; parameters.len()];
-        let mut supplied_keywords = FxHashSet::default();
-        let mut has_keyword_remainder = false;
-        let mut capture_supported = true;
-        let matched = arguments
-            .iter()
-            .zip(&binding.argument_matches)
-            .enumerate()
-            .all(|(index, ((argument, types), matched))| {
-                let mut required_keywords = None;
-                let mut keyword_names = FxHashSet::default();
-                let mut keyword_remainder = false;
-                let empty_keywords = match argument {
-                    Argument::Variadic => return false,
-                    Argument::Keywords => {
-                        capture_supported = false;
-                        // Ordinary mapping matching can assume names are present. Proof requires
-                        // the existing inventory to cover the keys and every residual value.
-                        if let Some(unpacking) = arguments.known_unpacking(index) {
-                            let KnownUnpacking::Keywords(keywords) = unpacking else {
-                                return false;
-                            };
-                            if keywords
-                                .items
-                                .iter()
-                                .any(|item| item.kind == DictionaryItemKind::Residual)
-                                || !keywords.residual_values(db, env).is_never()
-                            {
-                                return false;
-                            }
-                            keyword_names
-                                .extend(keywords.items.iter().map(|item| item.name.clone()));
-                            required_keywords = Some(
-                                keywords
-                                    .items
-                                    .iter()
-                                    .filter(|item| item.is_required())
-                                    .map(|item| item.name.clone())
-                                    .collect::<FxHashSet<_>>(),
-                            );
-                            keywords.items.is_empty()
-                        } else {
-                            let Some(unpacked) = types.get_default().and_then(|ty| {
-                                extract_unpacked_typed_dict_from_value_type(db, env, ty)
-                            }) else {
-                                return false;
-                            };
-                            if unpacked
-                                .keys
-                                .values()
-                                .any(|key| key.kind == DictionaryItemKind::Residual)
-                                || (!unpacked.openness.is_closed()
-                                    && parameters.keyword_variadic().is_none())
-                            {
-                                return false;
-                            }
-                            keyword_names.extend(unpacked.keys.keys().cloned());
-                            keyword_remainder = !unpacked.openness.is_closed();
-                            required_keywords = Some(
-                                unpacked
-                                    .keys
-                                    .iter()
-                                    .filter(|(_, key)| key.kind == DictionaryItemKind::Required)
-                                    .map(|(name, _)| name.clone())
-                                    .collect::<FxHashSet<_>>(),
-                            );
-                            unpacked.keys.is_empty() && unpacked.openness.is_closed()
-                        }
-                    }
-                    Argument::Synthetic => false,
-                    Argument::Positional => false,
-                    Argument::Keyword(name) => {
-                        keyword_names.insert(Name::new(name));
-                        false
-                    }
-                };
-                if empty_keywords {
-                    return matched.parameters.is_empty();
-                }
-                if !matched.matched || matched.parameters.is_empty() {
-                    return false;
-                }
-                // An implicit open tail is matched only to **kwargs by ordinary checking.
-                // Decline if it can also reach a named formal without a retained value pair.
-                if keyword_remainder
-                    && parameters.iter().enumerate().any(|(index, parameter)| {
-                        parameter.keyword_name().is_some_and(|name| {
-                            !keyword_names.contains(name)
-                                && !matched.iter().any(|matched| matched.index == index)
-                        })
-                    })
-                {
-                    return false;
-                }
-                capture_supported &= matched.parameters.len() == 1;
-                let valid_pairs = matched.iter().all(|matched_parameter| {
-                    let Some(parameter) = parameters.get(matched_parameter.index) else {
-                        return false;
-                    };
-                    if matches!(argument, Argument::Synthetic | Argument::Positional)
-                        && let Some(name) = parameter.keyword_name()
-                    {
-                        keyword_names.insert(name.clone());
-                    }
-                    definitely_supplied[matched_parameter.index] |=
-                        required_keywords.as_ref().is_none_or(|required| {
-                            parameter
-                                .keyword_name()
-                                .is_some_and(|name| required.contains(name))
-                        });
-                    if parameter.has_starred_annotation() {
-                        return false;
-                    }
-                    let Some(actual) = matched_parameter.argument_type(parameter, types) else {
-                        return false;
-                    };
-                    let expected = matched_parameter
-                        .expected_type
-                        .unwrap_or_else(|| parameter.annotated_type());
-                    pairs.push((actual, expected));
-                    true
-                });
-                // Different keyword sources must be disjoint even when they all feed **kwargs.
-                // An open remainder can overlap any name supplied by another source.
-                if !valid_pairs
-                    || (keyword_remainder && !supplied_keywords.is_empty())
-                    || (has_keyword_remainder && (keyword_remainder || !keyword_names.is_empty()))
-                    || keyword_names
-                        .into_iter()
-                        .any(|name| !supplied_keywords.insert(name))
-                {
-                    return false;
-                }
-                has_keyword_remainder |= keyword_remainder;
-                true
-            });
-        if !matched {
-            return false;
-        }
-        // Ordinary binding accepts possibly present keyword fields. Input proof additionally
-        // requires every parameter without a default to be supplied on every represented path.
-        if parameters.iter().enumerate().any(|(index, parameter)| {
-            !parameter.has_default()
-                && !parameter.is_variadic()
-                && !parameter.is_keyword_variadic()
-                && !definitely_supplied[index]
-        }) {
-            return false;
-        }
-        let complete_inference = match binding.inference {
-            Some(inference) => {
-                matches!(inference.solutions(db), TypeVarInferenceSolutions::Single)
-            }
-            None => binding.signature.generic_context.is_none(),
-        };
-        if !complete_inference {
-            // Omitted parameters and result-only variables need no supplied-value proof. Check
-            // independent raw pairs before applying any recovery specialization.
-            return pairs.iter().all(|(actual, expected)| {
-                [*actual, *expected].into_iter().all(|ty| {
-                    !any_over_type(db, env, ty, true, |ty| {
-                        ty.as_typevar().is_some_and(|typevar| {
-                            typevar.is_inferable(db, binding.inferable_typevars)
-                        })
-                    })
-                }) && expected.is_fully_static_except_any(db, env)
-                    && !actual.has_provisional_marker(db, env)
-                    && actual.satisfies_declared_output(db, env, *expected)
-            });
-        }
-        let specialization = binding.partial_specialization(db, env);
-        if let Some(specialization) = specialization {
-            for (actual, _) in &mut pairs {
-                *actual = actual.apply_specialization(db, specialization);
-            }
-        }
-        let direct = pairs.iter().all(|(actual, expected)| {
-            let expected = specialization.map_or(*expected, |specialization| {
-                expected.apply_specialization(db, specialization)
-            });
-            expected.is_fully_static_except_any(db, env)
-                && !actual.has_provisional_marker(db, env)
-                && actual.satisfies_declared_output(db, env, expected)
-        });
-        direct
-            || (capture_supported
-                && binding.signature.generic_context.is_some()
-                && specialization.is_some_and(|specialization| {
-                    generic_arguments_satisfy_declared_parameters(db, env, specialization, &pairs)
-                }))
+        binding.arguments_satisfy_declared_parameters(db, env, &arguments)
     }
 
     pub(crate) fn from_overloads(
@@ -4483,6 +4299,7 @@ impl<'db> CallableBinding<'db> {
             // The return types of each of the expanded argument lists that evaluated successfully.
             let mut return_types = Vec::new();
             let mut selected_overloads = SmallVec::<[usize; 2]>::new();
+            let mut inputs_proved = call_arguments.requests_input_proof();
 
             for expanded_arguments in &expanded_argument_lists {
                 // The spec mentions that each expanded argument list should be re-evaluated from
@@ -4565,6 +4382,21 @@ impl<'db> CallableBinding<'db> {
                     }
                 };
 
+                // Check each alternative while its exact argument matches are still available.
+                // The merged state below retains only one representative per overload.
+                inputs_proved = inputs_proved
+                    && !is_ambiguous
+                    && self
+                        .matching_overloads()
+                        .exactly_one()
+                        .is_ok_and(|(_, binding)| {
+                            binding.arguments_satisfy_declared_parameters(
+                                db,
+                                env,
+                                expanded_arguments,
+                            )
+                        });
+
                 // This split between initializing and updating the merged evaluation state is
                 // required because otherwise it's difficult to differentiate between the
                 // following:
@@ -4617,6 +4449,7 @@ impl<'db> CallableBinding<'db> {
                     Box::new(ExpandedOverloadCall {
                         return_type: UnionType::from_elements(db, env, return_types),
                         selected_overloads,
+                        proved_arguments: inputs_proved.then(|| call_arguments.snapshot()),
                     }),
                 ));
 
@@ -5362,6 +5195,7 @@ enum OverloadCallResult<'db> {
 struct ExpandedOverloadCall<'db> {
     return_type: Type<'db>,
     selected_overloads: SmallVec<[usize; 2]>,
+    proved_arguments: Option<CallArgumentsSnapshot<'db>>,
 }
 
 #[derive(Debug)]
@@ -8102,6 +7936,220 @@ pub(crate) struct Binding<'db> {
 }
 
 impl<'db> Binding<'db> {
+    /// Check one matched signature against arguments that already include any bound receiver.
+    fn arguments_satisfy_declared_parameters(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        arguments: &CallArguments<'_, 'db>,
+    ) -> bool {
+        if self.nested_call_has_unproved_inputs {
+            return false;
+        }
+        let parameters = self.signature.parameters();
+        if !parameters.is_standard() {
+            return false;
+        }
+        if arguments.len() != self.argument_matches.len() {
+            return false;
+        }
+        // With no supplied values or implicit receiver, no input pair needs specialization.
+        if arguments.len() == 0 {
+            return true;
+        }
+        let mut pairs = Vec::new();
+        let mut definitely_supplied = vec![false; parameters.len()];
+        let mut supplied_keywords = FxHashSet::default();
+        let mut has_keyword_remainder = false;
+        let mut capture_supported = true;
+        let matched = arguments
+            .iter()
+            .zip(&self.argument_matches)
+            .enumerate()
+            .all(|(index, ((argument, types), matched))| {
+                let mut required_keywords = None;
+                let mut keyword_names = FxHashSet::default();
+                let mut keyword_remainder = false;
+                let empty_keywords = match argument {
+                    Argument::Variadic => return false,
+                    Argument::Keywords => {
+                        capture_supported = false;
+                        // Ordinary mapping matching can assume names are present. Proof requires
+                        // the existing inventory to cover the keys and every residual value.
+                        if let Some(unpacking) = arguments.known_unpacking(index) {
+                            let KnownUnpacking::Keywords(keywords) = unpacking else {
+                                return false;
+                            };
+                            if keywords
+                                .items
+                                .iter()
+                                .any(|item| item.kind == DictionaryItemKind::Residual)
+                                || !keywords.residual_values(db, env).is_never()
+                            {
+                                return false;
+                            }
+                            keyword_names
+                                .extend(keywords.items.iter().map(|item| item.name.clone()));
+                            required_keywords = Some(
+                                keywords
+                                    .items
+                                    .iter()
+                                    .filter(|item| item.is_required())
+                                    .map(|item| item.name.clone())
+                                    .collect::<FxHashSet<_>>(),
+                            );
+                            keywords.items.is_empty()
+                        } else {
+                            let Some(unpacked) = types.get_default().and_then(|ty| {
+                                extract_unpacked_typed_dict_from_value_type(db, env, ty)
+                            }) else {
+                                return false;
+                            };
+                            if unpacked
+                                .keys
+                                .values()
+                                .any(|key| key.kind == DictionaryItemKind::Residual)
+                                || (!unpacked.openness.is_closed()
+                                    && parameters.keyword_variadic().is_none())
+                            {
+                                return false;
+                            }
+                            keyword_names.extend(unpacked.keys.keys().cloned());
+                            keyword_remainder = !unpacked.openness.is_closed();
+                            required_keywords = Some(
+                                unpacked
+                                    .keys
+                                    .iter()
+                                    .filter(|(_, key)| key.kind == DictionaryItemKind::Required)
+                                    .map(|(name, _)| name.clone())
+                                    .collect::<FxHashSet<_>>(),
+                            );
+                            unpacked.keys.is_empty() && unpacked.openness.is_closed()
+                        }
+                    }
+                    Argument::Synthetic => false,
+                    Argument::Positional => false,
+                    Argument::Keyword(name) => {
+                        keyword_names.insert(Name::new(name));
+                        false
+                    }
+                };
+                if empty_keywords {
+                    return matched.parameters.is_empty();
+                }
+                if !matched.matched || matched.parameters.is_empty() {
+                    return false;
+                }
+                // An implicit open tail is matched only to **kwargs by ordinary checking.
+                // Decline if it can also reach a named formal without a retained value pair.
+                if keyword_remainder
+                    && parameters.iter().enumerate().any(|(index, parameter)| {
+                        parameter.keyword_name().is_some_and(|name| {
+                            !keyword_names.contains(name)
+                                && !matched.iter().any(|matched| matched.index == index)
+                        })
+                    })
+                {
+                    return false;
+                }
+                capture_supported &= matched.parameters.len() == 1;
+                let valid_pairs = matched.iter().all(|matched_parameter| {
+                    let Some(parameter) = parameters.get(matched_parameter.index) else {
+                        return false;
+                    };
+                    if matches!(argument, Argument::Synthetic | Argument::Positional)
+                        && let Some(name) = parameter.keyword_name()
+                    {
+                        keyword_names.insert(name.clone());
+                    }
+                    definitely_supplied[matched_parameter.index] |=
+                        required_keywords.as_ref().is_none_or(|required| {
+                            parameter
+                                .keyword_name()
+                                .is_some_and(|name| required.contains(name))
+                        });
+                    if parameter.has_starred_annotation() {
+                        return false;
+                    }
+                    let Some(actual) = matched_parameter.argument_type(parameter, types) else {
+                        return false;
+                    };
+                    let expected = matched_parameter
+                        .expected_type
+                        .unwrap_or_else(|| parameter.annotated_type());
+                    pairs.push((actual, expected));
+                    true
+                });
+                // Different keyword sources must be disjoint even when they all feed **kwargs.
+                // An open remainder can overlap any name supplied by another source.
+                if !valid_pairs
+                    || (keyword_remainder && !supplied_keywords.is_empty())
+                    || (has_keyword_remainder && (keyword_remainder || !keyword_names.is_empty()))
+                    || keyword_names
+                        .into_iter()
+                        .any(|name| !supplied_keywords.insert(name))
+                {
+                    return false;
+                }
+                has_keyword_remainder |= keyword_remainder;
+                true
+            });
+        if !matched {
+            return false;
+        }
+        // Ordinary binding accepts possibly present keyword fields. Input proof additionally
+        // requires every parameter without a default to be supplied on every represented path.
+        if parameters.iter().enumerate().any(|(index, parameter)| {
+            !parameter.has_default()
+                && !parameter.is_variadic()
+                && !parameter.is_keyword_variadic()
+                && !definitely_supplied[index]
+        }) {
+            return false;
+        }
+        let complete_inference = match self.inference {
+            Some(inference) => {
+                matches!(inference.solutions(db), TypeVarInferenceSolutions::Single)
+            }
+            None => self.signature.generic_context.is_none(),
+        };
+        if !complete_inference {
+            // Omitted parameters and result-only variables need no supplied-value proof. Check
+            // independent raw pairs before applying any recovery specialization.
+            return pairs.iter().all(|(actual, expected)| {
+                [*actual, *expected].into_iter().all(|ty| {
+                    !any_over_type(db, env, ty, true, |ty| {
+                        ty.as_typevar().is_some_and(|typevar| {
+                            typevar.is_inferable(db, self.inferable_typevars)
+                        })
+                    })
+                }) && expected.is_fully_static_except_any(db, env)
+                    && !actual.has_provisional_marker(db, env)
+                    && actual.satisfies_declared_output(db, env, *expected)
+            });
+        }
+        let specialization = self.partial_specialization(db, env);
+        if let Some(specialization) = specialization {
+            for (actual, _) in &mut pairs {
+                *actual = actual.apply_specialization(db, specialization);
+            }
+        }
+        let direct = pairs.iter().all(|(actual, expected)| {
+            let expected = specialization.map_or(*expected, |specialization| {
+                expected.apply_specialization(db, specialization)
+            });
+            expected.is_fully_static_except_any(db, env)
+                && !actual.has_provisional_marker(db, env)
+                && actual.satisfies_declared_output(db, env, expected)
+        });
+        direct
+            || (capture_supported
+                && self.signature.generic_context.is_some()
+                && specialization.is_some_and(|specialization| {
+                    generic_arguments_satisfy_declared_parameters(db, env, specialization, &pairs)
+                }))
+    }
+
     /// Infers finite runtime lookups while retaining their implicit call requirements.
     fn infer_getattr(
         &mut self,
@@ -10933,6 +10981,94 @@ mod tests {
     use crate::place::global_symbol;
     use crate::types::constraints::resolution::SolutionType::Resolved;
     use crate::types::generics::TypeVarInferenceSolutions;
+
+    #[test]
+    fn expanded_inputs_do_not_skip_implicit_calls() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+            from builtins import getattr as lookup
+
+            class Receiver:
+                @property
+                def a_bad(self: int) -> int: ...
+                @property
+                def b_good(self) -> int: ...
+                @property
+                def c_good(self) -> int: ...
+
+            receiver: Receiver
+            "#,
+        )?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/a.py")?;
+        let file = ProgramFile::new(&db, file, env.program(&db));
+        let callable = global_symbol(&db, file, "lookup").place.expect_type();
+        let receiver = global_symbol(&db, file, "receiver").place.expect_type();
+        let names = ["a_bad", "b_good", "c_good"].map(|name| Type::string_literal(&db, name));
+        let int = KnownClass::Int.to_instance(&db, &env);
+        // The first overload is selected twice. Its merged parameter state retains b_good,
+        // so evaluating implicit getters only after that merge cannot establish a_bad's inputs.
+        let signatures = [
+            UnionType::from_elements(&db, &env, names[..2].iter().copied()),
+            names[2],
+        ]
+        .map(|name| {
+            Signature::new(
+                Parameters::standard([
+                    Parameter::positional_only(Some(Name::new_static("receiver")))
+                        .with_annotated_type(receiver),
+                    Parameter::positional_only(Some(Name::new_static("name")))
+                        .with_annotated_type(name),
+                ]),
+                int,
+            )
+        });
+        for (name, expected) in [
+            (names[1], true),
+            (UnionType::from_elements(&db, &env, names), false),
+        ] {
+            let arguments =
+                CallArguments::positional([receiver, name]).with_input_proof_request(true);
+            let bindings = Bindings::from(CallableBinding::from_overloads(
+                callable,
+                signatures.clone(),
+            ))
+            .match_parameters(&db, &env, &arguments)
+            .check_types(
+                &db,
+                &env,
+                &ConstraintSetBuilder::new(),
+                &arguments,
+                TypeContext::default(),
+                &[],
+            )
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            assert_eq!(bindings.return_type(&db, &env), int);
+            if !expected {
+                let Some(callable) = bindings.single_element() else {
+                    anyhow::bail!("expected one callable");
+                };
+                let Some(overload) = callable.overloads.first() else {
+                    anyhow::bail!("expected a retained overload");
+                };
+                assert_eq!(overload.parameter_types()[1], Some(names[1]));
+                let Some(result) = &callable.overload_call_result else {
+                    anyhow::bail!("expected an overload result");
+                };
+                let OverloadCallResult::ArgumentTypeExpansion(expanded) = result else {
+                    anyhow::bail!("expected successful argument expansion");
+                };
+                assert!(expanded.proved_arguments.is_some());
+            }
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(&db, &env, &arguments),
+                expected
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn call_argument_correspondence_preserves_ordinary_binding() -> anyhow::Result<()> {
