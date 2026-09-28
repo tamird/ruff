@@ -122,6 +122,25 @@ static_assert(is_subtype_of(types.MethodWrapperType, AlwaysTruthy))
 static_assert(is_subtype_of(types.WrapperDescriptorType, AlwaysTruthy))
 ```
 
+### Final builtin classes with ambiguous truthiness
+
+Final builtin classes retain ambiguous truthiness when their methods return general `bool` or `int`.
+Known ambiguous results also survive when the declarations omit truthiness methods.
+
+```py
+from types import NotImplementedType
+from typing import _SpecialForm
+
+def check(flag: bool, span: range, view: memoryview, missing: NotImplementedType, form: _SpecialForm):
+    reveal_type(bool(flag))  # revealed: bool
+    reveal_type(bool(span))  # revealed: bool
+    reveal_type(bool(view))  # revealed: bool
+    reveal_type(bool(missing))  # revealed: bool
+    reveal_type(bool(form))  # revealed: bool
+
+reveal_type(bool(NotImplemented))  # revealed: bool
+```
+
 ### Subclassable special-cased classes
 
 `Path` and `super` cannot be inferred as always truthy because subclasses can override `__bool__`.
@@ -279,4 +298,62 @@ class AllKeysNotRequired(TypedDict):
 def _(a: AllKeysNotRequired) -> None:
     # This should be `bool`. `Literal[True]` would be wrong as `{}` is a valid value.
     reveal_type(bool(a))  # revealed: bool
+```
+
+## Final classes in supplied builtins
+
+A supplied builtin declaration can provide more precise truthiness than the known-class fallback.
+Final classes use their special methods when that fallback is ambiguous; nonfinal classes retain
+ambiguous truthiness.
+
+```toml
+[environment]
+typeshed = "/typeshed"
+```
+
+`/typeshed/stdlib/typing.pyi`:
+
+```pyi
+class _SpecialForm: ...
+class Protocol: ...
+
+Literal: _SpecialForm
+
+class SupportsIndex(Protocol):
+    def __index__(self) -> int: ...
+
+def final(cls): ...
+def reveal_type(value): ...
+```
+
+`/typeshed/stdlib/builtins.pyi`:
+
+```pyi
+from typing import Literal, final
+
+class object: ...
+class bool: ...
+
+class int:
+    def __bool__(self) -> Literal[False]: ...
+    def __index__(self) -> int: ...
+
+@final
+class list:
+    def __len__(self) -> Literal[0]: ...
+
+@final
+class dict:
+    def __bool__(self) -> Literal[False]: ...
+```
+
+```py
+from typing import reveal_type
+
+def check(final_value: list, boolean_value: dict, nonfinal_value: int):
+    # error: [redundant-condition]
+    reveal_type(1 if final_value else 2)  # revealed: Literal[2]
+    # error: [redundant-condition]
+    reveal_type(1 if boolean_value else 2)  # revealed: Literal[2]
+    reveal_type(1 if nonfinal_value else 2)  # revealed: Literal[1, 2]
 ```
