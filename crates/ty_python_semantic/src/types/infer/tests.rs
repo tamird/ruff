@@ -1917,7 +1917,7 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
     db.write_dedented(
         "/src/main.py",
         r#"
-        from typing import Any, Callable, Literal, no_type_check
+        from typing import Any, Callable, Literal, no_type_check, overload
         from typing_extensions import NotRequired, TypedDict
         from ty_extensions import Intersection
 
@@ -2053,6 +2053,47 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
                 del values[key]
             finite_consume(**values)
 
+        @overload
+        def transport(kind: Literal["left"], value: int) -> None: ...
+        @overload
+        def transport(kind: Literal["right"], value: int) -> None: ...
+        def transport(kind: str, value: int) -> None:
+            pass
+
+        def expanded_call(kind: Literal["left", "right"], value: int) -> None:
+            transport(kind, value)
+
+        def expanded_any(kind: Literal["left", "right"], value: Any) -> None:
+            transport(kind, value)
+
+        def expanded_unknown(kind: Literal["left", "right"], value) -> None:
+            transport(kind, value)
+
+        @overload
+        def partial_transport(kind: Literal["left"], value: Any) -> None: ...
+        @overload
+        def partial_transport(kind: Literal["right"], value: int) -> None: ...
+        def partial_transport(kind: str, value: Any) -> None:
+            pass
+
+        def expanded_partial(kind: Literal["left", "right"], value: Any) -> None:
+            partial_transport(kind, value)
+
+        class Expanded:
+            @overload
+            def transport(self, kind: Literal["left"], value: int) -> None: ...
+            @overload
+            def transport(self, kind: Literal["right"], value: int) -> None: ...
+            def transport(self, kind: str, value: int) -> None:
+                pass
+
+        def expanded_bound(receiver: Expanded, kind: Literal["left", "right"], value: int) -> None:
+            receiver.transport(kind, value)
+
+        def expanded_pop(values: FiniteValues, key: Literal["left", "right"]) -> None:
+            if key in values:
+                values.pop(key)
+
         def popped() -> None:
             values = {"value": 1, "removed": 0}
             values.pop("removed")
@@ -2112,6 +2153,12 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         ("finite_delete_broad", true),
         ("finite_delete_exposed", true),
         ("finite_delete_typed", false),
+        ("expanded_call", false),
+        ("expanded_bound", false),
+        ("expanded_pop", false),
+        ("expanded_any", true),
+        ("expanded_unknown", true),
+        ("expanded_partial", true),
         ("typed_popped", false),
         ("typed_merged", false),
         ("typed_filtered", false),
