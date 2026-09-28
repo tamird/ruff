@@ -142,12 +142,7 @@ impl<'db> Type<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> bool {
-        visitor::any_over_type_expanding_aliases(db, env, self, |ty| {
-            ty.is_divergent()
-                || ty
-                    .as_dynamic()
-                    .is_some_and(DynamicType::is_provisional_marker)
-        })
+        visitor::has_indeterminate_inference(db, env, self)
     }
 
     pub(crate) fn has_provisional_marker(

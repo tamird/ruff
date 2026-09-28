@@ -8,11 +8,11 @@ use smallvec::SmallVec;
 use ty_python_core::definition::Definition;
 
 use crate::types::{
-    BoundMethodType, BoundSuperType, BoundTypeVarInstance, CallableType, EnumComplementType,
-    GenericAlias, IntersectionType, KnownBoundMethodType, KnownInstanceType, NominalInstanceType,
-    PropertyInstanceType, ProtocolInstanceType, RecursiveType, Signature, SlotDescriptorType,
-    StaticClassLiteral, SubclassOfType, Type, TypeAliasType, TypeFormType, TypeGuardType,
-    TypeIsType, TypedDictType, UnionType,
+    BoundMethodType, BoundSuperType, BoundTypeVarInstance, CallableType, DynamicType,
+    EnumComplementType, GenericAlias, IntersectionType, KnownBoundMethodType, KnownInstanceType,
+    NominalInstanceType, PropertyInstanceType, ProtocolInstanceType, RecursiveType, Signature,
+    SlotDescriptorType, StaticClassLiteral, SubclassOfType, Type, TypeAliasType, TypeFormType,
+    TypeGuardType, TypeIsType, TypedDictType, UnionType,
     bound_super::walk_bound_super_type,
     callable::walk_callable_type,
     class::walk_generic_alias,
@@ -928,13 +928,36 @@ pub(super) fn any_over_type_including_alias_arguments<'db>(
 
 /// Searches through type aliases without forcing other lazily inferred type attributes.
 ///
-/// An exact recursive revisit adds no new type to inspect. A potentially growing specialization
-/// counts as a match because its later types are unknown. Distinct specializations of a
-/// nonrecursive alias remain separate, so `Identity[Identity[int]]` is still finite.
+/// A recursive revisit counts as a match. Existing eligibility checks use this conservative
+/// result to decline recursive aliases. Distinct nonrecursive specializations remain separate.
 pub(super) fn any_over_type_expanding_aliases<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
+    query: impl Fn(Type<'db>) -> bool,
+) -> bool {
+    any_over_type_expanding_aliases_impl(db, env, ty, true, query)
+}
+
+/// Inspect completed recursive types for inference markers, declining potentially growing aliases.
+pub(super) fn has_indeterminate_inference<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
+    any_over_type_expanding_aliases_impl(db, env, ty, false, |ty| {
+        ty.is_divergent()
+            || ty
+                .as_dynamic()
+                .is_some_and(DynamicType::is_provisional_marker)
+    })
+}
+
+fn any_over_type_expanding_aliases_impl<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    match_exact_cycles: bool,
     query: impl Fn(Type<'db>) -> bool,
 ) -> bool {
     fn search<'db>(
@@ -942,6 +965,7 @@ pub(super) fn any_over_type_expanding_aliases<'db>(
         env: &ProgramEnvironment<'db>,
         ty: Type<'db>,
         query: &impl Fn(Type<'db>) -> bool,
+        match_exact_cycles: bool,
         active_aliases: &ActiveRecursionDetector<TypeIdentity<'db>>,
     ) -> bool {
         any_over_type(db, env, ty, false, |nested| {
@@ -951,21 +975,31 @@ pub(super) fn any_over_type_expanding_aliases<'db>(
                         let identity = nested.to_type_identity(db);
                         active_aliases.visit(
                             &identity,
-                            || !matches!(identity, TypeIdentity::Other(_)),
-                            || search(db, env, alias.value_type(db), query, active_aliases),
+                            || match_exact_cycles || !matches!(identity, TypeIdentity::Other(_)),
+                            || {
+                                search(
+                                    db,
+                                    env,
+                                    alias.value_type(db),
+                                    query,
+                                    match_exact_cycles,
+                                    active_aliases,
+                                )
+                            },
                         )
                     }
                     Type::Recursive(recursive) => {
                         let identity = nested.to_type_identity(db);
                         active_aliases.visit(
                             &identity,
-                            || !matches!(identity, TypeIdentity::Other(_)),
+                            || match_exact_cycles || !matches!(identity, TypeIdentity::Other(_)),
                             || {
                                 search(
                                     db,
                                     env,
                                     recursive.unfold(db, env).into_type(),
                                     query,
+                                    match_exact_cycles,
                                     active_aliases,
                                 )
                             },
@@ -976,7 +1010,14 @@ pub(super) fn any_over_type_expanding_aliases<'db>(
         })
     }
 
-    search(db, env, ty, &query, &ActiveRecursionDetector::default())
+    search(
+        db,
+        env,
+        ty,
+        &query,
+        match_exact_cycles,
+        &ActiveRecursionDetector::default(),
+    )
 }
 
 /// Recurse into a type and calls the passed-in closure on every nested type
