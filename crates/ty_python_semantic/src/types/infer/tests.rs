@@ -773,6 +773,111 @@ def make(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]:
 }
 
 #[test]
+fn conservative_annotated_aliases() -> anyhow::Result<()> {
+    for (parameters, initializer, ordinary, conservative, invalid_write) in [
+        (
+            "values: list[Any]",
+            "alias: list[Any] = values",
+            "list[Any]",
+            "Top[list[Any]]",
+            true,
+        ),
+        (
+            "values: list[int]",
+            "alias: list[int] = values",
+            "list[int]",
+            "list[int]",
+            false,
+        ),
+        ("", "alias: list[Any] = []", "list[Any]", "list[Any]", false),
+    ] {
+        let mut db = setup_db();
+        db.write_file(
+            "/src/main.py",
+            format!(
+                "from typing import Any
+
+def make({parameters}) -> None:
+    {initializer}
+    alias.append(1)
+    alias[0] = 1
+"
+            ),
+        )?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let signature = |db: &TestDb| {
+            global_symbol(db, file, "make")
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        };
+        let original = signature(&db);
+        for mode in [
+            FunctionInferenceMode::Default,
+            FunctionInferenceMode::Conservative,
+            FunctionInferenceMode::Default,
+        ] {
+            db.select_function_inference(Some((file, vec!["make".to_owned()], mode)));
+            let module = program_file(&db, file);
+            let model = crate::SemanticModel::new(&db, module);
+            let parsed = parsed_module(&db, module.python_file(&db)).load(&db);
+            let statement = parsed.suite().last().unwrap();
+            let ast::Stmt::FunctionDef(function) = statement else {
+                panic!("expected make function");
+            };
+            let [_, statement, _] = function.body.as_slice() else {
+                panic!("expected declaration and two writes");
+            };
+            let ast::Stmt::Expr(statement) = statement else {
+                panic!("expected append expression");
+            };
+            let ast::Expr::Call(call) = statement.value.as_ref() else {
+                panic!("expected append call");
+            };
+            let ast::Expr::Attribute(attribute) = call.func.as_ref() else {
+                panic!("expected append receiver");
+            };
+            // Public symbol lookup intentionally reports the declared type.
+            let alias = attribute.value.inferred_type(&model).unwrap();
+            assert_eq!(
+                alias.display(&db, &db.program_environment()).to_string(),
+                if mode == FunctionInferenceMode::Conservative {
+                    conservative
+                } else {
+                    ordinary
+                },
+                "{mode:?}: {initializer}"
+            );
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, "make"))
+                .unwrap();
+            let expected_failure = mode == FunctionInferenceMode::Conservative && invalid_write;
+            assert_eq!(
+                facts.has_checking_failures, expected_failure,
+                "{mode:?}: {initializer}: {facts:?}"
+            );
+            let diagnostics = check_types(&db, program_file(&db, file));
+            let ids = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids,
+                if expected_failure {
+                    vec!["invalid-argument-type", "invalid-assignment"]
+                } else {
+                    vec![]
+                },
+                "{mode:?}: {initializer}"
+            );
+            assert_eq!(signature(&db), original);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn conservative_lambda_inputs() -> anyhow::Result<()> {
     use crate::HasType;
     use ty_python_core::scope::NodeWithScopeRef;
