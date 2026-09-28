@@ -133,6 +133,23 @@ impl<'db> Type<'db> {
         })
     }
 
+    /// Whether inference placeholders or potentially growing aliases prevent a finite proof.
+    ///
+    /// Expand aliases to find hidden contextual or divergent placeholders. Exact recursive
+    /// revisits add no information; stable Any and Unknown remain eligible.
+    pub(crate) fn has_indeterminate_inference(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
+        visitor::any_over_type_expanding_aliases(db, env, self, |ty| {
+            ty.is_divergent()
+                || ty
+                    .as_dynamic()
+                    .is_some_and(DynamicType::is_provisional_marker)
+        })
+    }
+
     pub(crate) fn has_provisional_marker(
         self,
         db: &'db dyn Db,

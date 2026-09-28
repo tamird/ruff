@@ -7646,14 +7646,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let use_def = self.index.use_def_map(scope.file_scope_id(db));
         let mut names = Vec::with_capacity(elements.len());
         let mut tag = None;
-        let is_provisional = |ty| {
-            crate::types::visitor::any_over_type_expanding_aliases(db, env, ty, |ty| {
-                matches!(ty, Type::Divergent(_))
-                    || ty
-                        .as_dynamic()
-                        .is_some_and(DynamicType::is_provisional_marker)
-            })
-        };
         for (position, element) in elements.iter().enumerate() {
             let ast::Expr::Name(name) = element else {
                 return None;
@@ -7674,7 +7666,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             }
             let ordinary = self.expression_type(element);
-            if is_provisional(ordinary) {
+            if ordinary.has_indeterminate_inference(db, env) {
                 return None;
             }
             let use_id = name.scoped_use_id(db, self.program_file());
@@ -7731,7 +7723,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     return None;
                 }
                 let projected = place.raw_type()?;
-                if is_provisional(projected) {
+                if projected.has_indeterminate_inference(db, env) {
                     return None;
                 }
                 if position == tag_index {
