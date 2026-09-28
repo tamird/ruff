@@ -2959,6 +2959,27 @@ fn membership_argument_correspondence() -> anyhow::Result<()> {
 
         def executed(checker: ListConsumer) -> bool:
             return "present" in ["present"] in checker
+
+        def skipped_elif(tags: None) -> bool:
+            if not tags:  # ty: ignore[redundant-condition]
+                return True
+            elif "manual" not in tags:
+                return False
+            return False
+
+        def reachable_elif(container: Container, callback: Callable[[str], None]) -> bool:
+            if False:
+                return True
+            elif callback in container:
+                return False
+            return False
+
+        def possible_elif(flag: bool, container: Container, callback: Callable[[str], None]) -> bool:
+            if flag:
+                return True
+            elif callback in container:
+                return False
+            return False
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -2979,6 +3000,9 @@ fn membership_argument_correspondence() -> anyhow::Result<()> {
         ("typed_dict", false),
         ("executed", true),
         ("mixed_chain", true),
+        ("skipped_elif", false),
+        ("reachable_elif", true),
+        ("possible_elif", true),
     ];
     let signatures = |db: &TestDb| {
         cases.map(|(name, _)| {
@@ -3019,6 +3043,60 @@ fn membership_argument_correspondence() -> anyhow::Result<()> {
         }
         assert_eq!(signatures(&db), ordinary);
         assert_file_diagnostics(&db, "/src/main.py", &[]);
+    }
+    Ok(())
+}
+
+#[test]
+fn elif_conditions_use_incoming_type_checking_context() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import TYPE_CHECKING
+
+        if TYPE_CHECKING:
+            pass
+        elif runtime_after_type_only:
+            pass
+
+        if not TYPE_CHECKING:
+            pass
+        elif type_only_after_runtime:
+            pass
+
+        if flag:
+            pass
+        elif TYPE_CHECKING:
+            pass
+
+        if TYPE_CHECKING:
+            if flag:
+                pass
+            elif nested_type_only:
+                pass
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let index = semantic_index(&db, program_file(&db, file));
+    let source = source_text(&db, file);
+    for (text, expected) in [
+        ("runtime_after_type_only", false),
+        ("type_only_after_runtime", true),
+        ("elif TYPE_CHECKING", false),
+        ("nested_type_only", true),
+    ] {
+        let condition = text.strip_prefix("elif ").unwrap_or(text);
+        let start = source.find(text).expect("condition exists") + text.len() - condition.len();
+        let range = ruff_text_size::TextRange::new(
+            start.try_into().unwrap(),
+            (start + condition.len()).try_into().unwrap(),
+        );
+        assert_eq!(
+            index.is_in_type_checking_block(FileScopeId::global(), range),
+            expected,
+            "{text}",
+        );
     }
     Ok(())
 }
