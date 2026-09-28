@@ -442,6 +442,74 @@ alice["extra"] = True
 bob["extra"] = True
 ```
 
+## Merging with empty built-in dictionaries
+
+An empty built-in dictionary leaves the `TypedDict` unchanged in either operand position:
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Never
+from typing_extensions import TypedDict
+
+class Record(TypedDict, closed=True):
+    value: int
+
+def merge(record: Record):
+    empty = {}
+    reveal_type(record | empty)  # revealed: Record
+    reveal_type(empty | record)  # revealed: Record
+    # error: [invalid-argument-type]
+    reveal_type(Record(value="bad") | empty)  # revealed: Record
+
+def extract_absent_keys(record: Record):
+    empty = {key: record.pop(key) for key in ("testonly", "features") if key in record}
+    reveal_type(record | empty)  # revealed: Record
+    reveal_type(empty | record)  # revealed: Record
+    reveal_type(empty)  # revealed: dict[Never, Never]
+```
+
+A nominal dictionary annotation can contain a subclass that overrides the merge operation. Its empty
+key and value types alone do not establish that the result preserves required fields:
+
+```py
+class DropsKeys(dict[Never, Never]):
+    def __ror__[K, V](self, other: dict[K, V], /) -> dict[K, V]:
+        return {}
+
+def nominal_empty(record: Record, empty: dict[Never, Never]):
+    # error: [unsupported-operator]
+    reveal_type(record | empty)  # revealed: Unknown
+
+def overridden(record: Record):
+    # error: [unsupported-operator]
+    reveal_type(record | DropsKeys())  # revealed: Unknown
+```
+
+The contents at the merge must still be empty after intervening writes:
+
+```py
+def mutated(record: Record):
+    empty = {}
+    empty["value"] = "wrong"
+    reveal_type(record | empty)  # revealed: dict[str, object]
+```
+
+Evaluating the other operand can also change the dictionary before the merge:
+
+```py
+def populate(record: Record, empty: dict[str, str]) -> Record:
+    empty["other"] = "value"
+    return record
+
+def operand_effect(record: Record):
+    empty = {}
+    reveal_type(empty | populate(record, empty))  # revealed: dict[str, object]
+```
+
 ## Unpacked assignments to `TypedDict` variables
 
 This is a regression test for a bug in an early implementation of precise annotations for unpacked

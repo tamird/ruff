@@ -10,6 +10,7 @@ use crate::types::cyclic::CycleDetector;
 use crate::types::diagnostic::{
     DIVISION_BY_ZERO, report_unsupported_augmented_assignment, report_unsupported_binary_operation,
 };
+use crate::types::dictionary::DictionaryItems;
 use crate::types::function::OverloadLiteral;
 use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::tuple::{TupleSpecBuilder, TupleType};
@@ -173,18 +174,17 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
 
         let ast::ExprBinOp {
-            left,
+            left: _,
             op,
-            right,
+            right: _,
             range: _,
             node_index: _,
         } = binary;
 
-        let (left_ty, right_ty) =
-            match self.infer_binary_expression_operand_types(left, *op, right, tcx) {
-                BinaryExpressionOperandTypes::TypedDictResult(ty) => return ty,
-                BinaryExpressionOperandTypes::Inferred(left_ty, right_ty) => (left_ty, right_ty),
-            };
+        let (left_ty, right_ty) = match self.infer_binary_expression_operand_types(binary, tcx) {
+            BinaryExpressionOperandTypes::TypedDictResult(ty) => return ty,
+            BinaryExpressionOperandTypes::Inferred(left_ty, right_ty) => (left_ty, right_ty),
+        };
 
         let mut state = BinaryInferenceState {
             arguments_proved: (self.function_inference_mode
@@ -252,11 +252,17 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     /// operand types for ordinary binary inference.
     fn infer_binary_expression_operand_types(
         &mut self,
-        left: &ast::Expr,
-        op: ast::Operator,
-        right: &ast::Expr,
+        binary: &ast::ExprBinOp,
         tcx: TypeContext<'db>,
     ) -> BinaryExpressionOperandTypes<'db> {
+        let ast::ExprBinOp {
+            left,
+            op,
+            right,
+            range: _,
+            node_index: _,
+        } = binary;
+        let op = *op;
         let db = self.db();
         // As a special case, pass `tcx` to binary operands that are collection literals/displays.
         // Note that it's not correct to pass it to all binary operands, for example:
@@ -285,7 +291,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         // When a dict literal is `|`'d with a TypedDict, infer the non-literal side first
         // so we can use bidirectional inference on the literal before calling the synthesized
         // `__or__`/`__ror__` method on the TypedDict side.
-        if op == ast::Operator::BitOr && matches!(left, ast::Expr::Dict(_)) {
+        if op == ast::Operator::BitOr && matches!(left.as_ref(), ast::Expr::Dict(_)) {
             let right_ty = self.infer_expression(right, operand_tcx(right));
             if let Type::TypedDict(typed_dict) = right_ty
                 && let Some(ty) = self.try_infer_typed_dict_merge(
@@ -309,7 +315,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let left_ty = self.infer_expression(left, operand_tcx(left));
         if op == ast::Operator::BitOr
             && let Type::TypedDict(typed_dict) = left_ty
-            && matches!(right, ast::Expr::Dict(_))
+            && matches!(right.as_ref(), ast::Expr::Dict(_))
             && let Some(ty) = self.try_infer_typed_dict_merge(
                 right,
                 typed_dict.to_partial(db),
@@ -320,10 +326,36 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             return BinaryExpressionOperandTypes::TypedDictResult(ty);
         }
 
-        BinaryExpressionOperandTypes::Inferred(
-            left_ty,
-            self.infer_expression(right, operand_tcx(right)),
-        )
+        let right_ty = self.infer_expression(right, operand_tcx(right));
+        let env = self.program_environment();
+        if op == ast::Operator::BitOr && !self.in_detached_annotation() {
+            let candidate = if let Type::TypedDict(typed_dict) = left_ty {
+                Some((typed_dict, right.as_ref()))
+            } else if let Type::TypedDict(typed_dict) = right_ty {
+                Some((typed_dict, left.as_ref()))
+            } else {
+                None
+            };
+            if let Some((typed_dict, empty)) = candidate
+                && !left_ty.has_provisional_marker(db, env)
+                && !right_ty.has_provisional_marker(db, env)
+                && let Ok(dictionary) = DictionaryItems::builtin_source(
+                    db,
+                    env,
+                    self.scope(),
+                    binary.into(),
+                    empty,
+                    &mut |expression| self.try_expression_type(expression),
+                )
+                && dictionary.is_complete()
+                && dictionary.items.is_empty()
+            {
+                // Both operands use builtin union dispatch, and the empty operand leaves
+                // every TypedDict item unchanged. The snapshot includes operand evaluation.
+                return BinaryExpressionOperandTypes::TypedDictResult(Type::TypedDict(typed_dict));
+            }
+        }
+        BinaryExpressionOperandTypes::Inferred(left_ty, right_ty)
     }
 
     fn try_infer_typed_dict_merge(
