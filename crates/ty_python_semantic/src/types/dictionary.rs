@@ -345,7 +345,7 @@ impl<'db> DictionaryItems<'db> {
     }
 
     /// Union dispatch requires a builtin allocation, not just a nominal dictionary type.
-    fn builtin_source(
+    pub(super) fn builtin_source(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         scope: ScopeId<'db>,
@@ -479,6 +479,12 @@ impl<'db> DictionaryItems<'db> {
             return Some(Self::from_typed_dict(unpacked, source));
         }
         let (key_ty, value_ty) = ty.unpack_keys_and_items(db, env)?;
+        if key_ty.resolve_type_alias(db).is_never() || value_ty.resolve_type_alias(db).is_never() {
+            return Some(Self {
+                items: Box::default(),
+                extra_items: DictionaryExtraItems::Closed,
+            });
+        }
         let str_ty = KnownClass::Str.to_instance(db, env);
         if key_ty.is_assignable_to(db, env, str_ty) && !str_ty.is_assignable_to(db, env, key_ty) {
             // The ordinary mapping checker handles key domains that exclude some strings.
@@ -488,11 +494,7 @@ impl<'db> DictionaryItems<'db> {
         }
         Some(Self {
             items: Box::default(),
-            extra_items: if value_ty.resolve_type_alias(db).is_never() {
-                DictionaryExtraItems::Closed
-            } else {
-                DictionaryExtraItems::Value(value_ty)
-            },
+            extra_items: DictionaryExtraItems::Value(value_ty),
         })
     }
 }
