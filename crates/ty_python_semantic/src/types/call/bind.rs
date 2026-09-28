@@ -68,8 +68,8 @@ use crate::types::typed_dict::{TypedDictOpenness, extract_unpacked_typed_dict_fr
 use crate::types::typevar::{BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVarSet};
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
-    TypeCollector, TypeKind, TypeVisitor, any_over_type, any_over_type_expanding_aliases,
-    walk_non_atomic_type, walk_type_with_recursion_guard,
+    TypeCollector, TypeKind, TypeVisitor, any_over_type, walk_non_atomic_type,
+    walk_type_with_recursion_guard,
 };
 use crate::types::{
     BindingContext, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
@@ -8149,6 +8149,11 @@ impl<'db> Binding<'db> {
                     let expected = matched_parameter
                         .expected_type
                         .unwrap_or_else(|| parameter.annotated_type());
+                    if actual.has_indeterminate_inference(db, env)
+                        || expected.has_indeterminate_inference(db, env)
+                    {
+                        return false;
+                    }
                     if index == 0
                         && matches!(argument, Argument::Synthetic)
                         && matched_parameter.index == 0
@@ -8157,7 +8162,6 @@ impl<'db> Binding<'db> {
                         && method.signature_receiver(db) == actual
                         && self.signature.has_implicit_positional_receiver_annotation()
                         && matches!(actual, Type::NominalInstance(_))
-                        && !actual.has_provisional_marker(db, env)
                         && let Some(receiver) = self.signature.unused_self_typevar(db, env)
                         && expected == Type::TypeVar(receiver)
                         && receiver.typevar(db).upper_bound(db, env) == Some(actual)
@@ -8214,14 +8218,19 @@ impl<'db> Binding<'db> {
                         })
                     })
                 }) && expected.is_fully_static_except_any(db, env)
-                    && !actual.has_provisional_marker(db, env)
                     && actual.satisfies_declared_output(db, env, *expected)
             });
         }
         let specialization = self.partial_specialization(db, env);
         if let Some(specialization) = specialization {
-            for (actual, _) in &mut pairs {
+            for (actual, expected) in &mut pairs {
                 *actual = actual.apply_specialization(db, specialization);
+                let expected = expected.apply_specialization(db, specialization);
+                if actual.has_indeterminate_inference(db, env)
+                    || expected.has_indeterminate_inference(db, env)
+                {
+                    return false;
+                }
             }
         }
         let direct = pairs.iter().all(|(actual, expected)| {
@@ -8229,7 +8238,6 @@ impl<'db> Binding<'db> {
                 expected.apply_specialization(db, specialization)
             });
             expected.is_fully_static_except_any(db, env)
-                && !actual.has_provisional_marker(db, env)
                 && actual.satisfies_declared_output(db, env, expected)
         });
         direct
@@ -8293,12 +8301,7 @@ impl<'db> Binding<'db> {
             else {
                 return None;
             };
-            if any_over_type_expanding_aliases(db, env, ty, |nested| {
-                matches!(nested, Type::Divergent(_))
-                    || nested
-                        .as_dynamic()
-                        .is_some_and(DynamicType::is_provisional_marker)
-            }) {
+            if ty.has_indeterminate_inference(db, env) {
                 return None;
             }
             let resolved = match ty.resolve_type_alias(db) {
@@ -11427,6 +11430,121 @@ mod tests {
     }
 
     #[test]
+    fn argument_correspondence_rejects_unfinished_types() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+            type Recursive[T] = list[Recursive[T]] | T
+            type Growing[T] = T | list[Growing[list[T]]]
+            recursive: Recursive[int]
+            growing: Growing[int]
+            "#,
+        )?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/a.py")?;
+        let file = ProgramFile::new(&db, file, env.program(&db));
+        let recursive = global_symbol(&db, file, "recursive").place.expect_type();
+        assert!(
+            any_over_type(&db, &env, recursive.resolve_type_alias(&db), false, |ty| {
+                ty == recursive
+            }),
+            "the fixture must retain its recursive reference: {}",
+            recursive.resolve_type_alias(&db).display(&db, &env),
+        );
+        let growing = global_symbol(&db, file, "growing").place.expect_type();
+        assert!(
+            matches!(
+                growing.to_type_identity(&db),
+                TypeIdentity::GrowingTypeAlias(_)
+            ),
+            "the fixture must retain potentially growing specialization",
+        );
+        let none = Type::none(&db, &env);
+        let any = Type::any();
+        let object = KnownClass::Object.to_instance(&db, &env);
+        let provisional = UnionType::from_two_elements(
+            &db,
+            &env,
+            none,
+            Type::Dynamic(DynamicType::UnspecializedTypeVar),
+        );
+        let divergent = UnionType::from_two_elements(
+            &db,
+            &env,
+            none,
+            Type::divergent(salsa::plumbing::Id::from_bits(1)),
+        );
+        assert!(
+            any_over_type(&db, &env, divergent, false, |ty| ty.is_divergent()),
+            "the known union arm must retain divergence in the test input",
+        );
+        assert!(
+            provisional.has_provisional_marker(&db, &env),
+            "the known union arm must not erase the provisional test input",
+        );
+        let Type::TypeAlias(alias) = recursive else {
+            panic!("expected the recursive alias constructor");
+        };
+        let recursive_marker = Type::TypeAlias(
+            alias.apply_specialization(&db, |context| context.specialize(&db, vec![provisional])),
+        );
+        assert!(
+            recursive_marker
+                .resolve_type_alias(&db)
+                .has_provisional_marker(&db, &env),
+            "the recursive branch must retain its hidden placeholder",
+        );
+        let callable = |input| {
+            Type::function_like_callable(
+                &db,
+                Signature::new(
+                    Parameters::standard([
+                        Parameter::positional_only(None).with_annotated_type(input)
+                    ]),
+                    none,
+                ),
+            )
+        };
+        for (name, actual, expected, proved) in [
+            ("explicit Any domain", none, any, true),
+            ("explicit Any value", any, any, true),
+            ("provisional domain", none, provisional, false),
+            ("provisional value", provisional, object, false),
+            ("divergent domain", none, divergent, false),
+            ("divergent value", divergent, object, false),
+            ("divergent Any value", divergent, any, false),
+            ("recursive object", recursive, object, true),
+            ("recursive Any", recursive, any, true),
+            ("recursive marker", recursive_marker, object, false),
+            ("growing object", growing, object, false),
+        ] {
+            let arguments = CallArguments::positional([actual]);
+            let bindings = callable(expected)
+                .bindings(&db, &env)
+                .match_parameters(&db, &env, &arguments)
+                .check_types(
+                    &db,
+                    &env,
+                    &ConstraintSetBuilder::new(),
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                )
+                .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
+            assert_eq!(bindings.return_type(&db, &env), none, "{name}");
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(&db, &env, &arguments),
+                proved,
+                "{name}: {} -> {}",
+                actual.display(&db, &env),
+                expected.display(&db, &env),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn independent_arguments_do_not_require_generic_solutions() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(
@@ -11723,6 +11841,32 @@ unbound_or = dict.__or__
                 bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
                 proved,
                 "{name}",
+            );
+        }
+        // Receiver binding cannot turn an unfinished class argument into proof.
+        for marker in [
+            Type::Dynamic(DynamicType::UnspecializedTypeVar),
+            Type::divergent(salsa::plumbing::Id::from_bits(1)),
+        ] {
+            let receiver = dict(marker, unknown);
+            assert!(
+                any_over_type(db, &env, receiver, false, |ty| ty == marker),
+                "the receiver must retain the unfinished class argument",
+            );
+            let result = Type::try_call_bin_op_result(
+                db,
+                &env,
+                receiver,
+                ast::Operator::BitOr,
+                dict(str, int),
+                MemberLookupPolicy::default(),
+                true,
+            )
+            .expect("dictionary union is callable");
+            assert!(
+                !result.arguments_proved,
+                "unfinished receiver: {}",
+                receiver.display(db, &env),
             );
         }
         for (left, right) in [

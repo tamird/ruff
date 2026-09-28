@@ -928,9 +928,9 @@ pub(super) fn any_over_type_including_alias_arguments<'db>(
 
 /// Searches through type aliases without forcing other lazily inferred type attributes.
 ///
-/// Revisiting a recursive alias counts as a match because its specialization can grow on each
-/// visit. Distinct specializations of a nonrecursive alias remain separate, so nested uses such as
-/// `Identity[Identity[int]]` are still considered finite.
+/// An exact recursive revisit adds no new type to inspect. A potentially growing specialization
+/// counts as a match because its later types are unknown. Distinct specializations of a
+/// nonrecursive alias remain separate, so `Identity[Identity[int]]` is still finite.
 pub(super) fn any_over_type_expanding_aliases<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -947,24 +947,30 @@ pub(super) fn any_over_type_expanding_aliases<'db>(
         any_over_type(db, env, ty, false, |nested| {
             query(nested)
                 || match nested {
-                    Type::TypeAlias(alias) => active_aliases.visit(
-                        &nested.to_type_identity(db),
-                        || true,
-                        || search(db, env, alias.value_type(db), query, active_aliases),
-                    ),
-                    Type::Recursive(recursive) => active_aliases.visit(
-                        &nested.to_type_identity(db),
-                        || true,
-                        || {
-                            search(
-                                db,
-                                env,
-                                recursive.unfold(db, env).into_type(),
-                                query,
-                                active_aliases,
-                            )
-                        },
-                    ),
+                    Type::TypeAlias(alias) => {
+                        let identity = nested.to_type_identity(db);
+                        active_aliases.visit(
+                            &identity,
+                            || !matches!(identity, TypeIdentity::Other(_)),
+                            || search(db, env, alias.value_type(db), query, active_aliases),
+                        )
+                    }
+                    Type::Recursive(recursive) => {
+                        let identity = nested.to_type_identity(db);
+                        active_aliases.visit(
+                            &identity,
+                            || !matches!(identity, TypeIdentity::Other(_)),
+                            || {
+                                search(
+                                    db,
+                                    env,
+                                    recursive.unfold(db, env).into_type(),
+                                    query,
+                                    active_aliases,
+                                )
+                            },
+                        )
+                    }
                     _ => false,
                 }
         })
