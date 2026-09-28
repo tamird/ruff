@@ -1988,6 +1988,33 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         def good() -> None:
             accept(lambda values: None)
 
+        def finite_consume(value: int, left: None = None, right: None = None) -> None:
+            pass
+
+        def finite_require(value: int, left: None, right: None = None) -> None:
+            pass
+
+        def finite_write(key: Literal["left", "right"]) -> None:
+            values = {"value": 1}
+            values[key] = None
+            finite_consume(**values)
+
+        def finite_write_required(key: Literal["left", "right"]) -> None:
+            values = {"value": 1}
+            values[key] = None
+            finite_require(**values)
+
+        def finite_write_present(key: Literal["left", "right"]) -> None:
+            values = {"value": 1, "left": None}
+            values[key] = None
+            finite_require(**values)
+
+        def finite_write_exposed(key: Literal["left", "right"], mutate: Callable[[object], None]) -> None:
+            values = {"value": 1}
+            mutate(values)
+            values[key] = None
+            finite_consume(**values)
+
         def popped() -> None:
             values = {"value": 1, "removed": 0}
             values.pop("removed")
@@ -2037,6 +2064,10 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         ("bad", true),
         ("good", false),
         ("popped", false),
+        ("finite_write", false),
+        ("finite_write_required", true),
+        ("finite_write_present", false),
+        ("finite_write_exposed", true),
         ("typed_popped", false),
         ("typed_merged", false),
         ("typed_filtered", false),
