@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
 use std::collections::hash_map;
 use std::convert::Infallible;
@@ -120,7 +121,9 @@ use crate::types::special_form::TypeQualifier;
 use crate::types::string_annotation::SourceAnnotation;
 use crate::types::subclass_of::SubclassOfInner;
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
-use crate::types::tuple::{Tuple, TupleLength, TupleSpecBuilder, TupleType, VariableSegment};
+use crate::types::tuple::{
+    Tuple, TupleLength, TupleSpec, TupleSpecBuilder, TupleType, VariableSegment,
+};
 use crate::types::type_alias::{ManualPEP695TypeAliasType, PEP695TypeAliasType};
 use crate::types::typed_dict::{TypedDictAssignmentKind, TypedDictKeyAssignment};
 use crate::types::typevar::{
@@ -5434,25 +5437,38 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             //  but only if the target is a name. We should report a diagnostic here if the target isn't a name:
             //  `for a.x in not_iterable: ...
             let iterable_type = builder.infer_standalone_expression(iter, tcx);
+            // Preserve this path's existing synchronous result inference for async targets.
+            if *is_async {
+                builder.context.record_unproved_requirement(&**iter);
+            }
             if !*is_async
                 && let Some(element_type) = builder
                     .fixed_length_iterable_element_type(iter, |expr| builder.expression_type(expr))
             {
+                if builder.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
+                    let _ = iterable_type.try_iterate_with_context(
+                        &builder.context,
+                        &**iter,
+                        EvaluationMode::Sync,
+                    );
+                }
                 element_type
             } else {
                 let env = builder.program_environment();
-                iterable_type.try_iterate(db, env).map_or_else(
-                    |err| err.fallback_element_type(db, env),
-                    |tuple| {
-                        let element = tuple.homogeneous_element_type(db, env);
-                        builder.snapshot_iterable_element_type(
-                            iter,
-                            element,
-                            EvaluationMode::from_is_async(*is_async),
-                            |expression| builder.expression_type(expression),
-                        )
-                    },
-                )
+                iterable_type
+                    .try_iterate_with_context(&builder.context, &**iter, EvaluationMode::Sync)
+                    .map_or_else(
+                        |err| err.fallback_element_type(db, env),
+                        |tuple| {
+                            let element = tuple.homogeneous_element_type(db, env);
+                            builder.snapshot_iterable_element_type(
+                                iter,
+                                element,
+                                EvaluationMode::from_is_async(*is_async),
+                                |expression| builder.expression_type(expression),
+                            )
+                        },
+                    )
             }
         });
 
@@ -5488,13 +5504,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             self.expression_type(expr)
                         })
                 {
+                    if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
+                        let _ = iterable_type.try_iterate_with_context(
+                            &self.context,
+                            iterable,
+                            EvaluationMode::Sync,
+                        );
+                    }
                     element_type
                 } else {
                     let env = self.program_environment();
                     iterable_type
-                        .try_iterate_with_mode(
-                            db,
-                            env,
+                        .try_iterate_with_context(
+                            &self.context,
+                            iterable,
                             EvaluationMode::from_is_async(for_stmt.is_async()),
                         )
                         .map(|tuple| {
@@ -9071,20 +9094,28 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             target,
             iter,
             ifs,
-            is_async: _,
+            is_async,
         } = comprehension;
 
         self.infer_target(target, iter, &|builder, tcx| {
             // TODO: `infer_comprehension_definition` reports a diagnostic if `iter_ty` isn't iterable
             //  but only if the target is a name. We should report a diagnostic here if the target isn't a name:
             //  `[... for a.x in not_iterable]
-            if is_first {
+            let iterable_type = if is_first {
                 infer_same_file_expression_type(builder.db(), builder.index.expression(iter), tcx)
             } else {
                 builder.infer_maybe_standalone_expression(iter, tcx)
+            };
+            // Preserve this path's existing synchronous result inference for async targets.
+            if *is_async {
+                builder.context.record_unproved_requirement(iter);
             }
-            .iterate(db, env)
-            .homogeneous_element_type(db, env)
+            iterable_type
+                .try_iterate_with_context(&builder.context, iter, EvaluationMode::Sync)
+                .unwrap_or_else(|error| {
+                    Cow::Owned(TupleSpec::homogeneous(error.fallback_element_type(db, env)))
+                })
+                .homogeneous_element_type(db, env)
         });
 
         for expr in ifs {
@@ -9145,13 +9176,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let (iterable_type, element_type, result) = infer_iterable_type();
 
                 if let Some(element_type) = element_type {
+                    if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
+                        let _ = iterable_type.try_iterate_with_context(
+                            &self.context,
+                            iterable,
+                            EvaluationMode::Sync,
+                        );
+                    }
                     element_type
                 } else {
                     let env = self.program_environment();
                     iterable_type
-                        .try_iterate_with_mode(
-                            db,
-                            env,
+                        .try_iterate_with_context(
+                            &self.context,
+                            iterable,
                             EvaluationMode::from_is_async(comprehension.is_async()),
                         )
                         .map(|tuple| {

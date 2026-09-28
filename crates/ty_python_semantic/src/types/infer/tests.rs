@@ -6,6 +6,7 @@ use crate::db::tests::{TestDb, TestDbBuilder, setup_db};
 use crate::lint::{LintSource, RuleSelection};
 use crate::place::symbol;
 use crate::place::{ConsideredDefinitions, Place, PlaceAndQualifiers};
+use crate::types::iteration::IterationOutcome;
 use crate::types::{
     DynamicType, KnownClass, KnownInstanceType, MemberLookupPolicy, RecursiveType, check_types,
 };
@@ -22,7 +23,8 @@ use ty_python_core::definition::Definition;
 use ty_python_core::program::Program;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::{
-    ProgramFile, TestProgramDb as _, global_scope, place_table, semantic_index, use_def_map,
+    EvaluationMode, ProgramFile, TestProgramDb as _, global_scope, place_table, semantic_index,
+    use_def_map,
 };
 
 use super::*;
@@ -3518,6 +3520,233 @@ fn rich_comparison_argument_correspondence() -> anyhow::Result<()> {
                 "{mode:?} {name}"
             );
         }
+        assert_eq!(signatures(&db), ordinary);
+        assert_file_diagnostics(&db, "/src/main.py", &[]);
+    }
+    Ok(())
+}
+
+#[test]
+fn iteration_argument_correspondence() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from __future__ import annotations
+        from typing import Any, AsyncIterator, Callable, Iterator
+        from ty_extensions._internal import Unknown
+
+        class BadIter[T]:
+            def __iter__(self: BadIter[Callable[[Any], None]]) -> Iterator[int]: return iter([1])
+        class GoodIter[T]:
+            def __iter__(self: GoodIter[Callable[[str], None]]) -> Iterator[int]: return iter([1])
+        class BadNext[T]:
+            def __iter__(self) -> BadNext[T]: return self
+            def __next__(self: BadNext[Callable[[Any], None]]) -> int: return 1
+        class GoodNext[T]:
+            def __iter__(self) -> GoodNext[T]: return self
+            def __next__(self: GoodNext[Callable[[str], None]]) -> int: return 1
+        class CustomTuple(tuple[int, ...]):
+            def __iter__(self) -> Iterator[int]: return iter([1])
+        class InheritedTuple(tuple[int, ...]): pass
+        class BadLegacy[T]:
+            def __getitem__(self: BadLegacy[Callable[[Any], None]], index: int) -> int: return 1
+        class GoodLegacy[T]:
+            def __getitem__(self: GoodLegacy[Callable[[str], None]], index: int) -> int: return 1
+
+        class IteratorFactory:
+            def __next__(self) -> int: return 1
+        class ConstructorIter:
+            __iter__ = IteratorFactory
+
+        custom_tuple_value: CustomTuple
+        inherited_tuple_value: InheritedTuple
+        async_value: AsyncIterator[int]
+        tuple_value: tuple[Any, ...]
+
+        def constructor(value: ConstructorIter) -> None:
+            for item in value: pass
+        def dynamic(value: Any) -> None:
+            for item in value: pass
+        def unknown(value: Unknown) -> None:
+            for item in value: pass
+        def mixed(value: list[Any] | Any) -> None:
+            for item in value: pass
+        def known_list(value: list[Any]) -> None:
+            for item in value: pass
+        def known_unknown_list(value: list[Unknown]) -> None:
+            for item in value: pass
+        def known_tuple(value: tuple[Any, ...]) -> None:
+            for item in value: pass
+        def dynamic_comprehension(value: Any) -> None:
+            [item for item in value if False]
+        def skipped_comprehension(value: Any) -> None:
+            [item for first in [0] if False for item in value]
+        def dynamic_unpack(value: Any) -> None:
+            first, second = value
+        def known_unpack(value: list[Any]) -> None:
+            first, second = value
+        def nested_unpack(value: Any) -> None:
+            for first, second in (value,): pass
+        def nested_assignment(value: Any) -> None:
+            (first, second), = [value]
+        def stored_target(value: Any, target: list[object]) -> None:
+            for target[0] in value: pass
+        def stored_comprehension(value: Any, target: list[object]) -> None:
+            [None for target[0] in value]
+        def bad_iter(value: BadIter[Callable[[str], None]]) -> None:
+            for item in value: pass
+        def good_iter(value: GoodIter[Callable[[str], None]]) -> None:
+            for item in value: pass
+        def bad_next(value: BadNext[Callable[[str], None]]) -> None:
+            for item in value: pass
+        def good_next(value: GoodNext[Callable[[str], None]]) -> None:
+            for item in value: pass
+        def custom_tuple(value: CustomTuple) -> None:
+            for item in value: pass
+        def inherited_tuple(value: InheritedTuple) -> None:
+            for item in value: pass
+        def bad_legacy(value: BadLegacy[Callable[[str], None]]) -> None:
+            for item in value: pass
+        def good_legacy(value: GoodLegacy[Callable[[str], None]]) -> None:
+            for item in value: pass
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    {
+        let env = db.program_environment();
+        let symbol_type = |name| {
+            let ty = global_symbol(&db, file, name).place.expect_type();
+            assert!(
+                matches!(ty, Type::NominalInstance(_)),
+                "{name} must retain its nominal iteration domain: {}",
+                ty.display(&db, &env)
+            );
+            ty
+        };
+        let async_type = global_symbol(&db, file, "async_value").place.expect_type();
+        assert_matches!(
+            async_type,
+            Type::ProtocolInstance(_),
+            "async_value must retain its declared protocol domain"
+        );
+        for (ty, mode, expected_proof) in [
+            (symbol_type("tuple_value"), EvaluationMode::Sync, true),
+            (
+                symbol_type("custom_tuple_value"),
+                EvaluationMode::Sync,
+                false,
+            ),
+            (
+                symbol_type("inherited_tuple_value"),
+                EvaluationMode::Sync,
+                false,
+            ),
+            (async_type, EvaluationMode::Async, false),
+            (Type::Never, EvaluationMode::Sync, true),
+            (
+                Type::divergent(salsa::plumbing::Id::from_bits(1)),
+                EvaluationMode::Sync,
+                false,
+            ),
+        ] {
+            let ordinary = ty.try_iterate_with_mode(&db, &env, mode).unwrap();
+            let IterationOutcome {
+                tuple,
+                inputs_proved,
+            } = ty
+                .try_iterate_with_mode_and_proof(&db, &env, mode, true)
+                .unwrap();
+            assert_eq!(tuple, ordinary, "{ty:?} {mode:?}: ordinary iteration shape");
+            assert_eq!(inputs_proved, expected_proof, "{ty:?} {mode:?}");
+        }
+        let invalid = KnownClass::Int.to_instance(&db, &env);
+        let Err(ordinary_error) = invalid.try_iterate(&db, &env) else {
+            panic!("int must retain its ordinary iteration error");
+        };
+        let Err(checked_error) =
+            invalid.try_iterate_with_mode_and_proof(&db, &env, EvaluationMode::Sync, true)
+        else {
+            panic!("requested proof must not recover invalid iteration");
+        };
+        assert_eq!(
+            std::mem::discriminant(&checked_error),
+            std::mem::discriminant(&ordinary_error)
+        );
+        assert_eq!(
+            checked_error.fallback_element_type(&db, &env),
+            ordinary_error.fallback_element_type(&db, &env)
+        );
+    }
+    let cases = [
+        ("constructor", true),
+        ("dynamic", true),
+        ("unknown", true),
+        ("mixed", true),
+        ("known_list", false),
+        ("known_unknown_list", false),
+        ("known_tuple", false),
+        ("dynamic_comprehension", true),
+        ("skipped_comprehension", false),
+        ("dynamic_unpack", true),
+        ("known_unpack", false),
+        ("nested_unpack", true),
+        ("nested_assignment", true),
+        ("stored_target", true),
+        ("stored_comprehension", true),
+        ("bad_iter", true),
+        ("good_iter", false),
+        ("bad_next", true),
+        ("good_next", false),
+        ("custom_tuple", true),
+        ("inherited_tuple", true),
+        ("bad_legacy", true),
+        ("good_legacy", false),
+    ];
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary = signatures(&db);
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((
+            file,
+            cases
+                .map(|(name, _)| name)
+                .into_iter()
+                .chain(["<listcomp>"])
+                .map(str::to_owned)
+                .collect(),
+            mode,
+        )));
+        let model = crate::SemanticModel::new(&db, program_file(&db, file));
+        let mut mismatches = Vec::new();
+        for (name, unproved) in cases {
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, name))
+                .unwrap();
+            if facts.has_unproved_requirements
+                != (mode == FunctionInferenceMode::OutputProof && unproved)
+            {
+                mismatches.push((name, unproved, facts));
+            }
+            assert!(!facts.has_errors, "{mode:?} {name}: {facts:?}");
+            assert_eq!(
+                facts.return_type_correspondence,
+                (mode == FunctionInferenceMode::OutputProof).then_some(true),
+                "{mode:?} {name}",
+            );
+        }
+        assert!(mismatches.is_empty(), "{mode:?}: {mismatches:#?}");
         assert_eq!(signatures(&db), ordinary);
         assert_file_diagnostics(&db, "/src/main.py", &[]);
     }
