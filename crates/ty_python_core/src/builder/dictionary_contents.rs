@@ -378,7 +378,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 }
 
 /// Values stored in another object can retain a mapping; a subscript read does not expose its
-/// receiver. Calls handle their own arguments and return an independently inferred value.
+/// receiver. Container construction records stored elements. Calls handle their own arguments
+/// and return an independently inferred value.
 pub(super) fn value_receivers<'ast>(
     expression: &'ast ast::Expr,
     receivers: &mut Vec<&'ast ast::Expr>,
@@ -387,31 +388,9 @@ pub(super) fn value_receivers<'ast>(
         ast::Expr::Name(_) => receivers.push(expression),
         ast::Expr::Attribute(attribute) => {
             receivers.push(expression);
-            receivers.push(&attribute.value);
+            value_receivers(&attribute.value, receivers);
         }
         ast::Expr::Subscript(_) => receivers.push(expression),
-        ast::Expr::List(list) => {
-            for value in &list.elts {
-                value_receivers(value, receivers);
-            }
-        }
-        ast::Expr::Tuple(tuple) => {
-            for value in &tuple.elts {
-                value_receivers(value, receivers);
-            }
-        }
-        ast::Expr::Set(set) => {
-            for value in &set.elts {
-                value_receivers(value, receivers);
-            }
-        }
-        ast::Expr::Dict(dict) => {
-            for item in &dict.items {
-                if item.key.is_some() {
-                    value_receivers(&item.value, receivers);
-                }
-            }
-        }
         ast::Expr::If(if_expr) => {
             value_receivers(&if_expr.body, receivers);
             value_receivers(&if_expr.orelse, receivers);
@@ -426,25 +405,35 @@ pub(super) fn value_receivers<'ast>(
     }
 }
 
-pub(super) fn call_receivers(call: &ast::ExprCall) -> Vec<(&ast::Expr, bool)> {
+pub(super) fn call_receivers<'ast>(call: &'ast ast::ExprCall) -> Vec<(&'ast ast::Expr, bool)> {
     let mut result = Vec::new();
+    let mut add_receivers = |expression: &'ast ast::Expr, direct: bool| {
+        let direct = direct
+            .then(|| PlaceExpr::try_from_expr(expression))
+            .flatten();
+        if direct.is_some() {
+            result.push((expression, false));
+        }
+        let mut receivers = Vec::new();
+        value_receivers(expression, &mut receivers);
+        result.extend(
+            receivers
+                .into_iter()
+                .filter(|receiver| PlaceExpr::try_from_expr(*receiver) != direct)
+                .map(|receiver| (receiver, true)),
+        );
+    };
     if let ast::Expr::Attribute(attribute) = call.func.as_ref() {
-        result.push((attribute.value.as_ref(), false));
+        add_receivers(&attribute.value, true);
+    } else {
+        add_receivers(&call.func, false);
     }
     for argument in &call.arguments.args {
-        if PlaceExpr::try_from_expr(argument).is_some() {
-            result.push((argument, false));
-        } else {
-            let mut nested = Vec::new();
-            value_receivers(argument, &mut nested);
-            result.extend(nested.into_iter().map(|receiver| (receiver, true)));
-        }
+        add_receivers(argument, true);
     }
     for keyword in &call.arguments.keywords {
         if keyword.arg.is_some() {
-            let mut nested = Vec::new();
-            value_receivers(&keyword.value, &mut nested);
-            result.extend(nested.into_iter().map(|receiver| (receiver, true)));
+            add_receivers(&keyword.value, false);
         }
     }
     result

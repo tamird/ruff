@@ -152,6 +152,75 @@ def restricted(values: Restricted):
     del values["note"]  # error: [invalid-argument-type]
 ```
 
+## Bound method escapes
+
+Passing a bound method to another callable retains its dictionary receiver. A call through a
+conditional expression can likewise mutate the receiver before later keyword arguments use it.
+
+```py
+from typing import Callable
+from typing_extensions import NotRequired, TypedDict
+
+class Values(TypedDict, closed=True):
+    note: NotRequired[str]
+
+def consume(note: str): ...
+def mutate(update: Callable[..., None]) -> None:
+    update(note="again")
+
+def forwarded(values: Values):
+    values.pop("note", None)
+    mutate(values.update)
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def conditional(values: Values):
+    values.pop("note", None)
+    (values.update if True else None)(note="again")
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def projected(values: Values):
+    values.pop("note", None)
+    [values.update][0](note="again")
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def chained(values: Values):
+    values.pop("note", None)
+    mutate(values.update.__call__)
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def chained_callee(values: Values):
+    values.pop("note", None)
+    values.update.__call__.__call__(note="again")
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def conditional_receiver(values: Values):
+    values.pop("note", None)
+    (values if True else values).update(note="again")
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def dictionary_key(values: Values):
+    values.pop("note", None)
+    next(iter({values.update: 0}))(note="again")
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def set_element(values: Values):
+    values.pop("note", None)
+    {values.update}.pop()(note="again")
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+```
+
+An assignment expression still identifies the directly passed object.
+
+```py
+def clear(values: dict[str, int]) -> None:
+    values.clear()
+
+def empty(): ...
+def assigned_argument():
+    clear(values := {"extra": 1})
+    empty(**values)
+```
+
 ## Opaque exposure
 
 Passing a dictionary to an ordinary callable leaves key presence uncertain. Known value refinements
