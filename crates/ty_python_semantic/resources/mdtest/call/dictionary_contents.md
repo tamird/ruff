@@ -93,6 +93,24 @@ def wrong_value(values: Values):
     consume(**values)  # error: [invalid-argument-type]
 ```
 
+Dictionary unions preserve the observed entries of each operand. The resulting copy is independent
+of later key writes to its source.
+
+```py
+def merged(values: Values):
+    values.pop("note", None)
+    consume(note="replacement", **(values | {}))
+    consume(note="replacement", **({} | values))
+    consume(note="replacement", **(values | {} | {}))
+
+def copied(values: Values):
+    values.pop("note", None)
+    copied = values | {}
+    values["note"] = "again"
+    consume(note="replacement", **copied)
+    consume(note="replacement", **(values | {}))  # error: [parameter-already-assigned]
+```
+
 Passing the dictionary to an ordinary callable restores the declared possibilities. A returned value
 likewise follows its declared schema; a matching return annotation does not preserve deleted keys.
 
