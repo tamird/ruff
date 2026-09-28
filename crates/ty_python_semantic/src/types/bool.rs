@@ -170,8 +170,12 @@ impl<'db> Type<'db> {
                                 Ok(Truthiness::Ambiguous)
                             }
                         }
-                        // if a `@final` type does not define `__bool__` or `__len__`, it is always truthy
-                        Err(CallDunderError::MethodNotAvailable) => Ok(Truthiness::AlwaysTrue),
+                        // Known builtin declarations can omit truthiness methods. Preserve their
+                        // fallback; other final classes without either method are always truthy.
+                        Err(CallDunderError::MethodNotAvailable) => Ok(instance
+                            .known_class(db)
+                            .and_then(KnownClass::bool)
+                            .unwrap_or(Truthiness::AlwaysTrue)),
                         // TODO: errors during a `__len__` call (if `__len__` exists) should be reported
                         // as diagnostics similar to errors during a `__bool__` call (when `__bool__` exists)
                         Err(_) => Ok(Truthiness::Ambiguous),
@@ -352,6 +356,9 @@ impl<'db> Type<'db> {
             Type::NominalInstance(instance) => instance
                 .known_class(db)
                 .and_then(KnownClass::bool)
+                .filter(|truthiness| {
+                    *truthiness != Truthiness::Ambiguous || !instance.class(db, env).is_final(db)
+                })
                 .map(Ok)
                 .unwrap_or_else(try_dunders)?,
 
