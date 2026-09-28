@@ -1951,6 +1951,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // `str: "str" = ""`, that value lets the next iteration reject the annotation
                     // instead of leaving both the annotation and the binding divergent.
                     if !should_preserve_inferred_binding_type(inferred_ty)
+                        && (self.function_inference_mode
+                            != crate::FunctionInferenceMode::Conservative
+                            || declared_type.is_fully_static(db, env))
                         && !matches!(
                             declared_type,
                             Type::Dynamic(DynamicType::Unknown) | Type::Divergent(_)
