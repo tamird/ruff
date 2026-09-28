@@ -112,10 +112,10 @@ fn supplied_call_diagnostics_follow_native_policy() -> anyhow::Result<()> {
         let file = system_path_to_file(&db, "/src/main.py")?;
         let crate::types::TypeCheckResult {
             diagnostics,
-            has_suppressed_inference_diagnostics,
+            has_suppressed_inference_failures,
             has_unproved_requirements: _,
         } = crate::types::check_types_with_diagnostics(&db, db.program_file(file), []);
-        assert_eq!(has_suppressed_inference_diagnostics, suppressed, "{source}");
+        assert_eq!(has_suppressed_inference_failures, suppressed, "{source}");
         let mut ids: Vec<_> = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.id().as_str())

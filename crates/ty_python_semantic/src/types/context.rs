@@ -695,7 +695,9 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
         }
 
         if suppressed {
-            ctx.diagnostics.borrow_mut().mark_reachable_suppression();
+            ctx.diagnostics
+                .borrow_mut()
+                .mark_reachable_suppression(lint_id);
             return None;
         }
 

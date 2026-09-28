@@ -959,9 +959,15 @@ mod tests {
     }
 
     #[test]
-    fn file_check_retains_inference_suppression_status() -> anyhow::Result<()> {
+    fn file_check_retains_suppressed_checking_failures() -> anyhow::Result<()> {
         for (source, expected, diagnostic) in [
             ("value = 1\n", false, None),
+            (
+                "def make(): return 1\nif make: # ty: ignore[redundant-condition]\n    pass\n",
+                false,
+                None,
+            ),
+            ("len(1) # ty: ignore[invalid-argument-type]\n", true, None),
             (
                 "value = missing # ty: ignore[unresolved-reference]\n",
                 true,
@@ -989,7 +995,7 @@ mod tests {
                 .map(|diagnostic| diagnostic.id().as_str())
                 .collect();
             assert_eq!(actual, diagnostic.into_iter().collect::<Vec<_>>());
-            assert_eq!(result.has_suppressed_inference_diagnostics, expected);
+            assert_eq!(result.has_suppressed_inference_failures, expected);
         }
         Ok(())
     }
@@ -1032,7 +1038,7 @@ mod tests {
             };
             let result =
                 check_types_with_diagnostics(&db, program_file, [provided_diagnostic(file, range)]);
-            assert!(!result.has_suppressed_inference_diagnostics);
+            assert!(!result.has_suppressed_inference_failures);
             assert!(result.diagnostics.is_empty(), "{source}: {result:?}");
         }
         Ok(())

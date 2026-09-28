@@ -206,10 +206,10 @@ mod subscript;
 #[derive(Debug)]
 pub struct TypeCheckResult {
     pub diagnostics: Vec<Diagnostic>,
-    /// Whether file inference suppressed diagnostics in reachable code, including in nested
+    /// Whether file inference suppressed checking failures in reachable code, including in nested
     /// scopes, defaults, and implicit aliases. Supplemental diagnostics and checks of
     /// suppression comments themselves do not contribute to this flag.
-    pub has_suppressed_inference_diagnostics: bool,
+    pub has_suppressed_inference_failures: bool,
     /// Whether selected inference encountered reachable input requirements it could not prove.
     /// Includes committed nested scopes and defaults, independently of diagnostic display policy.
     pub has_unproved_requirements: bool,
@@ -301,7 +301,8 @@ pub fn check_types_with_diagnostics(
             .map(|error| Diagnostic::invalid_syntax(source_file, error, error)),
     );
 
-    let has_suppressed_inference_diagnostics = diagnostics.has_reachable_suppressed_diagnostics();
+    let has_suppressed_inference_failures =
+        diagnostics.has_reachable_suppressed_checking_failures();
     let has_unproved_requirements = diagnostics.has_unproved_requirements();
     diagnostics.extend_provided(db, file.python_file(db), supplemental, |_| false);
     let diagnostics = check_suppressions(db, file.python_file(db), diagnostics);
@@ -316,7 +317,7 @@ pub fn check_types_with_diagnostics(
 
     TypeCheckResult {
         diagnostics,
-        has_suppressed_inference_diagnostics,
+        has_suppressed_inference_failures,
         has_unproved_requirements,
     }
 }
