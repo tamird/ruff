@@ -319,6 +319,65 @@ fn function_inference_facts() -> anyhow::Result<()> {
 }
 
 #[test]
+fn comprehension_requirement_reachability() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Literal
+        from typing_extensions import NotRequired, TypedDict
+
+        class Row(TypedDict, closed=True):
+            value: NotRequired[int]
+
+        def absent_keys(row: Row) -> None:
+            result = {key: row.pop(key) for key in ["absent"] if key in row}
+
+        def needs_int(value: int) -> Literal[False]:
+            return False
+
+        def evaluated_filter() -> None:
+            [0 for x in [1] if needs_int("bad") for y in [2] if False]
+
+        def reachable_body(value: object) -> None:
+            [needs_int(value) for x in [1]]
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("absent_keys", false),
+        ("evaluated_filter", true),
+        ("reachable_body", true),
+    ];
+    db.select_function_inference(Some((
+        file,
+        cases
+            .map(|(name, _)| name)
+            .into_iter()
+            .chain(["<dictcomp>", "<listcomp>"])
+            .map(str::to_owned)
+            .collect(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    let model = crate::SemanticModel::new(&db, program_file(&db, file));
+    for (name, unproved) in cases {
+        let definition = first_public_binding(&db, file, name);
+        assert_matches!(
+            model.function_inference_facts(definition),
+            Some(crate::FunctionInferenceFacts {
+                return_type_correspondence: _,
+                has_cycle_recovery: false,
+                has_errors: _,
+                has_checking_failures: _,
+                has_unproved_requirements,
+            }) if has_unproved_requirements == unproved,
+            "{name}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn conservative_global_inputs() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(

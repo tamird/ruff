@@ -3396,8 +3396,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     /// - Inside that scope, it visits a list of [`Comprehension`] nodes,
     ///   assumed to be the "generators" that compose a comprehension
     ///   (that is, the `for x in y` and `for y in z` parts of `x for x in y for y in z`).
-    /// - Inside that scope, it also calls a closure for visiting the outer `elt`
-    ///   of a list/dict/set comprehension or generator expression
+    /// - Inside that scope, it visits the element expressions of the comprehension
     /// - It then pops the new scope off the stack
     ///
     /// [`Comprehension`]: ast::Comprehension
@@ -3405,7 +3404,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         &mut self,
         scope: NodeWithScopeRef<'ast>,
         generators: &'ast [ast::Comprehension],
-        visit_outer_elt: impl FnOnce(&mut Self),
+        elements: impl IntoIterator<Item = &'ast ast::Expr>,
     ) -> FileScopeId {
         let mut generators_iter = generators.iter();
 
@@ -3450,6 +3449,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         }
 
         for generator in generators_iter {
+            let in_type_checking_block = self.in_type_checking_block;
+            self.current_use_def_map_mut()
+                .record_range_reachability(generator.range(), in_type_checking_block);
             let value = self.add_standalone_expression(&generator.iter);
             self.visit_expr(&generator.iter);
             let iteration_can_raise =
@@ -3471,7 +3473,12 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             }
         }
 
-        visit_outer_elt(self);
+        for element in elements {
+            let in_type_checking_block = self.in_type_checking_block;
+            self.current_use_def_map_mut()
+                .record_range_reachability(element.range(), in_type_checking_block);
+            self.visit_expr(element);
+        }
         for filtered_out_path in filtered_out_paths {
             self.flow_merge(filtered_out_path);
         }
@@ -3495,6 +3502,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     /// print(last)
     /// ```
     fn visit_comprehension_filter(&mut self, if_expr: &'ast ast::Expr) -> FlowSnapshot {
+        let in_type_checking_block = self.in_type_checking_block;
+        self.current_use_def_map_mut()
+            .record_range_reachability(if_expr.range(), in_type_checking_block);
         self.visit_condition(if_expr);
         let condition_flow_snapshot = self.flow_snapshot_for_condition(if_expr);
         let filtered_out = if let Some(snapshots) = condition_flow_snapshot.into_branches() {
@@ -4063,7 +4073,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 let scope = self.with_generators_scope(
                     NodeWithScopeRef::ListComprehension(list_comprehension),
                     generators,
-                    |builder| builder.visit_expr(elt),
+                    [elt.as_ref()],
                 );
                 if self.async_comprehensions.contains(&scope) {
                     self.mark_current_comprehension_async();
@@ -4077,7 +4087,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 let scope = self.with_generators_scope(
                     NodeWithScopeRef::SetComprehension(set_comprehension),
                     generators,
-                    |builder| builder.visit_expr(elt),
+                    [elt.as_ref()],
                 );
                 if self.async_comprehensions.contains(&scope) {
                     self.mark_current_comprehension_async();
@@ -4091,7 +4101,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 self.with_generators_scope(
                     NodeWithScopeRef::GeneratorExpression(generator),
                     generators,
-                    |builder| builder.visit_expr(elt),
+                    [elt.as_ref()],
                 );
             }
             ast::Expr::DictComp(
@@ -4105,12 +4115,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 let scope = self.with_generators_scope(
                     NodeWithScopeRef::DictComprehension(dict_comprehension),
                     generators,
-                    |builder| {
-                        if let Some(key) = key {
-                            builder.visit_expr(key);
-                        }
-                        builder.visit_expr(value);
-                    },
+                    key.as_deref().into_iter().chain([value.as_ref()]),
                 );
                 if self.async_comprehensions.contains(&scope) {
                     self.mark_current_comprehension_async();

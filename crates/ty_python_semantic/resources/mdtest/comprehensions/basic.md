@@ -177,6 +177,42 @@ class InvalidBoolReturn:
 [x for x in range(3) if InvalidBoolReturn()]  # error: [unsupported-bool-conversion]
 ```
 
+## Unreachable comprehension expressions
+
+A false filter skips the element expression, including both the key and value of a dictionary
+comprehension:
+
+```py
+def needs_int(value: int) -> int:
+    return value
+
+[needs_int("bad") for _ in range(3) if False]
+{needs_int("bad") for _ in range(3) if False}
+{needs_int("key"): needs_int("value") for _ in range(3) if False}
+(needs_int("bad") for _ in range(3) if False)
+```
+
+The first iterable and first filter are evaluated before filtering. Subsequent iterables and filters
+are skipped after a false filter:
+
+```py
+from typing import Literal
+
+def numbers(value: int) -> list[int]:
+    return [value]
+
+def reject(value: int) -> Literal[False]:
+    return False
+
+[
+    needs_int("body")
+    for x in numbers("first iterable")  # error: [invalid-argument-type]
+    if reject("first filter")  # error: [invalid-argument-type]
+    if needs_int("later filter")
+    for y in numbers("later iterable")
+]
+```
+
 ## Nested comprehension
 
 ```py

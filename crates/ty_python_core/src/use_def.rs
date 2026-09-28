@@ -1100,12 +1100,9 @@ impl<'db> UseDefMap<'db> {
     }
 
     pub(crate) fn is_range_in_type_checking_block(&self, range: TextRange) -> bool {
-        self.range_reachability
-            .iter()
-            .take_while(|(entry_range, _)| entry_range.start() <= range.start())
-            .any(|&(entry_range, block)| {
-                block.in_type_checking_block && entry_range.contains_range(range)
-            })
+        self.range_reachability.iter().any(|&(entry_range, block)| {
+            block.in_type_checking_block && entry_range.contains_range(range)
+        })
     }
 
     /// Candidate value identity for an occurrence, requiring a semantic stability proof.
@@ -2940,9 +2937,12 @@ impl<'db> UseDefMapBuilder<'db> {
 
         // If the last entry has the same reachability constraint and the same
         // "in-TYPE_CHECKING" status, extend it to cover this range too, collapsing
-        // consecutive statements in a contiguous range into a single entry.
+        // consecutive statements in a contiguous range into a single entry. Expressions can be
+        // visited out of source order, such as comprehension elements after their filters. Merging
+        // backwards could include expressions evaluated under different constraints.
         if let Some((last_range, last_range_info)) = self.range_reachability.last_mut()
             && *last_range_info == this_range_info
+            && last_range.end() <= range.start()
         {
             *last_range = last_range.cover(range);
             return;
