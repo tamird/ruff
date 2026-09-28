@@ -978,7 +978,7 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         ),
         (
             "values = {'x': 1}\ndel values['x']\nresult = observe(values)",
-            "complete; x~: Never at 'x'",
+            "complete",
         ),
         (
             "values = {'x': 1}\nvalues.clear()\nresult = observe(values)",

@@ -132,7 +132,11 @@ impl<'db> MappingContents<'db> {
             let name = Name::new(name);
             let mut items = std::mem::take(&mut self.dictionary.items).into_vec();
             items.retain(|item| item.name != name);
-            if !self.exposed {
+            // A closed inventory already excludes missing names. An open remainder needs an
+            // explicit exclusion so it cannot supply the deleted key.
+            if !self.exposed
+                && matches!(self.dictionary.extra_items, DictionaryExtraItems::Value(_))
+            {
                 items.push(DictionaryItem {
                     name,
                     ty: Type::Never,
