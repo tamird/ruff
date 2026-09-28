@@ -8661,6 +8661,25 @@ def _(closed: Closed, functional: FunctionalClosed, empty: EmptyClosed, key: str
     reveal_type(closed.get(key))  # revealed: str | int | None
     reveal_type(functional.get(key))  # revealed: str | int | None
     reveal_type(empty.get(key))  # revealed: None
+    reveal_type(closed.get(key, False))  # revealed: str | int
+```
+
+A literal key outside the declared schema returns only `None` or the supplied default. This also
+applies to saved method references, and defaults receive context from the expected result type:
+
+```py
+def _(closed: Closed, functional: FunctionalClosed) -> None:
+    reveal_type(closed.get("missing"))  # revealed: None
+    reveal_type(closed.get("missing", False))  # revealed: Literal[False]
+    reveal_type(functional.get("missing", 0))  # revealed: Literal[0]
+
+    get = closed.get
+    reveal_type(get("missing"))  # revealed: None
+    reveal_type(get("missing", False))  # revealed: Literal[False]
+
+    values: list[int] = closed.get("missing", [])
+    reveal_type(values)  # revealed: list[int]
+    wrong: int = closed.get("missing", "wrong")  # error: [invalid-assignment]
 ```
 
 ### `pop` and `setdefault` support literal extra-item keys
