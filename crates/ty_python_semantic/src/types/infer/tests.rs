@@ -2797,6 +2797,9 @@ fn binary_and_augmented_argument_correspondence() -> anyhow::Result<()> {
 
         def ordinary_numeric(value: int) -> int:
             return value + 1
+
+        def generic_union(left: dict, right: dict) -> None:
+            left | right
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -2823,6 +2826,7 @@ fn binary_and_augmented_argument_correspondence() -> anyhow::Result<()> {
         ("ordinary_conditional_known", false),
         ("ordinary_class_valued", true),
         ("ordinary_numeric", false),
+        ("generic_union", false),
     ];
     let signatures = |db: &TestDb| {
         cases.map(|(name, _)| {
