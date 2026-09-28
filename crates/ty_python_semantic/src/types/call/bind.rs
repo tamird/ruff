@@ -8130,6 +8130,12 @@ impl<'db> Binding<'db> {
         }) {
             return false;
         }
+        let pair_is_proved = |actual: Type<'db>, expected: Type<'db>| {
+            (expected.is_fully_static_except_any(db, env)
+                && actual.satisfies_declared_output(db, env, expected))
+                // Subtyping checks every materialization, including the formal's unknown parts.
+                || actual.is_subtype_of(db, env, expected)
+        };
         let complete_inference = match self.inference {
             Some(inference) => {
                 matches!(inference.solutions(db), TypeVarInferenceSolutions::Single)
@@ -8146,8 +8152,7 @@ impl<'db> Binding<'db> {
                             typevar.is_inferable(db, self.inferable_typevars)
                         })
                     })
-                }) && expected.is_fully_static_except_any(db, env)
-                    && actual.satisfies_declared_output(db, env, *expected)
+                }) && pair_is_proved(*actual, *expected)
             });
         }
         let specialization = self.partial_specialization(db, env);
@@ -8166,8 +8171,7 @@ impl<'db> Binding<'db> {
             let expected = specialization.map_or(*expected, |specialization| {
                 expected.apply_specialization(db, specialization)
             });
-            expected.is_fully_static_except_any(db, env)
-                && actual.satisfies_declared_output(db, env, expected)
+            pair_is_proved(*actual, expected)
         });
         direct
             || (capture_supported
@@ -11252,7 +11256,7 @@ mod tests {
     }
 
     #[test]
-    fn argument_correspondence_rejects_unfinished_types() -> anyhow::Result<()> {
+    fn argument_correspondence_preserves_gradual_input_domains() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(
             "/src/a.py",
@@ -11284,6 +11288,10 @@ mod tests {
         );
         let none = Type::none(&db, &env);
         let any = Type::any();
+        let unknown = Type::unknown();
+        let str = KnownClass::Str.to_instance(&db, &env);
+        let optional_unknown = UnionType::from_two_elements(&db, &env, none, unknown);
+        let list = |element| KnownClass::List.to_specialized_instance(&db, &env, &[element]);
         let object = KnownClass::Object.to_instance(&db, &env);
         let provisional = UnionType::from_two_elements(
             &db,
@@ -11329,6 +11337,14 @@ mod tests {
             )
         };
         for (name, actual, expected, proved) in [
+            ("known arm", none, optional_unknown, true),
+            ("other type", str, optional_unknown, false),
+            ("unknown value", unknown, optional_unknown, false),
+            ("Any value", any, optional_unknown, false),
+            ("unknown domain", none, unknown, false),
+            ("invariant", list(none), list(optional_unknown), false),
+            ("broad callback", callable(object), callable(unknown), true),
+            ("narrow callback", callable(str), callable(unknown), false),
             ("explicit Any domain", none, any, true),
             ("explicit Any value", any, any, true),
             ("provisional domain", none, provisional, false),
