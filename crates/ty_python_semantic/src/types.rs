@@ -1,5 +1,5 @@
 use compact_str::{CompactString, ToCompactString};
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use ruff_diagnostics::{Edit, Fix};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -3246,6 +3246,29 @@ impl<'db> Type<'db> {
     /// Returns the exact string value, if this is a string literal type.
     pub fn string_literal_value(self, db: &'db dyn Db) -> Option<&'db str> {
         self.as_string_literal().map(|literal| literal.value(db))
+    }
+
+    /// Given a string literal or a union of string literals, return an iterator over the contained
+    /// strings, or `None` if the type is neither.
+    pub(crate) fn string_literal_values(
+        self,
+        db: &'db dyn Db,
+    ) -> Option<impl Iterator<Item = &'db str> + 'db> {
+        if let Some(literal) = self.as_string_literal() {
+            Some(Either::Left(std::iter::once(literal.value(db))))
+        } else {
+            let elements = self.as_union()?.elements(db);
+            elements
+                .iter()
+                .all(|ty| ty.as_string_literal().is_some())
+                .then(|| {
+                    Either::Right(
+                        elements
+                            .iter()
+                            .filter_map(|ty| ty.as_string_literal().map(|lit| lit.value(db))),
+                    )
+                })
+        }
     }
 
     fn is_int_literal(&self) -> bool {

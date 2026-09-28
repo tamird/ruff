@@ -138,15 +138,10 @@ impl<'db> MappingContents<'db> {
             }
         } else {
             let key = UnionBuilder::new(db, env).add(key).build();
-            let keys = match &key {
-                Type::Union(union) => union.elements(db),
-                ty => std::slice::from_ref(ty),
-            };
-            let items: Option<Box<[_]>> = keys
-                .iter()
-                .map(|key| {
-                    Some(DictionaryItem {
-                        name: Name::new(key.string_literal_value(db)?),
+            if let Some(keys) = key.string_literal_values(db) {
+                let items = keys
+                    .map(|name| DictionaryItem {
+                        name: Name::new(name),
                         ty: value,
                         kind: if self.uses_residual_presence {
                             DictionaryItemKind::Residual
@@ -155,9 +150,7 @@ impl<'db> MappingContents<'db> {
                         },
                         source,
                     })
-                })
-                .collect();
-            if let Some(items) = items {
+                    .collect();
                 let mut result = DictionaryItemsBuilder::default();
                 result.overlay(db, env, self.dictionary.clone());
                 result.overlay(
@@ -181,7 +174,13 @@ impl<'db> MappingContents<'db> {
         }
     }
 
-    fn delete_item(&mut self, db: &'db dyn Db, key: Type<'db>, source: TextRange) {
+    fn delete_item(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        key: Type<'db>,
+        source: TextRange,
+    ) {
         if let Some(name) = key.string_literal_value(db) {
             let name = Name::new(name);
             let mut items = std::mem::take(&mut self.dictionary.items).into_vec();
@@ -200,8 +199,16 @@ impl<'db> MappingContents<'db> {
             }
             self.dictionary.items = items.into_boxed_slice();
         } else {
+            let key = UnionBuilder::new(db, env).add(key).build();
+            let names = key
+                .string_literal_values(db)
+                .map(Iterator::collect::<FxHashSet<_>>);
             for item in &mut self.dictionary.items {
-                if item.kind == DictionaryItemKind::Required {
+                if item.kind == DictionaryItemKind::Required
+                    && names
+                        .as_ref()
+                        .is_none_or(|names| names.contains(item.name.as_str()))
+                {
                     item.kind = DictionaryItemKind::Optional;
                 }
             }
@@ -778,7 +785,7 @@ impl<'db> MappingTransfer<'db> {
                 previous
             }
             Self::Delete { key, source } => {
-                mapping.delete_item(db, key, source);
+                mapping.delete_item(db, env, key, source);
                 previous
             }
             Self::Clear => {
