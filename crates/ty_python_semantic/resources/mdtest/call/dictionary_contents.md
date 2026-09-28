@@ -49,6 +49,80 @@ def augmented_target():
     with_other(**values)  # error: [invalid-argument-type]
 ```
 
+## Finite key writes
+
+A write through a union of literal keys changes only those entries. Each possible new key is
+optional; a previously present key remains present and retains its previous value as a possibility.
+
+```py
+from typing import Any, Literal
+from ty_extensions._internal import Unknown
+
+def consume(value: int, left: None = None, right: None = None): ...
+def finite(key: Literal["left", "right"]):
+    values = {"value": 1}
+    values[key] = None
+    consume(**values)
+
+def overwritten(key: Literal["value", "left"]):
+    values = {"value": 1}
+    values[key] = None
+    consume(**values)  # error: [invalid-argument-type]
+```
+
+Loops may execute zero or multiple writes. Keys outside the finite domain retain their values.
+
+```py
+def loop(keys: list[Literal["left", "right"]]):
+    values = {"value": 1}
+    for key in keys:
+        values[key] = None
+    consume(**values)
+
+def skipped(key: Literal["value", "left"]):
+    values = {"value": 1}
+    if False:
+        values[key] = None
+    consume(**values)
+```
+
+Broad or gradual key domains can overwrite other entries.
+
+```py
+def broad(key: str):
+    values = {"value": 1}
+    values[key] = None
+    consume(**values)  # error: [invalid-argument-type]
+
+def gradual(key: Any):
+    values = {"value": 1}
+    values[key] = None
+    consume(**values)  # error: [invalid-argument-type]
+
+def unresolved(key: Unknown):
+    values = {"value": 1}
+    values[key] = None
+    consume(**values)  # error: [invalid-argument-type]
+```
+
+A deleted key stays absent when every possible write targets another name. Including that key among
+the alternatives makes it possibly present again.
+
+```py
+def deleted(key: Literal["left", "right"]):
+    values = {"value": 1, "left": None}
+    values.pop("left")
+    values[key] = None
+    consume(left=None, **values)  # error: [parameter-already-assigned]
+
+def absent(key: Literal["right", "value"]):
+    values = {"value": 1, "left": None}
+    values.pop("left")
+    values[key] = 2
+    def consume_int(value: int, left: None, right: int = 0): ...
+    consume_int(left=None, **values)
+```
+
 ## Closed TypedDict mutations
 
 A closed `TypedDict` describes every possible key. Removing an optional key lets a caller supply

@@ -22,7 +22,7 @@ use crate::place::loop_header_reachability;
 use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
 use crate::types::infer::{StatementInference, infer_definition_types, infer_statement_types};
 use crate::types::narrow::NarrowingEvaluatorExtension;
-use crate::types::{KnownClass, ProgramEnvironment, Type, UnionType};
+use crate::types::{KnownClass, ProgramEnvironment, Type, UnionBuilder, UnionType};
 use crate::{Db, FxIndexMap};
 
 use super::{
@@ -137,6 +137,40 @@ impl<'db> MappingContents<'db> {
                 self.dictionary.items = items.into_boxed_slice();
             }
         } else {
+            let key = UnionBuilder::new(db, env).add(key).build();
+            let keys = match &key {
+                Type::Union(union) => union.elements(db),
+                ty => std::slice::from_ref(ty),
+            };
+            let items: Option<Box<[_]>> = keys
+                .iter()
+                .map(|key| {
+                    Some(DictionaryItem {
+                        name: Name::new(key.string_literal_value(db)?),
+                        ty: value,
+                        kind: if self.uses_residual_presence {
+                            DictionaryItemKind::Residual
+                        } else {
+                            DictionaryItemKind::Optional
+                        },
+                        source,
+                    })
+                })
+                .collect();
+            if let Some(items) = items {
+                let mut result = DictionaryItemsBuilder::default();
+                result.overlay(db, env, self.dictionary.clone());
+                result.overlay(
+                    db,
+                    env,
+                    DictionaryItems {
+                        items,
+                        extra_items: DictionaryExtraItems::Closed,
+                    },
+                );
+                self.dictionary = result.finish();
+                return;
+            }
             // A computed key can overwrite any named value as well as introduce another name.
             for item in &mut self.dictionary.items {
                 item.ty = UnionType::from_two_elements(db, env, item.ty, value);
