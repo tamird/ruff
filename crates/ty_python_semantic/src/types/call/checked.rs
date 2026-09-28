@@ -65,6 +65,19 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
         (self.expression_type)(expression)
     }
 
+    /// Checks current arguments against one matched signature, including keyword inventories.
+    ///
+    /// Applications establish callable/overload coverage and child evaluation independently.
+    /// Returns false for binding recovery or an implicit receiver.
+    pub fn arguments_satisfy_declared_parameters(&self, db: &'db dyn Db) -> bool {
+        if self.has_binding_errors || self.bound_receiver {
+            return false;
+        }
+        let env = ProgramEnvironment::from_file(self.file);
+        self.binding
+            .arguments_satisfy_declared_parameters(db, &env, self.arguments)
+    }
+
     pub fn argument(&self, name: &str) -> CheckedArgument<'a, 'db> {
         let Some(parameter) = self
             .binding

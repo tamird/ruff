@@ -633,7 +633,8 @@ def overloaded(value: int | str) -> int: return 1
                 .and_then(|function| function.selected_contract_signature(&db));
             assert_eq!(
                 selected.is_some(),
-                mode != FunctionInferenceMode::Default && matches!(name, "plain" | "alias"),
+                mode != FunctionInferenceMode::Default
+                    && matches!(name, "plain" | "defaulted" | "alias"),
                 "{name}: {mode:?}"
             );
         }
@@ -655,7 +656,7 @@ def overloaded(value: int | str) -> int: return 1
     for (source, expected) in [
         (
             source.replace("plain(values: list[Any])", "plain(values: list[Any] = [])"),
-            false,
+            true,
         ),
         (source.to_owned(), true),
         (source.replace("def plain(", "async def plain("), false),
