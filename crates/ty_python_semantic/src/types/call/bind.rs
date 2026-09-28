@@ -8008,7 +8008,7 @@ pub(crate) struct Binding<'db> {
 
 impl<'db> Binding<'db> {
     /// Check one matched signature against arguments that already include any bound receiver.
-    fn arguments_satisfy_declared_parameters(
+    pub(super) fn arguments_satisfy_declared_parameters(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,

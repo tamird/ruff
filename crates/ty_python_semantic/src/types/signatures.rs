@@ -6213,7 +6213,7 @@ impl<'db> Parameter<'db> {
     }
 
     /// Returns whether this parameter has a default without inferring its type.
-    pub(crate) fn has_default(&self) -> bool {
+    pub fn has_default(&self) -> bool {
         self.default().is_some()
     }
 

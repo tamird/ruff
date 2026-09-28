@@ -1309,11 +1309,12 @@ impl<'db> FunctionType<'db> {
     /// Returns the original signature of a function selected for contract validation.
     ///
     /// The function's body scope must use `OutputProof` or `Conservative` inference. This
-    /// admits one unmodified, nongeneric signature with named required parameters and
+    /// admits one unmodified, nongeneric signature with named parameters and
     /// known types. Async, generator, overloaded and narrowing-predicate functions are
     /// excluded. At call sites using the conservative contract, applications must compare
     /// ordinary arguments with these raw parameter types using [`Type::satisfies_declared_output`]
-    /// and account for every selected body's checking, suppression and file obligations.
+    /// and account for every selected body's and default's checking, suppression and file
+    /// obligations.
     /// This accessor identifies a modular declaration assumption.
     pub fn selected_contract_signature(self, db: &'db dyn Db) -> Option<&'db Signature<'db>> {
         #[salsa::tracked(returns(copy))]
@@ -1354,7 +1355,6 @@ impl<'db> FunctionType<'db> {
             || !signature.parameters().is_standard()
             || signature.parameters().iter().any(|parameter| {
                 parameter.name().is_none()
-                    || parameter.has_default()
                     || parameter.is_variadic()
                     || parameter.is_keyword_variadic()
             })
