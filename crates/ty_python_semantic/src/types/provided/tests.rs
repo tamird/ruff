@@ -942,11 +942,11 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         ),
         (
             "values = {'x': 1}\nalias = values\nalias['y'] = 2\nresult = observe(alias)",
-            "extra: Unknown; x~: Literal[1] at 'x'; y~: Literal[2] at 'y'",
+            "extra: Unknown; y~: Literal[2] at 'y'",
         ),
         (
             "def consume(value: object) -> None: pass\nvalues = {'x': 1}\nconsume(values)\nresult = observe(values | {'y': 2})",
-            "extra: Unknown; x~: Literal[1] at 'x'; y: Literal[2] at 'y'",
+            "extra: Unknown; y: Literal[2] at 'y'",
         ),
         (
             "from typing import Any\ndef unknown() -> Any: ...\nresult = observe({'x': 1} | unknown())",
@@ -966,7 +966,7 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         ),
         (
             "copy = dict\nvalues = copy(x=1)\nobserve(values)\ncopied = copy(values, y=2)\nresult = observe(value=copied)",
-            "extra: Unknown; x~: Literal[1] at x; y: Literal[2] at y",
+            "extra: Unknown; y: Literal[2] at y",
         ),
         (
             "values = {'x': 1}\nvalues['x'] = 'new'\nresult = observe(value=values)",
@@ -994,7 +994,7 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         ),
         (
             "values = {}\nvalues['inner'] = {'x': 1}\nvalues['inner']['y'] = 2\nresult = observe(values['inner'])",
-            "extra: int; x~: Literal[1] at 'x'; y~: Literal[2] at 'y'",
+            "extra: int; y~: Literal[2] at 'y'",
         ),
         (
             "values = {'x': 1}\nresult = observe({**values})",

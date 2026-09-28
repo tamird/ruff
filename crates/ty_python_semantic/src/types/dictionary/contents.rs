@@ -14,6 +14,7 @@ use ty_python_core::definition::{
 use ty_python_core::place::ScopedPlaceId;
 use ty_python_core::place::{PlaceExpr, PlaceTable};
 use ty_python_core::scope::{FileScopeId, ScopeId};
+use ty_python_core::symbol::Symbol;
 use ty_python_core::{
     BindingWithConstraintsIterator, NarrowingEvaluator, ProgramFile, Statement, semantic_index,
 };
@@ -84,6 +85,12 @@ impl<'db> MappingContents<'db> {
     }
 
     fn expose(&mut self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) {
+        self.dictionary.items = Box::default();
+        self.generalize_presence(db, env);
+    }
+
+    /// Retain observed values without treating ordinary dictionary entries as supplied keys.
+    fn generalize_presence(&mut self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) {
         if let Some(MappingBound { ty, source }) = self.bound
             && is_closed_typed_dict(db, ty)
             && let Some(dictionary) = DictionaryItems::unpacked(db, env, ty, source)
@@ -705,7 +712,16 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         }
     }
     if bounded || shared || value.is_some_and(|value| PlaceExpr::try_from_expr(value).is_some()) {
-        mapping.expose(db, &env);
+        if mapping.builtin
+            && place.as_symbol().is_some_and(Symbol::is_local)
+            && !shared
+            && value.is_some_and(|value| PlaceExpr::try_from_expr(value).is_none())
+        {
+            // A declared local allocation has a lasting bound, but no external mutation yet.
+            mapping.generalize_presence(db, &env);
+        } else {
+            mapping.expose(db, &env);
+        }
     }
     ContentsValue::Mapping(mapping)
 }
@@ -807,8 +823,10 @@ impl<'db> MappingTransfer<'db> {
                 result.overlay(db, env, mapping.dictionary.clone());
                 result.overlay(db, env, dictionary);
                 mapping.dictionary = result.finish();
-                if mapping.uses_residual_presence || retained {
+                if retained {
                     mapping.expose(db, env);
+                } else if mapping.uses_residual_presence {
+                    mapping.generalize_presence(db, env);
                 }
                 previous
             }
