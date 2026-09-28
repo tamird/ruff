@@ -463,7 +463,7 @@ pub(crate) enum CallErrorKind {
 }
 
 #[derive(Debug)]
-pub(super) enum CallDunderError<'db> {
+pub(crate) enum CallDunderError<'db> {
     /// The dunder attribute exists but it can't be called with the given arguments.
     ///
     /// This includes non-callable dunder attributes that are possibly unbound.

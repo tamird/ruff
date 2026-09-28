@@ -285,6 +285,69 @@ for _ in b"":
 reveal_type(value)  # revealed: Literal[1]
 ```
 
+## With empty iterable types
+
+An iterable whose successful iteration produces `Never` cannot execute the loop body. The iterable
+expression is still evaluated, and the `else` clause runs with the bindings from before the loop.
+
+```py
+from typing import Iterator, Literal
+from typing_extensions import Never
+
+def empty_tuple(values: tuple[()]):
+    for item in values:
+        len(0)
+    item  # error: [unresolved-reference]
+
+def empty_list(values: list[Never]):
+    value = "before"
+    for item in values:
+        len(0)
+        value = "body"
+        break
+    else:
+        reveal_type(value)  # revealed: Literal["before"]
+        value = "else"
+    reveal_type(value)  # revealed: Literal["else"]
+
+def make_empty(value: int) -> list[Never]:
+    return []
+
+def evaluate_iterable():
+    for item in make_empty("bad"):  # error: [invalid-argument-type]
+        len(0)
+
+def iteration_can_raise(values: list[Never]):
+    value = "before"
+    try:
+        for item in values:
+            value = "body"
+    except Exception:
+        reveal_type(value)  # revealed: Literal["before"]
+```
+
+Failed iteration does not establish emptiness, even if its recovery element type is `Never`.
+Truthiness also does not determine whether iteration produces elements.
+
+```py
+class InvalidIterable:
+    def __iter__(self, required: int) -> Iterator[Never]:
+        return iter(())
+
+class FalsyIterable:
+    def __bool__(self) -> Literal[False]:
+        return False
+
+    def __iter__(self) -> Iterator[int]:
+        return iter([1])
+
+def uncertain(invalid: InvalidIterable, falsy: FalsyIterable):
+    for item in invalid:  # error: [not-iterable]
+        len(0)  # error: [invalid-argument-type]
+    for item in falsy:
+        len(0)  # error: [invalid-argument-type]
+```
+
 ## With `else` clauses and statically known literal emptiness
 
 ```py
