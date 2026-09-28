@@ -9471,36 +9471,64 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     parameter
                 }
             });
-            let keyword_variadic = kwarg.as_ref().map(|param| {
-                let parameter = Parameter::keyword_variadic(param.name().id.clone())
-                    .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter));
-                if let Some(parameters) = contextual_parameters
-                    && parameters.is_standard()
-                    && let Some((_, context)) = parameters.keyword_variadic()
-                    && parameters
-                        .iter()
-                        .filter_map(Parameter::keyword_name)
-                        .all(|name| {
-                            args.iter()
-                                .chain(kwonlyargs)
-                                .any(|parameter| parameter.name().as_str() == name.as_str())
-                        })
-                {
-                    // Explicit keyword inputs can have different types from the homogeneous
-                    // remainder. Only parameters that accept keywords consume those inputs.
-                    parameter
-                        .with_annotated_type(contextual_parameter_type(context.annotated_type()))
-                } else {
-                    parameter
-                }
-            });
-
-            let parameters = positional_only
+            let mut parameters = positional_only
                 .into_iter()
                 .chain(positional_or_keyword)
                 .chain(variadic)
                 .chain(keyword_only)
-                .chain(keyword_variadic);
+                .collect::<Vec<_>>();
+            if let Some(kwarg) = kwarg {
+                let source_index = parameters.len();
+                let consumes_keyword = |name: &str| {
+                    args.iter()
+                        .chain(kwonlyargs)
+                        .any(|parameter| parameter.name().as_str() == name)
+                };
+                if let Some(context) = contextual_parameters
+                    && context.is_standard()
+                    && context.iter().all(|parameter| {
+                        parameter.keyword_name().is_none_or(|name| {
+                            consumes_keyword(name.as_str()) || parameter.is_keyword_only()
+                        })
+                    })
+                {
+                    // Remaining keyword-only inputs belong to this source kwargs parameter.
+                    // An unconsumed positional-or-keyword input can arrive through *args,
+                    // so it cannot establish a required key in the body dictionary.
+                    parameters.extend(
+                        context
+                            .iter()
+                            .filter(|parameter| {
+                                parameter
+                                    .keyword_name()
+                                    .is_some_and(|name| !consumes_keyword(name.as_str()))
+                            })
+                            .map(|parameter| {
+                                parameter
+                                    .clone()
+                                    .with_annotated_type(contextual_parameter_type(
+                                        parameter.annotated_type(),
+                                    ))
+                                    .with_source_parameter_index(Some(source_index))
+                            }),
+                    );
+                    if let Some((_, parameter)) = context.keyword_variadic() {
+                        parameters.push(
+                            Parameter::keyword_variadic(kwarg.name().id.clone())
+                                .with_annotated_type(contextual_parameter_type(
+                                    parameter.annotated_type(),
+                                ))
+                                .with_source_parameter_index(Some(source_index)),
+                        );
+                    }
+                } else {
+                    parameters.push(
+                        Parameter::keyword_variadic(kwarg.name().id.clone())
+                            .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
+                            .with_source_parameter_index(Some(source_index)),
+                    );
+                }
+            }
 
             Parameters::from_annotation(db, parameters)
         } else {

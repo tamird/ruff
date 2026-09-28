@@ -632,7 +632,7 @@ impl<'db> TypedDictType<'db> {
     }
 
     /// Creates a synthesized schema while preserving its undeclared-item policy.
-    fn from_schema_items_with_openness(
+    pub(super) fn from_schema_items_with_openness(
         db: &'db dyn Db,
         items: TypedDictSchema<'db>,
         openness: TypedDictOpenness<'db>,
