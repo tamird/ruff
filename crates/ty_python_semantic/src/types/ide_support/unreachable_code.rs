@@ -484,10 +484,12 @@ mod tests {
 
         assert_snapshot!(UnreachableTest::new().render(source)?, @r#"
         info[unreachable-code]: Code is always unreachable
-         --> src/main.py:5:5
+         --> src/main.py:4:6
           |
-        5 |     print("dead")
-          |     ^^^^^^^^^^^^^
+        4 |   elif False:
+          |  ______^
+        5 | |     print("dead")
+          | |_________________^
         "#);
         Ok(())
     }

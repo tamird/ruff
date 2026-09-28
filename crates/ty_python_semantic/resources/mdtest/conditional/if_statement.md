@@ -162,3 +162,31 @@ if NotBoolable():
 elif NotBoolable():
     pass
 ```
+
+## Elif conditions use the preceding branch reachability
+
+A later condition runs only after all preceding conditions were false. Its own truth value does not
+skip evaluation of that condition.
+
+```py
+from typing import Literal
+
+def invalid(value: str) -> Literal[False]:
+    return False
+
+def skipped(value: None):
+    if not value:  # error: [redundant-condition]
+        pass
+    elif invalid(1):
+        pass
+    elif invalid(2):
+        pass
+
+def evaluated():
+    if False:
+        pass
+    elif invalid(1):  # error: [invalid-argument-type]
+        pass
+    elif invalid(2):  # error: [invalid-argument-type]
+        pass
+```

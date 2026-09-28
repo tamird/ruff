@@ -5129,6 +5129,13 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                             self.current_use_def_map_mut()
                                 .set_if_chain_start(chain_start.take());
                         }
+                        // This test runs only after the preceding clauses were false. Its own
+                        // predicate does not constrain evaluation of the test itself.
+                        let in_type_checking_block =
+                            is_outer_block_in_type_checking || is_in_not_type_checking_chain;
+                        self.in_type_checking_block = in_type_checking_block;
+                        self.current_use_def_map_mut()
+                            .record_range_reachability(elif_test.range(), in_type_checking_block);
                         self.visit_condition(elif_test);
                         self.current_use_def_map_mut().set_if_chain_start(None);
                         // A test expression is evaluated whether the branch is taken or not
