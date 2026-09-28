@@ -2016,6 +2016,44 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
             values[key] = None
             finite_consume(**values)
 
+        def finite_delete(key: Literal["left", "right"]) -> None:
+            values = {"value": 1, "left": None, "right": None}
+            del values[key]
+            finite_consume(**values)
+
+        def finite_delete_target(key: Literal["value", "left"]) -> None:
+            values = {"value": 1, "left": None, "right": None}
+            del values[key]
+            finite_consume(**values)
+
+        def finite_delete_loop(keys: list[Literal["left", "right"]]) -> None:
+            values = {"value": 1, "left": None, "right": None}
+            for key in keys:
+                if key in values:
+                    del values[key]
+            finite_consume(**values)
+
+        def finite_delete_broad(key: str) -> None:
+            values = {"value": 1, "left": None, "right": None}
+            del values[key]
+            finite_consume(**values)
+
+        def finite_delete_exposed(key: Literal["left", "right"], mutate: Callable[[object], None]) -> None:
+            values = {"value": 1, "left": None, "right": None}
+            mutate(values)
+            del values[key]
+            finite_consume(**values)
+
+        class FiniteValues(TypedDict, closed=True):
+            value: int
+            left: NotRequired[None]
+            right: NotRequired[None]
+
+        def finite_delete_typed(values: FiniteValues, key: Literal["left", "right"]) -> None:
+            if key in values:
+                del values[key]
+            finite_consume(**values)
+
         def popped() -> None:
             values = {"value": 1, "removed": 0}
             values.pop("removed")
@@ -2069,6 +2107,12 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         ("finite_write_required", true),
         ("finite_write_present", false),
         ("finite_write_exposed", true),
+        ("finite_delete", false),
+        ("finite_delete_target", true),
+        ("finite_delete_loop", false),
+        ("finite_delete_broad", true),
+        ("finite_delete_exposed", true),
+        ("finite_delete_typed", false),
         ("typed_popped", false),
         ("typed_merged", false),
         ("typed_filtered", false),
