@@ -710,6 +710,12 @@ def tail(head: int, *args: Unpack[Ts]) -> tuple[Unpack[Ts]]:
 
 reveal_type(tail(*[1, "two", b"three"]))  # revealed: tuple[Literal["two"], Literal[b"three"]]
 reveal_type(tail(*[1]))  # revealed: tuple[()]
+reveal_type(tail(*(1, "two", b"three")))  # revealed: tuple[Literal["two"], Literal[b"three"]]
+reveal_type(tail(*(1, *("two", b"three"))))  # revealed: tuple[Literal["two"], Literal[b"three"]]
+reveal_type(tail(*(1,)))  # revealed: tuple[()]
+
+args = (1, "two", b"three")
+reveal_type(tail(*args))  # revealed: tuple[Literal["two"], Literal[b"three"]]
 ```
 
 ### Partials with bound variadic arguments
