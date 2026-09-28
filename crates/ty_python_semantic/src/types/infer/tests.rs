@@ -6,7 +6,9 @@ use crate::db::tests::{TestDb, TestDbBuilder, setup_db};
 use crate::lint::{LintSource, RuleSelection};
 use crate::place::symbol;
 use crate::place::{ConsideredDefinitions, Place, PlaceAndQualifiers};
-use crate::types::{KnownClass, KnownInstanceType, check_types};
+use crate::types::{
+    DynamicType, KnownClass, KnownInstanceType, MemberLookupPolicy, RecursiveType, check_types,
+};
 use crate::{FunctionInferenceMode, HasType};
 use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
@@ -3531,6 +3533,9 @@ fn descriptor_argument_correspondence() -> anyhow::Result<()> {
         from __future__ import annotations
         from typing import Any, Callable, Literal
         from ty_extensions import Intersection
+        from ty_extensions._internal import Unknown
+
+        Recursive = list["Recursive"]
 
         class Descriptor:
             def __get__(self, instance: Box[Callable[[Any], None]], owner: object = None) -> dict[str, Any]: return {}
@@ -3561,6 +3566,21 @@ fn descriptor_argument_correspondence() -> anyhow::Result<()> {
             __contains__ = MethodDescriptor()
 
         class Missing: pass
+
+        class DeclaredDynamic:
+            __slots__ = ("any_field", "unknown_field")
+            any_field: Any
+            unknown_field: Unknown
+
+        def dynamic_member(value: Any) -> None: value.missing
+        def unknown_member(value: Unknown) -> None: value.missing
+        def declared_any_member(value: DeclaredDynamic) -> None: value.any_field
+        def declared_unknown_member(value: DeclaredDynamic) -> None: value.unknown_field
+        def dynamic_member_union(value: KnownBox[Callable[[str], None]] | Any) -> None: value.field
+        def dynamic_getattr(value: Any) -> None: getattr(value, "missing")
+        def skipped_dynamic_member(value: Any) -> None:
+            if False:
+                value.missing
 
         def custom(value: Box[Callable[[str], None]]) -> None: value.field
         def shadowed(value: Box[Callable[[str], None]]) -> None:
@@ -3604,7 +3624,76 @@ fn descriptor_argument_correspondence() -> anyhow::Result<()> {
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
+    let env = db.program_environment();
+    let recursive = RecursiveType::initial(
+        &db,
+        first_public_binding(&db, file, "Recursive"),
+        salsa::plumbing::Id::from_bits(2),
+        None,
+    );
+    assert!(
+        recursive.unfold(&db, &env).into_unfolded().is_none(),
+        "the recursive seed must not establish a member domain",
+    );
+    for (receiver, name, inputs_proved) in [
+        (
+            Type::divergent(salsa::plumbing::Id::from_bits(1)),
+            "field",
+            false,
+        ),
+        (Type::Never, "field", true),
+        (Type::Recursive(recursive), "field", false),
+        (Type::any(), "__class__", true),
+        (Type::unknown(), "__class__", true),
+        (Type::Never, "__class__", true),
+        (
+            Type::Dynamic(DynamicType::UnspecializedTypeVar),
+            "__class__",
+            false,
+        ),
+        (
+            Type::divergent(salsa::plumbing::Id::from_bits(1)),
+            "__class__",
+            false,
+        ),
+    ] {
+        let ordinary = receiver
+            .member_lookup_with_policy_and_receiver(
+                &db,
+                &env,
+                name,
+                MemberLookupPolicy::RUNTIME_ATTRIBUTE,
+                None,
+            )
+            .unwrap();
+        let checked = receiver
+            .member_lookup_with_policy_and_receiver(
+                &db,
+                &env,
+                name,
+                MemberLookupPolicy::RUNTIME_ATTRIBUTE | MemberLookupPolicy::PROVE_GETTER_INPUTS,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            checked.member(&db),
+            ordinary.member(&db),
+            "{receiver:?}.{name}"
+        );
+        assert_eq!(
+            checked.inputs_proved(&db),
+            inputs_proved,
+            "{receiver:?}.{name}"
+        );
+    }
     let cases = [
+        ("dynamic_member", true),
+        ("unknown_member", true),
+        ("declared_any_member", false),
+        ("declared_unknown_member", false),
+        ("dynamic_member_union", true),
+        ("dynamic_getattr", true),
+        ("skipped_dynamic_member", false),
         ("custom", true),
         ("known_custom", false),
         // Observed storage refines the ordinary type but does not discharge getter proof.
