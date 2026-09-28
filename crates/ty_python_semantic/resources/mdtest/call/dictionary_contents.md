@@ -553,6 +553,86 @@ enclosing_class()
 empty(**fallback)
 ```
 
+## Comprehensions without reachable mutations
+
+A filtered-out dictionary operation does not invalidate an earlier deletion. Filters are evaluated
+before their bodies, so a mutation in a filter still changes the captured dictionary.
+
+```py
+from typing import Callable
+from typing_extensions import NotRequired, TypedDict
+
+class Values(TypedDict, closed=True):
+    value: int
+    note: NotRequired[str]
+
+def consume(value: int, note: str = ""): ...
+def mutate(update: Callable[..., None]) -> None:
+    update(note="again")
+
+def filtered(values: Values):
+    values.pop("note", None)
+    removed = {key: values.pop(key) for key in ("absent",) if key in values}
+    consume(note="replacement", **values)
+    consume(note="replacement", **(values | removed))
+
+def filter_mutates(values: Values):
+    values.pop("note", None)
+    [values.pop("absent", None) for _ in [0] if values.update(note="again") is not None]
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def unknown_method(values: Values):
+    values.pop("note", None)
+    [values.pop("absent", None) for _ in [0] if values.__setitem__("note", "again") is not None]
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def forwarded_method(values: Values):
+    values.pop("note", None)
+    [values.pop("absent", None) for _ in [0] if mutate(values.update) is not None]
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def projected_method(values: Values):
+    values.pop("note", None)
+    [values.pop("absent", None) for _ in [0] if [values.update][0](note="again") is not None]
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+```
+
+A live result can retain the dictionary or one of its bound methods even when a mutation elsewhere
+in the comprehension is unreachable. Assignment expressions can also publish a captured value.
+
+```py
+def retained(values: Values):
+    values.pop("note", None)
+    saved = [values if True else values.pop("absent", None) for _ in [0]]
+    saved[0]["note"] = "again"
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def retained_method(values: Values):
+    values.pop("note", None)
+    saved = [values.update if True else values.pop("absent", None) for _ in [0]]
+    saved[0](note="again")
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def retained_container(values: Values):
+    values.pop("note", None)
+    saved = [{"nested": values} if True else values.pop("absent", None) for _ in [0]]
+    saved[0]["nested"]["note"] = "again"
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def assigned_alias(values: Values):
+    values.pop("note", None)
+    alias: Values = {"value": 0}
+    [0 for _ in [0] if (alias := values) is not None if False if values.pop("absent", None)]
+    alias["note"] = "again"
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def deferred(values: Values):
+    values.pop("note", None)
+    pending = (values.update(note="again") for _ in [0])
+    next(pending)
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+```
+
 ## Failed stores and exposure of absent keys
 
 An exception during a store preserves the preceding state. Exposure removes absence evidence,

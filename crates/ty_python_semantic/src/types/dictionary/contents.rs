@@ -13,7 +13,7 @@ use ty_python_core::definition::{
 };
 use ty_python_core::place::ScopedPlaceId;
 use ty_python_core::place::{PlaceExpr, PlaceTable};
-use ty_python_core::scope::ScopeId;
+use ty_python_core::scope::{FileScopeId, ScopeId};
 use ty_python_core::{
     BindingWithConstraintsIterator, NarrowingEvaluator, ProgramFile, Statement, semantic_index,
 };
@@ -476,7 +476,9 @@ fn definition_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Con
                     },
                     NestedBindingExecution::Eager => {
                         let mut result = previous();
-                        if let ContentsValue::Mapping(mapping) = &mut result.value {
+                        if let ContentsValue::Mapping(mapping) = &mut result.value
+                            && !capture_has_no_reachable_effects(db, definition, *nested_scope)
+                        {
                             mapping.expose(db, &env);
                         }
                         result
@@ -486,6 +488,41 @@ fn definition_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Con
         },
         _ => Contents::new(ContentsValue::Unavailable),
     }
+}
+
+fn capture_has_no_reachable_effects<'db>(
+    db: &'db dyn Db,
+    capture: Definition<'db>,
+    nested_scope: FileScopeId,
+) -> bool {
+    let scope = capture.scope(db);
+    let file = scope.program_file(db);
+    let index = semantic_index(db, file);
+    let place = index
+        .place_table(scope.file_scope_id(db))
+        .place(capture.place(db));
+    let Some(place) = index.place_table(nested_scope).place_id(place) else {
+        return false;
+    };
+    let scope = nested_scope.to_scope_id(db, file);
+    let use_def = index.use_def_map(nested_scope);
+    let reachability = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
+    // This inventory retains earlier operations even when a later binding shadows them.
+    let mut bindings = use_def.reachable_bindings(place);
+    // A captured place has no local value at scope entry; this is not an inferred empty map.
+    if bindings.next().map(|binding| binding.binding) != Some(DefinitionState::Undefined) {
+        return false;
+    }
+    bindings.all(|binding| {
+        evaluate_reachability_with_cache(
+            db,
+            Some(&reachability),
+            use_def.reachability_constraints(),
+            use_def.predicates(),
+            binding.reachability_constraint,
+        )
+        .is_always_false()
+    })
 }
 
 /// Seed the contents graph from the same binding that owns ordinary value inference.
