@@ -3679,6 +3679,69 @@ def header() -> Callable[[str], str]:
     return callback
 ```
 
+## Returned callbacks registered through different call forms
+
+A fixed callback contract separates the local return context from the syntax of the registration
+call. Named parameters and unpacked keyword parameters use the same field domain.
+
+```py
+from typing import Protocol
+from typing_extensions import TypedDict, Unpack
+
+class FactoryFields(TypedDict, closed=True):
+    srcs: list[str]
+
+class FactoryCallback(Protocol):
+    def __call__(self, *, name: str, **kwargs: Unpack[FactoryFields]) -> None: ...
+
+def register_callback(*, implementation: FactoryCallback) -> None: ...
+def observe_fields(name: str, srcs: list[str]) -> None: ...
+
+class Registry:
+    @staticmethod
+    def register(*, implementation: FactoryCallback) -> None: ...
+
+def direct_named() -> FactoryCallback:
+    callback = lambda *, name, srcs: observe_fields(
+        reveal_type(name),  # revealed: str
+        reveal_type(srcs),  # revealed: list[str]
+    )
+    register_callback(implementation=callback)
+    return callback
+
+def direct_kwargs() -> FactoryCallback:
+    callback = lambda *, name, **kwargs: observe_fields(
+        reveal_type(name),  # revealed: str
+        reveal_type(kwargs["srcs"]),  # revealed: list[str]
+    )
+    register_callback(implementation=callback)
+    return callback
+
+def attribute_named() -> FactoryCallback:
+    callback = lambda *, name, srcs: observe_fields(
+        reveal_type(name),  # revealed: Unknown
+        reveal_type(srcs),  # revealed: Unknown
+    )
+    Registry.register(implementation=callback)
+    return callback
+
+def attribute_kwargs() -> FactoryCallback:
+    callback = lambda *, name, **kwargs: observe_fields(
+        reveal_type(name),  # revealed: Unknown
+        reveal_type(kwargs["srcs"]),  # revealed: Unknown
+    )
+    Registry.register(implementation=callback)
+    return callback
+
+def without_return_context():
+    callback = lambda *, name, **kwargs: observe_fields(
+        reveal_type(name),  # revealed: Unknown
+        reveal_type(kwargs["srcs"]),  # revealed: Unknown
+    )
+    register_callback(implementation=callback)
+    return callback
+```
+
 ## Returned callbacks with additional call surfaces
 
 An earlier call prevents contextualizing the shared initializer. In particular, returning a
