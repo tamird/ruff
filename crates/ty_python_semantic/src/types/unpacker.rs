@@ -22,6 +22,7 @@ use crate::types::{
     KnownClass, Type, TypeCheckDiagnostics, TypeContext, UnionBuilder, UnionType,
     infer_expression_types,
 };
+use ty_python_core::EvaluationMode;
 use ty_python_core::ExpressionNodeKey;
 use ty_python_core::ProgramFile;
 use ty_python_core::scope::ScopeId;
@@ -137,7 +138,7 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             }
             UnpackKind::Iterable { mode } => {
                 let env = self.context.program_environment();
-                match value_type.try_iterate_with_mode(db, env, mode) {
+                match value_type.try_iterate_with_context(&self.context, value_expr, mode) {
                     Ok(tuple) => {
                         let element = tuple.homogeneous_element_type(db, env);
                         refine_dict_snapshot_element_type(
@@ -300,11 +301,13 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             unpack_types
                 .iter()
                 .map(|ty| {
-                    let tuple = ty.try_iterate(db, env).unwrap_or_else(|err| {
-                        complete = false;
-                        err.report_diagnostic(&self.context, *ty, value_expr);
-                        Cow::Owned(TupleSpec::homogeneous(err.fallback_element_type(db, env)))
-                    });
+                    let tuple = ty
+                        .try_iterate_with_context(&self.context, value_expr, EvaluationMode::Sync)
+                        .unwrap_or_else(|err| {
+                            complete = false;
+                            err.report_diagnostic(&self.context, *ty, value_expr);
+                            Cow::Owned(TupleSpec::homogeneous(err.fallback_element_type(db, env)))
+                        });
                     sequence_from_type(db, &tuple)
                 })
                 .collect()
