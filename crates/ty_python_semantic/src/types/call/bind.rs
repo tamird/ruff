@@ -5449,7 +5449,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument: Argument<'a>,
         argument_type: Option<Type<'db>>,
     ) -> Result<(), ()> {
-        enum VariadicArgumentType<'db> {
+        enum VariadicArgumentType<'a, 'db> {
             ParamSpec(Type<'db>),
             /// A union type where each element has been individually iterated into a tuple spec.
             /// We pre-compute the per-position union types, length bounds, and variable element
@@ -5459,141 +5459,137 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 length: TupleLength,
                 variable_element: Option<Type<'db>>,
             },
-            Other {
-                argument_types: Vec<Type<'db>>,
-                length: TupleLength,
-                variable_element: Option<Type<'db>>,
-            },
+            Other(Cow<'a, TupleSpec<'db>>),
             None,
         }
 
-        if let Some(KnownUnpacking::Positional(types)) =
-            self.arguments.known_unpacking(argument_index)
+        let variadic_type = if let Some(tuple) =
+            self.arguments
+                .positional_shape(db, env, argument_index, None)
         {
-            for ty in types {
-                self.match_positional(argument_index, argument, Some(*ty), false)?;
-            }
-            return Ok(());
-        }
-
-        let variadic_type = match argument_type {
-            Some(argument_type) => match argument_type.as_paramspec_typevar(db) {
-                // If the argument is a `ParamSpec` `P.args`, we should not call `iterate` on it.
-                // This would lose the `ParamSpec` information and just flatten to `object` from
-                // the upper bound. What we want is to always use the `P.args` type to perform type
-                // checking against the parameter type. This will allow us to error when `*args:
-                // P.args` is matched against, for example, `n: int` and correctly type check when
-                // `*args: P.args` is matched against `*args: P.args` (another `ParamSpec`).
-                Some(paramspec) => VariadicArgumentType::ParamSpec(paramspec),
-                None => match argument_type {
-                    // `Type::iterate` unions tuple specs in a way that can invent additional
-                    // arities. Iterate each union element individually and compute per-position
-                    // union types, length bounds, and variable element so that the rest of the
-                    // matching logic handles unions correctly.
-                    //
-                    // The per-position union loses the correlation between tuple length and the
-                    // later element types. `match_variadic` accounts for that by treating
-                    // positions beyond the guaranteed minimum as only conditionally present: they
-                    // can satisfy optional parameters, but any required positional parameter
-                    // beyond the minimum still causes the match to fail provisionally. This is
-                    // only sound when no later argument can still contribute more positional
-                    // slots; otherwise, a later positional argument could shift left differently
-                    // for different union members.
-                    Type::Union(union)
-                        if self.parameters.variadic().is_none()
-                            && !self.has_later_positional_input(argument_index) =>
-                    {
-                        let tuple_specs: Vec<_> = union
-                            .elements(db)
-                            .iter()
-                            .map(|ty| ty.iterate(db, env))
-                            .collect();
-
-                        let min_len = tuple_specs
-                            .iter()
-                            .map(|s| s.len().minimum())
-                            .min()
-                            .unwrap_or(0);
-
-                        let any_variable = tuple_specs.iter().any(|s| s.len().is_variable());
-                        let max_elements = tuple_specs
-                            .iter()
-                            .map(|s| s.iter_element_types(db).count())
-                            .max()
-                            .unwrap_or(0);
-
-                        let variable_element = {
-                            let var_types: Vec<_> = tuple_specs
+            VariadicArgumentType::Other(tuple)
+        } else {
+            match argument_type {
+                Some(argument_type) => match argument_type.as_paramspec_typevar(db) {
+                    // If the argument is a `ParamSpec` `P.args`, we should not call `iterate` on it.
+                    // This would lose the `ParamSpec` information and just flatten to `object` from
+                    // the upper bound. What we want is to always use the `P.args` type to perform type
+                    // checking against the parameter type. This will allow us to error when `*args:
+                    // P.args` is matched against, for example, `n: int` and correctly type check when
+                    // `*args: P.args` is matched against `*args: P.args` (another `ParamSpec`).
+                    Some(paramspec) => VariadicArgumentType::ParamSpec(paramspec),
+                    None => match argument_type {
+                        // `Type::iterate` unions tuple specs in a way that can invent additional
+                        // arities. Iterate each union element individually and compute per-position
+                        // union types, length bounds, and variable element so that the rest of the
+                        // matching logic handles unions correctly.
+                        //
+                        // The per-position union loses the correlation between tuple length and the
+                        // later element types. `match_variadic` accounts for that by treating
+                        // positions beyond the guaranteed minimum as only conditionally present: they
+                        // can satisfy optional parameters, but any required positional parameter
+                        // beyond the minimum still causes the match to fail provisionally. This is
+                        // only sound when no later argument can still contribute more positional
+                        // slots; otherwise, a later positional argument could shift left differently
+                        // for different union members.
+                        Type::Union(union)
+                            if self.parameters.variadic().is_none()
+                                && !self.has_later_positional_input(argument_index) =>
+                        {
+                            let tuple_specs: Vec<_> = union
+                                .elements(db)
                                 .iter()
-                                .filter_map(|s| s.variable_element_type(db))
+                                .map(|ty| ty.iterate(db, env))
                                 .collect();
-                            if var_types.is_empty() {
-                                None
+
+                            let min_len = tuple_specs
+                                .iter()
+                                .map(|s| s.len().minimum())
+                                .min()
+                                .unwrap_or(0);
+
+                            let any_variable = tuple_specs.iter().any(|s| s.len().is_variable());
+                            let max_elements = tuple_specs
+                                .iter()
+                                .map(|s| s.iter_element_types(db).count())
+                                .max()
+                                .unwrap_or(0);
+
+                            let variable_element = {
+                                let var_types: Vec<_> = tuple_specs
+                                    .iter()
+                                    .filter_map(|s| s.variable_element_type(db))
+                                    .collect();
+                                if var_types.is_empty() {
+                                    None
+                                } else {
+                                    Some(UnionType::from_elements_leave_aliases(db, env, var_types))
+                                }
+                            };
+
+                            let max_elements = i32::try_from(max_elements).unwrap_or(i32::MAX);
+                            let mut argument_types_vec = Vec::new();
+                            for index in 0..max_elements {
+                                let positional_types: Vec<_> = tuple_specs
+                                    .iter()
+                                    .filter_map(|s| s.py_index(db, env, index).ok())
+                                    .collect();
+                                if positional_types.is_empty() {
+                                    break;
+                                }
+                                argument_types_vec.push(UnionType::from_elements_leave_aliases(
+                                    db,
+                                    env,
+                                    positional_types,
+                                ));
+                            }
+
+                            let length = if any_variable || argument_types_vec.len() > min_len {
+                                TupleLength::Variable(min_len, 0)
                             } else {
-                                Some(UnionType::from_elements_leave_aliases(db, env, var_types))
+                                TupleLength::Fixed(min_len)
+                            };
+
+                            VariadicArgumentType::Union {
+                                argument_types: argument_types_vec,
+                                length,
+                                variable_element,
                             }
-                        };
-
-                        let max_elements = i32::try_from(max_elements).unwrap_or(i32::MAX);
-                        let mut argument_types_vec = Vec::new();
-                        for index in 0..max_elements {
-                            let positional_types: Vec<_> = tuple_specs
-                                .iter()
-                                .filter_map(|s| s.py_index(db, env, index).ok())
-                                .collect();
-                            if positional_types.is_empty() {
-                                break;
-                            }
-                            argument_types_vec.push(UnionType::from_elements_leave_aliases(
-                                db,
-                                env,
-                                positional_types,
-                            ));
                         }
-
-                        let length = if any_variable || argument_types_vec.len() > min_len {
-                            TupleLength::Variable(min_len, 0)
-                        } else {
-                            TupleLength::Fixed(min_len)
-                        };
-
-                        VariadicArgumentType::Union {
-                            argument_types: argument_types_vec,
-                            length,
-                            variable_element,
-                        }
-                    }
-                    _ => {
-                        let tuple = argument_type.iterate(db, env);
-                        VariadicArgumentType::Other {
-                            argument_types: tuple.iter_element_types(db).collect(),
-                            length: tuple.len(),
-                            variable_element: tuple.variable_element_type(db),
-                        }
-                    }
+                        _ => VariadicArgumentType::Other(argument_type.iterate(db, env)),
+                    },
                 },
-            },
-            None => VariadicArgumentType::None,
+                None => VariadicArgumentType::None,
+            }
         };
 
-        let (argument_types, length, variable_element) = match &variadic_type {
-            VariadicArgumentType::ParamSpec(paramspec) => {
-                ([].as_slice(), TupleLength::unknown(), Some(*paramspec))
-            }
+        let (mut argument_types, length, variable_element) = match &variadic_type {
+            VariadicArgumentType::ParamSpec(paramspec) => (
+                Either::Left([].iter().copied()),
+                TupleLength::unknown(),
+                Some(*paramspec),
+            ),
             VariadicArgumentType::Union {
                 argument_types,
                 length,
                 variable_element,
-            } => (argument_types.as_slice(), *length, *variable_element),
-            VariadicArgumentType::Other {
-                argument_types,
-                length,
-                variable_element,
-            } => (argument_types.as_slice(), *length, *variable_element),
-            VariadicArgumentType::None => ([].as_slice(), TupleLength::unknown(), None),
+            } => (
+                Either::Left(argument_types.iter().copied()),
+                *length,
+                *variable_element,
+            ),
+            VariadicArgumentType::Other(tuple) => (
+                Either::Right(tuple.iter_element_types(db)),
+                tuple.len(),
+                tuple.variable_element_type(db),
+            ),
+            VariadicArgumentType::None => (
+                Either::Left([].iter().copied()),
+                TupleLength::unknown(),
+                None,
+            ),
         };
 
-        let mut argument_types = argument_types.iter().copied();
         // This can be true either if we have a true variable-length tuple (in which case
         // `variable_element.is_some()`) or if we have a union of different fixed-length tuples (in
         // which case `variable_element.is_none()`).
@@ -6886,19 +6882,12 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             }
 
             if matches!(argument, Argument::Variadic) {
-                if let Some(KnownUnpacking::Positional(_)) =
-                    self.arguments.known_unpacking(argument_index)
-                {
-                    for matched in matches
-                        .iter()
-                        .filter(|matched| matched.index == parameter_index)
-                    {
-                        actual.push(matched.argument_type?);
-                    }
-                    continue;
-                }
-                let argument_type = argument_types.get_default()?;
-                let mut argument_tuple = argument_type.iterate(db, self.env);
+                let mut argument_tuple = self.arguments.positional_shape(
+                    db,
+                    self.env,
+                    argument_index,
+                    argument_types.get_default(),
+                )?;
                 let consumed_prefix = matches
                     .parameters
                     .iter()

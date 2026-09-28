@@ -353,6 +353,12 @@ def tail[*Ts](head: int, *args: *Ts) -> tuple[*Ts]:
 
 reveal_type(tail(*[1, "two", b"three"]))  # revealed: tuple[Literal["two"], Literal[b"three"]]
 reveal_type(tail(*[1]))  # revealed: tuple[()]
+reveal_type(tail(*(1, "two", b"three")))  # revealed: tuple[Literal["two"], Literal[b"three"]]
+reveal_type(tail(*(1, *("two", b"three"))))  # revealed: tuple[Literal["two"], Literal[b"three"]]
+reveal_type(tail(*(1,)))  # revealed: tuple[()]
+
+args = (1, "two", b"three")
+reveal_type(tail(*args))  # revealed: tuple[Literal["two"], Literal[b"three"]]
 ```
 
 ### Multiple type variable tuples

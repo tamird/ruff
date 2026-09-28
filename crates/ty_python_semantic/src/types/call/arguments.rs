@@ -15,6 +15,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ProgramEnvironment;
 use crate::types::signatures::Parameters;
+use crate::types::tuple::TupleSpec;
 use crate::types::typed_dict::extract_unpacked_typed_dict_keys_from_value_type;
 use crate::types::{Type, TypeContext, UnionType, expand_type};
 
@@ -198,7 +199,7 @@ impl OwnedArgument {
 /// a residual value type for additional names; individual known keys can be optional.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum KnownUnpacking<'db> {
-    Positional(Box<[Type<'db>]>),
+    Positional(TupleSpec<'db>),
     Keywords(KnownKeywords<'db>),
 }
 
@@ -295,7 +296,7 @@ impl<'db> KnownUnpacking<'db> {
                 }
             })
             .collect::<Option<Box<[_]>>>()?;
-        Some(Self::Positional(types))
+        Some(Self::Positional(TupleSpec::heterogeneous(types)))
     }
 
     fn keywords(dictionary: DictionaryItems<'db>) -> Self {
@@ -568,6 +569,26 @@ impl<'a, 'db> CallArguments<'a, 'db> {
             known_unpacking,
         } = items.get(index)?;
         known_unpacking.as_ref()
+    }
+
+    /// The positional slots supplied by an unpacked argument.
+    ///
+    /// Retained literal children take precedence over the operand type, including when no
+    /// operand type is available. Otherwise use that original type's iteration shape. This
+    /// leaves the operand type available for diagnostics, expansion, and protocol checks.
+    pub(super) fn positional_shape(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        index: usize,
+        argument_type: Option<Type<'db>>,
+    ) -> Option<Cow<'_, TupleSpec<'db>>> {
+        if let Some(unpacking) = self.known_unpacking(index)
+            && let KnownUnpacking::Positional(tuple) = unpacking
+        {
+            return Some(Cow::Borrowed(tuple));
+        }
+        argument_type.map(|ty| ty.iterate(db, env))
     }
 
     /// Create a [`CallArguments`] with no arguments.
@@ -1050,6 +1071,64 @@ mod tests {
     use crate::types::call::{Bindings, CallableBinding};
     use crate::types::constraints::ConstraintSetBuilder;
     use crate::types::{KnownClass, Parameter, Signature};
+
+    #[test]
+    fn literal_unpacking_preserves_operand_and_child_types() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new().with_file("/src/main.py", "").build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let env = ProgramEnvironment::from_file(db.program_file(file));
+        let int = KnownClass::Int.to_instance(&db, &env);
+        let divergent = Type::divergent(salsa::plumbing::Id::from_bits(1));
+        for source in ["call(*[first, second])", "call(*(first, second))"] {
+            let parsed = ruff_python_parser::parse_module(source)?;
+            assert_eq!(parsed.syntax().body.len(), 1, "Expected one call statement");
+            let statement = parsed.syntax().body[0]
+                .as_expr_stmt()
+                .expect("Expected an expression statement");
+            let call = statement
+                .value
+                .as_call_expr()
+                .expect("Expected a call expression");
+            for operand in [Some(Type::unknown()), Some(divergent), None] {
+                let arguments: CallArguments =
+                    [(Argument::Variadic, operand)].into_iter().collect();
+                let arguments = arguments.with_known_unpacking(
+                    &call.arguments,
+                    |expression| {
+                        let name = expression
+                            .as_name_expr()
+                            .expect("Expected a literal child name");
+                        match name.id.as_str() {
+                            "first" => Some(int),
+                            "second" => Some(divergent),
+                            _ => panic!("Unexpected literal child"),
+                        }
+                    },
+                    |_| unreachable!("The fixture has no keyword unpacking"),
+                );
+                let types = arguments
+                    .argument_types(0)
+                    .expect("Expected the unpacked operand");
+                assert_eq!(
+                    types.get_default(),
+                    operand,
+                    "Original operand must remain available"
+                );
+                let shape = arguments
+                    .positional_shape(&db, &env, 0, types.get_default())
+                    .expect("Literal children must supply a shape without an operand type");
+                assert!(
+                    !shape.len().is_variable(),
+                    "Literal children retain fixed slots"
+                );
+                assert_eq!(
+                    shape.iter_element_types(&db).collect::<Vec<_>>(),
+                    [int, divergent]
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn expanded_input_proof_checks_committed_arguments() -> anyhow::Result<()> {

@@ -468,6 +468,11 @@ pair(*[])  # error: [missing-argument]
 pair(*[1])  # error: [missing-argument]
 pair(*[1, "two", 3])  # error: [too-many-positional-arguments]
 pair(*["one", "two"])  # error: [invalid-argument-type]
+
+pair(*(1, "two"))
+pair(*(1, *("two",)))
+pair(*(1,))  # error: [missing-argument]
+pair(*("one", "two"))  # error: [invalid-argument-type]
 ```
 
 An exact positional unpack still supplies a parameter that also has an explicit keyword, whether
