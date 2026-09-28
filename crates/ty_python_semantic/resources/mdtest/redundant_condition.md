@@ -3,12 +3,12 @@
 A common error in Python is to accidentally test truthiness of the wrong object: for example
 `if func:` (which is always true) where `if func():` was intended, or `if coroutine():` where
 `if await coroutine():` was intended. By default, ty alerts the user to these errors with the error
-code `redundant-condition`, but only if the inferred type of the object is not assignable to `int`
-and has fixed truthiness. This heuristic catches the `if func` and `if coroutine()` cases, while
-avoiding false positives on cases such as `if DEBUG:` where `DEBUG = 0` or `DEBUG = False` is a
-constant.
+code `redundant-condition`, but only if the inferred type of the object is not assignable to
+`bool | int` and has fixed truthiness. This heuristic catches the `if func` and `if coroutine()`
+cases, while avoiding false positives on cases such as `if DEBUG:` where `DEBUG = 0` or
+`DEBUG = False` is a constant.
 
-The remaining cases -- where the inferred type is assignable to `int`, or only short-circuit
+The remaining cases -- where the inferred type is assignable to `bool | int`, or only short-circuit
 evaluation makes the condition's truthiness fixed -- are covered by a separate, stricter rule
 (`redundant-condition-strict`).
 
@@ -6340,4 +6340,36 @@ if next((value := (1,)) for _ in range(1)):  # error: [redundant-condition-stric
     pass
 if next((1,) for item in range(3) if (value := item > 0)):  # error: [redundant-condition-strict]
     pass
+```
+
+## Independent boolean and integer declarations
+
+A supplied builtins module can declare `bool` and `int` independently. Fixed boolean and integer
+conditions still use the strict rule, and defensive assertions remain exempt.
+
+```toml
+[environment]
+typeshed = "/typeshed"
+
+[rules]
+redundant-condition-strict = "error"
+```
+
+`/typeshed/stdlib/builtins.pyi`:
+
+```pyi
+class object: ...
+class bool: ...
+class int: ...
+```
+
+```py
+def check(flag: bool):
+    known = True
+    mixed = True if flag else 1
+    if known:  # error: [redundant-condition-strict]
+        pass
+    if mixed:  # error: [redundant-condition-strict]
+        pass
+    assert known
 ```
