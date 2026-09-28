@@ -336,8 +336,8 @@ fn element_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
             file,
             dictionary,
             builtin: true,
-            exposed: false,
-            value_bound: None,
+            uses_residual_presence: false,
+            bound: None,
         };
         result = Some(match result.take() {
             Some(previous) => previous.join(db, &env, &next),
