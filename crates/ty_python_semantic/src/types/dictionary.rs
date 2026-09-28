@@ -143,10 +143,6 @@ impl<'db> DictionaryItems<'db> {
                 }
                 let mut dictionary = DictionaryItemsBuilder::default();
                 for operand in [left.as_ref(), right.as_ref()] {
-                    let ty = expression_type(operand).ok_or(DictionaryFallback::Unavailable)?;
-                    if !has_dict_type(db, ty) {
-                        return Err(DictionaryFallback::Unavailable);
-                    }
                     let source = Self::builtin_source(
                         db,
                         env,
