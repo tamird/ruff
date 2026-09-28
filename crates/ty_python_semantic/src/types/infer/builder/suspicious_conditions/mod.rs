@@ -86,7 +86,7 @@ use self::exemptions::RedundantConditionContext;
 /// This is used to determine which diagnostic rule would apply to the condition.
 #[derive(Debug, PartialEq, Eq)]
 enum ConditionKind<'db> {
-    /// A condition whose value type is assignable to `int`, including `bool`.
+    /// A condition whose value type is assignable to `bool | int`.
     ///
     /// These tests commonly enforce runtime invariants, so they are only flagged by the
     /// opt-in `redundant-condition-strict` rule and are exempted entirely in `assert` tests.
@@ -758,7 +758,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             } else {
                 return None;
             }
-        } else if value_type.is_assignable_to(db, env, KnownClass::Int.to_instance(db, env)) {
+        } else if value_type.is_assignable_to(
+            db,
+            env,
+            UnionType::from_two_elements(
+                db,
+                env,
+                KnownClass::Bool.to_instance(db, env),
+                KnownClass::Int.to_instance(db, env),
+            ),
+        ) {
             ConditionKind::Boolean
         } else if value_type.bool(db, env).is_ambiguous() {
             ConditionKind::ShortCircuit
