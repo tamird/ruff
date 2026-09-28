@@ -2343,6 +2343,16 @@ fn indexed_store_correspondence() -> anyhow::Result<()> {
         def intersection_closed(values: First, value: Callable[..., None]) -> None:
             if isinstance(values, Second):
                 values[0] = value
+
+        def local_store(key: str, value: None) -> None:
+            values = {}
+            values[key] = value
+
+        def loop_store(keys: list[Literal["left", "right"]]) -> None:
+            values = {}
+            for key in keys:
+                values[key] = None
+
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -2362,6 +2372,8 @@ fn indexed_store_correspondence() -> anyhow::Result<()> {
         ("union", true),
         ("intersection", false),
         ("intersection_closed", true),
+        ("local_store", false),
+        ("loop_store", false),
     ];
     let facts = |db: &TestDb, name: &str| {
         crate::SemanticModel::new(db, program_file(db, file))
