@@ -1040,12 +1040,12 @@ type MemberLookupResult<'db> = Result<ResolvedMember<'db>, MemberLookupError<'db
 enum ResolvedMember<'db> {
     /// A member with no deprecated property accessors.
     Plain(PlaceAndQualifiers<'db>),
-    /// Accessor deprecations or unresolved getter inputs, stored separately to keep ordinary
+    /// Accessor deprecations or unresolved lookup inputs, stored separately to keep ordinary
     /// lookups compact.
     WithMetadata(MemberMetadata<'db>),
 }
 
-/// Only deprecations or unresolved getter inputs need this additional storage.
+/// Only deprecations or unresolved lookup inputs need this additional storage.
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
 struct MemberMetadata<'db> {
     #[returns(copy)]
@@ -1355,7 +1355,7 @@ enum InstanceFallbackShadowsNonDataDescriptor {
 bitflags! {
     #[derive(Clone, Debug, Copy, PartialEq, Eq, Hash)]
     pub(crate) struct MemberLookupPolicy: u16 {
-        /// Compute requirements for implicit getter calls without changing lookup semantics.
+        /// Prove the receiver and implicit getter inputs without changing lookup semantics.
         const PROVE_GETTER_INPUTS = 1 << 8;
         /// Dunder methods are looked up on the meta-type of a type without potentially falling
         /// back on attributes on the type itself. For example, when implicitly invoked on an
@@ -6258,7 +6258,11 @@ impl<'db> Type<'db> {
                             db, env, name_str, policy, receiver,
                         )
                     })
-                    .unwrap_or(Place::bound(Type::unknown()).into()),
+                    .unwrap_or_else(|| {
+                        Type::unknown().member_lookup_with_policy_and_receiver(
+                            db, env, name_str, policy, receiver,
+                        )
+                    }),
                 Type::RecursiveVar(_) => {
                     unreachable!("semantic operation on an unbound recursive variable")
                 }
@@ -6969,11 +6973,21 @@ impl<'db> Type<'db> {
                     .place
                     .is_definitely_bound()
             {
-                return Place::bound(self.dunder_class(db, env)).into();
+                let member = Place::bound(self.dunder_class(db, env)).into();
+                if policy.contains(MemberLookupPolicy::PROVE_GETTER_INPUTS)
+                    && self.has_indeterminate_inference(db, env)
+                {
+                    return unproved_member_lookup(db, member);
+                }
+                return member;
             }
 
             if matches!(self, Type::Dynamic(_) | Type::Divergent(_) | Type::Never) {
-                return Place::bound(self).into();
+                let member = Place::bound(self).into();
+                if policy.contains(MemberLookupPolicy::PROVE_GETTER_INPUTS) && !self.is_never() {
+                    return unproved_member_lookup(db, member);
+                }
+                return member;
             }
         }
 
