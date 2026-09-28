@@ -1954,6 +1954,11 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
             values.pop("removed", None)
             needs_int(**(values | {} | {}))
 
+        def typed_filtered(values: Values) -> None:
+            values.pop("removed", None)
+            removed = {key: values.pop(key) for key in ("absent",) if key in values}
+            needs_int(**(values | removed))
+
         def typed_reinserted(values: Values) -> None:
             values.pop("removed", None)
             values["removed"] = 0
@@ -1983,6 +1988,7 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         ("popped", false),
         ("typed_popped", false),
         ("typed_merged", false),
+        ("typed_filtered", false),
         ("typed_reinserted", true),
         ("typed_wrong_value", true),
         ("dead", false),

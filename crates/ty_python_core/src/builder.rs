@@ -3487,6 +3487,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             self.current_use_def_map_mut()
                 .record_range_reachability(element.range(), in_type_checking_block);
             self.visit_expr(element);
+            self.record_value_exposure(element);
         }
         for filtered_out_path in filtered_out_paths {
             self.flow_merge(filtered_out_path);
