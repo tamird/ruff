@@ -84,8 +84,10 @@ pub struct FunctionInferenceFacts {
     pub return_type_correspondence: Option<bool>,
     pub has_cycle_recovery: bool,
     pub has_errors: bool,
-    /// Includes emitted diagnostics and diagnostics suppressed in reachable code.
-    pub has_diagnostics_or_suppressions: bool,
+    /// Includes emitted and reachably suppressed checking failures, independently of severity.
+    /// Redundant-condition advisories do not count. Disabled checks and complete expression
+    /// evidence remain separate.
+    pub has_checking_failures: bool,
     /// Whether selected input checks encountered a reachable requirement they could not prove.
     /// Diagnostic rule selection and source suppressions do not clear this status. It covers
     /// failures among selected checks; check selection and complete body evidence are separate.
@@ -170,10 +172,10 @@ impl<'db> SemanticModel<'db> {
                     .into_iter()
                     .any(|diagnostic| diagnostic.severity() == ruff_db::diagnostic::Severity::Error)
             }),
-            has_diagnostics_or_suppressions: diagnostics.into_iter().flatten().any(|diagnostics| {
-                diagnostics.into_iter().next().is_some()
-                    || diagnostics.has_reachable_suppressed_diagnostics()
-            }),
+            has_checking_failures: diagnostics
+                .into_iter()
+                .flatten()
+                .any(TypeCheckDiagnostics::has_checking_failures),
             has_unproved_requirements: diagnostics
                 .into_iter()
                 .flatten()

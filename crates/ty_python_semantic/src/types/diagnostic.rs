@@ -1430,12 +1430,19 @@ declare_lint! {
     }
 }
 
+// Truthiness advisories are compatible with successful type checking. Unclassified
+// diagnostics, including application-supplied ones, conservatively remain checking failures.
+fn is_checking_failure(id: DiagnosticId) -> bool {
+    id != DiagnosticId::Lint(REDUNDANT_CONDITION.name())
+        && id != DiagnosticId::Lint(REDUNDANT_CONDITION_STRICT.name())
+}
+
 /// A collection of type check diagnostics.
 #[derive(Default, Eq, PartialEq, get_size2::GetSize)]
 pub struct TypeCheckDiagnostics {
     diagnostics: Vec<Diagnostic>,
     used_suppressions: FxHashSet<FileSuppressionId>,
-    has_reachable_suppressed_diagnostics: bool,
+    has_reachable_suppressed_checking_failures: bool,
     has_unproved_requirements: bool,
 }
 
@@ -1474,7 +1481,8 @@ impl TypeCheckDiagnostics {
     pub(super) fn extend(&mut self, other: &TypeCheckDiagnostics) {
         self.diagnostics.extend_from_slice(&other.diagnostics);
         self.used_suppressions.extend(&other.used_suppressions);
-        self.has_reachable_suppressed_diagnostics |= other.has_reachable_suppressed_diagnostics;
+        self.has_reachable_suppressed_checking_failures |=
+            other.has_reachable_suppressed_checking_failures;
         self.has_unproved_requirements |= other.has_unproved_requirements;
     }
 
@@ -1491,7 +1499,8 @@ impl TypeCheckDiagnostics {
                 .cloned(),
         );
         self.used_suppressions.extend(&other.used_suppressions);
-        self.has_reachable_suppressed_diagnostics |= other.has_reachable_suppressed_diagnostics;
+        self.has_reachable_suppressed_checking_failures |=
+            other.has_reachable_suppressed_checking_failures;
         self.has_unproved_requirements |= other.has_unproved_requirements;
     }
 
@@ -1523,7 +1532,7 @@ impl TypeCheckDiagnostics {
                     && self.is_suppressed(db, file, range, lint)
                 {
                     if should_record_suppression(range) {
-                        self.mark_reachable_suppression();
+                        self.mark_reachable_suppression(lint);
                     }
                     continue;
                 }
@@ -1561,12 +1570,21 @@ impl TypeCheckDiagnostics {
         self.used_suppressions.len()
     }
 
-    pub(crate) fn mark_reachable_suppression(&mut self) {
-        self.has_reachable_suppressed_diagnostics = true;
+    pub(crate) fn mark_reachable_suppression(&mut self, lint: LintId) {
+        self.has_reachable_suppressed_checking_failures |=
+            is_checking_failure(DiagnosticId::Lint(lint.name()));
     }
 
-    pub(crate) fn has_reachable_suppressed_diagnostics(&self) -> bool {
-        self.has_reachable_suppressed_diagnostics
+    pub(crate) fn has_reachable_suppressed_checking_failures(&self) -> bool {
+        self.has_reachable_suppressed_checking_failures
+    }
+
+    pub(crate) fn has_checking_failures(&self) -> bool {
+        self.has_reachable_suppressed_checking_failures
+            || self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| is_checking_failure(diagnostic.id()))
     }
 
     pub(crate) fn shrink_to_fit(&mut self) {

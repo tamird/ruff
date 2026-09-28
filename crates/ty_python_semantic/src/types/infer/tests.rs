@@ -205,7 +205,12 @@ value: Row = record(run=lambda value: value.lower())
 
 #[test]
 fn function_inference_facts() -> anyhow::Result<()> {
-    let mut db = setup_db();
+    let registry = crate::default_lint_registry();
+    let mut rules = RuleSelection::from_registry(registry);
+    for name in ["invalid-argument-type", "redundant-condition-strict"] {
+        rules.enable(registry.get(name)?, Severity::Warning, LintSource::File);
+    }
+    let mut db = TestDbBuilder::new().with_rule_selection(rules).build()?;
     db.write_dedented(
         "/src/main.py",
         r#"
@@ -233,33 +238,65 @@ fn function_inference_facts() -> anyhow::Result<()> {
 
         def suppressed_default(value: int = needs_int("bad")) -> int:  # ty: ignore[invalid-argument-type]
             return value
+
+        def advisory(empty: tuple[()]) -> int:
+            if not empty:
+                return 1
+            return 1
+
+        def suppressed_advisory(empty: tuple[()]) -> int:
+            if not empty:  # ty: ignore[redundant-condition]
+                return 1
+            return 1
+
+        def strict_advisory() -> int:
+            flag = True
+            if flag:
+                return 1
+            return 1
+
+        def suppressed_strict_advisory() -> int:
+            flag = True
+            if flag:  # ty: ignore[redundant-condition-strict]
+                return 1
+            return 1
+
+        def warning_body(value: int) -> int:
+            len(value)
+            return value
+
+        def suppressed_call(value: int) -> int:
+            len(value)  # ty: ignore[invalid-argument-type]
+            return value
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     let model = crate::SemanticModel::new(&db, program_file(&db, file));
-    for (name, errors, diagnostics_or_suppressions) in [
+    for (name, errors, checking_failures) in [
         ("clean", false, false),
         ("bad_body", true, true),
         ("suppressed_body", false, true),
         ("dead_body", false, false),
-        ("bad_default", true, true),
+        ("bad_default", false, true),
         ("suppressed_default", false, true),
+        ("advisory", false, false),
+        ("suppressed_advisory", false, false),
+        ("strict_advisory", false, false),
+        ("suppressed_strict_advisory", false, false),
+        ("warning_body", false, true),
+        ("suppressed_call", false, true),
     ] {
         let definition = first_public_binding(&db, file, name);
         let crate::FunctionInferenceFacts {
             return_type_correspondence: _,
             has_cycle_recovery,
             has_errors,
-            has_diagnostics_or_suppressions,
+            has_checking_failures,
             has_unproved_requirements: _,
         } = model.function_inference_facts(definition).unwrap();
         assert_eq!(
-            (
-                has_cycle_recovery,
-                has_errors,
-                has_diagnostics_or_suppressions,
-            ),
-            (false, errors, diagnostics_or_suppressions),
+            (has_cycle_recovery, has_errors, has_checking_failures,),
+            (false, errors, checking_failures),
             "{name}",
         );
     }
@@ -267,6 +304,16 @@ fn function_inference_facts() -> anyhow::Result<()> {
         model
             .function_inference_facts(first_public_binding(&db, file, "unrelated"))
             .is_none()
+    );
+    let diagnostics = check_types(&db, program_file(&db, file));
+    let advisories: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.id().as_str().starts_with("redundant-condition"))
+        .map(|diagnostic| diagnostic.id().as_str())
+        .collect();
+    assert_eq!(
+        advisories,
+        ["redundant-condition", "redundant-condition-strict"]
     );
     Ok(())
 }
@@ -1896,8 +1943,8 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         cases.map(|(_, unproved)| unproved)
     );
     assert_eq!(
-        selected.map(|fact| (fact.has_errors, fact.has_diagnostics_or_suppressions)),
-        ordinary.map(|fact| (fact.has_errors, fact.has_diagnostics_or_suppressions))
+        selected.map(|fact| (fact.has_errors, fact.has_checking_failures)),
+        ordinary.map(|fact| (fact.has_errors, fact.has_checking_failures))
     );
     assert_eq!(signatures(&db), ordinary_signatures);
     let file_result = crate::types::check_types_with_diagnostics(&db, program_file(&db, file), []);
@@ -1948,7 +1995,7 @@ fn function_argument_correspondence_with_disabled_diagnostics() -> anyhow::Resul
     )));
     let result = crate::types::check_types_with_diagnostics(&db, program_file(&db, file), []);
     assert!(result.diagnostics.is_empty());
-    assert!(!result.has_suppressed_inference_diagnostics);
+    assert!(!result.has_suppressed_inference_failures);
     assert!(result.has_unproved_requirements);
     Ok(())
 }
@@ -5926,14 +5973,8 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
         requirements.push((name, selected.has_unproved_requirements));
         assert_eq!(selected.return_type_correspondence, Some(true), "{name}");
         assert_eq!(
-            (
-                selected.has_errors,
-                selected.has_diagnostics_or_suppressions
-            ),
-            (
-                ordinary.has_errors,
-                ordinary.has_diagnostics_or_suppressions
-            ),
+            (selected.has_errors, selected.has_checking_failures),
+            (ordinary.has_errors, ordinary.has_checking_failures),
             "{name}",
         );
     }
