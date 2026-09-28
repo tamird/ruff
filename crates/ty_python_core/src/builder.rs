@@ -4121,6 +4121,61 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     self.mark_current_comprehension_async();
                 }
             }
+            ast::Expr::List(ast::ExprList {
+                node_index: _,
+                range: _,
+                elts,
+                ctx,
+            }) => {
+                for element in elts {
+                    self.visit_expr(element);
+                    if ctx.is_load() {
+                        self.record_value_exposure(element);
+                    }
+                }
+                self.visit_expr_context(ctx);
+            }
+            ast::Expr::Tuple(ast::ExprTuple {
+                node_index: _,
+                range: _,
+                elts,
+                ctx,
+                parenthesized: _,
+            }) => {
+                for element in elts {
+                    self.visit_expr(element);
+                    if ctx.is_load() {
+                        self.record_value_exposure(element);
+                    }
+                }
+                self.visit_expr_context(ctx);
+            }
+            ast::Expr::Set(ast::ExprSet {
+                node_index: _,
+                range: _,
+                elts,
+            }) => {
+                for element in elts {
+                    self.visit_expr(element);
+                    self.record_value_exposure(element);
+                }
+            }
+            ast::Expr::Dict(ast::ExprDict {
+                node_index: _,
+                range: _,
+                items,
+            }) => {
+                for ast::DictItem { key, value } in items {
+                    if let Some(key) = key {
+                        self.visit_expr(key);
+                        self.record_value_exposure(key);
+                    }
+                    self.visit_expr(value);
+                    if key.is_some() {
+                        self.record_value_exposure(value);
+                    }
+                }
+            }
             ast::Expr::Call(call) => {
                 walk_expr(self, expr);
                 let ast::ExprCall {
