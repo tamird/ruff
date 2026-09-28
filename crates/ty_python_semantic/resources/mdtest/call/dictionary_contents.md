@@ -297,9 +297,9 @@ def assigned_argument():
 
 ## Opaque exposure
 
-Passing a dictionary to an ordinary callable leaves key presence uncertain. Known value refinements
-remain useful, including values written after exposure; a clear or deletion removes the previous
-restriction. Rebinding to a fresh dictionary starts a new object lifetime.
+Passing a dictionary to an ordinary callable leaves key presence uncertain and discards observed
+values. Values written after exposure remain useful until the next exposure; a clear or deletion
+removes the previous restriction. Rebinding to a fresh dictionary starts a new object lifetime.
 
 ```py
 from typing import Any
@@ -318,6 +318,10 @@ def exposed():
     values["value"] = "bad"
     del values["value"]
     consume(**values)
+    values.update(value="bad")
+    consume(**values)  # error: [invalid-argument-type]
+    opaque(values)
+    consume(**values)
     values = {"extra": 1}
     empty(**values)  # error: [unknown-argument]
 
@@ -326,6 +330,28 @@ def insertion():
     del values["value"]
     opaque(values)
     consume(**values)
+```
+
+An opaque call can replace an earlier value. A lasting dictionary annotation still limits the
+replacement type, while an unbounded dictionary loses that value restriction entirely.
+
+```py
+def mutate(values: dict[str, int | str]) -> None:
+    values["value"] = "changed"
+
+def consume_integer(*, value: int) -> None: ...
+def bounded_exposure():
+    values: dict[str, int | str] = {"value": 1}
+    consume_integer(**values)
+    mutate(values)
+    consume_integer(**values)  # error: [invalid-argument-type]
+    values["value"] = 2
+    consume_integer(**values)
+
+def unbounded_exposure():
+    values = {"value": "old"}
+    opaque(values)
+    consume_integer(**values)
 ```
 
 ## Argument evaluation order
