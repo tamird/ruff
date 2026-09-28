@@ -1937,6 +1937,11 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         def good() -> None:
             accept(lambda values: None)
 
+        def popped() -> None:
+            values = {"value": 1, "removed": 0}
+            values.pop("removed")
+            needs_int(**values)
+
         def dead() -> None:
             if False:
                 accept(narrow)
@@ -1953,6 +1958,7 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
     let cases = [
         ("bad", true),
         ("good", false),
+        ("popped", false),
         ("dead", false),
         ("suppressed", true),
         ("unchecked", true),
