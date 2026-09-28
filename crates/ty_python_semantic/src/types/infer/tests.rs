@@ -377,6 +377,57 @@ fn comprehension_requirement_reachability() -> anyhow::Result<()> {
 }
 
 #[test]
+fn loop_requirement_reachability() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any
+        from typing_extensions import Never
+
+        def empty_tuple(values: tuple[()]) -> None:
+            for value in values:
+                value.format(name="target")
+
+        def empty_list(values: list[Never]) -> None:
+            for value in values:
+                value.format(name="target")
+
+        def reachable(values: list[Any]) -> None:
+            for value in values:
+                value.format(name="target")
+
+        def make_empty(value: int) -> list[Never]:
+            return []
+
+        def evaluated_iterable() -> None:
+            for value in make_empty("bad"):
+                value.format(name="target")
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("empty_tuple", false),
+        ("empty_list", false),
+        ("reachable", true),
+        ("evaluated_iterable", true),
+    ];
+    db.select_function_inference(Some((
+        file,
+        cases.map(|(name, _)| name.to_owned()).to_vec(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    let model = crate::SemanticModel::new(&db, program_file(&db, file));
+    for (name, unproved) in cases {
+        let definition = first_public_binding(&db, file, name);
+        let facts = model.function_inference_facts(definition).unwrap();
+        assert!(!facts.has_cycle_recovery, "{name}");
+        assert_eq!(facts.has_unproved_requirements, unproved, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
 fn conservative_global_inputs() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(

@@ -1841,11 +1841,22 @@ pub(crate) fn is_non_terminal_call<'db>(
 }
 
 fn analyze_non_empty_iterable(db: &dyn Db, iterable: Expression) -> Truthiness {
-    match infer_same_file_expression_type(db, iterable, TypeContext::default()) {
-        Type::KnownInstance(KnownInstanceType::Range { is_non_empty }) => {
-            Truthiness::from(is_non_empty)
-        }
-        _ => Truthiness::Ambiguous,
+    let iterable_ty = infer_same_file_expression_type(db, iterable, TypeContext::default());
+    if let Type::KnownInstance(KnownInstanceType::Range { is_non_empty }) = iterable_ty {
+        return Truthiness::from(is_non_empty);
+    }
+    let env = ProgramEnvironment::from_scope(iterable.scope(db));
+    if iterable_ty.has_provisional_marker(db, &env) {
+        return Truthiness::Ambiguous;
+    }
+    let Ok(iteration) = iterable_ty.try_iterate(db, &env) else {
+        return Truthiness::Ambiguous;
+    };
+    let element = iteration.homogeneous_element_type(db, &env);
+    if element.is_never() {
+        Truthiness::AlwaysFalse
+    } else {
+        Truthiness::Ambiguous
     }
 }
 

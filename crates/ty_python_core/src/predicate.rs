@@ -225,8 +225,8 @@ pub enum PredicateNode<'db> {
     },
     /// Whether an iterable is statically known to yield at least one item.
     ///
-    /// Currently, this predicate is only emitted for direct `range(...)` calls. It is resolved
-    /// semantically during type checking, so calls to a shadowed `range` remain ambiguous.
+    /// This predicate describes synchronous iteration. It is resolved semantically during type
+    /// checking, including empty iterable types and statically known builtin ranges.
     IsNonEmptyIterable(Expression<'db>),
     Pattern(PatternPredicate<'db>),
     /// Whether control flow takes one branch of an OR pattern instead of its remaining

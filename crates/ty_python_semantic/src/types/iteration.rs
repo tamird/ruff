@@ -415,7 +415,7 @@ impl<'db> Type<'db> {
     /// ```python
     /// y(*x)
     /// ```
-    pub(super) fn try_iterate(
+    pub(crate) fn try_iterate(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -805,7 +805,7 @@ impl<'db> Type<'db> {
 
 /// Error returned if a type is not (or may not be) iterable.
 #[derive(Debug)]
-pub(super) enum IterationError<'db> {
+pub(crate) enum IterationError<'db> {
     /// The object being iterated over has a bound `__(a)iter__` method,
     /// but calling it with the expected arguments results in an error.
     IterCallError {

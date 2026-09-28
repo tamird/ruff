@@ -5393,7 +5393,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     .then(|| literal_iterable_truthiness(iter))
                     .and_then(Truthiness::into_bool);
 
-                let (after_empty_iter, non_empty_range_constraint) =
+                let (after_empty_iter, non_empty_iterable_constraint) =
                     match literal_iterable_is_non_empty {
                         Some(false) => {
                             let after_iter = self.flow_snapshot();
@@ -5401,7 +5401,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                             (Some(after_iter), None)
                         }
                         Some(true) => (None, None),
-                        None if is_direct_range_call(iter) => {
+                        None if !*is_async => {
+                            let is_direct_range = is_direct_range_call(iter);
+                            if !is_direct_range {
+                                self.record_ambiguous_reachability();
+                            }
                             let after_iter = self.flow_snapshot();
                             let constraint = self.record_reachability_constraint(
                                 PredicateOrLiteral::Predicate(Predicate {
@@ -5410,7 +5414,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                                 }),
                             );
 
-                            (None, Some((after_iter, constraint)))
+                            (
+                                None,
+                                Some((after_iter, is_direct_range.then_some(constraint))),
+                            )
                         }
                         None => {
                             self.record_ambiguous_reachability();
@@ -5466,14 +5473,19 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 } else if literal_iterable_is_non_empty.is_none() {
                     // We may execute the `else` clause without ever executing the body, so merge
                     // in a zero-iteration state before visiting `else`.
-                    if let Some((after_iter, non_empty_range_constraint)) =
-                        non_empty_range_constraint
+                    if let Some((after_iter, non_empty_iterable_constraint)) =
+                        non_empty_iterable_constraint
                     {
-                        let post_loop_body = self.flow_snapshot();
-                        self.flow_restore(after_iter);
-                        self.record_negated_reachability_constraint(non_empty_range_constraint);
-                        let no_iteration = self.flow_snapshot();
-                        self.flow_restore(post_loop_body);
+                        let no_iteration = if let Some(constraint) = non_empty_iterable_constraint {
+                            let post_loop_body = self.flow_snapshot();
+                            self.flow_restore(after_iter);
+                            self.record_negated_reachability_constraint(constraint);
+                            let no_iteration = self.flow_snapshot();
+                            self.flow_restore(post_loop_body);
+                            no_iteration
+                        } else {
+                            after_iter
+                        };
                         self.flow_merge(no_iteration);
                     } else {
                         self.flow_merge(pre_loop);
@@ -6881,10 +6893,9 @@ fn dunder_all_extend_argument(value: &ast::Expr) -> Option<&ast::Expr> {
 
 /// Returns `true` for syntactically direct `range(...)` calls.
 ///
-/// This avoids adding reachability predicates for every `for` loop target to the TDD graph. We only
-/// emit the predicate for syntactically direct `range(...)` calls; type checking later verifies that
-/// the callee resolves to the built-in `range` and determines whether the range is statically
-/// non-empty.
+/// Their semantic predicate can prove that the loop executes, so its negation excludes the
+/// zero-iteration path. Other iterables only need to exclude bodies known to be empty; retaining
+/// their unconditional zero-iteration path avoids correlating that state with body effects.
 fn is_direct_range_call(expr: &ast::Expr) -> bool {
     expr.expression_value()
         .as_call_expr()
