@@ -48,10 +48,17 @@ pub(super) struct MappingContents<'db> {
     /// The object was allocated by builtin dictionary construction, so its operations cannot
     /// dispatch to subclass overrides. Exposure changes contents, not this allocation fact.
     pub(super) builtin: bool,
-    /// Other code can retain this object. Later writes refine values but cannot prove presence.
-    pub(super) exposed: bool,
-    /// The ordinary mapping value bound for declared or external/member bindings survives exposure.
-    pub(super) value_bound: Option<Type<'db>>,
+    /// Opaque exposure leaves only value restrictions, rather than evidence of key presence.
+    /// A closed `TypedDict` retains its schema and can track subsequent mutations.
+    pub(super) uses_residual_presence: bool,
+    /// The original mapping bound and its local source survive exposure.
+    pub(super) bound: Option<MappingBound<'db>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
+pub(super) struct MappingBound<'db> {
+    ty: Type<'db>,
+    source: TextRange,
 }
 
 impl<'db> MappingContents<'db> {
@@ -70,8 +77,22 @@ impl<'db> MappingContents<'db> {
         }
     }
 
-    fn expose(&mut self, db: &'db dyn Db) {
-        self.exposed = true;
+    fn bound_value(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
+        self.bound
+            .and_then(|MappingBound { ty, source: _ }| ty.unpack_keys_and_items(db, env))
+            .map_or_else(Type::unknown, |(_, value)| value)
+    }
+
+    fn expose(&mut self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) {
+        if let Some(MappingBound { ty, source }) = self.bound
+            && is_closed_typed_dict(db, ty)
+            && let Some(dictionary) = DictionaryItems::unpacked(db, env, ty, source)
+        {
+            self.dictionary = dictionary;
+            self.uses_residual_presence = false;
+            return;
+        }
+        self.uses_residual_presence = true;
         self.dictionary.items = std::mem::take(&mut self.dictionary.items)
             .into_vec()
             .into_iter()
@@ -80,8 +101,7 @@ impl<'db> MappingContents<'db> {
         for item in &mut self.dictionary.items {
             item.kind = DictionaryItemKind::Residual;
         }
-        self.dictionary.extra_items =
-            DictionaryExtraItems::Value(self.value_bound.unwrap_or_else(Type::unknown));
+        self.dictionary.extra_items = DictionaryExtraItems::Value(self.bound_value(db, env));
     }
 
     fn set_item(
@@ -97,7 +117,7 @@ impl<'db> MappingContents<'db> {
             let item = DictionaryItem {
                 name: name.clone(),
                 ty: value,
-                kind: if self.exposed {
+                kind: if self.uses_residual_presence {
                     DictionaryItemKind::Residual
                 } else {
                     DictionaryItemKind::Required
@@ -134,7 +154,7 @@ impl<'db> MappingContents<'db> {
             items.retain(|item| item.name != name);
             // A closed inventory already excludes missing names. An open remainder needs an
             // explicit exclusion so it cannot supply the deleted key.
-            if !self.exposed
+            if !self.uses_residual_presence
                 && matches!(self.dictionary.extra_items, DictionaryExtraItems::Value(_))
             {
                 items.push(DictionaryItem {
@@ -159,6 +179,9 @@ impl<'db> MappingContents<'db> {
             for item in &mut self.dictionary.items {
                 item.source = source;
             }
+            if let Some(bound) = &mut self.bound {
+                bound.source = source;
+            }
             self.file = file;
         }
     }
@@ -173,20 +196,21 @@ impl<'db> MappingContents<'db> {
             file,
             dictionary,
             builtin,
-            exposed,
-            value_bound,
+            uses_residual_presence,
+            bound,
         } = self;
         let Self {
             file: _,
             dictionary: other_dictionary,
             builtin: other_builtin,
-            exposed: other_exposed,
-            value_bound: other_bound,
+            uses_residual_presence: other_uses_residual_presence,
+            bound: other_bound,
         } = other;
-        let exposed = *exposed || *other_exposed;
-        let value_bound = value_bound
-            .zip(*other_bound)
-            .map(|(left, right)| UnionType::from_two_elements(db, env, left, right));
+        let uses_residual_presence = *uses_residual_presence || *other_uses_residual_presence;
+        let bound = bound.zip(*other_bound).map(|(left, right)| MappingBound {
+            ty: UnionType::from_two_elements(db, env, left.ty, right.ty),
+            source: left.source,
+        });
         let extra_value =
             UnionType::from_two_elements(db, env, self.extra_value(), other.extra_value());
         let mut items: FxIndexMap<_, _> = dictionary
@@ -207,7 +231,7 @@ impl<'db> MappingContents<'db> {
                 .find(|item| &item.name == name);
             item.ty =
                 UnionType::from_two_elements(db, env, self.value_at(name), other.value_at(name));
-            item.kind = if exposed {
+            item.kind = if uses_residual_presence {
                 DictionaryItemKind::Residual
             } else if left.is_some_and(DictionaryItem::is_required)
                 && right.is_some_and(DictionaryItem::is_required)
@@ -233,8 +257,8 @@ impl<'db> MappingContents<'db> {
                     DictionaryExtraItems::Value(extra_value)
                 },
             },
-            exposed,
-            value_bound,
+            uses_residual_presence,
+            bound,
             builtin: *builtin && *other_builtin,
         }
     }
@@ -315,7 +339,7 @@ impl<'db> Contents<'db> {
         let captured = captured || other_captured;
         let mut value = value.join(db, env, other_value);
         if captured && let ContentsValue::Mapping(mapping) = &mut value {
-            mapping.expose(db);
+            mapping.expose(db, env);
         }
         Self { value, captured }
     }
@@ -453,7 +477,7 @@ fn definition_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Con
                     NestedBindingExecution::Eager => {
                         let mut result = previous();
                         if let ContentsValue::Mapping(mapping) = &mut result.value {
-                            mapping.expose(db);
+                            mapping.expose(db, &env);
                         }
                         result
                     }
@@ -465,7 +489,8 @@ fn definition_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Con
 }
 
 /// Seed the contents graph from the same binding that owns ordinary value inference.
-/// Parameter and member bindings carry value refinements without asserting a closed key set.
+/// Nominal dictionary parameters and members carry value refinements without a closed key set.
+/// A closed `TypedDict` retains its fields until a recorded mutation changes them.
 fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> ContentsValue<'db> {
     if crate::types::infer::is_discarded_dict_key_assignment(db, definition) {
         return ContentsValue::Unavailable;
@@ -479,7 +504,8 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         return ContentsValue::Pending;
     }
     let bound_type = inference.binding_type(definition);
-    if !super::has_dict_type(db, bound_type) {
+    let closed_typed_dict = is_closed_typed_dict(db, bound_type);
+    if !closed_typed_dict && !super::has_dict_type(db, bound_type) {
         return ContentsValue::Unavailable;
     }
     let index = semantic_index(db, file);
@@ -494,7 +520,7 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
     }
     // Ordinary dictionary bounds retain their per-alternative key domains. A union of
     // invariant dictionaries is admitted only by the proved record seed above.
-    if bound_type.as_nominal_instance().is_none() {
+    if !closed_typed_dict && bound_type.as_nominal_instance().is_none() {
         return ContentsValue::Unavailable;
     }
     let (owner, value, shared) = match definition.kind(db) {
@@ -518,62 +544,57 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         return ContentsValue::Pending;
     }
     let bounded = !place.is_symbol() || place.is_declared() || value.is_none();
-    let value_bound = if bounded {
-        bound_type
-            .unpack_keys_and_items(db, &env)
-            .map(|(_, value)| value)
-    } else {
-        None
-    };
-    let Some(dictionary) = DictionaryItems::unpacked(
-        db,
-        &env,
-        bound_type,
-        definition.kind(db).target_range(&module),
-    ) else {
+    let source = definition.kind(db).target_range(&module);
+    let bound = (bounded || closed_typed_dict).then_some(MappingBound {
+        ty: bound_type,
+        source,
+    });
+    let Some(dictionary) = DictionaryItems::unpacked(db, &env, bound_type, source) else {
         return ContentsValue::Unavailable;
     };
     let mut mapping = MappingContents {
         file,
         dictionary,
-        builtin: match definition.kind(db) {
-            DefinitionKind::Parameter(parameter) => {
-                matches!(
+        builtin: closed_typed_dict
+            || match definition.kind(db) {
+                DefinitionKind::Parameter(parameter) => {
+                    matches!(
+                        parameter,
+                        ParameterDefinitionNodeKind::VariadicKeywordParameter(_)
+                    )
+                }
+                DefinitionKind::LambdaParameter(LambdaParameterDefinitionNodeKind {
+                    index: _,
+                    lambda: _,
+                    parameter,
+                }) => matches!(
                     parameter,
                     ParameterDefinitionNodeKind::VariadicKeywordParameter(_)
-                )
-            }
-            DefinitionKind::LambdaParameter(LambdaParameterDefinitionNodeKind {
-                index: _,
-                lambda: _,
-                parameter,
-            }) => matches!(
-                parameter,
-                ParameterDefinitionNodeKind::VariadicKeywordParameter(_)
-            ),
-            _ => false,
-        },
-        exposed: bounded,
-        value_bound,
+                ),
+                _ => false,
+            },
+        uses_residual_presence: false,
+        bound,
     };
     if !owner_inference.discards_dict_key_assignments()
         && let Some(value) = value
     {
         // A constructor establishes allocation even when its keys cannot be enumerated.
-        mapping.builtin = match value {
-            ast::Expr::Dict(_) => true,
-            ast::Expr::DictComp(_) => true,
-            ast::Expr::Call(call) => owner_inference
-                .try_expression_type(&call.func)
-                .and_then(Type::as_class_literal)
-                .is_some_and(|class| class.is_known(db, KnownClass::Dict)),
-            _ => false,
-        };
+        mapping.builtin = closed_typed_dict
+            || match value {
+                ast::Expr::Dict(_) => true,
+                ast::Expr::DictComp(_) => true,
+                ast::Expr::Call(call) => owner_inference
+                    .try_expression_type(&call.func)
+                    .and_then(Type::as_class_literal)
+                    .is_some_and(|class| class.is_known(db, KnownClass::Dict)),
+                _ => false,
+            };
         if PlaceExpr::try_from_expr(value).is_some() {
             let use_def = index.use_def_map(scope.file_scope_id(db));
             let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
             match snapshot_contents(db, scope, value, value.into(), bound_type, &cache) {
-                ContentsValue::Mapping(source) => mapping.builtin = source.builtin,
+                ContentsValue::Mapping(source) => mapping.builtin |= source.builtin,
                 ContentsValue::Pending => return ContentsValue::Pending,
                 ContentsValue::Unreachable => return ContentsValue::Unreachable,
                 ContentsValue::Unavailable => {}
@@ -606,7 +627,7 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         }
     }
     if bounded || shared || value.is_some_and(|value| PlaceExpr::try_from_expr(value).is_some()) {
-        mapping.expose(db);
+        mapping.expose(db, &env);
     }
     ContentsValue::Mapping(mapping)
 }
@@ -678,7 +699,7 @@ impl<'db> MappingTransfer<'db> {
             Self::Result(result) => result,
             Self::Keep => previous,
             Self::Expose => {
-                mapping.expose(db);
+                mapping.expose(db, env);
                 previous
             }
             Self::Set { key, value, source } => {
@@ -692,10 +713,8 @@ impl<'db> MappingTransfer<'db> {
             Self::Clear => {
                 mapping.dictionary = DictionaryItems {
                     items: Box::default(),
-                    extra_items: if mapping.exposed {
-                        DictionaryExtraItems::Value(
-                            mapping.value_bound.unwrap_or_else(Type::unknown),
-                        )
+                    extra_items: if mapping.uses_residual_presence {
+                        DictionaryExtraItems::Value(mapping.bound_value(db, env))
                     } else {
                         DictionaryExtraItems::Closed
                     },
@@ -710,8 +729,8 @@ impl<'db> MappingTransfer<'db> {
                 result.overlay(db, env, mapping.dictionary.clone());
                 result.overlay(db, env, dictionary);
                 mapping.dictionary = result.finish();
-                if mapping.exposed || retained {
-                    mapping.expose(db);
+                if mapping.uses_residual_presence || retained {
+                    mapping.expose(db, env);
                 }
                 previous
             }
@@ -862,10 +881,12 @@ fn mapping_transfer<'db>(
             let receiver = receiver.node(&module);
             let method = call.func.as_attribute_expr().filter(|attribute| {
                 PlaceExpr::try_from_expr(&*attribute.value) == PlaceExpr::try_from_expr(receiver)
-                    && inference
-                        .try_expression_type(receiver)
-                        .and_then(Type::as_nominal_instance)
-                        .is_some_and(|instance| instance.has_known_class(db, KnownClass::Dict))
+                    && inference.try_expression_type(receiver).is_some_and(|ty| {
+                        is_closed_typed_dict(db, ty)
+                            || ty.as_nominal_instance().is_some_and(|instance| {
+                                instance.has_known_class(db, KnownClass::Dict)
+                            })
+                    })
             });
             let Some(method) = method else {
                 return MappingTransfer::Expose;
@@ -1185,12 +1206,14 @@ pub(super) fn snapshot_contents<'db>(
     reachability: &ReachabilityEvaluationCache<'db>,
 ) -> ContentsValue<'db> {
     let observed = (|| {
-        if !super::has_dict_type(db, argument_type) {
+        let closed_typed_dict = is_closed_typed_dict(db, argument_type);
+        if !closed_typed_dict && !super::has_dict_type(db, argument_type) {
             return None;
         }
         // Only a proved For seed can observe an invariant dictionary union. Ordinary
         // assignment and capture unions retain their existing argument-matching fallback.
-        if argument_type.as_nominal_instance().is_none()
+        if !closed_typed_dict
+            && argument_type.as_nominal_instance().is_none()
             && super::records::for_binding(db, scope, expression).is_none()
         {
             return None;
@@ -1215,4 +1238,10 @@ pub(super) fn snapshot_contents<'db>(
         Some(contents) => contents,
         None => ContentsValue::Unavailable,
     }
+}
+
+fn is_closed_typed_dict(db: &dyn Db, ty: Type<'_>) -> bool {
+    ty.resolve_type_alias(db)
+        .as_typed_dict()
+        .is_some_and(|typed_dict| typed_dict.openness(db).is_closed())
 }

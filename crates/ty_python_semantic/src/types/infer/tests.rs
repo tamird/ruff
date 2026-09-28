@@ -1868,6 +1868,7 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         "/src/main.py",
         r#"
         from typing import Any, Callable, Literal, no_type_check
+        from typing_extensions import NotRequired, TypedDict
         from ty_extensions import Intersection
 
         class Factory:
@@ -1942,6 +1943,24 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
             values.pop("removed")
             needs_int(**values)
 
+        class Values(TypedDict, closed=True):
+            value: int
+            removed: NotRequired[int]
+
+        def typed_popped(values: Values) -> None:
+            values.pop("removed", None)
+            needs_int(**values)
+
+        def typed_reinserted(values: Values) -> None:
+            values.pop("removed", None)
+            values["removed"] = 0
+            needs_int(**values)  # ty: ignore[unknown-argument]
+
+        def typed_wrong_value(values: Values) -> None:
+            values.pop("removed", None)
+            values["value"] = "bad"  # ty: ignore[invalid-assignment]
+            needs_int(**values)  # ty: ignore[invalid-argument-type]
+
         def dead() -> None:
             if False:
                 accept(narrow)
@@ -1959,6 +1978,9 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         ("bad", true),
         ("good", false),
         ("popped", false),
+        ("typed_popped", false),
+        ("typed_reinserted", true),
+        ("typed_wrong_value", true),
         ("dead", false),
         ("suppressed", true),
         ("unchecked", true),

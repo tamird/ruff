@@ -49,6 +49,91 @@ def augmented_target():
     with_other(**values)  # error: [invalid-argument-type]
 ```
 
+## Closed TypedDict mutations
+
+A closed `TypedDict` describes every possible key. Removing an optional key lets a caller supply
+that keyword explicitly. The remaining fields retain their declared value types. These observations
+follow ordinary flow narrowing: indirect mutations through untracked aliases are not modeled.
+
+```py
+from typing import Callable
+from typing_extensions import NotRequired, ReadOnly, TypedDict
+
+class Values(TypedDict, closed=True):
+    value: int
+    note: NotRequired[str]
+
+def consume(value: int, note: str = ""): ...
+def popped(values: Values):
+    values.pop("note", None)
+    consume(note="replacement", **values)
+
+def deleted(values: Values):
+    del values["note"]
+    consume(note="replacement", **values)
+
+def conditional(values: Values, remove: bool):
+    if remove:
+        values.pop("note", None)
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def reinserted(values: Values):
+    values.pop("note", None)
+    values["note"] = "again"
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def updated(values: Values):
+    values.pop("note", None)
+    values.update(note="again")
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def wrong_value(values: Values):
+    values.pop("note", None)
+    values["value"] = "bad"  # error: [invalid-assignment]
+    consume(**values)  # error: [invalid-argument-type]
+```
+
+Passing the dictionary to an ordinary callable restores the declared possibilities. A returned value
+likewise follows its declared schema; a matching return annotation does not preserve deleted keys.
+
+```py
+def exposed(values: Values, mutate: Callable[[Values], None]):
+    values.pop("note", None)
+    mutate(values)
+    consume(note="replacement", **values)  # error: [parameter-already-assigned]
+
+def identity(values: Values) -> Values:
+    return values
+
+def returned(values: Values):
+    values.pop("note", None)
+    consume(note="replacement", **identity(values))  # error: [parameter-already-assigned]
+```
+
+Clearing a dictionary removes every key when its schema permits arbitrary deletion.
+
+```py
+class OptionalValues(TypedDict, closed=True):
+    value: NotRequired[int]
+    note: NotRequired[str]
+
+def cleared(values: OptionalValues):
+    values.clear()
+    consume(value=1, note="replacement", **values)
+```
+
+The declared schema still governs whether a write or deletion is valid.
+
+```py
+class Restricted(TypedDict, closed=True):
+    value: int
+    note: ReadOnly[NotRequired[str]]
+
+def restricted(values: Restricted):
+    values.pop("value")  # error: [invalid-argument-type]
+    del values["note"]  # error: [invalid-argument-type]
+```
+
 ## Opaque exposure
 
 Passing a dictionary to an ordinary callable leaves key presence uncertain. Known value refinements
