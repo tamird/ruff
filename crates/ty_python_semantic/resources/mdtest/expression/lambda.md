@@ -316,8 +316,10 @@ reveal_type(collect)  # revealed: (**kwargs: int) -> dict[str, int]
 wrong_operation: Collect = lambda **kwargs: (kwargs["value"].upper(), kwargs)[1]
 ```
 
-Named keyword inputs must be consumed by explicit lambda parameters before the remaining values can
-share the variadic type. A positional-only parameter cannot consume an argument passed by keyword.
+Explicit lambda parameters consume named keyword inputs. A positional-only parameter cannot consume
+an argument passed by keyword. Remaining named inputs keep their own types, so returning a
+dictionary that includes the string-valued name cannot satisfy a dictionary with only integer
+values.
 
 ```py
 class Named(Protocol):
@@ -333,33 +335,123 @@ keyword_named: KeywordNamed = lambda *, name="default", **kwargs: (
     reveal_type(kwargs),  # revealed: dict[str, int]
     kwargs,
 )[2]
-swallowed: KeywordNamed = lambda **kwargs: (reveal_type(kwargs), kwargs)[1]  # revealed: dict[str, Unknown]
+# error: [invalid-assignment]
+swallowed: KeywordNamed = lambda **kwargs: (reveal_type(kwargs["name"]), kwargs)[1]  # revealed: str
+# error: [invalid-assignment]
 positional_only: KeywordNamed = lambda name=0, /, **kwargs: (
-    reveal_type(kwargs),  # revealed: dict[str, Unknown]
+    reveal_type(kwargs["name"]),  # revealed: str
     kwargs,
 )[1]
 ```
 
-Closed unpacked fields and an unbound parameter specification do not provide a homogeneous
-remainder.
+An unbound parameter specification supplies no concrete keyword input types.
 
 ```py
 from typing import Callable, ParamSpec
-from typing_extensions import TypedDict, Unpack
-
-class Options(TypedDict, closed=True):
-    name: str
-    count: int
-
-class Unpacked(Protocol):
-    def __call__(self, **kwargs: Unpack[Options]) -> object: ...
-
-unpacked: Unpacked = lambda **kwargs: reveal_type(kwargs)  # revealed: dict[str, Unknown]
 
 P = ParamSpec("P")
 
 def configure(callback: Callable[P, None]) -> None:
     forwarded: Callable[P, None] = lambda *args, **kwargs: (reveal_type(kwargs), None)[1]  # revealed: dict[str, Unknown]
+```
+
+## Callback unpacked keyword parameters
+
+The callback's remaining keyword inputs describe the fresh kwargs dictionary. Required fields,
+optional fields and extra items retain their individual types.
+
+```py
+from typing import Protocol
+from typing_extensions import NotRequired, ReadOnly, TypedDict, Unpack
+
+class Options(TypedDict, closed=True):
+    count: int
+    suffix: NotRequired[str]
+
+class Callback(Protocol):
+    def __call__(self, *, name: str, **kwargs: Unpack[Options]) -> int: ...
+
+def consume(values: Options) -> int:
+    return values["count"]
+
+def ordinary(*, name: str, **kwargs: Unpack[Options]) -> int:
+    return consume(kwargs)
+
+ordinary_callback: Callback = ordinary
+direct: Callback = lambda *, name, **kwargs: consume(kwargs)
+read: Callback = lambda *, name, **kwargs: (
+    reveal_type(name),  # revealed: str
+    reveal_type(kwargs["count"]),  # revealed: int
+    reveal_type(kwargs.get("suffix")),  # revealed: str | None
+    kwargs["count"],
+)[3]
+# error: [unresolved-attribute]
+wrong_operation: Callback = lambda *, name, **kwargs: kwargs["count"].upper()
+
+direct(name="task", count=1)
+direct(name="task", count=1, suffix="!")
+# error: [missing-argument]
+direct(name="task")
+# error: [unknown-argument]
+direct(name="task", count=1, other=True)
+```
+
+Explicit extra items retain their value type alongside the named fields.
+
+```py
+class ExtraOptions(TypedDict, extra_items=bool):
+    count: int
+
+class ExtraCallback(Protocol):
+    def __call__(self, **kwargs: Unpack[ExtraOptions]) -> int: ...
+
+extra: ExtraCallback = lambda **kwargs: (
+    reveal_type(kwargs["count"]),  # revealed: int
+    reveal_type(kwargs["other"]),  # revealed: bool
+    kwargs["count"],
+)[2]
+
+extra(count=1, other=True)
+# error: [invalid-argument-type]
+extra(count=1, other="wrong")
+```
+
+The fresh kwargs dictionary can mutate a key declared read-only in the input contract.
+
+```py
+class ReadOnlyOptions(TypedDict, closed=True):
+    value: NotRequired[ReadOnly[int]]
+
+class CopyCallback(Protocol):
+    def __call__(self, **kwargs: Unpack[ReadOnlyOptions]) -> int | None: ...
+
+copy_callback: CopyCallback = lambda **kwargs: kwargs.pop("value", None)
+```
+
+An empty closed context supplies an empty dictionary. An unconsumed positional-or-keyword input may
+arrive through `*args`, so it does not establish a required key in kwargs.
+
+```py
+class Empty(TypedDict, closed=True):
+    pass
+
+class EmptyCallback(Protocol):
+    def __call__(self, **kwargs: Unpack[Empty]) -> None: ...
+
+def consume_empty(values: Empty) -> None:
+    pass
+
+empty: EmptyCallback = lambda **kwargs: consume_empty(kwargs)
+empty()
+# error: [unknown-argument]
+empty(other=True)
+
+class Positional(Protocol):
+    def __call__(self, count: int, **kwargs: str) -> object: ...
+
+ambiguous: Positional = lambda *args, **kwargs: reveal_type(kwargs)  # revealed: dict[str, Unknown]
+
+ambiguous_context: Callback | ExtraCallback = lambda **kwargs: (reveal_type(kwargs), 0)[1]  # revealed: dict[str, Unknown]
 ```
 
 ## Generic callback context

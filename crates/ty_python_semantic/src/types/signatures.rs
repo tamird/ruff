@@ -5889,7 +5889,7 @@ impl<'db> Parameter<'db> {
     ///
     /// A `TypedDict` field can then keep its declaration for navigation while diagnostics refer
     /// to the enclosing `**kwargs` parameter.
-    fn with_source_parameter_index(mut self, index: Option<usize>) -> Self {
+    pub(super) fn with_source_parameter_index(mut self, index: Option<usize>) -> Self {
         self.source_parameter_index = index
             .and_then(|index| u32::try_from(index).ok())
             .and_then(|index| index.checked_add(1))

@@ -28,9 +28,12 @@ use crate::{
             original_class_type,
         },
         relation::TypeRelation,
-        signatures::{Parameter, ReturnCallableTypeVarScope},
+        signatures::{Parameter, Parameters, ReturnCallableTypeVarScope},
         tuple::{TupleSpecBuilder, TupleType},
-        typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation,
+        typed_dict::{
+            TypedDictFieldBuilder, TypedDictOpenness, TypedDictSchema, TypedDictType,
+            extract_unpacked_typed_dict_keys_from_kwargs_annotation,
+        },
         typevar::TypeVarSet,
     },
 };
@@ -1686,19 +1689,72 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         definition: Definition<'db>,
     ) {
         let db = self.db();
-        let element_type = self.contextual_lambda_parameter(index, lambda).map_or(
-            Type::Dynamic(DynamicType::UnknownLambdaParameter),
-            Parameter::annotated_type,
-        );
-        let env = self.program_environment();
-        let inferred_ty = KnownClass::Dict.to_specialized_instance(
-            db,
-            env,
-            &[KnownClass::Str.to_instance(db, env), element_type],
-        );
+        let inferred_ty = self
+            .contextual_lambda_kwargs_type(index, lambda)
+            .unwrap_or_else(|| {
+                let env = self.program_environment();
+                KnownClass::Dict.to_specialized_instance(
+                    db,
+                    env,
+                    &[
+                        KnownClass::Str.to_instance(db, env),
+                        Type::Dynamic(DynamicType::UnknownLambdaParameter),
+                    ],
+                )
+            });
 
         self.add_binding(parameter.into(), definition)
             .insert(self, inferred_ty);
+    }
+
+    fn contextual_lambda_kwargs_type(
+        &mut self,
+        index: u32,
+        lambda: &'ast ast::ExprLambda,
+    ) -> Option<Type<'db>> {
+        let db = self.db();
+        let parameters = self.contextual_lambda_parameters(lambda)?;
+        let env = self.program_environment();
+        let mut fields = TypedDictSchema::default();
+        let mut extra_items = None;
+        for parameter in parameters
+            .iter()
+            .filter(|parameter| parameter.source_parameter_index() == Some(index as usize))
+        {
+            let ty = parameter.annotated_type();
+            if ty.has_provisional_marker(db, env) {
+                return None;
+            }
+            if let Some(name) = parameter.keyword_name() {
+                fields.insert(
+                    name.clone(),
+                    TypedDictFieldBuilder::new(ty)
+                        .required(!parameter.has_default())
+                        .build(),
+                );
+            } else if parameter.is_keyword_variadic() {
+                extra_items = Some(ty);
+            } else {
+                return None;
+            }
+        }
+        if fields.is_empty()
+            && let Some(element_type) = extra_items
+        {
+            return Some(KnownClass::Dict.to_specialized_instance(
+                db,
+                env,
+                &[KnownClass::Str.to_instance(db, env), element_type],
+            ));
+        }
+        // An empty group in a complete signature represents closed, empty kwargs.
+        // An unavailable context retains its Unknown kwargs slot instead.
+        let openness = extra_items.map_or(TypedDictOpenness::Closed, |ty| {
+            TypedDictOpenness::extra(db, ty, false)
+        });
+        Some(Type::TypedDict(
+            TypedDictType::from_schema_items_with_openness(db, fields, openness),
+        ))
     }
 
     /// Returns the contextual parameter from the lambda's inferred callable, if available.
@@ -1707,6 +1763,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         index: u32,
         lambda: &'ast ast::ExprLambda,
     ) -> Option<&'db Parameter<'db>> {
+        let db = self.db();
+        let parameters = self.contextual_lambda_parameters(lambda)?;
+        let parameter = parameters.get(index as usize)?;
+        (!parameter
+            .annotated_type()
+            .has_provisional_marker(db, self.program_environment()))
+        .then_some(parameter)
+    }
+
+    fn contextual_lambda_parameters(
+        &mut self,
+        lambda: &'ast ast::ExprLambda,
+    ) -> Option<&'db Parameters<'db>> {
         let db = self.db();
         let enclosing_stmt = infer_statement_types(
             self.db(),
@@ -1727,10 +1796,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         };
 
-        let parameter = signature.parameters().get(index as usize)?;
-        (!parameter
-            .annotated_type()
-            .has_provisional_marker(db, self.program_environment()))
-        .then_some(parameter)
+        Some(signature.parameters())
     }
 }
