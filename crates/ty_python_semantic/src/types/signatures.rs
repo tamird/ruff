@@ -1621,21 +1621,16 @@ impl<'db> Signature<'db> {
             .is_some_and(|parameter| parameter.is_positional() && parameter.inferred_annotation)
     }
 
-    /// Binds the `Self` receiver if it is unused in the rest of the signature.
-    ///
-    /// This is purely a performance optimization. Eagerly binding the type of `Self` prevents
-    /// unnecessary work from being performed by the constraint solver.
-    pub(super) fn bind_unused_self(
+    /// Returns the receiver's `Self` variable when it is independent of the rest of the signature.
+    pub(super) fn unused_self_typevar(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
-        self_type: Type<'db>,
-    ) -> Option<Self> {
+    ) -> Option<BoundTypeVarInstance<'db>> {
         let context = self.generic_context?;
         let receiver = self.parameters.get(0)?;
 
-        // Ensure `Self` is not used elsewhere in the signature, in which case eagerly binding it
-        // would be unsound.
+        // Self must be independent of the other parameters and the return type.
         if !receiver.is_positional() || self.needs_self_mapping(db, env, true) {
             return None;
         }
@@ -1650,13 +1645,7 @@ impl<'db> Signature<'db> {
             return None;
         }
 
-        // Also ensure that the receiver satisfies the upper bound of `Self`.
-        let bound = self_typevar.typevar(db).upper_bound(db, env)?;
-        if !self_type.is_assignable_to(db, env, bound) {
-            return None;
-        }
-
-        // And that `Self` is not referenced by any other type variable, in which case removing it
+        // Ensure `Self` is not referenced by any other type variable, since removing it
         // from the generic context may leave it unspecialized.
         //
         // TODO: References to `Self` inside of bounds or defaults should not generally be permitted
@@ -1683,6 +1672,26 @@ impl<'db> Signature<'db> {
             {
                 return None;
             }
+        }
+
+        Some(self_typevar)
+    }
+
+    /// Binds the `Self` receiver if it is unused in the rest of the signature.
+    ///
+    /// This is purely a performance optimization. Eagerly binding the type of `Self` prevents
+    /// unnecessary work from being performed by the constraint solver.
+    pub(super) fn bind_unused_self(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        self_type: Type<'db>,
+    ) -> Option<Self> {
+        let self_typevar = self.unused_self_typevar(db, env)?;
+        // Also ensure that the receiver satisfies the upper bound of `Self`.
+        let bound = self_typevar.typevar(db).upper_bound(db, env)?;
+        if !self_type.is_assignable_to(db, env, bound) {
+            return None;
         }
 
         let mapping =
@@ -5698,9 +5707,9 @@ pub struct Parameter<'db> {
 
     /// Does the type of this parameter come from an explicit annotation, or was it inferred from
     /// the context, like `Unknown` for any normal un-annotated parameter, `Self` for the `self`
-    /// parameter of instance method, or `type[Self]` for `cls` parameter of classmethods. This
-    /// field is only used to decide whether to display the annotated type; it has no effect on the
-    /// type semantics of the parameter.
+    /// parameter of instance methods, or `type[Self]` for `cls` parameters of classmethods.
+    /// Inferred receiver annotations describe the owner; explicit annotations constrain accepted
+    /// receivers. This field also controls whether the annotated type is displayed.
     pub(crate) inferred_annotation: bool,
 
     /// Syntax-level annotation kind for cases where the annotation has special parameter semantics.

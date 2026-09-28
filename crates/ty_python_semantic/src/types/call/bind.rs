@@ -7958,6 +7958,7 @@ impl<'db> Binding<'db> {
             return true;
         }
         let mut pairs = Vec::new();
+        let mut proved_receiver = None;
         let mut definitely_supplied = vec![false; parameters.len()];
         let mut supplied_keywords = FxHashSet::default();
         let mut has_keyword_remainder = false;
@@ -8077,7 +8078,25 @@ impl<'db> Binding<'db> {
                     let expected = matched_parameter
                         .expected_type
                         .unwrap_or_else(|| parameter.annotated_type());
-                    pairs.push((actual, expected));
+                    if index == 0
+                        && matches!(argument, Argument::Synthetic)
+                        && matched_parameter.index == 0
+                        && self.constructor_context.is_none()
+                        && let Type::BoundMethod(method) = self.callable_type
+                        && method.signature_receiver(db) == actual
+                        && self.signature.has_implicit_positional_receiver_annotation()
+                        && matches!(actual, Type::NominalInstance(_))
+                        && !actual.has_provisional_marker(db, env)
+                        && let Some(receiver) = self.signature.unused_self_typevar(db, env)
+                        && expected == Type::TypeVar(receiver)
+                        && receiver.typevar(db).upper_bound(db, env) == Some(actual)
+                    {
+                        // Binding established this exact nominal receiver. An inferred, unused
+                        // Self adds no input restriction on its already selected class arguments.
+                        proved_receiver = Some(receiver);
+                    } else {
+                        pairs.push((actual, expected));
+                    }
                     true
                 });
                 // Different keyword sources must be disjoint even when they all feed **kwargs.
@@ -8146,6 +8165,22 @@ impl<'db> Binding<'db> {
             || (capture_supported
                 && self.signature.generic_context.is_some()
                 && specialization.is_some_and(|specialization| {
+                    let specialization = if let Some(receiver) = proved_receiver {
+                        let context = GenericContext::from_typevar_instances(
+                            db,
+                            env,
+                            specialization
+                                .generic_context(db)
+                                .variables(db)
+                                .filter(|variable| variable.identity(db) != receiver.identity(db)),
+                        );
+                        let Some(specialization) = specialization.restrict(db, context) else {
+                            return false;
+                        };
+                        specialization
+                    } else {
+                        specialization
+                    };
                     generic_arguments_satisfy_declared_parameters(db, env, specialization, &pairs)
                 }))
     }
@@ -10979,6 +11014,7 @@ mod tests {
 
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::global_symbol;
+    use crate::types::BoundMethodType;
     use crate::types::constraints::resolution::SolutionType::Resolved;
     use crate::types::generics::TypeVarInferenceSolutions;
 
@@ -11290,9 +11326,25 @@ mod tests {
         db.write_dedented(
             "/src/a.py",
             r#"
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, cast
+from typing_extensions import Self
 
-class Box[T]: ...
+class Box[T]:
+    def accept(self, value: T) -> None: ...
+    def explicit(self: "Box[int]", value: int) -> None: ...
+
+class Ops:
+    def transport[K, V](self, value: dict[K, V]) -> None: ...
+
+class Holder[K, V]:
+    def transport[A, B](self, value: dict[A, B]) -> None: ...
+    def peer(self, other: Self) -> None: ...
+    def clone(self) -> Self: ...
+    def explicit[A, B](self: "Holder[str, int]", value: dict[A, B]) -> None: ...
+
+def attached[K, V](receiver, value: dict[K, V]) -> None: ...
+class Unrelated: ...
+
 type Identity[T] = T
 
 def list_kind[T](value: list[T]) -> str: ...
@@ -11308,7 +11360,29 @@ def put[T](values: list[T], value: T) -> None: ...
 def apply[T](callback: Callable[[T], int], value: T) -> int: ...
 def identity[T](value: list[T]) -> list[T]: ...
 
-opaque_box: Box
+opaque_box = cast(Box, None)
+ops = cast(Ops, None)
+opaque_holder = cast(Holder, None)
+static_holder = cast(Holder[str, int], None)
+incompatible_holder = cast(Holder[int, str], None)
+opaque_dict = cast(dict, None)
+static_dict = cast(dict[str, int], None)
+opaque_list = cast(list, None)
+ops_transport = ops.transport
+opaque_transport = opaque_holder.transport
+peer = opaque_holder.peer
+clone = opaque_holder.clone
+unrelated = cast(Unrelated, None)
+static_explicit = static_holder.explicit
+static_transport = static_holder.transport
+explicit_transport = opaque_holder.explicit
+incompatible_transport = incompatible_holder.explicit
+box_accept = opaque_box.accept
+box_explicit = opaque_box.explicit
+list_append = opaque_list.append
+opaque_or = opaque_dict.__or__
+static_or = static_dict.__or__
+unbound_or = dict.__or__
 "#,
         )?;
         let db = &db;
@@ -11388,6 +11462,113 @@ opaque_box: Box
                 assert_eq!(ordinary_return, list(unknown));
                 assert!(!ordinary_return.satisfies_declared_output(db, &env, list(str)));
             }
+        }
+
+        // Bound inferred receivers establish their own nominal domain. Independent method
+        // variables still preserve opaque inputs, while explicit and correlated domains remain
+        // obligations. Unbound and attached free functions do not inherit that receiver fact.
+        let Type::BoundMethod(transport) = lookup("opaque_transport") else {
+            panic!("expected a bound transport method");
+        };
+        let unrelated = Type::BoundMethod(transport.map_self_type(db, |_| lookup("unrelated")));
+        let Type::FunctionLiteral(attached) = lookup("attached") else {
+            panic!("expected a free function");
+        };
+        let attached = Type::BoundMethod(BoundMethodType::new(db, attached, lookup("ops")));
+        for (name, actuals, accepted, proved) in [
+            ("ops_transport", vec![dict(unknown, unknown)], true, true),
+            ("static_transport", vec![dict(unknown, unknown)], true, true),
+            ("static_explicit", vec![dict(unknown, unknown)], true, true),
+            ("explicit_transport", vec![dict(str, int)], true, false),
+            ("incompatible_transport", vec![dict(str, int)], false, false),
+            ("box_accept", vec![int], true, false),
+            ("box_explicit", vec![int], true, false),
+            ("list_append", vec![int], true, false),
+            ("peer", vec![lookup("opaque_holder")], true, false),
+            ("clone", vec![], true, false),
+            ("attached_transport", vec![dict(str, int)], true, false),
+            ("unrelated_transport", vec![dict(str, int)], false, false),
+            (
+                "unbound_or",
+                vec![dict(unknown, unknown), dict(str, int)],
+                true,
+                false,
+            ),
+            ("opaque_transport", vec![dict(unknown, unknown)], true, true),
+            ("opaque_transport", vec![dict(str, int)], true, true),
+            ("opaque_or", vec![dict(unknown, unknown)], true, true),
+            ("opaque_or", vec![dict(str, int)], true, true),
+            ("static_or", vec![dict(unknown, unknown)], true, true),
+            ("static_or", vec![dict(str, int)], true, true),
+        ] {
+            let arguments = CallArguments::positional(actuals).with_input_proof_request(true);
+            let callable = match name {
+                "attached_transport" => attached,
+                "unrelated_transport" => unrelated,
+                _ => lookup(name),
+            };
+            let result = callable
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &ConstraintSetBuilder::new(),
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                );
+            assert_eq!(result.is_ok(), accepted, "{name}");
+            let bindings = match result {
+                Ok(bindings) => bindings,
+                Err(CallError(_, bindings)) => *bindings,
+            };
+            if name == "clone" {
+                let Ok(callable) = bindings.iter_flat().exactly_one() else {
+                    panic!("expected one clone callable");
+                };
+                let Ok((_, binding)) = callable.matching_overloads().exactly_one() else {
+                    panic!("expected one clone overload");
+                };
+                assert!(
+                    binding.signature.return_type().contains_self(db, &env),
+                    "the selected clone signature must retain Self",
+                );
+                let returned = bindings.return_type(db, &env);
+                assert_eq!(returned, lookup("opaque_holder"));
+                assert!(
+                    !returned.satisfies_declared_output(db, &env, lookup("static_holder")),
+                    "unknown class arguments must not prove a concrete output",
+                );
+            }
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                proved,
+                "{name}",
+            );
+        }
+        for (left, right) in [
+            (dict(unknown, unknown), dict(unknown, unknown)),
+            (dict(unknown, unknown), dict(str, int)),
+            (dict(str, int), dict(unknown, unknown)),
+            (dict(str, int), dict(str, int)),
+        ] {
+            let result = Type::try_call_bin_op_result(
+                db,
+                &env,
+                left,
+                ast::Operator::BitOr,
+                right,
+                MemberLookupPolicy::default(),
+                true,
+            )
+            .expect("dictionary union is callable");
+            assert!(
+                result.arguments_proved,
+                "{} | {}",
+                left.display(db, &env),
+                right.display(db, &env),
+            );
         }
 
         // A static solution containing a rigid variable is still conditional on that variable.
