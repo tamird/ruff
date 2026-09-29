@@ -493,9 +493,12 @@ fn runtime_type_test_literal(expression: &ast::Expr) -> bool {
         | ast::Expr::NumberLiteral(_)
         | ast::Expr::BooleanLiteral(_)
         | ast::Expr::NoneLiteral(_) => true,
-        ast::Expr::List(list) => list.elts.is_empty(),
-        ast::Expr::Dict(dict) => dict.items.is_empty(),
-        ast::Expr::Tuple(tuple) => tuple.elts.is_empty(),
+        ast::Expr::List(list) => list.elts.iter().all(runtime_type_test_literal),
+        ast::Expr::Dict(dict) => dict.items.iter().all(|item| {
+            item.key.as_ref().is_some_and(runtime_type_test_literal)
+                && runtime_type_test_literal(&item.value)
+        }),
+        ast::Expr::Tuple(tuple) => tuple.elts.iter().all(runtime_type_test_literal),
         _ => false,
     }
 }
