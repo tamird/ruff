@@ -578,6 +578,134 @@ def unions_are_different(t1: int | str, t2: int | str) -> int | str:
     return t1 + t2
 ```
 
+## Fresh returns after narrowing constrained typevars
+
+A constrained return type refers to the selected constraint. Narrowing the input can distinguish
+which constraints remain possible, while a fresh result has its own inferred type.
+
+```py
+from typing import TypeVar
+
+class IntList(list[int]): ...
+
+T = TypeVar("T", str, list[int])
+
+def copy_list(value: T) -> T:
+    if isinstance(value, list):
+        reveal_type(value)  # revealed: T@copy_list & list[int]
+        copied = list(value)
+        reveal_type(copied)  # revealed: list[int]
+        return copied
+    return value
+
+def fresh_list(value: T) -> T:
+    if isinstance(value, list):
+        return [1]
+    return ""
+
+def identity(value: T) -> T:
+    if isinstance(value, list):
+        return value
+    return value
+
+reveal_type(copy_list(IntList()))  # revealed: list[int]
+reveal_type(identity(IntList()))  # revealed: list[int]
+```
+
+The same membership test can come from a `TypeIs` function. A reassigned local no longer carries
+information about the original type variable.
+
+```py
+from typing import Any
+from typing_extensions import TypeIs
+
+def is_list(value: object) -> TypeIs[list[Any]]:
+    return isinstance(value, list)
+
+def copy_with_typeis(value: T) -> T:
+    if is_list(value=value):
+        reveal_type(value)  # revealed: T@copy_with_typeis & list[int]
+        copied = list(value)
+        reveal_type(copied)  # revealed: list[int]
+        return copied
+    return value
+
+def rebound(value: T) -> T:
+    probe = value
+    probe = [1]
+    if is_list(probe):
+        return probe  # error: [invalid-return-type]
+    return value
+```
+
+A wrong element type or an unguarded list result cannot satisfy every remaining constraint. An upper
+bound also permits a list subclass, whose identity a fresh list does not preserve.
+
+```py
+def wrong_elements(value: T) -> T:
+    if isinstance(value, list):
+        return ["wrong"]  # error: [invalid-return-type]
+    return value
+
+def unguarded(value: T) -> T:
+    return [1]  # error: [invalid-return-type]
+
+BoundedT = TypeVar("BoundedT", bound=list[int])
+
+def bounded(value: BoundedT) -> BoundedT:
+    return list(value)  # error: [invalid-return-type]
+
+AmbiguousT = TypeVar("AmbiguousT", str, list[int], list[str])
+
+def ambiguous_lists(value: AmbiguousT) -> AmbiguousT:
+    if isinstance(value, list):
+        return [1]  # error: [invalid-return-type]
+    return value
+```
+
+A union containing a separate list alternative does not identify the type variable's choice.
+`TypeGuard` replacement also cannot exclude the original container constraint.
+
+```py
+from typing_extensions import TypeGuard
+
+def unrelated_list(value: T | list[int]) -> T:
+    if is_list(value):
+        return [1]  # error: [invalid-return-type]
+    return value
+
+def integer_items(value: object) -> TypeGuard[list[int]]:
+    return isinstance(value, list) and all(isinstance(item, int) for item in value)
+
+R = TypeVar("R", list[int], list[str])
+
+def replaced(value: R) -> R:
+    if integer_items(value):
+        return [1]  # error: [invalid-return-type]
+    return value
+```
+
+Nominal constraints may overlap. An instance of `Both` can use the `Q` constraint and still pass a
+`P` check, so returning a fresh `P` is insufficient.
+
+```py
+class P: ...
+class Q: ...
+class Both(P, Q): ...
+
+OverlappingT = TypeVar("OverlappingT", P, Q)
+
+def overlapping(value: OverlappingT) -> OverlappingT:
+    if isinstance(value, P):
+        return P()  # error: [invalid-return-type]
+    return value
+
+def receives_q(value: Q) -> Q:
+    return overlapping(value)
+
+receives_q(Both())
+```
+
 ## Equality with constrained typevars
 
 `False` compares equal to `0` without belonging to `Literal[0]`. Comparing it with a constrained

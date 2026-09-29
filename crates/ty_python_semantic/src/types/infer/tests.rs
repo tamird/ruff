@@ -880,6 +880,78 @@ def make({parameters}) -> None:
 }
 
 #[test]
+fn constrained_returns_preserve_gradual_input_bounds() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .build()?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, TypeIs
+
+        def is_list(value: object) -> TypeIs[list[Any]]:
+            return isinstance(value, list)
+
+        def copy[T: (str, list[Any])](value: T) -> T:
+            if is_list(value):
+                return list(value)
+            return value
+
+        def mutate[T: (str, list[Any])](value: T) -> None:
+            if is_list(value):
+                value.append(1)
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let names = ["copy", "mutate"];
+    let signatures = |db: &TestDb| {
+        names.map(|name| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let original = signatures(&db);
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Conservative,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((file, names.map(str::to_owned).to_vec(), mode)));
+        let module = program_file(&db, file);
+        let model = crate::SemanticModel::new(&db, module);
+        let facts = model
+            .function_inference_facts(first_public_binding(&db, file, "copy"))
+            .unwrap();
+        assert!(!facts.has_checking_failures, "{mode:?}: {facts:?}");
+        assert_eq!(
+            facts.return_type_correspondence,
+            (mode == FunctionInferenceMode::OutputProof).then_some(true),
+            "{mode:?}"
+        );
+        let diagnostics = check_types(&db, module);
+        let ids = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            if mode == FunctionInferenceMode::Conservative {
+                vec!["invalid-argument-type"]
+            } else {
+                vec![]
+            },
+            "{mode:?}: {diagnostics:#?}"
+        );
+        assert_eq!(signatures(&db), original);
+    }
+    Ok(())
+}
+
+#[test]
 fn conservative_lambda_inputs() -> anyhow::Result<()> {
     use crate::HasType;
     use ty_python_core::scope::NodeWithScopeRef;
