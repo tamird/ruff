@@ -139,29 +139,56 @@ pub(crate) fn infer_narrowing_constraints<'db>(
     }
 }
 
-/// Prove a single returned runtime type comparison from the original argument.
+/// Check a returned type predicate against the original argument domain.
 ///
 /// The function-body owner excludes preceding statements and branches. Operand
 /// origins are resolved separately from occurrence narrowing: a predicate call
 /// or a narrowed local alias cannot supply the classifier or comparison value.
-pub(super) fn type_guard_return_implication<'db>(
+pub(super) fn type_predicate_return_correspondence<'db>(
     db: &'db dyn Db,
     parameter: Definition<'db>,
     domain: Type<'db>,
-    target: Type<'db>,
+    predicate: Type<'db>,
     expression: &ast::Expr,
     inferred_type: impl Fn(&ast::Expr) -> Type<'db>,
 ) -> Option<bool> {
     let scope = parameter.scope(db);
     let env = ProgramEnvironment::from_scope(scope);
-    if [domain, target].into_iter().any(|ty| {
-        !ty.is_fully_static(db, &env)
-            || super::visitor::any_over_type_expanding_aliases(db, &env, ty, |nested| {
-                matches!(nested, Type::TypeVar(_))
-            })
-    }) {
-        return None;
-    }
+    let target = match predicate {
+        Type::TypeGuard(guard) => {
+            let target = guard.return_type(db);
+            if [domain, target].into_iter().any(|ty| {
+                !ty.is_fully_static(db, &env)
+                    || super::visitor::any_over_type_expanding_aliases(db, &env, ty, |nested| {
+                        matches!(nested, Type::TypeVar(_))
+                    })
+            }) {
+                return None;
+            }
+            target
+        }
+        Type::TypeIs(type_is) => {
+            let target = type_is.return_type(db);
+            if !domain.is_fully_static(db, &env)
+                || !target.is_fully_static_except_any(db, &env)
+                || [domain, target].into_iter().any(|ty| {
+                    ty.has_indeterminate_inference(db, &env)
+                        || super::visitor::any_over_type_expanding_aliases(db, &env, ty, |nested| {
+                            matches!(nested, Type::TypeVar(_))
+                        })
+                })
+            {
+                return None;
+            }
+            // Borrowed annotations have no source return annotation for the
+            // ordinary TypeIs legality check to validate.
+            if !target.is_assignable_to(db, &env, domain) {
+                return Some(false);
+            }
+            target
+        }
+        _ => return None,
+    };
     let ast::Expr::Compare(comparison) = expression else {
         return None;
     };
@@ -200,20 +227,48 @@ pub(super) fn type_guard_return_implication<'db>(
     {
         return None;
     }
-    let narrowed = NarrowingConstraint::intersection(domain)
-        .merge_constraint_and(test.constraint(db, &env))
-        .evaluate_constraint_type(db, &env);
-    // Unknown element types can still fulfill readonly output requirements.
-    // Recovery types cannot establish the predicate's implication.
-    if super::visitor::any_over_type_expanding_aliases(db, &env, narrowed, |ty| {
-        matches!(ty, Type::Divergent(_))
-            || ty
-                .as_dynamic()
-                .is_some_and(super::DynamicType::is_provisional_marker)
-    }) {
-        return None;
+    let narrow = |test: RuntimeTypeTest<'db, '_>| {
+        let narrowed = NarrowingConstraint::intersection(domain)
+            .merge_constraint_and(test.constraint(db, &env))
+            .evaluate_constraint_type(db, &env);
+        // Unknown element types can still fulfill readonly output requirements.
+        // Recovery types cannot establish the predicate's correspondence.
+        if super::visitor::any_over_type_expanding_aliases(db, &env, narrowed, |ty| {
+            matches!(ty, Type::Divergent(_))
+                || ty
+                    .as_dynamic()
+                    .is_some_and(super::DynamicType::is_provisional_marker)
+        }) {
+            return None;
+        }
+        Some(narrowed)
+    };
+    let positive = narrow(test)?;
+    match predicate {
+        Type::TypeGuard(_) => Some(positive.satisfies_declared_output(db, &env, target)),
+        Type::TypeIs(_) => {
+            // Construct the negative test independently: exact-class checks
+            // cannot exclude subclasses of a non-final Python class.
+            let negative_test = RuntimeTypeTest::from_comparison(
+                db,
+                scope,
+                operand,
+                compared_type,
+                *op,
+                false,
+                &|_| callable,
+            )?;
+            let negative = narrow(negative_test)?;
+            // TypeIs establishes membership while preserving the caller's
+            // materialization, including existing mutable element bounds.
+            let membership = target.top_materialization(db, &env);
+            Some(
+                positive.is_subtype_of(db, &env, membership)
+                    && negative.is_disjoint_from(db, &env, membership),
+            )
+        }
+        _ => None,
     }
-    Some(narrowed.satisfies_declared_output(db, &env, target))
 }
 
 enum RuntimeTypeTestName<'db> {
