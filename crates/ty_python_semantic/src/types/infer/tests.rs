@@ -2262,6 +2262,27 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         def good() -> None:
             accept(lambda values: None)
 
+        def optional_result[K: str, V](callback: Callable[[object], dict[K, V] | None]) -> None:
+            pass
+
+        def optional_key[K: str, V](callback: Callable[[object], dict[K, V] | None], key: K) -> None:
+            pass
+
+        def optional_callback(callback: Callable[[object], None]) -> None:
+            optional_result(callback)
+
+        def optional_callback_any(callback: Callable[[object], Any]) -> None:
+            optional_result(callback)
+
+        def optional_callback_narrow(callback: Callable[[str], None]) -> None:
+            optional_result(callback)  # ty: ignore[invalid-argument-type]
+
+        def optional_callback_wrong(callback: Callable[[object], None | int]) -> None:
+            optional_result(callback)  # ty: ignore[invalid-argument-type]
+
+        def optional_callback_key(callback: Callable[[object], None]) -> None:
+            optional_key(callback, 1)  # ty: ignore[invalid-argument-type]
+
         def finite_consume(value: int, left: None = None, right: None = None) -> None:
             pass
 
@@ -2416,6 +2437,11 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
     let cases = [
         ("bad", true),
         ("good", false),
+        ("optional_callback", false),
+        ("optional_callback_any", true),
+        ("optional_callback_narrow", true),
+        ("optional_callback_wrong", true),
+        ("optional_callback_key", true),
         ("popped", false),
         ("finite_write", false),
         ("finite_write_required", true),

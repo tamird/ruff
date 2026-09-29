@@ -8132,15 +8132,12 @@ impl<'db> Binding<'db> {
             None => self.signature.generic_context.is_none(),
         };
         if !complete_inference {
-            // Omitted parameters and result-only variables need no supplied-value proof. Check
-            // independent raw pairs before applying any recovery specialization.
+            // The rigid relation can prove a pair for every choice of the formal's variables.
+            // Inferable variables in the supplied type still depend on unfinished inference.
             return pairs.iter().all(|(actual, expected)| {
-                [*actual, *expected].into_iter().all(|ty| {
-                    !any_over_type(db, env, ty, true, |ty| {
-                        ty.as_typevar().is_some_and(|typevar| {
-                            typevar.is_inferable(db, self.inferable_typevars)
-                        })
-                    })
+                !any_over_type(db, env, *actual, true, |ty| {
+                    ty.as_typevar()
+                        .is_some_and(|typevar| typevar.is_inferable(db, self.inferable_typevars))
                 }) && pair_is_proved(*actual, *expected)
             });
         }
@@ -11023,6 +11020,8 @@ impl<'db> ClassInfoValidator<'_, 'db> {
 // return types or diagnostics, making retained correlations and completeness observable.
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     use ruff_db::files::system_path_to_file;
@@ -11403,19 +11402,39 @@ mod tests {
             def bounded[T: int](value: object, unused: T = ...) -> T: ...
             def closed[T](callback: Callable[[Any], None], unused: T = ...) -> T: ...
             def dependent[T](value: T) -> T: ...
+            def unresolved_actual[T, U](value: T) -> U: ...
             def narrow(value: str) -> None: ...
+            def optional[K: str, V](callback: Callable[[object], dict[K, V] | None]) -> None: ...
+            def no_result(value: object) -> None: ...
+            def gradual_input(value: Any) -> None: ...
             "#,
         )?;
         let db = &db;
         let env = db.program_environment();
         let file = system_path_to_file(db, "/src/a.pyi")?;
         let file = ProgramFile::new(db, file, env.program(db));
-        let narrow = global_symbol(db, file, "narrow").place.expect_type();
+        let lookup = |name| global_symbol(db, file, name).place.expect_type();
+        let narrow = lookup("narrow");
+        let Type::FunctionLiteral(unresolved) = lookup("unresolved_actual") else {
+            panic!("expected a function");
+        };
+        let Some((variable, _result_variable)) = unresolved
+            .last_definition_signature(db)
+            .generic_context
+            .unwrap()
+            .variables(db)
+            .collect_tuple()
+        else {
+            panic!("expected two type variables");
+        };
         for (name, argument, expected) in [
             ("produce", Type::int_literal(1), true),
+            ("unresolved_actual", Type::TypeVar(variable), false),
             ("bounded", Type::int_literal(1), true),
             ("closed", narrow, false),
             ("dependent", Type::unknown(), false),
+            ("optional", lookup("no_result"), true),
+            ("optional", lookup("gradual_input"), false),
         ] {
             let callable = global_symbol(db, file, name).place.expect_type();
             let arguments = CallArguments::positional([argument]);
@@ -11433,12 +11452,6 @@ mod tests {
                 )
                 .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
             let ordinary_return = bindings.return_type(db, &env);
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                expected,
-                "{name}",
-            );
-            assert_eq!(bindings.return_type(db, &env), ordinary_return);
             let Ok(callable) = bindings
                 .argument_correspondence_callables(&arguments)
                 .unwrap()
@@ -11450,15 +11463,28 @@ mod tests {
                 panic!("expected one matching overload for {name}");
             };
             let solutions = binding.inference.unwrap().solutions(db);
-            if name == "produce" {
-                assert!(ordinary_return.is_unknown());
-                assert!(matches!(
-                    solutions,
-                    TypeVarInferenceSolutions::Unavailable(_)
-                ));
-            } else if name == "dependent" {
-                assert!(matches!(solutions, TypeVarInferenceSolutions::Single));
+            if argument == Type::TypeVar(variable) {
+                assert!(variable.is_inferable(db, binding.inferable_typevars));
+                let parameter = binding.signature.parameters().iter().exactly_one().unwrap();
+                assert_eq!(parameter.annotated_type(), argument);
+                assert!(argument.is_subtype_of(db, &env, parameter.annotated_type()));
             }
+            if name == "dependent" {
+                assert_matches!(solutions, TypeVarInferenceSolutions::Single);
+            } else {
+                assert_matches!(solutions, TypeVarInferenceSolutions::Unavailable(_));
+            }
+            if name == "optional" {
+                assert_eq!(ordinary_return, Type::none(db, &env));
+            } else {
+                assert!(ordinary_return.is_unknown());
+            }
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                expected,
+                "{name}",
+            );
+            assert_eq!(bindings.return_type(db, &env), ordinary_return);
         }
         Ok(())
     }
