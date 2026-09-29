@@ -114,24 +114,6 @@ impl PredicateOrLiteral<'_> {
     }
 }
 
-/// A stable key for call-completion queries. Creating it while building predicates lets cached
-/// queries use its ID directly, without looking up its components in Salsa's intern table again.
-#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
-pub struct CallableAndCallExpr<'db> {
-    #[returns(copy)]
-    pub callable: Expression<'db>,
-    #[returns(copy)]
-    pub call_expr: Expression<'db>,
-    /// Whether the call is wrapped in an `await` expression. If `true`, `call_expr` refers to the
-    /// `await` expression rather than the call itself. This is used to detect terminal `await`s of
-    /// async functions that return `Never`.
-    #[returns(copy)]
-    pub is_await: bool,
-}
-
-// The Salsa heap is tracked separately.
-impl get_size2::GetSize for CallableAndCallExpr<'_> {}
-
 /// A call whose completion determines whether an expression statement can continue.
 #[derive(Debug)]
 pub struct StatementCall<'ast> {
@@ -216,7 +198,7 @@ pub enum PredicateNode<'db> {
     /// [`crate::Truthiness::Ambiguous`], even if the return type of the
     /// call is `Unknown`/`Any`, because that would result in too many false
     /// positives.
-    IsNonTerminalCall(CallableAndCallExpr<'db>),
+    IsNonTerminalCall(Expression<'db>),
     /// A receiver value whose subscription completed normally. This constrains only the
     /// captured receiver bindings; it does not establish scope-wide reachability.
     SuccessfulSubscript {

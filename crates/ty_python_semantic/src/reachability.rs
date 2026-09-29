@@ -222,13 +222,13 @@ use ty_python_core::{
     Truthiness, UseDefMap,
     ast_ids::HasScopedUseId,
     definition::{BindingsOwner, Definition, DefinitionKind, DefinitionState},
-    expression::Expression,
+    expression::{Expression, ExpressionKind},
     narrowing_constraints::{NarrowingConstraints, ScopedNarrowingConstraint},
     place::ScopedPlaceId,
     place_table,
     predicate::{
-        BooleanGuard, CallableAndCallExpr, PatternPredicate, PatternPredicateKind, Predicate,
-        PredicateNode, ScopedPredicateId,
+        BooleanGuard, PatternPredicate, PatternPredicateKind, Predicate, PredicateNode,
+        ScopedPredicateId, StatementCall,
     },
     reachability_constraints::{
         ReachabilityAtom, ReachabilityConstraints, ScopedReachabilityConstraintId,
@@ -553,7 +553,7 @@ fn predicate_scope<'db>(db: &'db dyn Db, predicate: &Predicate<'db>) -> ScopeId<
         | PredicateNode::Condition(expression)
         | PredicateNode::ChainedComparisonCondition(expression)
         | PredicateNode::ContextManagerSuppresses { expression, .. } => expression.scope(db),
-        PredicateNode::IsNonTerminalCall(call) => call.callable(db).scope(db),
+        PredicateNode::IsNonTerminalCall(call) => call.scope(db),
         PredicateNode::SuccessfulSubscript { receiver, key: _ } => receiver.scope(db),
         PredicateNode::Pattern(pattern) => pattern.scope(db),
         PredicateNode::FinallyNormalPathImpossible { scope, .. } => scope,
@@ -1782,8 +1782,23 @@ fn analyze_single_pattern_predicate_kind<'db>(
     },
     heap_size = get_size2::GetSize::get_heap_size
 )]
-fn analyze_non_terminal_call<'db>(db: &'db dyn Db, call: CallableAndCallExpr<'db>) -> Truthiness {
-    let callable = call.callable(db);
+fn analyze_non_terminal_call<'db>(db: &'db dyn Db, call_expr: Expression<'db>) -> Truthiness {
+    let file = call_expr.program_file(db);
+    let module = parsed_module(db, file.python_file(db)).load(db);
+    let Some(StatementCall { call, is_await }) =
+        StatementCall::from_expression(call_expr.node_ref(db).node(&module))
+    else {
+        // A tracked expression can refer to a different kind of node after an edit.
+        return Truthiness::AlwaysTrue;
+    };
+    let Some(callable) =
+        ty_python_core::semantic_index(db, file).try_expression(call.func.as_ref())
+    else {
+        return Truthiness::AlwaysTrue;
+    };
+    if callable.kind(db) != ExpressionKind::Callee {
+        return Truthiness::AlwaysTrue;
+    }
     let env = ProgramEnvironment::from_scope(callable.scope(db));
     // We first infer just the type of the callable. In the most likely case that the function is
     // not marked with `NoReturn`, or that it always returns `NoReturn`, doing so allows us to avoid
@@ -1793,8 +1808,8 @@ fn analyze_non_terminal_call<'db>(db: &'db dyn Db, call: CallableAndCallExpr<'db
     // add them on all statement-level function calls.
     let ty = infer_same_file_expression_type(db, callable, TypeContext::default());
 
-    is_non_terminal_call(db, &env, ty, call.is_await(db), || {
-        infer_same_file_expression_type(db, call.call_expr(db), TypeContext::default())
+    is_non_terminal_call(db, &env, ty, is_await, || {
+        infer_same_file_expression_type(db, call_expr, TypeContext::default())
     })
 }
 
@@ -2539,8 +2554,9 @@ impl<'db> DeclarationsIteratorExtension<'db> for DeclarationsIterator<'_, 'db> {
 mod tests {
     use super::*;
     use crate::db::tests::setup_db;
-    use ruff_db::files::system_path_to_file;
-    use ruff_db::system::DbWithWritableSystem as _;
+    use ruff_db::Db as _;
+    use ruff_db::files::{FileRootKind, system_path_to_file};
+    use ruff_db::system::{DbWithWritableSystem as _, SystemPath};
     use salsa::Database as _;
     use ty_python_core::ProgramFile;
     use ty_python_core::narrowing_constraints::InteriorNode;
@@ -2689,6 +2705,105 @@ class TargetB:
             evaluate_reachability_constraint(&db, scope, use_def.end_of_scope_reachability(),)
                 .is_always_false()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn non_terminal_call_follows_reused_expression_after_edits() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let mut previous_id = None;
+        for (statement, expected) in [
+            ("stop()", Truthiness::AlwaysFalse),
+            ("if flag: pass", Truthiness::AlwaysTrue),
+            ("if stop(): pass", Truthiness::AlwaysTrue),
+            ("await stop_async()", Truthiness::AlwaysFalse),
+            ("stop_async()", Truthiness::AlwaysTrue),
+        ] {
+            let source = format!(
+                "from typing import NoReturn\ndef stop() -> NoReturn: ...\nasync def stop_async() -> NoReturn: ...\nasync def f(flag: bool):\n    {statement}\n"
+            );
+            db.write_file("/src/test.py", source)?;
+            let file = system_path_to_file(&db, "/src/test.py")?;
+            let program = ProgramFile::new(&db, file, db.program_environment().program(&db));
+            let parsed = parsed_module(&db, program.python_file(&db)).load(&db);
+            let function = parsed
+                .syntax()
+                .body
+                .last()
+                .unwrap()
+                .as_function_def_stmt()
+                .unwrap();
+            let node = match &function.body[0] {
+                ast::Stmt::Expr(statement) => statement.value.as_ref(),
+                ast::Stmt::If(statement) => statement.test.as_ref(),
+                statement => panic!("unexpected fixture statement: {statement:?}"),
+            };
+            let expression = semantic_index(&db, program).expression(node);
+            let id = salsa::plumbing::AsId::as_id(&expression);
+            if let Some(previous) = previous_id {
+                assert_eq!(id, previous, "the edit must reuse the warmed expression");
+            }
+            previous_id = Some(id);
+            assert_eq!(
+                analyze_non_terminal_call(&db, expression),
+                expected,
+                "{statement}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn statement_call_index_survives_unrelated_revisions() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        // Project files have LOW durability, so their interned call keys can be reclaimed.
+        let root =
+            db.files()
+                .try_add_root(&db, SystemPath::new("/src/project"), FileRootKind::Project);
+        assert_eq!(root.kind_at_time_of_creation(&db), FileRootKind::Project);
+        let source = format!("def run(callback):\n{}", "    callback()\n".repeat(64));
+        db.write_file("/src/project/target.py", &source)?;
+        let file = system_path_to_file(&db, "/src/project/target.py")?;
+        // Register these files before editing them so each write advances a revision.
+        let mut others = Vec::new();
+        for revision in 0..8 {
+            let path = format!("/src/project/other_{revision}.py");
+            db.write_file(&path, "")?;
+            let file = system_path_to_file(&db, &path)?;
+            others.push((path, file));
+        }
+        let program = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        let original_id = salsa::plumbing::AsId::as_id(&program);
+        semantic_index(&db, program);
+        for (path, other_file) in others {
+            let other = format!("def run(callback):\n{}", "    callback()\n".repeat(256));
+            let revision = salsa::plumbing::current_revision(&db);
+            db.write_file(&path, other)?;
+            assert!(salsa::plumbing::current_revision(&db) > revision);
+            let other_program =
+                ProgramFile::new(&db, other_file, db.program_environment().program(&db));
+            semantic_index(&db, other_program);
+        }
+        db.clear_salsa_events();
+        let program = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        assert_eq!(salsa::plumbing::AsId::as_id(&program), original_id);
+        semantic_index(&db, program);
+        let events = db.take_salsa_events();
+        assert!(
+            !events.iter().any(|event| matches!(event.kind,
+                salsa::EventKind::WillExecute { database_key }
+                if db.ingredient_debug_name(database_key.ingredient_index()) == "semantic_index"
+            )),
+            "{events:?}"
+        );
+        db.write_file("/src/project/target.py", format!("{source}changed = 1\n"))?;
+        let program = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        semantic_index(&db, program);
+        let events = db.take_salsa_events();
+        assert!(events.iter().any(|event| matches!(event.kind,
+            salsa::EventKind::WillExecute { database_key }
+            if db.ingredient_debug_name(database_key.ingredient_index()) == "semantic_index"
+        )));
         Ok(())
     }
 
