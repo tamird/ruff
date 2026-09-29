@@ -8194,10 +8194,25 @@ impl<'db> Binding<'db> {
         request_input_proof: bool,
     ) {
         self.nested_call_has_unproved_inputs = true;
+        if let Some((return_type, inputs_proved)) =
+            self.getattr_call_result(db, env, request_input_proof)
+        {
+            self.set_return_type(return_type);
+            self.nested_call_has_unproved_inputs = !(request_input_proof && inputs_proved);
+        }
+    }
+
+    /// Finite runtime lookup facts for already matched operands.
+    pub(super) fn getattr_call_result(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        request_input_proof: bool,
+    ) -> Option<(Type<'db>, bool)> {
         let (instance, names, default) = match self.parameter_types() {
             [Some(instance), Some(names)] => (*instance, *names, None),
-            [Some(instance), Some(names), Some(default)] => (*instance, *names, Some(*default)),
-            _ => return,
+            [Some(instance), Some(names), default] => (*instance, *names, *default),
+            _ => return None,
         };
         let names = match names.resolve_type_alias(db) {
             Type::Union(union) => union.expand_aliases(db, env),
@@ -8248,17 +8263,13 @@ impl<'db> Binding<'db> {
             Type::Union(union) => union.try_map(db, env, lookup),
             name => lookup(&name),
         };
-        if let Some(result) = result {
-            // A present descriptor can raise AttributeError, causing getattr to return
-            // the supplied default. Static boundness does not establish getter totality.
-            self.set_return_type(UnionType::from_two_elements(
-                db,
-                env,
-                result,
-                default.unwrap_or(Type::Never),
-            ));
-            self.nested_call_has_unproved_inputs = !(request_input_proof && inputs_proved);
-        }
+        let result = result?;
+        // A present descriptor can raise AttributeError, causing getattr to return
+        // the supplied default. Static boundness does not establish getter totality.
+        Some((
+            UnionType::from_two_elements(db, env, result, default.unwrap_or(Type::Never)),
+            inputs_proved,
+        ))
     }
 
     /// Checks the getter invoked by `property.__get__`, retaining its error and recovery type.

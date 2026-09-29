@@ -1943,6 +1943,133 @@ intercepted: Intercepted
 }
 
 #[test]
+fn supplied_getattr_refines_matched_operands() -> anyhow::Result<()> {
+    fn refine<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
+        if call
+            .declaration()
+            .and_then(|definition| definition.name(db))
+            .as_deref()
+            != Some("native_getattr")
+        {
+            return ProvidedCallResult::default();
+        }
+        call.getattr_return_type(db).into()
+    }
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            r#"
+def native_getattr(x: object, name: str, default: object = ..., /) -> object: ...
+
+class Record:
+    field: str
+
+class Lookup:
+    field: str
+    def native_getattr(self, name: str, default: object = ..., /) -> object: ...
+
+class KnownInt:
+    field: int = 1
+
+class Base: ...
+
+class Child(Base):
+    field: str = "text"
+
+type OpenReceiver = KnownInt | Base
+
+def field_name() -> str: ...
+def default_values() -> tuple[()] | tuple[int]: ...
+def open_receiver() -> OpenReceiver: ...
+
+record = Record()
+name = field_name()
+omitted = native_getattr(record, "field")
+explicit_none = native_getattr(record, "field", None)
+computed = native_getattr(record, name)
+defaults = default_values()
+possible_default = native_getattr(record, "field", *defaults)
+invalid = native_getattr(record, "field", None, 0)
+bound = Lookup().native_getattr("field")
+open_union = native_getattr(open_receiver(), "field", 0)
+
+def bounded[T: OpenReceiver](value: T):
+    return native_getattr(value, "field", 0)
+
+def constrained[T: (KnownInt, Base)](value: T):
+    return native_getattr(value, "field", 0)
+
+def class_bound[T: OpenReceiver](value: type[T]):
+    return native_getattr(value, "field", 0)
+"#,
+        )
+        .with_call_result_provider(refine)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let program = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program);
+    let str_type = KnownClass::Str.to_instance(&db, &env);
+    let object_type = KnownClass::Object.to_instance(&db, &env);
+    let int_type = KnownClass::Int.to_instance(&db, &env);
+    let none_type = KnownClass::NoneType.to_instance(&db, &env);
+    for (name, expected) in [
+        ("omitted", str_type),
+        (
+            "explicit_none",
+            crate::types::UnionType::from_two_elements(&db, &env, str_type, none_type),
+        ),
+        (
+            "possible_default",
+            crate::types::UnionType::from_two_elements(&db, &env, str_type, int_type),
+        ),
+        ("computed", object_type),
+        ("invalid", object_type),
+        ("bound", object_type),
+        ("open_union", object_type),
+    ] {
+        assert_eq!(
+            crate::place::global_symbol(&db, program, name)
+                .place
+                .expect_type(),
+            expected,
+            "{name}",
+        );
+    }
+    let model = SemanticModel::new(&db, program);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let mut symbolic_results = Vec::new();
+    for statement in module.suite() {
+        let Some(function) = statement.as_function_def_stmt() else {
+            continue;
+        };
+        if !matches!(
+            function.name.as_str(),
+            "bounded" | "constrained" | "class_bound"
+        ) {
+            continue;
+        }
+        let returned = function.body[0].as_return_stmt().unwrap();
+        let result = returned.value.as_ref().unwrap();
+        let result_type = result.inferred_type(&model).unwrap();
+        symbolic_results.push((function.name.as_str(), result_type));
+    }
+    assert_eq!(
+        symbolic_results,
+        [
+            ("bounded", object_type),
+            ("constrained", object_type),
+            ("class_bound", object_type),
+        ],
+        "{:?}",
+        symbolic_results
+            .iter()
+            .map(|(name, ty)| (name, ty.display(&db, &env).to_string()))
+            .collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+#[test]
 fn optional_getters_retain_results_and_input_requirements() -> anyhow::Result<()> {
     let db = TestDbBuilder::new()
         .with_file(

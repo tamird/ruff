@@ -57,6 +57,20 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
         self.binding.return_ty
     }
 
+    /// Refines the result of a native getattr call from its already matched operands.
+    ///
+    /// The matched parameters must be the object, name, and optional default, in that order.
+    /// Applications select the native operation declaration and establish its input contract.
+    /// This projection does not alter the call's implicit input requirements.
+    pub fn getattr_return_type(&self, db: &'db dyn Db) -> Option<Type<'db>> {
+        if self.has_binding_errors || self.bound_receiver {
+            return None;
+        }
+        let env = ProgramEnvironment::from_file(self.file);
+        let (return_type, _inputs_proved) = self.binding.getattr_call_result(db, &env, false)?;
+        Some(return_type)
+    }
+
     pub fn has_binding_errors(&self) -> bool {
         self.has_binding_errors
     }
