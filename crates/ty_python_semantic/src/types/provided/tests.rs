@@ -1828,6 +1828,207 @@ fn callable_metadata_survives_signature_transforms() -> anyhow::Result<()> {
 }
 
 #[test]
+fn supplied_getter_inputs_and_defaults_remain_independent() -> anyhow::Result<()> {
+    fn presence(db: &TestDb, definition: ty_python_core::definition::Definition<'_>) -> bool {
+        definition.name(db).as_deref() == Some("__getattr__")
+    }
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            r#"
+from builtins import getattr as lookup
+from typing import Literal
+
+class Record:
+    def __getattr__(self, name: str) -> str: ...
+
+class BadReceiver:
+    def __getattr__(self: int, name: str) -> str: ...
+
+class BadName:
+    def __getattr__(self, name: Literal["other"]) -> str: ...
+
+class Getter:
+    def __init__(self, name: str) -> None: ...
+
+class Constructed:
+    __getattr__ = Getter
+
+class Intercepted(Record):
+    def __getattribute__(self, name: str) -> str: ...
+
+record: Record
+bad_receiver: BadReceiver
+bad_name: BadName
+constructed: Constructed
+intercepted: Intercepted
+"#,
+        )
+        .with_getattr_presence_provider(presence)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let program = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program);
+    let lookup = crate::place::global_symbol(&db, program, "lookup")
+        .place
+        .expect_type();
+    let str_type = KnownClass::Str.to_instance(&db, &env);
+    let default_type = Type::int_literal(0);
+    for (name, inputs_proved) in [
+        ("record", true),
+        ("bad_receiver", false),
+        ("bad_name", false),
+        ("constructed", false),
+        ("intercepted", false),
+    ] {
+        let receiver = crate::place::global_symbol(&db, program, name)
+            .place
+            .expect_type();
+        assert!(receiver.as_nominal_instance().is_some(), "{name}");
+        let ordinary_member = receiver.member_lookup_with_policy_and_receiver(
+            &db,
+            &env,
+            "field",
+            MemberLookupPolicy::RUNTIME_ATTRIBUTE,
+            None,
+        );
+        let proved_member = receiver.member_lookup_with_policy_and_receiver(
+            &db,
+            &env,
+            "field",
+            MemberLookupPolicy::RUNTIME_ATTRIBUTE | MemberLookupPolicy::PROVE_GETTER_INPUTS,
+            None,
+        );
+        let ordinary = ordinary_member.unwrap_or_else(|error| error.fallback_member(&db));
+        let proved = proved_member.unwrap_or_else(|error| error.fallback_member(&db));
+        assert_eq!(ordinary.member(&db), proved.member(&db), "{name}");
+        assert_eq!(ordinary_member.is_ok(), proved_member.is_ok(), "{name}");
+        assert_eq!(proved.inputs_proved(&db), inputs_proved, "{name}");
+
+        for default in [None, Some(default_type)] {
+            let arguments = crate::types::CallArguments::positional(
+                [receiver, Type::string_literal(&db, "field")]
+                    .into_iter()
+                    .chain(default),
+            );
+            let ordinary = lookup.try_call(&db, &env, &arguments).unwrap();
+            let arguments = arguments.with_input_proof_request(true);
+            let proved = lookup.try_call(&db, &env, &arguments).unwrap();
+            assert_eq!(
+                ordinary.return_type(&db, &env),
+                proved.return_type(&db, &env),
+                "{name}"
+            );
+            assert_eq!(
+                proved.arguments_satisfy_declared_parameters(&db, &env, &arguments),
+                inputs_proved && default.is_some(),
+                "{name}, {default:?}",
+            );
+            if name == "record" {
+                let expected = default.map_or(Type::any(), |default| {
+                    crate::types::UnionType::from_two_elements(&db, &env, str_type, default)
+                });
+                assert_eq!(ordinary.return_type(&db, &env), expected);
+                assert!(
+                    !proved_member
+                        .unwrap()
+                        .member(&db)
+                        .place
+                        .is_definitely_bound()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn optional_getters_retain_results_and_input_requirements() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            r#"
+from builtins import getattr as lookup
+from typing import Any, Callable
+
+def condition() -> bool: ...
+
+class Present:
+    field: int
+
+class MaybeFallback[T]:
+    if condition():
+        def __getattr__(self: MaybeFallback[Callable[[Any], None]], name: str) -> str: ...
+
+optional: MaybeFallback[Callable[[str], None]]
+combined: Present | MaybeFallback[Callable[[str], None]]
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let program = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program);
+    let lookup = crate::place::global_symbol(&db, program, "lookup")
+        .place
+        .expect_type();
+    let name_type = Type::string_literal(&db, "field");
+    let str_type = KnownClass::Str.to_instance(&db, &env);
+    let int_type = KnownClass::Int.to_instance(&db, &env);
+    for (name, result) in [
+        ("optional", str_type),
+        (
+            "combined",
+            crate::types::UnionType::from_two_elements(&db, &env, int_type, str_type),
+        ),
+    ] {
+        let receiver = crate::place::global_symbol(&db, program, name)
+            .place
+            .expect_type();
+        let mut arguments =
+            crate::types::CallArguments::positional([name_type]).with_input_proof_request(true);
+        match receiver.try_call_dunder_with_policy(
+            &db,
+            &env,
+            "__getattr__",
+            &mut arguments,
+            crate::types::TypeContext::default(),
+            MemberLookupPolicy::default(),
+        ) {
+            Err(crate::types::CallDunderError::PossiblyUnbound {
+                bindings,
+                unbound_on: _,
+            }) => {
+                assert_eq!(bindings.return_type(&db, &env), str_type);
+                assert!(!bindings.arguments_satisfy_declared_parameters(&db, &env, &arguments));
+            }
+            other => panic!("expected optional callable for {name}, got {other:?}"),
+        }
+        let member = receiver
+            .member_lookup_with_policy_and_receiver(
+                &db,
+                &env,
+                "field",
+                MemberLookupPolicy::RUNTIME_ATTRIBUTE | MemberLookupPolicy::PROVE_GETTER_INPUTS,
+                None,
+            )
+            .unwrap();
+        assert_eq!(member.member(&db).place.expect_type(), result, "{name}");
+        assert!(!member.member(&db).place.is_definitely_bound());
+        assert!(!member.inputs_proved(&db));
+        let default = Type::int_literal(0);
+        let arguments = crate::types::CallArguments::positional([receiver, name_type, default]);
+        let ordinary = lookup.try_call(&db, &env, &arguments).unwrap();
+        let arguments = arguments.with_input_proof_request(true);
+        let checked = lookup.try_call(&db, &env, &arguments).unwrap();
+        let expected = crate::types::UnionType::from_two_elements(&db, &env, result, default);
+        assert_eq!(ordinary.return_type(&db, &env), expected, "{name}");
+        assert_eq!(checked.return_type(&db, &env), expected, "{name}");
+        assert!(!checked.arguments_satisfy_declared_parameters(&db, &env, &arguments));
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_getters_preserve_attribute_presence() -> anyhow::Result<()> {
     fn presence(db: &TestDb, definition: ty_python_core::definition::Definition<'_>) -> bool {
         if definition
