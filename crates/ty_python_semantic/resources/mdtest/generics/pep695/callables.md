@@ -1360,3 +1360,20 @@ callback_growing = make_growing((1, None))
 reveal_type(callback_growing)  # revealed: (int, /) -> int
 callback_growing("bad")  # error: [invalid-argument-type]
 ```
+
+## Generic callbacks in inferred collections
+
+A collection can contain a generic callback alongside other values. The callback's type parameter
+belongs to its signature, including compound result types.
+
+```py
+def wrap[T](value: T) -> list[T]:
+    return [value]
+
+def seed() -> int:
+    return 1
+
+def callbacks() -> None:
+    values = {"seed": seed}
+    values.update(empty=None, wrap=wrap)
+```

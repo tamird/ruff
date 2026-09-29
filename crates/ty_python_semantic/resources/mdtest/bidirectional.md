@@ -3113,6 +3113,57 @@ reveal_type(x32)  # revealed: list[Unknown]
 reveal_type(x33)  # revealed: list[Unknown]
 ```
 
+## Generic callbacks in collection uses
+
+A generic callback's type parameters belong to its callable signature. A collection use can include
+that callback alongside other values.
+
+```py
+def seed() -> int:
+    return 1
+
+def identity[T](value: T) -> T:
+    return value
+
+def static_identity(value: object) -> object:
+    return value
+
+def generic_callback() -> None:
+    values = {"seed": seed}
+    values.update(empty=None, identity=identity)
+
+def static_callback() -> None:
+    values = {"seed": seed}
+    values.update(empty=None, identity=static_identity)
+```
+
+## Generic callbacks preserve concrete call results
+
+A collection of integer and generic identity callbacks accepts integer arguments and returns
+integers. Both callback signatures satisfy a consumer that requires integer callbacks.
+
+```py
+from collections.abc import Callable, Sequence
+
+def int_identity(value: int) -> int:
+    return value
+
+def identity[T](value: T) -> T:
+    return value
+
+functions = []
+functions.append(int_identity)
+functions.append(identity)
+
+reveal_type(functions[0](1))  # revealed: int
+functions[0]("bad")  # error: [invalid-argument-type]
+
+def use(callbacks: Sequence[Callable[[int], int]]) -> None:
+    pass
+
+use(functions)
+```
+
 ## Collection context through lambda captures
 
 A helper call in a lambda can constrain a collection in its enclosing function. The lambda's

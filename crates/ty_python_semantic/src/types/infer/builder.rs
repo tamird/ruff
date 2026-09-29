@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::hash_map;
 use std::convert::Infallible;
 use std::rc::Rc;
@@ -66,6 +66,7 @@ use crate::types::class::{
 };
 use crate::types::constraints::{CandidateSolutions, ConstraintSetBuilder, Solutions};
 use crate::types::context::InferContext;
+use crate::types::cyclic::ActiveRecursionDetector;
 use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
     self, CALL_NON_CALLABLE, CONFLICTING_DECLARATIONS, CYCLIC_TYPE_ALIAS_DEFINITION,
@@ -116,7 +117,7 @@ use crate::types::narrow::NarrowingEvaluatorExtension;
 use crate::types::narrow::pattern_success_types;
 use crate::types::newtype::NewType;
 use crate::types::set_theoretic::RecursivelyDefined;
-use crate::types::signatures::{CallableSignature, ReturnCallableTypeVarScope};
+use crate::types::signatures::{CallableSignature, ReturnCallableTypeVarScope, walk_signature};
 use crate::types::special_form::TypeQualifier;
 use crate::types::string_annotation::SourceAnnotation;
 use crate::types::subclass_of::SubclassOfInner;
@@ -133,6 +134,7 @@ use crate::types::unpacker::{
     UnpackResult, fixed_sequence_elements, sequence_from_literal_elements,
     tuple_literal_needs_promotion,
 };
+use crate::types::visitor::{TypeKind, TypeVisitor, walk_non_atomic_type};
 use crate::types::{
     BindingContext, BoundTypeVarInstance, CallDunderError, CallableBinding, CallableType,
     ClassType, DictionaryItems, DynamicType, GeneratorTypeMode, InferenceFlags,
@@ -9727,6 +9729,58 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         receiver_generic_context: Option<GenericContext<'db>>,
         call_specialization: Specialization<'db>,
     ) -> Option<Type<'db>> {
+        // Method-local typevars describe requirements imposed by the method, not concrete element
+        // types learned for the collection. A generic callback binds its own variables, so those
+        // variables can remain inside its signature without escaping into the collection's scope.
+        struct CollectionConstraintVisitor<'a, 'db> {
+            env: &'a ProgramEnvironment<'db>,
+            contexts: RefCell<SmallVec<[GenericContext<'db>; 4]>>,
+            active: ActiveRecursionDetector<Type<'db>>,
+            has_free_typevar: Cell<bool>,
+        }
+
+        impl<'db> TypeVisitor<'db> for CollectionConstraintVisitor<'_, 'db> {
+            fn program_environment(&self) -> &ProgramEnvironment<'db> {
+                self.env
+            }
+
+            fn should_visit_lazy_type_attributes(&self) -> bool {
+                false
+            }
+
+            fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+                if self.has_free_typevar.get() {
+                    return;
+                }
+                if let Some(typevar) = ty.as_typevar()
+                    && !self
+                        .contexts
+                        .borrow()
+                        .iter()
+                        .any(|context| context.contains(db, typevar.identity(db)))
+                {
+                    self.has_free_typevar.set(true);
+                    return;
+                }
+                if let TypeKind::NonAtomic(non_atomic) = TypeKind::from(ty) {
+                    // A completed sibling may mention the same type outside the signature that
+                    // bound its variables. Only active recursive edges can share a visit.
+                    self.active
+                        .visit(&ty, || (), || walk_non_atomic_type(db, non_atomic, self));
+                }
+            }
+
+            fn visit_signature(&self, db: &'db dyn Db, signature: &Signature<'db>) {
+                if let Some(context) = signature.generic_context {
+                    self.contexts.borrow_mut().push(context);
+                }
+                walk_signature(db, signature, self);
+                if signature.generic_context.is_some() {
+                    self.contexts.borrow_mut().pop();
+                }
+            }
+        }
+
         let db = self.db();
         let env = self.program_environment();
         let constraint = identity_instance.apply_specialization(db, call_specialization);
@@ -9734,19 +9788,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return Some(constraint);
         };
 
-        // Method-local typevars describe requirements imposed by the method, not concrete element
-        // types learned for the collection. Until collection-use constraints are represented as
-        // projected constraint sets, avoid leaking those method-local typevars into the inferred
-        // collection literal type.
-        if any_over_type(db, env, constraint, false, |ty| {
-            ty.as_typevar().is_some_and(|typevar| {
-                !receiver_generic_context.contains(self.db(), typevar.identity(self.db()))
-            })
-        }) {
-            return None;
-        }
-
-        Some(constraint)
+        let visitor = CollectionConstraintVisitor {
+            env,
+            contexts: RefCell::new([receiver_generic_context].into_iter().collect()),
+            active: ActiveRecursionDetector::default(),
+            has_free_typevar: Cell::new(false),
+        };
+        visitor.visit_type(db, constraint);
+        (!visitor.has_free_typevar.get()).then_some(constraint)
     }
 
     fn infer_call_expression(
