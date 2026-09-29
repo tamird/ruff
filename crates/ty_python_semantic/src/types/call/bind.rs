@@ -8239,11 +8239,15 @@ impl<'db> Binding<'db> {
                 }
             }
         }
-        let direct = pairs.iter().all(|(actual, expected)| {
+        let direct = pairs.iter().enumerate().all(|(index, (actual, expected))| {
             let expected = specialization.map_or(*expected, |specialization| {
                 expected.apply_specialization(db, specialization)
             });
             pair_is_proved(*actual, expected)
+                || (index == 0
+                    && matches!(arguments.iter().next(), Some((Argument::Synthetic, _)))
+                    && self
+                        .explicit_receiver_satisfies_declared_parameter(db, env, *actual, expected))
         });
         direct
             || (capture_supported
@@ -8267,6 +8271,125 @@ impl<'db> Binding<'db> {
                     };
                     generic_arguments_satisfy_declared_parameters(db, env, specialization, &pairs)
                 }))
+    }
+
+    /// Prove a captured receiver against its resolved explicit self annotation.
+    fn explicit_receiver_satisfies_declared_parameter(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        actual: Type<'db>,
+        expected: Type<'db>,
+    ) -> bool {
+        if actual != expected
+            || self.constructor_context.is_some()
+            || self.signature.generic_context.is_some()
+            || self.signature.has_implicit_positional_receiver_annotation()
+            || self.source_parameter_index_offset != 0
+            || !matches!(actual, Type::NominalInstance(_))
+        {
+            return false;
+        }
+        let Type::BoundMethod(method) = self.callable_type else {
+            return false;
+        };
+        if method.class_method(db) || method.signature_receiver(db) != actual {
+            return false;
+        }
+        let Some(function) = method.function(db) else {
+            return false;
+        };
+        if function.is_staticmethod(db) || function.is_classmethod(db) {
+            return false;
+        }
+        let Some((origin, specialization)) = actual.class_specialization(db, env) else {
+            return false;
+        };
+        if specialization.materialization_kind(db).is_some() {
+            return false;
+        }
+        let resolve = |specialization| {
+            let class = origin.apply_specialization(db, |_| specialization);
+            let Place::Defined(DefinedPlace {
+                ty,
+                origin: _,
+                definedness: Definedness::AlwaysDefined,
+                public_type_policy: _,
+                provenance: _,
+            }) = class
+                .own_class_member(db, env, None, function.name(db))
+                .inner
+                .place
+            else {
+                return None;
+            };
+            ty.as_function_literal()
+        };
+        // Resolved members include decorators. Exact function and signature identity tie
+        // this overload to the class member whose class arguments we can reconstruct.
+        let Some(resolved) = resolve(specialization) else {
+            return false;
+        };
+        if resolved != function {
+            return false;
+        }
+        let select = |function: FunctionType<'db>| {
+            function
+                .signature(db)
+                .iter()
+                .enumerate()
+                .filter(|(index, signature)| {
+                    signature.source_overload_index().unwrap_or(*index)
+                        == self.source_overload_index
+                })
+                .exactly_one()
+                .ok()
+                .map(|(_, signature)| signature)
+        };
+        let Some(resolved_signature) = select(resolved) else {
+            return false;
+        };
+        if resolved_signature != &self.signature
+            || !resolved_signature
+                .definition()
+                .is_some_and(|definition| definition.scope(db) == origin.body_scope(db))
+        {
+            return false;
+        }
+        // Static class arguments stay fixed; class variables represent every possible
+        // materialization of each gradual argument.
+        let context = specialization.generic_context(db);
+        let mut slots = Vec::new();
+        for (variable, slot) in context.variables(db).zip(specialization.types(db)) {
+            if variable.is_paramspec(db)
+                || variable.is_typevartuple(db)
+                || variable.typevar(db).bound_or_constraints(db, env).is_some()
+            {
+                return false;
+            }
+            slots.push(if slot.is_fully_static(db, env) {
+                *slot
+            } else {
+                Type::TypeVar(variable)
+            });
+        }
+        let rigid = context.specialize(db, slots);
+        let Some(resolved_rigid) = resolve(rigid) else {
+            return false;
+        };
+        if resolved_rigid.literal(db) != function.literal(db) {
+            return false;
+        }
+        let Some(rigid_signature) = select(resolved_rigid) else {
+            return false;
+        };
+        let Some(receiver_parameter) = rigid_signature.parameters().get(0) else {
+            return false;
+        };
+        // Both sides share only class-derived slots. An independent bare annotation keeps
+        // its unknown domain, and every supplied argument is checked separately.
+        let receiver = Type::instance(db, env, origin.apply_specialization(db, |_| rigid));
+        receiver.is_subtype_of(db, env, receiver_parameter.annotated_type())
     }
 
     /// Infers finite runtime lookups while retaining their implicit call requirements.
@@ -11692,6 +11815,7 @@ mod tests {
             r#"
 from typing import Any, Callable, Iterable, Mapping, cast
 from typing_extensions import Self
+from ty_extensions._internal import TypeOf
 
 class Copy[T]:
     items: list[T]
@@ -11716,7 +11840,18 @@ class Box[T]:
 class Ops:
     def transport[K, V](self, value: dict[K, V]) -> None: ...
 
+def restricted_receiver(self: "Holder[str, int]") -> None: ...
+def replace(callback: object) -> TypeOf[restricted_receiver]: ...
+
 class Holder[K, V]:
+    items: dict[K, V]
+    def inspect(self: "Holder[K, V]") -> None: ...
+    def keyword(self: "Holder[K | str, V]") -> None: ...
+    def bare(self: "Holder") -> None: ...
+    @replace
+    def replaced(self: "Holder[K, V]") -> None: ...
+    def write(self: "Holder[K, V]", value: V) -> None: ...
+    def independent(self: "Holder[K, V]", other: "Holder[K, V]") -> None: ...
     def transport[A, B](self, value: dict[A, B]) -> None: ...
     def peer(self, other: Self) -> None: ...
     def clone(self) -> Self: ...
@@ -11755,6 +11890,13 @@ static_dict = cast(dict[str, int], None)
 opaque_list = cast(list, None)
 ops_transport = ops.transport
 opaque_transport = opaque_holder.transport
+explicit_inspect = opaque_holder.inspect
+explicit_bare = opaque_holder.bare
+explicit_replaced = opaque_holder.replaced
+explicit_write = opaque_holder.write
+explicit_peer = opaque_holder.independent
+string_holder = cast(Holder[str, Any], None)
+explicit_keyword = string_holder.keyword
 peer = opaque_holder.peer
 clone = opaque_holder.clone
 unrelated = cast(Unrelated, None)
@@ -11870,6 +12012,30 @@ unbound_or = dict.__or__
             panic!("expected a free function");
         };
         let attached = Type::BoundMethod(BoundMethodType::new(db, attached, lookup("ops")));
+        let Type::BoundMethod(replaced) = lookup("explicit_replaced") else {
+            panic!("expected the replacement function to bind as a method");
+        };
+        let Some(replacement) = replaced.function(db) else {
+            panic!("expected a replacement function literal");
+        };
+        let Type::FunctionLiteral(restricted) = lookup("restricted_receiver") else {
+            panic!("expected the declared replacement function");
+        };
+        assert_eq!(replacement.literal(db), restricted.literal(db));
+        let Some((holder, specialization)) = lookup("opaque_holder").class_specialization(db, &env)
+        else {
+            panic!("expected a specialized Holder instance");
+        };
+        let receiver = Type::instance(
+            db,
+            &env,
+            holder.apply_specialization(db, |_| {
+                specialization
+                    .generic_context(db)
+                    .specialize(db, &[str, unknown])
+            }),
+        );
+        let unknown_keyword = receiver.member(db, &env, "keyword").place.expect_type();
         for (name, actuals, accepted, proved) in [
             ("fixed_copy", vec![list(str)], false, false),
             ("copy_init", vec![list(unknown)], true, false),
@@ -11877,6 +12043,10 @@ unbound_or = dict.__or__
             ("static_transport", vec![dict(unknown, unknown)], true, true),
             ("static_explicit", vec![dict(unknown, unknown)], true, true),
             ("explicit_transport", vec![dict(str, int)], true, false),
+            ("explicit_bare", vec![], true, false),
+            ("explicit_replaced", vec![], true, false),
+            ("explicit_write", vec![int], true, false),
+            ("explicit_peer", vec![lookup("opaque_holder")], true, false),
             ("incompatible_transport", vec![dict(str, int)], false, false),
             ("box_accept", vec![int], true, false),
             ("box_explicit", vec![int], true, false),
@@ -11897,11 +12067,15 @@ unbound_or = dict.__or__
             ("opaque_or", vec![dict(str, int)], true, true),
             ("static_or", vec![dict(unknown, unknown)], true, true),
             ("static_or", vec![dict(str, int)], true, true),
+            ("explicit_inspect", vec![], true, true),
+            ("explicit_keyword", vec![], true, true),
+            ("unknown_keyword", vec![], true, true),
         ] {
             let arguments = CallArguments::positional(actuals).with_input_proof_request(true);
             let callable = match name {
                 "attached_transport" => attached,
                 "unrelated_transport" => unrelated,
+                "unknown_keyword" => unknown_keyword,
                 _ => lookup(name),
             };
             let result = callable
