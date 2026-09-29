@@ -4260,7 +4260,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             PredicateNode::SubjectElementPattern(subject_element) => {
                 subject_element.pattern.scope(db)
             }
-            PredicateNode::IsNonTerminalCall(call) => call.callable(db).scope(db),
+            PredicateNode::IsNonTerminalCall(call) => call.scope(db),
             PredicateNode::SuccessfulSubscript { receiver, key: _ } => receiver.scope(db),
             PredicateNode::IsNonEmptyIterable(expression) => expression.scope(db),
             PredicateNode::StarImportPlaceholder(definition) => definition.scope(db),

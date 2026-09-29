@@ -49,11 +49,10 @@ use crate::place::{
     ScopedPlaceId, match_subject_place_expressions,
 };
 use crate::predicate::{
-    CallableAndCallExpr, ClassPatternKeywordPredicateKind, ClassPatternPredicateKind,
-    MappingPatternEntryPredicateKind, MappingPatternPredicateKind, PatternPredicate,
-    PatternPredicateKind, Predicate, PredicateNode, PredicateOrLiteral, ScopedPredicateId,
-    SequencePatternPredicateKind, StarImportPlaceholderPredicate, StatementCall,
-    SubjectElementPatternPredicate,
+    ClassPatternKeywordPredicateKind, ClassPatternPredicateKind, MappingPatternEntryPredicateKind,
+    MappingPatternPredicateKind, PatternPredicate, PatternPredicateKind, Predicate, PredicateNode,
+    PredicateOrLiteral, ScopedPredicateId, SequencePatternPredicateKind,
+    StarImportPlaceholderPredicate, StatementCall, SubjectElementPatternPredicate,
 };
 use crate::re_exports::exported_names;
 use crate::reachability_constraints::{
@@ -6139,7 +6138,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 // it significantly degrades performance. We thus cut scope here and add these
                 // constraints only at statement-level function calls, like `sys.exit()`, and not
                 // within sub-expressions like `3 + sys.exit()` etc.
-                if let Some(StatementCall { call, is_await }) =
+                if let Some(StatementCall { call, is_await: _ }) =
                     StatementCall::from_expression(value)
                 {
                     let func = call.func.as_ref();
@@ -6163,14 +6162,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                             })
                             .is_none()
                     {
-                        let callable =
-                            self.add_standalone_expression_impl(func, ExpressionKind::Callee, None);
+                        self.add_standalone_expression_impl(func, ExpressionKind::Callee, None);
                         let call_expr = self.add_standalone_expression(value);
 
                         let predicate = Predicate {
-                            node: PredicateNode::IsNonTerminalCall(CallableAndCallExpr::new(
-                                self.db, callable, call_expr, is_await,
-                            )),
+                            node: PredicateNode::IsNonTerminalCall(call_expr),
                             is_positive: true,
                         };
 
