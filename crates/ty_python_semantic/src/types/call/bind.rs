@@ -8232,7 +8232,9 @@ impl<'db> Binding<'db> {
                 definedness,
                 public_type_policy: _,
                 provenance: _,
-            }) = member.member(db).place
+            }) = policy
+                .preserve_missing_alternative(db, instance, member.member(db))
+                .place
             else {
                 return None;
             };
