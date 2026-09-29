@@ -8195,15 +8195,16 @@ impl<'db> Binding<'db> {
     ) {
         self.nested_call_has_unproved_inputs = true;
         let (instance, names, default) = match self.parameter_types() {
-            [Some(instance), Some(names)] => (*instance, *names, Type::Never),
-            [Some(instance), Some(names), Some(default)] => (*instance, *names, *default),
+            [Some(instance), Some(names)] => (*instance, *names, None),
+            [Some(instance), Some(names), Some(default)] => (*instance, *names, Some(*default)),
             _ => return,
         };
         let names = match names.resolve_type_alias(db) {
             Type::Union(union) => union.expand_aliases(db, env),
             names => names,
         };
-        let mut policy = MemberLookupPolicy::RUNTIME_ATTRIBUTE;
+        let mut policy = MemberLookupPolicy::RUNTIME_ATTRIBUTE
+            | MemberLookupPolicy::PRESERVE_MISSING_ALTERNATIVES;
         if request_input_proof {
             policy |= MemberLookupPolicy::PROVE_GETTER_INPUTS;
         }
@@ -8216,13 +8217,16 @@ impl<'db> Binding<'db> {
             let Place::Defined(DefinedPlace {
                 ty,
                 origin: _,
-                definedness: Definedness::AlwaysDefined,
+                definedness,
                 public_type_policy: _,
                 provenance: _,
             }) = member.member(db).place
             else {
                 return None;
             };
+            if definedness == Definedness::PossiblyUndefined && default.is_none() {
+                return None;
+            }
             if ty.has_indeterminate_inference(db, env) {
                 return None;
             }
@@ -8247,7 +8251,12 @@ impl<'db> Binding<'db> {
         if let Some(result) = result {
             // A present descriptor can raise AttributeError, causing getattr to return
             // the supplied default. Static boundness does not establish getter totality.
-            self.set_return_type(UnionType::from_two_elements(db, env, result, default));
+            self.set_return_type(UnionType::from_two_elements(
+                db,
+                env,
+                result,
+                default.unwrap_or(Type::Never),
+            ));
             self.nested_call_has_unproved_inputs = !(request_input_proof && inputs_proved);
         }
     }

@@ -1251,7 +1251,7 @@ fn distribute_member_lookup_over_bound_or_constraints<'db>(
                 inputs_proved &= member.inputs_proved(db);
                 properties =
                     union_deprecated_properties(db, properties, member.deprecated_properties(db));
-                member.member(db)
+                policy.preserve_missing_alternative(member.member(db))
             });
             member_lookup_result(db, member, error, properties, inputs_proved)
         }
@@ -1357,6 +1357,10 @@ bitflags! {
     pub(crate) struct MemberLookupPolicy: u16 {
         /// Prove the receiver and implicit getter inputs without changing lookup semantics.
         const PROVE_GETTER_INPUTS = 1 << 8;
+
+        /// Retain unknown values for undeclared alternatives when refining `getattr`.
+        /// An undeclared member can exist on a subclass, independently of a default.
+        const PRESERVE_MISSING_ALTERNATIVES = 1 << 9;
         /// Dunder methods are looked up on the meta-type of a type without potentially falling
         /// back on attributes on the type itself. For example, when implicitly invoked on an
         /// instance, dunder methods are not looked up as instance attributes. And when invoked
@@ -1414,6 +1418,18 @@ bitflags! {
 impl get_size2::GetSize for MemberLookupPolicy {}
 
 impl MemberLookupPolicy {
+    fn preserve_missing_alternative(
+        self,
+        mut member: PlaceAndQualifiers<'_>,
+    ) -> PlaceAndQualifiers<'_> {
+        if self.contains(Self::PRESERVE_MISSING_ALTERNATIVES) && member.place.is_undefined() {
+            member.place = Place::Defined(
+                DefinedPlace::new(Type::unknown()).with_definedness(Definedness::PossiblyUndefined),
+            );
+        }
+        member
+    }
+
     /// Only look up the attribute on the meta-type.
     ///
     /// If false - Look up the attribute on the meta-type, but fall back to attributes on the instance
@@ -4219,12 +4235,14 @@ impl<'db> Type<'db> {
             }
             Type::Union(union) => {
                 Some(union.map_with_boundness_and_qualifiers(db, env, |elem| {
-                    elem.find_name_in_mro_with_policy(db, env, name, policy)
+                    let member = elem
+                        .find_name_in_mro_with_policy(db, env, name, policy)
                         // If some elements are classes, and some are not, we simply fall back to `Unbound` for the non-class
                         // elements instead of short-circuiting the whole result to `None`. We would need a more detailed
                         // return type otherwise, and since `find_name_in_mro` is usually called via `class_member`, this is
                         // not a problem.
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    policy.preserve_missing_alternative(member)
                 }))
             }
             Type::Intersection(inter) => {
@@ -6282,7 +6300,7 @@ impl<'db> Type<'db> {
                             properties,
                             member.deprecated_properties(db),
                         );
-                        member.member(db)
+                        policy.preserve_missing_alternative(member.member(db))
                     });
                     member_lookup_result(db, member, error, properties, inputs_proved)
                 }
@@ -8629,28 +8647,53 @@ impl<'db> Type<'db> {
             }
 
             let name_type = Type::string_literal(db, name);
-            match self.try_call_dunder(
+            let request_input_proof = policy.contains(MemberLookupPolicy::PROVE_GETTER_INPUTS);
+            let mut arguments = CallArguments::positional([name_type])
+                .with_input_proof_request(request_input_proof);
+            let (bindings, possibly_unbound) = match self.try_call_dunder_with_policy(
                 db,
                 env,
                 "__getattr__",
-                CallArguments::positional([name_type]),
+                &mut arguments,
                 TypeContext::default(),
+                MemberLookupPolicy::default(),
             ) {
-                Ok(outcome) => unproved_member_lookup(db, outcome.getattr_result(db, env).into()),
-                Err(CallDunderError::CallError(_, bindings, _)) => member_lookup_result(
-                    db,
-                    bindings.getattr_result(db, env).into(),
-                    Some(MemberLookupErrorKind::GetAttr {
-                        receiver: self,
-                        name: name_type,
-                    }),
-                    None,
-                    false,
-                ),
-                Err(
-                    CallDunderError::PossiblyUnbound { .. } | CallDunderError::MethodNotAvailable,
-                ) => Place::Undefined.into(),
-            }
+                Ok(bindings) => (bindings, false),
+                Err(CallDunderError::PossiblyUnbound {
+                    bindings,
+                    unbound_on: _,
+                }) => (*bindings, true),
+                Err(CallDunderError::CallError(_, bindings, _)) => {
+                    return member_lookup_result(
+                        db,
+                        bindings.getattr_result(db, env).into(),
+                        Some(MemberLookupErrorKind::GetAttr {
+                            receiver: self,
+                            name: name_type,
+                        }),
+                        None,
+                        false,
+                    );
+                }
+                Err(CallDunderError::MethodNotAvailable) => return Place::Undefined.into(),
+            };
+            let place = if possibly_unbound {
+                Place::Defined(
+                    DefinedPlace::new(bindings.return_type(db, env))
+                        .with_definedness(Definedness::PossiblyUndefined),
+                )
+            } else {
+                bindings.getattr_result(db, env)
+            };
+            member_lookup_result(
+                db,
+                place.into(),
+                None,
+                None,
+                request_input_proof
+                    && !bindings.has_only_constructor_items()
+                    && bindings.arguments_satisfy_declared_parameters(db, env, &arguments),
+            )
         };
 
         let getattribute_policy = MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK
