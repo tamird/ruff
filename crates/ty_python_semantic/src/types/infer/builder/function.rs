@@ -2,10 +2,10 @@ use crate::{
     Db, DisplaySettings, FxIndexMap, ProgramEnvironment,
     reachability::ReachabilityConstraintsExtension,
     types::{
-        CheckedCall, CallableType, ClassBase, ClassLiteral, ClassType, DynamicType,
-        IntersectionBuilder, KnownClass, KnownInstanceType, ParamSpecAttrKind, SpecialFormType,
-        SubclassOfInner, SubclassOfType, Type, TypeContext, TypeVarBoundOrConstraints, TypeVarKind,
-        UnionBuilder, UnionType,
+        CallableType, CheckedCall, ClassBase, ClassLiteral, ClassType, DynamicType,
+        IntersectionBuilder, KnownClass, KnownInstanceType, NarrowingConstraint, ParamSpecAttrKind,
+        SpecialFormType, SubclassOfInner, SubclassOfType, Type, TypeContext,
+        TypeVarBoundOrConstraints, TypeVarKind, UnionBuilder, UnionType,
         callable::CallableTypeKind,
         constraints::ConstraintSetBuilder,
         context::InferContext,
@@ -61,12 +61,16 @@ use ty_module_resolver::{ImportingFile, ModuleName, resolve_module};
 use ty_python_core::{
     Truthiness, UseDefMap,
     definition::{Definition, DefinitionKind},
+    place::PlaceExpr,
+    place_table,
+    predicate::{Predicate, PredicateNode},
+    reachability_constraints::ReachabilityAtom,
     scope::NodeWithScopeRef,
 };
 
 use crate::types::string_annotation::SourceAnnotation;
 use ruff_python_ast::{self as ast, HasNodeIndex, find_node::covering_node};
-use ruff_text_size::Ranged;
+use ruff_text_size::{Ranged, TextRange};
 use ty_python_core::ProgramFile;
 
 fn parameters_have_defaults(parameters: &ast::Parameters) -> bool {
@@ -200,6 +204,42 @@ impl<'db> ExpectedReturnType<'db> {
         self.accepts(db, env, ty, TypeRelation::DeclaredOutput { strict: false })
     }
 
+    /// A constrained variable selects one of its canonical constraints, even for subclass inputs.
+    /// A fresh return must satisfy every choice that can still reach this statement.
+    fn accepts_under_constraints(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        relation: TypeRelation,
+        is_unreachable: impl Fn(Type<'db>, Type<'db>) -> bool,
+    ) -> bool {
+        if self.accepts(db, env, ty, relation) {
+            return true;
+        }
+        let Type::TypeVar(variable) = self.lexical.resolve_type_alias(db) else {
+            return false;
+        };
+        let TypeVarBoundOrConstraints::Constraints(constraints) =
+            variable.require_bound_or_constraints(db, env)
+        else {
+            return false;
+        };
+        if constraints
+            .elements(db)
+            .iter()
+            .any(|constraint| constraint.has_indeterminate_inference(db, env))
+        {
+            return false;
+        }
+        let builder = ConstraintSetBuilder::new();
+        constraints.elements(db).iter().all(|&constraint| {
+            ty.has_relation_to(db, env, constraint, &builder, TypeVarSet::None, relation)
+                .is_always_satisfied(db, env)
+                || is_unreachable(Type::TypeVar(variable), constraint)
+        })
+    }
+
     /// Returns the externally-visible return type.
     fn public(self) -> Type<'db> {
         self.public
@@ -226,6 +266,113 @@ impl<'db> ExpectedReturnType<'db> {
 }
 
 impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
+    /// Check a return path under one canonical constraint without changing expression types.
+    fn return_is_unreachable_for_constraint(
+        &self,
+        range: TextRange,
+        variable: Type<'db>,
+        constraint: Type<'db>,
+    ) -> bool {
+        if self.cycle_recovery.is_some() {
+            return false;
+        }
+        // Match the input view used to infer this body. The return relation still
+        // checks the original declared constraint in `accepts_under_constraints`.
+        let (input_variable, input_constraint) =
+            if self.function_inference_mode == crate::FunctionInferenceMode::Conservative {
+                let db = self.db();
+                let env = self.program_environment();
+                (
+                    variable.top_materialization(db, env),
+                    constraint.top_materialization(db, env),
+                )
+            } else {
+                (variable, constraint)
+            };
+        let use_def = self
+            .index
+            .use_def_map(self.scope().file_scope_id(self.db()));
+        use_def.range_reachability().any(|(entry_range, path)| {
+            entry_range.contains_range(range)
+                && use_def
+                    .reachability_constraints()
+                    .project::<()>(path, |atom| {
+                        ReachabilityAtom::Known(self.predicate_truthiness_for_constraint(
+                            use_def.predicates()[atom],
+                            input_variable,
+                            input_constraint,
+                        ))
+                    })
+                    .is_always_false()
+        })
+    }
+
+    /// Associate a call's narrowing with the type of its actual argument occurrence. A place alone
+    /// is insufficient: it may have been rebound, and `TypeIs` can target a keyword or later argument.
+    /// Unrelated predicates remain ambiguous; only an impossible path eliminates a constraint.
+    fn predicate_truthiness_for_constraint(
+        &self,
+        predicate: Predicate<'db>,
+        variable: Type<'db>,
+        constraint: Type<'db>,
+    ) -> Truthiness {
+        let db = self.db();
+        let env = self.program_environment();
+        let scope = self.scope();
+        let places = place_table(db, scope);
+        let expression = match predicate.node {
+            PredicateNode::Expression(expression) => expression,
+            PredicateNode::Condition(expression) => expression,
+            _ => return Truthiness::Ambiguous,
+        };
+        if expression.scope(db) != scope {
+            return Truthiness::Ambiguous;
+        }
+        let ast::Expr::Call(call) = expression.node_ref(db).node(self.module()) else {
+            return Truthiness::Ambiguous;
+        };
+        let argument_place = |argument: ast::ArgOrKeyword<'_>| {
+            let place = PlaceExpr::try_from_expr(argument.value())?;
+            places.place_id(&place)
+        };
+        for argument in call.arguments.iter_source_order() {
+            if argument.is_variadic()
+                || self.try_expression_type(argument.value()) != Some(variable)
+            {
+                continue;
+            }
+            let Some(place) = argument_place(argument) else {
+                continue;
+            };
+            if call
+                .arguments
+                .iter_source_order()
+                .filter(|&argument| argument_place(argument) == Some(place))
+                .count()
+                != 1
+            {
+                continue;
+            }
+            let (positive, negative) =
+                crate::types::infer_narrowing_constraints(db, predicate, place);
+            let impossible = |narrowing: Option<NarrowingConstraint<'db>>| {
+                narrowing.is_some_and(|narrowing| {
+                    NarrowingConstraint::intersection(constraint)
+                        .merge_constraint_and(narrowing)
+                        .evaluate_constraint_type(db, env)
+                        .is_never()
+                })
+            };
+            if impossible(positive) {
+                return Truthiness::AlwaysFalse;
+            }
+            if impossible(negative) {
+                return Truthiness::AlwaysTrue;
+            }
+        }
+        Truthiness::Ambiguous
+    }
+
     fn should_check_return_soundness(&self, expected: Type<'db>) -> bool {
         self.context.is_lint_enabled(&UNSOUND_RETURN_STATEMENT)
             && expected.is_fully_static(self.db(), self.program_environment())
@@ -483,23 +630,28 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         _ => Some(ty_range),
                     })
             {
-                let assignable = expected_return.accepts(
-                    db,
-                    env,
-                    return_statement.ty,
-                    TypeRelation::Assignability,
-                );
+                let accepts = |relation| {
+                    expected_return.accepts_under_constraints(
+                        db,
+                        env,
+                        return_statement.ty,
+                        relation,
+                        |variable, constraint| {
+                            self.return_is_unreachable_for_constraint(
+                                return_statement.range,
+                                variable,
+                                constraint,
+                            )
+                        },
+                    )
+                };
+                let assignable = accepts(TypeRelation::Assignability);
                 let check_soundness = self.should_check_return_soundness(expected_return.public);
                 let corresponds = assignable
                     && if check_soundness {
-                        expected_return.accepts(
-                            db,
-                            env,
-                            return_statement.ty,
-                            TypeRelation::Redundancy { pure: true },
-                        )
+                        accepts(TypeRelation::Redundancy { pure: true })
                     } else if correspondence.is_some() {
-                        expected_return.corresponds(db, env, return_statement.ty)
+                        accepts(TypeRelation::DeclaredOutput { strict: false })
                     } else {
                         true
                     };
@@ -2045,8 +2197,7 @@ impl KnownFunction {
                                 "`{casted_display}` is equivalent to `{source_display}`",
                             ));
                         }
-                        if let Some(value) = call.argument_expression(1)
-                        {
+                        if let Some(value) = call.argument_expression(1) {
                             let source = source_text(db, builder.file());
                             let covering = covering_node(
                                 builder.context.module().syntax().into(),
@@ -2075,13 +2226,12 @@ impl KnownFunction {
                     && source_type.is_disjoint_from(db, env, casted_type)
                     && !casted_type.is_equivalent_to(db, env, Type::Never)
                     && !source_type.is_equivalent_to(db, env, Type::Never)
-                    && call.argument_expression(1)
-                        .is_none_or(|value_expr| {
-                            builder
-                                .speculate_without_diagnostics()
-                                .infer_expression(value_expr, TypeContext::new(Some(casted_type)))
-                                .is_disjoint_from(db, env, casted_type)
-                        })
+                    && call.argument_expression(1).is_none_or(|value_expr| {
+                        builder
+                            .speculate_without_diagnostics()
+                            .infer_expression(value_expr, TypeContext::new(Some(casted_type)))
+                            .is_disjoint_from(db, env, casted_type)
+                    })
                     && let Some(diagnostic) =
                         builder.context.report_lint(&DISJOINT_CAST, call_expression)
                 {
