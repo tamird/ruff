@@ -1955,6 +1955,32 @@ fn function_output_correspondence() -> anyhow::Result<()> {
 
         def writable_list(value: object) -> TypeGuard[list[object]]:
             return type(value) is list
+
+        _LITERAL_LIST_CLASS = type([{"tag": (1,)}])
+        _CONTAINER_CLASS = type(str({("tag", 1): [()]}))
+        _TAG_ITEM = "tag"
+        _NAMED_CONTAINER_CLASS = type(str({_TAG_ITEM: []}))
+        _CALLED_CONTAINER_CLASS = type(str({"tag": [len(())]}))
+        _UNPACKED_LIST_CLASS = type(str([*[1]]))
+        _UNPACKED_DICT_CLASS = type(str({**{"tag": []}}))
+
+        def literal_collection(value: object) -> TypeGuard[Sequence[object]]:
+            return type(value) is _LITERAL_LIST_CLASS
+
+        def constructed_collection(value: object) -> TypeGuard[str]:
+            return type(value) is _CONTAINER_CLASS
+
+        def named_collection(value: object) -> TypeGuard[str]:
+            return type(value) is _NAMED_CONTAINER_CLASS
+
+        def called_collection(value: object) -> TypeGuard[str]:
+            return type(value) is _CALLED_CONTAINER_CLASS
+
+        def unpacked_list(value: object) -> TypeGuard[str]:
+            return type(value) is _UNPACKED_LIST_CLASS
+
+        def unpacked_dict(value: object) -> TypeGuard[str]:
+            return type(value) is _UNPACKED_DICT_CLASS
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -2001,6 +2027,12 @@ fn function_output_correspondence() -> anyhow::Result<()> {
         "readonly_list",
         "typed_list",
         "writable_list",
+        "literal_collection",
+        "constructed_collection",
+        "named_collection",
+        "called_collection",
+        "unpacked_list",
+        "unpacked_dict",
     ];
     let signatures = |db: &TestDb| {
         names.map(|name| {
@@ -2074,6 +2106,13 @@ fn function_output_correspondence() -> anyhow::Result<()> {
             Some(true),
             Some(false),
             Some(false),
+            // A sampled generic class is not resolved to a class literal.
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
         ]
     );
     assert_eq!(signatures(&db), ordinary);
