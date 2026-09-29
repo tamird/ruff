@@ -211,10 +211,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             && expected.is_fully_static(self.db(), self.program_environment())
     }
 
-    fn type_guard_body_implication(
+    fn type_predicate_body_correspondence(
         &self,
         function: &ast::StmtFunctionDef,
-        target: Type<'db>,
+        predicate: Type<'db>,
     ) -> Option<bool> {
         if self.cycle_recovery.is_some() {
             return None;
@@ -247,11 +247,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .or_else(|| function.parameters.args.first())?;
         let (_, domain, _) = self.parameter_annotation_type(&parameter.parameter)?;
         let definition = self.index.expect_single_definition(&parameter.parameter);
-        crate::types::narrow::type_guard_return_implication(
+        crate::types::narrow::type_predicate_return_correspondence(
             db,
             definition,
             domain,
-            target,
+            predicate,
             value,
             |expression| self.expression_type(expression),
         )
@@ -333,10 +333,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let mut correspondence =
                 if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
                     match declared_ty.resolve_type_alias(db) {
-                        Type::TypeGuard(guard) => {
-                            self.type_guard_body_implication(function, guard.return_type(db))
+                        predicate @ (Type::TypeGuard(_) | Type::TypeIs(_)) => {
+                            self.type_predicate_body_correspondence(function, predicate)
                         }
-                        Type::TypeIs(_) => None,
                         _ => Some(true),
                     }
                 } else {

@@ -2021,6 +2021,97 @@ fn function_output_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn type_is_output_correspondence() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY313)
+        .build()?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, TypeIs
+        from ty_extensions._internal import Unknown
+
+        def exact(value: object) -> TypeIs[bool]:
+            return type(value) is bool
+
+        def reversed(value: object) -> TypeIs[bool]:
+            return bool is type(value)
+
+        def wrong_positive(value: object) -> TypeIs[str]:
+            return type(value) is bool
+
+        # A bool is an int, but rejecting every non-bool also rejects other ints.
+        def wrong_negative(value: object) -> TypeIs[int]:
+            return type(value) is bool
+
+        # Python list subclasses prevent an exact class check from proving TypeIs.
+        def nonfinal(value: object) -> TypeIs[list[Any]]:
+            return type(value) is list
+
+        def gradual_input(value: Any) -> TypeIs[bool]:
+            return type(value) is bool
+
+        def unknown_target(value: object) -> TypeIs[Unknown]:
+            return type(value) is bool
+
+        def generic[T](value: object) -> TypeIs[T]:
+            return type(value) is bool
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("exact", Some(true)),
+        ("reversed", Some(true)),
+        ("wrong_positive", Some(false)),
+        ("wrong_negative", Some(false)),
+        ("nonfinal", None),
+        ("gradual_input", None),
+        ("unknown_target", None),
+        ("generic", None),
+    ];
+    let signatures = |db: &TestDb| {
+        cases.map(|(name, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let ordinary = signatures(&db);
+    for mode in [
+        crate::FunctionInferenceMode::Default,
+        crate::FunctionInferenceMode::OutputProof,
+        crate::FunctionInferenceMode::Conservative,
+        crate::FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((
+            file,
+            cases.map(|(name, _)| name.to_owned()).to_vec(),
+            mode,
+        )));
+        assert_file_diagnostics(&db, "/src/main.py", &[]);
+        let model = crate::SemanticModel::new(&db, program_file(&db, file));
+        for (name, expected) in cases {
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, name))
+                .unwrap();
+            assert_eq!(
+                facts.return_type_correspondence,
+                if mode == crate::FunctionInferenceMode::OutputProof {
+                    expected
+                } else {
+                    None
+                },
+                "{name} in {mode:?}",
+            );
+        }
+        assert_eq!(signatures(&db), ordinary);
+    }
+    Ok(())
+}
+
+#[test]
 fn function_argument_correspondence_status() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_python_version(PythonVersion::PY313)

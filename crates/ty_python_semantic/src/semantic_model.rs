@@ -77,8 +77,8 @@ pub struct FunctionInferenceFacts {
     /// Input domains, writes, and invariant storage require known compared types and pure
     /// correspondence under their materialization.
     /// `TypeGuard` results can retain a positive implication from a single returned runtime
-    /// type comparison of the original parameter. Unsupported predicate bodies and `TypeIs`
-    /// yield `None`.
+    /// type comparison of the original parameter. `TypeIs` checks both outcomes of that
+    /// comparison. Unsupported predicate bodies yield `None`.
     /// `None` means output checking was not selected or could not be completed.
     /// This fact does not establish operation safety, defaults, or complete body evidence.
     pub return_type_correspondence: Option<bool>,
