@@ -740,7 +740,7 @@ impl<'db> ConstructorContext<'db> {
         }
     }
 
-    fn instance_type(self) -> Type<'db> {
+    pub(super) fn instance_type(self) -> Type<'db> {
         self.instance_type
     }
 

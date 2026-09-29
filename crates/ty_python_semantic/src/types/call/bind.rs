@@ -8146,6 +8146,21 @@ impl<'db> Binding<'db> {
                     if index == 0
                         && matches!(argument, Argument::Synthetic)
                         && matched_parameter.index == 0
+                        && self.signature.has_implicit_positional_receiver_annotation()
+                        && matches!(actual, Type::NominalInstance(_))
+                        && actual == expected
+                        && self.constructor_context.is_some_and(|context| {
+                            context.kind() == constructor::ConstructorCallableKind::Init
+                                && context.instance_type() == actual
+                        })
+                    {
+                        // Constructor binding creates this receiver with its call-local class
+                        // variables. Supplied arguments still determine their specialization.
+                        return true;
+                    }
+                    if index == 0
+                        && matches!(argument, Argument::Synthetic)
+                        && matched_parameter.index == 0
                         && self.constructor_context.is_none()
                         && let Type::BoundMethod(method) = self.callable_type
                         && method.signature_receiver(db) == actual
@@ -11675,8 +11690,24 @@ mod tests {
         db.write_dedented(
             "/src/a.py",
             r#"
-from typing import Any, Callable, Mapping, cast
+from typing import Any, Callable, Iterable, Mapping, cast
 from typing_extensions import Self
+
+class Copy[T]:
+    items: list[T]
+    def __init__(self, items: Iterable[T]) -> None: ...
+
+class ExplicitCopy[T]:
+    items: list[T]
+    def __init__(self: "ExplicitCopy[int]", items: Iterable[T]) -> None: ...
+
+class SelfCopy[T]:
+    items: list[T]
+    def __init__(self, other: Self) -> None: ...
+
+class BoundedCopy[T: int]:
+    items: list[T]
+    def __init__(self, items: Iterable[T]) -> None: ...
 
 class Box[T]:
     def accept(self, value: T) -> None: ...
@@ -11709,6 +11740,11 @@ def put[T](values: list[T], value: T) -> None: ...
 def apply[T](callback: Callable[[T], int], value: T) -> int: ...
 def identity[T](value: list[T]) -> list[T]: ...
 
+fixed_copy = Copy[int]
+opaque_self_copy = cast(SelfCopy, None)
+opaque_copy = cast(Copy, None)
+copy_init = opaque_copy.__init__
+int_copy = cast(Copy[int], None)
 opaque_box = cast(Box, None)
 ops = cast(Ops, None)
 opaque_holder = cast(Holder, None)
@@ -11754,6 +11790,12 @@ unbound_or = dict.__or__
             ),
         );
         for (name, actuals, context, expected) in [
+            ("Copy", vec![list(unknown)], None, true),
+            ("Copy", vec![list(unknown)], Some(lookup("int_copy")), false),
+            ("fixed_copy", vec![list(unknown)], None, false),
+            ("ExplicitCopy", vec![list(unknown)], None, false),
+            ("SelfCopy", vec![lookup("opaque_self_copy")], None, false),
+            ("BoundedCopy", vec![list(unknown)], None, false),
             ("list_kind", vec![list(unknown)], None, true),
             ("dict_kind", vec![dict(unknown, unknown)], None, true),
             ("select", vec![dict(str, list(unknown))], None, true),
@@ -11785,7 +11827,7 @@ unbound_or = dict.__or__
             ("identity", vec![list(unknown)], None, true),
             ("identity", vec![list(unknown)], Some(list(str)), false),
         ] {
-            let arguments = CallArguments::positional(actuals);
+            let arguments = CallArguments::positional(actuals).with_input_proof_request(true);
             let constraints = ConstraintSetBuilder::new();
             let bindings = lookup(name)
                 .bindings(db, &env)
@@ -11800,6 +11842,10 @@ unbound_or = dict.__or__
                 )
                 .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
             let ordinary_return = bindings.return_type(db, &env);
+            if name == "Copy" && context.is_none() {
+                assert_eq!(ordinary_return, lookup("opaque_copy"));
+                assert!(!ordinary_return.satisfies_declared_output(db, &env, lookup("int_copy")));
+            }
             assert_eq!(
                 bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
                 expected,
@@ -11825,6 +11871,8 @@ unbound_or = dict.__or__
         };
         let attached = Type::BoundMethod(BoundMethodType::new(db, attached, lookup("ops")));
         for (name, actuals, accepted, proved) in [
+            ("fixed_copy", vec![list(str)], false, false),
+            ("copy_init", vec![list(unknown)], true, false),
             ("ops_transport", vec![dict(unknown, unknown)], true, true),
             ("static_transport", vec![dict(unknown, unknown)], true, true),
             ("static_explicit", vec![dict(unknown, unknown)], true, true),
