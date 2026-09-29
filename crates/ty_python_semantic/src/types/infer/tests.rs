@@ -3732,12 +3732,15 @@ fn iteration_argument_correspondence() -> anyhow::Result<()> {
         r#"
         from __future__ import annotations
         from typing import Any, AsyncIterator, Callable, Iterator
+        from ty_extensions import Intersection
         from ty_extensions._internal import Unknown
 
         class BadIter[T]:
             def __iter__(self: BadIter[Callable[[Any], None]]) -> Iterator[int]: return iter([1])
         class GoodIter[T]:
             def __iter__(self: GoodIter[Callable[[str], None]]) -> Iterator[int]: return iter([1])
+        class GoodWideIter:
+            def __iter__(self) -> Iterator[object]: return iter([object()])
         class BadNext[T]:
             def __iter__(self) -> BadNext[T]: return self
             def __next__(self: BadNext[Callable[[Any], None]]) -> int: return 1
@@ -3761,6 +3764,9 @@ fn iteration_argument_correspondence() -> anyhow::Result<()> {
         inherited_tuple_value: InheritedTuple
         async_value: AsyncIterator[int]
         tuple_value: tuple[Any, ...]
+        list_value: list[Any]
+        wide_iter_value: GoodWideIter
+        bad_iter_value: BadIter[Callable[[str], None]]
 
         def constructor(value: ConstructorIter) -> None:
             for item in value: pass
@@ -3769,6 +3775,10 @@ fn iteration_argument_correspondence() -> anyhow::Result<()> {
         def unknown(value: Unknown) -> None:
             for item in value: pass
         def mixed(value: list[Any] | Any) -> None:
+            for item in value: pass
+        def any_intersection(value: Intersection[Any, list[Any]]) -> None:
+            for item in value: pass
+        def unknown_intersection(value: Intersection[Unknown, list[Any]]) -> None:
             for item in value: pass
         def known_list(value: list[Any]) -> None:
             for item in value: pass
@@ -3828,7 +3838,54 @@ fn iteration_argument_correspondence() -> anyhow::Result<()> {
             Type::ProtocolInstance(_),
             "async_value must retain its declared protocol domain"
         );
+        let list_type = symbol_type("list_value");
+        let bad_type = symbol_type("bad_iter_value");
+        let wide_type = symbol_type("wide_iter_value");
+        let intersection = |left, right| {
+            let ty = crate::types::IntersectionType::from_two_elements(&db, &env, left, right);
+            assert!(
+                matches!(ty, Type::Intersection(_)),
+                "expected retained intersection: {ty:?}"
+            );
+            ty
+        };
+        // The bad receiver contributes an ordinary int result. Its input failure must
+        // remain a veto when the other constituent only establishes an object result.
+        let bad_shape = bad_type.try_iterate(&db, &env).unwrap();
+        let combined = intersection(wide_type, bad_type);
+        assert_eq!(combined.try_iterate(&db, &env).unwrap(), bad_shape);
         for (ty, mode, expected_proof) in [
+            (bad_type, EvaluationMode::Sync, false),
+            (combined, EvaluationMode::Sync, false),
+            (
+                intersection(Type::any(), list_type),
+                EvaluationMode::Sync,
+                true,
+            ),
+            (
+                intersection(Type::unknown(), list_type),
+                EvaluationMode::Sync,
+                false,
+            ),
+            (
+                crate::types::IntersectionType::from_two_elements(
+                    &db,
+                    &env,
+                    Type::divergent(salsa::plumbing::Id::from_bits(3)),
+                    list_type,
+                ),
+                EvaluationMode::Sync,
+                false,
+            ),
+            (
+                intersection(
+                    Type::any(),
+                    KnownClass::Str.to_instance(&db, &env).negate(&db, &env),
+                ),
+                EvaluationMode::Sync,
+                false,
+            ),
+            (Type::any(), EvaluationMode::Sync, false),
             (symbol_type("tuple_value"), EvaluationMode::Sync, true),
             (
                 symbol_type("custom_tuple_value"),
@@ -3881,6 +3938,8 @@ fn iteration_argument_correspondence() -> anyhow::Result<()> {
         ("dynamic", true),
         ("unknown", true),
         ("mixed", true),
+        ("any_intersection", false),
+        ("unknown_intersection", true),
         ("known_list", false),
         ("known_unknown_list", false),
         ("known_tuple", false),

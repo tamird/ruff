@@ -652,19 +652,25 @@ impl<'db> Type<'db> {
                                         request_input_proof,
                                     )
                                     .ok()
+                                    .map(|outcome| (element, outcome))
                             });
-                        let first_spec = specs_iter.next()?;
+                        let (first_element, first_spec) = specs_iter.next()?;
                         let IterationOutcome {
                             tuple,
-                            mut inputs_proved,
+                            inputs_proved: first_inputs_proved,
                         } = first_spec;
+                        let mut has_non_any_contributor = first_element != Type::any();
+                        let mut inputs_proved = !has_non_any_contributor || first_inputs_proved;
                         let mut builder = TupleSpecBuilder::from(&*tuple);
-                        for outcome in specs_iter {
+                        for (element, outcome) in specs_iter {
                             let IterationOutcome {
                                 tuple,
                                 inputs_proved: element_inputs_proved,
                             } = outcome;
-                            inputs_proved &= element_inputs_proved;
+                            if element != Type::any() {
+                                has_non_any_contributor = true;
+                                inputs_proved &= element_inputs_proved;
+                            }
                             // Two tuples cannot have incompatible specs unless the tuples themselves
                             // are disjoint. `IntersectionBuilder` eagerly simplifies such
                             // intersections to `Never`, so this should always return `Some`.
@@ -678,7 +684,9 @@ impl<'db> Type<'db> {
                         }
                         return Some(IterationOutcome {
                             tuple: Cow::Owned(builder.build()),
-                            inputs_proved,
+                            // Any contributes no additional iteration contract. Every other
+                            // successful constituent still owns the precision it contributes.
+                            inputs_proved: has_non_any_contributor && inputs_proved,
                         });
                     }
 
