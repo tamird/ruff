@@ -1959,6 +1959,8 @@ fn supplied_getattr_refines_matched_operands() -> anyhow::Result<()> {
         .with_file(
             "/src/main.py",
             r#"
+from typing import final
+
 def native_getattr(x: object, name: str, default: object = ..., /) -> object: ...
 
 class Record:
@@ -1976,6 +1978,29 @@ class Base: ...
 class Child(Base):
     field: str = "text"
 
+def condition() -> bool:
+    return True
+
+class RequiredBridge:
+    record = KnownInt()
+
+class OptionalBridge:
+    if condition():
+        record = KnownInt()
+
+class OptionalKeys:
+    if condition():
+        field: int = 1
+
+class OptionalKeyBridge:
+    record = OptionalKeys()
+
+@final
+class Missing: ...
+
+class MissingKeyBridge:
+    record = Missing()
+
 type OpenReceiver = KnownInt | Base
 
 def field_name() -> str: ...
@@ -1992,6 +2017,15 @@ possible_default = native_getattr(record, "field", *defaults)
 invalid = native_getattr(record, "field", None, 0)
 bound = Lookup().native_getattr("field")
 open_union = native_getattr(open_receiver(), "field", 0)
+required_bridge = native_getattr(native_getattr(RequiredBridge(), "record", None), "field", None)
+optional_bridge = native_getattr(native_getattr(OptionalBridge(), "record", None), "field", None)
+optional_key = native_getattr(native_getattr(OptionalKeyBridge(), "record", None), "field", None)
+missing_bridge = native_getattr(native_getattr(Missing(), "record", None), "field", None)
+missing_key = native_getattr(native_getattr(MissingKeyBridge(), "record", None), "field", None)
+none_default = native_getattr(None, "field", 0)
+none_no_default = native_getattr(None, "field")
+none_class = None.__class__
+none_present = native_getattr(None, "__class__", 0)
 
 def bounded[T: OpenReceiver](value: T):
     return native_getattr(value, "field", 0)
@@ -2012,6 +2046,10 @@ def class_bound[T: OpenReceiver](value: type[T]):
     let object_type = KnownClass::Object.to_instance(&db, &env);
     let int_type = KnownClass::Int.to_instance(&db, &env);
     let none_type = KnownClass::NoneType.to_instance(&db, &env);
+    let optional_int = crate::types::UnionType::from_two_elements(&db, &env, int_type, none_type);
+    let none_class = crate::place::global_symbol(&db, program, "none_class")
+        .place
+        .expect_type();
     for (name, expected) in [
         ("omitted", str_type),
         (
@@ -2026,6 +2064,17 @@ def class_bound[T: OpenReceiver](value: type[T]):
         ("invalid", object_type),
         ("bound", object_type),
         ("open_union", object_type),
+        ("required_bridge", optional_int),
+        ("optional_bridge", optional_int),
+        ("optional_key", optional_int),
+        ("missing_bridge", object_type),
+        ("missing_key", object_type),
+        ("none_default", Type::int_literal(0)),
+        ("none_no_default", object_type),
+        (
+            "none_present",
+            crate::types::UnionType::from_two_elements(&db, &env, none_class, Type::int_literal(0)),
+        ),
     ] {
         assert_eq!(
             crate::place::global_symbol(&db, program, name)

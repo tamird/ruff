@@ -1266,7 +1266,7 @@ fn distribute_member_lookup_over_bound_or_constraints<'db>(
                 inputs_proved &= member.inputs_proved(db);
                 properties =
                     union_deprecated_properties(db, properties, member.deprecated_properties(db));
-                policy.preserve_missing_alternative(member.member(db))
+                policy.preserve_missing_alternative(db, *constraint, member.member(db))
             });
             member_lookup_result(db, member, error, properties, inputs_proved)
         }
@@ -1433,13 +1433,22 @@ bitflags! {
 impl get_size2::GetSize for MemberLookupPolicy {}
 
 impl MemberLookupPolicy {
-    fn preserve_missing_alternative(
+    fn preserve_missing_alternative<'db>(
         self,
-        mut member: PlaceAndQualifiers<'_>,
-    ) -> PlaceAndQualifiers<'_> {
+        db: &'db dyn Db,
+        receiver: Type<'db>,
+        mut member: PlaceAndQualifiers<'db>,
+    ) -> PlaceAndQualifiers<'db> {
         if self.contains(Self::PRESERVE_MISSING_ALTERNATIVES) && member.place.is_undefined() {
+            // None has no unknown instance storage or subclass that could supply the member.
+            // Keep the missing path so a supplied getattr default still contributes.
+            let ty = if receiver.is_none(db) {
+                Type::Never
+            } else {
+                Type::unknown()
+            };
             member.place = Place::Defined(
-                DefinedPlace::new(Type::unknown()).with_definedness(Definedness::PossiblyUndefined),
+                DefinedPlace::new(ty).with_definedness(Definedness::PossiblyUndefined),
             );
         }
         member
@@ -4283,7 +4292,7 @@ impl<'db> Type<'db> {
                         // return type otherwise, and since `find_name_in_mro` is usually called via `class_member`, this is
                         // not a problem.
                         .unwrap_or_default();
-                    policy.preserve_missing_alternative(member)
+                    policy.preserve_missing_alternative(db, *elem, member)
                 }))
             }
             Type::Intersection(inter) => {
@@ -6338,7 +6347,7 @@ impl<'db> Type<'db> {
                             properties,
                             member.deprecated_properties(db),
                         );
-                        policy.preserve_missing_alternative(member.member(db))
+                        policy.preserve_missing_alternative(db, *elem, member.member(db))
                     });
                     member_lookup_result(db, member, error, properties, inputs_proved)
                 }
