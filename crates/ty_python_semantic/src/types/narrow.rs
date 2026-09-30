@@ -4315,6 +4315,15 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 }
                 unpack
             }
+            (ScopeKind::Function, DefinitionKind::For(for_stmt)) => {
+                let TargetKind::Sequence(_, unpack) = for_stmt.target_kind() else {
+                    return None;
+                };
+                if !matches!(unpack.value(db).kind(), UnpackKind::Iterable { .. }) {
+                    return None;
+                }
+                unpack
+            }
             (ScopeKind::Comprehension, DefinitionKind::Comprehension(comprehension)) => {
                 let TargetKind::Sequence(_, unpack) = comprehension.target_kind() else {
                     return None;
@@ -4353,7 +4362,10 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                     .any(|binding| match binding.binding {
                         DefinitionState::Undefined => false,
                         DefinitionState::Deleted => true,
-                        DefinitionState::Defined(other) => other != original,
+                        DefinitionState::Defined(other) => {
+                            // A loop header captures bindings; it does not introduce another write.
+                            other != original && !other.kind(db).is_loop_header()
+                        }
                     })
             {
                 return None;

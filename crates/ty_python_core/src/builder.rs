@@ -1437,6 +1437,15 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         }
                         unpack
                     }
+                    (ScopeKind::Function, DefinitionKind::For(for_stmt)) => {
+                        let TargetKind::Sequence(_, unpack) = for_stmt.target_kind() else {
+                            continue;
+                        };
+                        if !matches!(unpack.value(self.db).kind(), UnpackKind::Iterable { .. }) {
+                            continue;
+                        }
+                        unpack
+                    }
                     (ScopeKind::Comprehension, DefinitionKind::Comprehension(comprehension)) => {
                         let TargetKind::Sequence(_, unpack) = comprehension.target_kind() else {
                             continue;

@@ -297,6 +297,7 @@ A truthiness test on stable local unpack targets preserves the relationship betw
 and its payload. Reassigning either target must not restore the original relationship.
 
 ```py
+from collections.abc import AsyncIterable
 from typing import Literal
 
 def unpacked(item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], str]):
@@ -314,6 +315,41 @@ def aliased(item: Tagged):
         reveal_type(payload)  # revealed: dict[str, int]
     else:
         reveal_type(payload)  # revealed: str
+
+def for_targets(items: list[Tagged]):
+    for flag, payload in items:
+        if flag:
+            reveal_type(payload)  # revealed: dict[str, int]
+        else:
+            reveal_type(payload)  # revealed: str
+
+async def async_for_targets(items: AsyncIterable[Tagged]):
+    async for flag, payload in items:
+        if flag:
+            reveal_type(payload)  # revealed: dict[str, int]
+        else:
+            reveal_type(payload)  # revealed: str
+
+def assigned_in_loop(items: list[Tagged]):
+    for item in items:
+        flag, payload = item
+        if flag:
+            reveal_type(payload)  # revealed: dict[str, int]
+        else:
+            reveal_type(payload)  # revealed: str
+
+def replaced_for_payload(items: list[Tagged]) -> dict[str, int]:
+    for flag, payload in items:
+        payload = "replacement"
+        if flag:
+            return payload  # error: [invalid-return-type]
+    return {}
+
+def deleted_for_payload(items: list[Tagged]):
+    for flag, payload in items:
+        del payload
+        if flag:
+            payload  # error: [unresolved-reference]
 
 def replaced_source(item: Tagged):
     flag, payload = item
@@ -412,6 +448,10 @@ class Broken:
 def failed_outer_iteration():
     # error: [not-iterable]
     reveal_type([payload for flag, payload in Broken() if flag])  # revealed: list[dict[str, int] | str]
+
+    for flag, payload in Broken():  # error: [not-iterable]
+        if flag:
+            reveal_type(payload)  # revealed: dict[str, int] | str
 ```
 
 ### Tagged unions of tuples (equality narrowing)
