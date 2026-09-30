@@ -62,7 +62,7 @@ use crate::types::{
     ClassLiteral, KnownClass, RecursiveType, StaticClassLiteral, Type, TypeAndQualifiers,
     TypeQualifiers,
 };
-use crate::{Db, FxIndexSet};
+use crate::{Db, FxIndexMap};
 
 use builder::TypeInferenceBuilder;
 pub(super) use comparisons::UnsupportedComparisonError;
@@ -186,7 +186,25 @@ struct TypeAndRange<'db> {
     range: TextRange,
 }
 
-type CollectionUseConstraints<'db> = FxHashMap<Definition<'db>, FxIndexSet<Type<'db>>>;
+/// Both kinds contribute to inference. Only a declared context constrains singleton promotion:
+/// a projected mutation such as `append(None)` still permits other values in the collection.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
+enum CollectionUseConstraintKind {
+    Context,
+    Inferred,
+}
+
+impl CollectionUseConstraintKind {
+    fn merge(self, other: Self) -> Self {
+        match self {
+            Self::Context => Self::Context,
+            Self::Inferred => other,
+        }
+    }
+}
+
+type CollectionUseConstraints<'db> =
+    FxHashMap<Definition<'db>, FxIndexMap<Type<'db>, CollectionUseConstraintKind>>;
 
 /// Merges collection-use constraints from another inference result or cycle iteration.
 ///
@@ -201,10 +219,13 @@ fn extend_collection_use_constraints<'db>(
         reason = "constraints for distinct collection definitions are merged independently"
     )]
     for (collection_def, constraints) in previous {
-        current
-            .entry(*collection_def)
-            .or_default()
-            .extend(constraints);
+        let current = current.entry(*collection_def).or_default();
+        for (ty, kind) in constraints {
+            current
+                .entry(*ty)
+                .and_modify(|current| *current = current.merge(*kind))
+                .or_insert(*kind);
+        }
     }
 }
 
@@ -222,10 +243,13 @@ fn normalize_collection_use_constraints<'db>(
         reason = "constraints for distinct collection definitions are normalized independently"
     )]
     for types in constraints.values_mut() {
-        *types = std::mem::take(types)
-            .into_iter()
-            .map(|ty| ty.recursive_type_normalized(db, env, cycle))
-            .collect();
+        for (ty, kind) in std::mem::take(types) {
+            let ty = ty.recursive_type_normalized(db, env, cycle);
+            types
+                .entry(ty)
+                .and_modify(|current| *current = current.merge(kind))
+                .or_insert(kind);
+        }
         types.shrink_to_fit();
     }
 }
@@ -1812,7 +1836,7 @@ impl<'db> DefinitionInference<'db> {
     fn collection_use_constraints(
         &self,
         collection_def: Definition<'db>,
-    ) -> Option<&FxIndexSet<Type<'db>>> {
+    ) -> Option<&FxIndexMap<Type<'db>, CollectionUseConstraintKind>> {
         self.extra
             .as_deref()?
             .collection_use_constraints()?
@@ -2198,7 +2222,7 @@ impl<'db> ExpressionInference<'db> {
     fn collection_use_constraints(
         &self,
         collection_def: Definition<'db>,
-    ) -> Option<&FxIndexSet<Type<'db>>> {
+    ) -> Option<&FxIndexMap<Type<'db>, CollectionUseConstraintKind>> {
         self.extra
             .as_ref()?
             .collection_use_constraints
@@ -2258,7 +2282,7 @@ impl<'db> StatementInference<'db> {
     fn collection_use_constraints(
         &self,
         collection_def: Definition<'db>,
-    ) -> Option<&FxIndexSet<Type<'db>>> {
+    ) -> Option<&FxIndexMap<Type<'db>, CollectionUseConstraintKind>> {
         match self {
             StatementInference::Expression(inference) => {
                 inference.collection_use_constraints(collection_def)
@@ -2452,7 +2476,7 @@ impl<'db> StatementInferenceInner<'db> {
     fn collection_use_constraints(
         &self,
         collection_def: Definition<'db>,
-    ) -> Option<&FxIndexSet<Type<'db>>> {
+    ) -> Option<&FxIndexMap<Type<'db>, CollectionUseConstraintKind>> {
         self.extra
             .as_ref()?
             .collection_use_constraints

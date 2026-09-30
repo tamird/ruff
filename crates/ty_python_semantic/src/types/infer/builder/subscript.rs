@@ -21,7 +21,7 @@ use crate::types::infer::builder::annotation_expression::PEP613Policy;
 use crate::types::infer::builder::{
     ArgExpr, ArgumentsIter, DunderCallOutcome, MultiInferenceGuard,
 };
-use crate::types::infer::{InferenceFlags, TypeExpressionFlags};
+use crate::types::infer::{CollectionUseConstraintKind, InferenceFlags, TypeExpressionFlags};
 use crate::types::special_form::AliasSpec;
 use crate::types::subscript::{
     LegacyGenericOrigin, SubscriptError, SubscriptErrorKind, SubscriptResult,
@@ -1767,7 +1767,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         self.collection_use_constraints
                             .entry(collection_def)
                             .or_default()
-                            .insert(constraints);
+                            .entry(constraints)
+                            .or_insert(CollectionUseConstraintKind::Inferred);
                     }
                 }
             }

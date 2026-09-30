@@ -3220,6 +3220,61 @@ def incompatible_comprehension():
     reveal_type(values)  # revealed: dict[str | int, str | int]
 ```
 
+Exact singleton parameters constrain the stored values of a collection. A context that only reads
+keys or accepts appended values leaves the other element possibilities open. Gradual contexts and
+unconstrained mutations continue to infer gradual element types.
+
+```py
+def consume_markers(values: dict[str, None]) -> None: ...
+def direct_markers(keys: list[str]):
+    markers = {key: None for key in keys}
+    consume_markers(markers)
+    reveal_type(markers)  # revealed: dict[str, None]
+
+def captured_markers(keys: list[str]):
+    markers = {key: None for key in keys}
+    callback = lambda: consume_markers(markers)
+    reveal_type(markers)  # revealed: dict[str, None]
+
+from collections.abc import Iterable
+from typing import Any, Protocol
+
+def consume_keys(keys: Iterable[str]) -> None: ...
+def key_context(keys: list[str]):
+    markers = {key: None for key in keys}
+    consume_keys(markers)
+    reveal_type(markers)  # revealed: dict[str, None | Unknown]
+
+def consume_gradual_markers(values: dict[str, None | Any]) -> None: ...
+def gradual_context(keys: list[str]):
+    markers = {key: None for key in keys}
+    consume_gradual_markers(markers)
+    reveal_type(markers)  # revealed: dict[str, None | Any]
+
+class AcceptsNone(Protocol):
+    def append(self, value: None, /) -> None: ...
+
+def consume_appender(values: AcceptsNone) -> None: ...
+def lower_only_context():
+    values = [None]
+    consume_appender(values)
+    reveal_type(values)  # revealed: list[None | Unknown]
+
+def unconstrained_markers(keys: list[str]):
+    markers = {key: None for key in keys}
+    reveal_type(markers)  # revealed: dict[str, None | Unknown]
+
+def appended_none():
+    values = []
+    values.append(None)
+    reveal_type(values)  # revealed: list[None | Unknown]
+
+def conflicting_markers(keys: list[str]):
+    markers = {key: None for key in keys}
+    markers["extra"] = 1
+    consume_markers(markers)  # error: [invalid-argument-type]
+```
+
 Each captured argument supplies context even when the same collection occurs twice in a call.
 
 ```py

@@ -3736,6 +3736,7 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         allow_tuple_size_promotion: bool,
         unconstrained: bool,
+        singleton_context: Option<Type<'db>>,
     ) -> Type<'db> {
         let ty = if unconstrained {
             self.promote(db, env)
@@ -3747,10 +3748,23 @@ impl<'db> Type<'db> {
         } else {
             ty
         };
-        if unconstrained {
-            ty.promote_singletons_recursively(db, env)
-        } else {
+        if !unconstrained {
+            return ty;
+        }
+
+        let promoted = ty.promote_singletons_recursively(db, env);
+        // A later declared consumer can require a singleton even though the initializer had no
+        // annotation. Preserve regular literal and tuple promotion, but keep singleton widening
+        // within that slot's static domain. Inferred mutation evidence supplies no such domain.
+        if promoted != ty
+            && let Some(context) = singleton_context
+            && context.is_fully_static(db, env)
+            && ty.is_subtype_of(db, env, context)
+            && !promoted.is_subtype_of(db, env, context)
+        {
             ty
+        } else {
+            promoted
         }
     }
 

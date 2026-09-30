@@ -702,7 +702,7 @@ pub(super) fn collected_list_type<'db, 'ast>(
     } else {
         elements.build()
     };
-    let ty = ty.promote_collection_element_type(db, env, allow_tuple_size_promotion, true);
+    let ty = ty.promote_collection_element_type(db, env, allow_tuple_size_promotion, true, None);
     KnownClass::List.to_specialized_instance(db, env, &[ty])
 }
 

@@ -3166,6 +3166,21 @@ def infer_elements():
     values = []
     append_value(values, "value")
     reveal_type(values)  # revealed: list[str]
+
+def infer_singleton_elements():
+    values = []
+    append_value(values, None)
+    reveal_type(values)  # revealed: list[None | Unknown]
+```
+
+An explicitly declared collection parameter supplies context even when another parameter is generic.
+
+```py
+def consume_markers(markers: dict[str, None], unused: T) -> None: ...
+def exact_markers(keys: list[str]):
+    markers = {key: None for key in keys}
+    consume_markers(markers, 1)
+    reveal_type(markers)  # revealed: dict[str, None]
 ```
 
 ## Context for a recursively captured returned local

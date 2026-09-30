@@ -28,10 +28,10 @@ use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::statement::StatementInner;
 
 use super::{
-    CollectionUseConstraints, DeferredAndUndecorated, DefinitionInference,
-    DefinitionInferenceExtra, DefinitionTypes, ExpressionInference, ExpressionInferenceExtra,
-    FrozenMap, FrozenSet, FrozenValueMap, FunctionDecoratorInference, InferenceRegion,
-    OtherDefinitionInferenceExtra, ScopeInference, ScopeInferenceExtra,
+    CollectionUseConstraintKind, CollectionUseConstraints, DeferredAndUndecorated,
+    DefinitionInference, DefinitionInferenceExtra, DefinitionTypes, ExpressionInference,
+    ExpressionInferenceExtra, FrozenMap, FrozenSet, FrozenValueMap, FunctionDecoratorInference,
+    InferenceRegion, OtherDefinitionInferenceExtra, ScopeInference, ScopeInferenceExtra,
     extend_collection_use_constraints, infer_deferred_types, infer_definition_types,
     infer_expression_types, infer_same_file_expression_type, infer_unpack_types,
 };
@@ -319,7 +319,7 @@ pub(super) struct TypeInferenceBuilder<'db, 'ast> {
     // generic context and existentially quantify away the method-local typevars, so combining
     // `xs.append("x")` with `xs.sort()` yields `str ≤ T ≤ SupportsRichComparison` instead of
     // leaking `SupportsRichComparisonT@sort` into the inferred list element type.
-    collection_use_constraints: FxHashMap<Definition<'db>, FxIndexSet<Type<'db>>>,
+    collection_use_constraints: CollectionUseConstraints<'db>,
 
     /// Expressions that are string annotations
     string_annotations: FxHashSet<ExpressionNodeKey>,
@@ -7163,7 +7163,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.collection_use_constraints
                 .entry(collection_def)
                 .or_default()
-                .insert(tcx);
+                .insert(tcx, CollectionUseConstraintKind::Context);
         }
 
         ty
@@ -8453,6 +8453,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
+        let mut singleton_contexts: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
+            FxHashMap::default();
+
         if tcx.annotation.is_none()
             && let Some(collection_expr) = collection_expr
             && let InferenceRegion::Expression(current_expr, _) = self.region
@@ -8490,12 +8493,43 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 } else if let Some(constraints) =
                     statement_use_types.collection_use_constraints(collection_def)
                 {
-                    for constraint in constraints {
+                    for (constraint, kind) in constraints {
                         if constraint.has_unspecialized_type_var(db, env) {
                             continue;
                         }
 
                         builder.infer(identity_instance, *constraint).ok()?;
+                        if *kind == CollectionUseConstraintKind::Context {
+                            let (contexts, variances) =
+                                project_element_context(Some(*constraint), &builder);
+                            for typevar in generic_context.variables(db) {
+                                let identity = typevar.identity(db);
+                                // Only an upper bound restricts the values stored in this slot.
+                                if !matches!(
+                                    variances.get(&identity),
+                                    Some(TypeVarVariance::Covariant | TypeVarVariance::Invariant)
+                                ) {
+                                    continue;
+                                }
+                                let Some(context) = contexts.get(&identity).copied() else {
+                                    continue;
+                                };
+                                if !context.is_fully_static(db, env) {
+                                    continue;
+                                }
+                                // Every consumer constrains this slot. Keep their conjunction
+                                // separate from the evidence used to solve the element type.
+                                singleton_contexts
+                                    .entry(identity)
+                                    .and_modify(|current| {
+                                        *current = IntersectionBuilder::new(db, env)
+                                            .add_positive(*current)
+                                            .add_positive(context)
+                                            .build();
+                                    })
+                                    .or_insert(context);
+                            }
+                        }
                     }
                 }
             }
@@ -8640,6 +8674,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         env,
                         tuple_size_promotion_constraints.allow(current_typevar.identity(self.db())),
                         is_empty_collection_type_context(tcx),
+                        singleton_contexts
+                            .get(&current_typevar.identity(db))
+                            .copied(),
                     );
 
                     Some(lower)
@@ -10721,7 +10758,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         self.collection_use_constraints
                             .entry(collection_def)
                             .or_default()
-                            .insert(constraints);
+                            .entry(constraints)
+                            .or_insert(CollectionUseConstraintKind::Inferred);
                     }
                 }
             }
