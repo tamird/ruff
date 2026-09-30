@@ -3376,3 +3376,111 @@ def uninhabited_argument(value: T) -> T:
     reveal_type(is_dictionary(value))  # revealed: TypeIs[dict[Any, Any] @ value]
     return value
 ```
+
+## Composite union arguments
+
+A union argument retains the relationships between its type variables across every alternative. A
+callback can map the values while preserving the dictionary key type.
+
+```py
+from typing import Callable, Literal, TypeVar
+
+K = TypeVar("K")
+V = TypeVar("V")
+R = TypeVar("R")
+S = TypeVar("S")
+StrKey = TypeVar("StrKey", bound=str)
+
+def map_item(
+    func: Callable[[V], R],
+    item: tuple[Literal[True], dict[K, V]] | tuple[Literal[False], V],
+) -> tuple[Literal[True], dict[K, R]] | tuple[Literal[False], R]:
+    tag, value = item
+    if tag:
+        return True, {key: func(element) for key, element in value.items()}
+    return False, func(value)
+
+def map_dict(func: Callable[[V], R], item: dict[K, V]) -> dict[K, R]:
+    return {key: func(value) for key, value in item.items()}
+
+def preserve(
+    item: tuple[Literal[True], dict[K, V]] | tuple[Literal[False], V],
+) -> tuple[Literal[True], dict[K, V]] | tuple[Literal[False], V]:
+    return item
+
+def identity(value: str) -> str:
+    return value
+
+def length(value: str) -> int:
+    return len(value)
+
+def check(
+    dictionary: dict[int, str],
+    tagged: tuple[Literal[True], dict[int, str]],
+    item: tuple[Literal[True], dict[int, str]] | tuple[Literal[False], str],
+):
+    reveal_type(map_dict(identity, dictionary))  # revealed: dict[int, str]
+    reveal_type(map_item(identity, tagged))  # revealed: tuple[Literal[True], dict[int, str]] | tuple[Literal[False], str]
+    reveal_type(map_item(identity, item))  # revealed: tuple[Literal[True], dict[int, str]] | tuple[Literal[False], str]
+    reveal_type(preserve(item))  # revealed: tuple[Literal[True], dict[int, str]] | tuple[Literal[False], str]
+    reveal_type(map_item(length, item))  # revealed: tuple[Literal[True], dict[int, int]] | tuple[Literal[False], int]
+
+def bounded_keys(
+    item: tuple[Literal[True], dict[StrKey, V]] | tuple[Literal[False], V],
+) -> None:
+    pass
+
+def unrestricted_keys(
+    item: tuple[Literal[True], dict[S, str]] | tuple[Literal[False], str],
+):
+    bounded_keys(item)  # error: [invalid-argument-type]
+```
+
+The caller's dictionary key type must be preserved. Matching finite constraints permit forwarding; a
+`str | bytes` bound also admits narrower key types that the callee's constraints would widen.
+
+```py
+FiniteKey = TypeVar("FiniteKey", str, bytes)
+UnionKey = TypeVar("UnionKey", bound=str | bytes)
+CallerKey = TypeVar("CallerKey", str, bytes)
+
+def constrained_keys(
+    item: tuple[Literal[True], dict[FiniteKey, V]] | tuple[Literal[False], V],
+) -> None:
+    pass
+
+def unrestricted_constraint_keys(
+    item: tuple[Literal[True], dict[S, str]] | tuple[Literal[False], str],
+):
+    constrained_keys(item)  # error: [invalid-argument-type]
+
+def union_bound_keys(
+    item: tuple[Literal[True], dict[UnionKey, str]] | tuple[Literal[False], str],
+):
+    constrained_keys(item)  # error: [invalid-argument-type]
+
+def compatible_constraint_keys(
+    item: tuple[Literal[True], dict[CallerKey, str]] | tuple[Literal[False], str],
+):
+    constrained_keys(item)
+```
+
+Gradual keys and values retain their uncertainty, and the callback must accept the item's value.
+
+```py
+from typing import Any
+
+def integer_identity(value: int) -> int:
+    return value
+
+def check_gradual(
+    keys: tuple[Literal[True], dict[Any, str]] | tuple[Literal[False], str],
+    values: tuple[Literal[True], dict[int, Any]] | tuple[Literal[False], Any],
+    item: tuple[Literal[True], dict[int, str]] | tuple[Literal[False], str],
+):
+    reveal_type(preserve(keys))  # revealed: tuple[Literal[True], dict[Any, str]] | tuple[Literal[False], str]
+    reveal_type(preserve(values))  # revealed: tuple[Literal[True], dict[int, Any]] | tuple[Literal[False], Any]
+    # error: [invalid-argument-type]
+    # error: [invalid-argument-type]
+    map_item(integer_identity, item)
+```

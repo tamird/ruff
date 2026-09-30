@@ -12351,7 +12351,7 @@ bound = holder.read
             "/src/a.py",
             r#"
 from _typeshed import SupportsKeysAndGetItem
-from typing import Iterable
+from typing import Any, Iterable, Literal
 
 def copy[K, V](source: SupportsKeysAndGetItem[K, V] | Iterable[tuple[K, V]]) -> dict[K, V]:
     raise NotImplementedError
@@ -12364,6 +12364,34 @@ def correlate[K, V](
 mapping: dict[str, int]
 pairs: list[tuple[str, int]]
 wrong_values: dict[str, bytes]
+mapping_or_pairs: dict[str, int] | list[tuple[str, int]]
+conflicting_values: dict[str, int] | list[tuple[str, bytes]]
+gradual_values: dict[str, Any] | list[tuple[str, Any]]
+
+def bounded[K: str, V](
+    source: tuple[Literal[True], dict[K, V]] | tuple[Literal[False], V],
+) -> None:
+    pass
+
+def constrained[K: (str, bytes), V](
+    source: tuple[Literal[True], dict[K, V]] | tuple[Literal[False], V],
+) -> None:
+    pass
+
+def union_bounded[S: str | bytes](
+    source: tuple[Literal[True], dict[S, str]] | tuple[Literal[False], str],
+) -> None:
+    pass
+
+def same_constraints[S: (str, bytes)](
+    source: tuple[Literal[True], dict[S, str]] | tuple[Literal[False], str],
+) -> None:
+    pass
+
+def unrestricted[S](
+    source: tuple[Literal[True], dict[S, str]] | tuple[Literal[False], str],
+) -> None:
+    pass
 "#,
         )?;
         let db = &db;
@@ -12376,7 +12404,72 @@ wrong_values: dict[str, bytes]
         let mapping = lookup("mapping");
         let str = KnownClass::Str.to_instance(db, &env);
         let int = KnownClass::Int.to_instance(db, &env);
-        for argument in [mapping, lookup("pairs")] {
+        let mut outcomes = Vec::new();
+        for (callee, caller) in [
+            ("bounded", "unrestricted"),
+            ("constrained", "unrestricted"),
+            ("constrained", "union_bounded"),
+            ("constrained", "same_constraints"),
+        ] {
+            let Type::FunctionLiteral(function) = lookup(caller) else {
+                anyhow::bail!("expected the caller's generic function");
+            };
+            let signature = function.last_definition_signature(db);
+            let parameter = signature
+                .parameters()
+                .iter()
+                .exactly_one()
+                .map_err(|_| anyhow::anyhow!("expected one caller parameter"))?;
+            let arguments = CallArguments::positional([parameter.annotated_type()]);
+            let constraints = ConstraintSetBuilder::new();
+            let result = lookup(callee)
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &constraints,
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                );
+            let (accepted, bindings) = match result {
+                Ok(bindings) => (true, bindings),
+                Err(CallError(_, bindings)) => (false, *bindings),
+            };
+            let proved = bindings.arguments_satisfy_declared_parameters(db, &env, &arguments);
+            outcomes.push((callee, caller, accepted, proved));
+        }
+        let arguments = CallArguments::positional([lookup("gradual_values"), mapping]);
+        let constraints = ConstraintSetBuilder::new();
+        let result = correlate
+            .bindings(db, &env)
+            .match_parameters(db, &env, &arguments)
+            .check_types(
+                db,
+                &env,
+                &constraints,
+                &arguments,
+                TypeContext::default(),
+                &[],
+            );
+        let (accepted, bindings) = match result {
+            Ok(bindings) => (true, bindings),
+            Err(CallError(_, bindings)) => (false, *bindings),
+        };
+        let proved = bindings.arguments_satisfy_declared_parameters(db, &env, &arguments);
+        outcomes.push(("correlate", "gradual_values", accepted, proved));
+        assert_eq!(
+            outcomes,
+            [
+                ("bounded", "unrestricted", false, false),
+                ("constrained", "unrestricted", false, false),
+                ("constrained", "union_bounded", false, false),
+                ("constrained", "same_constraints", true, true),
+                ("correlate", "gradual_values", true, false),
+            ]
+        );
+        for argument in [mapping, lookup("pairs"), lookup("mapping_or_pairs")] {
             for inference in [
                 call_inference(db, copy, [argument], TypeContext::default())?,
                 call_inference(db, correlate, [argument, mapping], TypeContext::default())?,
@@ -12391,6 +12484,15 @@ wrong_values: dict[str, bytes]
                 db,
                 correlate,
                 [mapping, lookup("wrong_values")],
+                TypeContext::default(),
+            )
+            .is_err()
+        );
+        assert!(
+            call_inference(
+                db,
+                correlate,
+                [lookup("conflicting_values"), mapping],
                 TypeContext::default(),
             )
             .is_err()

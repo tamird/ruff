@@ -4137,12 +4137,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 }
             }
 
-            // TODO: We haven't implemented a full unification solver yet. If typevars appear in
-            // multiple union elements, we ideally want to express that _only one_ of them needs to
-            // match, and that we should infer the smallest type mapping that allows that.
-            //
-            // For now, we punt on fully handling multiple typevar elements. Instead, we handle two
-            // common cases specially:
+            // Composite union alternatives use the complete relation where ordinary type
+            // variables can be inferred together. Bare variables, Self, and variadics still
+            // require the specialized inference rules below.
             (Type::Union(formal_union), Type::Union(actual_union)) => {
                 // First, if both formal and actual are unions, and precisely one formal union
                 // element contains type variables, infer through that element after removing
@@ -4161,30 +4158,46 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 //     reveal_type(g(x))  # revealed: str | int
                 // ```
                 // The generic element can be composite, such as `Sequence[T]` in
-                // `Sequence[T] | None`. Multiple generic elements still need a choice of which
-                // one to match: `T | list[T]` against `int | list[int]` should infer `T = int`.
-                let types_have_typevars = formal_union
-                    .elements(db)
-                    .iter()
-                    .filter(|ty| ty.has_typevar(db, self.env));
-                let Ok(generic_element) = types_have_typevars.exactly_one() else {
+                // `Sequence[T] | None`. Multiple composite generic elements share a relation,
+                // while choices involving bare variables remain unsupported: `T | list[T]`
+                // against `int | list[int]` should infer `T = int`.
+                if actual_union.elements(db).iter().any(|ty| ty.is_type_var()) {
                     return Ok(());
-                };
-                // Composite members can infer ordinary type variables, but re-inferring `Self`
-                // can widen the receiver's specialization, and variadic inference must preserve
-                // the caller's parameter pack instead of widening it through another union arm.
-                if !generic_element.is_type_var()
-                    && any_over_type(db, self.env, *generic_element, false, |ty| {
+                }
+                let contains_self_or_variadic = |ty| {
+                    any_over_type(db, self.env, ty, false, |ty| {
                         ty.as_typevar().is_some_and(|typevar| {
                             typevar.typevar(db).is_self(db)
                                 || typevar.is_paramspec(db)
                                 || typevar.is_typevartuple(db)
                         })
                     })
-                {
-                    return Ok(());
-                }
-                if actual_union.elements(db).iter().any(|ty| ty.is_type_var()) {
+                };
+                let types_have_typevars = formal_union
+                    .elements(db)
+                    .iter()
+                    .filter(|ty| ty.has_typevar(db, self.env));
+                let Ok(generic_element) = types_have_typevars.exactly_one() else {
+                    // Keep all alternatives in one relation so tuple discriminators and later
+                    // arguments constrain the same solution. Zero generic elements need no
+                    // inference; bare variables, Self, and packs retain their existing rules.
+                    if !formal.has_typevar(db, self.env)
+                        || formal_union.elements(db).iter().any(|ty| ty.is_type_var())
+                        || contains_self_or_variadic(formal)
+                        || self
+                            .inferable
+                            .iter(db)
+                            .any(|typevar| typevar.is_paramspec(db) || typevar.is_typevartuple(db))
+                    {
+                        return Ok(());
+                    }
+                    let when = self.constraint_for_relation(formal, actual, relation_polarity);
+                    return self.infer_from_constraint_set(when);
+                };
+                // Composite members can infer ordinary type variables, but re-inferring `Self`
+                // can widen the receiver's specialization, and variadic inference must preserve
+                // the caller's parameter pack instead of widening it through another union arm.
+                if !generic_element.is_type_var() && contains_self_or_variadic(*generic_element) {
                     return Ok(());
                 }
                 let remaining_actual =
