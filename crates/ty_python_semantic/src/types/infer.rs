@@ -188,7 +188,7 @@ struct TypeAndRange<'db> {
 
 type CollectionUseConstraints<'db> = FxHashMap<Definition<'db>, FxIndexSet<Type<'db>>>;
 
-/// Extends the current collection-use constraints with those from the previous cycle iteration.
+/// Merges collection-use constraints from another inference result or cycle iteration.
 ///
 /// Constraints for a collection can appear and disappear while dependent inference results are
 /// still changing. Retaining previous constraints makes this part of inference monotonic.

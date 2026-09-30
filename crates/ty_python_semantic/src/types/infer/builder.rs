@@ -31,9 +31,9 @@ use super::{
     CollectionUseConstraints, DeferredAndUndecorated, DefinitionInference,
     DefinitionInferenceExtra, DefinitionTypes, ExpressionInference, ExpressionInferenceExtra,
     FrozenMap, FrozenSet, FrozenValueMap, FunctionDecoratorInference, InferenceRegion,
-    OtherDefinitionInferenceExtra, ScopeInference, ScopeInferenceExtra, infer_deferred_types,
-    infer_definition_types, infer_expression_types, infer_same_file_expression_type,
-    infer_unpack_types,
+    OtherDefinitionInferenceExtra, ScopeInference, ScopeInferenceExtra,
+    extend_collection_use_constraints, infer_deferred_types, infer_definition_types,
+    infer_expression_types, infer_same_file_expression_type, infer_unpack_types,
 };
 use crate::diagnostic::format_enumeration;
 use crate::place::{
@@ -662,17 +662,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     self.type_expression_flags
                         .extend(extra.type_expression_flags.iter().copied());
 
-                    #[expect(
-                        clippy::iter_over_hash_type,
-                        reason = "constraints for distinct collection definitions are merged \
-                            independently"
-                    )]
-                    for (collection_def, constraints) in &extra.collection_use_constraints {
-                        self.collection_use_constraints
-                            .entry(*collection_def)
-                            .and_modify(|this| this.extend(constraints))
-                            .or_insert(constraints.clone());
-                    }
+                    extend_collection_use_constraints(
+                        &mut self.collection_use_constraints,
+                        &extra.collection_use_constraints,
+                    );
                 }
             }
         }
@@ -772,16 +765,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.type_expression_flags
                 .extend(extra.type_expression_flags.iter().copied());
 
-            #[expect(
-                clippy::iter_over_hash_type,
-                reason = "constraints for distinct collection definitions are merged independently"
-            )]
-            for (collection_def, constraints) in &extra.collection_use_constraints {
-                self.collection_use_constraints
-                    .entry(*collection_def)
-                    .and_modify(|this| this.extend(constraints))
-                    .or_insert(constraints.clone());
-            }
+            extend_collection_use_constraints(
+                &mut self.collection_use_constraints,
+                &extra.collection_use_constraints,
+            );
         }
     }
 
@@ -813,16 +800,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .map(|(key, flags)| (*key, *flags)),
         );
 
-        #[expect(
-            clippy::iter_over_hash_type,
-            reason = "constraints for distinct collection definitions are merged independently"
-        )]
-        for (collection_def, constraints) in &inference.collection_use_constraints {
-            self.collection_use_constraints
-                .entry(*collection_def)
-                .and_modify(|this| this.extend(constraints))
-                .or_insert(constraints.clone());
-        }
+        extend_collection_use_constraints(
+            &mut self.collection_use_constraints,
+            &inference.collection_use_constraints,
+        );
 
         if !matches!(self.region, InferenceRegion::Scope(..)) {
             self.bindings.extend(
@@ -849,16 +830,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.type_expression_flags
                 .extend(extra.type_expression_flags.iter().copied());
 
-            #[expect(
-                clippy::iter_over_hash_type,
-                reason = "constraints for distinct collection definitions are merged independently"
-            )]
-            for (collection_def, constraints) in &extra.collection_use_constraints {
-                self.collection_use_constraints
-                    .entry(*collection_def)
-                    .and_modify(|this| this.extend(constraints))
-                    .or_insert(constraints.clone());
-            }
+            extend_collection_use_constraints(
+                &mut self.collection_use_constraints,
+                &extra.collection_use_constraints,
+            );
         }
     }
 
@@ -8234,124 +8209,122 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // We use a forward assignability check (`identity_instance ≤ tcx`) to infer what each
         // typevar maps to in the type context. For example, if the type context is `list[int]` and
         // `collection_instance` is `list[T]`, the check produces `T = int`.
-        let (elt_tcx_constraints, elt_tcx_variance) = {
-            let mut elt_tcx_constraints: FxHashMap<
-                BoundTypeVarIdentity<'db>,
-                UnionAccumulator<'db>,
-            > = FxHashMap::default();
-            let mut elt_tcx_variance: FxHashMap<BoundTypeVarIdentity<'_>, TypeVarVariance> =
-                FxHashMap::default();
+        let project_element_context =
+            |annotation: Option<Type<'db>>, builder: &SpecializationBuilder<'db, '_>| {
+                let mut elt_tcx_constraints: FxHashMap<
+                    BoundTypeVarIdentity<'db>,
+                    UnionAccumulator<'db>,
+                > = FxHashMap::default();
+                let mut elt_tcx_variance: FxHashMap<BoundTypeVarIdentity<'_>, TypeVarVariance> =
+                    FxHashMap::default();
 
-            if let Some(tcx) = tcx.annotation.map(|tcx| tcx.resolve_type_alias(db))
-                && matches!(tcx, Type::NominalInstance(_))
-                && let Some(specialization) = tcx.known_specialization(db, env, collection_class)
-                && specialization.generic_context(self.db()) == generic_context
-                && generic_context.variables(self.db()).all(|typevar| {
-                    !typevar.is_paramspec(self.db())
-                        && typevar
-                            .typevar(self.db())
-                            .bound_or_constraints(db, env)
-                            .is_none()
-                })
-            {
-                // For an instance of the collection class itself, the identity specialization
-                // maps directly to the contextual specialization. Avoid constructing and solving
-                // a general assignability constraint set for this common case.
-                for (typevar, inferred_ty) in generic_context
-                    .variables(self.db())
-                    .zip(specialization.types(self.db()))
+                if let Some(tcx) = annotation.map(|tcx| tcx.resolve_type_alias(db))
+                    && matches!(tcx, Type::NominalInstance(_))
+                    && let Some(specialization) =
+                        tcx.known_specialization(db, env, collection_class)
+                    && specialization.generic_context(db) == generic_context
+                    && generic_context.variables(db).all(|typevar| {
+                        !typevar.is_paramspec(db)
+                            && typevar.typevar(db).bound_or_constraints(db, env).is_none()
+                    })
                 {
-                    let inferred_ty = inferred_ty
-                        .filter_union(db, env, |ty| {
-                            !ty.as_typevar()
-                                .is_some_and(|tv| tv.is_inferable(self.db(), inferable))
-                        })
-                        .filter_union(db, env, |ty| {
-                            elts.is_empty() || !ty.has_unspecialized_type_var(db, env)
-                        });
-                    if !elts.is_empty() && inferred_ty.has_unspecialized_type_var(db, env) {
-                        continue;
-                    }
-
-                    let identity = typevar.identity(self.db());
-                    elt_tcx_constraints.insert(identity, UnionAccumulator::new(inferred_ty));
-                    elt_tcx_variance.insert(identity, typevar.variance(db));
-                }
-            } else if let Some(tcx) = tcx.annotation
-                && supports_collection_literal_context(db, env, tcx)
-            {
-                let db = self.db();
-
-                let path_bounds =
-                    identity_instance.assignable_solutions_with_inferable(db, env, tcx, inferable);
-                let solutions = path_bounds.solve_with(|variance, path_bound| {
-                    let identity = path_bound.bound_typevar.identity(db);
-                    elt_tcx_variance
-                        .entry(identity)
-                        .and_modify(|current| *current = current.join(variance))
-                        .or_insert(variance);
-                    CandidateSolutions::preliminary_solve(db, env, &constraints, path_bound)
-                });
-
-                match solutions {
-                    // If the type context is not compatible with the collection type (e.g., a
-                    // `list` literal where a `tuple` is expected), the assignability check
-                    // produces an unsatisfiable result. In that case, we simply proceed without
-                    // type context constraints rather than aborting the entire collection literal
-                    // inference.
-                    Solutions::Unsatisfiable(_) | Solutions::Unconstrained => {}
-                    Solutions::Constrained(solutions) => {
-                        for solution in solutions.as_slice() {
-                            for binding in &solution.solved_typevars {
-                                // The SequentMap's transitivity reasoning can inject
-                                // cross-typevar references into the solution bounds.
-                                // For example, `_KT ≤ str ∧ str ≤ _VT` derives `_KT ≤ _VT`,
-                                // which adds `_KT` to `_VT`'s lower bound. Remove inferable
-                                // typevars from the same generic context, since they represent
-                                // cross-typevar relationships that are resolved independently.
-                                let inferred_ty = builder
-                                    .remove_inferable_typevar_artifacts_from_solution(
-                                        binding.bound_typevar,
-                                        binding.solution,
-                                    );
-
-                                // Avoid inferring a preferred type based on partially specialized
-                                // type context from an outer generic call. If the type context is
-                                // a union, we try to keep any concrete elements.
-                                let inferred_ty = inferred_ty.filter_union(db, env, |ty| {
-                                    !ty.has_unspecialized_type_var(db, env)
-                                });
-                                if inferred_ty.has_unspecialized_type_var(db, env) {
-                                    continue;
-                                }
-
-                                let identity = binding.bound_typevar.identity(db);
-                                elt_tcx_constraints
-                                    .entry(identity)
-                                    .and_modify(|existing| {
-                                        existing.add(db, env, inferred_ty);
-                                    })
-                                    .or_insert_with(|| UnionAccumulator::new(inferred_ty));
-                            }
+                    // For an instance of the collection class itself, the identity specialization
+                    // maps directly to the contextual specialization. Avoid constructing and solving
+                    // a general assignability constraint set for this common case.
+                    for (typevar, inferred_ty) in
+                        generic_context.variables(db).zip(specialization.types(db))
+                    {
+                        let inferred_ty = inferred_ty
+                            .filter_union(db, env, |ty| {
+                                !ty.as_typevar()
+                                    .is_some_and(|tv| tv.is_inferable(db, inferable))
+                            })
+                            .filter_union(db, env, |ty| {
+                                elts.is_empty() || !ty.has_unspecialized_type_var(db, env)
+                            });
+                        if !elts.is_empty() && inferred_ty.has_unspecialized_type_var(db, env) {
+                            continue;
                         }
 
-                        // Remove variance entries for typevars whose solutions were filtered out
-                        // (e.g., due to unspecialized typevars). Variance should only be tracked
-                        // for typevars with actual type context constraints.
+                        let identity = typevar.identity(db);
+                        elt_tcx_constraints.insert(identity, UnionAccumulator::new(inferred_ty));
+                        elt_tcx_variance.insert(identity, typevar.variance(db));
+                    }
+                } else if let Some(tcx) = annotation
+                    && supports_collection_literal_context(db, env, tcx)
+                {
+                    let path_bounds = identity_instance
+                        .assignable_solutions_with_inferable(db, env, tcx, inferable);
+                    let solutions = path_bounds.solve_with(|variance, path_bound| {
+                        let identity = path_bound.bound_typevar.identity(db);
                         elt_tcx_variance
-                            .retain(|identity, _| elt_tcx_constraints.contains_key(identity));
+                            .entry(identity)
+                            .and_modify(|current| *current = current.join(variance))
+                            .or_insert(variance);
+                        CandidateSolutions::preliminary_solve(db, env, &constraints, path_bound)
+                    });
+
+                    match solutions {
+                        // If the type context is not compatible with the collection type (e.g., a
+                        // `list` literal where a `tuple` is expected), the assignability check
+                        // produces an unsatisfiable result. In that case, we simply proceed without
+                        // type context constraints rather than aborting the entire collection literal
+                        // inference.
+                        Solutions::Unsatisfiable(_) | Solutions::Unconstrained => {}
+                        Solutions::Constrained(solutions) => {
+                            for solution in solutions.as_slice() {
+                                for binding in &solution.solved_typevars {
+                                    // The SequentMap's transitivity reasoning can inject
+                                    // cross-typevar references into the solution bounds.
+                                    // For example, `_KT ≤ str ∧ str ≤ _VT` derives `_KT ≤ _VT`,
+                                    // which adds `_KT` to `_VT`'s lower bound. Remove inferable
+                                    // typevars from the same generic context, since they represent
+                                    // cross-typevar relationships that are resolved independently.
+                                    let inferred_ty = builder
+                                        .remove_inferable_typevar_artifacts_from_solution(
+                                            binding.bound_typevar,
+                                            binding.solution,
+                                        );
+
+                                    // Avoid inferring a preferred type based on partially specialized
+                                    // type context from an outer generic call. If the type context is
+                                    // a union, we try to keep any concrete elements.
+                                    let inferred_ty = inferred_ty.filter_union(db, env, |ty| {
+                                        !ty.has_unspecialized_type_var(db, env)
+                                    });
+                                    if inferred_ty.has_unspecialized_type_var(db, env) {
+                                        continue;
+                                    }
+
+                                    let identity = binding.bound_typevar.identity(db);
+                                    elt_tcx_constraints
+                                        .entry(identity)
+                                        .and_modify(|existing| {
+                                            existing.add(db, env, inferred_ty);
+                                        })
+                                        .or_insert_with(|| UnionAccumulator::new(inferred_ty));
+                                }
+                            }
+
+                            // Remove variance entries for typevars whose solutions were filtered out
+                            // (e.g., due to unspecialized typevars). Variance should only be tracked
+                            // for typevars with actual type context constraints.
+                            elt_tcx_variance
+                                .retain(|identity, _| elt_tcx_constraints.contains_key(identity));
+                        }
                     }
                 }
-            }
 
-            let elt_tcx_constraints: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
-                elt_tcx_constraints
-                    .into_iter()
-                    .map(|(identity, accumulator)| (identity, accumulator.into_type(db, env)))
-                    .collect();
+                let elt_tcx_constraints: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
+                    elt_tcx_constraints
+                        .into_iter()
+                        .map(|(identity, accumulator)| (identity, accumulator.into_type(db, env)))
+                        .collect();
 
-            (elt_tcx_constraints, elt_tcx_variance)
-        };
+                (elt_tcx_constraints, elt_tcx_variance)
+            };
+        let (elt_tcx_constraints, elt_tcx_variance) =
+            project_element_context(tcx.annotation, &builder);
 
         // Dictionary unpacking always contributes constraints on the inferred key and value types,
         // even when the unpacked mapping is assignable to the context. Keep it on the general path
@@ -13552,16 +13525,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .extend(bindings.iter().map(|(def, ty)| (*def, *ty)));
         }
 
-        #[expect(
-            clippy::iter_over_hash_type,
-            reason = "constraints for distinct collection definitions are merged independently"
-        )]
-        for (collection_def, constraints) in &collection_use_constraints {
-            self.collection_use_constraints
-                .entry(*collection_def)
-                .and_modify(|this| this.extend(constraints))
-                .or_insert(constraints.clone());
-        }
+        extend_collection_use_constraints(
+            &mut self.collection_use_constraints,
+            &collection_use_constraints,
+        );
     }
 }
 
