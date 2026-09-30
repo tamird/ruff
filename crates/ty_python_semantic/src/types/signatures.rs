@@ -1127,12 +1127,12 @@ impl<'db> Signature<'db> {
         )
     }
 
-    /// Whether static specialization can preserve the signature's complete input shape.
+    /// Whether specialization can preserve the signature's complete input shape.
     /// Declaration domains are checked separately by the chosen inference path.
-    fn supports_static_specialization(
+    fn supports_specialization(
         &self,
         db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
+        mut supports_type: impl FnMut(Type<'db>) -> bool,
     ) -> bool {
         !self.is_paramspec_value()
             && self.receiver_constraints().is_none()
@@ -1142,17 +1142,17 @@ impl<'db> Signature<'db> {
                     .variables(db)
                     .all(|variable| variable.domain(db) == TypeVarDomain::Type)
             })
-            && self.return_type().is_fully_static(db, env)
+            && supports_type(self.return_type())
             && self
                 .parameters()
                 .iter()
-                .all(|parameter| parameter.annotated_type().is_fully_static(db, env))
+                .all(|parameter| supports_type(parameter.annotated_type()))
     }
 
     /// Whether source specialization can use static constraints without declaration-domain solving.
     /// The caller separately excludes generic target signatures.
     fn supports_static_inference(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
-        self.supports_static_specialization(db, env)
+        self.supports_specialization(db, |ty| ty.is_fully_static(db, env))
             && self.generic_context.is_none_or(|context| {
                 context
                     .variables(db)
@@ -1160,11 +1160,15 @@ impl<'db> Signature<'db> {
             })
     }
 
-    fn has_static_declared_domain(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+    fn has_supported_declared_domain(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
         let Some(context) = self.generic_context else {
             return false;
         };
-        if !self.supports_static_specialization(db, env) {
+        if !self.supports_specialization(db, |ty| ty.is_fully_static_except_any(db, env)) {
             return false;
         }
         let mut has_domain = false;
@@ -1176,14 +1180,18 @@ impl<'db> Signature<'db> {
                 continue;
             };
             has_domain = true;
-            let is_static = match domain {
+            let is_supported = match domain {
                 TypeVarBoundOrConstraints::UpperBound(bound) => bound.is_fully_static(db, env),
-                TypeVarBoundOrConstraints::Constraints(constraints) => constraints
-                    .elements(db)
-                    .iter()
-                    .all(|ty| ty.is_fully_static(db, env)),
+                TypeVarBoundOrConstraints::Constraints(constraints) => {
+                    // The solver selects finite alternatives as declared. Any components must
+                    // still satisfy the original strict relation after specialization.
+                    constraints
+                        .elements(db)
+                        .iter()
+                        .all(|ty| ty.is_fully_static_except_any(db, env))
+                }
             };
-            if !is_static {
+            if !is_supported {
                 return false;
             }
         }
@@ -2714,9 +2722,9 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 TypeRelation::Redundancy { pure: true }
                     | TypeRelation::DeclaredOutput { strict: _ }
             )
-            && source.has_static_declared_domain(db, env)
+            && source.has_supported_declared_domain(db, env)
             && target.generic_context.is_none()
-            && target.supports_static_inference(db, env)
+            && target.supports_specialization(db, |ty| ty.is_fully_static_except_any(db, env))
             && self.proves_declared_domain_specialization(db, source, target)
         {
             return self.always();

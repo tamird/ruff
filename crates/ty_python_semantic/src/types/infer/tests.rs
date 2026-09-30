@@ -1646,11 +1646,14 @@ fn static_generic_callable_specializations() -> anyhow::Result<()> {
         "/src/main.py",
         r#"
         from typing import Any, Callable, Generic, Protocol, TypeVar, cast
-        from ty_extensions._internal import into_regular_callable
+        from ty_extensions._internal import Unknown, into_regular_callable
 
         T = TypeVar("T")
         B = TypeVar("B", bound=int)
         C = TypeVar("C", str, bytes)
+        M = TypeVar("M", str, list[Any])
+        N = TypeVar("N", str, list[str])
+        A = TypeVar("A", bound=Any)
         def identity(value: T) -> T: return value
         def pep_identity[U](value: U) -> U: return value
         def list_identity(value: list[T]) -> list[T]: return value
@@ -1661,11 +1664,22 @@ fn static_generic_callable_specializations() -> anyhow::Result<()> {
         def wrong_bounded[S: str](value: S) -> int: return 1
         def bounded_list[S: str](value: list[S]) -> list[S]: return value
         def gradual_domain[S: Any](value: S) -> S: return value
+        def mixed[S: (str, list[Any])](value: S) -> S: return value
+        def legacy_mixed(value: M) -> M: return value
+        def wrong_mixed[S: (str, list[Any])](value: S) -> int: return 1
+        def any_choice[S: (int, Any)](value: S) -> S: return value
+        def unknown_choice[S: (str, Unknown)](value: S) -> S: return value
+        def partial_any[S: str](value: S, extra: Any) -> S: return value
+        def concrete_partial_any(value: str, extra: Any) -> str: return value
+        def erased_result[S: str](value: S) -> Any: return value
         class StrSubclass(str): pass
         subclass_identity = cast(Callable[[StrSubclass], StrSubclass], None)
         class FiniteIdentity(Protocol):
             def __call__[S: (str, bytes)](self, value: S) -> S: ...
         finite_callback = cast(FiniteIdentity, None)
+        class MixedIdentity(Protocol):
+            def __call__[S: (str, list[Any])](self, value: S) -> S: ...
+        mixed_callback = cast(MixedIdentity, None)
 
         def same_constraints[S: (str, bytes)](value: S) -> Callable[[S], S]:
             raise NotImplementedError
@@ -1675,10 +1689,26 @@ fn static_generic_callable_specializations() -> anyhow::Result<()> {
             raise NotImplementedError
         def str_bounded_caller[S: str](value: S) -> Callable[[S], S]:
             raise NotImplementedError
+        def same_mixed[S: (str, list[Any])](value: S) -> Callable[[S], S]:
+            raise NotImplementedError
+        def narrower_mixed[S: (str, list[str])](value: S) -> Callable[[S], S]:
+            raise NotImplementedError
+        def bounded_mixed[S: str | list[str]](value: S) -> Callable[[S], S]:
+            raise NotImplementedError
+        def legacy_same_mixed(value: M) -> Callable[[M], M]:
+            raise NotImplementedError
+        def legacy_narrower_mixed(value: N) -> Callable[[N], N]:
+            raise NotImplementedError
+        def any_bounded_caller[S: Any](value: S) -> Callable[[S], S]:
+            raise NotImplementedError
+        def legacy_any_bounded_caller(value: A) -> Callable[[A], A]:
+            raise NotImplementedError
         generic_target = into_regular_callable(identity)
         fixed = cast(Callable[[str], str], None)
         wrong_result = cast(Callable[[str], int], None)
         any_input = cast(Callable[[Any], int], None)
+        any_input_str = cast(Callable[[Any], str], None)
+        partial_target = cast(Callable[[str, Any], str], None)
         int_identity = cast(Callable[[int], int], None)
         fixed_list = cast(Callable[[list[str]], list[str]], None)
         wrong_list = cast(Callable[[list[str]], list[int]], None)
@@ -1774,6 +1804,28 @@ fn static_generic_callable_specializations() -> anyhow::Result<()> {
         ("bounded_list", "fixed_list", true, Some(true)),
         ("bounded_list", "wrong_list", false, None),
         ("gradual_domain", "fixed", false, Some(true)),
+        ("mixed", "fixed", true, Some(true)),
+        ("legacy_mixed", "fixed", true, Some(true)),
+        ("mixed", "fixed_list", false, None),
+        ("legacy_mixed", "fixed_list", false, None),
+        ("mixed", "same_mixed", true, Some(true)),
+        ("mixed", "legacy_same_mixed", true, Some(true)),
+        ("legacy_mixed", "same_mixed", true, Some(true)),
+        ("legacy_mixed", "legacy_same_mixed", true, Some(true)),
+        ("mixed", "narrower_mixed", false, None),
+        ("legacy_mixed", "legacy_narrower_mixed", false, None),
+        ("mixed", "bounded_mixed", false, None),
+        ("mixed", "unrestricted_caller", false, None),
+        ("mixed_callback", "same_mixed", true, Some(true)),
+        ("wrong_mixed", "fixed", false, None),
+        ("any_choice", "fixed", false, None),
+        ("unknown_choice", "fixed", false, Some(true)),
+        ("str_bounded", "any_input_str", false, None),
+        ("mixed", "any_bounded_caller", false, None),
+        ("legacy_mixed", "legacy_any_bounded_caller", false, None),
+        ("partial_any", "partial_target", true, Some(true)),
+        ("concrete_partial_any", "partial_target", true, Some(true)),
+        ("erased_result", "fixed", false, None),
         ("bounded_callback", "gradual_callback", false, Some(true)),
         ("bounded_callback", "static_callback", true, None),
         ("bounded_field", "gradual_field", false, Some(true)),
