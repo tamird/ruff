@@ -50,6 +50,15 @@ pub enum FunctionInferenceMode {
 /// Database giving access to semantic information about a Python program.
 #[salsa::db]
 pub trait Db: PythonCoreDb {
+    /// Supplies a caller-visible contract while preserving the source body declaration.
+    /// Implementations must use tracked inputs and must not return the same function.
+    fn provided_function_contract<'db>(
+        &'db self,
+        _definition: Definition<'db>,
+    ) -> Option<crate::types::FunctionType<'db>> {
+        None
+    }
+
     /// Selects function inference using tracked configuration inputs.
     ///
     /// This changes the active configuration, not a simultaneous alternate view.

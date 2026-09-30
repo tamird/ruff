@@ -348,7 +348,7 @@ impl<'db> OverloadLiteral<'db> {
         self.decorators(db).contains(decorator)
     }
 
-    pub(crate) fn is_overload(self, db: &dyn Db) -> bool {
+    pub fn is_overload(self, db: &dyn Db) -> bool {
         self.has_known_decorator(db, FunctionDecorators::OVERLOAD)
     }
 
@@ -447,7 +447,7 @@ impl<'db> OverloadLiteral<'db> {
     /// calling query is not in the same file as this function is defined in, then this will create
     /// a cross-module dependency directly on the full AST which will lead to cache
     /// over-invalidation.
-    fn definition(self, db: &'db dyn Db) -> Definition<'db> {
+    pub fn definition(self, db: &'db dyn Db) -> Definition<'db> {
         let body_scope = self.body_scope(db);
         let index = semantic_index(db, body_scope.program_file(db));
         index.expect_single_definition(body_scope.node(db).expect_function())
@@ -519,7 +519,7 @@ impl<'db> OverloadLiteral<'db> {
     /// calling query is not in the same file as this function is defined in, then this will create
     /// a cross-module dependency directly on the full AST which will lead to cache
     /// over-invalidation.
-    pub(crate) fn signature(self, db: &'db dyn Db) -> Signature<'db> {
+    pub fn signature(self, db: &'db dyn Db) -> Signature<'db> {
         let scope = self.body_scope(db);
         let program_file = self.program_file(db);
         let python_file = program_file.python_file(db);
@@ -1725,7 +1725,7 @@ impl<'db> FunctionType<'db> {
 
     /// Returns an iterator of all of the definitions of this function, including both overload
     /// signatures and any implementation, all in source order.
-    pub(crate) fn iter_overloads_and_implementation(
+    pub fn iter_overloads_and_implementation(
         self,
         db: &'db dyn Db,
     ) -> impl DoubleEndedIterator<Item = OverloadLiteral<'db>> + 'db {
@@ -1766,6 +1766,9 @@ impl<'db> FunctionType<'db> {
         heap_size=ruff_memory_usage::heap_size,
     )]
     fn literal_signature(self, db: &'db dyn Db) -> CallableSignature<'db> {
+        if let Some(contract) = db.provided_function_contract(self.definition(db)) {
+            return contract.signature(db).clone();
+        }
         self.literal(db).signature(db)
     }
 
