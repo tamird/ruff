@@ -8165,13 +8165,21 @@ impl<'db> Binding<'db> {
                         && let Type::BoundMethod(method) = self.callable_type
                         && method.signature_receiver(db) == actual
                         && self.signature.has_implicit_positional_receiver_annotation()
-                        && matches!(actual, Type::NominalInstance(_))
                         && let Some(receiver) = self.signature.unused_self_typevar(db, env)
                         && expected == Type::TypeVar(receiver)
-                        && receiver.typevar(db).upper_bound(db, env) == Some(actual)
+                        && let Some(bound) = receiver.typevar(db).upper_bound(db, env)
+                        && matches!(bound, Type::NominalInstance(_))
+                        && match actual {
+                            Type::NominalInstance(_) => actual == bound,
+                            Type::Intersection(intersection) => {
+                                intersection.positive(db).contains(&bound)
+                            }
+                            _ => false,
+                        }
                     {
-                        // Binding established this exact nominal receiver. An inferred, unused
-                        // Self adds no input restriction on its already selected class arguments.
+                        // An unused inferred Self repeats the nominal domain established by
+                        // method binding. That same domain remains a positive intersection
+                        // component after narrowing; other components only restrict the receiver.
                         proved_receiver = Some(receiver);
                     } else {
                         pairs.push((actual, expected));

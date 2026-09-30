@@ -5056,7 +5056,7 @@ impl<'db> Type<'db> {
     ) -> Place<'db> {
         if let Type::ModuleLiteral(module) = self {
             module
-                .static_member(db, env, name)
+                .static_member(db, env, name, MemberLookupPolicy::default())
                 .map_or(Place::Undefined, |member| member.member(db).place)
         } else if let place @ Place::Defined(_) = self
             .class_member_with_policy(db, env, name, MemberLookupPolicy::RUNTIME_ATTRIBUTE)
@@ -6374,38 +6374,27 @@ impl<'db> Type<'db> {
                         .into()
                     } else {
                         let receiver = Some(receiver.unwrap_or(this));
-                        let mut error = None;
-                        let mut properties: Option<PropertyDeprecations<'db>> = None;
-                        let mut all_deprecated = true;
-                        let mut inputs_proved = true;
-                        let member =
-                            intersection.map_with_boundness_and_qualifiers(db, env, |elem| {
-                                let result = elem.member_lookup_with_policy_and_receiver(
-                                    db, env, name_str, policy, receiver,
-                                );
-                                error = error.or_else(|| result.err().map(|error| error.kind(db)));
-                                let member =
-                                    result.unwrap_or_else(|error| error.fallback_member(db));
-                                if !member.member(db).place.is_undefined() {
-                                    inputs_proved &= member.inputs_proved(db);
-                                }
-                                if let Some(deprecated) = member.deprecated_properties(db) {
-                                    properties =
-                                        Some(properties.map_or(deprecated, |properties| {
-                                            properties.intersection(db, deprecated)
-                                        }));
-                                } else if !member.member(db).place.is_undefined() {
-                                    all_deprecated = false;
-                                }
-                                member.member(db)
-                            });
-                        member_lookup_result(
-                            db,
-                            member,
-                            error,
-                            properties.filter(|_| all_deprecated && !member.place.is_undefined()),
-                            inputs_proved,
-                        )
+                        // A definite member on any component takes precedence over every
+                        // `__getattr__` fallback. Custom `__getattribute__` still runs as part
+                        // of each component's ordinary lookup.
+                        let result = intersection.map_member_lookup_results(db, env, |elem| {
+                            elem.member_lookup_with_policy_and_receiver(
+                                db,
+                                env,
+                                name_str,
+                                policy | MemberLookupPolicy::NO_GETATTR_LOOKUP,
+                                receiver,
+                            )
+                        });
+                        if policy.no_instance_fallback() || policy.no_getattr_lookup() {
+                            result
+                        } else {
+                            member_lookup_or_fall_back_to(db, env, result, || {
+                                intersection.map_member_lookup_results(db, env, |elem| {
+                                    elem.getattr_result(db, env, name, policy, receiver)
+                                })
+                            })
+                        }
                     }
                 }
 
@@ -6725,7 +6714,7 @@ impl<'db> Type<'db> {
                     Place::bound(Type::int_literal(i64::from(bool_value))).into()
                 }
 
-                Type::ModuleLiteral(module) => module.static_member(db, env, name_str),
+                Type::ModuleLiteral(module) => module.static_member(db, env, name_str, policy),
 
                 // If a protocol does not include a member and the policy disables falling back to
                 // `object`, we return `Place::Undefined` here. This short-circuits attribute lookup
@@ -8717,6 +8706,118 @@ impl<'db> Type<'db> {
         })
     }
 
+    /// Resolve a fallback after the combined ordinary lookup can miss.
+    /// Transparent bounds and aliases retain ordinary members within their union alternatives.
+    fn getattr_result(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &Name,
+        policy: MemberLookupPolicy,
+        receiver: Option<Type<'db>>,
+    ) -> MemberLookupResult<'db> {
+        if policy.no_getattr_lookup() {
+            return MemberLookupResult::from(Place::Undefined);
+        }
+
+        if receiver.is_some()
+            && matches!(
+                self,
+                Type::TypeVar(_) | Type::TypeAlias(_) | Type::Recursive(_)
+            )
+        {
+            // Bounds and aliases can contain unions. Reuse their ordinary lookup so an arm
+            // with a declared member does not call its fallback when another arm can miss.
+            return self.member_lookup_with_policy_and_receiver(db, env, name, policy, receiver);
+        }
+
+        if matches!(
+            self,
+            Type::KnownInstance(KnownInstanceType::TypeGenericAlias(_))
+        ) {
+            // `GenericAlias.__getattr__` delegates to `__origin__`. For `type[T]`, the
+            // origin is always `type`, not `T`, even when `T` is `Any`.
+            return KnownClass::Type
+                .to_class_literal(db, env)
+                .member_lookup_with_policy_and_receiver(db, env, name, policy, None);
+        }
+
+        if let Type::ModuleLiteral(module) = self {
+            return module.try_module_getattr(db, env, name);
+        }
+
+        let name_type = Type::string_literal(db, name);
+        let request_input_proof = policy.contains(MemberLookupPolicy::PROVE_GETTER_INPUTS);
+        let mut arguments =
+            CallArguments::positional([name_type]).with_input_proof_request(request_input_proof);
+        let call_result = if let Some(receiver) = receiver {
+            let lookup_policy = if request_input_proof {
+                MemberLookupPolicy::PROVE_GETTER_INPUTS
+            } else {
+                MemberLookupPolicy::default()
+            };
+            Self::try_call_dunder_member_impl(
+                db,
+                env,
+                self.member_lookup_with_policy_and_receiver(
+                    db,
+                    env,
+                    "__getattr__",
+                    lookup_policy | MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+                    Some(receiver),
+                ),
+                &mut arguments,
+                TypeContext::default(),
+            )
+        } else {
+            self.try_call_dunder_with_policy(
+                db,
+                env,
+                "__getattr__",
+                &mut arguments,
+                TypeContext::default(),
+                MemberLookupPolicy::default(),
+            )
+        };
+        let (bindings, possibly_unbound) = match call_result {
+            Ok(bindings) => (bindings, false),
+            Err(CallDunderError::PossiblyUnbound {
+                bindings,
+                unbound_on: _,
+            }) => (*bindings, true),
+            Err(CallDunderError::CallError(_, bindings, _)) => {
+                return member_lookup_result(
+                    db,
+                    bindings.getattr_result(db, env).into(),
+                    Some(MemberLookupErrorKind::GetAttr {
+                        receiver: self,
+                        name: name_type,
+                    }),
+                    None,
+                    false,
+                );
+            }
+            Err(CallDunderError::MethodNotAvailable) => return Place::Undefined.into(),
+        };
+        let place = if possibly_unbound {
+            Place::Defined(
+                DefinedPlace::new(bindings.return_type(db, env))
+                    .with_definedness(Definedness::PossiblyUndefined),
+            )
+        } else {
+            bindings.getattr_result(db, env)
+        };
+        member_lookup_result(
+            db,
+            place.into(),
+            None,
+            None,
+            request_input_proof
+                && !bindings.has_only_constructor_items()
+                && bindings.arguments_satisfy_declared_parameters(db, env, &arguments),
+        )
+    }
+
     /// Apply `__getattr__` / `__getattribute__` fallback to an attribute-lookup result.
     ///
     /// A custom `__getattribute__` can intercept even an always-defined normal lookup result.
@@ -8730,71 +8831,7 @@ impl<'db> Type<'db> {
         result: MemberLookupResult<'db>,
         policy: MemberLookupPolicy,
     ) -> MemberLookupResult<'db> {
-        let custom_getattr_result = || {
-            if policy.no_getattr_lookup() {
-                return MemberLookupResult::from(Place::Undefined);
-            }
-
-            if matches!(
-                self,
-                Type::KnownInstance(KnownInstanceType::TypeGenericAlias(_))
-            ) {
-                // `GenericAlias.__getattr__` delegates to `__origin__`. For `type[T]`, the
-                // origin is always `type`, not `T`, even when `T` is `Any`.
-                return KnownClass::Type
-                    .to_class_literal(db, env)
-                    .member_lookup_with_policy_and_receiver(db, env, name, policy, None);
-            }
-
-            let name_type = Type::string_literal(db, name);
-            let request_input_proof = policy.contains(MemberLookupPolicy::PROVE_GETTER_INPUTS);
-            let mut arguments = CallArguments::positional([name_type])
-                .with_input_proof_request(request_input_proof);
-            let (bindings, possibly_unbound) = match self.try_call_dunder_with_policy(
-                db,
-                env,
-                "__getattr__",
-                &mut arguments,
-                TypeContext::default(),
-                MemberLookupPolicy::default(),
-            ) {
-                Ok(bindings) => (bindings, false),
-                Err(CallDunderError::PossiblyUnbound {
-                    bindings,
-                    unbound_on: _,
-                }) => (*bindings, true),
-                Err(CallDunderError::CallError(_, bindings, _)) => {
-                    return member_lookup_result(
-                        db,
-                        bindings.getattr_result(db, env).into(),
-                        Some(MemberLookupErrorKind::GetAttr {
-                            receiver: self,
-                            name: name_type,
-                        }),
-                        None,
-                        false,
-                    );
-                }
-                Err(CallDunderError::MethodNotAvailable) => return Place::Undefined.into(),
-            };
-            let place = if possibly_unbound {
-                Place::Defined(
-                    DefinedPlace::new(bindings.return_type(db, env))
-                        .with_definedness(Definedness::PossiblyUndefined),
-                )
-            } else {
-                bindings.getattr_result(db, env)
-            };
-            member_lookup_result(
-                db,
-                place.into(),
-                None,
-                None,
-                request_input_proof
-                    && !bindings.has_only_constructor_items()
-                    && bindings.arguments_satisfy_declared_parameters(db, env, &arguments),
-            )
-        };
+        let custom_getattr_result = || self.getattr_result(db, env, name, policy, None);
 
         let getattribute_policy = MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK
             | MemberLookupPolicy::META_CLASS_NO_TYPE_FALLBACK;
@@ -11108,6 +11145,41 @@ impl<'db> Type<'db> {
 }
 
 impl<'db> IntersectionType<'db> {
+    fn map_member_lookup_results(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        mut lookup: impl FnMut(Type<'db>) -> MemberLookupResult<'db>,
+    ) -> MemberLookupResult<'db> {
+        let mut error = None;
+        let mut properties: Option<PropertyDeprecations<'db>> = None;
+        let mut all_deprecated = true;
+        let mut inputs_proved = true;
+        let member = self.map_with_boundness_and_qualifiers(db, env, |elem| {
+            let result = lookup(*elem);
+            error = error.or_else(|| result.err().map(|error| error.kind(db)));
+            let member = result.unwrap_or_else(|error| error.fallback_member(db));
+            if !member.member(db).place.is_undefined() {
+                inputs_proved &= member.inputs_proved(db);
+            }
+            if let Some(deprecated) = member.deprecated_properties(db) {
+                properties = Some(properties.map_or(deprecated, |properties| {
+                    properties.intersection(db, deprecated)
+                }));
+            } else if !member.member(db).place.is_undefined() {
+                all_deprecated = false;
+            }
+            member.member(db)
+        });
+        member_lookup_result(
+            db,
+            member,
+            error,
+            properties.filter(|_| all_deprecated && !member.place.is_undefined()),
+            inputs_proved,
+        )
+    }
+
     /// Return whether the negation of this intersection is a subtype of `target`.
     ///
     /// Applying De Morgan's law to an intersection produces a union. Checking each branch
@@ -12617,6 +12689,7 @@ impl<'db> ModuleLiteralType<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
+        policy: MemberLookupPolicy,
     ) -> MemberLookupResult<'db> {
         let module = self.module(db);
         // `__dict__` is a very special member that is never overridden by module globals;
@@ -12650,7 +12723,7 @@ impl<'db> ModuleLiteralType<'db> {
         let place_and_qualifiers = imported_symbol(db, env, file, name, None);
 
         // If the normal lookup failed, try to call the module's `__getattr__` function
-        if place_and_qualifiers.place.is_undefined() {
+        if place_and_qualifiers.place.is_undefined() && !policy.no_getattr_lookup() {
             return self.try_module_getattr(db, env, name);
         }
 

@@ -136,3 +136,44 @@ def no_dictionary(value: FinalSlotted) -> None:
     if hasattr(value, "__dict__"):
         reveal_type(value)  # revealed: Never
 ```
+
+A conditionally available getter supplies its value type when a readability check succeeds. The
+check also establishes the field presence needed by a protocol consumer.
+
+```py
+class ConditionalFallback:
+    if returns_bool():
+        def __getattr__(self, name: str) -> list[int]:
+            return []
+
+class RequiredItems(Protocol):
+    @property
+    def items(self) -> list[int]: ...
+
+def take_items(value: RequiredItems) -> None:
+    pass
+
+def conditional_fallback(value: ConditionalFallback):
+    # error: [possibly-missing-attribute]
+    reveal_type(value.items)  # revealed: list[int]
+    # error: [invalid-argument-type]
+    take_items(value)
+    if hasattr(value, "items"):
+        reveal_type(value.items)  # revealed: list[int]
+        take_items(value)
+
+class NoKnownItems:
+    pass
+
+def missing_alternative(value: ConditionalFallback | NoKnownItems):
+    if hasattr(value, "items"):
+        reveal_type(value.items)  # revealed: list[int] | Unknown
+```
+
+Successive `hasattr` checks preserve each attribute's type.
+
+```py
+def conditional_siblings(value: ConditionalFallback):
+    if hasattr(value, "items") and hasattr(value, "other") and value.items:
+        reveal_type(value.other)  # revealed: list[int]
+```

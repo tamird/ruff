@@ -3886,5 +3886,53 @@ def rebound(replacement: Builder) -> Builder:
     return self
 ```
 
+## Attribute fallbacks through intersection bounds
+
+Fallback lookup through a type variable combines the getter results from its intersection bound.
+
+```py
+from ty_extensions import Intersection
+
+class First:
+    def __getattr__(self, name: str) -> str:
+        return "first"
+
+class Second:
+    def __getattr__(self, name: str) -> str:
+        return "second"
+
+class Marker: ...
+
+def composite[T: Intersection[First, Second]](value: Intersection[T, Marker]):
+    reveal_type(value)  # revealed: T@composite & Marker
+    reveal_type(value.missing)  # revealed: str
+```
+
+## Attribute fallbacks through union bounds
+
+A bound's union alternatives retain their own lookup precedence. An alternative with a declared
+field does not call its fallback for that field.
+
+```py
+from typing import Literal
+from ty_extensions import Intersection
+
+class HasField:
+    field: int = 1
+
+    def __getattr__(self, name: Literal["other"]) -> bytes:
+        return b"other"
+
+class Fallback:
+    def __getattr__(self, name: str) -> str:
+        return "fallback"
+
+class Other: ...
+
+def union_bound[T: HasField | Fallback](value: Intersection[T, Other]):
+    reveal_type(value)  # revealed: T@union_bound & Other
+    reveal_type(value.field)  # revealed: int | str
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

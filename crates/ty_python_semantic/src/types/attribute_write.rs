@@ -392,7 +392,7 @@ pub(super) fn attribute_write_requirement<'db>(
                 builtins_symbol(db, env, attribute)
             } else {
                 module
-                    .static_member(db, env, attribute)
+                    .static_member(db, env, attribute, MemberLookupPolicy::default())
                     .map_or_else(|_| Place::Undefined.into(), |member| member.member(db))
             };
             AttributeWriteRequirement::Module(match symbol.place {

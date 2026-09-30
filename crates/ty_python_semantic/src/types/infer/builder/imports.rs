@@ -12,7 +12,7 @@ use crate::{
     place::{DefinedPlace, Definedness, Place, PlaceAndQualifiers, Provenance, TypeOrigin},
     reachability::evaluate_reachability_with_cache,
     types::{
-        ModuleLiteralType, Type, TypeAndQualifiers,
+        MemberLookupPolicy, ModuleLiteralType, Type, TypeAndQualifiers,
         diagnostic::{
             MISSING_DIRECT_DEPENDENCY, POSSIBLY_MISSING_IMPORT, UNRESOLVED_IMPORT,
             hint_if_stdlib_attribute_exists_on_other_versions,
@@ -584,7 +584,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // First try loading the requested attribute from the module.
         if !skip_self_referential_member_lookup {
-            let result = module_literal.static_member(db, self.program_environment(), name);
+            let result = module_literal.static_member(
+                db,
+                self.program_environment(),
+                name,
+                MemberLookupPolicy::default(),
+            );
             let error = result.err();
             if let PlaceAndQualifiers {
                 place:

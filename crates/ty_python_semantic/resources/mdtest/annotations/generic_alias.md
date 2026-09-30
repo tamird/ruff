@@ -89,6 +89,29 @@ def dynamic_class(modern: Modern, legacy: Legacy) -> None:
     reveal_type(legacy.missing)  # revealed: Any
 ```
 
+## Attributes of narrowed type aliases
+
+Narrowing an alias preserves attribute delegation to its origin.
+
+```py
+from typing import Literal, Protocol
+from typing_extensions import TypeIs
+
+class TypeName(Protocol):
+    @property
+    def __name__(self) -> Literal["type"]: ...
+
+def has_type_name(value: object) -> TypeIs[TypeName]:
+    return getattr(value, "__name__", None) == "type"
+
+alias = type[int]
+if has_type_name(alias):
+    reveal_type(alias)  # revealed: <special-form 'type[int]'> & TypeName
+    reveal_type(alias.__name__)  # revealed: Literal["type"]
+    reveal_type(alias.__qualname__)  # revealed: str
+    alias.bit_length  # error: [unresolved-attribute]
+```
+
 ## Attributes of arbitrary `GenericAlias` instances
 
 When the origin is unknown, we allow arbitrary attribute access through a `GenericAlias` instance.

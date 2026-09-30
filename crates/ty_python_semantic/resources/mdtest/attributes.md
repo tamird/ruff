@@ -3335,6 +3335,66 @@ def _(a_and_b: Intersection[type[A], type[B]]):
     a_and_b.x = 2
 ```
 
+### Declared attributes take precedence over `__getattr__`
+
+A definite attribute on one intersection element takes precedence over another element's
+`__getattr__`, just as it does on a class inheriting both elements. Missing and possibly missing
+attributes still use the fallback.
+
+```py
+from ty_extensions import Intersection
+
+class Fallback:
+    def __getattr__(self, name: str) -> str:
+        return "fallback"
+
+class Named:
+    value: int = 1
+
+class Both(Fallback, Named): ...
+
+reveal_type(Both().value)  # revealed: int
+reveal_type(Both().missing)  # revealed: str
+
+def declared(left: Intersection[Fallback, Named]):
+    reveal_type(left.missing)  # revealed: str
+    reveal_type(left.value)  # revealed: int
+
+def reversed_elements(right: Intersection[Named, Fallback]):
+    reveal_type(right.missing)  # revealed: str
+    reveal_type(right.value)  # revealed: int
+
+def flag() -> bool:
+    return True
+
+class PossiblyNamed:
+    if flag():
+        value: bytes = b"value"
+
+def possibly_missing(value: Intersection[Fallback, PossiblyNamed]):
+    reveal_type(value.value)  # revealed: bytes | str
+```
+
+### Implicit methods do not use intersection fallbacks
+
+Explicit attribute access can use `__getattr__`, but Python bypasses it for implicit special
+methods.
+
+```py
+from typing import Callable
+from ty_extensions import Intersection
+
+class Fallback:
+    def __getattr__(self, name: str) -> Callable[[], int]:
+        return lambda: 1
+
+class Marker: ...
+
+def use(value: Intersection[Fallback, Marker]):
+    reveal_type(value.__neg__())  # revealed: int
+    -value  # error: [unsupported-operator]
+```
+
 ### Attribute available on both elements
 
 ```py
@@ -3358,6 +3418,24 @@ def _(a_and_b: Intersection[A, B]):
 def _(a_and_b: Intersection[type[A], type[B]]):
     reveal_type(a_and_b.x)  # revealed: P & Q
     a_and_b.x = R()
+```
+
+### Fallback methods bind to the full intersection
+
+```py
+from typing_extensions import Self
+from ty_extensions import Intersection
+
+class Fallback:
+    def __getattr__(self, name: str) -> Self:
+        return self
+
+class Named:
+    value: int = 1
+
+def read(value: Intersection[Fallback, Named]):
+    reveal_type(value.missing)  # revealed: Fallback & Named
+    reveal_type(value.missing.value)  # revealed: int
 ```
 
 ### Descriptor binding uses the full intersection type

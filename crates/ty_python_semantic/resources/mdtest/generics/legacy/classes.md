@@ -2772,5 +2772,32 @@ def check(child: Child[str]) -> None:
     child.items.append(1)  # error: [invalid-argument-type]
 ```
 
+## Successive attribute checks
+
+Successive `hasattr` checks preserve a conditional getter's result type. Omitted class arguments
+remain unknown after both checks.
+
+```py
+from typing import Generic, TypeVar
+
+_T = TypeVar("_T")
+
+def returns_bool() -> bool:
+    return True
+
+class ConditionalFields(Generic[_T]):
+    def __init__(self, value: _T):
+        self._value = value
+
+    if returns_bool():
+        def __getattr__(self, name: str) -> _T:
+            return self._value
+
+# error: [missing-type-argument]
+def inspect(value: ConditionalFields):
+    if hasattr(value, "items") and hasattr(value, "other") and value.items:
+        reveal_type(value.other)  # revealed: Unknown
+```
+
 [crtp]: https://en.wikipedia.org/wiki/Curiously_recurring_template_pattern
 [f-bound]: https://en.wikipedia.org/wiki/Bounded_quantification#F-bounded_quantification

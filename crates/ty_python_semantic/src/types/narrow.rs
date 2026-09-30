@@ -27,12 +27,12 @@ use crate::types::unpacker::collected_list_type;
 use crate::types::{
     CallableType, ClassBase, ClassLiteral, ClassPatternPositionalSource, ClassType, CycleDetector,
     IntersectionBuilder, IntersectionType, KnownClass, KnownInstanceType, LiteralValueTypeKind,
-    Parameter, Parameters, Signature, SpecialFormType, SubclassOfInner, SubclassOfType, Truthiness,
-    Type, TypeContext, TypeVarBoundOrConstraints, UnfoldResult, UnionBuilder, binding_type,
-    class_pattern_positional_sources, definite_match_pattern_type_for_subject,
-    exact_sequence_pattern_type, infer_expression_types, mapping_pattern_type,
-    pattern_binding_fallthrough_type, sequence_pattern_type_builder, singleton_pattern_type,
-    starred_sequence_pattern_type, typed_dict_matches_class_pattern,
+    MemberLookupPolicy, Parameter, Parameters, Signature, SpecialFormType, SubclassOfInner,
+    SubclassOfType, Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnfoldResult,
+    UnionBuilder, binding_type, class_pattern_positional_sources,
+    definite_match_pattern_type_for_subject, exact_sequence_pattern_type, infer_expression_types,
+    mapping_pattern_type, pattern_binding_fallthrough_type, sequence_pattern_type_builder,
+    singleton_pattern_type, starred_sequence_pattern_type, typed_dict_matches_class_pattern,
 };
 use crate::{Db, ProgramEnvironment};
 use ty_python_core::ast_ids::HasScopedUseId;
@@ -5368,10 +5368,10 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 }
             }
             Type::FunctionLiteral(function_type) if expr_call.arguments.keywords.is_empty() => {
-                let [first_arg, second_arg] = &*expr_call.arguments.args else {
+                let [first_arg_expr, second_arg] = &*expr_call.arguments.args else {
                     return None;
                 };
-                let first_arg = PlaceExpr::try_from_expr(first_arg)?;
+                let first_arg = PlaceExpr::try_from_expr(first_arg_expr)?;
                 let function = function_type.known(db)?;
                 let place = self.expect_place(&first_arg);
 
@@ -5385,13 +5385,29 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                         return None;
                     }
 
-                    // Since `hasattr` only checks if an attribute is readable,
-                    // the type of the protocol member should be a read-only property that returns `object`.
-                    let constraint = Type::protocol_with_readonly_members(
-                        db,
-                        &self.env,
-                        [(attr, Type::object())],
-                    );
+                    // A successful readability check establishes presence without discarding
+                    // the value domain of a possibly available attribute or getter.
+                    let mut value_type = Type::object();
+                    if is_positive
+                        && let Ok(member) = inference
+                            .expression_type(first_arg_expr)
+                            .member_lookup_with_policy_and_receiver(
+                                db,
+                                &self.env,
+                                attr,
+                                MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK
+                                    | MemberLookupPolicy::PRESERVE_MISSING_ALTERNATIVES
+                                    | MemberLookupPolicy::PROVE_GETTER_INPUTS,
+                                None,
+                            )
+                        && member.inputs_proved(db)
+                        && let Some(ty) = member.member(db).place.ignore_possibly_undefined()
+                        && !ty.has_indeterminate_inference(db, &self.env)
+                    {
+                        value_type = ty;
+                    }
+                    let constraint =
+                        Type::protocol_with_readonly_members(db, &self.env, [(attr, value_type)]);
 
                     return Some(NarrowingConstraints::from_iter([(
                         place,
