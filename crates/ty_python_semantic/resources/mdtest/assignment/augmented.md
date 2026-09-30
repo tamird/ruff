@@ -173,6 +173,35 @@ def _(flag: bool):
     reveal_type(f)  # revealed: str | Literal[54]
 ```
 
+## Target union with binary fallback
+
+When no in-place method is available, each member uses the ordinary binary operator. An unsupported
+member retains its diagnostic and contributes `Unknown` alongside successful results.
+
+```py
+class Add:
+    def __add__(self, value: int) -> str:
+        return "x"
+
+def supported(value: Add | int):
+    result = value
+    result += 1
+    reveal_type(result)  # revealed: str | int
+
+def unsupported(value: Add | None):
+    result = value
+    result += 1  # error: [unsupported-operator]
+    reveal_type(result)  # revealed: str | Unknown
+
+def needs_str(value: str) -> int:
+    return 1
+
+def invalid_child(value: Add | int):
+    result = value
+    result += needs_str(1)  # error: [invalid-argument-type]
+    reveal_type(result)  # revealed: str | int
+```
+
 ## Partially bound target union with `__add__`
 
 ```py

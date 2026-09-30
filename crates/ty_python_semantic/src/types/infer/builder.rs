@@ -5152,13 +5152,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         match target_type {
             Type::Union(union) => {
-                // Silent member contexts do not retain complete child requirements.
-                state.retain_argument_proof(false);
                 let mut infer_value_ty = MultiInferenceGuard::new(infer_value_ty);
 
                 // Perform loud inference without type context, as there may be multiple
                 // equally applicable type contexts for each union member.
-                infer_value_ty.infer_loud(self, TypeContext::default());
+                let default_value_ty = infer_value_ty.infer_loud(self, TypeContext::default());
+                let mut inferred_silently = false;
 
                 let mut operation_failed = false;
                 let Ok(result_ty) = state.try_map_union(db, env, union, |elem_type, state| {
@@ -5166,7 +5165,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         assignment,
                         elem_type,
                         value_expr,
-                        &mut |builder, tcx| infer_value_ty.infer_silent(builder, tcx),
+                        &mut |builder, tcx| {
+                            if tcx == TypeContext::default() {
+                                default_value_ty
+                            } else {
+                                inferred_silently = true;
+                                infer_value_ty.infer_silent(builder, tcx)
+                            }
+                        },
                         state,
                     ) {
                         Ok(ty) => ty,
@@ -5177,6 +5183,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     };
                     Ok::<_, Infallible>(result_ty)
                 });
+
+                // Only the committed inference retains the RHS child requirements.
+                // Member-specific contexts still require speculative inference.
+                state.retain_argument_proof(!inferred_silently);
 
                 if operation_failed {
                     Err(result_ty)

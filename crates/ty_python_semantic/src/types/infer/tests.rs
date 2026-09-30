@@ -3150,6 +3150,36 @@ fn binary_and_augmented_argument_correspondence() -> anyhow::Result<()> {
 
         def generic_union(left: dict, right: dict) -> None:
             left | right
+
+        class AddInt:
+            def __add__(self, value: int) -> int: return value
+
+        class AddStr:
+            def __add__(self, value: int) -> str: return "x"
+
+        def union_default(left: AddInt | AddStr, value: int) -> int | str:
+            result = left
+            result += value
+            return result
+
+        def make_int(callback: Callable[[Any], None]) -> int:
+            return 1
+
+        def union_child(left: AddInt | AddStr, callback: Callable[[str], None]) -> int | str:
+            result = left
+            result += make_int(callback)
+            return result
+
+        class ContextInt:
+            def __iadd__(self, callback: Callable[[int], int]) -> int: return 1
+
+        class ContextStr:
+            def __iadd__(self, callback: Callable[[int], int]) -> str: return "x"
+
+        def union_context(left: ContextInt | ContextStr) -> int | str:
+            result = left
+            result += lambda value: value
+            return result
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -3177,6 +3207,9 @@ fn binary_and_augmented_argument_correspondence() -> anyhow::Result<()> {
         ("ordinary_class_valued", true),
         ("ordinary_numeric", false),
         ("generic_union", false),
+        ("union_default", false),
+        ("union_child", true),
+        ("union_context", true),
     ];
     let signatures = |db: &TestDb| {
         cases.map(|(name, _)| {
