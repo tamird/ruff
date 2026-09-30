@@ -38,6 +38,9 @@ pub enum FunctionInferenceMode {
     /// must compare ordinary actual arguments with raw parameter types using
     /// [`crate::types::Type::satisfies_declared_output`] and account for all selected body
     /// and file obligations.
+    /// Subscript results retain narrower ordinary values only when independently supported
+    /// by checked getter results or confined dictionary observations. Other results use the
+    /// upper materialization of that evidence for subsequent operations and branch selection.
     /// Eager global snapshots and member results have no separate projection.
     /// Ordinary assignments infer values without gradual inherited annotation hints;
     /// the original declarations still govern assignment checking.

@@ -7,7 +7,7 @@ use ruff_python_ast::visitor::{Visitor, walk_expr};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
 use ty_python_core::definition::{
-    Definition, DefinitionKind, DefinitionState, DictionaryContentsDefinitionKind,
+    BindingsOwner, Definition, DefinitionKind, DefinitionState, DictionaryContentsDefinitionKind,
     DictionaryContentsEffect, DictionaryContentsInferenceOwner, LambdaParameterDefinitionNodeKind,
     NestedBindingExecution, ParameterDefinitionNodeKind,
 };
@@ -21,7 +21,9 @@ use ty_python_core::{
 
 use crate::place::loop_header_reachability;
 use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
-use crate::types::infer::{StatementInference, infer_definition_types, infer_statement_types};
+use crate::types::infer::{
+    DefinitionInference, StatementInference, infer_definition_types, infer_statement_types,
+};
 use crate::types::narrow::NarrowingEvaluatorExtension;
 use crate::types::{KnownClass, ProgramEnvironment, Type, UnionBuilder, UnionType};
 use crate::{Db, FxIndexMap};
@@ -665,16 +667,7 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         && let Some(value) = value
     {
         // A constructor establishes allocation even when its keys cannot be enumerated.
-        mapping.builtin = closed_typed_dict
-            || match value {
-                ast::Expr::Dict(_) => true,
-                ast::Expr::DictComp(_) => true,
-                ast::Expr::Call(call) => owner_inference
-                    .try_expression_type(&call.func)
-                    .and_then(Type::as_class_literal)
-                    .is_some_and(|class| class.is_known(db, KnownClass::Dict)),
-                _ => false,
-            };
+        mapping.builtin = closed_typed_dict || is_builtin_allocation(db, value, owner_inference);
         if PlaceExpr::try_from_expr(value).is_some() {
             let use_def = index.use_def_map(scope.file_scope_id(db));
             let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
@@ -726,6 +719,53 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
     ContentsValue::Mapping(mapping)
 }
 
+fn is_builtin_allocation<'db>(
+    db: &'db dyn Db,
+    value: &ast::Expr,
+    inference: &DefinitionInference<'db>,
+) -> bool {
+    match value {
+        ast::Expr::Dict(_) => true,
+        ast::Expr::DictComp(_) => true,
+        ast::Expr::Call(call) => inference
+            .try_expression_type(&call.func)
+            .and_then(Type::as_class_literal)
+            .is_some_and(|class| class.is_known(db, KnownClass::Dict)),
+        _ => false,
+    }
+}
+
+fn fresh_local_allocation<'db>(db: &'db dyn Db, definition: Definition<'db>) -> KeyPreservation {
+    let scope = definition.scope(db);
+    let index = semantic_index(db, scope.program_file(db));
+    if !index
+        .place_table(scope.file_scope_id(db))
+        .place(definition.place(db))
+        .as_symbol()
+        .is_some_and(Symbol::is_local)
+    {
+        return KeyPreservation::Changed;
+    }
+    if let DefinitionKind::Assignment(assignment) = definition.kind(db)
+        && assignment.owner() != BindingsOwner::Definition
+    {
+        return KeyPreservation::Changed;
+    }
+    let module = parsed_module(db, scope.program_file(db).python_file(db)).load(db);
+    let Some(value) = definition.kind(db).value(&module) else {
+        return KeyPreservation::Changed;
+    };
+    let inference = infer_definition_types(db, definition);
+    if StatementInference::Definition(definition, inference).is_provisional() {
+        return KeyPreservation::Pending;
+    }
+    if !inference.discards_dict_key_assignments() && is_builtin_allocation(db, value, inference) {
+        KeyPreservation::Preserved
+    } else {
+        KeyPreservation::Changed
+    }
+}
+
 /// The semantic transfer is shared by contents inference and saved-key predicate validity.
 /// The index records syntax only; exact builtin identity is resolved with the operand's owner.
 enum MappingTransfer<'db> {
@@ -772,6 +812,25 @@ impl<'db> MappingTransfer<'db> {
                 }
             }
             Self::Clear => false,
+            Self::Result(_) => false,
+        }
+    }
+
+    fn preserves_confinement(&self) -> bool {
+        match self {
+            Self::Keep => true,
+            Self::Set {
+                key: _,
+                value: _,
+                source: _,
+            } => true,
+            Self::Delete { key: _, source: _ } => true,
+            Self::Clear => true,
+            Self::Update {
+                dictionary: _,
+                retained,
+            } => !retained,
+            Self::Expose => false,
             Self::Result(_) => false,
         }
     }
@@ -1159,15 +1218,74 @@ pub(crate) fn alias_preserves_key<'db>(
         return Some(KeyPreservation::Changed);
     };
     let anchors: Vec<_> = original_bindings.map(|binding| binding.binding).collect();
-    let mut pending: Vec<_> = current_bindings.map(|binding| binding.binding).collect();
+    Some(check_contents_history(
+        db,
+        scope,
+        current_bindings.map(|binding| binding.binding).collect(),
+        KeyHistoryOrigin::SavedRead {
+            anchors: &anchors,
+            name,
+        },
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum KeyHistoryOrigin<'a, 'db> {
+    SavedRead {
+        anchors: &'a [DefinitionState<'db>],
+        name: &'a str,
+    },
+    FreshAllocation,
+}
+
+/// A residual local value is evidence only while its allocation has remained confined.
+/// Reuse the saved-predicate history; ordinary contents values and narrowing stay unchanged.
+pub(super) fn has_confined_origin<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    receiver: &ast::Expr,
+) -> bool {
+    let index = semantic_index(db, scope.program_file(db));
+    let table = index.place_table(scope.file_scope_id(db));
+    let Some(place) = PlaceExpr::contents(receiver).and_then(|place| table.place_id(&place)) else {
+        return false;
+    };
+    let Some(use_id) = index.try_expression_use_id(receiver.into()) else {
+        return false;
+    };
+    let use_def = index.use_def_map(scope.file_scope_id(db));
+    let Some(bindings) = use_def.multi_bindings_at_use(use_id, place) else {
+        return false;
+    };
+    matches!(
+        check_contents_history(
+            db,
+            scope,
+            bindings.map(|binding| binding.binding).collect(),
+            KeyHistoryOrigin::FreshAllocation,
+        ),
+        KeyPreservation::Preserved
+    )
+}
+
+fn check_contents_history<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    mut pending: Vec<DefinitionState<'db>>,
+    origin: KeyHistoryOrigin<'_, 'db>,
+) -> KeyPreservation {
+    let index = semantic_index(db, scope.program_file(db));
+    let use_def = index.use_def_map(scope.file_scope_id(db));
     let mut visited = FxHashSet::default();
     let mut provisional = false;
     while let Some(binding) = pending.pop() {
-        if anchors.contains(&binding) {
+        if let KeyHistoryOrigin::SavedRead { anchors, name: _ } = origin
+            && anchors.contains(&binding)
+        {
             continue;
         }
         let Some(definition) = binding.definition() else {
-            return Some(KeyPreservation::Changed);
+            return KeyPreservation::Changed;
         };
         // Ordinary operation predecessors are source ordered. LoopHeader is the only back
         // edge and is rejected below; deduplication therefore only skips shared suffixes.
@@ -1175,21 +1293,43 @@ pub(crate) fn alias_preserves_key<'db>(
             continue;
         }
         let DefinitionKind::DictionaryContents(contents) = definition.kind(db) else {
-            return Some(KeyPreservation::Changed);
+            return KeyPreservation::Changed;
         };
         match contents.as_ref() {
             DictionaryContentsDefinitionKind::Initialize {
-                definition: _,
+                definition,
                 range: _,
-            } => return Some(KeyPreservation::Changed),
+            } => {
+                if matches!(
+                    origin,
+                    KeyHistoryOrigin::SavedRead {
+                        anchors: _,
+                        name: _
+                    }
+                ) {
+                    return KeyPreservation::Changed;
+                }
+                match fresh_local_allocation(db, *definition) {
+                    KeyPreservation::Preserved => {}
+                    KeyPreservation::Pending => provisional = true,
+                    KeyPreservation::Changed => return KeyPreservation::Changed,
+                }
+                continue;
+            }
             DictionaryContentsDefinitionKind::Operation { receiver, effect } => {
                 let transfer = mapping_transfer(db, definition, receiver, effect);
                 if matches!(transfer, MappingTransfer::Result(ContentsValue::Pending)) {
                     provisional = true;
                     continue;
                 }
-                if !transfer.preserves_key(db, name) {
-                    return Some(KeyPreservation::Changed);
+                let preserved = match origin {
+                    KeyHistoryOrigin::SavedRead { anchors: _, name } => {
+                        transfer.preserves_key(db, name)
+                    }
+                    KeyHistoryOrigin::FreshAllocation => transfer.preserves_confinement(),
+                };
+                if !preserved {
+                    return KeyPreservation::Changed;
                 }
             }
             DictionaryContentsDefinitionKind::Capture {
@@ -1199,6 +1339,9 @@ pub(crate) fn alias_preserves_key<'db>(
                 execution,
                 resolution: _,
             } => {
+                if matches!(origin, KeyHistoryOrigin::FreshAllocation) {
+                    return KeyPreservation::Changed;
+                }
                 if *execution == NestedBindingExecution::Lazy {
                     continue;
                 }
@@ -1208,7 +1351,12 @@ pub(crate) fn alias_preserves_key<'db>(
             DictionaryContentsDefinitionKind::LoopCapture {
                 header: _,
                 range: _,
-            } => continue,
+            } => {
+                if matches!(origin, KeyHistoryOrigin::FreshAllocation) {
+                    return KeyPreservation::Changed;
+                }
+                continue;
+            }
         }
         pending.extend(
             use_def
@@ -1216,11 +1364,11 @@ pub(crate) fn alias_preserves_key<'db>(
                 .map(|binding| binding.binding),
         );
     }
-    Some(if provisional {
+    if provisional {
         KeyPreservation::Pending
     } else {
         KeyPreservation::Preserved
-    })
+    }
 }
 
 fn from_bindings<'db>(

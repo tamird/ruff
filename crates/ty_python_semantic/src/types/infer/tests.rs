@@ -2243,6 +2243,7 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         from typing import Any, Callable, Literal, no_type_check, overload
         from typing_extensions import NotRequired, TypedDict
         from ty_extensions import Intersection
+        from ty_extensions._internal import Unknown
 
         class Factory:
             def __init__(self, cls: object, callback: Callable[..., None]) -> None:
@@ -2308,6 +2309,112 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         def needs_str(value: str) -> None:
             pass
 
+        def replace_nested(outer: dict[str, dict[str, int | str]]) -> None:
+            outer["inner"]["value"] = 42
+
+        def direct_nested() -> None:
+            outer: dict[str, dict[str, int | str]] = {"inner": {"value": "ok"}}
+            replace_nested(outer)
+            needs_str(outer["inner"]["value"])
+
+        def keywords_nested() -> None:
+            outer: dict[str, dict[str, int | str]] = {"inner": {"value": "ok"}}
+            replace_nested(outer)
+            needs_str(**outer["inner"])  # ty: ignore[invalid-argument-type]
+
+        def fresh_read() -> None:
+            values = {"value": "ok"}
+            needs_str(values["value"])
+
+        def aliased_write(initial: int | str) -> None:
+            values = {"value": initial}
+            alias = values
+            values["value"] = "ok"
+            alias["value"] = 42
+            needs_str(values["value"])
+
+        def named_alias(initial: int | str) -> None:
+            alias = (values := {"value": initial})
+            values["value"] = "ok"
+            alias["value"] = 42
+            needs_str(values["value"])
+
+        class AliasedValues(TypedDict, closed=True):
+            value: int | str
+
+        def typed_alias(first: AliasedValues, second: AliasedValues) -> None:
+            if isinstance(first["value"], str):
+                second["value"] = 42
+                needs_str(first["value"])
+
+        def declared_read(values: dict[str, str]) -> None:
+            needs_str(values["value"])
+
+        def gradual_read(values: dict[str, Any]) -> None:
+            needs_str(values["value"])
+
+        def refined_any(values: dict[str, Any]) -> None:
+            values["value"] = "ok"
+            needs_str(values["value"])
+
+        def refined_str(values: dict[str, str]) -> None:
+            values["value"] = "ok"
+            needs_str(values["value"])
+            stored = values["value"]
+            needs_str(stored)
+
+        def needs_ok(value: Literal["ok"]) -> None:
+            pass
+
+        def refined_literal(values: dict[str, str]) -> None:
+            values["value"] = "ok"
+            needs_ok(values["value"])
+
+        def rewrite_string(values: dict[str, str]) -> None:
+            values["value"] = "changed"
+
+        def stale_string(values: dict[str, str]) -> str:
+            values["value"] = "ok"
+            rewrite_string(values)
+            return values["value"]
+
+        def stale_literal(values: dict[str, str]) -> Literal["ok"]:
+            values["value"] = "ok"
+            rewrite_string(values)
+            return values["value"]
+
+        class MappingSource:
+            def values(self) -> dict[str, Any]:
+                return {}
+
+        def gradual_getter(source: MappingSource) -> None:
+            values = source.values()
+            values["value"] = "ok"
+            needs_str(values["value"])
+
+        def refined_branch(values: dict[str, str]) -> None:
+            values["value"] = "ok"
+            rewrite_string(values)
+            if values["value"] != "ok":
+                needs_int("bad")
+
+        def refined_unknown(values: dict[str, Unknown]) -> None:
+            values["value"] = "ok"
+            needs_str(values["value"])
+
+        def live_readonly(initial: int | str) -> None:
+            values: dict[str, int | str] = {"value": initial}
+            if isinstance(values["value"], str):
+                needs_str(values["value"])
+
+        def rewritten_read(initial: int | str) -> None:
+            values: dict[str, int | str] = {"value": initial}
+            values["value"] = "ok"
+            needs_str(values["value"])
+            values["value"] = initial
+            if isinstance(values["value"], str):
+                needs_str(values["value"])
+
         def mutate_saved(values: dict[str, int | str]) -> None:
             values["value"] = 42
 
@@ -2317,6 +2424,14 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
             mutate_saved(values)
             if ready:
                 needs_str(values["value"])  # ty: ignore[invalid-argument-type]
+
+        def aliased_guard(initial: int | str) -> None:
+            values: dict[str, int | str] = {"value": initial}
+            alias = values
+            ready = isinstance(values["value"], str)
+            alias["value"] = 42
+            if ready:
+                needs_str(values["value"])
 
         def saved_readonly(initial: int | str) -> None:
             values: dict[str, int | str] = {"value": initial}
@@ -2600,6 +2715,86 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         crate::types::check_types_with_diagnostics(&db, program_file(&db, file), [])
             .has_unproved_requirements
     );
+
+    let conservative_cases = [
+        ("direct_nested", true, true),
+        ("keywords_nested", false, true),
+        ("fresh_read", false, false),
+        ("aliased_write", true, true),
+        ("named_alias", true, true),
+        ("typed_alias", true, true),
+        ("declared_read", false, false),
+        ("gradual_read", true, true),
+        ("refined_any", true, true),
+        ("refined_str", false, false),
+        ("refined_literal", true, true),
+        ("refined_branch", true, true),
+        ("refined_unknown", true, true),
+        ("live_readonly", false, false),
+        ("rewritten_read", false, false),
+        ("aliased_guard", true, true),
+        ("saved_opaque", false, true),
+        ("saved_readonly", false, false),
+        ("stale_string", false, false),
+        ("stale_literal", true, true),
+        ("gradual_getter", true, true),
+    ];
+    let conservative_signatures = |db: &TestDb| {
+        conservative_cases.map(|(name, _, _)| {
+            global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .display(db, &db.program_environment())
+                .to_string()
+        })
+    };
+    let declared_signatures = conservative_signatures(&db);
+    db.select_function_inference(Some((
+        file,
+        conservative_cases
+            .map(|(name, _, _)| name.to_owned())
+            .to_vec(),
+        FunctionInferenceMode::Conservative,
+    )));
+    let model = crate::SemanticModel::new(&db, program_file(&db, file));
+    let conservative_facts = conservative_cases.map(|(name, _, _)| {
+        model
+            .function_inference_facts(first_public_binding(&db, file, name))
+            .unwrap()
+    });
+    let conservative_result =
+        crate::types::check_types_with_diagnostics(&db, program_file(&db, file), []);
+    assert_eq!(
+        conservative_facts.map(|facts| (facts.has_errors, facts.has_checking_failures)),
+        conservative_cases.map(|(_, errors, checking)| (errors, checking)),
+    );
+    assert_eq!(conservative_signatures(&db), declared_signatures);
+    let source = source_text(&db, file);
+    let parsed = parsed_module(&db, program_file(&db, file).python_file(&db)).load(&db);
+    for (name, id, expected_source) in [
+        (
+            "gradual_getter",
+            "invalid-argument-type",
+            "values[\"value\"]",
+        ),
+        ("stale_literal", "invalid-return-type", "values[\"value\"]"),
+        ("refined_branch", "invalid-argument-type", "\"bad\""),
+    ] {
+        let function_range = first_public_binding(&db, file, name)
+            .kind(&db)
+            .full_range(&parsed);
+        let diagnostics: Vec<_> = conservative_result
+            .diagnostics
+            .iter()
+            .filter_map(|diagnostic| {
+                let range = diagnostic.primary_span().and_then(|span| span.range())?;
+                function_range
+                    .contains_range(range)
+                    .then(|| (diagnostic.id().as_str(), &source[range]))
+            })
+            .collect();
+        assert_eq!(diagnostics, [(id, expected_source)], "{name}");
+    }
 
     db.select_function_inference(None);
     assert_eq!(

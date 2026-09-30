@@ -386,6 +386,7 @@ pub(super) fn value_receivers<'ast>(
 ) {
     match expression {
         ast::Expr::Name(_) => receivers.push(expression),
+        ast::Expr::Named(named) => value_receivers(&named.target, receivers),
         ast::Expr::Attribute(attribute) => {
             receivers.push(expression);
             value_receivers(&attribute.value, receivers);

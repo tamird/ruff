@@ -14,8 +14,8 @@ use crate::types::infer::{StatementInference, infer_definition_types, infer_stat
 use crate::types::{KnownClass, MemberLookupPolicy, ProgramEnvironment, Type};
 use crate::{Db, FxIndexSet, SemanticModel};
 
+use super::DictionaryItems;
 use super::contents::{ContentsValue, MappingContents};
-use super::{DictionaryFallback, DictionaryItems};
 
 fn local_binding<'db>(
     db: &'db dyn Db,
@@ -459,21 +459,9 @@ pub(crate) fn item_type<'db>(
     if !super::has_dict_type(db, receiver_type) {
         return None;
     }
-    let key = subscript.slice.as_string_literal_expr()?.value.to_str();
+    subscript.slice.as_string_literal_expr()?;
     for_binding(db, scope, &subscript.value)?;
-    let dictionary =
-        match DictionaryItems::observed(db, scope, &subscript.value, receiver_type, reachability) {
-            Ok(dictionary) => dictionary,
-            Err(fallback) => match fallback {
-                DictionaryFallback::Unavailable => return None,
-                DictionaryFallback::Unreachable => return Some(Type::Never),
-            },
-        };
-    dictionary
-        .items
-        .iter()
-        .find(|item| item.name == key && item.is_required())
-        .map(|item| item.ty)
+    super::required_item_type(db, scope, subscript, receiver_type, reachability)
 }
 
 #[cfg(test)]

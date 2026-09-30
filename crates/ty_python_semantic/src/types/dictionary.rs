@@ -29,6 +29,58 @@ fn has_dict_type(db: &dyn Db, ty: Type<'_>) -> bool {
     }
 }
 
+/// Observe a nominal-dictionary item through the existing contents history.
+/// Closed `TypedDict` schemas are excluded: exposure can preserve their required entries.
+fn observed_item_type<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    subscript: &ast::ExprSubscript,
+    receiver_type: Type<'db>,
+    reachability: &ReachabilityEvaluationCache<'db>,
+) -> Option<(Type<'db>, DictionaryItemKind)> {
+    if !has_dict_type(db, receiver_type) {
+        return None;
+    }
+    let key = subscript.slice.as_string_literal_expr()?.value.to_str();
+    let dictionary =
+        match DictionaryItems::observed(db, scope, &subscript.value, receiver_type, reachability) {
+            Ok(dictionary) => dictionary,
+            Err(fallback) => match fallback {
+                DictionaryFallback::Unavailable => return None,
+                DictionaryFallback::Unreachable => {
+                    return Some((Type::Never, DictionaryItemKind::Required));
+                }
+            },
+        };
+    dictionary
+        .items
+        .iter()
+        .find(|item| item.name == key)
+        .map(|item| (item.ty, item.kind))
+}
+
+pub(crate) fn required_item_type<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    subscript: &ast::ExprSubscript,
+    receiver_type: Type<'db>,
+    reachability: &ReachabilityEvaluationCache<'db>,
+) -> Option<Type<'db>> {
+    let (ty, kind) = observed_item_type(db, scope, subscript, receiver_type, reachability)?;
+    kind.is_required().then_some(ty)
+}
+
+pub(crate) fn proved_item_type<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    subscript: &ast::ExprSubscript,
+    receiver_type: Type<'db>,
+    reachability: &ReachabilityEvaluationCache<'db>,
+) -> Option<Type<'db>> {
+    let (ty, kind) = observed_item_type(db, scope, subscript, receiver_type, reachability)?;
+    (kind.is_required() || contents::has_confined_origin(db, scope, &subscript.value)).then_some(ty)
+}
+
 /// Publication of contents evidence. An impossible mapping is not an empty mapping, and
 /// must not fall back to the receiver's ordinary type when matching a keyword argument.
 #[derive(Clone, Copy)]
