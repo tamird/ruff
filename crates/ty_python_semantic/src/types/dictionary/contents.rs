@@ -752,7 +752,7 @@ impl<'db> MappingTransfer<'db> {
     fn preserves_key(&self, db: &'db dyn Db, name: &str) -> bool {
         match self {
             Self::Keep => true,
-            Self::Expose => true,
+            Self::Expose => false,
             Self::Set {
                 key,
                 value: _,

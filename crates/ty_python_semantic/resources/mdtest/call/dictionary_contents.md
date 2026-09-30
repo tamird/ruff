@@ -495,6 +495,25 @@ def saved_predicate(initial: object):
     if ready:
         strings(**values)  # error: [invalid-argument-type]
 
+def mutate_saved(values: dict[str, int | str]) -> None:
+    values["value"] = 42
+
+def saved_opaque(initial: int | str) -> None:
+    values: dict[str, int | str] = {"value": initial}
+    ready = isinstance(values["value"], str)
+    mutate_saved(values)
+    if ready:
+        reveal_type(values["value"])  # revealed: int | str
+        strings(values["value"])  # error: [invalid-argument-type]
+
+def saved_readonly(initial: int | str) -> None:
+    values: dict[str, int | str] = {"value": initial}
+    ready = isinstance(values["value"], str)
+    values.get("value")
+    if ready:
+        reveal_type(values["value"])  # revealed: str
+        strings(values["value"])  # no diagnostic
+
 def impossible_guard(initial: object):
     values = {"value": initial}
     values.update(value=42)

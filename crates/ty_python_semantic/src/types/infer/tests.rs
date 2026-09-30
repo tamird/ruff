@@ -2305,6 +2305,26 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
         def needs_int(value: int) -> None:
             pass
 
+        def needs_str(value: str) -> None:
+            pass
+
+        def mutate_saved(values: dict[str, int | str]) -> None:
+            values["value"] = 42
+
+        def saved_opaque(initial: int | str) -> None:
+            values: dict[str, int | str] = {"value": initial}
+            ready = isinstance(values["value"], str)
+            mutate_saved(values)
+            if ready:
+                needs_str(values["value"])  # ty: ignore[invalid-argument-type]
+
+        def saved_readonly(initial: int | str) -> None:
+            values: dict[str, int | str] = {"value": initial}
+            ready = isinstance(values["value"], str)
+            values.get("value")
+            if ready:
+                needs_str(values["value"])
+
         def bad() -> None:
             accept(narrow)
 
@@ -2484,6 +2504,8 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     let cases = [
+        ("saved_opaque", true),
+        ("saved_readonly", false),
         ("bad", true),
         ("good", false),
         ("optional_callback", false),
