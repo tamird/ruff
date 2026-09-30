@@ -3358,3 +3358,21 @@ def union_bound(value: Intersection[T, Other]):
     reveal_type(value)  # revealed: T@union_bound & Other
     reveal_type(value.field)  # revealed: int | str
 ```
+
+## Type predicates with uninhabited arguments
+
+An uninhabited argument does not make a `TypeIs` call a returning false value.
+
+```py
+from typing import Any, TypeVar
+from typing_extensions import Never, TypeIs
+
+T = TypeVar("T", bound=Never)
+
+def is_dictionary(value: object) -> TypeIs[dict[Any, Any]]:
+    return isinstance(value, dict)
+
+def uninhabited_argument(value: T) -> T:
+    reveal_type(is_dictionary(value))  # revealed: TypeIs[dict[Any, Any] @ value]
+    return value
+```

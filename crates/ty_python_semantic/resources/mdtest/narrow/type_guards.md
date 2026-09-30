@@ -324,6 +324,63 @@ def _(d: Any, guarded: object, narrowed: object, other: object, mode: bool):
         reveal_type(narrowed)  # revealed: int
 ```
 
+A `TypeIs` call is false when its positive narrowing cannot contain the supplied argument. This also
+excludes assignments guarded by the call.
+
+```py
+from collections.abc import Sequence
+from typing import TypedDict
+from typing_extensions import Never
+
+def is_dictionary(value: object) -> TypeIs[dict[Any, Any]]:
+    return isinstance(value, dict)
+
+class Classifier:
+    def is_dictionary(self, value: object) -> TypeIs[dict[Any, Any]]:
+        return isinstance(value, dict)
+
+class Fields(TypedDict):
+    value: int
+
+def call_results(value: str, dynamic: Any, broad: object, fields: Fields, mode: bool):
+    reveal_type(is_dictionary(value))  # revealed: Literal[False]
+    reveal_type(is_dictionary(value="text"))  # revealed: Literal[False]
+    reveal_type(Classifier().is_dictionary(value))  # revealed: Literal[False]
+    reveal_type(Classifier.is_dictionary(Classifier(), value))  # revealed: Literal[False]
+    reveal_type(overloaded(mode=mode, a=value))  # revealed: Literal[False]
+    reveal_type(is_dictionary(dynamic))  # revealed: TypeIs[dict[Any, Any] @ dynamic]
+    reveal_type(is_dictionary(broad))  # revealed: TypeIs[dict[Any, Any] @ broad]
+    reveal_type(is_dictionary(fields))  # revealed: TypeIs[dict[Any, Any] @ fields]
+    reveal_type(defaulted(other=value))  # revealed: TypeIs[int]
+    reveal_type(g(*dynamic))  # revealed: TypeIs[int]
+    reveal_type(f(1))  # revealed: TypeGuard[str]
+
+Bottom = Never
+
+def uninhabited_alias(value: Bottom):
+    reveal_type(is_dictionary(value))  # revealed: TypeIs[dict[Any, Any] @ value]
+
+def impossible_write(value: str):
+    found = False
+    if is_dictionary(value):
+        found = True
+    reveal_type(found)  # revealed: Literal[False]
+
+def tagged_payloads(
+    items: Sequence[tuple[Literal[True], dict[str, str]] | tuple[Literal[False], str]],
+):
+    found = False
+    for item in items:
+        item_is_select, item_value = item
+        if item_is_select:
+            for value in item_value.values():
+                if is_dictionary(value):
+                    found = True
+        elif is_dictionary(item_value):
+            found = True
+    reveal_type(found)  # revealed: Literal[False]
+```
+
 ## Intersections
 
 Guards for overlapping types can share a common subtype. A function returning `TypeGuard[int]`
@@ -541,6 +598,8 @@ def _(a: Foo):
 
     if g(f(a)):
         reveal_type(a)  # revealed: Foo & Bar
+
+    reveal_type(g(f(object())))  # revealed: TypeIs[Bar]
 ```
 
 Type guard narrowing also works when the callee has a `Callable` type:

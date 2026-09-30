@@ -1852,6 +1852,25 @@ impl<'db> NarrowingConstraint<'db> {
         ))
     }
 
+    /// Construct the narrowing established by a type test under the caller's generic policy.
+    pub(super) fn type_test(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        target: Type<'db>,
+        is_positive: bool,
+        strict_generic_narrowing: bool,
+    ) -> Self {
+        if is_positive && !strict_generic_narrowing {
+            Self::generic_filtering(target)
+        } else {
+            Self::intersection(
+                target
+                    .top_materialization(db, env)
+                    .negate_if(db, env, !is_positive),
+            )
+        }
+    }
+
     /// Create a "replacement" constraint: the previous type will be
     /// replaced wholesale with this constraint
     fn replacement(constraint: Type<'db>) -> Self {
@@ -5484,20 +5503,15 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         target: Type<'db>,
         is_positive: bool,
     ) -> NarrowingConstraint<'db> {
-        let db = self.db;
-        if is_positive
-            && !db
-                .analysis_settings(self.scope().file(db))
-                .strict_generic_narrowing
-        {
-            NarrowingConstraint::generic_filtering(target)
-        } else {
-            NarrowingConstraint::intersection(target.top_materialization(db, &self.env).negate_if(
-                db,
-                &self.env,
-                !is_positive,
-            ))
-        }
+        NarrowingConstraint::type_test(
+            self.db,
+            &self.env,
+            target,
+            is_positive,
+            self.db
+                .analysis_settings(self.scope().file(self.db))
+                .strict_generic_narrowing,
+        )
     }
 
     // Helper to evaluate TypeGuard/TypeIs narrowing for a call expression.

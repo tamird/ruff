@@ -3934,5 +3934,21 @@ def union_bound[T: HasField | Fallback](value: Intersection[T, Other]):
     reveal_type(value.field)  # revealed: int | str
 ```
 
+## Type predicates with uninhabited arguments
+
+An uninhabited argument does not make a `TypeIs` call a returning false value.
+
+```py
+from typing import Any
+from typing_extensions import Never, TypeIs
+
+def is_dictionary(value: object) -> TypeIs[dict[Any, Any]]:
+    return isinstance(value, dict)
+
+def uninhabited_argument[T: Never](value: T) -> T:
+    reveal_type(is_dictionary(value))  # revealed: TypeIs[dict[Any, Any] @ value]
+    return value
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

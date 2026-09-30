@@ -3,16 +3,19 @@ use ty_python_core::place::PlaceExpr;
 use ty_python_core::place_table;
 use ty_python_core::scope::ScopeId;
 
-use crate::Db;
 use crate::types::Type;
 use crate::types::call::{Binding, Bindings};
+use crate::types::narrow::NarrowingConstraint;
+use crate::{Db, ProgramEnvironment};
 
 pub(super) fn bind_type_guard_return_type<'db>(
     db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
     scope: ScopeId<'db>,
     return_ty: Type<'db>,
     bindings: &Bindings<'db>,
     arguments: &ast::Arguments,
+    expression_type: impl FnOnce(&ast::Expr) -> Option<Type<'db>>,
 ) -> Type<'db> {
     let narrowed_argument_index = || {
         bindings
@@ -31,7 +34,7 @@ pub(super) fn bind_type_guard_return_type<'db>(
             .unwrap_or(0)
     };
 
-    let find_narrowed_place = || {
+    let find_narrowed_argument = || {
         // Use the call binding to find the argument that maps to the first parameter a type
         // guard can narrow. This supports keyword arguments without falling back to a later
         // parameter when the target is defaulted.
@@ -88,19 +91,69 @@ pub(super) fn bind_type_guard_return_type<'db>(
             return None;
         }
 
-        let place_expr = PlaceExpr::try_from_expr(argument.value())?;
+        Some((
+            argument.value(),
+            matches!(matched_narrowed_argument_index, Some(Some(_))),
+        ))
+    };
+    let find_narrowed_place = |argument: &ast::Expr| {
+        let place_expr = PlaceExpr::try_from_expr(argument)?;
         place_table(db, scope).place_id(&place_expr)
     };
 
     match return_ty {
-        Type::TypeIs(type_is) => match find_narrowed_place() {
-            Some(place) => type_is.bind(db, scope, place),
-            None => return_ty,
-        },
-        Type::TypeGuard(type_guard) => match find_narrowed_place() {
-            Some(place) => type_guard.bind(db, scope, place),
-            None => return_ty,
-        },
+        Type::TypeIs(type_is) => {
+            let Some((argument, has_parameter_mapping)) = find_narrowed_argument() else {
+                return return_ty;
+            };
+            // A generic identity function can forward a TypeIs result without testing its
+            // own argument. Only a predicate's declared return establishes that relationship.
+            let has_type_is_return = bindings.single_element().is_some_and(|binding| {
+                binding.matching_overloads().all(|(_, overload)| {
+                    match overload.signature.return_type() {
+                        Type::TypeIs(annotation) => !annotation.is_bound(db),
+                        _ => false,
+                    }
+                })
+            });
+            let target = type_is.return_type(db);
+            // Materialized guards and non-completing arguments do not denote an ordinary
+            // false result. Classify only the argument selected by the call binding.
+            if has_parameter_mapping
+                && has_type_is_return
+                && !type_is.is_bound(db)
+                && type_is.materialization_kind(db).is_none()
+                && let Some(actual) = expression_type(argument)
+                && !actual.has_indeterminate_inference(db, env)
+                && !target.has_indeterminate_inference(db, env)
+                && !actual.is_equivalent_to(db, env, Type::Never)
+            {
+                let positive = NarrowingConstraint::type_test(
+                    db,
+                    env,
+                    target,
+                    true,
+                    db.analysis_settings(scope.file(db))
+                        .strict_generic_narrowing,
+                );
+                let narrowed = NarrowingConstraint::intersection(actual)
+                    .merge_constraint_and(positive)
+                    .evaluate_constraint_type(db, env);
+                if narrowed.is_never() {
+                    return Type::bool_literal(false);
+                }
+            }
+            match find_narrowed_place(argument) {
+                Some(place) => type_is.bind(db, scope, place),
+                None => return_ty,
+            }
+        }
+        Type::TypeGuard(type_guard) => {
+            match find_narrowed_argument().and_then(|(argument, _)| find_narrowed_place(argument)) {
+                Some(place) => type_guard.bind(db, scope, place),
+                None => return_ty,
+            }
+        }
         _ => return_ty,
     }
 }

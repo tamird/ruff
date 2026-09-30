@@ -10792,7 +10792,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => return_ty,
         };
 
-        typeguard::bind_type_guard_return_type(db, self.scope(), return_ty, &bindings, arguments)
+        typeguard::bind_type_guard_return_type(
+            db,
+            env,
+            self.scope(),
+            return_ty,
+            &bindings,
+            arguments,
+            |expression| self.try_expression_type(expression),
+        )
     }
 
     /// Applications can refine factory results without replacing binding or argument inference.
