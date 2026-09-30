@@ -17,6 +17,272 @@ def copies():
     consume(**values)
     values = {"note": "missing"}
     consume(**values)  # error: [missing-argument]
+
+class Holder:
+    values: dict[str, int | str]
+
+def shared_members(left: Holder, right: Holder):
+    left.values = right.values = {"value": 1}
+    right.values["value"] = "bad"
+    # error: [invalid-argument-type] "Expected `int`, found `int | str`"
+    # error: [invalid-argument-type] "Expected `str`, found `int | str`"
+    consume(**left.values)
+```
+
+## Nested dictionaries: calls on containing values
+
+Passing or storing a containing value can expose its existing child dictionaries.
+
+```py
+def integers(value: int) -> None:
+    pass
+
+class Holder:
+    inner: dict[str, int | str]
+
+def mutate_outer(outer: dict[str, dict[str, int | str]]) -> None:
+    outer["inner"]["value"] = "changed"
+
+def nested_opaque() -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    integers(**outer["inner"])  # no diagnostic
+    mutate_outer(outer)
+    integers(**outer["inner"])  # error: [invalid-argument-type]
+
+def nested_alias() -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    alias = outer
+    mutate_outer(alias)
+    integers(**outer["inner"])  # error: [invalid-argument-type]
+
+def mutate_holder(holder: Holder) -> None:
+    holder.inner["value"] = "changed"
+
+def member_opaque(holder: Holder) -> None:
+    holder.inner = {"value": 1}
+    integers(**holder.inner)  # no diagnostic
+    mutate_holder(holder)
+    integers(**holder.inner)  # error: [invalid-argument-type]
+
+def separate_parent(holder: Holder) -> None:
+    holder.inner = {"value": 1}
+    copied = dict(holder.inner, parent=holder)
+    parent = copied["parent"]
+    if isinstance(parent, Holder):
+        parent.inner["value"] = "changed"
+    integers(**holder.inner)  # error: [invalid-argument-type]
+```
+
+## Nested dictionaries: readonly and child operations
+
+Discarded readonly results preserve child values. Accessing or passing an admitted builtin child
+does not record an escape of its containing object.
+
+```py
+def integers(value: int) -> None:
+    pass
+
+class Holder:
+    inner: dict[str, int | str]
+
+def nested_readonly() -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    outer["inner"].get("value")
+    outer.get("inner")
+    outer.copy()
+    outer.keys()
+    outer.items()
+    outer.values()
+    dict(outer)
+    size = len(outer)
+    integers(**outer["inner"])  # no diagnostic
+
+def member_readonly(holder: Holder) -> None:
+    holder.inner = {"value": 1}
+    holder.inner.get("value")
+    value = holder.inner.get("value")
+    copied = dict(holder.inner)
+    size = len(holder.inner)
+    integers(**holder.inner)  # no diagnostic
+
+def member_after_readonly(holder: Holder) -> None:
+    holder.inner = {"value": 1}
+    holder.inner.get("value")
+    holder.inner = {"value": 2}
+    integers(**holder.inner)  # no diagnostic
+
+def member_after_scalar_read(holder: Holder) -> None:
+    holder.inner = {"value": 1}
+    value = holder.inner.get("value")
+    holder.inner = {"value": 2}
+    integers(**holder.inner)  # no diagnostic
+
+def mutate_inner(values: dict[str, int | str]) -> None:
+    values["value"] = "changed"
+
+def member_after_child_call(holder: Holder) -> None:
+    holder.inner = {"value": 1}
+    mutate_inner(holder.inner)
+    holder.inner = {"value": 2}
+    integers(**holder.inner)  # no diagnostic
+```
+
+## Nested dictionaries: returned children and shallow copies
+
+Consumed return values and views can retain mutable children.
+
+```py
+def integers(value: int) -> None:
+    pass
+
+def returned_child() -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    child = outer.get("inner")
+    if child is not None:
+        child["value"] = "changed"
+        integers(**outer["inner"])  # error: [invalid-argument-type]
+
+def shallow_copy() -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    copied = outer.copy()
+    copied["inner"]["value"] = "changed"
+    integers(**outer["inner"])  # error: [invalid-argument-type]
+
+def constructor_copy() -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    copied = dict(outer)
+    copied["inner"]["value"] = "changed"
+    integers(**outer["inner"])  # error: [invalid-argument-type]
+
+def returned_view() -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    keys = outer.keys()
+    keys.mapping["inner"]["value"] = "changed"
+    integers(**outer["inner"])  # error: [invalid-argument-type]
+```
+
+## Nested dictionaries: escaped bound methods
+
+A stored or forwarded bound method retains its receiver.
+
+```py
+from typing import Callable
+
+def integers(value: int) -> None:
+    pass
+
+def mutate_getter(getter: Callable[[str], dict[str, int | str] | None]) -> None:
+    child = getter("inner")
+    if child is not None:
+        child["value"] = "changed"
+
+def bound_method_argument() -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    mutate_getter(outer.get)
+    integers(**outer["inner"])  # error: [invalid-argument-type]
+
+def bound_method_storage() -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    saved = outer.get
+    mutate_getter(saved)
+    integers(**outer["inner"])  # error: [invalid-argument-type]
+```
+
+## Nested dictionaries: replacement after earlier exposure
+
+Replacing a child does not replace its containing object. A fresh root allocation resets the root,
+while rebinding it to an alias does not.
+
+```py
+def integers(value: int) -> None:
+    pass
+
+class Holder:
+    inner: dict[str, int | str]
+
+def replace_after_alias() -> None:
+    outer: dict[str, dict[str, int | str]] = {}
+    alias = outer
+    outer["inner"] = {"value": 1}
+    alias["inner"]["value"] = "changed"
+    integers(**outer["inner"])  # error: [invalid-argument-type]
+
+def rebind_after_alias() -> None:
+    outer: dict[str, dict[str, int | str]] = {}
+    alias = outer
+    outer = {"inner": {"value": 1}}
+    alias["inner"] = {"value": "changed"}
+    integers(**outer["inner"])  # no diagnostic
+
+def rebind_to_alias() -> None:
+    outer: dict[str, dict[str, int | str]] = {}
+    alias = outer
+    outer = alias
+    outer["inner"] = {"value": 1}
+    alias["inner"]["value"] = "changed"
+    integers(**outer["inner"])  # error: [invalid-argument-type]
+
+def member_after_alias(holder: Holder) -> None:
+    alias = holder
+    holder.inner = {"value": 1}
+    alias.inner["value"] = "changed"
+    integers(**holder.inner)  # error: [invalid-argument-type]
+
+def nested_parent_replacement() -> None:
+    outer: dict[str, dict[str, dict[str, int | str]]] = {"inner": {"nested": {}}}
+    outer["inner"]["nested"] = {"value": 1}
+    integers(**outer["inner"]["nested"])  # no diagnostic
+
+def nested_replacement_after_alias() -> None:
+    outer: dict[str, dict[str, dict[str, int | str]]] = {}
+    alias = outer
+    outer["inner"] = {"nested": {}}
+    outer["inner"]["nested"] = {"value": 1}
+    alias["inner"]["nested"]["value"] = "changed"
+    integers(**outer["inner"]["nested"])  # error: [invalid-argument-type]
+```
+
+## Nested dictionaries: loop effects
+
+Loop headers reserve the same affected contents as straight-line calls.
+
+```py
+def integers(value: int) -> None:
+    pass
+
+def mutate_outer(outer: dict[str, dict[str, int | str]]) -> None:
+    outer["inner"]["value"] = "changed"
+
+def loop_parent(count: int) -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    for _ in range(count):
+        mutate_outer(outer)
+    integers(**outer["inner"])  # error: [invalid-argument-type]
+
+def loop_readonly(count: int) -> None:
+    outer: dict[str, dict[str, int | str]] = {"inner": {"value": 1}}
+    for _ in range(count):
+        outer.get("inner")
+    integers(**outer["inner"])  # no diagnostic
+```
+
+## Nested dictionaries: unobserved caller aliases
+
+Ordinary access paths do not relate aliases supplied through separate parameters. If `incoming`
+contains `parent`, the mutation below can replace the new child. Ordinary checking retains its value
+refinement; implementation validation must still refuse the unsupported contract.
+
+```py
+def integers(value: int) -> None:
+    pass
+
+def hidden_backreference(parent: dict[str, object], incoming: dict[str, dict[str, object]]) -> None:
+    parent["inner"] = dict(incoming)
+    other = parent["inner"].get("parent")
+    parent["inner"] = {"value": 1}
+    if other is not None:
+        other["inner"] = {"value": "changed"}
+    integers(**parent["inner"])  # no diagnostic
 ```
 
 ## Updates and deletions

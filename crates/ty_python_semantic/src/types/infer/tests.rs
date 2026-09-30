@@ -2619,6 +2619,8 @@ fn function_argument_correspondence_status() -> anyhow::Result<()> {
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     let cases = [
+        ("direct_nested", false),
+        ("keywords_nested", true),
         ("saved_opaque", true),
         ("saved_readonly", false),
         ("bad", true),

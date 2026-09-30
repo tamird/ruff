@@ -571,7 +571,7 @@ pub(crate) struct ImportFromSubmoduleDefinitionNodeRef<'ast> {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct AssignmentDefinitionNodeRef<'ast, 'db> {
     pub(crate) unpack: Option<Unpack<'db>>,
-    pub(crate) value: &'ast ast::Expr,
+    pub(crate) node: &'ast ast::StmtAssign,
     pub(crate) target: &'ast ast::Expr,
     pub(crate) owner: BindingsOwner,
 }
@@ -758,12 +758,12 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
             }
             DefinitionNodeRef::Assignment(AssignmentDefinitionNodeRef {
                 unpack,
-                value,
+                node,
                 target,
                 owner,
             }) => DefinitionKind::Assignment(AssignmentDefinitionKind {
                 unpack,
-                value: AstNodeRef::new(parsed, value),
+                node: AstNodeRef::new(parsed, node),
                 target: AstNodeRef::new(parsed, target),
                 owner,
             }),
@@ -917,7 +917,7 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
             Self::TypeAlias(node) => node.into(),
             Self::NamedExpression(node) => node.into(),
             Self::Assignment(AssignmentDefinitionNodeRef {
-                value: _,
+                node: _,
                 unpack: _,
                 target,
                 owner: _,
@@ -1674,6 +1674,9 @@ pub enum DictionaryContentsEffect<'db> {
         /// A nested or named argument can retain the mapping instead of copying its entries.
         retained: bool,
     },
+    /// Project an actual receiver's call onto a related contents place.
+    /// The original call owns builtin admission and semantic classification.
+    ProjectedCall(Definition<'db>),
     /// An alias, stored value, return, or escaped bound method can outlive this evaluation.
     Expose,
 }
@@ -1690,7 +1693,7 @@ pub enum BindingsOwner {
 #[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub struct AssignmentDefinitionKind<'db> {
     unpack: Option<Unpack<'db>>,
-    value: AstNodeRef<ast::Expr>,
+    node: AstNodeRef<ast::StmtAssign>,
     target: AstNodeRef<ast::Expr>,
     owner: BindingsOwner,
 }
@@ -1700,8 +1703,19 @@ impl<'db> AssignmentDefinitionKind<'db> {
         self.unpack
     }
 
+    /// Whether this assignment binds one target without unpacking.
+    pub fn is_single_target(&self, module: &ParsedModuleRef) -> bool {
+        if self.unpack.is_some() {
+            return false;
+        }
+        let [target] = self.node.node(module).targets.as_slice() else {
+            return false;
+        };
+        NodeKey::from_node(target) == NodeKey::from_node_ref(&self.target)
+    }
+
     pub fn value<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::Expr {
-        self.value.node(module)
+        &self.node.node(module).value
     }
 
     pub fn target<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::Expr {

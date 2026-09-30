@@ -66,8 +66,22 @@ impl LoopBindingsVisitor<'_> {
     fn expose(&mut self, value: &ast::Expr) {
         let mut receivers = Vec::new();
         super::dictionary_contents::value_receivers(value, &mut receivers);
-        for receiver in receivers {
+        for &receiver in &receivers {
             self.add_contents(receiver);
+            self.add_nested_contents(receiver, None);
+        }
+    }
+
+    fn add_nested_contents(&mut self, receiver: &ast::Expr, direct_receiver: Option<&ast::Expr>) {
+        let Some(table) = self.contents else {
+            return;
+        };
+        for place in
+            super::dictionary_contents::nested_contents_places(table, receiver, direct_receiver)
+        {
+            if let PlaceExprRef::Member(member) = table.place(place) {
+                self.bound_places.push(PlaceExpr::Member(member.clone()));
+            }
         }
     }
 
@@ -244,8 +258,14 @@ impl<'ast> Visitor<'ast> for LoopBindingsVisitor<'_> {
             self.expose(&node.value);
         }
         if let ast::Expr::Call(call) = expr {
-            for (receiver, _) in super::dictionary_contents::call_receivers(call) {
+            let receivers = super::dictionary_contents::call_receivers(call);
+            for &(receiver, _) in &receivers {
                 self.add_contents(receiver);
+                let source = super::dictionary_contents::outermost_receiver(
+                    receiver,
+                    receivers.iter().map(|(value, _)| *value),
+                );
+                self.add_nested_contents(receiver, Some(source));
             }
         }
         if let ast::Expr::Lambda(lambda) = expr {

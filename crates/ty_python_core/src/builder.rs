@@ -1590,7 +1590,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     place_id,
                     AssignmentDefinitionNodeRef {
                         unpack,
-                        value: &node.value,
+                        node,
                         target: expr,
                         owner,
                     },

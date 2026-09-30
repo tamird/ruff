@@ -13,7 +13,7 @@ use crate::definition::{
     DictionaryContentsEffect, DictionaryContentsInferenceOwner, NestedBindingExecution,
 };
 use crate::member::MemberExprBuilder;
-use crate::place::{PlaceExpr, ScopedPlaceId};
+use crate::place::{PlaceExpr, PlaceExprRef, PlaceTableBuilder, ScopedPlaceId};
 use crate::scope::NodeWithScopeRef;
 
 use super::{SemanticIndexBuilder, UnresolvedCapture};
@@ -55,9 +55,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
     fn register_receiver_place(&mut self, receiver: &'ast ast::Expr) {
         match receiver {
-            ast::Expr::Attribute(attribute) => self.register_receiver_place(&attribute.value),
-            ast::Expr::Subscript(subscript) => self.register_receiver_place(&subscript.value),
-            ast::Expr::Named(named) => self.register_receiver_place(&named.target),
+            ast::Expr::Attribute(attribute) => self.register_contents_place(&attribute.value),
+            ast::Expr::Subscript(subscript) => self.register_contents_place(&subscript.value),
+            ast::Expr::Named(named) => self.register_contents_place(&named.target),
             _ => {}
         }
         if !receiver.is_name_expr()
@@ -85,11 +85,20 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     pub(super) fn record_contents_effect(
         &mut self,
         receiver: &'ast ast::Expr,
-        mut effect: DictionaryContentsEffect<'db>,
+        effect: DictionaryContentsEffect<'db>,
     ) {
         let Some(place) = self.contents_place(receiver) else {
             return;
         };
+        let _ = self.record_contents_effect_at(place, receiver, effect);
+    }
+
+    fn record_contents_effect_at(
+        &mut self,
+        place: ScopedPlaceId,
+        receiver: &'ast ast::Expr,
+        mut effect: DictionaryContentsEffect<'db>,
+    ) -> Option<Definition<'db>> {
         let owner = match &mut effect {
             DictionaryContentsEffect::SetItem {
                 subscript: _,
@@ -105,13 +114,12 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 retained: _,
             } => Some(owner),
             DictionaryContentsEffect::AugmentItem(_) => None,
+            DictionaryContentsEffect::ProjectedCall(_) => None,
             DictionaryContentsEffect::UnknownMutation => None,
             DictionaryContentsEffect::Expose => None,
         };
         if let Some(owner) = owner {
-            let Some(statement) = self.current_statement_mut() else {
-                return;
-            };
+            let statement = self.current_statement_mut()?;
             let statement = statement.node;
             *owner = self.contents_inference_owner(statement, receiver);
             if matches!(owner, Some(DictionaryContentsInferenceOwner::Statement(_)))
@@ -129,6 +137,18 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         let key = DefinitionNodeKey::from_node_ref(receiver.into());
         let (definition, _) = self.create_definition_with_kind(place, key, kind);
         self.record_definition(place, definition, None);
+        Some(definition)
+    }
+
+    fn record_nested_contents_effect(
+        &mut self,
+        receiver: &'ast ast::Expr,
+        effect: &DictionaryContentsEffect<'db>,
+        direct_receiver: Option<&ast::Expr>,
+    ) {
+        for place in nested_contents_places(self.current_place_table(), receiver, direct_receiver) {
+            let _ = self.record_contents_effect_at(place, receiver, effect.clone());
+        }
     }
 
     pub(super) fn record_contents_capture(&mut self, capture: &UnresolvedCapture) {
@@ -345,8 +365,22 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             self.record_contents_snapshot(expression, &[source]);
         }
 
+        let occurrences = call_receivers(call);
+        let sources: Vec<_> = occurrences
+            .iter()
+            .map(|&(receiver, _)| {
+                let outermost =
+                    outermost_receiver(receiver, occurrences.iter().map(|(value, _)| *value));
+                let source = if self.contents_place(outermost).is_some() {
+                    outermost
+                } else {
+                    receiver
+                };
+                (receiver, source)
+            })
+            .collect();
         let mut receivers: Vec<(ScopedPlaceId, &ast::Expr, bool)> = Vec::new();
-        for (receiver, retained) in call_receivers(call) {
+        for &(receiver, retained) in &occurrences {
             let Some(place) = self.contents_place(receiver) else {
                 continue;
             };
@@ -356,8 +390,16 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 receivers.push((place, receiver, retained));
             }
         }
-        for (_, receiver, retained) in receivers {
-            self.record_contents_effect(
+        let mut originals = Vec::new();
+        for (place, receiver, retained) in receivers {
+            if !sources
+                .iter()
+                .any(|(_, source)| self.contents_place(source) == Some(place))
+            {
+                continue;
+            }
+            let definition = self.record_contents_effect_at(
+                place,
                 receiver,
                 DictionaryContentsEffect::Call {
                     call: AstNodeRef::new(self.module, call),
@@ -365,16 +407,85 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     retained,
                 },
             );
+            if let Some(definition) = definition {
+                originals.push((place, definition));
+            }
+        }
+        for (receiver, source) in sources {
+            let Some(source_place) = self.contents_place(source) else {
+                continue;
+            };
+            let Some(&(_, definition)) = originals.iter().find(|(id, _)| *id == source_place)
+            else {
+                continue;
+            };
+            if self.contents_place(receiver) != Some(source_place) {
+                self.record_contents_effect(
+                    receiver,
+                    DictionaryContentsEffect::ProjectedCall(definition),
+                );
+            }
+            self.record_nested_contents_effect(
+                receiver,
+                &DictionaryContentsEffect::ProjectedCall(definition),
+                Some(source),
+            );
         }
     }
 
     pub(super) fn record_value_exposure(&mut self, value: &'ast ast::Expr) {
         let mut receivers = Vec::new();
         value_receivers(value, &mut receivers);
-        for receiver in receivers {
+        for &receiver in &receivers {
             self.record_contents_effect(receiver, DictionaryContentsEffect::Expose);
+            self.record_nested_contents_effect(receiver, &DictionaryContentsEffect::Expose, None);
         }
     }
+}
+
+/// Attribute traversal can mention a containing object that is not itself passed or stored.
+pub(super) fn outermost_receiver<'ast>(
+    receiver: &'ast ast::Expr,
+    receivers: impl Iterator<Item = &'ast ast::Expr>,
+) -> &'ast ast::Expr {
+    receivers.fold(receiver, |outermost, other| {
+        if other.range().contains_range(outermost.range()) {
+            other
+        } else {
+            outermost
+        }
+    })
+}
+
+/// Both ordinary indexing and loop-header discovery use the same demanded descendants.
+pub(super) fn nested_contents_places(
+    table: &PlaceTableBuilder,
+    receiver: &ast::Expr,
+    direct_receiver: Option<&ast::Expr>,
+) -> SmallVec<[ScopedPlaceId; 2]> {
+    let Some(parent) =
+        PlaceExpr::try_from_expr(receiver).and_then(|place| table.place_id((&place).into()))
+    else {
+        return SmallVec::new();
+    };
+    let direct = PlaceExpr::contents(receiver).and_then(|place| table.place_id((&place).into()));
+    let invoked = direct_receiver
+        .and_then(PlaceExpr::contents)
+        .and_then(|place| table.place_id((&place).into()));
+    table
+        .associated_place_ids(parent)
+        .iter()
+        .copied()
+        .map(ScopedPlaceId::from)
+        .filter(|place| {
+            Some(*place) != direct
+                && Some(*place) != invoked
+                && match table.place(*place) {
+                    PlaceExprRef::Member(member) => member.is_contents(),
+                    PlaceExprRef::Symbol(_) => false,
+                }
+        })
+        .collect()
 }
 
 /// Values stored in another object can retain a mapping; a subscript read does not expose its

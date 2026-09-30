@@ -994,7 +994,7 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         ),
         (
             "values = {}\nvalues['inner'] = {'x': 1}\nvalues['inner']['y'] = 2\nresult = observe(values['inner'])",
-            "extra: int; y~: Literal[2] at 'y'",
+            "extra: int; x~: Literal[1] at 'x'; y~: Literal[2] at 'y'",
         ),
         (
             "values = {'x': 1}\nresult = observe({**values})",

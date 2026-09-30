@@ -7,7 +7,7 @@ use ruff_python_ast::visitor::{Visitor, walk_expr};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
 use ty_python_core::definition::{
-    BindingsOwner, Definition, DefinitionKind, DefinitionState, DictionaryContentsDefinitionKind,
+    Definition, DefinitionKind, DefinitionState, DictionaryContentsDefinitionKind,
     DictionaryContentsEffect, DictionaryContentsInferenceOwner, LambdaParameterDefinitionNodeKind,
     NestedBindingExecution, ParameterDefinitionNodeKind,
 };
@@ -25,7 +25,7 @@ use crate::types::infer::{
     DefinitionInference, StatementInference, infer_definition_types, infer_statement_types,
 };
 use crate::types::narrow::NarrowingEvaluatorExtension;
-use crate::types::{KnownClass, ProgramEnvironment, Type, UnionBuilder, UnionType};
+use crate::types::{KnownClass, KnownFunction, ProgramEnvironment, Type, UnionBuilder, UnionType};
 use crate::{Db, FxIndexMap};
 
 use super::{
@@ -614,7 +614,7 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         DefinitionKind::DictKeyAssignment(assignment) => (
             assignment.assignment(),
             Some(assignment.value(&module)),
-            true,
+            false,
         ),
         DefinitionKind::NamedExpression(named) => {
             (definition, Some(named.node(&module).value.as_ref()), false)
@@ -622,7 +622,7 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         DefinitionKind::Assignment(assignment) => (
             definition,
             Some(assignment.value(&module)),
-            assignment.owner() != ty_python_core::definition::BindingsOwner::Definition,
+            !assignment.is_single_target(&module),
         ),
         kind => (definition, kind.value(&module), false),
     };
@@ -630,6 +630,17 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
     if StatementInference::Definition(owner, owner_inference).is_provisional() {
         return ContentsValue::Pending;
     }
+    let builtin_allocation = !owner_inference.discards_dict_key_assignments()
+        && value.is_some_and(|value| is_builtin_allocation(db, value, owner_inference));
+    let parent_preserved = if builtin_allocation && !shared && !place.is_symbol() {
+        match parent_allows_seed(db, owner) {
+            KeyPreservation::Preserved => true,
+            KeyPreservation::Changed => false,
+            KeyPreservation::Pending => return ContentsValue::Pending,
+        }
+    } else {
+        true
+    };
     let bounded = !place.is_symbol() || place.is_declared() || value.is_none();
     let source = definition.kind(db).target_range(&module);
     let bound = (bounded || closed_typed_dict).then_some(MappingBound {
@@ -667,7 +678,7 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         && let Some(value) = value
     {
         // A constructor establishes allocation even when its keys cannot be enumerated.
-        mapping.builtin = closed_typed_dict || is_builtin_allocation(db, value, owner_inference);
+        mapping.builtin = closed_typed_dict || builtin_allocation;
         if PlaceExpr::try_from_expr(value).is_some() {
             let use_def = index.use_def_map(scope.file_scope_id(db));
             let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
@@ -705,12 +716,12 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         }
     }
     if bounded || shared || value.is_some_and(|value| PlaceExpr::try_from_expr(value).is_some()) {
-        if mapping.builtin
-            && place.as_symbol().is_some_and(Symbol::is_local)
+        if builtin_allocation
             && !shared
-            && value.is_some_and(|value| PlaceExpr::try_from_expr(value).is_none())
+            && parent_preserved
+            && place.as_symbol().is_none_or(Symbol::is_local)
         {
-            // A declared local allocation has a lasting bound, but no external mutation yet.
+            // Ordinary per-key values remain available without proving key presence.
             mapping.generalize_presence(db, &env);
         } else {
             mapping.expose(db, &env);
@@ -746,17 +757,28 @@ fn fresh_local_allocation<'db>(db: &'db dyn Db, definition: Definition<'db>) -> 
     {
         return KeyPreservation::Changed;
     }
-    if let DefinitionKind::Assignment(assignment) = definition.kind(db)
-        && assignment.owner() != BindingsOwner::Definition
+    fresh_allocation(db, definition)
+}
+
+fn fresh_allocation<'db>(db: &'db dyn Db, definition: Definition<'db>) -> KeyPreservation {
+    let scope = definition.scope(db);
+    let module = parsed_module(db, scope.program_file(db).python_file(db)).load(db);
+    let (owner, value) = match definition.kind(db) {
+        DefinitionKind::DictKeyAssignment(assignment) => {
+            (assignment.assignment(), Some(assignment.value(&module)))
+        }
+        kind => (definition, kind.value(&module)),
+    };
+    if let DefinitionKind::Assignment(assignment) = owner.kind(db)
+        && !assignment.is_single_target(&module)
     {
         return KeyPreservation::Changed;
     }
-    let module = parsed_module(db, scope.program_file(db).python_file(db)).load(db);
-    let Some(value) = definition.kind(db).value(&module) else {
+    let Some(value) = value else {
         return KeyPreservation::Changed;
     };
-    let inference = infer_definition_types(db, definition);
-    if StatementInference::Definition(definition, inference).is_provisional() {
+    let inference = infer_definition_types(db, owner);
+    if StatementInference::Definition(owner, inference).is_provisional() {
         return KeyPreservation::Pending;
     }
     if !inference.discards_dict_key_assignments() && is_builtin_allocation(db, value, inference) {
@@ -770,7 +792,9 @@ fn fresh_local_allocation<'db>(db: &'db dyn Db, definition: Definition<'db>) -> 
 /// The index records syntax only; exact builtin identity is resolved with the operand's owner.
 enum MappingTransfer<'db> {
     Result(ContentsValue<'db>),
-    Keep,
+    Keep {
+        exposes_descendants: bool,
+    },
     Expose,
     Set {
         key: Type<'db>,
@@ -791,7 +815,9 @@ enum MappingTransfer<'db> {
 impl<'db> MappingTransfer<'db> {
     fn preserves_key(&self, db: &'db dyn Db, name: &str) -> bool {
         match self {
-            Self::Keep => true,
+            Self::Keep {
+                exposes_descendants: _,
+            } => true,
             Self::Expose => false,
             Self::Set {
                 key,
@@ -818,7 +844,9 @@ impl<'db> MappingTransfer<'db> {
 
     fn preserves_confinement(&self) -> bool {
         match self {
-            Self::Keep => true,
+            Self::Keep {
+                exposes_descendants: _,
+            } => true,
             Self::Set {
                 key: _,
                 value: _,
@@ -832,6 +860,40 @@ impl<'db> MappingTransfer<'db> {
             } => !retained,
             Self::Expose => false,
             Self::Result(_) => false,
+        }
+    }
+
+    fn for_descendants(self) -> Self {
+        match self {
+            Self::Keep {
+                exposes_descendants,
+            } => {
+                if exposes_descendants {
+                    Self::Expose
+                } else {
+                    Self::Keep {
+                        exposes_descendants: false,
+                    }
+                }
+            }
+            Self::Result(result) => match result {
+                ContentsValue::Pending => Self::Result(ContentsValue::Pending),
+                ContentsValue::Unreachable => Self::Result(ContentsValue::Unreachable),
+                ContentsValue::Unavailable => Self::Expose,
+                ContentsValue::Mapping(_) => Self::Expose,
+            },
+            Self::Expose => Self::Expose,
+            Self::Set {
+                key: _,
+                value: _,
+                source: _,
+            } => Self::Expose,
+            Self::Delete { key: _, source: _ } => Self::Expose,
+            Self::Clear => Self::Expose,
+            Self::Update {
+                dictionary: _,
+                retained: _,
+            } => Self::Expose,
         }
     }
 
@@ -850,7 +912,9 @@ impl<'db> MappingTransfer<'db> {
         };
         match self {
             Self::Result(result) => result,
-            Self::Keep => previous,
+            Self::Keep {
+                exposes_descendants: _,
+            } => previous,
             Self::Expose => {
                 mapping.expose(db, env);
                 previous
@@ -931,7 +995,9 @@ fn mapping_transfer<'db>(
     // admission here because saved-key proofs also inspect the transfer before applying it.
     if !matches!(
         effect,
-        DictionaryContentsEffect::Expose | DictionaryContentsEffect::UnknownMutation
+        DictionaryContentsEffect::Expose
+            | DictionaryContentsEffect::UnknownMutation
+            | DictionaryContentsEffect::ProjectedCall(_)
     ) {
         let index = semantic_index(db, file);
         let use_def = index.use_def_map(scope.file_scope_id(db));
@@ -955,6 +1021,49 @@ fn mapping_transfer<'db>(
     match effect {
         DictionaryContentsEffect::Expose => MappingTransfer::Expose,
         DictionaryContentsEffect::UnknownMutation => unavailable(),
+        DictionaryContentsEffect::ProjectedCall(original) => {
+            let DefinitionKind::DictionaryContents(kind) = original.kind(db) else {
+                return unavailable();
+            };
+            let DictionaryContentsDefinitionKind::Operation { receiver, effect } = kind.as_ref()
+            else {
+                return unavailable();
+            };
+            if !matches!(
+                effect,
+                DictionaryContentsEffect::Call {
+                    call: _,
+                    owner: _,
+                    retained: _,
+                }
+            ) {
+                return unavailable();
+            }
+            let transfer = mapping_transfer(db, *original, receiver, effect);
+            let index = semantic_index(db, file);
+            let table = index.place_table(scope.file_scope_id(db));
+            let Some(source) = PlaceExpr::try_from_expr(receiver.node(&module))
+                .and_then(|place| table.place_id(&place))
+            else {
+                return unavailable();
+            };
+            let descendant = table
+                .parents(table.place(definition.place(db)))
+                .any(|place| place == source);
+            if !descendant && !matches!(transfer, MappingTransfer::Result(_)) {
+                // Reading a member mentions its ancestors syntactically. Recognized child
+                // mappings do not constitute an observed escape of those ancestors, even
+                // when the actual child escapes. Every completed Call transfer passed
+                // builtin receiver admission above.
+                // Ordinary analysis tracks observed escapes; parameters can still alias
+                // through hidden backreferences.
+                MappingTransfer::Keep {
+                    exposes_descendants: false,
+                }
+            } else {
+                transfer.for_descendants()
+            }
+        }
         DictionaryContentsEffect::AugmentItem(assignment) => {
             let DefinitionKind::AugmentedAssignment(node) = assignment.kind(db) else {
                 return unavailable();
@@ -1024,16 +1133,42 @@ fn mapping_transfer<'db>(
                 return pending();
             }
             let call = call.node(&module);
+            let discarded = match owner {
+                Some(DictionaryContentsInferenceOwner::Statement(statement)) => {
+                    if let ast::Stmt::Expr(statement) = statement.node(&module) {
+                        statement
+                            .value
+                            .as_call_expr()
+                            .is_some_and(|expression| std::ptr::eq(expression, call))
+                    } else {
+                        false
+                    }
+                }
+                Some(DictionaryContentsInferenceOwner::Expression(_)) => false,
+                None => false,
+            };
             if let Some(Type::ClassLiteral(class)) = inference.try_expression_type(&call.func)
                 && class.is_known(db, KnownClass::Dict)
             {
                 return if *retained {
                     MappingTransfer::Expose
                 } else {
-                    MappingTransfer::Keep
+                    MappingTransfer::Keep {
+                        exposes_descendants: !discarded,
+                    }
                 };
             }
             let receiver = receiver.node(&module);
+            if let Some(Type::FunctionLiteral(function)) = inference.try_expression_type(&call.func)
+                && function.known(db) == Some(KnownFunction::Len)
+                && let [argument] = call.arguments.args.as_ref()
+                && call.arguments.keywords.is_empty()
+                && PlaceExpr::try_from_expr(argument) == PlaceExpr::try_from_expr(receiver)
+            {
+                return MappingTransfer::Keep {
+                    exposes_descendants: false,
+                };
+            }
             let method = call.func.as_attribute_expr().filter(|attribute| {
                 PlaceExpr::try_from_expr(&*attribute.value) == PlaceExpr::try_from_expr(receiver)
                     && inference.try_expression_type(receiver).is_some_and(|ty| {
@@ -1057,7 +1192,10 @@ fn mapping_transfer<'db>(
                     {
                         MappingTransfer::Expose
                     } else {
-                        MappingTransfer::Keep
+                        MappingTransfer::Keep {
+                            exposes_descendants: !discarded
+                                && method.attr.as_str() != "__contains__",
+                        }
                     }
                 }
                 "clear" => {
@@ -1236,6 +1374,48 @@ enum KeyHistoryOrigin<'a, 'db> {
         name: &'a str,
     },
     FreshAllocation,
+    /// Ordinary member seeds may start at a parameter, but not after a known escape.
+    UnexposedParent,
+}
+
+/// A member store does not create a new containing object. Read the receiver's snapshot before
+/// the store, so a new child cannot hide an earlier escape of its parent.
+fn parent_allows_seed<'db>(db: &'db dyn Db, owner: Definition<'db>) -> KeyPreservation {
+    let owner = match owner.kind(db) {
+        DefinitionKind::DictKeyAssignment(assignment) => assignment.assignment(),
+        _ => owner,
+    };
+    let scope = owner.scope(db);
+    let module = parsed_module(db, scope.program_file(db).python_file(db)).load(db);
+    let target = match owner.kind(db) {
+        DefinitionKind::Assignment(assignment) => assignment.target(&module),
+        DefinitionKind::AnnotatedAssignment(assignment) => assignment.target(&module),
+        _ => return KeyPreservation::Changed,
+    };
+    let receiver = match target {
+        ast::Expr::Name(_) => return KeyPreservation::Preserved,
+        ast::Expr::Attribute(attribute) => attribute.value.as_ref(),
+        ast::Expr::Subscript(subscript) => subscript.value.as_ref(),
+        _ => return KeyPreservation::Changed,
+    };
+    let index = semantic_index(db, scope.program_file(db));
+    let table = index.place_table(scope.file_scope_id(db));
+    let Some(place) = PlaceExpr::contents(receiver).and_then(|place| table.place_id(&place)) else {
+        return KeyPreservation::Changed;
+    };
+    let Some(use_id) = index.try_expression_use_id(receiver.into()) else {
+        return KeyPreservation::Changed;
+    };
+    let use_def = index.use_def_map(scope.file_scope_id(db));
+    let Some(bindings) = use_def.multi_bindings_at_use(use_id, place) else {
+        return KeyPreservation::Changed;
+    };
+    check_contents_history(
+        db,
+        scope,
+        bindings.map(|binding| binding.binding).collect(),
+        KeyHistoryOrigin::UnexposedParent,
+    )
 }
 
 /// A residual local value is evidence only while its allocation has remained confined.
@@ -1300,16 +1480,25 @@ fn check_contents_history<'db>(
                 definition,
                 range: _,
             } => {
-                if matches!(
-                    origin,
+                let allocation = match origin {
                     KeyHistoryOrigin::SavedRead {
                         anchors: _,
-                        name: _
+                        name: _,
+                    } => {
+                        return KeyPreservation::Changed;
                     }
-                ) {
-                    return KeyPreservation::Changed;
-                }
-                match fresh_local_allocation(db, *definition) {
+                    KeyHistoryOrigin::FreshAllocation => fresh_local_allocation(db, *definition),
+                    KeyHistoryOrigin::UnexposedParent => {
+                        if definition.kind(db).is_parameter_def() {
+                            continue;
+                        }
+                        match fresh_allocation(db, *definition) {
+                            KeyPreservation::Preserved => parent_allows_seed(db, *definition),
+                            result => result,
+                        }
+                    }
+                };
+                match allocation {
                     KeyPreservation::Preserved => {}
                     KeyPreservation::Pending => provisional = true,
                     KeyPreservation::Changed => return KeyPreservation::Changed,
@@ -1327,6 +1516,7 @@ fn check_contents_history<'db>(
                         transfer.preserves_key(db, name)
                     }
                     KeyHistoryOrigin::FreshAllocation => transfer.preserves_confinement(),
+                    KeyHistoryOrigin::UnexposedParent => transfer.preserves_confinement(),
                 };
                 if !preserved {
                     return KeyPreservation::Changed;
@@ -1339,7 +1529,13 @@ fn check_contents_history<'db>(
                 execution,
                 resolution: _,
             } => {
-                if matches!(origin, KeyHistoryOrigin::FreshAllocation) {
+                if !matches!(
+                    origin,
+                    KeyHistoryOrigin::SavedRead {
+                        anchors: _,
+                        name: _
+                    }
+                ) {
                     return KeyPreservation::Changed;
                 }
                 if *execution == NestedBindingExecution::Lazy {
@@ -1352,7 +1548,13 @@ fn check_contents_history<'db>(
                 header: _,
                 range: _,
             } => {
-                if matches!(origin, KeyHistoryOrigin::FreshAllocation) {
+                if !matches!(
+                    origin,
+                    KeyHistoryOrigin::SavedRead {
+                        anchors: _,
+                        name: _
+                    }
+                ) {
                     return KeyPreservation::Changed;
                 }
                 continue;
