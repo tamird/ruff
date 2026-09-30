@@ -1110,6 +1110,32 @@ def _(predicate: Top[Callable[[object], TypeIs[int | Any]]], value: int | str) -
         reveal_type(value)  # revealed: str
 ```
 
+A top-materialized guard is false when none of its possible positive domains contains the argument.
+The original materialization remains intact when the result is uncertain or the argument cannot
+complete. Bottom-materialized guards can exclude both outcomes and are not classified as ordinary
+false results.
+
+```py
+from typing_extensions import Never
+from ty_extensions import Bottom
+
+def disjoint(predicate: Top[Callable[[object], TypeIs[dict[Any, Any]]]], value: str):
+    reveal_type(predicate(value))  # revealed: Literal[False]
+    found = False
+    if predicate(value):
+        found = True
+    reveal_type(found)  # revealed: Literal[False]
+
+def uncertain(predicate: Top[Callable[[object], TypeIs[Any]]], value: str):
+    reveal_type(predicate(value))  # revealed: Top[TypeIs[Any @ value]]
+
+def bottom(predicate: Bottom[Callable[[object], TypeIs[Any]]], value: str):
+    reveal_type(predicate(value))  # revealed: Bottom[TypeIs[Any @ value]]
+
+def uninhabited(predicate: Top[Callable[[object], TypeIs[dict[Any, Any]]]], value: Never):
+    reveal_type(predicate(value))  # revealed: Top[TypeIs[dict[Any, Any] @ value]]
+```
+
 ## `TypeIs` narrowing of `NewType` instances
 
 `NewType` constructors return their arguments unchanged, so an integer-based `NewType` can contain a

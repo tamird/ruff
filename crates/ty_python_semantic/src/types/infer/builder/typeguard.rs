@@ -3,9 +3,9 @@ use ty_python_core::place::PlaceExpr;
 use ty_python_core::place_table;
 use ty_python_core::scope::ScopeId;
 
-use crate::types::Type;
 use crate::types::call::{Binding, Bindings};
 use crate::types::narrow::NarrowingConstraint;
+use crate::types::{MaterializationKind, Type};
 use crate::{Db, ProgramEnvironment};
 
 pub(super) fn bind_type_guard_return_type<'db>(
@@ -117,21 +117,25 @@ pub(super) fn bind_type_guard_return_type<'db>(
                 })
             });
             let target = type_is.return_type(db);
-            // Materialized guards and non-completing arguments do not denote an ordinary
-            // false result. Classify only the argument selected by the call binding.
+            // Bottom-materialized guards can exclude both outcomes, so an empty positive
+            // domain does not establish false. Non-completing arguments also remain unchanged.
             if has_parameter_mapping
                 && has_type_is_return
                 && !type_is.is_bound(db)
-                && type_is.materialization_kind(db).is_none()
+                && type_is.materialization_kind(db) != Some(MaterializationKind::Bottom)
                 && let Some(actual) = expression_type(argument)
                 && !actual.has_indeterminate_inference(db, env)
                 && !target.has_indeterminate_inference(db, env)
                 && !actual.is_equivalent_to(db, env, Type::Never)
             {
+                let positive_target = match type_is.materialization_kind(db) {
+                    Some(kind) => target.materialization(db, env, kind),
+                    None => target,
+                };
                 let positive = NarrowingConstraint::type_test(
                     db,
                     env,
-                    target,
+                    positive_target,
                     true,
                     db.analysis_settings(scope.file(db))
                         .strict_generic_narrowing,

@@ -438,6 +438,9 @@ fn conservative_global_inputs() -> anyhow::Result<()> {
         "/src/dependency.pyi",
         r#"
         from typing import Any, Callable
+        from typing_extensions import TypeIs
+
+        def is_dictionary(value: object) -> TypeIs[dict[Any, Any]]: ...
         OPAQUE: list[Any]
         CALLBACKS: list[Callable[..., object]]
         "#,
@@ -446,7 +449,8 @@ fn conservative_global_inputs() -> anyhow::Result<()> {
         "/src/main.py",
         r#"
         from collections.abc import Iterable, Sequence
-        from dependency import OPAQUE, CALLBACKS
+        from typing import Literal
+        from dependency import OPAQUE, CALLBACKS, is_dictionary
 
         def collect(extra: Iterable[object] | None) -> Sequence[object]:
             fresh = []
@@ -480,6 +484,12 @@ fn conservative_global_inputs() -> anyhow::Result<()> {
             xs = []
             xs.append(OPAQUE[0])
             return wants_int(xs[0])
+
+        def classify(value: str) -> Literal[False]:
+            found = False
+            if is_dictionary(value):
+                found = True
+            return found
 
         def unselected() -> None:
             OPAQUE.append("ordinary")
@@ -521,6 +531,7 @@ fn conservative_global_inputs() -> anyhow::Result<()> {
         "launder_argument",
         "launder_return",
         "fresh_laundering",
+        "classify",
     ]
     .map(str::to_owned)
     .to_vec();
