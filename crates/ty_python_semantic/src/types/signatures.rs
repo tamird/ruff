@@ -23,9 +23,10 @@ use smallvec::{SmallVec, smallvec_inline};
 
 use super::{DynamicType, Type, TypeVarVariance, UnionType, any_over_type, semantic_index};
 use crate::types::callable::CallableTypeKind;
+use crate::types::constraints::resolution::{SolutionType, resolve_solution};
 use crate::types::constraints::{
     CandidateSolutions, ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension,
-    OwnedConstraintSet, Solutions,
+    OwnedConstraintSet, Solution, SolutionPaths, SolutionValidity, Solutions,
 };
 use crate::types::cyclic::ActiveRecursionDetector;
 use crate::types::generics::{
@@ -1126,23 +1127,67 @@ impl<'db> Signature<'db> {
         )
     }
 
-    /// Whether source specialization can use static constraints without declaration-domain solving.
-    /// The caller separately excludes generic target signatures.
-    fn supports_static_inference(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+    /// Whether static specialization can preserve the signature's complete input shape.
+    /// Declaration domains are checked separately by the chosen inference path.
+    fn supports_static_specialization(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
         !self.is_paramspec_value()
             && self.receiver_constraints().is_none()
             && self.parameters().is_standard()
             && self.generic_context.is_none_or(|context| {
-                context.variables(db).all(|variable| {
-                    variable.domain(db) == TypeVarDomain::Type
-                        && variable.typevar(db).bound_or_constraints(db, env).is_none()
-                })
+                context
+                    .variables(db)
+                    .all(|variable| variable.domain(db) == TypeVarDomain::Type)
             })
             && self.return_type().is_fully_static(db, env)
             && self
                 .parameters()
                 .iter()
                 .all(|parameter| parameter.annotated_type().is_fully_static(db, env))
+    }
+
+    /// Whether source specialization can use static constraints without declaration-domain solving.
+    /// The caller separately excludes generic target signatures.
+    fn supports_static_inference(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+        self.supports_static_specialization(db, env)
+            && self.generic_context.is_none_or(|context| {
+                context
+                    .variables(db)
+                    .all(|variable| variable.typevar(db).bound_or_constraints(db, env).is_none())
+            })
+    }
+
+    fn has_static_declared_domain(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+        let Some(context) = self.generic_context else {
+            return false;
+        };
+        if !self.supports_static_specialization(db, env) {
+            return false;
+        }
+        let mut has_domain = false;
+        for variable in context.variables(db) {
+            if variable.typevar(db).is_self(db) {
+                return false;
+            }
+            let Some(domain) = variable.typevar(db).bound_or_constraints(db, env) else {
+                continue;
+            };
+            has_domain = true;
+            let is_static = match domain {
+                TypeVarBoundOrConstraints::UpperBound(bound) => bound.is_fully_static(db, env),
+                TypeVarBoundOrConstraints::Constraints(constraints) => constraints
+                    .elements(db)
+                    .iter()
+                    .all(|ty| ty.is_fully_static(db, env)),
+            };
+            if !is_static {
+                return false;
+            }
+        }
+        has_domain
     }
 
     fn max_typevar_freshness_matching_generic_context(
@@ -2659,6 +2704,24 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             target
         };
 
+        // With no caller-owned inference variables, a complete source specialization can be
+        // checked directly. Declared domains must pass the solver before existential reduction;
+        // satisfiability alone does not establish the original strict relation.
+        if self.inferable == TypeVarSet::None
+            && self.typevar_evaluation == TypeVarEvaluation::Eager
+            && matches!(
+                self.relation,
+                TypeRelation::Redundancy { pure: true }
+                    | TypeRelation::DeclaredOutput { strict: _ }
+            )
+            && source.has_static_declared_domain(db, env)
+            && target.generic_context.is_none()
+            && target.supports_static_inference(db, env)
+            && self.proves_declared_domain_specialization(db, source, target)
+        {
+            return self.always();
+        }
+
         let signature_typevars = |signature: &Signature<'db>| {
             signature
                 .generic_context
@@ -2709,6 +2772,79 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // If we introduced new inferable typevars, those will be existentially quantified away
         // before returning.
         when.reduce_inferable(db, env, self.constraints, signature_inferable)
+    }
+
+    fn proves_declared_domain_specialization(
+        &self,
+        db: &'db dyn Db,
+        source: &Signature<'db>,
+        target: &Signature<'db>,
+    ) -> bool {
+        let env = self.env;
+        let Some(context) = source.generic_context else {
+            return false;
+        };
+        let inferable = context.inferable_typevars(db);
+        let mut search = self.with_inferable_typevars(inferable);
+        search.typevar_evaluation = TypeVarEvaluation::Lazy;
+        let when = search.without_context_collection(|| {
+            search.with_signature_recursion_guard(source, target, || {
+                search.check_signature_pair_inner(db, source, target)
+            })
+        });
+        let Ok(solutions) = when.solutions(db, env, inferable) else {
+            return false;
+        };
+        let Solutions::Constrained(paths) = solutions else {
+            return false;
+        };
+        let SolutionPaths::Complete(paths) = paths else {
+            return false;
+        };
+        for solution in paths {
+            let Solution {
+                solved_typevars,
+                validity,
+            } = solution;
+            if !matches!(validity, SolutionValidity::Valid) {
+                continue;
+            }
+            let resolved = resolve_solution(db, env, inferable, &solved_typevars);
+            let types: Option<Vec<_>> = context
+                .variables(db)
+                .map(|variable| {
+                    let index = solved_typevars.iter().position(|binding| {
+                        binding.bound_typevar.identity(db) == variable.identity(db)
+                    })?;
+                    match resolved[index] {
+                        SolutionType::Resolved(ty) => Some(ty),
+                        SolutionType::Unresolved(_) => None,
+                    }
+                })
+                .collect();
+            let Some(types) = types else {
+                continue;
+            };
+            let specialization = context.specialize(db, types);
+            let mut specialized = source.apply_specialization(db, specialization);
+            if specialized
+                .generic_context
+                .is_some_and(|context| context.variables(db).next().is_some())
+            {
+                continue;
+            }
+            specialized.generic_context = None;
+            // Search and replay use different recursion entries. Replay only after the search
+            // entry has been removed, and retain the original strict relation for nested members.
+            let proved = self.without_context_collection(|| {
+                self.check_signature_pair(db, &specialized, target)
+                    .is_always_satisfied(db, env)
+            });
+            if proved {
+                return true;
+            }
+        }
+        false
     }
 
     fn with_signature_recursion_guard(

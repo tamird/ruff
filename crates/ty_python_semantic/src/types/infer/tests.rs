@@ -1657,6 +1657,24 @@ fn static_generic_callable_specializations() -> anyhow::Result<()> {
         def wrong(value: T) -> int: return 1
         def bounded(value: B) -> B: return value
         def constrained(value: C) -> C: return value
+        def str_bounded[S: str](value: S) -> S: return value
+        def wrong_bounded[S: str](value: S) -> int: return 1
+        def bounded_list[S: str](value: list[S]) -> list[S]: return value
+        def gradual_domain[S: Any](value: S) -> S: return value
+        class StrSubclass(str): pass
+        subclass_identity = cast(Callable[[StrSubclass], StrSubclass], None)
+        class FiniteIdentity(Protocol):
+            def __call__[S: (str, bytes)](self, value: S) -> S: ...
+        finite_callback = cast(FiniteIdentity, None)
+
+        def same_constraints[S: (str, bytes)](value: S) -> Callable[[S], S]:
+            raise NotImplementedError
+        def unrestricted_caller[S](value: S) -> Callable[[S], S]:
+            raise NotImplementedError
+        def union_bounded_caller[S: str | bytes](value: S) -> Callable[[S], S]:
+            raise NotImplementedError
+        def str_bounded_caller[S: str](value: S) -> Callable[[S], S]:
+            raise NotImplementedError
         generic_target = into_regular_callable(identity)
         fixed = cast(Callable[[str], str], None)
         wrong_result = cast(Callable[[str], int], None)
@@ -1685,6 +1703,8 @@ fn static_generic_callable_specializations() -> anyhow::Result<()> {
             def __call__(self, value: int) -> int: return value
         def generic_callback(callback: Callable[[T], T]) -> T:
             return callback(cast(T, None))
+        def bounded_callback(callback: Callable[[B], B]) -> B:
+            return callback(cast(B, None))
         gradual_callback = cast(Callable[[GradualCallback], int], None)
         static_callback = cast(Callable[[IntCallback], int], None)
 
@@ -1697,10 +1717,22 @@ fn static_generic_callable_specializations() -> anyhow::Result<()> {
         class IntField:
             field: int
         def generic_field(value: ReadField[T]) -> T: return value.field
+        def bounded_field(value: ReadField[B]) -> B: return value.field
         gradual_field = cast(Callable[[AnyField], int], None)
         static_field = cast(Callable[[IntField], int], None)
+
+        class RecursiveBound(Protocol):
+            def __call__[S: str](self, value: S) -> tuple["RecursiveBound", S]: ...
+        class RecursiveStr(Protocol):
+            def __call__(self, value: str) -> tuple["RecursiveStr", str]: ...
+        class RecursiveWrong(Protocol):
+            def __call__(self, value: str) -> tuple["RecursiveWrong", int]: ...
+        recursive_source = cast(RecursiveBound, None)
+        recursive_target = cast(RecursiveStr, None)
+        recursive_wrong = cast(RecursiveWrong, None)
         "#,
     )?;
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
     let file = system_path_to_file(&db, "/src/main.py")?;
     let env = db.program_environment();
     let target = global_symbol(&db, file, "generic_target")
@@ -1726,6 +1758,28 @@ fn static_generic_callable_specializations() -> anyhow::Result<()> {
         ("wrong", "fixed", false, None),
         ("bounded", "fixed", false, None),
         ("constrained", "int_identity", false, None),
+        ("bounded", "int_identity", true, Some(true)),
+        ("constrained", "fixed", true, Some(true)),
+        ("str_bounded", "subclass_identity", true, Some(true)),
+        ("constrained", "subclass_identity", false, None),
+        ("constrained", "same_constraints", true, Some(true)),
+        ("constrained", "unrestricted_caller", false, None),
+        ("constrained", "union_bounded_caller", false, None),
+        ("str_bounded", "str_bounded_caller", true, Some(true)),
+        ("str_bounded", "unrestricted_caller", false, None),
+        ("str_bounded", "same_constraints", false, None),
+        ("finite_callback", "fixed", true, Some(true)),
+        ("finite_callback", "same_constraints", true, Some(true)),
+        ("wrong_bounded", "fixed", false, None),
+        ("bounded_list", "fixed_list", true, Some(true)),
+        ("bounded_list", "wrong_list", false, None),
+        ("gradual_domain", "fixed", false, Some(true)),
+        ("bounded_callback", "gradual_callback", false, Some(true)),
+        ("bounded_callback", "static_callback", true, None),
+        ("bounded_field", "gradual_field", false, Some(true)),
+        ("bounded_field", "static_field", true, None),
+        ("recursive_source", "recursive_target", true, None),
+        ("recursive_source", "recursive_wrong", false, None),
         ("constructor", "factory", true, None),
         ("outer", "nested_bound", false, None),
         ("generic_callback", "gradual_callback", false, Some(true)),
@@ -1736,6 +1790,15 @@ fn static_generic_callable_specializations() -> anyhow::Result<()> {
     ] {
         let actual = global_symbol(&db, file, actual).place.expect_type();
         let target = global_symbol(&db, file, target).place.expect_type();
+        let target = match target {
+            Type::FunctionLiteral(function) => function
+                .last_definition_raw_signature(
+                    &db,
+                    crate::types::signatures::ReturnCallableTypeVarScope::Lexical,
+                )
+                .return_type(),
+            target => target,
+        };
         if let Some(expected) = assignable {
             assert_eq!(
                 actual.is_assignable_to(&db, &env, target),
