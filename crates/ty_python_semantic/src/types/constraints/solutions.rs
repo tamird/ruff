@@ -323,8 +323,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         node: NodeId,
     ) -> ControlFlow<L::Break> {
         self.validation_support = all_typevars.cloned();
-        let validations = all_typevars
-            .map(|all_typevars| Validations::from_support(db, env, storage, all_typevars));
+        let validations = all_typevars.map(|all_typevars| {
+            Validations::from_support(db, env, storage, all_typevars, TypeVarSet::None)
+        });
         let validations = validations.as_ref();
         self.visit_node_and_then(
             db,
@@ -2413,7 +2414,7 @@ impl<'db> Validations<'db> {
         (node, source_order)
     }
 
-    fn constraints(&self) -> impl Iterator<Item = AtomicConstraintId> + Clone {
+    pub(super) fn constraints(&self) -> impl Iterator<Item = AtomicConstraintId> + Clone {
         self.upper_bounds
             .values()
             .map(|bound| &bound.constraints)
@@ -2451,11 +2452,12 @@ impl<'db> Validations<'db> {
         result
     }
 
-    fn from_support(
+    pub(super) fn from_support(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
         all_typevars: &Support,
+        excluded: TypeVarSet<'db>,
     ) -> Self {
         let mut result = Self::default();
         let mut typevar_queue = all_typevars.clone();
@@ -2463,6 +2465,9 @@ impl<'db> Validations<'db> {
         while let Some(typevar) = typevar_queue.pop() {
             seen_typevars.insert(typevar);
             let bound_typevar = storage.typevar_data(typevar);
+            if bound_typevar.is_inferable(db, excluded) {
+                continue;
+            }
             result.add_typevar(
                 db,
                 env,

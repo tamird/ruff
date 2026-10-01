@@ -6,13 +6,17 @@
 //! The support of a node is the union of the supports of every constraint reachable from that
 //! node.
 
-use std::ops::{BitOrAssign, Sub};
+use std::ops::{BitOrAssign, ControlFlow, Sub};
 
-use crate::Db;
-use crate::types::constraints::{ConstraintId, ConstraintSetStorage, TypeVarId};
+use crate::types::constraints::{
+    Constraint, ConstraintId, ConstraintSetStorage, NodeId, SolutionLimits, TypeVarId,
+    solutions::Validations,
+};
 use crate::types::typevar::TypeVarSet;
+use crate::{Db, ProgramEnvironment};
 
 use ruff_index::newtype_index;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 #[newtype_index]
@@ -28,6 +32,54 @@ pub(super) struct Support {
 const CHUNK_SIZE: usize = usize::BITS as usize;
 
 impl Support {
+    /// Collects free variables, including dependencies in quantified declarations.
+    /// Binder locals contribute to ordinary support but cannot supply ambient assumptions.
+    pub(super) fn free_variables<'db, L: SolutionLimits>(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        storage: &mut ConstraintSetStorage<'db>,
+        node: NodeId,
+        limits: &mut L,
+    ) -> ControlFlow<L::Break, Self> {
+        fn collect<'db, L: SolutionLimits>(
+            db: &'db dyn Db,
+            env: &ProgramEnvironment<'db>,
+            storage: &mut ConstraintSetStorage<'db>,
+            node: NodeId,
+            limits: &mut L,
+            completed: &mut FxHashMap<NodeId, Support>,
+        ) -> ControlFlow<L::Break, Support> {
+            if node.is_terminal() {
+                return ControlFlow::Continue(Support::default());
+            }
+            if let Some(support) = completed.get(&node) {
+                return ControlFlow::Continue(support.clone());
+            }
+            limits.visit_node()?;
+            let interior = storage.interior_node_data(node);
+            let mut support = match storage.constraint_data(interior.constraint).clone() {
+                Constraint::Atomic(_) => storage.constraint_support(interior.constraint).clone(),
+                Constraint::Existential(existential) => {
+                    let mut support =
+                        collect(db, env, storage, existential.body, limits, completed)?;
+                    let declarations =
+                        Validations::from_locals(db, env, storage, &existential.locals);
+                    for constraint in declarations.constraints() {
+                        support |= storage.constraint_support(constraint.into_inner());
+                    }
+                    &support - &existential.locals
+                }
+            };
+            for child in [interior.if_true, interior.if_uncertain, interior.if_false] {
+                support |= &collect(db, env, storage, child, limits, completed)?;
+            }
+            completed.insert(node, support.clone());
+            ControlFlow::Continue(support)
+        }
+
+        collect(db, env, storage, node, limits, &mut FxHashMap::default())
+    }
+
     pub(super) fn from_typevars(typevars: impl IntoIterator<Item = TypeVarId>) -> Self {
         let mut result = Self::default();
         for typevar in typevars {

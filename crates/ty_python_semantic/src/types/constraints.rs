@@ -3942,6 +3942,14 @@ impl<'db> CandidateResidual<'db> {
             .collect();
         let has_locals = locals.iter(db).next().is_some();
         relation.query(|builder, when| {
+            let ambient = {
+                let mut storage = builder.storage.borrow_mut();
+                let support = Support::free_variables(db, env, &mut storage, when.node, limits)?;
+                let (node, source_order) =
+                    Validations::from_support(db, env, &mut storage, &support, joint_inferable)
+                        .as_constraint_set(&mut storage);
+                ConstraintSet::from_node(builder, node, source_order)
+            };
             // Closed caller outputs need existence of local witnesses, rather than inferred
             // choices for every local. Bind the locals before specializing so their declared
             // domains receive the same caller substitution as the body.
@@ -3963,12 +3971,14 @@ impl<'db> CandidateResidual<'db> {
                 let mapping = TypeMapping::ApplySpecialization(
                     ApplySpecialization::specialization(context.specialize(db, types)),
                 );
-                let replay = quantified.apply_type_mapping_impl(
-                    db,
-                    &mapping,
-                    TypeContext::default(),
-                    &ApplyTypeMappingVisitor::new(env),
-                );
+                let replay = ambient
+                    .implies(db, builder, || quantified)
+                    .apply_type_mapping_impl(
+                        db,
+                        &mapping,
+                        TypeContext::default(),
+                        &ApplyTypeMappingVisitor::new(env),
+                    );
                 if Self::replay_holds(db, env, replay, limits)? {
                     caller.solved_typevars = fixed;
                     return ControlFlow::Continue(Some((caller, false)));
@@ -4066,6 +4076,8 @@ impl<'db> CandidateResidual<'db> {
                     Ok(None) => continue,
                     Err(_) => break,
                 };
+                let ambient = Self::specialize(db, env, ambient, &bindings);
+                let replay = ambient.implies(db, builder, || replay);
                 if !Self::replay_holds(db, env, replay, limits)? {
                     continue;
                 }
@@ -6880,6 +6892,197 @@ mod tests {
     }
 
     #[test]
+    fn free_support_respects_nested_and_alternative_binders() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let string = KnownClass::Str.to_instance(db, &env);
+        let free = create_typevar(db, "Free");
+        let result = create_typevar(db, "Result");
+        let outer = create_typevar(db, "Outer").map_bound_or_constraints(db, |_| {
+            Some(TypeVarBoundOrConstraints::UpperBound(Type::TypeVar(free)))
+        });
+        let inner = create_typevar(db, "Inner").map_bound_or_constraints(db, |_| {
+            Some(TypeVarBoundOrConstraints::UpperBound(Type::TypeVar(free)))
+        });
+        let alternative = create_typevar(db, "Alternative").map_bound_or_constraints(db, |_| {
+            Some(TypeVarBoundOrConstraints::UpperBound(Type::TypeVar(result)))
+        });
+        let builder = ConstraintSetBuilder::new();
+        let nested =
+            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, inner, integer)
+                .and(db, &builder, || {
+                    ConstraintSet::constrain_typevar_equivalence_bound(
+                        db,
+                        &env,
+                        &builder,
+                        outer,
+                        Type::TypeVar(inner),
+                    )
+                })
+                .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [inner]))
+                .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [outer]));
+        let alternative = ConstraintSet::constrain_typevar_equivalence_bound(
+            db,
+            &env,
+            &builder,
+            alternative,
+            string,
+        )
+        .reduce_inferable(
+            db,
+            &env,
+            &builder,
+            TypeVarSet::from_typevars(db, [alternative]),
+        );
+        let same_source_free =
+            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, outer, integer);
+        for (set, expected) in [
+            (nested.negate(db, &builder), vec![free]),
+            (nested.or(db, &builder, || alternative), vec![free, result]),
+            (
+                nested.or(db, &builder, || same_source_free),
+                vec![free, outer],
+            ),
+        ] {
+            let mut storage = builder.storage.borrow_mut();
+            let ControlFlow::Continue(support) = Support::free_variables(
+                db,
+                &env,
+                &mut storage,
+                set.node,
+                &mut UnboundedSolutionLimits,
+            );
+            assert_eq!(
+                support
+                    .iter()
+                    .map(|id| storage.typevar_data(id))
+                    .collect::<FxHashSet<_>>(),
+                expected.into_iter().collect(),
+            );
+        }
+    }
+
+    #[test]
+    fn existential_receiver_preserves_rigid_lower_bound() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let local = create_typevar(db, "Local");
+        let result = create_typevar(db, "Result");
+        for domain in [None, Some(TypeVarBoundOrConstraints::UpperBound(integer))] {
+            let free = create_typevar(db, "Free").map_bound_or_constraints(db, |_| domain);
+            let builder = ConstraintSetBuilder::new();
+            let set = ConstraintSet::constrain_typevar(
+                db,
+                &env,
+                &builder,
+                local,
+                Type::TypeVar(free),
+                Type::TypeVar(result),
+            )
+            .reduce_inferable(
+                db,
+                &env,
+                &builder,
+                TypeVarSet::from_typevars(db, [local]),
+            );
+            assert_eq!(
+                set.solutions(db, &env, TypeVarSet::from_typevars(db, [result])),
+                Ok(Solutions::Constrained(SolutionPaths::Complete(vec![
+                    solution([TypeVarSolution {
+                        bound_typevar: result,
+                        solution: Type::TypeVar(free),
+                    },])
+                ])))
+            );
+        }
+    }
+
+    #[test]
+    fn existential_replay_requires_whole_rigid_domain() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let string = KnownClass::Str.to_instance(db, &env);
+        let free = create_typevar(db, "Free").map_bound_or_constraints(db, |_| {
+            Some(TypeVarBoundOrConstraints::Constraints(
+                TypeVarConstraints::new(db, [integer, string].as_slice()),
+            ))
+        });
+        let local = create_typevar(db, "Local");
+        let result = create_typevar(db, "Result");
+        for full_domain in [false, true] {
+            let relation = ConstraintSetBuilder::new().into_owned(|builder| {
+                let domain = {
+                    let mut storage = builder.storage.borrow_mut();
+                    let (node, order) = if full_domain {
+                        let support = Support::from_typevar_set(
+                            db,
+                            &mut storage,
+                            TypeVarSet::from_typevars(db, [free]),
+                        );
+                        Validations::from_locals(db, &env, &mut storage, &support)
+                            .as_constraint_set(&mut storage)
+                    } else {
+                        Constraint::new_nodes(
+                            db,
+                            &env,
+                            &mut storage,
+                            AtomicConstraint::new_equivalence_bound(
+                                db,
+                                &env,
+                                ConstraintProvenance::Validity,
+                                free,
+                                integer,
+                            ),
+                        )
+                    };
+                    ConstraintSet::from_node(builder, node, order)
+                };
+                domain
+                    .and(db, builder, || {
+                        ConstraintSet::constrain_typevar_equivalence_bound(
+                            db, &env, builder, local, integer,
+                        )
+                    })
+                    .and(db, builder, || {
+                        ConstraintSet::constrain_typevar_equivalence_bound(
+                            db, &env, builder, result, integer,
+                        )
+                    })
+            });
+            let residual = CandidateResidual {
+                relation,
+                locals: TypeVarSet::from_typevars(db, [local]),
+                inferable: TypeVarSet::from_typevars(db, [result]),
+            };
+            let caller = solution([TypeVarSolution {
+                bound_typevar: result,
+                solution: integer,
+            }]);
+            let builder = ConstraintSetBuilder::new();
+            let ControlFlow::Continue(actual) = residual.solve(
+                db,
+                &env,
+                &mut UnboundedSolutionLimits,
+                &mut ProjectionTypeBudget::new(SolutionBudget::default().type_terms),
+                caller.clone(),
+                &mut |_, bounds| CandidateSolutions::default_solve(db, &env, &builder, bounds),
+            );
+            if full_domain {
+                assert_eq!(actual, Some((caller, false)));
+            } else if let Some((solution, incomplete)) = actual {
+                assert!(incomplete);
+                assert!(solution.solved_typevars.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn existential_witness_selection_defers_local_bounds() {
         let db = setup_db();
         let db = &db;
@@ -7149,7 +7352,13 @@ mod tests {
         let local = create_typevar(db, "Local");
         let result = create_typevar(db, "Result");
         let free = create_typevar(db, "Free");
-        for (upper, expected) in [(Type::object(), true), (Type::TypeVar(free), false)] {
+        let bounded_free = free
+            .map_bound_or_constraints(db, |_| Some(TypeVarBoundOrConstraints::UpperBound(string)));
+        for (upper, expected) in [
+            (Type::object(), true),
+            (Type::TypeVar(free), false),
+            (Type::TypeVar(bounded_free), false),
+        ] {
             let builder = ConstraintSetBuilder::new();
             let list_local =
                 KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
