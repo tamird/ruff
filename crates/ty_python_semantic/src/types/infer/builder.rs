@@ -5968,9 +5968,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .with_unproved_lookup_inputs(!member.inputs_proved(db))
                     .match_parameters(db, env, argument_types);
 
-                let argument_context_supported = bindings
-                    .argument_correspondence_callables(argument_types)
-                    .is_some();
+                // Implicit calls can infer children in a separate silent context. Their
+                // union contributors still need a certificate for that child replay.
+                let argument_context_supported = (bindings.is_single()
+                    || argument_types.len() == 0)
+                    && bindings
+                        .argument_correspondence_callables(argument_types)
+                        .is_some();
                 if let Err(call_error) = self.infer_and_check_argument_types(
                     ast_arguments,
                     &[],
@@ -6255,6 +6259,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Result<(), CallErrorKind> {
         let db = self.db();
         let env = self.program_environment();
+        let commit_mode = CallArgumentInferenceMode::commit(bindings, argument_types);
         let requires_overload_evaluation = requires_overload_evaluation(candidates);
         let arguments_tcx = self.collect_call_arguments_type_context(
             collection_arguments,
@@ -6274,7 +6279,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 argument_types,
                 &arguments_tcx,
                 infer_argument_ty,
-                CallArgumentInferenceMode::Commit,
+                commit_mode,
             );
 
             return bindings.check_types_impl(
@@ -6330,7 +6335,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             argument_types,
             &arguments_tcx,
             infer_argument_ty,
-            CallArgumentInferenceMode::Commit,
+            commit_mode,
         );
         self.union_expected_types(&speculative_builder.expected_types);
 
@@ -6354,6 +6359,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         candidates: &OverloadSet,
     ) -> Result<(), CallErrorKind> {
         let db = self.db();
+        let commit_mode = CallArgumentInferenceMode::commit(bindings, argument_types);
         let requires_overload_evaluation = requires_overload_evaluation(candidates);
 
         let mut arguments_tcx = self.collect_call_arguments_type_context(
@@ -6386,7 +6392,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // inference here.
                     CallArgumentInferenceMode::Speculate
                 } else {
-                    CallArgumentInferenceMode::Commit
+                    commit_mode
                 },
             );
 
@@ -6475,7 +6481,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 if requires_overload_evaluation {
                     CallArgumentInferenceMode::Speculate
                 } else {
-                    CallArgumentInferenceMode::Commit
+                    commit_mode
                 },
             );
             next_bindings = bindings.clone();
@@ -6520,7 +6526,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 argument_types,
                 &arguments_tcx,
                 infer_argument_ty,
-                CallArgumentInferenceMode::Commit,
+                commit_mode,
             );
 
             self.union_expected_types(&converged_builder.expected_types);
@@ -6783,6 +6789,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             argument_tcx,
                             argument_types,
                         );
+
+                        if matches!(mode, CallArgumentInferenceMode::CommitAll)
+                            && (speculative_builder.context.has_unproved_requirements()
+                                || speculative_builder.cycle_recovery.is_some())
+                        {
+                            self.context.record_unproved_requirement(ast_argument);
+                        }
 
                         inferred_by_cache_key.insert(inference_cache_key, inferred_ty);
                         self.union_expected_types(&speculative_builder.expected_types);
@@ -13879,11 +13892,27 @@ enum CallArgumentInferenceMode {
     /// Commit a default inference without type context, if there are multiple
     /// applicable type contexts.
     Commit,
+
+    /// Also retain requirements from every contextual inference of a union argument.
+    CommitAll,
 }
 
 impl CallArgumentInferenceMode {
+    fn commit<'db>(bindings: &Bindings<'db>, arguments: &CallArguments<'_, 'db>) -> Self {
+        if arguments.requests_input_proof()
+            && !bindings.is_single()
+            && bindings
+                .argument_correspondence_callables(arguments)
+                .is_some()
+        {
+            Self::CommitAll
+        } else {
+            Self::Commit
+        }
+    }
+
     fn requires_default_inference(self) -> bool {
-        matches!(self, Self::Commit)
+        matches!(self, Self::Commit | Self::CommitAll)
     }
 }
 

@@ -284,6 +284,12 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
             .has_diagnostics_or_used_suppressions()
     }
 
+    /// Include checking failures even when their diagnostics are suppressed by configuration.
+    pub(super) fn has_unproved_requirements(&self) -> bool {
+        let diagnostics = self.diagnostics.borrow();
+        diagnostics.has_checking_failures() || diagnostics.has_unproved_requirements()
+    }
+
     /// Record a reachable selected requirement independently of diagnostic display policy.
     /// The result travels with committed inference, including cached expression results.
     pub(super) fn record_unproved_requirement(&self, node: impl Ranged) {

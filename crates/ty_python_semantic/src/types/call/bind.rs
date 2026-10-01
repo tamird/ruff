@@ -1711,7 +1711,7 @@ impl<'db> Bindings<'db> {
     /// Check the committed actual arguments against the selected parameter contracts.
     ///
     /// This query leaves ordinary overload selection and results unchanged. Multiple callable
-    /// contributors with explicit arguments, multiple or omitted constructor stages, and
+    /// contributors with unresolved overloads, multiple or omitted constructor stages, and
     /// unresolved generic solutions for supplied values need additional coverage to establish
     /// requirements. Ambiguous overloads suffice when one signature covers every argument.
     /// The caller must also establish that argument inference committed the selected contexts;
@@ -1733,8 +1733,9 @@ impl<'db> Bindings<'db> {
 
     /// Return the callables covered by argument correspondence, before or after inference.
     /// Constructor entry and downstream contexts must both be accounted for before checking.
-    /// With no explicit arguments, union alternatives need no contextual child replay, but each
-    /// must have one regular callable rather than multiple intersection candidates.
+    /// Each union alternative must have one regular callable. With explicit arguments, each
+    /// callable must also have one declared signature so all contextual child requirements can
+    /// be retained during inference. Overload alternatives need existential coverage instead.
     pub(crate) fn argument_correspondence_callables(
         &self,
         arguments: &CallArguments<'_, 'db>,
@@ -1753,12 +1754,11 @@ impl<'db> Bindings<'db> {
                     }
                 }
             }
-        } else if arguments.len() != 0
-            || self.elements.len() <= 1
-            || !self
-                .elements
-                .iter()
-                .all(|element| matches!(element.items.as_slice(), [CallableItem::Regular(_)]))
+        } else if self.elements.len() <= 1
+            || !self.elements.iter().all(|element| {
+                matches!(element.items.as_slice(), [CallableItem::Regular(callable)]
+                    if arguments.len() == 0 || callable.overloads().len() == 1)
+            })
         {
             return None;
         }

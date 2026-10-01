@@ -7599,6 +7599,109 @@ fn kwargs_exclusions_preserve_input_proof() -> anyhow::Result<()> {
 }
 
 #[test]
+fn callable_unions_preserve_argument_requirements() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable, TypedDict, cast, overload
+
+        class Left:
+            def __call__(self, *, name: str, value: object) -> None: ...
+        class Right:
+            def __call__(self, *, name: str, value: str) -> None: ...
+
+        class Named(TypedDict):
+            callback: Callable[[str], None]
+        class Broad(TypedDict):
+            callback: Callable[[Any], None]
+        class NamedConsumer:
+            def __call__(self, value: Named) -> None: ...
+        class BroadConsumer:
+            def __call__(self, value: Broad) -> None: ...
+
+        class Alternatives:
+            @overload
+            def __call__(self, value: Named) -> None: ...
+            @overload
+            def __call__(self, value: Broad) -> None: ...
+            def __call__(self, value: Named | Broad) -> None: ...
+        class General:
+            def __call__[T](self, value: T, callback: Callable[[T], None]) -> None: ...
+        class Text:
+            def __call__(self, value: str, callback: Callable[[str], None]) -> None: ...
+        class NamedSetter:
+            def __call__(self, key: int, value: Named) -> None: ...
+        class BroadSetter:
+            def __call__(self, key: int, value: Broad) -> None: ...
+        class Setter:
+            __setitem__ = cast(NamedSetter | BroadSetter, None)
+        class SingleSetter:
+            __setitem__ = cast(NamedSetter, None)
+
+        def narrow(value: str) -> None: pass
+        def wide(value: object) -> None: pass
+
+        def literals(callback: Left | Right) -> None:
+            callback(name="target", value="value")
+        def forwarded(callback: Left | Right, name: str, value: str) -> None:
+            callback(name=name, value=value)
+        def wrong(callback: Left | Right) -> None:
+            callback(name="target", value=1)
+        def children(callback: NamedConsumer | BroadConsumer) -> None:
+            callback({"callback": wide})
+        def unproved_child(callback: NamedConsumer | BroadConsumer) -> None:
+            callback({"callback": narrow})
+        def generic(callback: General | Text) -> None:
+            callback("value", wide)
+        def overloaded(callback: Alternatives) -> None:
+            callback({"callback": wide})
+        def overloaded_union(callback: Alternatives | NamedConsumer) -> None:
+            callback({"callback": wide})
+        def implicit(target: Setter) -> None:
+            target[0] = {"callback": wide}
+        def unproved_implicit(target: Setter) -> None:
+            target[0] = {"callback": narrow}
+        def single_implicit(target: SingleSetter) -> None:
+            target[0] = {"callback": wide}
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("literals", false),
+        ("forwarded", false),
+        ("wrong", true),
+        ("children", false),
+        ("unproved_child", true),
+        ("generic", false),
+        ("overloaded", false),
+        ("overloaded_union", true),
+        ("implicit", true),
+        ("unproved_implicit", true),
+        ("single_implicit", false),
+    ];
+    db.select_function_inference(Some((
+        file,
+        cases.map(|(name, _)| name.to_owned()).to_vec(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    let model = crate::SemanticModel::new(&db, program_file(&db, file));
+    let actual = cases.map(|(name, _)| {
+        let facts = model
+            .function_inference_facts(first_public_binding(&db, file, name))
+            .unwrap();
+        assert!(!facts.has_cycle_recovery, "{name}");
+        assert_eq!(facts.has_errors, name == "wrong", "{name}: {facts:?}");
+        if name != "wrong" {
+            assert_eq!(facts.return_type_correspondence, Some(true), "{name}");
+        }
+        (name, facts.has_unproved_requirements)
+    });
+    assert_eq!(actual, cases);
+    Ok(())
+}
+
+#[test]
 fn empty_generic_arguments_use_final_context() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_python_version(PythonVersion::PY313)
