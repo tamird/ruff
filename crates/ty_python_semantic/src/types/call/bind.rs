@@ -723,7 +723,7 @@ fn parameter_typevars<'db>(
     visitor.variables.into_inner()
 }
 
-/// Prove generic transport while retaining each argument's unknown nominal type slots.
+/// Prove generic transport while retaining opaque function values and nominal type slots.
 ///
 /// Captures are local rigid variables. Solving only the callee variables establishes one
 /// specialization for each possible input domain; strict replay checks the resulting pairs.
@@ -769,12 +769,34 @@ fn generic_arguments_satisfy_declared_parameters<'db>(
     let fixed = context.specialize(db, fixed);
     let mut captures = Vec::new();
     let mut originals = Vec::new();
+    let mut capture = |original| {
+        // Each occurrence is rigid only within this proof. Erasure below must reproduce the
+        // ordinary specialization before the proof can certify the supplied arguments.
+        let variable = BoundTypeVarInstance::synthetic(
+            db,
+            env,
+            Name::new(format!("$argument_input_{}", captures.len())),
+            TypeVarVariance::Invariant,
+        );
+        captures.push(variable);
+        originals.push(original);
+        Type::TypeVar(variable)
+    };
     let mut captured_pairs = Vec::new();
     for (actual, formal) in pairs {
         if actual.has_provisional_marker(db, env) || !formal.is_fully_static_except_any(db, env) {
             return false;
         }
-        let captured = if actual.is_fully_static(db, env) {
+        let captured = if matches!(actual, Type::FunctionLiteral(_)) {
+            // Collection inference promotes a function value to its callable signature. Keep
+            // the value rigid during proof; only erasure uses that same promotion.
+            let promoted = actual.promote(db, env);
+            if promoted.is_fully_static(db, env) {
+                *actual
+            } else {
+                capture(promoted)
+            }
+        } else if actual.is_fully_static(db, env) {
             *actual
         } else {
             let Type::NominalInstance(instance) = actual else {
@@ -804,17 +826,7 @@ fn generic_arguments_satisfy_declared_parameters<'db>(
                 if slot.is_fully_static(db, env) {
                     slots.push(*slot);
                 } else {
-                    // The distinct names identify occurrences within this local proof. These
-                    // variables never enter published inference results or argument caches.
-                    let capture = BoundTypeVarInstance::synthetic(
-                        db,
-                        env,
-                        Name::new(format!("$argument_input_{}", captures.len())),
-                        TypeVarVariance::Invariant,
-                    );
-                    captures.push(capture);
-                    originals.push(*slot);
-                    slots.push(Type::TypeVar(capture));
+                    slots.push(capture(*slot));
                 }
             }
             Type::instance(
@@ -12613,6 +12625,112 @@ def implemented[T](value: T) -> T: return value
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn generic_storage_preserves_function_values() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+from typing import Callable
+
+def opaque(value): return value
+def store_dict[T](value: T) -> dict[str, T]: ...
+def store_list[T](value: T) -> list[T]: ...
+def promise(value: Callable[[object], object]) -> object: ...
+def invoke[T](func: Callable[[T], T], value: T) -> T: ...
+def consume[T](values: list[T], callback: Callable[[object], int]) -> None: ...
+def typed_callback(value: object) -> int: return 1
+unknown_values: list
+
+promised: dict[str, Callable[[object], object]]
+"#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let lookup = |name| global_symbol(db, file, name).place.expect_type();
+        let mut outcomes = Vec::new();
+        for (name, arguments, context, expected) in [
+            (
+                "store_dict",
+                CallArguments::positional([lookup("opaque")]),
+                None,
+                true,
+            ),
+            (
+                "store_list",
+                CallArguments::positional([lookup("opaque")]),
+                None,
+                true,
+            ),
+            (
+                "consume",
+                CallArguments::positional([lookup("unknown_values"), lookup("typed_callback")]),
+                None,
+                true,
+            ),
+            (
+                "store_dict",
+                CallArguments::positional([lookup("opaque")]),
+                Some(lookup("promised")),
+                false,
+            ),
+            (
+                "promise",
+                CallArguments::positional([lookup("opaque")]),
+                None,
+                false,
+            ),
+            (
+                "invoke",
+                CallArguments::positional([lookup("opaque"), Type::int_literal(1)]),
+                None,
+                false,
+            ),
+            (
+                "store_dict",
+                CallArguments::positional([Type::unknown()]),
+                None,
+                false,
+            ),
+        ] {
+            let arguments = arguments.with_input_proof_request(true);
+            let result = lookup(name)
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &ConstraintSetBuilder::new(),
+                    &arguments,
+                    TypeContext::new(context),
+                    &[],
+                );
+            if expected {
+                assert!(result.is_ok(), "{name}: expected a valid ordinary call");
+            }
+            let bindings = match result {
+                Ok(bindings) => bindings,
+                Err(CallError(_, bindings)) => *bindings,
+            };
+            let proved = bindings.arguments_satisfy_declared_parameters(db, &env, &arguments);
+            outcomes.push((
+                name,
+                proved,
+                expected,
+                bindings.return_type(db, &env).display(db, &env).to_string(),
+            ));
+        }
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, actual, expected, _)| actual == expected),
+            "{outcomes:#?}",
+        );
         Ok(())
     }
 
