@@ -3831,6 +3831,37 @@ impl<'db> CandidateResidual<'db> {
         Ok(Some((replay, bindings)))
     }
 
+    fn replay_holds<L: SolutionLimits>(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        replay: ConstraintSet<'db, '_>,
+        limits: &mut L,
+    ) -> ControlFlow<L::Break, bool> {
+        let mut storage = replay.builder.storage.borrow_mut();
+        let orders = storage.calculate_source_orders(replay.source_order);
+        let mut path = replay
+            .node
+            .path_assignments(db, env, &mut storage, replay.source_order);
+        let mut walker = SolutionWalker::new(
+            db,
+            &mut storage,
+            orders,
+            TypeVarSet::None,
+            limits,
+            replay.node,
+        );
+        let outcome = walker.node_is_satisfiable_on_path(
+            db,
+            env,
+            &mut storage,
+            &mut path,
+            Polarity::Negative,
+            replay.node,
+            None,
+        )?;
+        ControlFlow::Continue(outcome == Satisfiability::Unsatisfiable)
+    }
+
     fn solve<L: SolutionLimits>(
         &self,
         db: &'db dyn Db,
@@ -3848,13 +3879,17 @@ impl<'db> CandidateResidual<'db> {
             locals,
             inferable,
         } = self;
-        let closed = resolve_solution(db, env, *inferable, &caller.solved_typevars);
+        let joint_inferable =
+            TypeVarSet::from_typevars(db, inferable.iter(db).chain(locals.iter(db)));
+        let closed = resolve_solution(db, env, joint_inferable, &caller.solved_typevars);
         let fixed: Vec<_> = caller
             .solved_typevars
             .iter()
             .zip(closed.iter())
             .filter_map(|(binding, closed)| {
-                if !binding.bound_typevar.is_inferable(db, *inferable) {
+                if !binding.bound_typevar.is_inferable(db, *inferable)
+                    || binding.bound_typevar.is_inferable(db, *locals)
+                {
                     return None;
                 }
                 match closed {
@@ -3866,9 +3901,37 @@ impl<'db> CandidateResidual<'db> {
                 }
             })
             .collect();
-        let joint_inferable =
-            TypeVarSet::from_typevars(db, inferable.iter(db).chain(locals.iter(db)));
         relation.query(|builder, when| {
+            // Closed caller outputs need existence of local witnesses, rather than inferred
+            // choices for every local. Bind the locals before specializing so their declared
+            // domains receive the same caller substitution as the body.
+            if inferable.iter(db).all(|variable| {
+                variable.is_inferable(db, *locals)
+                    || fixed
+                        .iter()
+                        .any(|binding| binding.bound_typevar.is_same_typevar_as(db, variable))
+            }) {
+                let quantified = when.reduce_inferable(db, env, builder, *locals);
+                let context = GenericContext::from_typevar_instances(
+                    db,
+                    env,
+                    fixed.iter().map(|binding| binding.bound_typevar),
+                );
+                let types: Vec<_> = fixed.iter().map(|binding| binding.solution).collect();
+                let mapping = TypeMapping::ApplySpecialization(
+                    ApplySpecialization::specialization(context.specialize(db, types)),
+                );
+                let replay = quantified.apply_type_mapping_impl(
+                    db,
+                    &mapping,
+                    TypeContext::default(),
+                    &ApplyTypeMappingVisitor::new(env),
+                );
+                if Self::replay_holds(db, env, replay, limits)? {
+                    caller.solved_typevars = fixed;
+                    return ControlFlow::Continue(Some((caller, false)));
+                }
+            }
             // The first choice gives contextual evidence priority. If it cannot extend to a
             // witness, retry the original joint relation without fixing that provisional choice.
             let attempts: &[&[TypeVarSolution<'db>]] = if fixed.is_empty() {
@@ -3955,32 +4018,7 @@ impl<'db> CandidateResidual<'db> {
                     Ok(None) => continue,
                     Err(_) => break,
                 };
-                let replay_holds = {
-                    let mut storage = builder.storage.borrow_mut();
-                    let orders = storage.calculate_source_orders(replay.source_order);
-                    let mut path =
-                        replay
-                            .node
-                            .path_assignments(db, env, &mut storage, replay.source_order);
-                    let mut walker = SolutionWalker::new(
-                        db,
-                        &mut storage,
-                        orders,
-                        TypeVarSet::None,
-                        &mut *limits,
-                        replay.node,
-                    );
-                    walker.node_is_satisfiable_on_path(
-                        db,
-                        env,
-                        &mut storage,
-                        &mut path,
-                        Polarity::Negative,
-                        replay.node,
-                        None,
-                    )
-                };
-                if replay_holds? != Satisfiability::Unsatisfiable {
+                if !Self::replay_holds(db, env, replay, limits)? {
                     continue;
                 }
                 caller.solved_typevars = bindings

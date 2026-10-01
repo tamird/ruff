@@ -417,6 +417,21 @@ def inspect[T](integer: Box[int], generic: Box[T]):
     reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: tuple[Solution[T=int]]
 ```
 
+## Quantified local aliases preserve caller bounds
+
+Inference may select each local variable in terms of the other. The scoped relation still permits
+concrete witnesses, so the caller retains its inferred bound.
+
+```py
+from ty_extensions._internal import ConstraintSet
+
+def local_aliases[T, S1, S2]():
+    lower = ConstraintSet.lower_bound(int, T)
+    local = ConstraintSet.upper_bound(S1, S2)
+    relation = (local & lower).exists(tuple[S1, S2]) & lower
+    reveal_type(relation.solutions_for(T, inferable=tuple[T]))  # revealed: tuple[Solution[T=int]]
+```
+
 ## Constraints from materialized types
 
 ### Invariant classes
