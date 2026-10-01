@@ -1680,10 +1680,14 @@ impl<'db> ConstraintSetStorage<'db> {
                         let source_order = existential
                             .source_order
                             .and_then(|old_source_order| source_orders[old_source_order.index()]);
+                        let locals =
+                            Support::from_typevars(existential.locals.iter().map(|typevar| {
+                                storage.intern_typevar(db, inner.typevars[typevar])
+                            }));
                         let Some(existential) = ExistentialBound::new(
                             storage,
                             existential.provenance,
-                            existential.locals.clone(),
+                            locals,
                             body,
                             source_order,
                         ) else {
@@ -5146,6 +5150,45 @@ mod tests {
                 ConstraintSet::constrain_typevar(db, env, builder, typevar, lower, upper)
             }
         }
+    }
+
+    #[test]
+    fn existential_locals_survive_owned_loading() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let local = create_typevar(db, "Local");
+        let unrelated = create_typevar(db, "Unrelated");
+        let locals = TypeVarSet::from_typevars(db, [local]);
+        let owned = ConstraintSetBuilder::new().into_owned(|builder| {
+            create_constraint(db, builder, local, KnownClass::Str)
+                .reduce_inferable(db, &env, builder, locals)
+        });
+        assert!(owned.query(|_, set| set.is_always_satisfied(db, &env)));
+
+        let builder = ConstraintSetBuilder::new();
+        create_constraint(db, &builder, unrelated, KnownClass::Bytes);
+        let loaded = builder.load(db, &env, &owned);
+        assert!(loaded.is_always_satisfied(db, &env));
+        assert!(!loaded.is_never_satisfied(db, &env));
+
+        let free = create_typevar(db, "Free");
+        let owned = ConstraintSetBuilder::new().into_owned(|builder| {
+            create_constraint(db, builder, local, KnownClass::Str)
+                .and(db, builder, || {
+                    create_constraint(db, builder, free, KnownClass::Bytes)
+                })
+                .reduce_inferable(db, &env, builder, locals)
+        });
+        let loaded = builder.load(db, &env, &owned);
+        let compatible = loaded.and(db, &builder, || {
+            create_constraint(db, &builder, free, KnownClass::Bytes)
+        });
+        assert!(!compatible.is_never_satisfied(db, &env));
+        let incompatible = loaded.and(db, &builder, || {
+            create_constraint(db, &builder, free, KnownClass::Int)
+        });
+        assert!(incompatible.is_never_satisfied(db, &env));
     }
 
     fn known_instance(db: &TestDb, class: KnownClass) -> Type<'_> {
