@@ -12283,6 +12283,67 @@ unbound_or = dict.__or__
     }
 
     #[test]
+    fn equivalent_callback_witnesses_prove_inputs() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+from typing import Callable, Sequence, overload
+
+@overload
+def callback[T](value: list[T]) -> T: ...
+@overload
+def callback[T](value: Sequence[T]) -> T: ...
+def callback(value): ...
+
+def incompatible(value: list[int]) -> int: ...
+def consume[R](callback: Callable[[list[str]], R]) -> R: ...
+"#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let lookup = |name| global_symbol(db, file, name).place.expect_type();
+        for (actual, expected) in [
+            (lookup("callback"), true),
+            (lookup("incompatible"), false),
+            (Type::unknown(), false),
+        ] {
+            let arguments = CallArguments::positional([actual]).with_input_proof_request(true);
+            let result = lookup("consume")
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &ConstraintSetBuilder::new(),
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                );
+            let bindings = match result {
+                Ok(bindings) => bindings,
+                Err(CallError(_, bindings)) => *bindings,
+            };
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                expected,
+                "consume({}), returned {}",
+                actual.display(db, &env),
+                bindings.return_type(db, &env).display(db, &env)
+            );
+            if expected {
+                assert_eq!(
+                    bindings.return_type(db, &env),
+                    KnownClass::Str.to_instance(db, &env)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn ambiguous_calls_can_have_proved_inputs() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(

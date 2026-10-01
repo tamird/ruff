@@ -3214,6 +3214,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         };
         let complete = matches!(solutions, SolutionPaths::Complete(_));
         let single = complete && solutions.as_slice().len() == 1;
+        let mut all_match_merged = complete && !solutions.as_slice().is_empty();
 
         // The compatibility projection must be cleaned after merging, independently of these
         // alternatives: a bare `U` survives on one path, but is removed from a merged `U | int`.
@@ -3236,8 +3237,8 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 .zip(resolved)
                 .map(|(binding, ty)| (binding.bound_typevar.identity(db), ty))
                 .collect();
-            if single
-                && generic_context.variables_inner(db).keys().all(|identity| {
+            let matches_merged =
+                generic_context.variables_inner(db).keys().all(|identity| {
                     match (path_types.get(identity), types.get(identity)) {
                         (None, None) => true,
                         (Some(SolutionType::Resolved(resolved)), Some(merged)) => {
@@ -3245,8 +3246,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                         }
                         _ => false,
                     }
-                })
-            {
+                });
+            all_match_merged &= matches_merged;
+            if single && matches_merged {
                 return self.typevar_inference(&types, TypeVarInferenceSolutions::Single);
             }
             if single && generic_context.len(db) > budget.type_terms {
@@ -3266,6 +3268,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             );
         }
 
+        if all_match_merged {
+            return self.typevar_inference(&types, TypeVarInferenceSolutions::Single);
+        }
         let paths = paths.into_boxed_slice();
         let solutions = if complete {
             TypeVarInferenceSolutions::Alternatives(paths)
@@ -5026,6 +5031,47 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_inference_keeps_equal_fallbacks() -> anyhow::Result<()> {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let typevars @ [t, _] = create_typevars(db, ["T", "U"]);
+        let context = GenericContext::from_typevar_instances(db, &env, typevars);
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let constraints = ConstraintSetBuilder::new();
+        let mut builder = SpecializationBuilder::new(db, &env, &constraints, context);
+        builder.record_constraint_set(exact_alternatives(
+            db,
+            &constraints,
+            typevars,
+            [[int, int], [str, int]],
+        ));
+        let inference = builder
+            .build_inference_with(|typevar, bounds| {
+                let lower = bounds
+                    .as_ref()
+                    .and_then(|bounds| bounds.inference_lower(db, &env));
+                (typevar == t && lower == Some(str)).then_some(PathBoundSolution::BudgetExceeded {
+                    fallback: Some(int),
+                })
+            })
+            .map_err(|_| anyhow::anyhow!("incomplete alternatives remain satisfiable"))?;
+        let TypeVarInferenceSolutions::Incomplete(paths) = inference.solutions(db) else {
+            anyhow::bail!(
+                "expected incomplete alternatives, got {:?}",
+                inference.solutions(db)
+            );
+        };
+        assert_eq!(paths.len(), 2);
+        for path in paths {
+            assert_eq!(path.as_ref(), [Some(Resolved(int)), Some(Resolved(int))]);
+        }
+        assert_eq!(inference.merged_types(db), [Some(int), Some(int)]);
         Ok(())
     }
 
