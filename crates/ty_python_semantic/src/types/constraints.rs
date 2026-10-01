@@ -2666,8 +2666,14 @@ impl NodeId {
             Node::AlwaysFalse => ControlFlow::Continue(false),
             Node::Interior(interior) => {
                 let source_orders = storage.calculate_source_orders(source_order);
-                let mut walker =
-                    SolutionWalker::new(db, storage, source_orders, TypeVarSet::None, limits, self);
+                let mut walker = SolutionWalker::new(
+                    db,
+                    storage,
+                    source_orders,
+                    TypeVarSet::None,
+                    limits,
+                    (self, source_order),
+                );
                 let mut path = interior.path_assignments(db, env, storage, source_order);
                 walker
                     .node_is_satisfiable_on_path(
@@ -2753,7 +2759,7 @@ impl NodeId {
                         source_orders,
                         TypeVarSet::None,
                         UnboundedSolutionLimits,
-                        self,
+                        (self, source_order),
                     );
                     let mut path = interior.path_assignments(db, env, storage, source_order);
                     walker.is_never_satisfied(db, env, storage, &mut path, Polarity::Positive, self)
@@ -3848,7 +3854,7 @@ impl<'db> CandidateResidual<'db> {
             orders,
             TypeVarSet::None,
             limits,
-            replay.node,
+            (replay.node, replay.source_order),
         );
         let outcome = walker.node_is_satisfiable_on_path(
             db,
@@ -3901,16 +3907,19 @@ impl<'db> CandidateResidual<'db> {
                 }
             })
             .collect();
+        let has_locals = locals.iter(db).next().is_some();
         relation.query(|builder, when| {
             // Closed caller outputs need existence of local witnesses, rather than inferred
             // choices for every local. Bind the locals before specializing so their declared
             // domains receive the same caller substitution as the body.
-            if inferable.iter(db).all(|variable| {
-                variable.is_inferable(db, *locals)
-                    || fixed
-                        .iter()
-                        .any(|binding| binding.bound_typevar.is_same_typevar_as(db, variable))
-            }) {
+            if !has_locals
+                || inferable.iter(db).all(|variable| {
+                    variable.is_inferable(db, *locals)
+                        || fixed
+                            .iter()
+                            .any(|binding| binding.bound_typevar.is_same_typevar_as(db, variable))
+                })
+            {
                 let quantified = when.reduce_inferable(db, env, builder, *locals);
                 let context = GenericContext::from_typevar_instances(
                     db,
@@ -3931,6 +3940,12 @@ impl<'db> CandidateResidual<'db> {
                     caller.solved_typevars = fixed;
                     return ControlFlow::Continue(Some((caller, false)));
                 }
+            }
+            if !has_locals {
+                // A negative scope only validates the selected callers. Recollecting this
+                // same obligation cannot supply an existential witness to infer.
+                caller.solved_typevars.clear();
+                return ControlFlow::Continue(Some((caller, true)));
             }
             // The first choice gives contextual evidence priority. If it cannot extend to a
             // witness, retry the original joint relation without fixing that provisional choice.
@@ -4143,7 +4158,14 @@ impl<'db> CandidateSolutions<'db> {
             return ControlFlow::Continue(path_bounds);
         }
 
-        let mut walker = SolutionWalker::new(db, storage, source_orders, inferable, limits, node);
+        let mut walker = SolutionWalker::new(
+            db,
+            storage,
+            source_orders,
+            inferable,
+            limits,
+            (node, source_order),
+        );
         // Sequent discovery must also happen in source order. Sorting the collected paths is
         // too late: sequent pairs are not commutative, and TDD traversal order can otherwise
         // discard gradual evidence before solution extraction.
@@ -5891,6 +5913,99 @@ mod tests {
                 .and(db, &builder, || right_int)
                 .is_never_satisfied(db, &env),
             "separate witnesses cannot exchange their caller conditions"
+        );
+    }
+
+    #[test]
+    fn negative_existential_projects_correlated_callers() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let local = create_typevar(db, "Local");
+        let left = create_typevar(db, "Left");
+        let right = create_typevar(db, "Right");
+        let builder = ConstraintSetBuilder::new();
+        let int_str =
+            create_constraint(db, &builder, left, KnownClass::Int).and(db, &builder, || {
+                create_constraint(db, &builder, right, KnownClass::Str)
+            });
+        let str_int =
+            create_constraint(db, &builder, left, KnownClass::Str).and(db, &builder, || {
+                create_constraint(db, &builder, right, KnownClass::Int)
+            });
+        let pairs = int_str.or(db, &builder, || str_int);
+        let excluded = create_constraint(db, &builder, local, KnownClass::Bytes)
+            .and(db, &builder, || pairs.negate(db, &builder))
+            .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        let negative = excluded.negate(db, &builder);
+        let inferable = TypeVarSet::from_typevars(db, [left, right]);
+        let expected = Solutions::Constrained(SolutionPaths::Complete(
+            [
+                (KnownClass::Int, KnownClass::Str),
+                (KnownClass::Str, KnownClass::Int),
+            ]
+            .into_iter()
+            .map(|(left_ty, right_ty)| {
+                solution([
+                    TypeVarSolution {
+                        bound_typevar: left,
+                        solution: left_ty.to_instance(db, &env),
+                    },
+                    TypeVarSolution {
+                        bound_typevar: right,
+                        solution: right_ty.to_instance(db, &env),
+                    },
+                ])
+            })
+            .collect(),
+        ));
+        assert_eq!(negative.solutions(db, &env, inferable), Ok(expected));
+        let crossed = negative
+            .and(db, &builder, || {
+                create_constraint(db, &builder, left, KnownClass::Int)
+            })
+            .and(db, &builder, || {
+                create_constraint(db, &builder, right, KnownClass::Int)
+            });
+        assert_matches!(
+            crossed.solutions(db, &env, inferable),
+            Ok(Solutions::Unsatisfiable(_))
+        );
+    }
+
+    #[test]
+    fn negative_existential_preserves_conditional_callers() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let local = create_typevar(db, "Local");
+        let free = create_typevar(db, "Free");
+        let result = create_typevar(db, "Result");
+        let builder = ConstraintSetBuilder::new();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let result_int = create_constraint(db, &builder, result, KnownClass::Int);
+        let excluded = ConstraintSet::constrain_typevar(
+            db,
+            &env,
+            &builder,
+            local,
+            KnownClass::Str.to_instance(db, &env),
+            Type::TypeVar(free),
+        )
+        .and(db, &builder, || result_int.negate(db, &builder))
+        .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        let negative = excluded.negate(db, &builder);
+        // Result=int refutes the body for every Free. Other Result choices still depend
+        // on the rigid free variable, even after refining the negative witness condition.
+        assert_eq!(
+            negative.solutions(db, &env, TypeVarSet::from_typevars(db, [result])),
+            Ok(Solutions::Constrained(SolutionPaths::Incomplete(vec![
+                solution([]),
+                solution([TypeVarSolution {
+                    bound_typevar: result,
+                    solution: integer
+                },]),
+            ])))
         );
     }
 

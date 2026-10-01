@@ -154,6 +154,15 @@ pub(super) enum Satisfiability {
     Incomplete,
 }
 
+enum ExistentialProof {
+    Satisfiable,
+    Unsatisfiable,
+    /// These whole-witness conditions imply existence, but do not cover the outer path.
+    Incomplete {
+        covered: NodeId,
+    },
+}
+
 enum Break<B> {
     Limits(B),
     EarlyBreak,
@@ -171,10 +180,11 @@ impl<B> Break<B> {
 
 pub(super) struct SolutionWalker<'db, L> {
     source_orders: FxIndexSet<AtomicConstraintId>,
-    /// The relation before non-inferable variables are projected away. Used to recover the
-    /// original upper bounds for diagnostics, since projected paths can contain derived bounds
-    /// that obscure the original evidence.
+    /// The logical relation being solved, independent of traversal polarity. Used for replay
+    /// and to recover original upper bounds for diagnostics, since projected paths can contain
+    /// derived bounds that obscure the original evidence.
     original_node: NodeId,
+    original_source_order: Option<SourceOrderId>,
     inferable: TypeVarSet<'db>,
     inferable_support: Support,
     limits: L,
@@ -230,12 +240,13 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         source_orders: FxIndexSet<AtomicConstraintId>,
         inferable: TypeVarSet<'db>,
         limits: L,
-        original_node: NodeId,
+        (original_node, original_source_order): (NodeId, Option<SourceOrderId>),
     ) -> Self {
         let inferable_support = Support::from_typevar_set(db, storage, inferable);
         Self {
             source_orders,
             original_node,
+            original_source_order,
             inferable,
             inferable_support,
             limits,
@@ -841,28 +852,66 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             check_cache,
             prune_path,
             &|this, storage, path| {
-                let previous_proving = std::mem::replace(&mut this.proving_satisfiability, true);
-                let result = this.existential_holds_on_path(
-                    db,
-                    env,
-                    storage,
-                    path,
-                    interior.constraint,
-                    existential_body,
-                );
-                this.proving_satisfiability = previous_proving;
-                match result.map_break(Break::Limits)? {
-                    Satisfiability::Satisfiable => return ControlFlow::Continue(()),
-                    Satisfiability::Incomplete => {
-                        this.incomplete = true;
-                        return ControlFlow::Continue(());
+                let prove = |this: &mut Self,
+                             storage: &mut ConstraintSetStorage<'db>,
+                             path: &mut PathAssignments| {
+                    let previous = std::mem::replace(&mut this.proving_satisfiability, true);
+                    let result = this.existential_holds_on_path(
+                        db,
+                        env,
+                        storage,
+                        path,
+                        interior.constraint,
+                        existential_body,
+                    );
+                    this.proving_satisfiability = previous;
+                    result.map_break(Break::Limits)
+                };
+                let process_refuted =
+                    |this: &mut Self,
+                     storage: &mut ConstraintSetStorage<'db>,
+                     path: &mut PathAssignments| {
+                        this.negative_scopes.push(interior.constraint);
+                        let result = process_satisfied(this, storage, path);
+                        this.negative_scopes.pop();
+                        result
+                    };
+                match prove(this, storage, path)? {
+                    ExistentialProof::Satisfiable => ControlFlow::Continue(()),
+                    ExistentialProof::Unsatisfiable => process_refuted(this, storage, path),
+                    ExistentialProof::Incomplete { covered } => {
+                        // Candidate inference can restrict caller choices. A Boolean proof
+                        // must keep the current outer assumptions fixed.
+                        if this.proving_satisfiability || covered == ALWAYS_FALSE {
+                            this.incomplete = true;
+                            return ControlFlow::Continue(());
+                        }
+                        // A negative existential must exclude every known witness. Walk that
+                        // necessary caller condition, then prove the original scope impossible
+                        // before emitting a candidate. Refine only once: a conditional proof on
+                        // the refined path remains incomplete.
+                        this.visit_node_and_then(
+                            db,
+                            env,
+                            storage,
+                            path,
+                            Polarity::Negative,
+                            covered,
+                            &never_cache,
+                            &never_prune,
+                            &|this, storage, path| match prove(this, storage, path)? {
+                                ExistentialProof::Satisfiable => ControlFlow::Continue(()),
+                                ExistentialProof::Unsatisfiable => {
+                                    process_refuted(this, storage, path)
+                                }
+                                ExistentialProof::Incomplete { covered: _ } => {
+                                    this.incomplete = true;
+                                    ControlFlow::Continue(())
+                                }
+                            },
+                        )
                     }
-                    Satisfiability::Unsatisfiable => {}
                 }
-                this.negative_scopes.push(interior.constraint);
-                let result = process_satisfied(this, storage, path);
-                this.negative_scopes.pop();
-                result
             },
         )
     }
@@ -877,7 +926,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         path: &mut PathAssignments,
         constraint: ConstraintId,
         body: NodeId,
-    ) -> ControlFlow<L::Break, Satisfiability> {
+    ) -> ControlFlow<L::Break, ExistentialProof> {
         let Constraint::Existential(existential) = storage.constraint_data(constraint) else {
             unreachable!("existential proof requires a quantified constraint");
         };
@@ -917,7 +966,15 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     }
                 },
             );
-            return self.finish_satisfiability_query(previous_incomplete, result);
+            return self
+                .finish_satisfiability_query(previous_incomplete, result)
+                .map_continue(|outcome| match outcome {
+                    Satisfiability::Satisfiable => ExistentialProof::Satisfiable,
+                    Satisfiability::Unsatisfiable => ExistentialProof::Unsatisfiable,
+                    Satisfiability::Incomplete => ExistentialProof::Incomplete {
+                        covered: ALWAYS_FALSE,
+                    },
+                });
         }
 
         let previous_locals = self.positive_locals.clone();
@@ -985,9 +1042,11 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         let witnesses = witnesses.into_inner();
         if witnesses.is_empty() {
             return ControlFlow::Continue(if incomplete {
-                Satisfiability::Incomplete
+                ExistentialProof::Incomplete {
+                    covered: ALWAYS_FALSE,
+                }
             } else {
-                Satisfiability::Unsatisfiable
+                ExistentialProof::Unsatisfiable
             });
         }
 
@@ -1070,11 +1129,11 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 None,
             )?;
             if outcome == Satisfiability::Unsatisfiable {
-                return ControlFlow::Continue(Satisfiability::Satisfiable);
+                return ControlFlow::Continue(ExistentialProof::Satisfiable);
             }
         }
         // Refuting these choices does not refute every possible witness.
-        ControlFlow::Continue(Satisfiability::Incomplete)
+        ControlFlow::Continue(ExistentialProof::Incomplete { covered })
     }
 
     fn with_declared_constraint_solution<R>(
@@ -2025,7 +2084,17 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             node = node.and(storage, condition);
             source_order = storage.ordered_source_order(source_order, order);
         }
-        for scope in &self.negative_scopes[negative_scopes_from..] {
+        self.include_negative_scopes(storage, node, source_order, negative_scopes_from)
+    }
+
+    fn include_negative_scopes(
+        &self,
+        storage: &mut ConstraintSetStorage<'db>,
+        mut node: NodeId,
+        mut source_order: Option<SourceOrderId>,
+        from: usize,
+    ) -> (NodeId, Option<SourceOrderId>) {
+        for scope in &self.negative_scopes[from..] {
             let (condition, order) = Node::new_constraint(storage, *scope);
             let condition = condition.negate(storage);
             node = node.and(storage, condition);
@@ -2053,8 +2122,19 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             return ControlFlow::Continue(false);
         };
         self.limits.satisfied_path().map_break(Break::Limits)?;
-        if self.positive_locals.iter().next().is_some() {
-            let (node, source_order) = self.signed_path(storage, path, 0);
+        if self.positive_locals.iter().next().is_some() || !self.negative_scopes.is_empty() {
+            let (node, source_order) = if self.positive_locals.iter().next().is_some() {
+                self.signed_path(storage, path, 0)
+            } else {
+                // Refinement can split on an outer variable even when the selected callers
+                // satisfy the original relation on both sides of that split.
+                self.include_negative_scopes(
+                    storage,
+                    self.original_node,
+                    self.original_source_order,
+                    0,
+                )
+            };
             let relation = match node.node() {
                 Node::Interior(root) => OwnedConstraintSetBuilder::snapshot(
                     storage,
@@ -2564,7 +2644,7 @@ mod tests {
             source_orders,
             TypeVarSet::None,
             UnboundedSolutionLimits,
-            negative.node,
+            (negative.node, negative.source_order),
         );
         // Local=Free is a complete witness under every outer specialization. Proving it
         // again must consume the same temporary-type budget, rather than replenish it.

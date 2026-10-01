@@ -1679,7 +1679,7 @@ mod tests {
                     orders,
                     inferable,
                     UnboundedSolutionLimits,
-                    node,
+                    (set.node, set.source_order),
                 );
                 let ControlFlow::Continue(()) = walker.visit_node(
                     db,
@@ -1809,7 +1809,7 @@ mod tests {
                     orders,
                     inferable,
                     UnboundedSolutionLimits,
-                    implicit.node,
+                    (implicit.node, implicit.source_order),
                 );
                 let ControlFlow::Continue(()) = walker.visit_node(
                     db,
@@ -1949,7 +1949,7 @@ mod tests {
                 source_orders.clone(),
                 inferable,
                 limits,
-                set.node,
+                (set.node, set.source_order),
             );
             assert_eq!(
                 walker.visit_node(
@@ -1972,7 +1972,7 @@ mod tests {
                 source_orders.clone(),
                 inferable,
                 limits,
-                set.node,
+                (set.node, set.source_order),
             );
             let ControlFlow::Continue(()) = walker.visit_node(
                 db,
