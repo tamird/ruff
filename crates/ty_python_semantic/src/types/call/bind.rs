@@ -12617,6 +12617,126 @@ def implemented[T](value: T) -> T: return value
     }
 
     #[test]
+    fn generic_callbacks_cover_unary_unions() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+from typing import Any, Callable, overload
+
+class Label: ...
+type Scalar = str | bool | int | None | Label
+type Compound = Scalar | list[Scalar]
+type Mapping = dict[Scalar, Compound]
+type Payload = Compound | Mapping | dict[Scalar, Compound | Mapping]
+
+@overload
+def clone[T](value: list[T]) -> list[T]: ...
+@overload
+def clone[K, V](value: dict[K, V]) -> dict[K, V]: ...
+@overload
+def clone[T: (str, Label, int, bool, None)](value: T) -> T: ...
+def clone(value): ...
+
+@overload
+def scalar[T: (int, str)](value: T) -> T: ...
+@overload
+def scalar(value: None) -> None: ...
+def scalar(value): ...
+
+@overload
+def concrete(value: int) -> int: ...
+@overload
+def concrete(value: str) -> str: ...
+def concrete(value): ...
+
+def constrained[T: (int, str)](value: T) -> T: ...
+def integer(value: int) -> int: ...
+def opaque(value): ...
+
+@overload
+def missing[T](value: list[T]) -> list[T]: ...
+@overload
+def missing[T: (str, Label, int, bool, None)](value: T) -> T: ...
+def missing(value): ...
+
+@overload
+def overlapping[T](value: list[T]) -> str: ...
+@overload
+def overlapping(value: list[int]) -> bytes: ...
+@overload
+def overlapping(value: str) -> str: ...
+def overlapping(value): ...
+
+def keyword_only[T: (int, str)](*, value: T) -> T: ...
+unknown: Any
+
+def consume(callback: Callable[
+    [Scalar | list[Scalar] | Mapping | dict[Scalar, Compound | Mapping]], object
+]) -> None: ...
+def consume_alias(callback: Callable[[Payload], object]) -> None: ...
+def consume_scalar(callback: Callable[[int | str], object]) -> None: ...
+def consume_int(callback: Callable[[int], object]) -> None: ...
+def consume_list(callback: Callable[[list[Scalar]], object]) -> None: ...
+def consume_dict(callback: Callable[[Mapping], object]) -> None: ...
+def consume_string(callback: Callable[[int | str], str]) -> None: ...
+def consume_overlapping(callback: Callable[[list[int] | str], str]) -> None: ...
+"#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let lookup = |name| global_symbol(db, file, name).place.expect_type();
+        for (consumer, callback, expected) in [
+            ("consume_int", "clone", true),
+            ("consume_scalar", "clone", true),
+            ("consume_list", "clone", true),
+            ("consume_dict", "clone", true),
+            ("consume", "clone", true),
+            ("consume_alias", "clone", true),
+            ("consume_scalar", "scalar", true),
+            ("consume_scalar", "constrained", true),
+            ("consume_scalar", "concrete", true),
+            ("consume", "integer", false),
+            ("consume", "opaque", false),
+            ("consume", "unknown", false),
+            ("consume", "missing", false),
+            ("consume_string", "constrained", false),
+            ("consume_overlapping", "overlapping", false),
+            ("consume_scalar", "keyword_only", false),
+        ] {
+            let actual = lookup(callback);
+            let arguments = CallArguments::positional([actual]).with_input_proof_request(true);
+            let result = lookup(consumer)
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &ConstraintSetBuilder::new(),
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                );
+            let ordinary = result.is_ok();
+            let bindings = match result {
+                Ok(bindings) => bindings,
+                Err(CallError(_, bindings)) => *bindings,
+            };
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                expected,
+                "{consumer}({callback})",
+            );
+            if expected {
+                assert!(ordinary, "{consumer}({callback})");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn equivalent_callback_witnesses_prove_inputs() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(

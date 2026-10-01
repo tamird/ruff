@@ -2397,8 +2397,9 @@ impl<'db> VarianceInferable<'db> for &Signature<'db> {
 }
 
 impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
-    /// Fast path for unary callable assignability: compare overload sets by aggregating
-    /// overlapping parameter domains and return types.
+    /// Fast path for unary callable relations over an explicit union input domain.
+    /// Static overloads aggregate overlapping domains and returns; generic signatures
+    /// establish coverage separately for each target input.
     ///
     /// This is intentionally accept-only. If the probe does not definitely succeed, it returns
     /// `None` and callers should fall back to legacy per-overload relation checks.
@@ -2437,15 +2438,16 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             }
         };
 
-        let other_parameter_type = single_required_positional_parameter_type(target_signature)?;
+        let other_parameter_type = single_required_positional_parameter_type(target_signature)?
+            .expand_top_level_aliases(db, self.env);
         // Keep this aggregate path narrowly scoped to unary target callables whose parameter
         // domain is an explicit union.
         //
-        // Broader overload-set assignability (non-union unary domains, higher arity,
-        // typevars/dynamic interactions) needs dedicated relation logic.
-        if !matches!(other_parameter_type, Type::Union(_)) {
+        // Broader overload-set relations (non-union unary domains, higher arity,
+        // and generic targets) need dedicated relation logic.
+        let Type::Union(target_parameters) = other_parameter_type else {
             return None;
-        }
+        };
 
         let env = self.env;
         let is_unary_overload_aggregate_candidate_type = |ty: Type<'db>| {
@@ -2458,6 +2460,53 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             || !is_unary_overload_aggregate_candidate_type(target_signature.return_ty)
         {
             return None;
+        }
+
+        if source_signatures
+            .iter()
+            .any(|signature| signature.generic_context.is_some())
+        {
+            if target_signature.generic_context.is_some() {
+                return None;
+            }
+            // Each input can choose a different source specialization. Full signature checks
+            // establish coverage; potentially overlapping signatures must also have safe returns.
+            for parameter in target_parameters.elements(db) {
+                let target = target_signature
+                    .clone()
+                    .with_parameters(Parameters::standard([target_signature
+                        .parameters()
+                        .get(0)?
+                        .clone()
+                        .with_annotated_type(*parameter)]));
+                let mut covered = false;
+                for source in source_signatures {
+                    let domain = single_required_positional_parameter_type(source)?;
+                    if self
+                        .without_context_collection(|| {
+                            self.check_signature_pair(db, source, &target)
+                        })
+                        .is_always_satisfied(db, env)
+                    {
+                        covered = true;
+                    } else if !self
+                        .as_disjointness_checker()
+                        .check_type_pair(db, domain, *parameter)
+                        .is_always_satisfied(db, env)
+                        && !self
+                            .without_context_collection(|| {
+                                self.check_signature_return_pair(db, source, &target)
+                            })
+                            .is_always_satisfied(db, env)
+                    {
+                        return None;
+                    }
+                }
+                if !covered {
+                    return None;
+                }
+            }
+            return Some(self.always());
         }
 
         let mut parameter_type_union = UnionBuilder::new(db, env);
@@ -2650,6 +2699,15 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 
         match (source_overloads, target_overloads) {
             ([source_signature], [target_signature]) => {
+                if source_signature.generic_context.is_some()
+                    && let Some(aggregate_relation) = self.try_unary_overload_aggregate_relation(
+                        db,
+                        source_overloads,
+                        target_signature,
+                    )
+                {
+                    return aggregate_relation;
+                }
                 // Base case: both callable types contain a single signature.
                 if self.typevar_evaluation == TypeVarEvaluation::Lazy
                     && (source_signature
