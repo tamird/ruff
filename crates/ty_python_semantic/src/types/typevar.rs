@@ -1424,6 +1424,11 @@ impl<'db> BoundTypeVarInstance<'db> {
     ) -> Type<'db> {
         let mapped_specialization_type =
             |specialization: &ApplySpecialization<'a, 'db>| -> Option<Type<'db>> {
+                if self.paramspec_attr(db).is_some()
+                    && let Some(ty) = specialization.get(db, self)
+                {
+                    return Some(ty);
+                }
                 let typevar = if self.is_paramspec(db) {
                     self.without_paramspec_attr(db)
                 } else {
@@ -3168,6 +3173,82 @@ mod tests {
 
         let events = db.take_salsa_events();
         assert_function_query_was_not_run_by_name(&db, "lazy_bound_unchecked", None, &events);
+    }
+
+    #[test]
+    fn paramspec_specializations_preserve_component_bindings() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let paramspec = bound_typevar(
+            db,
+            &env,
+            "P",
+            TypeVarKind::Pep695ParamSpec,
+            None,
+            TypeVarNonce::NONE,
+        );
+        let other = bound_typevar(
+            db,
+            &env,
+            "Q",
+            TypeVarKind::Pep695ParamSpec,
+            None,
+            TypeVarNonce::NONE,
+        );
+        let args = paramspec.with_paramspec_attr(db, ParamSpecAttrKind::Args);
+        let kwargs = paramspec.with_paramspec_attr(db, ParamSpecAttrKind::Kwargs);
+        let string = KnownClass::Str.to_instance(db, &env);
+        let positional = Type::homogeneous_tuple(db, &env, string);
+        let keywords = KnownClass::Dict.to_specialized_instance(db, &env, &[string, string]);
+        let context = GenericContext::from_typevar_instances(db, &env, [paramspec, args, kwargs]);
+        let types = [Type::TypeVar(other), positional, keywords];
+        let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Partial {
+            generic_context: context,
+            types: &types,
+            skip: None,
+        });
+        for (variable, expected) in [
+            (paramspec, types[0]),
+            (args, positional),
+            (kwargs, keywords),
+        ] {
+            assert_eq!(
+                variable
+                    .apply_type_mapping_impl(db, &mapping, &ApplyTypeMappingVisitor::new(&env),),
+                expected,
+            );
+        }
+
+        // A base ParamSpec substitution still carries each component onto its replacement.
+        let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Single(
+            paramspec,
+            Type::TypeVar(other),
+        ));
+        for attr in [ParamSpecAttrKind::Args, ParamSpecAttrKind::Kwargs] {
+            assert_eq!(
+                paramspec
+                    .with_paramspec_attr(db, attr)
+                    .apply_type_mapping_impl(db, &mapping, &ApplyTypeMappingVisitor::new(&env),),
+                Type::TypeVar(other.with_paramspec_attr(db, attr)),
+            );
+        }
+
+        // An exact component binding neither rewrites the base nor retags its replacement.
+        let other_kwargs = Type::TypeVar(other.with_paramspec_attr(db, ParamSpecAttrKind::Kwargs));
+        let mapping =
+            TypeMapping::ApplySpecialization(ApplySpecialization::Single(args, other_kwargs));
+        for (variable, expected) in [
+            (paramspec, Type::TypeVar(paramspec)),
+            (args, other_kwargs),
+            (kwargs, Type::TypeVar(kwargs)),
+        ] {
+            assert_eq!(
+                variable
+                    .apply_type_mapping_impl(db, &mapping, &ApplyTypeMappingVisitor::new(&env),),
+                expected,
+            );
+        }
     }
 
     #[test]
