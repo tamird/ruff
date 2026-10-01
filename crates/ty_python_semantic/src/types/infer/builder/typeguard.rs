@@ -3,7 +3,8 @@ use ty_python_core::place::PlaceExpr;
 use ty_python_core::place_table;
 use ty_python_core::scope::ScopeId;
 
-use crate::types::call::{Binding, Bindings};
+use crate::types::call::Bindings;
+use crate::types::call::bind::TypeGuardArgument;
 use crate::types::narrow::NarrowingConstraint;
 use crate::types::{MaterializationKind, Type};
 use crate::{Db, ProgramEnvironment};
@@ -38,62 +39,33 @@ pub(super) fn bind_type_guard_return_type<'db>(
         // Use the call binding to find the argument that maps to the first parameter a type
         // guard can narrow. This supports keyword arguments without falling back to a later
         // parameter when the target is defaulted.
-        let matched_narrowed_argument_index = bindings.single_element().and_then(|binding| {
-            let has_implicit_receiver = binding
-                .signature_type
-                .as_function_literal()
-                .or_else(|| binding.callable_type.as_function_literal())
-                .is_some_and(|function| function.has_implicit_receiver(db));
-            let bound_argument_offset = usize::from(binding.bound_type.is_some());
-            let narrowed_parameter_index =
-                usize::from(bound_argument_offset > 0 || has_implicit_receiver);
-            let narrowed_argument_index = |overload: &Binding<'db>| {
-                overload
-                    .argument_matches()
-                    .iter()
-                    .enumerate()
-                    .skip(bound_argument_offset)
-                    .find_map(|(argument_index, matched_argument)| {
-                        matched_argument
-                            .parameters
-                            .iter()
-                            .any(|parameter| parameter.index == narrowed_parameter_index)
-                            .then_some(argument_index - bound_argument_offset)
-                    })
-            };
-            let mut matching_overloads = binding.matching_overloads();
-            let (_, first_overload) = matching_overloads.next()?;
-            let first_argument_index = narrowed_argument_index(first_overload);
-
-            Some(
-                if matching_overloads
-                    .all(|(_, overload)| narrowed_argument_index(overload) == first_argument_index)
-                {
-                    first_argument_index
-                } else {
-                    None
-                },
-            )
-        });
+        let matched_narrowed_argument_index = bindings
+            .single_element()
+            .map_or(TypeGuardArgument::Unmapped, |binding| {
+                binding.type_guard_argument_index(db)
+            });
 
         let argument = match matched_narrowed_argument_index {
-            Some(Some(argument_index)) => arguments.iter_source_order().nth(argument_index),
+            TypeGuardArgument::Index(argument_index) => {
+                arguments.iter_source_order().nth(argument_index)
+            }
             // The target parameter was omitted, so there is no expression to narrow.
-            Some(None) => None,
+            TypeGuardArgument::NoTarget => None,
             // Preserve positional behavior when there isn't a unique callable binding whose
             // parameter mapping we can use.
-            None => arguments
+            TypeGuardArgument::Unmapped => arguments
                 .args
                 .get(narrowed_argument_index())
                 .map(ast::ArgOrKeyword::from),
-        }?;
+        };
+        let argument = argument?;
         if argument.is_variadic() {
             return None;
         }
 
         Some((
             argument.value(),
-            matches!(matched_narrowed_argument_index, Some(Some(_))),
+            matches!(matched_narrowed_argument_index, TypeGuardArgument::Index(_)),
         ))
     };
     let find_narrowed_place = |argument: &ast::Expr| {

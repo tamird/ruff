@@ -381,6 +381,36 @@ def tagged_payloads(
     reveal_type(found)  # revealed: Literal[False]
 ```
 
+## Expanded predicate arguments
+
+A starred argument can supply the predicate's first parameter in one expansion and leave it to the
+next argument in another. The predicate only narrows a source argument when every expansion tests
+that argument.
+
+```py
+from typing import Any, Literal, overload
+from typing_extensions import TypeIs
+
+@overload
+def tagged(value: object, *rest: object, tag: Literal[0]) -> TypeIs[dict[Any, Any]]: ...
+@overload
+def tagged(value: object, *rest: object, tag: Literal[1]) -> TypeIs[dict[Any, Any]]: ...
+def tagged(value: object, *rest: object, tag: int) -> bool:
+    return isinstance(value, dict)
+
+def changing(prefix: tuple[dict[str, int]] | tuple[()], value: Any, tag: Literal[0, 1]):
+    if tagged(*prefix, value, tag=tag):
+        reveal_type(value)  # revealed: Any
+
+def reversed_prefix(prefix: tuple[()] | tuple[dict[str, int]], value: Any, tag: Literal[0, 1]):
+    if tagged(*prefix, value, tag=tag):
+        reveal_type(value)  # revealed: Any
+
+def stable(prefix: tuple[dict[str, int]] | tuple[()], value: Any, tag: Literal[0, 1]):
+    if tagged(value, *prefix, tag=tag):
+        reveal_type(value)  # revealed: Any & dict[Any, Any]
+```
+
 ## Intersections
 
 Guards for overlapping types can share a common subtype. A function returning `TypeGuard[int]`

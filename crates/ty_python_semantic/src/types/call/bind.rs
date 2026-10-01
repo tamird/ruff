@@ -3646,6 +3646,16 @@ impl<'db> From<Binding<'db>> for Bindings<'db> {
     }
 }
 
+/// The source argument a type guard can narrow after matching overloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypeGuardArgument {
+    /// No matching overload supplied a parameter mapping.
+    Unmapped,
+    /// The target was omitted or the overloads disagree about its argument.
+    NoTarget,
+    Index(usize),
+}
+
 /// Binding information for a single callable. If the callable is overloaded, there is a separate
 /// [`Binding`] for each overload.
 ///
@@ -4354,6 +4364,7 @@ impl<'db> CallableBinding<'db> {
             let mut return_types = Vec::new();
             let mut selected_overloads = SmallVec::<[usize; 2]>::new();
             let mut inputs_proved = call_arguments.requests_input_proof();
+            let mut type_guard_argument = TypeGuardArgument::NoTarget;
 
             for expanded_arguments in &expanded_argument_lists {
                 self.overload_call_result = None;
@@ -4466,6 +4477,12 @@ impl<'db> CallableBinding<'db> {
                 }
 
                 if let Some(return_type) = return_type {
+                    let argument = self.type_guard_argument_index(db);
+                    if return_types.is_empty() {
+                        type_guard_argument = argument;
+                    } else if type_guard_argument != argument {
+                        type_guard_argument = TypeGuardArgument::NoTarget;
+                    }
                     return_types.push(return_type);
                     let matching = self.matching_overloads();
                     let selected = if is_ambiguous {
@@ -4503,6 +4520,7 @@ impl<'db> CallableBinding<'db> {
                         return_type: UnionType::from_elements(db, env, return_types),
                         selected_overloads,
                         proved_arguments: inputs_proved.then(|| call_arguments.snapshot()),
+                        type_guard_argument,
                     }),
                 ));
 
@@ -5011,6 +5029,54 @@ impl<'db> CallableBinding<'db> {
         Type::unknown()
     }
 
+    fn type_guard_parameter_index(&self, db: &'db dyn Db) -> usize {
+        usize::from(
+            self.bound_type.is_some()
+                || self
+                    .signature_type
+                    .as_function_literal()
+                    .or_else(|| self.callable_type.as_function_literal())
+                    .is_some_and(|function| function.has_implicit_receiver(db)),
+        )
+    }
+
+    /// Find the source argument narrowed by every matching overload.
+    pub(crate) fn type_guard_argument_index(&self, db: &'db dyn Db) -> TypeGuardArgument {
+        if let Some(result) = &self.overload_call_result
+            && let OverloadCallResult::ArgumentTypeExpansion(expanded) = result
+        {
+            return expanded.type_guard_argument;
+        }
+        let bound_argument_offset = usize::from(self.bound_type.is_some());
+        let parameter_index = self.type_guard_parameter_index(db);
+        let argument_index = |overload: &Binding<'db>| {
+            overload
+                .argument_matches()
+                .iter()
+                .enumerate()
+                .skip(bound_argument_offset)
+                .find_map(|(argument_index, matched_argument)| {
+                    matched_argument
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.index == parameter_index)
+                        .then_some(argument_index - bound_argument_offset)
+                })
+        };
+        let mut overloads = self.matching_overloads();
+        let Some((_, first)) = overloads.next() else {
+            return TypeGuardArgument::Unmapped;
+        };
+        let Some(first_argument) = argument_index(first) else {
+            return TypeGuardArgument::NoTarget;
+        };
+        if overloads.all(|(_, overload)| argument_index(overload) == Some(first_argument)) {
+            TypeGuardArgument::Index(first_argument)
+        } else {
+            TypeGuardArgument::NoTarget
+        }
+    }
+
     fn report_diagnostics(
         &self,
         context: &CallDiagnosticContext<'_, '_, 'db, '_>,
@@ -5265,6 +5331,8 @@ struct ExpandedOverloadCall<'db> {
     return_type: Type<'db>,
     selected_overloads: SmallVec<[usize; 2]>,
     proved_arguments: Option<CallArgumentsSnapshot<'db>>,
+    /// The target must agree before expansion snapshots discard individual argument matches.
+    type_guard_argument: TypeGuardArgument,
 }
 
 #[derive(Debug)]
