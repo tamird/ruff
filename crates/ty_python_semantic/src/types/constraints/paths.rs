@@ -60,7 +60,7 @@ pub(crate) struct PathAssignments {
     /// All of the rules that we know for inferring derived constraints on the current path.
     sequents: Vec<PathSequent>,
     /// The sequents that can fire when a particular assignment is added to the path.
-    sequent_antecedents: FxHashMap<Assignment<AtomicConstraintId>, Vec<usize>>,
+    sequent_triggers: FxHashMap<Assignment<AtomicConstraintId>, Vec<usize>>,
     /// Whole relations activated by atomic antecedents on this path.
     relations: FxIndexMap<usize, u16>,
     visiting_relations: FxHashSet<usize>,
@@ -193,7 +193,7 @@ impl Default for PathAssignments {
     fn default() -> Self {
         Self {
             sequents: Vec::default(),
-            sequent_antecedents: FxHashMap::default(),
+            sequent_triggers: FxHashMap::default(),
             relations: FxIndexMap::default(),
             visiting_relations: FxHashSet::default(),
             origin_fuel: AssignmentFuel::origin(),
@@ -290,7 +290,7 @@ impl PathAssignments {
             .collect();
         Self {
             sequents: Vec::default(),
-            sequent_antecedents: FxHashMap::default(),
+            sequent_triggers: FxHashMap::default(),
             relations: FxIndexMap::default(),
             visiting_relations: FxHashSet::default(),
             origin_fuel: AssignmentFuel::origin(),
@@ -658,15 +658,12 @@ impl PathAssignments {
             storage: &mut ConstraintSetStorage<'db>,
             sequents: &[CachedSequent<'db>],
             dest: &mut Vec<PathSequent>,
-            antecedents: &mut FxHashMap<Assignment<AtomicConstraintId>, Vec<usize>>,
+            triggers: &mut FxHashMap<Assignment<AtomicConstraintId>, Vec<usize>>,
         ) {
             for sequent in sequents {
                 let sequent_index = dest.len();
-                let mut add_antecedent = |assignment| {
-                    antecedents
-                        .entry(assignment)
-                        .or_default()
-                        .push(sequent_index);
+                let mut add_trigger = |assignment| {
+                    triggers.entry(assignment).or_default().push(sequent_index);
                 };
 
                 let sequent = match sequent {
@@ -678,8 +675,8 @@ impl PathAssignments {
                     } => {
                         let ante1 = storage.intern_atomic_constraint(db, env, *ante1);
                         let ante2 = storage.intern_atomic_constraint(db, env, *ante2);
-                        add_antecedent(ante1.when_true());
-                        add_antecedent(ante2.when_true());
+                        add_trigger(ante1.when_true());
+                        add_trigger(ante2.when_true());
                         let post = storage.load_with_provenance(db, env, post, Some(*provenance));
                         let (ante1_depth, _) =
                             storage.cached_constraint_bound_depth(db, env, ante1);
@@ -707,14 +704,14 @@ impl PathAssignments {
                     }
                     Sequent::SingleTautology { ante } => {
                         let ante = storage.intern_atomic_constraint(db, env, *ante);
-                        add_antecedent(ante.when_false());
+                        add_trigger(ante.when_false());
                         Sequent::SingleTautology { ante }
                     }
                     Sequent::PairImpossibility { ante1, ante2 } => {
                         let ante1 = storage.intern_atomic_constraint(db, env, *ante1);
                         let ante2 = storage.intern_atomic_constraint(db, env, *ante2);
-                        add_antecedent(ante1.when_true());
-                        add_antecedent(ante2.when_true());
+                        add_trigger(ante1.when_true());
+                        add_trigger(ante2.when_true());
                         Sequent::PairImpossibility { ante1, ante2 }
                     }
                     Sequent::TripleImpossibility {
@@ -725,9 +722,9 @@ impl PathAssignments {
                         let ante1 = storage.intern_atomic_constraint(db, env, *ante1);
                         let ante2 = storage.intern_atomic_constraint(db, env, *ante2);
                         let ante3 = storage.intern_atomic_constraint(db, env, *ante3);
-                        add_antecedent(ante1.when_true());
-                        add_antecedent(ante2.when_true());
-                        add_antecedent(ante3.when_true());
+                        add_trigger(ante1.when_true());
+                        add_trigger(ante2.when_true());
+                        add_trigger(ante3.when_true());
                         Sequent::TripleImpossibility {
                             ante1,
                             ante2,
@@ -744,8 +741,9 @@ impl PathAssignments {
                         let ante1 = storage.intern_atomic_constraint(db, env, *ante1);
                         let ante2 = storage.intern_atomic_constraint(db, env, *ante2);
                         let post = storage.intern_atomic_constraint(db, env, *post);
-                        add_antecedent(ante1.when_true());
-                        add_antecedent(ante2.when_true());
+                        add_trigger(ante1.when_true());
+                        add_trigger(ante2.when_true());
+                        add_trigger(post.when_false());
                         let (ante1_depth, _) =
                             storage.cached_constraint_bound_depth(db, env, ante1);
                         let (ante2_depth, _) =
@@ -763,7 +761,10 @@ impl PathAssignments {
                     Sequent::SingleImplication { ante, post, .. } => {
                         let ante = storage.intern_atomic_constraint(db, env, *ante);
                         let post = storage.intern_atomic_constraint(db, env, *post);
-                        add_antecedent(ante.when_true());
+                        add_trigger(ante.when_true());
+                        // A sibling can negate a consequence rolled back after its rule was
+                        // discovered. Recheck the still-held antecedent in that branch.
+                        add_trigger(post.when_false());
                         let (ante_depth, _) = storage.cached_constraint_bound_depth(db, env, ante);
                         let fuel_cost = storage.sequent_fuel_cost(db, env, post, ante_depth);
                         Sequent::SingleImplication {
@@ -788,7 +789,7 @@ impl PathAssignments {
                         storage,
                         sequents,
                         &mut self.sequents,
-                        &mut self.sequent_antecedents,
+                        &mut self.sequent_triggers,
                     );
                 }
                 SequentGroup::Grouped {
@@ -808,7 +809,7 @@ impl PathAssignments {
                         storage,
                         first,
                         &mut self.sequents,
-                        &mut self.sequent_antecedents,
+                        &mut self.sequent_triggers,
                     );
                     intern_sequents(
                         db,
@@ -816,7 +817,7 @@ impl PathAssignments {
                         storage,
                         second,
                         &mut self.sequents,
-                        &mut self.sequent_antecedents,
+                        &mut self.sequent_triggers,
                     );
                 }
             }
@@ -1042,17 +1043,14 @@ impl PathAssignments {
 
         self.new_assignments.clear();
         let previous_sequents_len = self.sequents.len();
-        let previous_antecedents_len = self
-            .sequent_antecedents
-            .get(&assignment)
-            .map_or(0, Vec::len);
+        let previous_triggers_len = self.sequent_triggers.get(&assignment).map_or(0, Vec::len);
         self.discover_constraint(db, env, storage, assignment.constraint());
         let sequents_len = self.sequents.len();
 
-        // Previously discovered sequents can only start firing if the assignment that we just
-        // added is one of their antecedents.
-        for index in 0..previous_antecedents_len {
-            let sequent_index = self.sequent_antecedents[&assignment][index];
+        // Recheck cached rules when an antecedent is added or an implication's consequence
+        // is negated after a sibling branch rolled back its derived assignment.
+        for index in 0..previous_triggers_len {
+            let sequent_index = self.sequent_triggers[&assignment][index];
             let sequent = self.sequents[sequent_index];
             self.check_sequent(db, env, storage, sequent_index, sequent)?;
         }
@@ -1335,6 +1333,142 @@ mod tests {
         let env = db.program_environment();
         let ty = bound.to_instance(db, &env);
         ConstraintSet::constrain_typevar_equivalence_bound(db, &env, builder, bound_typevar, ty)
+    }
+
+    #[test]
+    fn negated_consequent_rechecks_a_cached_implication() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let builder = ConstraintSetBuilder::new();
+        let exact = create_constraint(db, &builder, t, KnownClass::Object);
+        let lower = ConstraintSet::constrain_typevar_lower_bound(
+            db,
+            &env,
+            &builder,
+            t,
+            KnownClass::Str.to_instance(db, &env),
+        );
+        let mut storage = builder.storage.borrow_mut();
+        let exact = storage
+            .interior_node_data(exact.node)
+            .constraint
+            .expect_atomic(&storage);
+        let lower = storage
+            .interior_node_data(lower.node)
+            .constraint
+            .expect_atomic(&storage);
+        let mut path = PathAssignments::default();
+        path.walk_edge(
+            db,
+            &env,
+            &mut storage,
+            exact.when_true(),
+            |storage, path, _, conflict| {
+                assert!(!conflict);
+                // This branch discovers `T = object => str <= T`. Its consequence is then
+                // rolled back while the implication remains cached for sibling branches.
+                path.walk_edge(db, &env, storage, lower.when_true(), |_, _, _, conflict| {
+                    assert!(!conflict)
+                });
+                path.walk_edge(
+                    db,
+                    &env,
+                    storage,
+                    lower.when_false(),
+                    |_, _, _, conflict| assert!(conflict),
+                );
+            },
+        );
+        // Without the antecedent, the same negative edge is satisfiable.
+        path.walk_edge(
+            db,
+            &env,
+            &mut storage,
+            lower.when_false(),
+            |_, _, _, conflict| assert!(!conflict),
+        );
+    }
+
+    #[test]
+    fn negated_consequent_rechecks_a_cached_pair_implication() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let builder = ConstraintSetBuilder::new();
+        let left = create_constraint(db, &builder, create_typevar(db, "T"), KnownClass::Int);
+        let right = create_constraint(db, &builder, create_typevar(db, "U"), KnownClass::Str);
+        let post = create_constraint(db, &builder, create_typevar(db, "V"), KnownClass::Bytes);
+        let mut storage = builder.storage.borrow_mut();
+        let [left, right, post] = [left, right, post].map(|set| {
+            storage
+                .interior_node_data(set.node)
+                .constraint
+                .expect_atomic(&storage)
+        });
+        let mut map = SequentMap::default();
+        map.sequents.push(SequentGroup::Ungrouped(Box::new([
+            Sequent::PairImplication {
+                ante1: storage.atomic_constraint_data(left),
+                ante2: storage.atomic_constraint_data(right),
+                post: storage.atomic_constraint_data(post),
+                fuel_cost: (),
+                is_substitution: false,
+            },
+        ])));
+        let mut path = PathAssignments::default();
+        path.walk_edge(
+            db,
+            &env,
+            &mut storage,
+            left.when_true(),
+            |storage, path, _, conflict| {
+                assert!(!conflict);
+                path.walk_edge(
+                    db,
+                    &env,
+                    storage,
+                    right.when_true(),
+                    |storage, path, _, conflict| {
+                        assert!(!conflict);
+                        path.walk_edge(
+                            db,
+                            &env,
+                            storage,
+                            post.when_true(),
+                            |storage, path, _, conflict| {
+                                assert!(!conflict);
+                                path.add_sequents(db, &env, storage, &map);
+                            },
+                        );
+                        path.walk_edge(
+                            db,
+                            &env,
+                            storage,
+                            post.when_false(),
+                            |_, _, _, conflict| assert!(conflict),
+                        );
+                    },
+                );
+                // Removing either antecedent makes the negative consequence satisfiable.
+                path.walk_edge(db, &env, storage, post.when_false(), |_, _, _, conflict| {
+                    assert!(!conflict)
+                });
+            },
+        );
+        path.walk_edge(
+            db,
+            &env,
+            &mut storage,
+            right.when_true(),
+            |storage, path, _, conflict| {
+                assert!(!conflict);
+                path.walk_edge(db, &env, storage, post.when_false(), |_, _, _, conflict| {
+                    assert!(!conflict)
+                });
+            },
+        );
     }
 
     #[test]
