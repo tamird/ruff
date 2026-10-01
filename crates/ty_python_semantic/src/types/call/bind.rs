@@ -66,7 +66,9 @@ use crate::types::signatures::{
 };
 use crate::types::tuple::{TupleLength, TupleSpec, TupleSpecBuilder, TupleType, VariableSegment};
 use crate::types::typed_dict::{TypedDictOpenness, extract_unpacked_typed_dict_from_value_type};
-use crate::types::typevar::{BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVarSet};
+use crate::types::typevar::{
+    BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVarSet, walk_type_var_bounds,
+};
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
     TypeCollector, TypeKind, TypeVisitor, any_over_type, walk_non_atomic_type,
@@ -669,6 +671,56 @@ impl CheckTypesMode {
     fn is_provisional(self) -> bool {
         matches!(self, Self::Provisional)
     }
+}
+
+/// Find the selected variables needed by supplied parameters and their declarations.
+/// Bounds and constraints determine dependencies; defaults supply omitted selections.
+fn parameter_typevars<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    context: GenericContext<'db>,
+    pairs: &[(Type<'db>, Type<'db>)],
+) -> FxHashSet<BoundTypeVarIdentity<'db>> {
+    struct ParameterTypeVars<'a, 'db> {
+        env: &'a ProgramEnvironment<'db>,
+        inferable: TypeVarSet<'db>,
+        variables: RefCell<FxHashSet<BoundTypeVarIdentity<'db>>>,
+        recursion_guard: TypeCollector<'db>,
+    }
+
+    impl<'db> TypeVisitor<'db> for ParameterTypeVars<'_, 'db> {
+        fn program_environment(&self) -> &ProgramEnvironment<'db> {
+            self.env
+        }
+
+        fn should_visit_lazy_type_attributes(&self) -> bool {
+            true
+        }
+
+        fn visit_bound_type_var_type(&self, db: &'db dyn Db, variable: BoundTypeVarInstance<'db>) {
+            if variable.is_inferable(db, self.inferable) {
+                self.variables.borrow_mut().insert(variable.identity(db));
+                if let Some(domain) = variable.typevar(db).bound_or_constraints(db, self.env) {
+                    walk_type_var_bounds(db, domain, self);
+                }
+            }
+        }
+
+        fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+            walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
+        }
+    }
+
+    let visitor = ParameterTypeVars {
+        env,
+        inferable: context.inferable_typevars(db),
+        variables: RefCell::default(),
+        recursion_guard: TypeCollector::default(),
+    };
+    for (_, formal) in pairs {
+        visitor.visit_type(db, *formal);
+    }
+    visitor.variables.into_inner()
 }
 
 /// Prove generic transport while retaining each argument's unknown nominal type slots.
@@ -8412,16 +8464,47 @@ impl<'db> Binding<'db> {
                 }
             }
         }
-        let direct = pairs.iter().enumerate().all(|(index, (actual, expected))| {
-            let expected = specialization.map_or(*expected, |specialization| {
-                expected.apply_specialization(db, specialization)
-            });
-            pair_is_proved(*actual, expected)
-                || (index == 0
-                    && matches!(arguments.iter().next(), Some((Argument::Synthetic, _)))
-                    && self
-                        .explicit_receiver_satisfies_declared_parameter(db, env, *actual, expected))
+        let declarations_proved = specialization.is_none_or(|specialization| {
+            let context = specialization.generic_context(db);
+            let required = parameter_typevars(db, env, context, &pairs);
+            context
+                .variables(db)
+                .zip(specialization.types(db))
+                .all(|(variable, solution)| {
+                    if !required.contains(&variable.identity(db)) {
+                        return true;
+                    }
+                    let satisfies = |bound: Type<'db>| {
+                        pair_is_proved(
+                            *solution,
+                            bound
+                                .apply_specialization(db, specialization)
+                                .top_materialization(db, env),
+                        )
+                    };
+                    let Some(domain) = variable.typevar(db).bound_or_constraints(db, env) else {
+                        return true;
+                    };
+                    match domain {
+                        TypeVarBoundOrConstraints::UpperBound(bound) => satisfies(bound),
+                        TypeVarBoundOrConstraints::Constraints(constraints) => {
+                            constraints.elements(db).iter().copied().any(satisfies)
+                        }
+                    }
+                })
         });
+        let direct = declarations_proved
+            && pairs.iter().enumerate().all(|(index, (actual, expected))| {
+                let expected = specialization.map_or(*expected, |specialization| {
+                    expected.apply_specialization(db, specialization)
+                });
+                pair_is_proved(*actual, expected)
+                    || (index == 0
+                        && matches!(arguments.iter().next(), Some((Argument::Synthetic, _)))
+                        && self.explicit_receiver_satisfies_declared_parameter(
+                            db, env, *actual, expected,
+                        ))
+            });
         direct
             || (capture_supported
                 && self.signature.generic_context.is_some()
@@ -12037,8 +12120,13 @@ def dict_kind[K, V](value: dict[K, V]) -> str: ...
 def select[K: str, V](value: Mapping[K, V]) -> V: ...
 def box_kind[T](value: Box[T]) -> str: ...
 def fixed(value: list) -> str: ...
+def declared_any(value: Any) -> str: ...
+def object_bound[T: object](value: list[T]) -> str: ...
+def unused_bound[T: int, U](value: U, unused: T = ...) -> str: ...
+def referenced_default[U: int, T = U](value: T) -> str: ...
 def bounded[T: int](value: list[T]) -> str: ...
 def constrained[T: (int, str)](value: list[T]) -> str: ...
+def constrained_pair[T: (int, str)](left: list[T], right: list[T]) -> str: ...
 def fixed_any[T](callback: Callable[[Any], int], other: list[T]) -> None: ...
 def correlate[T](left: list[T], right: list[T]) -> None: ...
 def put[T](values: list[T], value: T) -> None: ...
@@ -12103,6 +12191,12 @@ unbound_or = dict.__or__
                 int,
             ),
         );
+        let gradual_choice = IntersectionType::from_two_elements(
+            db,
+            &env,
+            Type::any(),
+            UnionType::from_two_elements(db, &env, int, str),
+        );
         for (name, actuals, context, expected) in [
             ("Copy", vec![list(unknown)], None, true),
             ("Copy", vec![list(unknown)], Some(lookup("int_copy")), false),
@@ -12117,14 +12211,31 @@ unbound_or = dict.__or__
                 false,
             ),
             ("BoundedCopy", vec![list(unknown)], None, false),
+            ("BoundedCopy", vec![list(Type::any())], None, false),
             ("list_kind", vec![list(unknown)], None, true),
+            ("list_kind", vec![list(Type::any())], None, true),
+            ("declared_any", vec![Type::any()], None, true),
+            ("object_bound", vec![list(Type::any())], None, true),
+            ("unused_bound", vec![int], None, true),
+            ("referenced_default", vec![int], None, true),
+            ("referenced_default", vec![Type::any()], None, true),
             ("dict_kind", vec![dict(unknown, unknown)], None, true),
             ("select", vec![dict(str, list(unknown))], None, true),
             ("box_kind", vec![lookup("opaque_box")], None, true),
             ("fixed", vec![list(unknown)], None, false),
             ("bounded", vec![list(unknown)], None, false),
+            ("bounded", vec![list(Type::any())], None, false),
             ("bounded", vec![list(int)], None, true),
             ("constrained", vec![list(unknown)], None, false),
+            ("constrained", vec![list(Type::any())], None, false),
+            ("constrained", vec![list(int)], None, true),
+            ("constrained", vec![list(gradual_choice)], None, false),
+            (
+                "constrained_pair",
+                vec![list(gradual_choice), list(gradual_choice)],
+                None,
+                false,
+            ),
             (
                 "fixed_any",
                 vec![
