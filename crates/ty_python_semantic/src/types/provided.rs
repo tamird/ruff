@@ -5,6 +5,7 @@
 
 use ruff_db::diagnostic::Diagnostic;
 use ruff_db::files::FileRange;
+use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex};
 use ty_python_core::ProgramFile;
@@ -16,7 +17,123 @@ use crate::place::{Place, PlaceAndQualifiers};
 use crate::types::CheckedCall;
 use crate::types::ClassLiteral;
 use crate::types::class::{DynamicClassAnchor, DynamicClassLiteral, DynamicClassScopeOffset};
-use crate::types::{IntersectionBuilder, MemberLookupPolicy, Type, TypeQualifiers};
+use crate::types::{
+    ClassType, IntersectionBuilder, KnownClass, MemberLookupPolicy, Type, TypeQualifiers,
+};
+
+impl KnownClass {
+    pub(crate) fn allocation_class<'db>(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<ClassLiteral<'db>> {
+        self.provided_allocation_class(db, env)
+            .or_else(|| self.try_to_class_literal(db, env).map(ClassLiteral::Static))
+    }
+
+    /// Returns the checked allocation declaration supplied for this builtin collection.
+    /// Its sole base preserves the builtin's generic parameters and operations.
+    pub fn provided_allocation_class<'db>(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<ClassLiteral<'db>> {
+        if !matches!(self, Self::Dict | Self::List | Self::Set) {
+            return None;
+        }
+        let builtin = self.try_to_class_literal(db, env)?;
+        let declaration = db.provided_allocation_class(env.program(db), self)?;
+        let Type::ClassLiteral(allocation) = declaration.resolve_type(db)? else {
+            return None;
+        };
+        checked_allocation_class(db, builtin.into(), allocation)
+    }
+}
+
+impl<'db> ClassType<'db> {
+    pub(crate) fn provided_allocation(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<Self> {
+        let known = self.known(db)?;
+        let allocation = known.provided_allocation_class(db, env)?;
+        Some(match self {
+            Self::NonGeneric(_) => Self::NonGeneric(allocation),
+            Self::Generic(alias) => {
+                let specialization = alias.specialization(db);
+                allocation.apply_specialization(db, |context| {
+                    context
+                        .specialize_recursive(
+                            db,
+                            specialization.types(db).iter().copied().map(Some),
+                        )
+                        .with_materialization_kind(db, specialization.materialization_kind(db))
+                })
+            }
+        })
+    }
+}
+
+#[salsa::tracked(returns(copy))]
+fn checked_allocation_class<'db>(
+    db: &'db dyn Db,
+    builtin: ClassLiteral<'db>,
+    allocation: ClassLiteral<'db>,
+) -> Option<ClassLiteral<'db>> {
+    let class = allocation.as_static()?;
+    if !class.is_final(db) || class.has_explicit_metaclass(db) {
+        return None;
+    }
+    let env = ProgramEnvironment::from_scope(class.body_scope(db));
+    let context = allocation.generic_context(db)?;
+    let builtin_context = builtin.generic_context(db)?;
+    if context.variables(db).any(|variable| {
+        variable.is_paramspec(db)
+            || variable.default_type(db).is_some()
+            || variable
+                .typevar(db)
+                .bound_or_constraints(db, &env)
+                .is_some()
+    }) {
+        return None;
+    }
+    if context
+        .variables(db)
+        .zip(builtin_context.variables(db))
+        .any(|(allocation, original)| allocation.variance(db) != original.variance(db))
+    {
+        return None;
+    }
+    let [Type::GenericAlias(base)] = class.explicit_bases(db) else {
+        return None;
+    };
+    if ClassLiteral::Static(base.origin(db)) != builtin
+        || !base
+            .specialization(db)
+            .types(db)
+            .iter()
+            .copied()
+            .eq(context.variables(db).map(Type::TypeVar))
+    {
+        return None;
+    }
+    let module = parsed_module(db, class.program_file(db).python_file(db)).load(db);
+    let declaration = class.body_scope(db).node(db).expect_class().node(&module);
+    if declaration.decorator_list.len() != 1
+        || !declaration.body.iter().all(|statement| match statement {
+            ast::Stmt::Pass(_) => true,
+            ast::Stmt::Expr(expression) => matches!(
+                expression.value.as_ref(),
+                ast::Expr::EllipsisLiteral(_) | ast::Expr::StringLiteral(_)
+            ),
+            _ => false,
+        })
+    {
+        return None;
+    }
+    Some(allocation)
+}
 
 mod data;
 pub use data::ProvidedData;

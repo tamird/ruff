@@ -592,7 +592,7 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
     }
     let bound_type = inference.binding_type(definition);
     let closed_typed_dict = is_closed_typed_dict(db, bound_type);
-    if !closed_typed_dict && !super::has_dict_type(db, bound_type) {
+    if !closed_typed_dict && !super::has_dict_type(db, &env, bound_type) {
         return ContentsValue::Unavailable;
     }
     let index = semantic_index(db, file);
@@ -1173,9 +1173,8 @@ fn mapping_transfer<'db>(
                 PlaceExpr::try_from_expr(&*attribute.value) == PlaceExpr::try_from_expr(receiver)
                     && inference.try_expression_type(receiver).is_some_and(|ty| {
                         is_closed_typed_dict(db, ty)
-                            || ty.as_nominal_instance().is_some_and(|instance| {
-                                instance.has_known_class(db, KnownClass::Dict)
-                            })
+                            || (ty.as_nominal_instance().is_some()
+                                && super::has_dict_type(db, &env, ty))
                     })
             });
             let Some(method) = method else {
@@ -1653,7 +1652,9 @@ pub(super) fn snapshot_contents<'db>(
 ) -> ContentsValue<'db> {
     let observed = (|| {
         let closed_typed_dict = is_closed_typed_dict(db, argument_type);
-        if !closed_typed_dict && !super::has_dict_type(db, argument_type) {
+        if !closed_typed_dict
+            && !super::has_dict_type(db, &ProgramEnvironment::from_scope(scope), argument_type)
+        {
             return None;
         }
         // Only a proved For seed can observe an invariant dictionary union. Ordinary

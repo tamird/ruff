@@ -293,10 +293,25 @@ impl<'db> Type<'db> {
                 }
             }
             Type::ClassLiteral(class_literal) => {
-                Some(class_literal.identity_specialization(db).into_callable(db))
+                let class = ClassType::NonGeneric(class_literal);
+                let class = class.provided_allocation(db, env).unwrap_or(class);
+                Some(
+                    class
+                        .class_literal(db)
+                        .identity_specialization(db)
+                        .into_callable(db),
+                )
             }
 
-            Type::GenericAlias(alias) => Some(ClassType::Generic(alias).into_callable(db)),
+            Type::GenericAlias(alias) => {
+                let class = ClassType::Generic(alias);
+                Some(
+                    class
+                        .provided_allocation(db, env)
+                        .unwrap_or(class)
+                        .into_callable(db),
+                )
+            }
 
             Type::NewTypeInstance(newtype) => newtype
                 .concrete_base_type(db)

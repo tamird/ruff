@@ -8,7 +8,7 @@ use ruff_db::system::DbWithWritableSystem as _;
 use ruff_text_size::{Ranged, TextLen, TextRange};
 
 use super::*;
-use crate::db::tests::{TestDb, TestDbBuilder};
+use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
 use crate::types::definition_resolution::definitions_for_attribute;
 use crate::types::ide_support::{
     definitions_for_keyword_argument, inlay_hint_call_argument_details,
@@ -18,6 +18,281 @@ use crate::types::{
     DictionaryItems, KnownClass, Parameter, Parameters, Signature,
 };
 use crate::{HasType, SemanticModel};
+
+struct AllocationSource;
+
+impl SourceProvider for AllocationSource {
+    fn allocation_class<'db>(
+        &self,
+        db: &'db TestDb,
+        program: crate::Program<'db>,
+        class: KnownClass,
+    ) -> Option<ProvidedBindingValue<'db>> {
+        if class != KnownClass::Dict
+            || program.semantic_namespace(db).as_deref() == Some("unallocated")
+        {
+            return None;
+        }
+        let file = system_path_to_file(db, "/src/leaf.pyi").ok()?;
+        Some(ProvidedBindingValue::Export {
+            file: db.program_file(file),
+            name: Name::new_static("Exact"),
+        })
+    }
+
+    fn statements(
+        &self,
+        _db: &TestDb,
+        _file: ProgramFile<'_>,
+    ) -> Vec<ty_python_core::definition::ProvidedStatement> {
+        Vec::new()
+    }
+    fn annotation<'db>(
+        &self,
+        _db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        _owner: NodeIndex,
+    ) -> Option<ty_python_core::ProvidedAnnotation<'db>> {
+        None
+    }
+    fn binding<'db>(
+        &self,
+        _db: &'db TestDb,
+        _definition: ty_python_core::definition::Definition<'db>,
+    ) -> ProvidedBindingResolution<'db> {
+        ProvidedBindingValue::Unresolved.into()
+    }
+    fn builtin<'db>(
+        &self,
+        _db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        _name: &str,
+        _usage: BuiltinUsage,
+    ) -> Option<ProvidedBindingValue<'db>> {
+        None
+    }
+}
+
+#[test]
+fn supplied_allocation_uses_collection_and_constructor_inference() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_source_provider(AllocationSource)
+        .with_file(
+            "/src/leaf.pyi",
+            "from typing import final\n@final\nclass Exact[K, V](dict[K, V]): ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from leaf import Exact
+from typing import Callable, TypedDict
+
+literal: Exact[str, int] = {"x": 1}
+empty: Exact[str, int] = {}
+nested: Exact[str, Exact[str, int]] = {"x": {}}
+comp: Exact[str, int] = {key: 1 for key in ["x"]}
+specialized: Exact[str, int] = dict[str, int]()
+constructor: Callable[[dict[str, int]], Exact[str, int]] = dict
+constructor_specialized: Callable[[dict[str, int]], Exact[str, int]] = dict[str, int]
+alias = dict
+aliased: Exact[str, int] = alias(x=1)
+
+def consume(value: Exact[str, int]) -> None: ...
+def later() -> None:
+    value = {}
+    consume(value)
+
+def generic_empty[K, V]() -> dict[K, V]:
+    return {}
+
+def generic_mutation[K, V](key: K, value: V) -> tuple[dict[K, V], int]:
+    result = {}
+    for _ in range(1):
+        result[key] = value
+    return result, 0
+
+def callback() -> None: ...
+def later_update(enabled: bool) -> object:
+    result = {"callback": callback}
+    if enabled:
+        result.update(nullable=None)
+    return result
+
+def annotated_update() -> None:
+    result: Exact[str, int] = {"x": 1}
+    result.update(invalid=None)
+
+class Row(TypedDict):
+    x: int
+row: Row = {"x": 1}
+def erase(value: dict[str, int], schema: Row) -> None:
+    exact: Exact[str, int] = value
+    structural: Exact[str, int] = schema
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    db.select_function_inference(Some((
+        file,
+        vec!["generic_empty".into(), "generic_mutation".into()],
+        crate::FunctionInferenceMode::OutputProof,
+    )));
+    let diagnostics = crate::types::check_types(&db, db.program_file(file));
+    let ids: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.id().as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "invalid-argument-type",
+            "invalid-assignment",
+            "invalid-assignment"
+        ],
+        "{diagnostics:#?}"
+    );
+    let program = db.program_file(file);
+    let model = SemanticModel::new(&db, program);
+    let env = ProgramEnvironment::from_file(program);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let mut returned_types = Vec::new();
+    for statement in module.suite() {
+        let Some(function) = statement.as_function_def_stmt() else {
+            continue;
+        };
+        if !matches!(
+            function.name.as_str(),
+            "generic_empty" | "generic_mutation" | "later_update"
+        ) {
+            continue;
+        }
+        let returned = function.body.last().unwrap().as_return_stmt().unwrap();
+        let result = returned.value.as_ref().unwrap();
+        returned_types.push(
+            result
+                .inferred_type(&model)
+                .unwrap()
+                .display(&db, &env)
+                .to_string(),
+        );
+    }
+    assert_eq!(
+        returned_types,
+        [
+            "Exact[K@generic_empty, V@generic_empty]",
+            "tuple[Exact[K@generic_mutation, V@generic_mutation], Literal[0]]",
+            "Exact[str, None | (() -> None)]",
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_allocation_preserves_later_generic_context() -> anyhow::Result<()> {
+    for allocated in [false, true] {
+        for (value, corresponds) in [("'value'", true), ("object()", false), ("unknown", false)] {
+            let source = format!(
+                "from typing import Any\ndef make[K](key: K, unknown: Any) -> tuple[dict[K, str | int], int]:\n    result = {{}}\n    for _ in range(1):\n        result[key] = {value}\n    return result, 0\n"
+            );
+            let builder = TestDbBuilder::new()
+                .with_file(
+                    "/src/leaf.pyi",
+                    "from typing import final\n@final\nclass Exact[K,V](dict[K,V]): ...\n",
+                )
+                .with_file("/src/main.py", &source);
+            let builder = if allocated {
+                builder.with_source_provider(AllocationSource)
+            } else {
+                builder
+            };
+            let mut db = builder.build()?;
+            let file = system_path_to_file(&db, "/src/main.py")?;
+            db.select_function_inference(Some((
+                file,
+                vec!["make".into()],
+                crate::FunctionInferenceMode::OutputProof,
+            )));
+            let program = db.program_file(file);
+            let function = crate::place::global_symbol(&db, program, "make")
+                .place
+                .expect_type()
+                .as_function_literal()
+                .unwrap();
+            let facts = SemanticModel::new(&db, program)
+                .function_inference_facts(function.definition(&db))
+                .unwrap();
+            assert_eq!(
+                facts.return_type_correspondence == Some(true)
+                    && !facts.has_checking_failures
+                    && !facts.has_unproved_requirements,
+                corresponds,
+                "allocated={allocated}, value={value}, {facts:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_allocation_follows_program_and_declaration_edits() -> anyhow::Result<()> {
+    let leaf = "from typing import final\n@final\nclass Exact[K, V](dict[K, V]): ...\n";
+    let mut db = TestDbBuilder::new()
+        .with_source_provider(AllocationSource)
+        .with_file("/src/leaf.pyi", leaf)
+        .with_file("/src/main.py", "value = {'x': 1}\n")
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (declaration, expected) in [
+        (leaf, "Exact[str, int]"),
+        (
+            "from typing import final\n@final\nclass Exact[K, V](dict[V, K]): ...\n",
+            "dict[str, int]",
+        ),
+        (leaf, "Exact[str, int]"),
+    ] {
+        db.write_file("/src/leaf.pyi", declaration)?;
+        let program = db.program_file(file).program(&db);
+        let unallocated = crate::Program::with_semantic_namespace(
+            &db,
+            program.python_platform(&db),
+            program.resolver_environment(&db),
+            &Name::new_static("unallocated"),
+        );
+        for (program, expected) in [(program, expected), (unallocated, "dict[str, int]")] {
+            let source = ProgramFile::new(&db, file, program);
+            let env = ProgramEnvironment::from_file(source);
+            let actual = crate::place::global_symbol(&db, source, "value")
+                .place
+                .expect_type();
+            assert_eq!(actual.display(&db, &env).to_string(), expected);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_allocation_requires_unchanged_builtin_parameters() -> anyhow::Result<()> {
+    for declaration in [
+        "from typing import final, TypeVar\nK = TypeVar('K', covariant=True)\nV = TypeVar('V')\n@final\nclass Exact(dict[K,V]): ...\n",
+        "from typing import final\n@final\nclass Exact[K, V](dict[V,K]): ...\n",
+        "from typing import final\n@final\nclass Exact[K: str, V](dict[K,V]): ...\n",
+        "from typing import final\n@final\nclass Exact[K, V = int](dict[K,V]): ...\n",
+        "from typing import final\nfrom dataclasses import dataclass\n@final\n@dataclass\nclass Exact[K, V](dict[K,V]): ...\n",
+        "from typing import final\n@final\nclass Exact[K, V](dict[K,V]):\n    def clear(self) -> int: ...\n",
+    ] {
+        let db = TestDbBuilder::new()
+            .with_source_provider(AllocationSource)
+            .with_file("/src/leaf.pyi", declaration)
+            .build()?;
+        assert!(
+            KnownClass::Dict
+                .provided_allocation_class(&db, &db.program_environment())
+                .is_none(),
+            "{declaration}"
+        );
+    }
+    Ok(())
+}
 
 crate::declare_lint! {
     /// An obligation supplied by an application after checking a call.

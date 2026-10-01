@@ -294,7 +294,7 @@ pub(super) fn refine_dict_snapshot_element_type<'db>(
     let Type::NominalInstance(instance) = receiver_type else {
         return None;
     };
-    if !instance.has_known_class(db, KnownClass::Dict) {
+    if !super::dictionary::has_dict_type(db, env, Type::NominalInstance(instance)) {
         return None;
     }
     let Type::BoundMethod(method) = expression_type(func)? else {

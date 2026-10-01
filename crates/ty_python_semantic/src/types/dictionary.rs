@@ -18,10 +18,17 @@ pub(crate) mod contents;
 pub(crate) mod records;
 
 /// The nominal type is `dict`; runtime subclasses can still override its operations.
-fn has_dict_type(db: &dyn Db, ty: Type<'_>) -> bool {
+pub(crate) fn has_dict_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
     let is_instance = |ty: Type<'_>| {
-        ty.as_nominal_instance()
-            .is_some_and(|instance| instance.has_known_class(db, KnownClass::Dict))
+        ty.as_nominal_instance().is_some_and(|instance| {
+            instance.has_known_class(db, KnownClass::Dict)
+                || KnownClass::Dict.allocation_class(db, env)
+                    == Some(instance.class_literal(db, env))
+        })
     };
     match ty {
         Type::Union(union) => union.elements(db).iter().copied().all(is_instance),
@@ -38,7 +45,7 @@ fn observed_item_type<'db>(
     receiver_type: Type<'db>,
     reachability: &ReachabilityEvaluationCache<'db>,
 ) -> Option<(Type<'db>, DictionaryItemKind)> {
-    if !has_dict_type(db, receiver_type) {
+    if !has_dict_type(db, &ProgramEnvironment::from_scope(scope), receiver_type) {
         return None;
     }
     let key = subscript.slice.as_string_literal_expr()?.value.to_str();

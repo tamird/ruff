@@ -8171,7 +8171,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Extract the type variable `T` from `list[T]` in typeshed.
         let elt_tys = |collection_class: KnownClass| {
             let collection_alias = collection_class
-                .try_to_class_literal(db, env)?
+                .allocation_class(db, env)?
                 .identity_specialization(db)
                 .into_generic_alias()?;
 
@@ -8231,17 +8231,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 if let Some(tcx) = annotation.map(|tcx| tcx.resolve_type_alias(db))
                     && matches!(tcx, Type::NominalInstance(_))
-                    && let Some(specialization) =
-                        tcx.known_specialization(db, env, collection_class)
-                    && specialization.generic_context(db) == generic_context
+                    && let Some(specialization) = tcx
+                        .known_specialization(db, env, collection_class)
+                        .or_else(|| tcx.specialization_of(db, env, collection_alias.origin(db)))
                     && generic_context.variables(db).all(|typevar| {
                         !typevar.is_paramspec(db)
                             && typevar.typevar(db).bound_or_constraints(db, env).is_none()
                     })
                 {
-                    // For an instance of the collection class itself, the identity specialization
-                    // maps directly to the contextual specialization. Avoid constructing and solving
-                    // a general assignability constraint set for this common case.
+                    // The builtin and its checked allocation class have corresponding generic
+                    // slots. Project either direct specialization without losing caller typevars
+                    // from an empty literal's context.
                     for (typevar, inferred_ty) in
                         generic_context.variables(db).zip(specialization.types(db))
                     {
@@ -8509,7 +8509,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             continue;
                         }
 
-                        builder.infer(identity_instance, *constraint).ok()?;
+                        let inference_instance = if *kind == CollectionUseConstraintKind::Context
+                            && collection_alias.origin(db).known(db) != Some(collection_class)
+                            && constraint
+                                .known_specialization(db, env, collection_class)
+                                .is_some()
+                        {
+                            // A builtin context describes the same slots even when allocation
+                            // uses a nominal leaf. Infer those slots through their shared base.
+                            collection_class.to_specialized_instance(
+                                db,
+                                env,
+                                elt_tys.clone().map(Type::TypeVar).collect_vec(),
+                            )
+                        } else {
+                            identity_instance
+                        };
+                        builder.infer(inference_instance, *constraint).ok()?;
                         if *kind == CollectionUseConstraintKind::Context {
                             let (contexts, variances) =
                                 project_element_context(Some(*constraint), &builder);

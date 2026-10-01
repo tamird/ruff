@@ -8179,6 +8179,14 @@ impl<'db> Type<'db> {
             })
         }
 
+        if matches!(self, Type::ClassLiteral(_) | Type::GenericAlias(_))
+            && let Some(allocation) = class.provided_allocation(db, env)
+        {
+            return Type::from(allocation)
+                .constructor_bindings(db, env, allocation, recursion_guard)
+                .with_callable_type(self);
+        }
+
         let class_literal = class.class_literal(db);
         let class_generic_context = class_literal.generic_context(db);
         let inferable_class_context = if matches!(self, Type::ClassLiteral(_)) {

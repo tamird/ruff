@@ -92,6 +92,23 @@ pub trait Db: PythonCoreDb {
         None
     }
 
+    /// Selects a nominal allocation class for builtin collection construction.
+    ///
+    /// The declaration must be an empty final subclass whose sole base specializes the
+    /// builtin with the same unconstrained type parameters. The application guarantees
+    /// that construction produces this runtime subset and preserves the builtin's operations.
+    /// Annotations and structural dictionary schemas continue to denote the builtin class.
+    /// Implementations must select the association from tracked inputs of the requesting program.
+    /// The declaration may belong to a shared support program; its builtin base must have the same
+    /// identity as the builtin resolved in the requesting program.
+    fn provided_allocation_class<'db>(
+        &'db self,
+        _program: crate::Program<'db>,
+        _class: crate::types::KnownClass,
+    ) -> Option<ProvidedBindingValue<'db>> {
+        None
+    }
+
     /// Supplies the initial body type of an unannotated ordinary parameter.
     ///
     /// This does not change the function's public signature or declare a type for later
@@ -236,6 +253,15 @@ pub(crate) mod tests {
     use ty_site_packages::{PythonVersionSource, PythonVersionWithSource};
 
     pub(crate) trait SourceProvider: Send + Sync {
+        fn allocation_class<'db>(
+            &self,
+            _db: &'db TestDb,
+            _program: crate::Program<'db>,
+            _class: crate::types::KnownClass,
+        ) -> Option<ProvidedBindingValue<'db>> {
+            None
+        }
+
         fn exclusions(
             &self,
             _db: &TestDb,
@@ -461,6 +487,16 @@ pub(crate) mod tests {
 
     #[salsa::db]
     impl Db for TestDb {
+        fn provided_allocation_class<'db>(
+            &'db self,
+            program: crate::Program<'db>,
+            class: crate::types::KnownClass,
+        ) -> Option<ProvidedBindingValue<'db>> {
+            self.source_provider
+                .as_ref()
+                .and_then(|provider| provider.allocation_class(self, program, class))
+        }
+
         fn function_inference_mode(
             &self,
             scope: ty_python_core::scope::ScopeId<'_>,

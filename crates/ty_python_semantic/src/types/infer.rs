@@ -1662,7 +1662,7 @@ impl<'db> DefinitionInference<'db> {
             };
 
             if let Some(known_collection) = known_collection {
-                if let Some(collection_class) = known_collection.try_to_class_literal(db, &env) {
+                if let Some(collection_class) = known_collection.allocation_class(db, &env) {
                     let divergent_collection = collection_class
                         .apply_specialization(db, |generic_context| {
                             generic_context.repeat_specialization(db, cycle_recovery)

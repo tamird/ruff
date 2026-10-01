@@ -456,7 +456,7 @@ pub(crate) fn item_type<'db>(
     receiver_type: Type<'db>,
     reachability: &crate::reachability::ReachabilityEvaluationCache<'db>,
 ) -> Option<Type<'db>> {
-    if !super::has_dict_type(db, receiver_type) {
+    if !super::has_dict_type(db, &ProgramEnvironment::from_scope(scope), receiver_type) {
         return None;
     }
     subscript.slice.as_string_literal_expr()?;
