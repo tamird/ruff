@@ -704,10 +704,8 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 let new_locals = this
                     .validation_support
                     .as_ref()
-                    .map(|validated| &locals - validated);
-                let validations = new_locals
-                    .as_ref()
-                    .map(|locals| Validations::from_support(db, env, storage, locals));
+                    .map_or_else(|| locals.clone(), |validated| &locals - validated);
+                let validations = Validations::from_support(db, env, storage, &new_locals);
                 let previous = this.positive_locals.clone();
                 this.positive_locals |= &locals;
                 let result = this.visit_node_and_then(
@@ -725,7 +723,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                             env,
                             storage,
                             path,
-                            validations.as_ref(),
+                            Some(&validations),
                             process_satisfied,
                         )
                     },
@@ -766,7 +764,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             &|this, storage, path| {
                 // Note that we never negate existential's body, even when we are walking the
                 // negation of the existential _node_.
-                let validations = this.validation_support.as_ref().map(|_| {
+                let validations = {
                     let Constraint::Existential(existential) =
                         storage.constraint_data(interior.constraint)
                     else {
@@ -774,7 +772,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     };
                     let locals = existential.locals.clone();
                     Validations::from_support(db, env, storage, &locals)
-                });
+                };
                 let has_any_solutions = this
                     .node_is_satisfiable_on_path(
                         db,
@@ -783,7 +781,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                         path,
                         Polarity::Positive,
                         existential_body,
-                        validations.as_ref(),
+                        Some(&validations),
                     )
                     .map_break(Break::Limits)?;
                 if has_any_solutions {

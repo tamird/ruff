@@ -551,8 +551,9 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
         debug_assert!(std::ptr::eq(self.builder, builder));
     }
 
-    /// Returns whether this constraint set never holds, without checking the type variables'
-    /// declared bounds or constraints. Use [`Self::has_no_valid_solutions`] to include those.
+    /// Returns whether this constraint set never holds, ignoring free type variables'
+    /// declared bounds or constraints. Quantified witnesses satisfy their declared domains.
+    /// Use [`Self::has_no_valid_solutions`] to include free variables' declarations.
     pub(crate) fn is_never_satisfied(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
         let mut storage = self.builder.storage.borrow_mut();
         self.node
@@ -5546,6 +5547,59 @@ mod tests {
             }
             (Some(lower), Some(upper)) => {
                 ConstraintSet::constrain_typevar(db, env, builder, typevar, lower, upper)
+            }
+        }
+    }
+
+    #[test]
+    fn existential_queries_validate_bound_domains() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let string = KnownClass::Str.to_instance(db, &env);
+        let bytes = KnownClass::Bytes.to_instance(db, &env);
+        let outer = create_typevar(db, "Outer")
+            .map_bound_or_constraints(db, |_| Some(TypeVarBoundOrConstraints::UpperBound(integer)));
+        for (domain, allowed) in [
+            (
+                TypeVarBoundOrConstraints::UpperBound(integer),
+                vec![integer],
+            ),
+            (
+                TypeVarBoundOrConstraints::Constraints(TypeVarConstraints::new(
+                    db,
+                    [integer, string].as_slice(),
+                )),
+                vec![integer, string],
+            ),
+        ] {
+            let local = create_typevar(db, "Local").map_bound_or_constraints(db, |_| Some(domain));
+            for witness in [integer, string, bytes] {
+                let builder = ConstraintSetBuilder::new();
+                let body = ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &builder, local, witness,
+                );
+                // Free declarations are intentionally ignored by this query.
+                assert!(!body.is_never_satisfied(db, &env));
+                let scoped = body.reduce_inferable(
+                    db,
+                    &env,
+                    &builder,
+                    TypeVarSet::from_typevars(db, [local]),
+                );
+                let expected = allowed.contains(&witness);
+                assert_eq!(scoped.is_always_satisfied(db, &env), expected);
+                assert_eq!(scoped.is_never_satisfied(db, &env), !expected);
+                assert_eq!(
+                    scoped.negate(db, &builder).is_always_satisfied(db, &env),
+                    !expected
+                );
+                let nested = create_constraint(db, &builder, outer, KnownClass::Int)
+                    .and(db, &builder, || scoped)
+                    .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [outer]));
+                assert_eq!(nested.is_always_satisfied(db, &env), expected);
+                assert_eq!(nested.is_never_satisfied(db, &env), !expected);
             }
         }
     }
