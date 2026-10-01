@@ -1407,17 +1407,14 @@ impl ExistentialBound {
             Some(storage.intern_typevar(db, mapped))
         }));
 
-        let Some(existential) = ExistentialBound::new(
-            &storage,
+        storage.quantify(
+            db,
+            env,
             self.provenance,
-            locals,
+            &locals,
             body.node,
             body.source_order,
-        ) else {
-            return (body.node, body.source_order);
-        };
-        let mapped = Constraint::Existential(existential);
-        mapped.new_node(db, env, &mut storage)
+        )
     }
 
     fn display<'a, 'db>(

@@ -112,11 +112,11 @@ impl OwnedConstraintSetBuilder {
                     }
                 }
             }
-            SourceOrder::AtomicConstraint(constraint) => {
+            SourceOrder::Constraint(constraint) => {
                 // If a constraint is not used anywhere in the BDD, and doesn't mention any
                 // typevars that are used in the BDD, we don't have to include it in the compacted
                 // source_order list.
-                let constraint_support_id = storage.constraint_support_id(constraint.into_inner());
+                let constraint_support_id = storage.constraint_support_id(constraint);
                 let constraint_support = storage.support_data(constraint_support_id);
                 if !self.used_constraints[constraint.index()]
                     && let Some(live_support) = self.live_support.as_ref()
@@ -127,11 +127,9 @@ impl OwnedConstraintSetBuilder {
                     return None;
                 }
 
-                self.mark_constraint_used(storage, constraint.into_inner());
+                self.mark_constraint_used(storage, constraint);
                 self.mark_support_used(storage, constraint_support_id);
-                let mapped = self
-                    .source_orders
-                    .push(SourceOrder::AtomicConstraint(constraint));
+                let mapped = self.source_orders.push(SourceOrder::Constraint(constraint));
                 Some(mapped)
             }
         }

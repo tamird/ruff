@@ -1526,8 +1526,14 @@ impl<'db> BoundTypeVarInstance<'db> {
             TypeMapping::FreshenBoundTypeVars {
                 generic_context,
                 delta,
+                include_paramspec,
             } => {
-                if generic_context.contains(db, self.identity(db)) && !self.is_paramspec(db) {
+                let included = if *include_paramspec {
+                    generic_context.contains_exact(db, self.identity(db))
+                } else {
+                    generic_context.contains(db, self.identity(db)) && !self.is_paramspec(db)
+                };
+                if included {
                     let freshened = self.freshen_with_mapping(
                         db,
                         self.freshness(db).add(*delta),
@@ -2575,6 +2581,7 @@ mod tests {
         let mapping = TypeMapping::FreshenBoundTypeVars {
             generic_context: u_context,
             delta: 1,
+            include_paramspec: false,
         };
         let visitor = ApplyTypeMappingVisitor::new(&env);
         let fresh_u = u
@@ -2595,6 +2602,7 @@ mod tests {
         let both_mapping = TypeMapping::FreshenBoundTypeVars {
             generic_context: both_context,
             delta: 1,
+            include_paramspec: false,
         };
         let fresh_t = t
             .apply_type_mapping_impl(db, &both_mapping, &ApplyTypeMappingVisitor::new(&env))
@@ -2611,6 +2619,7 @@ mod tests {
         let next_mapping = TypeMapping::FreshenBoundTypeVars {
             generic_context: both_context,
             delta: max_freshness.map_or(1, |nonce| nonce.increment().value()),
+            include_paramspec: false,
         };
         let next_t = t
             .apply_type_mapping_impl(db, &next_mapping, &ApplyTypeMappingVisitor::new(&env))
@@ -2625,6 +2634,7 @@ mod tests {
                 &TypeMapping::FreshenBoundTypeVars {
                     generic_context: mapped_t_context,
                     delta: 1,
+                    include_paramspec: false,
                 },
                 &ApplyTypeMappingVisitor::new(&env),
             )
@@ -2648,6 +2658,7 @@ mod tests {
         let mapping = TypeMapping::FreshenBoundTypeVars {
             generic_context: context,
             delta: 1,
+            include_paramspec: false,
         };
         for domain in [
             TypeVarBoundOrConstraintsEvaluation::LazyUpperBound,
@@ -2956,6 +2967,7 @@ mod tests {
         let freshen_mapping = TypeMapping::FreshenBoundTypeVars {
             generic_context: context,
             delta: 1,
+            include_paramspec: false,
         };
         let visitor = ApplyTypeMappingVisitor::new(&env);
         let fresh_t = t
@@ -2975,6 +2987,7 @@ mod tests {
         let projected_freshen = TypeMapping::FreshenBoundTypeVars {
             generic_context: projected_context,
             delta: 1,
+            include_paramspec: false,
         };
         let fresh_projected = projected
             .apply_type_mapping_impl(db, &projected_freshen, &visitor)

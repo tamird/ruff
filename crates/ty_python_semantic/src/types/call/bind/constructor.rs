@@ -142,6 +142,7 @@ impl<'db> ConstructorBinding<'db> {
         let type_mapping = TypeMapping::FreshenBoundTypeVars {
             generic_context,
             delta,
+            include_paramspec: false,
         };
         let fresh_instance_type =
             instance_type.apply_type_mapping(db, env, &type_mapping, TypeContext::default());
@@ -162,6 +163,7 @@ impl<'db> ConstructorBinding<'db> {
         let type_mapping = TypeMapping::FreshenBoundTypeVars {
             generic_context,
             delta,
+            include_paramspec: false,
         };
 
         // Keep the source-level instance on `ConstructorBinding`; the final return type applies
@@ -193,6 +195,7 @@ impl<'db> ConstructorBinding<'db> {
                 &TypeMapping::FreshenBoundTypeVars {
                     generic_context: signature_context,
                     delta,
+                    include_paramspec: false,
                 },
                 TypeContext::default(),
                 &ApplyTypeMappingVisitor::new(env),

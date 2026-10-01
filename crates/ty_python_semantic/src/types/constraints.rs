@@ -110,8 +110,10 @@ use crate::types::constraints::projection::ProjectionError;
 #[cfg(test)]
 use crate::types::constraints::projection::SolutionBudget;
 use crate::types::constraints::support::{Support, SupportId};
+use crate::types::generics::GenericContext;
 use crate::types::typevar::{
-    BoundTypeVarIdentity, TypeVarConstraints, TypeVarInstance, TypeVarSet,
+    BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarConstraints, TypeVarInstance, TypeVarNonce,
+    TypeVarSet,
 };
 use crate::types::visitor::{
     NonAtomicType, TypeCollector, TypeKind, TypeVisitor, any_over_type_expanding_aliases,
@@ -771,18 +773,23 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
             return self;
         }
         let mut storage = builder.storage.borrow_mut();
-        let to_remove = Support::from_typevar_set(db, &mut storage, to_remove);
-        let Some(existential) = ExistentialBound::new(
-            &storage,
+        let mut locals = Support::from_typevar_set(db, &mut storage, to_remove);
+        for typevar in to_remove.iter(db) {
+            if typevar.is_paramspec(db) && typevar.paramspec_attr(db).is_none() {
+                for attr in [ParamSpecAttrKind::Args, ParamSpecAttrKind::Kwargs] {
+                    locals
+                        .insert(storage.intern_typevar(db, typevar.with_paramspec_attr(db, attr)));
+                }
+            }
+        }
+        let (node, source_order) = storage.quantify(
+            db,
+            env,
             ConstraintProvenance::Evidence,
-            to_remove,
+            &locals,
             self.node,
             self.source_order,
-        ) else {
-            return self;
-        };
-        let existential = Constraint::Existential(existential);
-        let (node, source_order) = existential.new_node(db, env, &mut storage);
+        );
         Self::from_node(builder, node, source_order)
     }
 
@@ -870,27 +877,10 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
             mapped
         }
 
-        // We have to collect this into a temporary vec since we can't hold an open borrow on the
-        // storage during the apply_type_mapping calls below, since they also need to borrow the
-        // storage.
-        let storage = self.builder.storage.borrow();
-        let mut constraints = SmallVec::<[_; 8]>::new();
-        self.node
-            .for_each_unique_constraint(&storage, &mut |constraint_id| {
-                constraints.push(constraint_id);
-            });
-        // Mapping can intern constraints and typevars. Preserve their source order rather than
-        // letting the old diagram's variable order determine the rebuilt diagram's ordering.
-        let source_orders = storage.calculate_source_orders(self.source_order);
-        constraints.sort_unstable_by_key(|constraint| {
-            constraint
-                .as_atomic(&storage)
-                .and_then(|constraint| source_orders.get_index_of(&constraint))
-        });
-        drop(storage);
+        let constraints = self.ordered_constraints();
 
         let mut mapped_constraints = FxHashMap::default();
-        for constraint_id in constraints {
+        for constraint_id in constraints.iter().copied() {
             if mapped_constraints.contains_key(&constraint_id) {
                 continue;
             }
@@ -903,10 +893,10 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
         }
 
         let mut storage = self.builder.storage.borrow_mut();
-        let source_order = source_orders
+        let source_order = constraints
             .into_iter()
             .fold(None, |source_order, constraint| {
-                mapped_constraints.get(&constraint.into_inner()).map_or(
+                mapped_constraints.get(&constraint).map_or(
                     source_order,
                     |(_, mapped_source_order)| {
                         storage.ordered_source_order(source_order, *mapped_source_order)
@@ -923,6 +913,30 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
             ),
             source_order,
         )
+    }
+
+    /// Orders the immediate constraints without flattening quantified scopes.
+    fn ordered_constraints(self) -> SmallVec<[ConstraintId; 8]> {
+        let storage = self.builder.storage.borrow();
+        let mut pending = Vec::from_iter(self.source_order);
+        let mut visited = FxHashSet::default();
+        let mut source_orders = FxIndexSet::default();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            match storage.source_order_data(current) {
+                SourceOrder::Ordered(left, right) => pending.extend([right, left]),
+                SourceOrder::Constraint(constraint) => {
+                    source_orders.insert(constraint);
+                }
+            }
+        }
+        let mut constraints = SmallVec::new();
+        self.node
+            .for_each_unique_constraint(&storage, &mut |constraint| constraints.push(constraint));
+        constraints.sort_by_key(|constraint| source_orders.get_index_of(constraint));
+        constraints
     }
 
     /// Universally abstracts constraints involving the given type variables from this TDD.
@@ -1063,6 +1077,8 @@ struct ConstraintSetStorage<'db> {
     // Everything below are the memoization tables for the arenas and for our BDD operations.
     constraint_cache: FxHashMap<Constraint<'db>, ConstraintId>,
     typevar_cache: FxHashMap<BoundTypeVarIdentity<'db>, TypeVarId>,
+    /// Highest occurrence nonce in the local and overlaid typevar tables.
+    max_typevar_freshness: TypeVarNonce,
     node_cache: FxHashMap<InteriorNodeData, NodeId>,
     /// Avoid repeatedly walking deep constraint bounds without imposing Salsa-query overhead on
     /// the many shallow bounds that are cheap to walk once.
@@ -1123,6 +1139,12 @@ impl<'db> ConstraintSetStorage<'db> {
             return;
         }
 
+        self.max_typevar_freshness = compacted
+            .typevars
+            .iter()
+            .map(|typevar| typevar.freshness(db))
+            .max()
+            .unwrap_or_default();
         self.typevar_cache.extend(
             compacted
                 .typevars
@@ -1224,6 +1246,83 @@ impl<'db> ConstraintSetBuilder<'db> {
 }
 
 impl<'db> ConstraintSetStorage<'db> {
+    /// Gives one quantified body private occurrences of its bound variables.
+    ///
+    /// New scopes, colliding imports, and independently mapped copies pass through this
+    /// boundary. Free variables keep their identities so the containing relation can constrain
+    /// them while separate quantifiers choose independent witnesses.
+    fn quantify(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        provenance: ConstraintProvenance,
+        locals: &Support,
+        body: NodeId,
+        source_order: Option<SourceOrderId>,
+    ) -> (NodeId, Option<SourceOrderId>) {
+        if self
+            .node_support(body)
+            .is_none_or(|body_support| !locals.overlaps_with(body_support))
+        {
+            return (body, source_order);
+        }
+
+        let context = GenericContext::from_typevar_instances(
+            db,
+            env,
+            locals.iter().map(|local| self.typevar_data(local)),
+        );
+        self.ensure_overlay_typevar_identity_cache(db);
+        let minimum = context
+            .variables(db)
+            .map(|typevar| typevar.freshness(db))
+            .min()
+            .expect("a quantified scope must have local typevars");
+        let delta = self.max_typevar_freshness.increment().value() - minimum.value();
+        let mapping = TypeMapping::FreshenBoundTypeVars {
+            generic_context: context,
+            delta,
+            include_paramspec: true,
+        };
+        let fresh_locals: SmallVec<[_; 4]> = locals
+            .iter()
+            .map(|local| {
+                Type::TypeVar(self.typevar_data(local))
+                    .apply_type_mapping(db, env, &mapping, TypeContext::default())
+                    .as_typevar()
+                    .expect("freshening preserves type variables")
+            })
+            .collect();
+        let locals = Support::from_typevars(
+            fresh_locals
+                .into_iter()
+                .map(|local| self.intern_typevar(db, local)),
+        );
+
+        // Type mappings use a builder to rebuild related constraints. Move this storage into
+        // that existing interface, retaining its arenas and memoization tables, and restore it
+        // before exposing any rebuilt IDs.
+        let builder = ConstraintSetBuilder {
+            storage: RefCell::new(std::mem::take(self)),
+        };
+        let mapped = ConstraintSet::from_node(&builder, body, source_order)
+            .apply_type_mapping_impl(
+                db,
+                &mapping,
+                TypeContext::default(),
+                &ApplyTypeMappingVisitor::new(env),
+            );
+        let body = mapped.node;
+        let source_order = mapped.source_order;
+        *self = builder.storage.into_inner();
+
+        let Some(existential) = ExistentialBound::new(self, provenance, locals, body, source_order)
+        else {
+            return (body, source_order);
+        };
+        Constraint::Existential(existential).new_node(db, env, self)
+    }
+
     /// Interns a single typevar, giving it a stable order in this builder
     fn intern_typevar(&mut self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarId {
         self.ensure_overlay_identity_caches();
@@ -1232,6 +1331,7 @@ impl<'db> ConstraintSetStorage<'db> {
         if let Some(id) = self.typevar_cache.get(&identity) {
             return *id;
         }
+        self.max_typevar_freshness = self.max_typevar_freshness.max(typevar.freshness(db));
         let id = self.typevars.push(typevar);
         let id = self.adjusted_typevar_id(id);
         self.typevar_cache.insert(identity, id);
@@ -1474,18 +1574,12 @@ impl<'db> ConstraintSetStorage<'db> {
         }
     }
 
-    fn constraint_source_order(&mut self, constraint: ConstraintId) -> Option<SourceOrderId> {
-        let constraint_data = self.constraint_data(constraint);
-        match constraint_data {
-            Constraint::Atomic(_) => Some(self.intern_source_order(SourceOrder::AtomicConstraint(
-                AtomicConstraintId(constraint),
-            ))),
-            Constraint::Existential(existential) => existential.source_order,
-        }
+    fn constraint_source_order(&mut self, constraint: ConstraintId) -> SourceOrderId {
+        self.intern_source_order(SourceOrder::Constraint(constraint))
     }
 
     fn atomic_constraint_source_order(&mut self, constraint: AtomicConstraintId) -> SourceOrderId {
-        self.intern_source_order(SourceOrder::AtomicConstraint(constraint))
+        self.intern_source_order(SourceOrder::Constraint(constraint.into_inner()))
     }
 
     fn source_order_data(&self, source_order: SourceOrderId) -> SourceOrder {
@@ -1517,9 +1611,14 @@ impl<'db> ConstraintSetStorage<'db> {
                 SourceOrder::Ordered(left, right) => {
                     pending.extend([right, left]);
                 }
-                SourceOrder::AtomicConstraint(constraint) => {
-                    result.insert(constraint);
-                }
+                SourceOrder::Constraint(constraint) => match self.constraint_data(constraint) {
+                    Constraint::Atomic(_) => {
+                        result.insert(AtomicConstraintId(constraint));
+                    }
+                    Constraint::Existential(existential) => {
+                        pending.extend(existential.source_order);
+                    }
+                },
             }
         }
         result
@@ -1611,103 +1710,118 @@ impl<'db> ConstraintSetStorage<'db> {
         env: &ProgramEnvironment<'db>,
         other: &OwnedConstraintSet<'db>,
     ) -> (NodeId, Option<SourceOrderId>) {
-        type RemappedConstraint = Cell<Option<(NodeId, Option<SourceOrderId>)>>;
+        type RemappedConstraint = Option<(NodeId, Option<SourceOrderId>)>;
 
-        #[expect(clippy::too_many_arguments)]
-        fn rebuild_node<'db>(
+        #[derive(Clone, Copy)]
+        enum SourceOrderMapping {
+            Pending,
+            Mapped(Option<SourceOrderId>),
+        }
+
+        struct Loader<'a, 'db> {
             db: &'db dyn Db,
-            env: &ProgramEnvironment<'db>,
-            storage: &mut ConstraintSetStorage<'db>,
-            inner: &OwnedConstraintSetInner<'db>,
-            constraints: &[RemappedConstraint],
-            source_orders: &[Option<SourceOrderId>],
-            cache: &mut FxHashMap<NodeId, NodeId>,
-            old_node: NodeId,
-        ) -> NodeId {
-            if old_node.is_terminal() {
-                return old_node;
-            }
-            if let Some(remapped) = cache.get(&old_node) {
-                return *remapped;
+            env: &'a ProgramEnvironment<'db>,
+            storage: &'a mut ConstraintSetStorage<'db>,
+            inner: &'a OwnedConstraintSetInner<'db>,
+            constraints: Box<[RemappedConstraint]>,
+            source_orders: Vec<SourceOrderMapping>,
+            nodes: FxHashMap<NodeId, NodeId>,
+            preexisting_typevars: usize,
+        }
+
+        impl Loader<'_, '_> {
+            fn node(&mut self, old_node: NodeId) -> NodeId {
+                if old_node.is_terminal() {
+                    return old_node;
+                }
+                if let Some(remapped) = self.nodes.get(&old_node) {
+                    return *remapped;
+                }
+                let old_index = self.inner.retained_node_index(old_node);
+                let old = self.inner.nodes[old_index];
+                let if_true = self.node(old.if_true);
+                let if_uncertain = self.node(old.if_uncertain);
+                let if_false = self.node(old.if_false);
+                let (condition, _) = self.constraint(old.constraint);
+                let remapped =
+                    condition.ite_uncertain(self.storage, if_true, if_uncertain, if_false);
+                self.nodes.insert(old_node, remapped);
+                remapped
             }
 
-            let old_node_index = inner.retained_node_index(old_node);
-            let old_interior = inner.nodes[old_node_index];
-            let if_true = rebuild_node(
-                db,
-                env,
-                storage,
-                inner,
-                constraints,
-                source_orders,
-                cache,
-                old_interior.if_true,
-            );
-            let if_uncertain = rebuild_node(
-                db,
-                env,
-                storage,
-                inner,
-                constraints,
-                source_orders,
-                cache,
-                old_interior.if_uncertain,
-            );
-            let if_false = rebuild_node(
-                db,
-                env,
-                storage,
-                inner,
-                constraints,
-                source_orders,
-                cache,
-                old_interior.if_false,
-            );
-            let old_constraint_index = inner.retained_constraint_index(old_interior.constraint);
-            constraints[old_constraint_index].update(|mut constraint| {
-                constraint.get_or_insert_with(|| match &inner.constraints[old_constraint_index] {
+            fn constraint(&mut self, old: ConstraintId) -> (NodeId, Option<SourceOrderId>) {
+                let index = self.inner.retained_constraint_index(old);
+                if let Some(remapped) = self.constraints[index] {
+                    return remapped;
+                }
+                let remapped = match &self.inner.constraints[index] {
                     Constraint::Existential(existential) => {
-                        let body = rebuild_node(
-                            db,
-                            env,
-                            storage,
-                            inner,
-                            constraints,
-                            source_orders,
-                            cache,
-                            existential.body,
-                        );
-                        let source_order = existential
-                            .source_order
-                            .and_then(|old_source_order| source_orders[old_source_order.index()]);
-                        let locals =
-                            Support::from_typevars(existential.locals.iter().map(|typevar| {
-                                storage.intern_typevar(db, inner.typevars[typevar])
-                            }));
-                        let Some(existential) = ExistentialBound::new(
-                            storage,
-                            existential.provenance,
+                        // The constructor marker is private to the constraint owner.
+                        let ExistentialBound {
+                            provenance,
                             locals,
                             body,
                             source_order,
-                        ) else {
-                            return (body, source_order);
-                        };
-                        Constraint::Existential(existential).new_node(db, env, storage)
+                            ..
+                        } = existential.clone();
+                        let body = self.node(body);
+                        let source_order = source_order.and_then(|order| self.source_order(order));
+                        let locals = Support::from_typevars(locals.iter().map(|typevar| {
+                            self.storage
+                                .intern_typevar(self.db, self.inner.typevars[typevar])
+                        }));
+                        if locals
+                            .iter()
+                            .any(|local| local.index() < self.preexisting_typevars)
+                        {
+                            self.storage.quantify(
+                                self.db,
+                                self.env,
+                                provenance,
+                                &locals,
+                                body,
+                                source_order,
+                            )
+                        } else {
+                            let Some(existential) = ExistentialBound::new(
+                                self.storage,
+                                provenance,
+                                locals,
+                                body,
+                                source_order,
+                            ) else {
+                                return (body, source_order);
+                            };
+                            Constraint::Existential(existential).new_node(
+                                self.db,
+                                self.env,
+                                self.storage,
+                            )
+                        }
                     }
                     Constraint::Atomic(_) => {
                         panic!("atomic constraints should have already been rebuilt")
                     }
-                });
-                constraint
-            });
-            let (condition, _) = constraints[old_constraint_index]
-                .get()
-                .expect("constraint should have been rebuilt");
-            let remapped = condition.ite_uncertain(storage, if_true, if_uncertain, if_false);
+                };
+                self.constraints[index] = Some(remapped);
+                remapped
+            }
 
-            cache.insert(old_node, remapped);
-            remapped
+            fn source_order(&mut self, old: SourceOrderId) -> Option<SourceOrderId> {
+                if let SourceOrderMapping::Mapped(remapped) = self.source_orders[old.index()] {
+                    return remapped;
+                }
+                let remapped = match self.inner.source_orders[old.index()] {
+                    SourceOrder::Ordered(left, right) => {
+                        let left = self.source_order(left);
+                        let right = self.source_order(right);
+                        self.storage.ordered_source_order(left, right)
+                    }
+                    SourceOrder::Constraint(constraint) => self.constraint(constraint).1,
+                };
+                self.source_orders[old.index()] = SourceOrderMapping::Mapped(remapped);
+                remapped
+            }
         }
 
         if other.node.is_terminal() {
@@ -1717,6 +1831,14 @@ impl<'db> ConstraintSetStorage<'db> {
             .inner
             .as_ref()
             .expect("storage-free owned constraint sets must have terminal roots");
+
+        // Imported binders already have distinct names. Preserve them when they do not
+        // collide with the destination, so repeated owned round trips retain stable identities.
+        let preexisting_typevars = self.typevars.len()
+            + self
+                .compacted
+                .as_ref()
+                .map_or(0, |inner| inner.typevars.len());
 
         // Restore the saved order of referenced typevars before rebuilding constraints. A stored
         // `T <= U` can have `U` as its subject and `T` as its lower bound. Interning that subject
@@ -1733,52 +1855,28 @@ impl<'db> ConstraintSetStorage<'db> {
 
         // Rebuild atomic constraints in their saved order, using the destination's typevar
         // ordering. Existential constraints are rebuilt lazily after their bodies.
-        let constraints: Box<[RemappedConstraint]> = inner
+        let constraints = inner
             .constraints
             .iter()
-            .map(|old_constraint| {
-                Cell::new(match old_constraint {
-                    Constraint::Atomic(_) => Some(old_constraint.clone().new_node(db, env, self)),
-                    Constraint::Existential(_) => None,
-                })
+            .map(|old_constraint| match old_constraint {
+                Constraint::Atomic(_) => Some(old_constraint.clone().new_node(db, env, self)),
+                Constraint::Existential(_) => None,
             })
             .collect();
-
-        let mut source_orders = vec![None; inner.source_orders.len()];
-        for (i, old_source_order) in inner.source_orders.iter().copied().enumerate() {
-            match old_source_order {
-                SourceOrder::Ordered(old_left, old_right) => {
-                    let new_left = source_orders[old_left.index()];
-                    let new_right = source_orders[old_right.index()];
-                    source_orders[i] = self.ordered_source_order(new_left, new_right);
-                }
-                SourceOrder::AtomicConstraint(old_constraint) => {
-                    let old_constraint_index =
-                        inner.retained_constraint_index(old_constraint.into_inner());
-                    let (_, constraint_source_order) = constraints[old_constraint_index]
-                        .get()
-                        .expect("every source-order constraint should have a retained node");
-                    source_orders[i] = constraint_source_order;
-                }
-            }
-        }
-
-        // Maps NodeIds in the OwnedConstraintSet to the corresponding NodeIds in this builder.
-        let mut cache = FxHashMap::default();
-        let node = rebuild_node(
+        let mut loader = Loader {
             db,
             env,
-            self,
+            storage: self,
             inner,
-            &constraints,
-            &source_orders,
-            &mut cache,
-            other.node,
-        );
-        let old_source_order = other
+            constraints,
+            source_orders: vec![SourceOrderMapping::Pending; inner.source_orders.len()],
+            nodes: FxHashMap::default(),
+            preexisting_typevars,
+        };
+        let node = loader.node(other.node);
+        let source_order = other
             .source_order
-            .expect("non-terminal constraint set should have a source_order");
-        let source_order = source_orders[old_source_order.index()];
+            .and_then(|order| loader.source_order(order));
         (node, source_order)
     }
 }
@@ -1912,7 +2010,7 @@ struct SourceOrderId;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 enum SourceOrder {
     Ordered(SourceOrderId, SourceOrderId),
-    AtomicConstraint(AtomicConstraintId),
+    Constraint(ConstraintId),
 }
 
 /// A factored conjunction of upper-bound clauses accumulated for one typevar.
@@ -2414,7 +2512,7 @@ impl Node {
     ) -> (NodeId, Option<SourceOrderId>) {
         (
             NodeId::with_uncertain(storage, constraint, ALWAYS_TRUE, ALWAYS_FALSE, ALWAYS_FALSE),
-            storage.constraint_source_order(constraint),
+            Some(storage.constraint_source_order(constraint)),
         )
     }
 
@@ -2443,7 +2541,7 @@ impl Node {
                 NodeId::with_uncertain(storage, constraint, ALWAYS_FALSE, ALWAYS_TRUE, ALWAYS_FALSE)
             }
         };
-        (node, storage.constraint_source_order(constraint_id))
+        (node, Some(storage.constraint_source_order(constraint_id)))
     }
 }
 
@@ -5102,9 +5200,12 @@ mod tests {
     use crate::place::global_symbol;
     use crate::types::generics::ApplySpecialization;
     use crate::types::typevar::{
-        TypeVarBoundOrConstraintsEvaluation, TypeVarConstraints, TypeVarDefaultEvaluation,
+        BindingContext, TypeVarBoundOrConstraintsEvaluation, TypeVarConstraints,
+        TypeVarDefaultEvaluation, TypeVarIdentity,
     };
-    use crate::types::{BoundTypeVarInstance, KnownClass, SubclassOfType, TypeVarVariance};
+    use crate::types::{
+        BoundTypeVarInstance, KnownClass, SubclassOfType, TypeVarKind, TypeVarVariance,
+    };
     use ruff_db::files::system_path_to_file;
     use ruff_db::system::DbWithWritableSystem;
     use ruff_python_ast::name::Name;
@@ -5187,6 +5288,244 @@ mod tests {
         assert!(!compatible.is_never_satisfied(db, &env));
         let incompatible = loaded.and(db, &builder, || {
             create_constraint(db, &builder, free, KnownClass::Int)
+        });
+        assert!(incompatible.is_never_satisfied(db, &env));
+    }
+
+    #[test]
+    fn existential_scopes_have_independent_witnesses() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let builder = ConstraintSetBuilder::new();
+        let local = create_typevar(db, "Local");
+        let locals = TypeVarSet::from_typevars(db, [local]);
+        let strings = create_constraint(db, &builder, local, KnownClass::Str)
+            .reduce_inferable(db, &env, &builder, locals);
+        let bytes = create_constraint(db, &builder, local, KnownClass::Bytes)
+            .reduce_inferable(db, &env, &builder, locals);
+        let independent = strings.and(db, &builder, || bytes);
+        assert!(independent.is_always_satisfied(db, &env));
+        assert!(!independent.is_never_satisfied(db, &env));
+        assert_eq!(
+            independent.solutions(db, &env, TypeVarSet::None),
+            Ok(Solutions::Unconstrained),
+        );
+
+        let shared = create_constraint(db, &builder, local, KnownClass::Str)
+            .and(db, &builder, || {
+                create_constraint(db, &builder, local, KnownClass::Bytes)
+            })
+            .reduce_inferable(db, &env, &builder, locals);
+        assert!(shared.is_never_satisfied(db, &env));
+
+        // The outer binder owns the original occurrence; the inner binder retains its own.
+        let nested = strings
+            .and(db, &builder, || {
+                create_constraint(db, &builder, local, KnownClass::Bytes)
+            })
+            .reduce_inferable(db, &env, &builder, locals);
+        assert!(nested.is_always_satisfied(db, &env));
+        assert!(!nested.is_never_satisfied(db, &env));
+    }
+
+    #[test]
+    fn existential_mapped_copies_have_independent_witnesses() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let builder = ConstraintSetBuilder::new();
+        let local = create_typevar(db, "Local");
+        let free = create_typevar(db, "Free");
+        let locals = TypeVarSet::from_typevars(db, [local]);
+        let original = ConstraintSet::constrain_typevar_equivalence_bound(
+            db,
+            &env,
+            &builder,
+            local,
+            Type::TypeVar(free),
+        )
+        .reduce_inferable(db, &env, &builder, locals);
+        let mapped = |class: KnownClass| {
+            original.apply_type_mapping_impl(
+                db,
+                &TypeMapping::ApplySpecialization(ApplySpecialization::Single(
+                    free,
+                    class.to_instance(db, &env),
+                )),
+                TypeContext::default(),
+                &ApplyTypeMappingVisitor::new(&env),
+            )
+        };
+        let independent = mapped(KnownClass::Str).and(db, &builder, || mapped(KnownClass::Bytes));
+        assert!(independent.is_always_satisfied(db, &env));
+        assert!(!independent.is_never_satisfied(db, &env));
+
+        // Mapping the free variable must not rename its occurrences outside the binder.
+        let mixed = original.and(db, &builder, || {
+            create_constraint(db, &builder, free, KnownClass::Str)
+        });
+        let incompatible = mixed.and(db, &builder, || {
+            create_constraint(db, &builder, free, KnownClass::Bytes)
+        });
+        assert!(incompatible.is_never_satisfied(db, &env));
+    }
+
+    #[test]
+    fn existential_owned_round_trips_keep_freshness_bounded() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let local = create_typevar(db, "Local");
+        let peer = create_typevar(db, "Peer");
+        let context = GenericContext::from_typevar_instances(db, &env, [peer]);
+        let peer = Type::TypeVar(peer).apply_type_mapping(
+            db,
+            &env,
+            &TypeMapping::FreshenBoundTypeVars {
+                generic_context: context,
+                delta: 64,
+                include_paramspec: false,
+            },
+            TypeContext::default(),
+        );
+        assert_matches!(peer, Type::TypeVar(_));
+        let peer = peer.as_typevar().unwrap();
+        let locals = TypeVarSet::from_typevars(db, [local, peer]);
+        let mut owned = ConstraintSetBuilder::new().into_owned(|builder| {
+            create_constraint(db, builder, local, KnownClass::Str)
+                .and(db, builder, || {
+                    create_constraint(db, builder, peer, KnownClass::Bytes)
+                })
+                .reduce_inferable(db, &env, builder, locals)
+        });
+        owned = ConstraintSetBuilder::new().into_owned(|builder| builder.load(db, &env, &owned));
+        for _ in 0..64 {
+            let next =
+                ConstraintSetBuilder::new().into_owned(|builder| builder.load(db, &env, &owned));
+            assert_eq!(owned, next);
+            assert!(next.query(|_, set| set.is_always_satisfied(db, &env)));
+            owned = next;
+        }
+
+        let builder = ConstraintSetBuilder::new();
+        let mut mapped = builder.load(db, &env, &owned);
+        let initial_freshness = builder.storage.borrow().max_typevar_freshness.value();
+        let unrelated = create_typevar(db, "Unrelated");
+        let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Single(
+            unrelated,
+            KnownClass::Int.to_instance(db, &env),
+        ));
+        for _ in 0..64 {
+            mapped = mapped.apply_type_mapping_impl(
+                db,
+                &mapping,
+                TypeContext::default(),
+                &ApplyTypeMappingVisitor::new(&env),
+            );
+        }
+        assert!(mapped.is_always_satisfied(db, &env));
+        assert!(
+            builder.storage.borrow().max_typevar_freshness.value() <= initial_freshness + 64 * 65
+        );
+    }
+
+    #[test]
+    fn existential_paramspec_components_remain_local() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let identity = TypeVarIdentity::new(
+            db,
+            Name::new_static("P"),
+            None,
+            TypeVarKind::Pep695ParamSpec,
+        );
+        let paramspec = BoundTypeVarInstance::new(
+            db,
+            TypeVarInstance::new(db, identity, None, Some(TypeVarVariance::Invariant), None),
+            BindingContext::Synthetic(env.program(db)),
+            None,
+            TypeVarNonce::NONE,
+        );
+        let args = paramspec.with_paramspec_attr(db, ParamSpecAttrKind::Args);
+        let kwargs = paramspec.with_paramspec_attr(db, ParamSpecAttrKind::Kwargs);
+        let builder = ConstraintSetBuilder::new();
+        let string = KnownClass::Str.to_instance(db, &env);
+        let positional = Type::homogeneous_tuple(db, &env, string);
+        let keywords = KnownClass::Dict.to_specialized_instance(db, &env, &[string, string]);
+        let body = ConstraintSet::constrain_typevar_equivalence_bound(
+            db, &env, &builder, args, positional,
+        )
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, kwargs, keywords)
+        });
+        let scoped = body.reduce_inferable(
+            db,
+            &env,
+            &builder,
+            TypeVarSet::from_typevars(db, [paramspec]),
+        );
+        assert!(scoped.is_always_satisfied(db, &env));
+        assert!(!scoped.is_never_satisfied(db, &env));
+        assert_eq!(
+            scoped.solutions(db, &env, TypeVarSet::from_typevars(db, [args, kwargs])),
+            Ok(Solutions::Unconstrained)
+        );
+        let storage = builder.storage.borrow();
+        let constraint = storage.interior_node_data(scoped.node).constraint;
+        let constraint = storage.constraint_data(constraint);
+        assert_matches!(constraint, Constraint::Existential(_));
+        let Constraint::Existential(existential) = constraint else {
+            unreachable!();
+        };
+        let variables: Vec<_> = existential
+            .locals
+            .iter()
+            .map(|id| storage.typevar_data(id))
+            .collect();
+        let fresh_args = variables
+            .iter()
+            .copied()
+            .find(|variable| variable.paramspec_attr(db) == Some(ParamSpecAttrKind::Args))
+            .expect("quantifier must retain its positional component");
+        let fresh_kwargs = variables
+            .iter()
+            .copied()
+            .find(|variable| variable.paramspec_attr(db) == Some(ParamSpecAttrKind::Kwargs))
+            .expect("quantifier must retain its keyword component");
+        assert_ne!(
+            fresh_args.without_paramspec_attr(db).identity(db),
+            paramspec.identity(db)
+        );
+        assert_eq!(
+            fresh_args.without_paramspec_attr(db).identity(db),
+            fresh_kwargs.without_paramspec_attr(db).identity(db)
+        );
+        drop(storage);
+        assert_eq!(
+            scoped.solutions(
+                db,
+                &env,
+                TypeVarSet::from_typevars(db, [fresh_args, fresh_kwargs])
+            ),
+            Ok(Solutions::Unconstrained)
+        );
+
+        // Quantifying a component alone leaves the other component's identity free.
+        let positional_only =
+            body.reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [args]));
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let incompatible_keywords =
+            KnownClass::Dict.to_specialized_instance(db, &env, &[string, integer]);
+        let incompatible = positional_only.and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                kwargs,
+                incompatible_keywords,
+            )
         });
         assert!(incompatible.is_never_satisfied(db, &env));
     }
@@ -6894,9 +7233,20 @@ class E: ...
 
     #[test]
     fn deeply_nested_source_order_preserves_first_occurrences() {
-        let mut storage = ConstraintSetStorage::default();
-        let first = AtomicConstraintId::new(0);
-        let second = AtomicConstraintId::new(1);
+        let db = setup_db();
+        let builder = ConstraintSetBuilder::new();
+        let local = create_typevar(&db, "T");
+        let first = create_constraint(&db, &builder, local, KnownClass::Int);
+        let second = create_constraint(&db, &builder, local, KnownClass::Str);
+        let mut storage = builder.storage.borrow_mut();
+        let first = storage
+            .interior_node_data(first.node)
+            .constraint
+            .expect_atomic(&storage);
+        let second = storage
+            .interior_node_data(second.node)
+            .constraint
+            .expect_atomic(&storage);
         let first_order = storage.atomic_constraint_source_order(first);
         let second_order = storage.atomic_constraint_source_order(second);
         let mut source_order = storage.ordered_source_order(Some(second_order), Some(first_order));

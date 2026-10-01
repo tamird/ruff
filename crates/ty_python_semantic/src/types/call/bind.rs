@@ -221,6 +221,7 @@ fn freshen_generic_contexts_in_type<'db>(
                 &TypeMapping::FreshenBoundTypeVars {
                     generic_context,
                     delta: nonce_generator.next().value(),
+                    include_paramspec: false,
                 },
                 TypeContext::default(),
             )

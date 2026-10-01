@@ -1121,6 +1121,7 @@ impl<'db> Signature<'db> {
             &TypeMapping::FreshenBoundTypeVars {
                 generic_context,
                 delta,
+                include_paramspec: false,
             },
             TypeContext::default(),
             &ApplyTypeMappingVisitor::new(env),

@@ -533,8 +533,18 @@ impl<'db> GenericContext<'db> {
         } else {
             bound_typevar
         };
+        self.contains_exact(db, bound_typevar)
+    }
+
+    /// Checks the complete identity, keeping `ParamSpec` components distinct from their base.
+    pub(crate) fn contains_exact(
+        self,
+        db: &'db dyn Db,
+        bound_typevar: BoundTypeVarIdentity<'db>,
+    ) -> bool {
         self.variables_inner(db).contains_key(&bound_typevar)
     }
+
     /// Returns `true` if this generic context contains exactly one `ParamSpec` and no other type
     /// variables.
     ///

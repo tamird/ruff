@@ -11670,6 +11670,8 @@ pub enum TypeMapping<'a, 'db> {
     FreshenBoundTypeVars {
         generic_context: GenericContext<'db>,
         delta: u32,
+        /// Quantified scopes also rename parameter specifications and their components.
+        include_paramspec: bool,
     },
     /// Binds any `typing.Self` typevar with a particular `self` class.
     BindSelf(SelfBinding<'db>),
