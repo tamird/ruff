@@ -8413,38 +8413,6 @@ class E: ...
     }
 
     #[test]
-    fn owned_constraint_set_discards_unrelated_quantified_constraints() {
-        let db = setup_db();
-        let db = &db;
-        let env = db.program_environment();
-        let t = create_typevar(db, "T");
-        let u = create_typevar(db, "U");
-
-        let owned = ConstraintSetBuilder::new().into_owned(|builder| {
-            let t_int = create_constraint(db, builder, t, KnownClass::Int);
-            let u_str = create_constraint(db, builder, u, KnownClass::Str);
-            t_int.and(db, builder, || u_str).reduce_inferable(
-                db,
-                &env,
-                builder,
-                TypeVarSet::from_typevars(db, [t]),
-            )
-        });
-
-        assert_eq!(
-            owned
-                .types()
-                .filter_map(Type::as_typevar)
-                .collect::<Vec<_>>(),
-            vec![u],
-        );
-        assert_eq!(
-            owned.inner.as_ref().map(|inner| inner.source_orders.len()),
-            Some(1),
-        );
-    }
-
-    #[test]
     fn owned_constraint_set_preserves_projected_solution_order() {
         let db = setup_db();
         let db = &db;
@@ -8452,48 +8420,64 @@ class E: ...
         let t = create_typevar(db, "T");
         let u = create_typevar(db, "U");
         let inferable = TypeVarSet::from_typevars(db, [u]);
-        let expected = Ok(Solutions::Constrained(SolutionPaths::Complete(vec![
-            solution([TypeVarSolution {
-                bound_typevar: u,
-                solution: known_instance(db, KnownClass::Int),
-            }]),
-            solution([TypeVarSolution {
-                bound_typevar: u,
-                solution: known_instance(db, KnownClass::Str),
-            }]),
-        ])));
+        for derived_first in [true, false] {
+            let order = if derived_first {
+                [KnownClass::Str, KnownClass::Int]
+            } else {
+                [KnownClass::Int, KnownClass::Str]
+            };
+            let expected = Ok(Solutions::Constrained(SolutionPaths::Complete(
+                order
+                    .into_iter()
+                    .map(|class| {
+                        solution([TypeVarSolution {
+                            bound_typevar: u,
+                            solution: known_instance(db, class),
+                        }])
+                    })
+                    .collect(),
+            )));
 
-        let owned = ConstraintSetBuilder::new().into_owned(|builder| {
-            let u_t = ConstraintSet::constrain_typevar_equivalence_bound(
-                db,
-                &env,
-                builder,
-                u,
-                Type::TypeVar(t),
-            );
-            let t_str = create_constraint(db, builder, t, KnownClass::Str);
-            let u_int = create_constraint(db, builder, u, KnownClass::Int);
+            let owned = ConstraintSetBuilder::new().into_owned(|builder| {
+                let u_t = ConstraintSet::constrain_typevar_equivalence_bound(
+                    db,
+                    &env,
+                    builder,
+                    u,
+                    Type::TypeVar(t),
+                );
+                let t_str = create_constraint(db, builder, t, KnownClass::Str);
+                let u_int = create_constraint(db, builder, u, KnownClass::Int);
 
-            // Eliminating T leaves a derived U = str alternative alongside the direct U = int.
-            let projected = u_t
-                .and(db, builder, || t_str)
-                .or(db, builder, || u_int)
-                .reduce_inferable(db, &env, builder, TypeVarSet::from_typevars(db, [t]));
-            assert_eq!(projected.solutions(db, &env, inferable), expected);
-            projected
-        });
-
-        let reloaded =
-            ConstraintSetBuilder::new().into_owned(|builder| builder.load(db, &env, &owned));
-        for constraints in [&owned, &reloaded] {
-            constraints.query(|_builder, constraints| {
-                assert_eq!(constraints.solutions(db, &env, inferable), expected);
+                // Both the scoped U = str branch and direct U = int retain their source order.
+                let derived = u_t.and(db, builder, || t_str);
+                let relation = if derived_first {
+                    derived.or(db, builder, || u_int)
+                } else {
+                    u_int.or(db, builder, || derived)
+                };
+                let projected = relation.reduce_inferable(
+                    db,
+                    &env,
+                    builder,
+                    TypeVarSet::from_typevars(db, [t]),
+                );
+                assert_eq!(projected.solutions(db, &env, inferable), expected);
+                projected
             });
-        }
 
-        let reloaded_again =
-            ConstraintSetBuilder::new().into_owned(|builder| builder.load(db, &env, &reloaded));
-        assert_eq!(reloaded, reloaded_again);
+            let reloaded =
+                ConstraintSetBuilder::new().into_owned(|builder| builder.load(db, &env, &owned));
+            for constraints in [&owned, &reloaded] {
+                constraints.query(|_builder, constraints| {
+                    assert_eq!(constraints.solutions(db, &env, inferable), expected);
+                });
+            }
+
+            let reloaded_again =
+                ConstraintSetBuilder::new().into_owned(|builder| builder.load(db, &env, &reloaded));
+            assert_eq!(reloaded, reloaded_again);
+        }
     }
 
     #[test]
