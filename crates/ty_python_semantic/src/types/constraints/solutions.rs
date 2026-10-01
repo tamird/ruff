@@ -167,6 +167,9 @@ pub(super) struct SolutionWalker<'db, L> {
     limits: L,
 
     positive_locals: Support,
+    /// Typevars whose declarations are checked by the root validation pass. Derived
+    /// relations can introduce additional scoped locals after this pass is prepared.
+    validation_support: Option<Support>,
     negative_scopes: Vec<ConstraintId>,
 
     declared_constraint_solutions: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
@@ -215,6 +218,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             inferable_support,
             limits,
             positive_locals: Support::default(),
+            validation_support: None,
             negative_scopes: Vec::new(),
             declared_constraint_solutions: FxHashMap::default(),
             explored_nodes: FxHashSet::default(),
@@ -281,6 +285,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         polarity: Polarity,
         node: NodeId,
     ) -> ControlFlow<L::Break> {
+        self.validation_support = all_typevars.cloned();
         let validations = all_typevars
             .map(|all_typevars| Validations::from_support(db, env, storage, all_typevars));
         let validations = validations.as_ref();
@@ -410,6 +415,41 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             (polarity, node)
         {
             return ControlFlow::Continue(());
+        }
+
+        // Atomic antecedents can imply a whole quantified relation. Visit it before
+        // pruning, memoization, or terminal success, retaining its witnesses through the
+        // original continuation. The consequence holds positively under either polarity.
+        if let Some((index, relation, source_order)) = path.pending_relation() {
+            self.source_orders
+                .extend(storage.calculate_source_orders(source_order));
+            return path.with_relation(index, |path, previous_fuel| {
+                self.visit_node_and_then(
+                    db,
+                    env,
+                    storage,
+                    path,
+                    Polarity::Positive,
+                    relation,
+                    &never_cache,
+                    &never_prune,
+                    &|this, storage, path| {
+                        path.with_origin_fuel(previous_fuel, |path| {
+                            this.visit_node_and_then(
+                                db,
+                                env,
+                                storage,
+                                path,
+                                polarity,
+                                node,
+                                &never_cache,
+                                &never_prune,
+                                process_satisfied,
+                            )
+                        })
+                    },
+                )
+            });
         }
 
         if !check_cache(self, storage, path, polarity, node)? {
@@ -660,8 +700,16 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 else {
                     unreachable!("existential visitor requires an existential constraint");
                 };
+                let locals = existential.locals.clone();
+                let new_locals = this
+                    .validation_support
+                    .as_ref()
+                    .map(|validated| &locals - validated);
+                let validations = new_locals
+                    .as_ref()
+                    .map(|locals| Validations::from_support(db, env, storage, locals));
                 let previous = this.positive_locals.clone();
-                this.positive_locals |= &existential.locals;
+                this.positive_locals |= &locals;
                 let result = this.visit_node_and_then(
                     db,
                     env,
@@ -671,7 +719,16 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     existential_body,
                     &never_cache,
                     prune_path,
-                    process_satisfied,
+                    &|this, storage, path| {
+                        this.validate_satisfied_path(
+                            db,
+                            env,
+                            storage,
+                            path,
+                            validations.as_ref(),
+                            process_satisfied,
+                        )
+                    },
                 );
                 this.positive_locals = previous;
                 result
@@ -709,6 +766,15 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             &|this, storage, path| {
                 // Note that we never negate existential's body, even when we are walking the
                 // negation of the existential _node_.
+                let validations = this.validation_support.as_ref().map(|_| {
+                    let Constraint::Existential(existential) =
+                        storage.constraint_data(interior.constraint)
+                    else {
+                        unreachable!("existential visitor requires an existential constraint");
+                    };
+                    let locals = existential.locals.clone();
+                    Validations::from_support(db, env, storage, &locals)
+                });
                 let has_any_solutions = this
                     .node_is_satisfiable_on_path(
                         db,
@@ -717,7 +783,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                         path,
                         Polarity::Positive,
                         existential_body,
-                        None,
+                        validations.as_ref(),
                     )
                     .map_break(Break::Limits)?;
                 if has_any_solutions {
@@ -758,7 +824,17 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         process_satisfied: &ProcessSatisfied<'_, 'db, L, Break<L::Break>>,
     ) -> ControlFlow<Break<L::Break>> {
         let Some((constraint, constraints)) = constraints.split_first() else {
-            return process_satisfied(self, storage, path);
+            return self.visit_node_and_then(
+                db,
+                env,
+                storage,
+                path,
+                Polarity::Positive,
+                ALWAYS_TRUE,
+                &never_cache,
+                &never_prune,
+                process_satisfied,
+            );
         };
         self.source_orders.insert(*constraint);
         path.walk_edge(

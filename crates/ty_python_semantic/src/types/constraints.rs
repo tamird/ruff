@@ -1711,6 +1711,17 @@ impl<'db> ConstraintSetStorage<'db> {
         env: &ProgramEnvironment<'db>,
         other: &OwnedConstraintSet<'db>,
     ) -> (NodeId, Option<SourceOrderId>) {
+        self.load_with_provenance(db, env, other, None)
+    }
+
+    /// Loads a derived relation without turning validity bounds into call-site evidence.
+    fn load_with_provenance(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        other: &OwnedConstraintSet<'db>,
+        provenance: Option<ConstraintProvenance>,
+    ) -> (NodeId, Option<SourceOrderId>) {
         type RemappedConstraint = Option<(NodeId, Option<SourceOrderId>)>;
 
         #[derive(Clone, Copy)]
@@ -1728,6 +1739,7 @@ impl<'db> ConstraintSetStorage<'db> {
             source_orders: Vec<SourceOrderMapping>,
             nodes: FxHashMap<NodeId, NodeId>,
             preexisting_typevars: usize,
+            provenance: Option<ConstraintProvenance>,
         }
 
         impl Loader<'_, '_> {
@@ -1765,6 +1777,7 @@ impl<'db> ConstraintSetStorage<'db> {
                             source_order,
                             ..
                         } = existential.clone();
+                        let provenance = self.provenance.unwrap_or(provenance);
                         let body = self.node(body);
                         let source_order = source_order.and_then(|order| self.source_order(order));
                         let locals = Support::from_typevars(locals.iter().map(|typevar| {
@@ -1860,7 +1873,11 @@ impl<'db> ConstraintSetStorage<'db> {
             .constraints
             .iter()
             .map(|old_constraint| match old_constraint {
-                Constraint::Atomic(_) => Some(old_constraint.clone().new_node(db, env, self)),
+                Constraint::Atomic(atomic) => {
+                    let atomic =
+                        provenance.map_or(*atomic, |derived| atomic.with_provenance(derived));
+                    Some(Constraint::Atomic(atomic).new_node(db, env, self))
+                }
                 Constraint::Existential(_) => None,
             })
             .collect();
@@ -1873,6 +1890,7 @@ impl<'db> ConstraintSetStorage<'db> {
             source_orders: vec![SourceOrderMapping::Pending; inner.source_orders.len()],
             nodes: FxHashMap::default(),
             preexisting_typevars,
+            provenance,
         };
         let node = loader.node(other.node);
         let source_order = other

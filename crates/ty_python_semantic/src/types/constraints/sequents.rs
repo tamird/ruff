@@ -13,7 +13,7 @@ use crate::types::constraints::variables::{
     TypeVarRangeBound,
 };
 use crate::types::constraints::{
-    ALWAYS_FALSE, AtomicConstraintId, ConstraintSetBuilder, ConstraintSetStorage, Node,
+    ALWAYS_FALSE, AtomicConstraintId, Constraint, ConstraintSetBuilder, ConstraintSetStorage, Node,
     OwnedConstraintSet,
 };
 use crate::types::typevar::TypeVarSet;
@@ -50,7 +50,7 @@ pub(super) struct SequentMap<'db> {
 
     /// Pending sequents that have not yet been added to [`sequents`][Self::sequents]. This is only
     /// used during construction, and will be empty in a finalized sequent map.
-    pending: Vec<Sequent<AtomicConstraint<'db>>>,
+    pending: Vec<CachedSequent<'db>>,
 }
 
 /// A batch of sequents, along with information about the order they need to be imported into a
@@ -71,18 +71,21 @@ pub(super) struct SequentMap<'db> {
 /// to import first, based on its builder's local typevar ordering.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(super) enum SequentGroup<'db> {
-    Ungrouped(Box<[Sequent<AtomicConstraint<'db>>]>),
+    Ungrouped(Box<[CachedSequent<'db>]>),
     Grouped {
         equivalence: TypeVarEquivalenceBound<'db>,
-        leftwards: Box<[Sequent<AtomicConstraint<'db>>]>,
-        rightwards: Box<[Sequent<AtomicConstraint<'db>>]>,
+        leftwards: Box<[CachedSequent<'db>]>,
+        rightwards: Box<[CachedSequent<'db>]>,
     },
 }
+
+pub(super) type CachedSequent<'db> =
+    Sequent<AtomicConstraint<'db>, (), (OwnedConstraintSet<'db>, ConstraintProvenance)>;
 
 /// Describes one rule for deriving new implicit constraints from existing constraints in a BDD
 /// path. Fuel costs are filled in when cached sequents are imported into a builder.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
-pub(super) enum Sequent<C, FuelCost = ()> {
+pub(super) enum Sequent<C, FuelCost = (), Relation = ()> {
     /// Sequent of the form `¬C → false`
     ///
     /// This indicates that `C` is always true. Any path that assumes it is false is impossible and
@@ -124,6 +127,13 @@ pub(super) enum Sequent<C, FuelCost = ()> {
         is_substitution: bool,
         fuel_cost: FuelCost,
     },
+    /// A consequence whose quantified variables must remain scoped together.
+    PairRelation {
+        ante1: C,
+        ante2: C,
+        post: Relation,
+        fuel_cost: FuelCost,
+    },
 }
 
 impl<'db> SequentMap<'db> {
@@ -148,6 +158,23 @@ impl<'db> SequentMap<'db> {
             for sequent in self.all_sequents() {
                 match sequent {
                     Sequent::SingleTautology { .. } => {}
+                    Sequent::PairRelation {
+                        ante1,
+                        ante2,
+                        post: (post, _),
+                        fuel_cost: (),
+                    } => {
+                        maybe_write_prefix(f)?;
+                        post.query(|_, when| {
+                            write!(
+                                f,
+                                "{} ∧ {} → {}",
+                                ante1.display(db, env, Some(true)),
+                                ante2.display(db, env, Some(true)),
+                                when.display(db, env)
+                            )
+                        })?;
+                    }
 
                     Sequent::PairImpossibility { ante1, ante2 } => {
                         maybe_write_prefix(f)?;
@@ -206,21 +233,21 @@ impl<'db> SequentMap<'db> {
         })
     }
 
-    fn all_sequents(&self) -> impl Iterator<Item = Sequent<AtomicConstraint<'db>>> {
+    fn all_sequents(&self) -> impl Iterator<Item = CachedSequent<'db>> {
         self.sequents.iter().flat_map(|group| match group {
-            SequentGroup::Ungrouped(ungrouped) => Either::Left(ungrouped.iter().copied()),
+            SequentGroup::Ungrouped(ungrouped) => Either::Left(ungrouped.iter().cloned()),
             SequentGroup::Grouped {
                 leftwards,
                 rightwards,
                 ..
             } => Either::Right(std::iter::chain(
-                leftwards.iter().copied(),
-                rightwards.iter().copied(),
+                leftwards.iter().cloned(),
+                rightwards.iter().cloned(),
             )),
         })
     }
 
-    fn extract_pending(&mut self) -> Box<[Sequent<AtomicConstraint<'db>>]> {
+    fn extract_pending(&mut self) -> Box<[CachedSequent<'db>]> {
         self.pending.drain(..).collect()
     }
 
@@ -705,6 +732,22 @@ impl<'db> AtomicConstraint<'db> {
         upper_constraint: Self,
         when: &OwnedConstraintSet<'db>,
     ) {
+        // A quantified consequence is one relation: splitting its body into atomic
+        // sequents would lose the shared witness and its scope.
+        if when.inner.as_ref().is_some_and(|inner| {
+            inner
+                .constraints
+                .iter()
+                .any(|constraint| matches!(constraint, Constraint::Existential(_)))
+        }) {
+            map.pending.push(Sequent::PairRelation {
+                ante1: lower_constraint,
+                ante2: upper_constraint,
+                post: (when.clone(), provenance),
+                fuel_cost: (),
+            });
+            return;
+        }
         when.query(|builder, when| {
             // If the relation _never_ holds, these constraints are contradictory.
             if when.is_trivially_never_satisfied() {

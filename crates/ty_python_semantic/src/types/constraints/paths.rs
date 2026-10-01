@@ -11,7 +11,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use ruff_index::{IndexVec, newtype_index};
 
-use crate::types::constraints::sequents::{Sequent, SequentGroup, SequentMap};
+use crate::types::constraints::sequents::{CachedSequent, Sequent, SequentGroup, SequentMap};
 use crate::types::constraints::support::Support;
 use crate::types::constraints::variables::AtomicConstraint;
 use crate::types::constraints::variables::AtomicConstraint::{
@@ -22,6 +22,8 @@ use crate::types::constraints::{
     TypeVarId,
 };
 use crate::{Db, FxIndexMap, FxIndexSet, ProgramEnvironment};
+
+type PathSequent = Sequent<AtomicConstraintId, u16, (NodeId, Option<SourceOrderId>)>;
 
 /// The position of an assignment in insertion order.
 #[newtype_index]
@@ -56,9 +58,14 @@ struct AssignmentIndex;
 #[derive(Debug)]
 pub(crate) struct PathAssignments {
     /// All of the rules that we know for inferring derived constraints on the current path.
-    sequents: Vec<Sequent<AtomicConstraintId, u16>>,
+    sequents: Vec<PathSequent>,
     /// The sequents that can fire when a particular assignment is added to the path.
     sequent_antecedents: FxHashMap<Assignment<AtomicConstraintId>, Vec<usize>>,
+    /// Whole relations activated by atomic antecedents on this path.
+    relations: FxIndexMap<usize, u16>,
+    visiting_relations: FxHashSet<usize>,
+    /// Atomic edges inside a derived relation continue the antecedents' fuel chain.
+    origin_fuel: AssignmentFuel,
     /// Each assignment's source constraint and greatest remaining per-path fuel.
     pub(super) assignments: FxIndexMap<Assignment<AtomicConstraintId>, (AtomicConstraintId, u16)>,
     /// Constraints that have been _replaced_ with other constraints on this path, because a
@@ -140,7 +147,7 @@ const PATH_FUEL_BUDGET: u16 = 8;
 
 /// The fuel cost of deriving a particular assignment during BDD path walking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AssignmentFuel {
+pub(super) struct AssignmentFuel {
     /// The amount of fuel consumed when deriving the assignment, or None if this assignment came
     /// directly from the BDD
     consumed: Option<u16>,
@@ -187,6 +194,9 @@ impl Default for PathAssignments {
         Self {
             sequents: Vec::default(),
             sequent_antecedents: FxHashMap::default(),
+            relations: FxIndexMap::default(),
+            visiting_relations: FxHashSet::default(),
+            origin_fuel: AssignmentFuel::origin(),
             assignments: FxIndexMap::default(),
             substituted_constraints: FxIndexSet::default(),
             quantified_typevars: Support::default(),
@@ -281,6 +291,9 @@ impl PathAssignments {
         Self {
             sequents: Vec::default(),
             sequent_antecedents: FxHashMap::default(),
+            relations: FxIndexMap::default(),
+            visiting_relations: FxHashSet::default(),
+            origin_fuel: AssignmentFuel::origin(),
             assignments: FxIndexMap::default(),
             substituted_constraints: FxIndexSet::default(),
             quantified_typevars: Support::default(),
@@ -442,6 +455,7 @@ impl PathAssignments {
         // pass along the range of which assignments are new, and so that we can reset back to this
         // point before returning.
         let start = self.assignments.len();
+        let relations_start = self.relations.len();
         let substituted_constraints_start = self.substituted_constraints.len();
         let fuel_undo_start = self.fuel_undo.len();
         let previous_remaining_overall_fuel = self.remaining_overall_fuel;
@@ -460,7 +474,7 @@ impl PathAssignments {
         );
         debug_assert!(self.assignment_queue.is_empty());
         self.assignment_queue
-            .push_back((assignment, AssignmentFuel::origin()));
+            .push_back((assignment, self.origin_fuel));
         let source_constraint = assignment.constraint();
         let found_conflict = self
             .drain_assignment_queue(db, env, storage, source_constraint)
@@ -505,9 +519,54 @@ impl PathAssignments {
             }
         }
         self.assignments.truncate(start);
+        self.relations.truncate(relations_start);
         self.substituted_constraints
             .truncate(substituted_constraints_start);
         self.remaining_overall_fuel = previous_remaining_overall_fuel;
+        result
+    }
+
+    pub(super) fn pending_relation(&self) -> Option<(usize, NodeId, Option<SourceOrderId>)> {
+        self.relations.keys().find_map(|index| {
+            if self.visiting_relations.contains(index) {
+                return None;
+            }
+            let Sequent::PairRelation {
+                ante1: _,
+                ante2: _,
+                post: (node, source_order),
+                fuel_cost: _,
+            } = self.sequents[*index]
+            else {
+                unreachable!("only whole relations are activated");
+            };
+            Some((*index, node, source_order))
+        })
+    }
+
+    pub(super) fn with_relation<R>(
+        &mut self,
+        index: usize,
+        f: impl FnOnce(&mut Self, AssignmentFuel) -> R,
+    ) -> R {
+        let previous_fuel = self.origin_fuel;
+        self.origin_fuel = AssignmentFuel::derived(0, self.relations[&index]);
+        self.visiting_relations.insert(index);
+        let result = f(self, previous_fuel);
+        self.visiting_relations.remove(&index);
+        self.origin_fuel = previous_fuel;
+        result
+    }
+
+    pub(super) fn with_origin_fuel<R>(
+        &mut self,
+        fuel: AssignmentFuel,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous_fuel = self.origin_fuel;
+        self.origin_fuel = fuel;
+        let result = f(self);
+        self.origin_fuel = previous_fuel;
         result
     }
 
@@ -597,8 +656,8 @@ impl PathAssignments {
             db: &'db dyn Db,
             env: &ProgramEnvironment<'db>,
             storage: &mut ConstraintSetStorage<'db>,
-            sequents: &[Sequent<AtomicConstraint<'db>>],
-            dest: &mut Vec<Sequent<AtomicConstraintId, u16>>,
+            sequents: &[CachedSequent<'db>],
+            dest: &mut Vec<PathSequent>,
             antecedents: &mut FxHashMap<Assignment<AtomicConstraintId>, Vec<usize>>,
         ) {
             for sequent in sequents {
@@ -611,6 +670,41 @@ impl PathAssignments {
                 };
 
                 let sequent = match sequent {
+                    Sequent::PairRelation {
+                        ante1,
+                        ante2,
+                        post: (post, provenance),
+                        fuel_cost: (),
+                    } => {
+                        let ante1 = storage.intern_atomic_constraint(db, env, *ante1);
+                        let ante2 = storage.intern_atomic_constraint(db, env, *ante2);
+                        add_antecedent(ante1.when_true());
+                        add_antecedent(ante2.when_true());
+                        let post = storage.load_with_provenance(db, env, post, Some(*provenance));
+                        let (ante1_depth, _) =
+                            storage.cached_constraint_bound_depth(db, env, ante1);
+                        let (ante2_depth, _) =
+                            storage.cached_constraint_bound_depth(db, env, ante2);
+                        let fuel_cost = storage
+                            .calculate_source_orders(post.1)
+                            .into_iter()
+                            .map(|constraint| {
+                                storage.sequent_fuel_cost(
+                                    db,
+                                    env,
+                                    constraint,
+                                    ante1_depth.max(ante2_depth),
+                                )
+                            })
+                            .max()
+                            .unwrap_or(1);
+                        Sequent::PairRelation {
+                            ante1,
+                            ante2,
+                            post,
+                            fuel_cost,
+                        }
+                    }
                     Sequent::SingleTautology { ante } => {
                         let ante = storage.intern_atomic_constraint(db, env, *ante);
                         add_antecedent(ante.when_false());
@@ -960,7 +1054,7 @@ impl PathAssignments {
         for index in 0..previous_antecedents_len {
             let sequent_index = self.sequent_antecedents[&assignment][index];
             let sequent = self.sequents[sequent_index];
-            self.check_sequent(db, env, storage, sequent)?;
+            self.check_sequent(db, env, storage, sequent_index, sequent)?;
         }
 
         // Sequent elaboration can produce rules whose antecedents do not include the constraint
@@ -968,7 +1062,7 @@ impl PathAssignments {
         // complete set of assignments on the current path.
         for sequent_index in previous_sequents_len..sequents_len {
             let sequent = self.sequents[sequent_index];
-            self.check_sequent(db, env, storage, sequent)?;
+            self.check_sequent(db, env, storage, sequent_index, sequent)?;
         }
 
         // If we were able to derive any new assignments from this one, add them to the processing
@@ -996,9 +1090,31 @@ impl PathAssignments {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
-        sequent: Sequent<AtomicConstraintId, u16>,
+        sequent_index: usize,
+        sequent: PathSequent,
     ) -> Result<(), PathAssignmentConflict> {
         match sequent {
+            Sequent::PairRelation {
+                ante1,
+                ante2,
+                fuel_cost,
+                post: _,
+            } => {
+                let Some(left) = self.max_remaining_fuel_for(ante1.when_true()) else {
+                    return Ok(());
+                };
+                let Some(right) = self.max_remaining_fuel_for(ante2.when_true()) else {
+                    return Ok(());
+                };
+                if let Entry::Vacant(entry) = self.relations.entry(sequent_index)
+                    && let Some(remaining) = left.min(right).checked_sub(fuel_cost)
+                    && let Some(overall) = self.remaining_overall_fuel.checked_sub(fuel_cost)
+                {
+                    self.remaining_overall_fuel = overall;
+                    entry.insert(remaining);
+                }
+                Ok(())
+            }
             Sequent::SingleTautology { ante } => {
                 self.check_single_tautology(db, env, storage, ante)
             }
@@ -1191,6 +1307,9 @@ struct PathAssignmentConflict;
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
+    use super::super::sequents::{Sequent, SequentGroup, SequentMap};
     use super::super::solutions::{Polarity, SolutionWalker};
     use super::super::*;
 
@@ -1216,6 +1335,246 @@ mod tests {
         let env = db.program_environment();
         let ty = bound.to_instance(db, &env);
         ConstraintSet::constrain_typevar_equivalence_bound(db, &env, builder, bound_typevar, ty)
+    }
+
+    #[test]
+    fn derived_relations_preserve_witnesses_and_domains() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let string = KnownClass::Str.to_instance(db, &env);
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let left = create_typevar(db, "Left");
+        let right = create_typevar(db, "Right");
+        let result = create_typevar(db, "Result");
+        let list_string = KnownClass::List.to_specialized_instance(db, &env, &[string]);
+        let list_integer = KnownClass::List.to_specialized_instance(db, &env, &[integer]);
+        for (domain, expected, negative, valid) in [
+            (string, list_string, false, true),
+            (string, list_integer, false, false),
+            (integer, list_string, false, false),
+            (integer, list_string, true, true),
+            (string, list_string, true, false),
+        ] {
+            let local = create_typevar(db, "Local").map_bound_or_constraints(db, |_| {
+                Some(TypeVarBoundOrConstraints::UpperBound(domain))
+            });
+            let relation = ConstraintSetBuilder::new().into_owned(|builder| {
+                let list_local =
+                    KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
+                let body =
+                    create_constraint(db, builder, local, KnownClass::Str).and(db, builder, || {
+                        ConstraintSet::constrain_typevar_equivalence_bound(
+                            db, &env, builder, result, list_local,
+                        )
+                    });
+                let relation = body.reduce_inferable(
+                    db,
+                    &env,
+                    builder,
+                    TypeVarSet::from_typevars(db, [local]),
+                );
+                if negative {
+                    relation.negate(db, builder)
+                } else {
+                    relation
+                }
+            });
+            let builder = ConstraintSetBuilder::new();
+            let lhs = create_constraint(db, &builder, left, KnownClass::Str);
+            let rhs = create_constraint(db, &builder, right, KnownClass::Int);
+            let set = lhs.and(db, &builder, || rhs).and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &builder, result, expected,
+                )
+            });
+            let mut storage = builder.storage.borrow_mut();
+            let ante1 = storage
+                .interior_node_data(lhs.node)
+                .constraint
+                .expect_atomic(&storage);
+            let ante2 = storage
+                .interior_node_data(rhs.node)
+                .constraint
+                .expect_atomic(&storage);
+            let mut map = SequentMap::default();
+            map.sequents
+                .push(SequentGroup::Ungrouped(Box::new([Sequent::PairRelation {
+                    ante1: storage.atomic_constraint_data(ante1),
+                    ante2: storage.atomic_constraint_data(ante2),
+                    post: (relation, ConstraintProvenance::Evidence),
+                    fuel_cost: (),
+                }])));
+            let mut path = set
+                .node
+                .path_assignments(db, &env, &mut storage, set.source_order);
+            path.add_sequents(db, &env, &mut storage, &map);
+            let inferable = TypeVarSet::from_typevars(db, [left, right, result]);
+            let support = Support::from_typevar_set(db, &mut storage, inferable);
+            // Reusing the path exercises activation rollback, including negatively walked roots.
+            for polarity in [Polarity::Positive, Polarity::Negative] {
+                let node = if polarity == Polarity::Positive {
+                    set.node
+                } else {
+                    set.node.negate(&mut storage)
+                };
+                let orders = storage.calculate_source_orders(set.source_order);
+                let mut walker = SolutionWalker::new(
+                    db,
+                    &mut storage,
+                    orders,
+                    inferable,
+                    UnboundedSolutionLimits,
+                    node,
+                );
+                let ControlFlow::Continue(()) = walker.visit_node(
+                    db,
+                    &env,
+                    &mut storage,
+                    &mut path,
+                    Some(&support),
+                    polarity,
+                    node,
+                );
+                let candidates = walker.finish();
+                assert_eq!(
+                    !matches!(candidates, CandidateSolutions::Unsatisfiable),
+                    valid,
+                    "domain={domain:?}, expected={expected:?}, negative={negative}, polarity={polarity:?}"
+                );
+                let selection = ConstraintSetBuilder::new();
+                let solved = candidates.solve(db, &env, &selection);
+                if valid {
+                    assert_matches!(solved, Solutions::Constrained(SolutionPaths::Complete(solutions)) if
+                        solutions.iter().any(|solution| {
+                            solution.is_valid() && solution.solved_typevars.iter().any(|binding| {
+                                binding.bound_typevar == result && binding.solution == expected
+                            })
+                        })
+                    );
+                } else {
+                    assert!(matches!(solved, Solutions::Unsatisfiable(_)));
+                }
+                assert!(path.assignments.is_empty());
+                assert!(path.relations.is_empty());
+                assert!(path.visiting_relations.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn derived_relation_evidence_matches_explicit_relation() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let left = create_typevar(db, "Left");
+        let right = create_typevar(db, "Right");
+        let local = create_typevar(db, "Local");
+        let result = create_typevar(db, "Result");
+        let string = KnownClass::Str.to_instance(db, &env);
+        let gradual = UnionType::from_elements(db, &env, [Type::any(), string]);
+        let inferable = TypeVarSet::from_typevars(db, [result]);
+        let relation = ConstraintSetBuilder::new().into_owned(|builder| {
+            create_constraint(db, builder, local, KnownClass::Str)
+                .and(db, builder, || {
+                    ConstraintSet::constrain_typevar_lower_bound(db, &env, builder, result, gradual)
+                })
+                .reduce_inferable(db, &env, builder, TypeVarSet::from_typevars(db, [local]))
+        });
+        for reverse in [false, true] {
+            for reload in [false, true] {
+                let builder = ConstraintSetBuilder::new();
+                let lhs = create_constraint(db, &builder, left, KnownClass::Str);
+                let rhs = create_constraint(db, &builder, right, KnownClass::Int);
+                let antecedents = lhs.and(db, &builder, || rhs);
+                let later = ConstraintSet::constrain_typevar_upper_bound(
+                    db, &env, &builder, result, string,
+                );
+                let explicit = builder.load(db, &env, &relation);
+                let explicit = if reverse {
+                    later
+                        .and(db, &builder, || explicit)
+                        .and(db, &builder, || antecedents)
+                } else {
+                    antecedents
+                        .and(db, &builder, || explicit)
+                        .and(db, &builder, || later)
+                };
+                let expected = explicit.solutions(db, &env, inferable).unwrap();
+                assert!(matches!(
+                    expected,
+                    Solutions::Constrained(SolutionPaths::Complete(_))
+                ));
+                let implicit = if reverse {
+                    later.and(db, &builder, || antecedents)
+                } else {
+                    antecedents.and(db, &builder, || later)
+                };
+                let implicit = if reload {
+                    let owned = match implicit.node.node() {
+                        Node::Interior(root) => OwnedConstraintSetBuilder::snapshot(
+                            &builder.storage.borrow(),
+                            root,
+                            implicit.source_order.unwrap(),
+                        ),
+                        Node::AlwaysTrue | Node::AlwaysFalse => {
+                            unreachable!("test relation is nonterminal")
+                        }
+                    };
+                    builder.load(db, &env, &owned)
+                } else {
+                    implicit
+                };
+                let mut storage = builder.storage.borrow_mut();
+                let ante1 = storage
+                    .interior_node_data(lhs.node)
+                    .constraint
+                    .expect_atomic(&storage);
+                let ante2 = storage
+                    .interior_node_data(rhs.node)
+                    .constraint
+                    .expect_atomic(&storage);
+                let mut map = SequentMap::default();
+                map.sequents
+                    .push(SequentGroup::Ungrouped(Box::new([Sequent::PairRelation {
+                        ante1: storage.atomic_constraint_data(ante1),
+                        ante2: storage.atomic_constraint_data(ante2),
+                        post: (relation.clone(), ConstraintProvenance::Evidence),
+                        fuel_cost: (),
+                    }])));
+                let mut path =
+                    implicit
+                        .node
+                        .path_assignments(db, &env, &mut storage, implicit.source_order);
+                path.add_sequents(db, &env, &mut storage, &map);
+                let support = Support::from_typevar_set(db, &mut storage, inferable);
+                let orders = storage.calculate_source_orders(implicit.source_order);
+                let mut walker = SolutionWalker::new(
+                    db,
+                    &mut storage,
+                    orders,
+                    inferable,
+                    UnboundedSolutionLimits,
+                    implicit.node,
+                );
+                let ControlFlow::Continue(()) = walker.visit_node(
+                    db,
+                    &env,
+                    &mut storage,
+                    &mut path,
+                    Some(&support),
+                    Polarity::Positive,
+                    implicit.node,
+                );
+                let candidates = walker.finish();
+                drop(storage);
+                assert_eq!(
+                    candidates.solve(db, &env, &builder),
+                    expected,
+                    "reverse={reverse}, reload={reload}"
+                );
+            }
+        }
     }
 
     #[test]
