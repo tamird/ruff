@@ -137,7 +137,7 @@ mod variables;
 
 use owned::OwnedConstraintSetBuilder;
 use paths::PathAssignments;
-use solutions::{Polarity, Satisfiability, SolutionWalker};
+use solutions::{Polarity, Satisfiability, SolutionWalker, Validations};
 use variables::{AtomicConstraint, Constraint, ConstraintProvenance, ExistentialBound};
 
 /// An extension trait for building constraint sets from [`Option`] values.
@@ -3817,6 +3817,17 @@ impl<'db> CandidateResidual<'db> {
                 budget.charge_type(db, binding.solution)?;
             }
         }
+        // Family inference may retain a symbolic witness without choosing one declared
+        // constraint. Its complete domain must survive substitution of that witness.
+        let (domain, source_order) = {
+            let mut storage = set.builder.storage.borrow_mut();
+            let support = Support::from_typevar_set(db, &mut storage, locals);
+            Validations::from_locals(db, env, &mut storage, &support)
+                .as_constraint_set(&mut storage)
+        };
+        let set = set.and(db, set.builder, || {
+            ConstraintSet::from_node(set.builder, domain, source_order)
+        });
         let replay = Self::specialize(db, env, set, &bindings);
         let storage = set.builder.storage.borrow();
         // ParamSpec scopes include the base parameter even when the body only uses its
@@ -6350,6 +6361,89 @@ mod tests {
                         solution: expected,
                     }])
                 ])))
+            );
+        }
+    }
+
+    #[test]
+    fn existential_witness_families_preserve_finite_domains() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let string = KnownClass::Str.to_instance(db, &env);
+        let bytes = KnownClass::Bytes.to_instance(db, &env);
+        let local = create_typevar(db, "Local").map_bound_or_constraints(db, |_| {
+            Some(TypeVarBoundOrConstraints::Constraints(
+                TypeVarConstraints::new(db, [integer, string].as_slice()),
+            ))
+        });
+        let caller = create_typevar(db, "Caller");
+        let builder = ConstraintSetBuilder::new();
+        let set = ConstraintSet::constrain_typevar_equivalence_bound(
+            db,
+            &env,
+            &builder,
+            local,
+            Type::TypeVar(caller),
+        )
+        .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        let inferable = TypeVarSet::from_typevars(db, [caller]);
+        for value in [integer, string, bytes] {
+            let fixed = set.and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &builder, caller, value,
+                )
+            });
+            let result = fixed.solutions(db, &env, inferable).unwrap();
+            if value == bytes {
+                assert_matches!(result, Solutions::Unsatisfiable(_));
+            } else {
+                assert_eq!(
+                    result,
+                    Solutions::Constrained(SolutionPaths::Complete(vec![solution([
+                        TypeVarSolution {
+                            bound_typevar: caller,
+                            solution: value
+                        },
+                    ])]))
+                );
+            }
+        }
+
+        let projected = set.solutions(db, &env, inferable).unwrap();
+        let Solutions::Constrained(paths) = projected else {
+            panic!("expected finite caller solutions, got {projected:?}");
+        };
+        let (paths, incomplete) = match paths {
+            SolutionPaths::Complete(paths) => {
+                assert!(
+                    !paths.is_empty(),
+                    "finite domain has legal int and str witnesses"
+                );
+                (paths, false)
+            }
+            SolutionPaths::Incomplete(paths) => (paths, true),
+        };
+        for path in paths {
+            if incomplete && path.solved_typevars.is_empty() {
+                continue;
+            }
+            let output = path
+                .solved_typevars
+                .iter()
+                .find(|binding| binding.bound_typevar == caller)
+                .map_or(Type::TypeVar(caller), |binding| binding.solution);
+            let instantiated = output.apply_type_mapping(
+                db,
+                &env,
+                &TypeMapping::ApplySpecialization(ApplySpecialization::Single(caller, bytes)),
+                TypeContext::default(),
+            );
+            assert!(
+                instantiated == integer || instantiated == string,
+                "witness family admitted {} outside Local's domain",
+                instantiated.display(db, &env),
             );
         }
     }

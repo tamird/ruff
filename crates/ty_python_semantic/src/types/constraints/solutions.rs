@@ -806,15 +806,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 };
                 let result = if this.proving_satisfiability {
                     let domains = Validations::from_locals(db, env, storage, &locals);
-                    this.visit_domains_and_then(
-                        db,
-                        env,
-                        storage,
-                        path,
-                        domains.upper_bounds.as_slice(),
-                        domains.constrained.as_slice(),
-                        &visit_body,
-                    )
+                    this.visit_domains_and_then(db, env, storage, path, &domains, &visit_body)
                 } else {
                     visit_body(this, storage, path)
                 };
@@ -944,8 +936,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 env,
                 storage,
                 path,
-                validations.upper_bounds.as_slice(),
-                validations.constrained.as_slice(),
+                &validations,
                 &|this, storage, path| match this
                     .node_is_satisfiable_on_path(
                         db,
@@ -987,8 +978,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             env,
             storage,
             path,
-            validations.upper_bounds.as_slice(),
-            validations.constrained.as_slice(),
+            &validations,
             &|this, storage, path| {
                 this.visit_node_and_then(
                     db,
@@ -1153,67 +1143,29 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
 
     /// Quantifier domains are logical assumptions while walking the body. Candidate validation
     /// separately chooses promoted constraints or preserves inference families after the body.
-    #[expect(clippy::too_many_arguments)]
     fn visit_domains_and_then(
         &mut self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
         path: &mut PathAssignments,
-        upper_bounds: &Slice<BoundTypeVarInstance<'db>, UpperBound>,
-        constrained: &Slice<BoundTypeVarInstance<'db>, Constrained<'db>>,
+        domains: &Validations<'db>,
         process_satisfied: &ProcessSatisfied<'_, 'db, L, Break<L::Break>>,
     ) -> ControlFlow<Break<L::Break>> {
-        if let Some(((_, bound), remaining)) = upper_bounds.split_first() {
-            let Some(constraints) = bound.constraints.as_deref() else {
-                return ControlFlow::Continue(());
-            };
-            return self.visit_constraints_and_then(
-                db,
-                env,
-                storage,
-                path,
-                constraints,
-                &|this, storage, path| {
-                    this.visit_domains_and_then(
-                        db,
-                        env,
-                        storage,
-                        path,
-                        remaining,
-                        constrained,
-                        process_satisfied,
-                    )
-                },
-            );
-        }
-        let Some(((_, domain), remaining)) = constrained.split_first() else {
-            return process_satisfied(self, storage, path);
-        };
-        for declared in &domain.declared_constraints {
-            let Some(constraints) = declared.constraints.as_deref() else {
-                continue;
-            };
-            self.visit_constraints_and_then(
-                db,
-                env,
-                storage,
-                path,
-                constraints,
-                &|this, storage, path| {
-                    this.visit_domains_and_then(
-                        db,
-                        env,
-                        storage,
-                        path,
-                        upper_bounds,
-                        remaining,
-                        process_satisfied,
-                    )
-                },
-            )?;
-        }
-        ControlFlow::Continue(())
+        let (node, source_order) = domains.as_constraint_set(storage);
+        self.source_orders
+            .extend(storage.calculate_source_orders(source_order));
+        self.visit_node_and_then(
+            db,
+            env,
+            storage,
+            path,
+            Polarity::Positive,
+            node,
+            &never_cache,
+            &never_prune,
+            process_satisfied,
+        )
     }
 
     fn visit_constraints_and_then(
@@ -2356,6 +2308,46 @@ struct DeclaredConstraint<'db> {
 }
 
 impl<'db> Validations<'db> {
+    /// The declared domain used by proof traversal and witness replay.
+    pub(super) fn as_constraint_set(
+        &self,
+        storage: &mut ConstraintSetStorage<'db>,
+    ) -> (NodeId, Option<SourceOrderId>) {
+        let conjunction = |storage: &mut ConstraintSetStorage<'db>,
+                           constraints: &ValidationConstraints| {
+            let Some(constraints) = constraints else {
+                return (ALWAYS_FALSE, None);
+            };
+            constraints
+                .iter()
+                .fold((ALWAYS_TRUE, None), |(node, source_order), &constraint| {
+                    let (next, next_order) = Node::new_constraint(storage, constraint.into_inner());
+                    let node = node.and(storage, next);
+                    let source_order = storage.ordered_source_order(source_order, next_order);
+                    (node, source_order)
+                })
+        };
+        let mut node = ALWAYS_TRUE;
+        let mut source_order = None;
+        for bound in self.upper_bounds.values() {
+            let (next, next_order) = conjunction(storage, &bound.constraints);
+            node = node.and(storage, next);
+            source_order = storage.ordered_source_order(source_order, next_order);
+        }
+        for domain in self.constrained.values() {
+            let mut alternatives = ALWAYS_FALSE;
+            let mut alternative_order = None;
+            for declared in &domain.declared_constraints {
+                let (next, next_order) = conjunction(storage, &declared.constraints);
+                alternatives = alternatives.or(storage, next);
+                alternative_order = storage.ordered_source_order(alternative_order, next_order);
+            }
+            node = node.and(storage, alternatives);
+            source_order = storage.ordered_source_order(source_order, alternative_order);
+        }
+        (node, source_order)
+    }
+
     fn constraints(&self) -> impl Iterator<Item = AtomicConstraintId> + Clone {
         self.upper_bounds
             .values()
@@ -2371,7 +2363,7 @@ impl<'db> Validations<'db> {
 
     /// A binder owns only its locals' declarations. Types mentioned by those declarations remain
     /// free, and their declarations follow the outer query's validation policy.
-    fn from_locals(
+    pub(super) fn from_locals(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
