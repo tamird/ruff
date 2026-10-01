@@ -10,6 +10,7 @@ use smallvec::SmallVec;
 use crate::types::constraints::PathBoundSolution;
 use crate::types::constraints::paths::PathAssignments;
 use crate::types::constraints::projection::{ProjectionTypeBudget, SolutionBudget};
+use crate::types::constraints::resolution::{SolutionType, resolve_solution};
 use crate::types::constraints::support::Support;
 use crate::types::constraints::variables::{
     AtomicConstraint, Constraint, ConstraintProvenance, UnsatisfiableBound,
@@ -1092,7 +1093,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     }
                 }
                 let relation = ConstraintSet::from_node(&builder, node, source_order);
-                let (replay, _) = CandidateResidual::specialize_witness(
+                let outcome = CandidateResidual::specialize_witness(
                     db,
                     env,
                     relation,
@@ -1100,8 +1101,26 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     locals,
                     &selected,
                     &mut self.witness_budget,
-                )
-                .ok()??;
+                );
+                let replay = match outcome.ok()? {
+                    Some((replay, _)) => replay,
+                    None => {
+                        let alternate = Self::lower_bound_alias_witness(
+                            db, env, &candidate, locals, &selected,
+                        )?;
+                        let (replay, _) = CandidateResidual::specialize_witness(
+                            db,
+                            env,
+                            relation,
+                            locals,
+                            locals,
+                            &alternate,
+                            &mut self.witness_budget,
+                        )
+                        .ok()??;
+                        replay
+                    }
+                };
                 Some((replay.node, replay.source_order))
             })();
             *storage = builder.storage.into_inner();
@@ -1126,6 +1145,50 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         }
         // Refuting these choices does not refute every possible witness.
         ControlFlow::Continue(ExistentialProof::Incomplete { covered })
+    }
+
+    /// Tries logical lower endpoints when ordinary inference selected a local alias cycle.
+    /// This is one alternative witness for a proof; its full relation must still be replayed.
+    fn lower_bound_alias_witness(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        candidate: &CandidateSolution<'db>,
+        locals: TypeVarSet<'db>,
+        selected: &[TypeVarSolution<'db>],
+    ) -> Option<Vec<TypeVarSolution<'db>>> {
+        let resolved = resolve_solution(db, env, locals, selected);
+        let mut alternate = selected.to_vec();
+        let mut changed = false;
+        for (binding, resolved) in alternate.iter_mut().zip(&resolved) {
+            let SolutionType::Unresolved(solution) = resolved else {
+                continue;
+            };
+            let Type::TypeVar(target) = solution else {
+                return None;
+            };
+            let ordinary_local = |variable: BoundTypeVarInstance<'db>| {
+                variable.is_inferable(db, locals)
+                    && !variable.is_paramspec(db)
+                    && !variable.is_typevartuple(db)
+            };
+            if !ordinary_local(binding.bound_typevar)
+                || !ordinary_local(*target)
+                || !selected
+                    .iter()
+                    .any(|other| other.bound_typevar.identity(db) == target.identity(db))
+            {
+                return None;
+            }
+            let bound = candidate.typevars.iter().find(|bound| {
+                bound.bound_typevar.identity(db) == binding.bound_typevar.identity(db)
+            })?;
+            if bound.selected_declared_constraint.is_some() {
+                return None;
+            }
+            binding.solution = bound.effective_lower(db, env);
+            changed = true;
+        }
+        changed.then_some(alternate)
     }
 
     fn with_declared_constraint_solution<R>(
