@@ -1990,23 +1990,8 @@ from functions import invoke, identity
 reveal_type(invoke(identity, 1))  # revealed: Literal[1]
 ```
 
-When the either the parameter or the return type is a generic alias referring to the typevar, we
-should still be able to propagate the specializations through. This should work regardless of the
-typevar's variance in the generic alias.
-
-TODO: This currently only works for the `lift` functions (TODO: and only currently for the covariant
-case). For the `lift` functions, the parameter type is a bare typevar, resulting in us inferring a
-type mapping of `A = int, B = Class[A]`. When specializing, we can substitute the mapping of `A`
-into the mapping of `B`, giving the correct return type.
-
-For the `head` functions, the parameter type is a generic alias, resulting in us inferring a type
-mapping of `A = Class[int], A = Class[B]`. At this point, the old solver is not able to unify the
-two mappings for `A`, and we have no mapping for `B`. As a result, we infer `Unknown` for the return
-type.
-
-As part of migrating to the new solver, we will generate a single constraint set combining all of
-the facts that we learn while checking the arguments. And the constraint set implementation should
-be able to unify the two assignments to `A`.
+The callback's parameter and return types share a type variable. Argument inference propagates that
+relationship through generic classes with each variance.
 
 `covariant.py`:
 
@@ -2024,12 +2009,13 @@ reveal_type(invoke(lift_covariant, 1))
 ```py
 from functions import invoke, Contravariant, head_contravariant, lift_contravariant
 
-# TODO: revealed: `int`
-# revealed: Unknown
-reveal_type(invoke(head_contravariant, Contravariant[int]()))
-# TODO: revealed: Contravariant[int]
-# revealed: Unknown
-reveal_type(invoke(lift_contravariant, 1))
+result = invoke(head_contravariant, Contravariant[int]())
+reveal_type(result)  # revealed: int
+invalid: str = result  # error: [invalid-assignment]
+
+lifted = invoke(lift_contravariant, 1)
+reveal_type(lifted)  # revealed: Contravariant[Literal[1]]
+lifted.receive("wrong")  # error: [invalid-argument-type]
 ```
 
 `invariant.py`:
@@ -2039,9 +2025,9 @@ from functions import invoke, Invariant, head_invariant, lift_invariant
 
 # revealed: int
 reveal_type(invoke(head_invariant, Invariant[int]()))
-# TODO: revealed: `Invariant[int]`
-# revealed: Unknown
-reveal_type(invoke(lift_invariant, 1))
+lifted = invoke(lift_invariant, 1)
+reveal_type(lifted)  # revealed: Invariant[Literal[1]]
+lifted.mutable_attribute = "wrong"  # error: [invalid-assignment]
 ```
 
 ## Passing unbound generic methods to generic functions
