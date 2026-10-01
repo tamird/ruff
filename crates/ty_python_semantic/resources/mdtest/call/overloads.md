@@ -2266,7 +2266,8 @@ reveal_type(f((None, None, None)))  # revealed: Literal[b""]
 ### Ambiguous predicate calls
 
 An ambiguous predicate call still returns a boolean. Its gradual result can be assigned to either
-candidate return type, but does not prove that the predicate returned `True` or narrow its argument.
+candidate return type. The candidates share the dictionary predicate relationship, while the result
+remains uncertain.
 
 ```toml
 [environment]
@@ -2294,9 +2295,9 @@ from predicate import is_dictionary
 
 def check(known: dict[str, int], dynamic: Any, unknown, broad: object, mixed: dict[str, int] | str):
     reveal_type(is_dictionary(known))  # revealed: Literal[True]
-    # revealed: (Unknown & Literal[True]) | (Unknown & TypeIs[dict[Any, Any]])
+    # revealed: Unknown & TypeIs[dict[Any, Any] @ dynamic]
     dynamic_result = reveal_type(is_dictionary(dynamic))
-    # revealed: (Unknown & Literal[True]) | (Unknown & TypeIs[dict[Any, Any]])
+    # revealed: Unknown & TypeIs[dict[Any, Any] @ unknown]
     unknown_result = reveal_type(is_dictionary(unknown))
     static_assert(is_subtype_of(TypeOf[dynamic_result], bool))
     static_assert(is_subtype_of(TypeOf[unknown_result], bool))
@@ -2305,13 +2306,13 @@ def check(known: dict[str, int], dynamic: Any, unknown, broad: object, mixed: di
     static_assert(is_assignable_to(TypeOf[dynamic_result], Literal[True]))
     static_assert(is_assignable_to(TypeOf[dynamic_result], TypeIs[dict[Any, Any]]))
     if dynamic_result:
-        reveal_type(dynamic)  # revealed: Any
+        reveal_type(dynamic)  # revealed: Any & dict[Any, Any]
     else:
-        reveal_type(dynamic)  # revealed: Any
+        reveal_type(dynamic)  # revealed: Any & ~Top[dict[Any, Any]]
     if unknown_result:
-        reveal_type(unknown)  # revealed: Unknown
+        reveal_type(unknown)  # revealed: Unknown & dict[Any, Any]
     else:
-        reveal_type(unknown)  # revealed: Unknown
+        reveal_type(unknown)  # revealed: Unknown & ~Top[dict[Any, Any]]
     reveal_type(is_dictionary(broad))  # revealed: TypeIs[dict[Any, Any] @ broad]
     reveal_type(is_dictionary(mixed))  # revealed: TypeIs[dict[Any, Any] @ mixed]
     if is_dictionary(mixed):

@@ -5524,6 +5524,18 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
     ) -> Option<NarrowingConstraints<'db>> {
         let db = self.db;
         let return_ty = inference.expression_type(expr_call);
+        let return_ty = match return_ty {
+            Type::Intersection(intersection) => intersection
+                .positive(db)
+                .iter()
+                .copied()
+                .find(|ty| match ty {
+                    Type::TypeIs(guard) => guard.is_bound(db),
+                    _ => false,
+                })
+                .unwrap_or(return_ty),
+            _ => return_ty,
+        };
 
         let place_and_constraint = match return_ty {
             Type::TypeIs(type_is) => {

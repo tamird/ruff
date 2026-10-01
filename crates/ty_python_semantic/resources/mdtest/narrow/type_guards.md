@@ -381,6 +381,143 @@ def tagged_payloads(
     reveal_type(found)  # revealed: Literal[False]
 ```
 
+## Ambiguous predicate overloads
+
+An overload that always returns true for dictionaries agrees with the dictionary predicate when the
+argument leaves both overloads applicable.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Any, Literal, overload
+from typing_extensions import TypeIs
+from ty_extensions import Intersection
+
+@overload
+def is_dictionary[K, V](value: dict[K, V]) -> Literal[True]: ...
+@overload
+def is_dictionary(value: object) -> TypeIs[dict[Any, Any]]: ...
+def is_dictionary(value: object) -> bool:
+    return isinstance(value, dict)
+
+def check(value: Intersection[Any, str | dict[str, object]]):
+    reveal_type(is_dictionary(value))  # revealed: Unknown & TypeIs[dict[Any, Any] @ value]
+    if is_dictionary(value):
+        reveal_type(value)  # revealed: Any & dict[str, object]
+    else:
+        reveal_type(value)  # revealed: Any & str
+
+@overload
+def reversed_overloads(value: dict[Any, Any] | str) -> TypeIs[dict[Any, Any]]: ...
+@overload
+def reversed_overloads[K, V](value: dict[K, V]) -> Literal[True]: ...
+def reversed_overloads(value: object) -> bool:
+    return isinstance(value, dict)
+
+@overload
+def false_alternative(value: str) -> Literal[False]: ...
+@overload
+def false_alternative(value: object) -> TypeIs[dict[Any, Any]]: ...
+def false_alternative(value: object) -> bool:
+    return isinstance(value, dict)
+
+class Classifier:
+    @overload
+    def is_dictionary[K, V](self, value: dict[K, V]) -> Literal[True]: ...
+    @overload
+    def is_dictionary(self, value: object) -> TypeIs[dict[Any, Any]]: ...
+    def is_dictionary(self, value: object) -> bool:
+        return isinstance(value, dict)
+
+def alternatives(value: Intersection[Any, str | dict[str, object]], dynamic: Any):
+    reveal_type(reversed_overloads(dynamic))  # revealed: Unknown & TypeIs[dict[Any, Any] @ dynamic]
+    if reversed_overloads(dynamic):
+        reveal_type(dynamic)  # revealed: Any & dict[Any, Any]
+    if false_alternative(value):
+        reveal_type(value)  # revealed: Any & dict[str, object]
+    if Classifier().is_dictionary(value):
+        reveal_type(value)  # revealed: Any & dict[str, object]
+
+@overload
+def unrelated_true(value: str) -> Literal[True]: ...
+@overload
+def unrelated_true(value: object) -> TypeIs[dict[Any, Any]]: ...
+def unrelated_true(value: object) -> bool:
+    return isinstance(value, (str, dict))
+
+@overload
+def unrelated_false(value: dict[Any, Any]) -> Literal[False]: ...
+@overload
+def unrelated_false(value: object) -> TypeIs[dict[Any, Any]]: ...
+def unrelated_false(value: object) -> bool:
+    return False
+
+@overload
+def unconstrained(value: str) -> bool: ...
+@overload
+def unconstrained(value: object) -> TypeIs[dict[Any, Any]]: ...
+def unconstrained(value: object) -> bool:
+    return isinstance(value, (str, dict))
+
+@overload
+def inferred_domain[T](value: T, anchor: T) -> Literal[True]: ...
+@overload
+def inferred_domain(value: object, anchor: object) -> TypeIs[dict[Any, Any]]: ...
+def inferred_domain(value: object, anchor: object) -> bool:
+    return True
+
+@overload
+def reordered(value: dict[Any, Any], other: object) -> Literal[True]: ...
+@overload
+def reordered(other: object, value: object) -> TypeIs[dict[Any, Any]]: ...
+def reordered(*args: object, **kwargs: object) -> bool:
+    return True
+
+def refusals(value: Any, other: Any, anchor: dict[str, str]):
+    if unrelated_true(value):
+        reveal_type(value)  # revealed: Any
+    if unrelated_false(value):
+        reveal_type(value)  # revealed: Any
+    else:
+        reveal_type(value)  # revealed: Any
+    if unconstrained(value):
+        reveal_type(value)  # revealed: Any
+    if inferred_domain(value, anchor):
+        reveal_type(value)  # revealed: Any
+    if reordered(value=value, other=other):
+        reveal_type(value)  # revealed: Any
+        reveal_type(other)  # revealed: Any
+
+def identity[T](value: T) -> T:
+    return value
+
+def forwarded(value: Intersection[Any, str | dict[str, object]]):
+    if identity(is_dictionary(value)):
+        reveal_type(value)  # revealed: Any & dict[str, object]
+    else:
+        reveal_type(value)  # revealed: Any & str
+
+def unbound(predicate: Intersection[Any, TypeIs[dict[Any, Any]]]):
+    if identity(predicate):
+        reveal_type(predicate)  # revealed: Any & TypeIs[dict[Any, Any]]
+
+from ty_extensions import Bottom, Top
+from ty_extensions._internal import TypeOf
+
+def materialized(predicate: Top[TypeOf[is_dictionary]], value: Intersection[Any, str | dict[str, object]]):
+    if predicate(value):
+        reveal_type(value)  # revealed: Any & dict[str, object]
+    else:
+        reveal_type(value)  # revealed: (Any & str) | (Any & dict[str, object] & ~Bottom[dict[Any, Any]])
+
+def bottom(predicate: Bottom[TypeOf[is_dictionary]], value: Any):
+    if predicate(value):
+        reveal_type(value)  # revealed: Any
+```
+
 ## Expanded predicate arguments
 
 A starred argument can supply the predicate's first parameter in one expansion and leave it to the

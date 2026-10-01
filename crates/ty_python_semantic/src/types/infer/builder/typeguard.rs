@@ -6,7 +6,7 @@ use ty_python_core::scope::ScopeId;
 use crate::types::call::Bindings;
 use crate::types::call::bind::TypeGuardArgument;
 use crate::types::narrow::NarrowingConstraint;
-use crate::types::{MaterializationKind, Type};
+use crate::types::{IntersectionBuilder, MaterializationKind, Type};
 use crate::{Db, ProgramEnvironment};
 
 pub(super) fn bind_type_guard_return_type<'db>(
@@ -74,6 +74,42 @@ pub(super) fn bind_type_guard_return_type<'db>(
     };
 
     match return_ty {
+        Type::Intersection(intersection) => {
+            let Some(guard) = intersection.positive(db).iter().find_map(|ty| match ty {
+                Type::TypeIs(guard) => (!guard.is_bound(db)).then_some(*guard),
+                _ => None,
+            }) else {
+                return return_ty;
+            };
+            if bindings
+                .single_element()
+                .and_then(|binding| binding.common_type_is_return(db, env))
+                != Some(Type::TypeIs(guard))
+            {
+                return return_ty;
+            }
+            let bound = bind_type_guard_return_type(
+                db,
+                env,
+                scope,
+                Type::TypeIs(guard),
+                bindings,
+                arguments,
+                expression_type,
+            );
+            let mut result = IntersectionBuilder::new(db, env);
+            for positive in intersection.positive(db) {
+                result.add_positive_in_place(if *positive == Type::TypeIs(guard) {
+                    bound
+                } else {
+                    *positive
+                });
+            }
+            for negative in intersection.negative(db) {
+                result.add_negative_in_place(*negative);
+            }
+            result.build()
+        }
         Type::TypeIs(type_is) => {
             let Some((argument, has_parameter_mapping)) = find_narrowed_argument() else {
                 return return_ty;

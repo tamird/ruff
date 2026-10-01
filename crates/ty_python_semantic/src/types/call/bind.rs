@@ -59,6 +59,7 @@ use crate::types::infer::original_class_type;
 use crate::types::known_instance::{
     FieldInstance, InternedConstraintSetSolution, MethodWrapper, MethodWrapperKind,
 };
+use crate::types::narrow::NarrowingConstraint;
 use crate::types::signatures::{
     CallableSignature, Parameter, ParameterDisplayName, ParameterKind, Parameters, ParametersKind,
     PartialApplication, PartialSignatureApplication,
@@ -75,10 +76,10 @@ use crate::types::{
     BindingContext, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
     DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType, GenericAlias,
     InternedConstraintSet, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
-    LiteralValueTypeKind, MemberLookupPolicy, NominalInstanceType, PropertyInstanceType,
-    TypeContext, TypeIdentity, TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance,
-    UnionAccumulator, UnionBuilder, UnionType, WrapperDescriptorKind, enums, is_property_method,
-    list_members,
+    LiteralValueTypeKind, MaterializationKind, MemberLookupPolicy, NominalInstanceType,
+    PropertyInstanceType, TypeContext, TypeIdentity, TypeMapping, TypeVarBoundOrConstraints,
+    TypeVarVariance, UnionAccumulator, UnionBuilder, UnionType, WrapperDescriptorKind, enums,
+    is_property_method, list_members,
 };
 use crate::types::{DictionaryItemKind, ProgramEnvironment};
 use crate::{DisplaySettings, FxOrderSet};
@@ -5003,12 +5004,14 @@ impl<'db> CallableBinding<'db> {
                 OverloadCallResult::ArgumentTypeExpansion(expanded) => expanded.return_type,
                 OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => Type::unknown(),
                 OverloadCallResult::Ambiguous => {
-                    let bound = UnionType::from_elements(
-                        db,
-                        env,
-                        self.matching_overloads()
-                            .map(|(_, overload)| overload.return_type()),
-                    );
+                    let bound = self.common_type_is_return(db, env).unwrap_or_else(|| {
+                        UnionType::from_elements(
+                            db,
+                            env,
+                            self.matching_overloads()
+                                .map(|(_, overload)| overload.return_type()),
+                        )
+                    });
                     // Preserve possible results while accepting operations from every candidate.
                     // The ambiguity marker also preserves recursive-inference convergence.
                     IntersectionType::from_two_elements(
@@ -5075,6 +5078,71 @@ impl<'db> CallableBinding<'db> {
         } else {
             TypeGuardArgument::NoTarget
         }
+    }
+
+    /// Retain a predicate relationship only when every surviving overload establishes it.
+    pub(crate) fn common_type_is_return(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<Type<'db>> {
+        let overloads = self.matching_overloads();
+        let (_, predicate) =
+            overloads
+                .clone()
+                .find(|(_, overload)| match overload.signature.return_type() {
+                    Type::TypeIs(guard) => !guard.is_bound(db),
+                    _ => false,
+                })?;
+        let Type::TypeIs(guard) = predicate.return_type() else {
+            return None;
+        };
+        if guard.is_bound(db)
+            || guard.materialization_kind(db) == Some(MaterializationKind::Bottom)
+            || guard.return_type(db).has_indeterminate_inference(db, env)
+        {
+            return None;
+        }
+        let parameter_index = self.type_guard_parameter_index(db);
+        if !matches!(
+            self.type_guard_argument_index(db),
+            TypeGuardArgument::Index(_)
+        ) {
+            return None;
+        }
+        for (_, overload) in overloads {
+            let declared_return = overload.signature.return_type();
+            if let Type::TypeIs(declared) = declared_return {
+                if declared.is_bound(db) || overload.return_type() != Type::TypeIs(guard) {
+                    return None;
+                }
+                continue;
+            }
+            let truth = declared_return.as_bool_literal()?;
+            let parameter = overload.signature.parameters().get(parameter_index)?;
+            let domain =
+                parameter
+                    .annotated_type()
+                    .materialization(db, env, MaterializationKind::Top);
+            let target = match guard.materialization_kind(db) {
+                Some(kind) => guard.return_type(db).materialization(
+                    db,
+                    env,
+                    if truth { kind } else { kind.flip() },
+                ),
+                None => guard.return_type(db),
+            };
+            // Constant-return arms must exclude the opposite outcome. Certification uses
+            // strict intersection semantics, independently of ordinary narrowing preferences.
+            let excluded = NarrowingConstraint::type_test(db, env, target, !truth, true);
+            let remaining = NarrowingConstraint::intersection(domain)
+                .merge_constraint_and(excluded)
+                .evaluate_constraint_type(db, env);
+            if !remaining.is_never() {
+                return None;
+            }
+        }
+        Some(Type::TypeIs(guard))
     }
 
     fn report_diagnostics(
