@@ -17,6 +17,7 @@ use super::diagnostic::{
     self, INVALID_ARGUMENT_TYPE, INVALID_ASSIGNMENT, INVALID_KEY, PARAMETER_ALREADY_ASSIGNED,
     TOO_MANY_POSITIONAL_ARGUMENTS, report_invalid_key_on_typed_dict, report_missing_typed_dict_key,
 };
+use super::dictionary::{DictionaryExtraItems, DictionaryItem, DictionaryItems};
 use super::infer::{TypeExpressionFlags, infer_deferred_types};
 use super::{
     ApplyTypeMappingVisitor, BoundTypeVarIdentity, ErrorContext, IntersectionType, Type,
@@ -2442,16 +2443,26 @@ fn validate_extracted_typed_dict_keys<'db, 'ast>(
     nodes: TypedDictAssignmentNodes<'ast>,
     full_object_ty: Option<Type<'db>>,
     ignored_keys: &OrderSet<Name>,
+    check_value: &mut impl FnMut(Type<'db>, Type<'db>),
 ) -> (OrderSet<Name>, bool) {
     let mut provided_keys = OrderSet::new();
     let mut valid = true;
 
     for (key_name, unpacked_key) in unpacked_keys {
-        if ignored_keys.contains(key_name) {
+        if ignored_keys.contains(key_name)
+            || (unpacked_key.kind == DictionaryItemKind::Residual
+                && unpacked_key
+                    .value_ty
+                    .resolve_type_alias(context.db())
+                    .is_never())
+        {
             continue;
         }
         if unpacked_key.kind.is_required() {
             provided_keys.insert(key_name.clone());
+        }
+        if let Some(field) = typed_dict.item(context.db(), key_name.as_str()) {
+            check_value(unpacked_key.value_ty, field.declared_ty);
         }
         valid &= TypedDictKeyAssignment {
             context,
@@ -2483,6 +2494,7 @@ fn validate_extracted_typed_dict_openness<'db, 'ast>(
     source_openness: TypedDictOpenness<'db>,
     nodes: TypedDictAssignmentNodes<'ast>,
     ignored_keys: &OrderSet<Name>,
+    check_value: &mut impl FnMut(Type<'db>, Type<'db>),
 ) -> bool {
     let db = context.db();
     let Some(extra_items) = source_openness.effective_extra_items() else {
@@ -2501,9 +2513,11 @@ fn validate_extracted_typed_dict_openness<'db, 'ast>(
     if let Some(target_extra_items) = target_openness.explicit_extra_items() {
         if let Some((target_name, target_field)) =
             typed_dict.items(db).iter().find(|(name, field)| {
-                !source_keys.contains_key(*name)
-                    && !ignored_keys.contains(*name)
-                    && !extra_items_ty.is_assignable_to(db, env, field.declared_ty)
+                if source_keys.contains_key(*name) || ignored_keys.contains(*name) {
+                    return false;
+                }
+                check_value(extra_items_ty, field.declared_ty);
+                !extra_items_ty.is_assignable_to(db, env, field.declared_ty)
             })
         {
             if let Some(builder) = context.report_lint(&INVALID_ARGUMENT_TYPE, nodes.value) {
@@ -2521,6 +2535,7 @@ fn validate_extracted_typed_dict_openness<'db, 'ast>(
             return false;
         }
 
+        check_value(extra_items_ty, target_extra_items.declared_ty);
         if extra_items_ty.is_assignable_to(db, env, target_extra_items.declared_ty) {
             return true;
         }
@@ -2551,6 +2566,90 @@ fn validate_extracted_typed_dict_openness<'db, 'ast>(
         )));
     }
     false
+}
+
+/// Validate the current contents of a mapping copied into a fresh `TypedDict`.
+///
+/// This checks a new allocation, not a lasting schema for the source dictionary: aliases may
+/// still mutate the source after the copy. Contents normalization owns key presence and
+/// exclusions; the ordinary constructor validators own field and extra-item compatibility.
+pub(super) fn validate_typed_dict_copy<'db, 'ast>(
+    context: &InferContext<'db, 'ast>,
+    typed_dict: TypedDictType<'db>,
+    source: &'ast ast::Expr,
+    key_ty: Type<'db>,
+    dictionary: DictionaryItems<'db>,
+    mut check_value: impl FnMut(Type<'db>, Type<'db>),
+) -> bool {
+    let db = context.db();
+    let env = context.program_environment();
+    let str_ty = KnownClass::Str.to_instance(db, env);
+    check_value(key_ty, str_ty);
+    if !key_ty.is_assignable_to(db, env, str_ty) {
+        if let Some(builder) = context.report_lint(&INVALID_ARGUMENT_TYPE, source) {
+            builder.into_diagnostic(format_args!(
+                "Unpacked argument has key type `{}` that is not assignable to `str`",
+                key_ty.display(db, env),
+            ));
+        }
+        return false;
+    }
+
+    let DictionaryItems {
+        items,
+        extra_items,
+        first_entry: _,
+    } = dictionary;
+    let keys = items
+        .into_vec()
+        .into_iter()
+        .map(|item| {
+            let DictionaryItem {
+                name,
+                ty,
+                kind,
+                source: _,
+            } = item;
+            (
+                name,
+                UnpackedTypedDictKey {
+                    value_ty: ty,
+                    kind,
+                    definition: None,
+                },
+            )
+        })
+        .collect();
+    let openness = match extra_items {
+        DictionaryExtraItems::Closed => TypedDictOpenness::Closed,
+        DictionaryExtraItems::Value(ty) => TypedDictOpenness::extra(db, ty, true),
+    };
+    let nodes = TypedDictAssignmentNodes {
+        typed_dict: source.into(),
+        key: source.into(),
+        value: source.into(),
+    };
+    let ignored_keys = OrderSet::new();
+    let (provided_keys, mut valid) = validate_extracted_typed_dict_keys(
+        context,
+        typed_dict,
+        &keys,
+        nodes,
+        None,
+        &ignored_keys,
+        &mut check_value,
+    );
+    valid &= validate_extracted_typed_dict_openness(
+        context,
+        typed_dict,
+        &keys,
+        openness,
+        nodes,
+        &ignored_keys,
+        &mut check_value,
+    );
+    valid &= validate_typed_dict_required_keys(context, typed_dict, &provided_keys, source.into());
+    valid
 }
 
 /// Validates a mixed-constructor positional argument when its type can be viewed as a `TypedDict`.
@@ -2592,6 +2691,7 @@ fn validate_from_typed_dict_argument<'db, 'ast>(
         nodes,
         full_object_ty_annotation(arg_ty),
         ignored_keys,
+        &mut |_, _| {},
     );
     valid &= validate_extracted_typed_dict_openness(
         context,
@@ -2600,6 +2700,7 @@ fn validate_from_typed_dict_argument<'db, 'ast>(
         source_openness,
         nodes,
         ignored_keys,
+        &mut |_, _| {},
     );
 
     Some((provided_keys, valid))
@@ -3108,6 +3209,7 @@ fn validate_merged_unpacked_keyword_argument<'db, 'ast>(
             nodes,
             full_object_ty_annotation(unpacked_type),
             &ignored_keys,
+            &mut |_, _| {},
         );
         unpacked_valid &= validate_extracted_typed_dict_openness(
             context,
@@ -3116,6 +3218,7 @@ fn validate_merged_unpacked_keyword_argument<'db, 'ast>(
             unpacked.openness,
             nodes,
             &ignored_keys,
+            &mut |_, _| {},
         );
 
         for (key_name, unpacked_key) in unpacked.keys {
@@ -3154,6 +3257,7 @@ fn validate_merged_unpacked_keyword_argument<'db, 'ast>(
                 TypedDictOpenness::extra(db, value_ty, true),
                 nodes,
                 shadowed_keys,
+                &mut |_, _| {},
             );
         }
     }

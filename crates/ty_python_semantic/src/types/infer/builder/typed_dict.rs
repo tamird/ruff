@@ -12,11 +12,12 @@ use crate::types::diagnostic::{
     INVALID_ARGUMENT_TYPE, INVALID_TYPE_FORM, MISSING_ARGUMENT, TOO_MANY_POSITIONAL_ARGUMENTS,
     UNKNOWN_ARGUMENT, report_mismatched_type_name,
 };
+use crate::types::dictionary::has_dict_type;
 use crate::types::special_form::TypeQualifier;
 use crate::types::typed_dict::{
     TypedDictOpenness, TypedDictSchema, collect_guaranteed_keyword_keys,
     functional_typed_dict_field, infer_unpacked_keyword_types, typed_dict_with_relaxed_keys,
-    validate_typed_dict_constructor, validate_typed_dict_dict_literal,
+    validate_typed_dict_constructor, validate_typed_dict_copy, validate_typed_dict_dict_literal,
 };
 use crate::types::visitor::any_over_type_expanding_aliases;
 use crate::types::{
@@ -325,6 +326,38 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         Type::ClassLiteral(ClassLiteral::DynamicTypedDict(typeddict))
     }
 
+    /// A contents snapshot can establish a schema only at a fresh copy boundary.
+    pub(super) fn infer_typed_dict_copy(
+        &mut self,
+        typed_dict: TypedDictType<'db>,
+        source: &ast::Expr,
+        source_ty: Type<'db>,
+    ) -> Option<Type<'db>> {
+        if !has_dict_type(self.db(), self.program_environment(), source_ty) {
+            return None;
+        }
+        let (key_ty, _) = source_ty.unpack_keys_and_items(self.db(), self.program_environment())?;
+        let dictionary = self.dictionary_items(source, source_ty)?;
+        let mut requirements_proved = true;
+        let valid = validate_typed_dict_copy(
+            &self.context,
+            typed_dict,
+            source,
+            key_ty,
+            dictionary,
+            |actual, expected| {
+                requirements_proved &=
+                    !self.expression_has_unproved_requirement(source, actual, expected);
+            },
+        );
+        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
+            && (!valid || !requirements_proved)
+        {
+            self.context.record_unproved_requirement(source);
+        }
+        Some(Type::TypedDict(typed_dict))
+    }
+
     pub(super) fn infer_typed_dict_expression(
         &mut self,
         dict: &ast::ExprDict,
@@ -374,6 +407,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             };
 
             item_types.insert(item.value.node_index().load(), value_ty);
+        }
+
+        if let [item] = items.as_slice()
+            && item.key.is_none()
+            && let Some(source_ty) = item_types.get(&item.value.node_index().load()).copied()
+            && let Some(result) = self.infer_typed_dict_copy(typed_dict, &item.value, source_ty)
+        {
+            return Some(result);
         }
 
         let mut unproved_element = None;

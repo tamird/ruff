@@ -7702,6 +7702,144 @@ fn callable_unions_preserve_argument_requirements() -> anyhow::Result<()> {
 }
 
 #[test]
+fn dictionary_arguments_preserve_observed_exclusions() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any, Callable
+        from typing_extensions import Never, NotRequired, TypedDict
+
+        class Residual(TypedDict, extra_items=object):
+            name: NotRequired[Never]
+
+        class Integers(TypedDict, extra_items=int):
+            name: NotRequired[Never]
+
+        saved: Residual | None = None
+
+        def helper(value: Residual) -> None: pass
+        def retain(value: Residual) -> None:
+            global saved
+            saved = value
+        def integers(value: Integers) -> None: pass
+        def expose(value: object) -> None: pass
+
+        def direct(name: str, **kwargs: object) -> None:
+            helper(kwargs)
+
+        def copied(name: str, **kwargs: object) -> None:
+            helper({**kwargs})
+
+        def constructed(name: str, **kwargs: object) -> None:
+            helper(dict(kwargs))
+
+        def retained_alias(name: str, **kwargs: object) -> None:
+            retain(kwargs)
+            kwargs["name"] = 1
+
+        def inserted(name: str, **kwargs: object) -> None:
+            kwargs["name"] = 1
+            helper({**kwargs})
+
+        def wrong_values(name: str, **kwargs: str) -> None:
+            integers({**kwargs})
+
+        def escaped(name: str, **kwargs: object) -> None:
+            expose(kwargs)
+            helper({**kwargs})
+
+        def gradual(name: str, **kwargs: Any) -> None:
+            integers({**kwargs})
+
+        def wrong_keys(value: dict[int, object]) -> None:
+            helper({**value})
+
+        def plain(value: dict[str, object]) -> None:
+            helper(value)
+
+        class Fields(TypedDict):
+            field: str
+
+        class Nested(TypedDict):
+            values: list[object]
+
+        def fields(value: Fields) -> None: pass
+        def nested(value: Nested) -> None: pass
+
+        def required() -> None:
+            value = {"field": "hello"}
+            fields(dict(value))
+
+        def missing() -> None:
+            value = {}
+            fields(dict(value))
+
+        def nested_alias(values: list[int]) -> None:
+            value = {"values": values}
+            nested(dict(value))
+
+        class Callbacks(TypedDict, extra_items=Callable[[Any], None]):
+            pass
+
+        def callbacks(value: Callbacks) -> None: pass
+        def narrow(value: str) -> None: pass
+        def wide(value: object) -> None: pass
+
+        def copied_callback() -> None:
+            source = {"extra": narrow}
+            callbacks({**source})
+
+        def constructed_callback() -> None:
+            source = {"extra": narrow}
+            callbacks(dict(source))
+
+        def compatible_callback() -> None:
+            source = {"extra": wide}
+            callbacks(dict(source))
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("direct", true),
+        ("copied", false),
+        ("constructed", false),
+        ("retained_alias", true),
+        ("inserted", true),
+        ("wrong_values", true),
+        ("escaped", true),
+        ("gradual", true),
+        ("wrong_keys", true),
+        ("plain", true),
+        ("required", false),
+        ("missing", true),
+        ("nested_alias", true),
+        ("copied_callback", true),
+        ("constructed_callback", true),
+        ("compatible_callback", false),
+    ];
+    db.select_function_inference(Some((
+        file,
+        cases.map(|(name, _)| name.to_owned()).into_iter().collect(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    let model = crate::SemanticModel::new(&db, program_file(&db, file));
+    let actual = cases.map(|(name, unproved)| {
+        let facts = model
+            .function_inference_facts(first_public_binding(&db, file, name))
+            .unwrap();
+        assert!(!facts.has_cycle_recovery, "{name}");
+        if !unproved || matches!(name, "copied_callback" | "constructed_callback") {
+            assert!(!facts.has_errors, "{name}: {facts:?}");
+            assert_eq!(facts.return_type_correspondence, Some(true), "{name}");
+        }
+        (name, facts.has_unproved_requirements)
+    });
+    assert_eq!(actual, cases);
+    Ok(())
+}
+
+#[test]
 fn empty_generic_arguments_use_final_context() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_python_version(PythonVersion::PY313)

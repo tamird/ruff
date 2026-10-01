@@ -1135,6 +1135,50 @@ def shadowed(source: Source):
     copied: Source = dict(source)
 ```
 
+## Copying observed dictionary contents
+
+A fresh dictionary can be checked against a `TypedDict` using the source's known entries and
+excluded keys. The source keeps its original mutable dictionary type.
+
+```py
+from typing_extensions import Never, NotRequired, TypedDict
+
+class Residual(TypedDict, extra_items=object):
+    name: NotRequired[Never]
+
+def consume(value: Residual) -> None: ...
+def forward(name: str, **kwargs: object):
+    consume({**kwargs})  # no diagnostic
+    consume(dict(kwargs))  # no diagnostic
+    # error: [invalid-argument-type]
+    consume(kwargs)
+    kwargs["name"] = "changed"
+    # error: [invalid-argument-type]
+    consume({**kwargs})
+```
+
+Required fields still need known entries. Copying does not copy nested mutable values or grant them
+a wider element type.
+
+```py
+class Field(TypedDict):
+    field: str
+
+class Nested(TypedDict):
+    values: list[object]
+
+def copies(values: list[int]):
+    source = {"field": "hello"}
+    copied: Field = dict(source)
+    reveal_type(copied)  # revealed: Field
+    empty = {}
+    # error: [missing-typed-dict-key]
+    missing: Field = dict(empty)
+    nested = {"values": values}
+    # error: [invalid-argument-type]
+    wider: Nested = dict(nested)
+```
+
 ## Mixed positional and unpacked keyword constructors
 
 These calls mix a positional `TypedDict` argument with unpacked keyword arguments. They should

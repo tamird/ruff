@@ -3,6 +3,7 @@ use ruff_python_ast::{self as ast, HasNodeIndex};
 use rustc_hash::FxHashMap;
 
 use super::{ArgExpr, TypeInferenceBuilder};
+use crate::types::dictionary::has_dict_type;
 use crate::types::typed_dict::{
     extract_unpacked_typed_dict_keys_from_value_type, infer_unpacked_keyword_types,
 };
@@ -26,7 +27,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 .as_typed_dict()
         {
             // Only speculate applicability checks. A positional source must expose a TypedDict
-            // shape without context; the target must not manufacture its input fields.
+            // shape or observed copy contents without context; the target must not manufacture
+            // its input fields.
             // For `**kwargs`, assignability handles inputs already valid for the target, including
             // gradual and bottom types. The additional
             // TypedDict-shape check keeps invalid-but-analyzable unpacks on this path so validation
@@ -37,24 +39,34 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             // Named keyword values are inferred on the real builder so their diagnostics are either
             // committed with the fast path or left for ordinary `dict(...)` inference when we fall
             // back.
-            let supports_typed_dict_context = {
+            let (supports_typed_dict_context, copy_positional) = {
+                let mut copy_positional = false;
                 let mut speculative_builder = self.speculate_without_diagnostics();
                 let env = speculative_builder.program_environment();
                 let supports_positional = match arguments.args.as_ref() {
                     [] => true,
                     [argument] => {
-                        !argument.is_starred_expr()
-                            && extract_unpacked_typed_dict_keys_from_value_type(
-                                db,
-                                env,
-                                speculative_builder
-                                    .infer_expression(argument, TypeContext::default()),
-                            )
-                            .is_some()
+                        if argument.is_starred_expr() {
+                            false
+                        } else {
+                            let source_ty = speculative_builder
+                                .infer_expression(argument, TypeContext::default());
+                            copy_positional = arguments.keywords.is_empty()
+                                && has_dict_type(db, env, source_ty)
+                                && source_ty.unpack_keys_and_items(db, env).is_some()
+                                && speculative_builder
+                                    .dictionary_items(argument, source_ty)
+                                    .is_some();
+                            copy_positional
+                                || extract_unpacked_typed_dict_keys_from_value_type(
+                                    db, env, source_ty,
+                                )
+                                .is_some()
+                        }
                     }
                     _ => false,
                 };
-                supports_positional
+                let supported = supports_positional
                     && infer_unpacked_keyword_types(arguments, |expr, tcx| {
                         speculative_builder.infer_expression(expr, tcx)
                     })
@@ -64,10 +76,19 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         keyword_ty.is_assignable_to(db, env, Type::TypedDict(typed_dict))
                             || extract_unpacked_typed_dict_keys_from_value_type(db, env, keyword_ty)
                                 .is_some()
-                    })
+                    });
+                (supported, copy_positional)
             };
 
             if supports_typed_dict_context {
+                if copy_positional && let [source] = arguments.args.as_ref() {
+                    let source_ty = self.get_or_infer_expression(source, TypeContext::default());
+                    if let Some(result) = self.infer_typed_dict_copy(typed_dict, source, source_ty)
+                    {
+                        return Some(result);
+                    }
+                }
+
                 let requirements_proved =
                     self.prepare_typed_dict_constructor(typed_dict, arguments, func.into());
                 if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
