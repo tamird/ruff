@@ -106,11 +106,11 @@ use ty_static::EnvVars;
 
 use crate::types::callable::CallableTypeKind;
 use crate::types::class::GenericAlias;
-use crate::types::constraints::projection::ProjectionError;
-#[cfg(test)]
-use crate::types::constraints::projection::SolutionBudget;
+use crate::types::constraints::projection::{
+    ProjectionError, ProjectionTypeBudget, SolutionBudget,
+};
 use crate::types::constraints::support::{Support, SupportId};
-use crate::types::generics::GenericContext;
+use crate::types::generics::{ApplySpecialization, GenericContext};
 use crate::types::typevar::{
     BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarConstraints, TypeVarInstance, TypeVarNonce,
     TypeVarSet,
@@ -124,6 +124,7 @@ use crate::types::{
     TypeContext, TypeMapping, TypePair, TypeVarBoundOrConstraints, TypeVarVariance, UnionType,
 };
 use crate::{Db, FxIndexMap, FxIndexSet, FxOrderSet, ProgramEnvironment};
+use resolution::{SolutionType, resolve_solution};
 
 mod owned;
 pub(crate) mod paths;
@@ -3721,6 +3722,216 @@ pub(crate) enum CandidateSolutions<'db> {
 pub(crate) struct CandidateSolution<'db> {
     typevars: Box<[CandidateTypeVarSolution<'db>]>,
     validity: SolutionValidity<'db>,
+    residual: Option<CandidateResidual<'db>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
+struct CandidateResidual<'db> {
+    /// The selected signed path, including declaration validation and negative scopes.
+    /// Positive scoped locals are free substitution holes here; they are closed before export.
+    relation: OwnedConstraintSet<'db>,
+    /// Positive witnesses that must be resolved and then removed from the result.
+    locals: TypeVarSet<'db>,
+    /// The original caller variables. Other free variables stay rigid during replay.
+    inferable: TypeVarSet<'db>,
+}
+
+impl<'db> CandidateResidual<'db> {
+    fn specialize<'c>(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        set: ConstraintSet<'db, 'c>,
+        bindings: &[TypeVarSolution<'db>],
+    ) -> ConstraintSet<'db, 'c> {
+        let context = GenericContext::from_typevar_instances(
+            db,
+            env,
+            bindings.iter().map(|binding| binding.bound_typevar),
+        );
+        let types: Vec<_> = bindings.iter().map(|binding| binding.solution).collect();
+        let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Partial {
+            generic_context: context,
+            types: &types,
+            skip: None,
+        });
+        let visitor = ApplyTypeMappingVisitor::new(env);
+        set.apply_type_mapping_impl(db, &mapping, TypeContext::default(), &visitor)
+    }
+
+    fn solve<L: SolutionLimits>(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        limits: &mut L,
+        type_budget: &mut ProjectionTypeBudget,
+        mut caller: Solution<'db>,
+        choose: &mut impl FnMut(
+            TypeVarVariance,
+            &CandidateTypeVarSolution<'db>,
+        ) -> PathBoundSolution<'db>,
+    ) -> ControlFlow<L::Break, Option<(Solution<'db>, bool)>> {
+        let Self {
+            relation,
+            locals,
+            inferable,
+        } = self;
+        let closed = resolve_solution(db, env, *inferable, &caller.solved_typevars);
+        let fixed: Vec<_> = caller
+            .solved_typevars
+            .iter()
+            .zip(closed.iter())
+            .filter_map(|(binding, closed)| {
+                if !binding.bound_typevar.is_inferable(db, *inferable) {
+                    return None;
+                }
+                match closed {
+                    SolutionType::Resolved(ty) => Some(TypeVarSolution {
+                        bound_typevar: binding.bound_typevar,
+                        solution: *ty,
+                    }),
+                    SolutionType::Unresolved(_) => None,
+                }
+            })
+            .collect();
+        let joint_inferable =
+            TypeVarSet::from_typevars(db, inferable.iter(db).chain(locals.iter(db)));
+        relation.query(|builder, when| {
+            // The first choice gives contextual evidence priority. If it cannot extend to a
+            // witness, retry the original joint relation without fixing that provisional choice.
+            let attempts: &[&[TypeVarSolution<'db>]] = if fixed.is_empty() {
+                &[&[]]
+            } else {
+                &[&fixed, &[]]
+            };
+            for fixed in attempts {
+                let remaining = TypeVarSet::from_typevars(
+                    db,
+                    joint_inferable.iter(db).filter(|typevar| {
+                        !fixed
+                            .iter()
+                            .any(|binding| binding.bound_typevar == *typevar)
+                    }),
+                );
+                let fixed_relation = Self::specialize(db, env, when, fixed);
+                let candidates = {
+                    let mut storage = builder.storage.borrow_mut();
+                    CandidateSolutions::compute_with_limits(
+                        db,
+                        env,
+                        &mut storage,
+                        fixed_relation.node,
+                        remaining,
+                        fixed_relation.source_order,
+                        &mut *limits,
+                    )
+                };
+                let candidates = candidates?;
+                let (candidate_inferable, candidates) = match candidates {
+                    CandidateSolutions::Unsatisfiable => {
+                        if fixed.is_empty() {
+                            return ControlFlow::Continue(None);
+                        }
+                        continue;
+                    }
+                    CandidateSolutions::Unconstrained => continue,
+                    CandidateSolutions::Constrained { inferable, paths } => (inferable, paths),
+                };
+                let [candidate] = candidates.as_ref() else {
+                    // Selecting across several residual families needs a joint policy. Keep
+                    // this result incomplete rather than selecting unrelated endpoints.
+                    break;
+                };
+                let solution = CandidateSolutions::solve_path_with(
+                    db,
+                    env,
+                    candidate_inferable,
+                    candidate,
+                    limits,
+                    type_budget,
+                    choose,
+                )?;
+                let Some((mut joint, incomplete)) = solution else {
+                    continue;
+                };
+                if incomplete {
+                    break;
+                }
+                if !joint.is_valid() {
+                    continue;
+                }
+                joint.solved_typevars.extend(fixed.iter().copied());
+                let resolved = resolve_solution(db, env, joint_inferable, &joint.solved_typevars);
+                let bindings: Option<Vec<_>> = joint
+                    .solved_typevars
+                    .iter()
+                    .zip(resolved.iter())
+                    .filter(|(binding, _)| binding.bound_typevar.is_inferable(db, joint_inferable))
+                    .map(|(binding, resolved)| match resolved {
+                        SolutionType::Resolved(ty) => Some(TypeVarSolution {
+                            bound_typevar: binding.bound_typevar,
+                            solution: *ty,
+                        }),
+                        SolutionType::Unresolved(_) => None,
+                    })
+                    .collect();
+                let Some(bindings) = bindings else {
+                    continue;
+                };
+                if locals.iter(db).any(|local| {
+                    !bindings
+                        .iter()
+                        .any(|binding| binding.bound_typevar == local)
+                }) {
+                    continue;
+                }
+                if bindings
+                    .iter()
+                    .filter(|binding| binding.bound_typevar.is_inferable(db, *locals))
+                    .any(|binding| type_budget.charge_type(db, binding.solution).is_err())
+                {
+                    break;
+                }
+                let replay = Self::specialize(db, env, when, &bindings);
+                let replay_holds = {
+                    let mut storage = builder.storage.borrow_mut();
+                    let orders = storage.calculate_source_orders(replay.source_order);
+                    let mut path =
+                        replay
+                            .node
+                            .path_assignments(db, env, &mut storage, replay.source_order);
+                    let mut walker = SolutionWalker::new(
+                        db,
+                        &mut storage,
+                        orders,
+                        TypeVarSet::None,
+                        &mut *limits,
+                        replay.node,
+                    );
+                    walker.node_is_satisfiable_on_path(
+                        db,
+                        env,
+                        &mut storage,
+                        &mut path,
+                        Polarity::Negative,
+                        replay.node,
+                        None,
+                    )
+                };
+                if replay_holds? {
+                    continue;
+                }
+                caller.solved_typevars = bindings
+                    .into_iter()
+                    .filter(|binding| !binding.bound_typevar.is_inferable(db, *locals))
+                    .collect();
+                return ControlFlow::Continue(Some((caller, false)));
+            }
+            // Neither an unresolved witness nor a refuted provisional choice justifies an
+            // ordinary result type. Keep only the explicit incomplete outcome.
+            caller.solved_typevars.clear();
+            ControlFlow::Continue(Some((caller, true)))
+        })
+    }
 }
 
 /// Limits shared by the preprocessing, collection, and validation walks used to extract solutions.
@@ -4032,6 +4243,7 @@ impl<'db> CandidateSolutions<'db> {
         let candidate = CandidateSolution {
             typevars: typevars.into_boxed_slice(),
             validity: SolutionValidity::Valid,
+            residual: None,
         };
         ControlFlow::Continue(Some(CandidateSolutions::Constrained {
             inferable,
@@ -4052,18 +4264,24 @@ impl<'db> CandidateSolutions<'db> {
 
     /// Solves each path by applying a per-typevar solver function, collecting retained solutions.
     ///
-    /// A genuinely unsolved variable does not invalidate a path. Budget exhaustion also retains
-    /// the path's available bindings, but marks the resulting path family as incomplete.
+    /// A genuinely unsolved variable does not invalidate a path. Budget exhaustion marks the
+    /// path family as incomplete. Paths with a scoped witness discard unvalidated bindings;
+    /// other paths retain available fallback bindings.
     pub(crate) fn solve_with(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         choose: impl FnMut(TypeVarVariance, &CandidateTypeVarSolution<'db>) -> PathBoundSolution<'db>,
     ) -> Solutions<'db> {
-        let ControlFlow::Continue(solutions) =
-            self.try_solve_with(db, env, &mut UnboundedSolutionLimits, choose, |_| {
-                ControlFlow::<Infallible>::Continue(())
-            });
+        let mut type_budget = ProjectionTypeBudget::new(SolutionBudget::default().type_terms);
+        let ControlFlow::Continue(solutions) = self.try_solve_with(
+            db,
+            env,
+            &mut UnboundedSolutionLimits,
+            &mut type_budget,
+            choose,
+            |_, _| ControlFlow::<Infallible>::Continue(()),
+        );
         solutions
     }
 
@@ -4073,12 +4291,32 @@ impl<'db> CandidateSolutions<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         limits: &mut L,
+        type_budget: &mut ProjectionTypeBudget,
         mut choose: impl FnMut(
             TypeVarVariance,
             &CandidateTypeVarSolution<'db>,
         ) -> PathBoundSolution<'db>,
-        mut check_solution: impl FnMut(&Solution<'db>) -> ControlFlow<L::Break>,
+        check_solution: impl FnMut(&Solution<'db>, &mut ProjectionTypeBudget) -> ControlFlow<L::Break>,
     ) -> ControlFlow<L::Break, Solutions<'db>> {
+        self.try_collect_solutions(
+            type_budget,
+            |inferable, candidate, budget| {
+                Self::solve_path_with(db, env, inferable, candidate, limits, budget, &mut choose)
+            },
+            check_solution,
+        )
+    }
+
+    fn try_collect_solutions<E>(
+        &self,
+        type_budget: &mut ProjectionTypeBudget,
+        mut solve: impl FnMut(
+            TypeVarSet<'db>,
+            &CandidateSolution<'db>,
+            &mut ProjectionTypeBudget,
+        ) -> ControlFlow<E, Option<(Solution<'db>, bool)>>,
+        mut check_solution: impl FnMut(&Solution<'db>, &mut ProjectionTypeBudget) -> ControlFlow<E>,
+    ) -> ControlFlow<E, Solutions<'db>> {
         let (inferable, paths) = match self {
             CandidateSolutions::Unsatisfiable => {
                 let solutions = SolutionPaths::Complete(Vec::default());
@@ -4092,39 +4330,69 @@ impl<'db> CandidateSolutions<'db> {
 
         let mut valid_solutions = Vec::with_capacity(paths.len());
         let mut invalid_solutions = Vec::new();
-        let mut valid_exceeded_budget = false;
-        let mut invalid_exceeded_budget = false;
+        let mut valid_incomplete = false;
+        let mut invalid_incomplete = false;
         for path in paths {
-            let Some((solution, path_exceeded_budget)) =
-                Self::solve_path_with(db, env, inferable, path, limits, &mut choose)?
-            else {
+            let Some((solution, incomplete)) = solve(inferable, path, type_budget)? else {
                 continue;
             };
             if solution.is_valid() {
-                check_solution(&solution)?;
-                valid_exceeded_budget |= path_exceeded_budget;
+                check_solution(&solution, type_budget)?;
+                valid_incomplete |= incomplete;
                 valid_solutions.push(solution);
             } else {
-                invalid_exceeded_budget |= path_exceeded_budget;
+                invalid_incomplete |= incomplete;
                 invalid_solutions.push(solution);
             }
         }
 
         if !valid_solutions.is_empty() {
-            let solutions = SolutionPaths::new(valid_solutions, valid_exceeded_budget);
+            let solutions = SolutionPaths::new(valid_solutions, valid_incomplete);
             return ControlFlow::Continue(Solutions::Constrained(solutions));
         }
 
         for solution in &invalid_solutions {
-            check_solution(solution)?;
+            check_solution(solution, type_budget)?;
         }
-        let solutions = SolutionPaths::new(invalid_solutions, invalid_exceeded_budget);
+        let solutions = SolutionPaths::new(invalid_solutions, invalid_incomplete);
         ControlFlow::Continue(Solutions::Unsatisfiable(solutions))
     }
 
-    /// Solves one complete path, retaining whether any of its bindings used a fallback.
-    /// A later unsatisfiable bound rejects the path even if an earlier bound exhausted its budget.
+    /// Solves one path, validating selected bounds and its complete scoped witness.
     fn solve_path_with<L: SolutionLimits>(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        inferable: TypeVarSet<'db>,
+        candidate: &CandidateSolution<'db>,
+        limits: &mut L,
+        type_budget: &mut ProjectionTypeBudget,
+        choose: &mut impl FnMut(
+            TypeVarVariance,
+            &CandidateTypeVarSolution<'db>,
+        ) -> PathBoundSolution<'db>,
+    ) -> ControlFlow<L::Break, Option<(Solution<'db>, bool)>> {
+        // Scoped locals remain inference variables until witness replay closes them.
+        // A provisional choice containing one cannot yet be checked as a fixed type.
+        let selection_inferable = candidate
+            .residual
+            .as_ref()
+            .map_or(inferable, |residual| inferable.merge(db, residual.locals));
+        let Some((mut solution, incomplete)) =
+            Self::select_bindings(db, env, selection_inferable, candidate, limits, choose)?
+        else {
+            return ControlFlow::Continue(None);
+        };
+        if let Some(residual) = &candidate.residual {
+            if incomplete {
+                solution.solved_typevars.clear();
+            } else {
+                return residual.solve(db, env, limits, type_budget, solution, choose);
+            }
+        }
+        ControlFlow::Continue(Some((solution, incomplete)))
+    }
+
+    fn select_bindings<L: SolutionLimits>(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         inferable: TypeVarSet<'db>,
@@ -4811,18 +5079,18 @@ pub(crate) enum Solutions<'db> {
 /// The retained solution paths and whether all their bindings could be computed.
 ///
 /// An unsolved variable can occur in a complete result when no evidence selects its type. An
-/// exhausted budget is different: consumers must not treat the fallback bindings as an exhaustive
-/// set of valid specializations.
+/// exhausted budget or unresolved witness is different: consumers must not treat fallback
+/// bindings as an exhaustive set of valid specializations.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum SolutionPaths<'db> {
     Complete(Vec<Solution<'db>>),
-    BudgetExceeded(Vec<Solution<'db>>),
+    Incomplete(Vec<Solution<'db>>),
 }
 
 impl<'db> SolutionPaths<'db> {
-    fn new(solutions: Vec<Solution<'db>>, exceeded_budget: bool) -> Self {
-        if exceeded_budget {
-            SolutionPaths::BudgetExceeded(solutions)
+    fn new(solutions: Vec<Solution<'db>>, incomplete: bool) -> Self {
+        if incomplete {
+            SolutionPaths::Incomplete(solutions)
         } else {
             SolutionPaths::Complete(solutions)
         }
@@ -4832,14 +5100,14 @@ impl<'db> SolutionPaths<'db> {
     /// Match the outcome directly when completeness matters.
     pub(crate) fn as_slice(&self) -> &[Solution<'db>] {
         match self {
-            Self::Complete(paths) | Self::BudgetExceeded(paths) => paths,
+            Self::Complete(paths) | Self::Incomplete(paths) => paths,
         }
     }
 
     /// Returns the available solution paths, discarding completeness information.
     pub(crate) fn into_vec(self) -> Vec<Solution<'db>> {
         match self {
-            Self::Complete(paths) | Self::BudgetExceeded(paths) => paths,
+            Self::Complete(paths) | Self::Incomplete(paths) => paths,
         }
     }
 }
@@ -5565,6 +5833,336 @@ mod tests {
     }
 
     #[test]
+    fn existential_witness_results_retain_context() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let string = KnownClass::Str.to_instance(db, &env);
+        let local = create_typevar(db, "Local");
+        let result = create_typevar(db, "Result");
+        let list_string = KnownClass::List.to_specialized_instance(db, &env, &[string]);
+        let list_object = KnownClass::List.to_specialized_instance(db, &env, &[Type::object()]);
+        for (context, expected) in [(None, list_string), (Some(list_object), list_object)] {
+            let builder = ConstraintSetBuilder::new();
+            let list_local =
+                KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
+            let set =
+                ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, local, string)
+                    .and(db, &builder, || {
+                        ConstraintSet::constrain_typevar_equivalence_bound(
+                            db, &env, &builder, result, list_local,
+                        )
+                    })
+                    .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+            let set = match context {
+                Some(context) => set.and(db, &builder, || {
+                    ConstraintSet::constrain_typevar_lower_bound(
+                        db, &env, &builder, result, context,
+                    )
+                }),
+                None => set,
+            };
+            assert_eq!(
+                set.solutions(db, &env, TypeVarSet::from_typevars(db, [result])),
+                Ok(Solutions::Constrained(SolutionPaths::Complete(vec![
+                    solution([TypeVarSolution {
+                        bound_typevar: result,
+                        solution: expected,
+                    }])
+                ])))
+            );
+        }
+    }
+
+    #[test]
+    fn existential_witness_replay_preserves_negative_atoms() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let string = KnownClass::Str.to_instance(db, &env);
+        let local = create_typevar(db, "Local");
+        let result = create_typevar(db, "Result");
+        let builder = ConstraintSetBuilder::new();
+        let list_local =
+            KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
+        let set = ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, local, string)
+            .and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &builder, result, list_local,
+                )
+            })
+            .and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &builder, local, string,
+                )
+                .negate(db, &builder)
+            })
+            .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        // A larger local witness exists, but the selected str witness fails the negative atom.
+        // Its list[str] result must not escape even as an ordinary fallback binding.
+        assert_eq!(
+            set.solutions(db, &env, TypeVarSet::from_typevars(db, [result])),
+            Ok(Solutions::Constrained(SolutionPaths::Incomplete(vec![
+                solution([])
+            ])))
+        );
+
+        let list_string = KnownClass::List.to_specialized_instance(db, &env, &[string]);
+        let sequence_object =
+            KnownClass::Sequence.to_specialized_instance(db, &env, &[Type::object()]);
+        let set = set.and(db, &builder, || {
+            ConstraintSet::constrain_typevar_upper_bound(
+                db,
+                &env,
+                &builder,
+                result,
+                sequence_object,
+            )
+        });
+        assert_eq!(
+            set.solutions_with(
+                db,
+                &env,
+                TypeVarSet::from_typevars(db, [result]),
+                SolutionBudget::default(),
+                |_, _| PathBoundSolution::BudgetExceeded {
+                    fallback: Some(list_string),
+                },
+            ),
+            Ok(Solutions::Constrained(SolutionPaths::Incomplete(vec![
+                solution([])
+            ])))
+        );
+    }
+
+    #[test]
+    fn existential_witness_replay_respects_limits() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let string = KnownClass::Str.to_instance(db, &env);
+        let local = create_typevar(db, "Local");
+        let result = create_typevar(db, "Result");
+        let builder = ConstraintSetBuilder::new();
+        let list_local =
+            KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
+        let set = ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, local, string)
+            .and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &builder, result, list_local,
+                )
+            })
+            .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        let (candidates, _) = set
+            .bounded_path_bounds(
+                db,
+                &env,
+                TypeVarSet::from_typevars(db, [result]),
+                SolutionBudget::default(),
+            )
+            .unwrap();
+        for (paths, visits, error) in [
+            (usize::MAX, 0, ProjectionError::TraversalBudgetExceeded),
+            (0, usize::MAX, ProjectionError::PathBudgetExceeded),
+        ] {
+            let mut limits = BoundedSolutionLimits {
+                remaining_paths: paths,
+                remaining_visits: visits,
+            };
+            assert_eq!(
+                candidates.try_solve_with(
+                    db,
+                    &env,
+                    &mut limits,
+                    &mut ProjectionTypeBudget::new(usize::MAX),
+                    |_, bound| CandidateSolutions::default_solve(db, &env, &builder, bound),
+                    |_, _| ControlFlow::Continue(()),
+                ),
+                ControlFlow::Break(error),
+            );
+        }
+        // A hidden witness that exceeds its type budget cannot justify fallback bindings.
+        assert_eq!(
+            candidates.try_solve_with(
+                db,
+                &env,
+                &mut UnboundedSolutionLimits,
+                &mut ProjectionTypeBudget::new(0),
+                |_, bound| CandidateSolutions::default_solve(db, &env, &builder, bound),
+                |_, _| ControlFlow::Continue(()),
+            ),
+            ControlFlow::Continue(Solutions::Constrained(SolutionPaths::Incomplete(vec![
+                solution([])
+            ]))),
+        );
+    }
+
+    #[test]
+    fn existential_witness_selection_defers_local_bounds() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let local = create_typevar(db, "Local");
+        let free = create_typevar(db, "Free");
+        let result = create_typevar(db, "Result")
+            .map_bound_or_constraints(db, |_| Some(TypeVarBoundOrConstraints::UpperBound(integer)));
+        let builder = ConstraintSetBuilder::new();
+        let set =
+            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, local, integer)
+                .and(db, &builder, || {
+                    ConstraintSet::constrain_typevar_equivalence_bound(
+                        db,
+                        &env,
+                        &builder,
+                        result,
+                        Type::TypeVar(local),
+                    )
+                })
+                .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]))
+                .and(db, &builder, || {
+                    ConstraintSet::constrain_typevar_lower_bound(
+                        db, &env, &builder, result, integer,
+                    )
+                });
+        let (candidates, _) = set
+            .bounded_path_bounds(
+                db,
+                &env,
+                TypeVarSet::from_typevars(db, [result]),
+                SolutionBudget::default(),
+            )
+            .unwrap();
+        let CandidateSolutions::Constrained {
+            paths,
+            inferable: _,
+        } = &candidates
+        else {
+            panic!("expected a scoped candidate");
+        };
+        let [candidate] = paths.as_ref() else {
+            panic!("expected one scoped candidate");
+        };
+        let fresh_local = candidate
+            .residual
+            .as_ref()
+            .unwrap()
+            .locals
+            .iter(db)
+            .next()
+            .unwrap();
+        for chosen in [fresh_local, free] {
+            let mut provisional = true;
+            let solutions = candidates.solve_with(db, &env, |_, bound| {
+                if bound.bound_typevar == result && std::mem::take(&mut provisional) {
+                    PathBoundSolution::Solved(Type::TypeVar(chosen))
+                } else {
+                    CandidateSolutions::default_solve(db, &env, &builder, bound)
+                }
+            });
+            if chosen == fresh_local {
+                assert_eq!(
+                    solutions,
+                    Solutions::Constrained(SolutionPaths::Complete(vec![solution([
+                        TypeVarSolution {
+                            bound_typevar: result,
+                            solution: integer
+                        },
+                    ])]))
+                );
+            } else {
+                assert_matches!(solutions, Solutions::Unsatisfiable(_));
+            }
+        }
+    }
+
+    #[test]
+    fn existential_witness_replay_retains_negative_scope_context() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let string = KnownClass::Str.to_instance(db, &env);
+        let local = create_typevar(db, "Local");
+        let nested = create_typevar(db, "Nested");
+        let result = create_typevar(db, "Result");
+        let list_object = KnownClass::List.to_specialized_instance(db, &env, &[Type::object()]);
+        let builder = ConstraintSetBuilder::new();
+        let list_local =
+            KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
+        let set = ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, local, string)
+            .and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &builder, result, list_local,
+                )
+            })
+            .and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db,
+                    &env,
+                    &builder,
+                    nested,
+                    Type::TypeVar(local),
+                )
+                .and(db, &builder, || {
+                    ConstraintSet::constrain_typevar_equivalence_bound(
+                        db, &env, &builder, nested, string,
+                    )
+                })
+                .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [nested]))
+                .negate(db, &builder)
+            })
+            .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        let set = set.and(db, &builder, || {
+            ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, result, list_object)
+        });
+        assert_eq!(
+            set.solutions(db, &env, TypeVarSet::from_typevars(db, [result])),
+            Ok(Solutions::Constrained(SolutionPaths::Complete(vec![
+                solution([TypeVarSolution {
+                    bound_typevar: result,
+                    solution: list_object,
+                }])
+            ])))
+        );
+    }
+
+    #[test]
+    fn existential_witness_replay_keeps_free_callers_rigid() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let string = KnownClass::Str.to_instance(db, &env);
+        let local = create_typevar(db, "Local");
+        let result = create_typevar(db, "Result");
+        let free = create_typevar(db, "Free");
+        for (upper, expected) in [(Type::object(), true), (Type::TypeVar(free), false)] {
+            let builder = ConstraintSetBuilder::new();
+            let list_local =
+                KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
+            let set = ConstraintSet::constrain_typevar(db, &env, &builder, local, string, upper)
+                .and(db, &builder, || {
+                    ConstraintSet::constrain_typevar_equivalence_bound(
+                        db, &env, &builder, result, list_local,
+                    )
+                })
+                .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+            let list_string = KnownClass::List.to_specialized_instance(db, &env, &[string]);
+            let paths = if expected {
+                SolutionPaths::Complete(vec![solution([TypeVarSolution {
+                    bound_typevar: result,
+                    solution: list_string,
+                }])])
+            } else {
+                SolutionPaths::Incomplete(vec![solution([])])
+            };
+            assert_eq!(
+                set.solutions(db, &env, TypeVarSet::from_typevars(db, [result])),
+                Ok(Solutions::Constrained(paths))
+            );
+        }
+    }
+
+    #[test]
     fn type_mapping_updates_constraint_bounds() {
         // (list[U] ≤ T ≤ list[U])[U ↦ int] = (list[int] ≤ T ≤ list[int])
         let db = setup_db();
@@ -6084,6 +6682,7 @@ mod tests {
                 paths: Box::new([CandidateSolution {
                     typevars: Box::new([path_bound]),
                     validity: SolutionValidity::Valid,
+                    residual: None,
                 }]),
             }
             .solve(db, &env, &builder,),
@@ -6235,11 +6834,13 @@ class E: ...
                         ]
                         .into_boxed_slice(),
                         validity: SolutionValidity::Valid,
+                        residual: None,
                     },
                     CandidateSolution {
                         typevars: vec![CandidateTypeVarSolution::from_equivalence(t, int)]
                             .into_boxed_slice(),
                         validity: SolutionValidity::Valid,
+                        residual: None,
                     },
                 ];
                 let mut recovered = lower
@@ -6258,7 +6859,7 @@ class E: ...
                         paths: paths.into_boxed_slice(),
                     }
                     .solve(db, &env, &builder,),
-                    Solutions::Constrained(SolutionPaths::BudgetExceeded(expected_paths))
+                    Solutions::Constrained(SolutionPaths::Incomplete(expected_paths))
                 );
             }
         }

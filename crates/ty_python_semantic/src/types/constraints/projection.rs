@@ -65,7 +65,7 @@ pub(crate) struct ProjectionTypeBudget {
 }
 
 impl ProjectionTypeBudget {
-    fn new(remaining: usize) -> Self {
+    pub(super) fn new(remaining: usize) -> Self {
         Self { remaining }
     }
 
@@ -162,10 +162,10 @@ impl<'db> ConstraintSet<'db, '_> {
     /// outcome distinguishes missing evidence, invalid paths, and exhausted solution budgets.
     /// The caller is responsible for combining the resulting paths (typically via union).
     ///
-    /// Per-variable budget exhaustion preserves available fallback bindings and marks the path
-    /// family as [`SolutionPaths::BudgetExceeded`](super::SolutionPaths::BudgetExceeded).
-    /// Exhausting a limit in the supplied [`SolutionBudget`] instead returns an error without a
-    /// partial path family.
+    /// Per-variable or hidden-witness type-budget exhaustion marks the path family as
+    /// [`SolutionPaths::Incomplete`](super::SolutionPaths::Incomplete). Paths with a scoped
+    /// witness discard bindings that could not be validated; other paths retain fallback
+    /// bindings. Exhausting the traversal, path, or exported-type budget returns an error.
     pub(crate) fn solutions_with(
         self,
         db: &'db dyn Db,
@@ -176,23 +176,70 @@ impl<'db> ConstraintSet<'db, '_> {
     ) -> Result<Solutions<'db>, ProjectionError> {
         let (path_bounds, mut limits) = self.bounded_path_bounds(db, env, inferable, budget)?;
         let mut type_budget = ProjectionTypeBudget::new(budget.type_terms);
-        match path_bounds.try_solve_with(db, env, &mut limits, choose, |solution| {
-            let mut charge = || {
-                for violation in solution.violations() {
-                    for evidence in violation.evidence_types() {
-                        type_budget.charge_type(db, *evidence)?;
+        match path_bounds.try_solve_with(
+            db,
+            env,
+            &mut limits,
+            &mut type_budget,
+            choose,
+            |solution, type_budget| {
+                let mut charge = || {
+                    for violation in solution.violations() {
+                        for evidence in violation.evidence_types() {
+                            type_budget.charge_type(db, *evidence)?;
+                        }
+                    }
+                    for binding in &solution.solved_typevars {
+                        type_budget.charge_type(db, binding.solution)?;
+                    }
+                    Ok(())
+                };
+                match charge() {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(error) => ControlFlow::Break(error),
+                }
+            },
+        ) {
+            ControlFlow::Continue(solutions) => Ok(solutions),
+            ControlFlow::Break(error) => Err(error),
+        }
+    }
+
+    /// Reconstructs independent bound hints only to diagnose an already rejected full call.
+    /// These choices do not establish a joint witness and are always marked incomplete.
+    pub(crate) fn diagnostic_solutions(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        inferable: TypeVarSet<'db>,
+    ) -> Result<Solutions<'db>, ProjectionError> {
+        let budget = SolutionBudget::default();
+        let (candidates, mut limits) = self.bounded_path_bounds(db, env, inferable, budget)?;
+        let mut type_budget = ProjectionTypeBudget::new(budget.type_terms);
+        match candidates.try_collect_solutions(
+            &mut type_budget,
+            |inferable, candidate, _budget| {
+                let selected = CandidateSolutions::select_bindings(
+                    db,
+                    env,
+                    inferable,
+                    candidate,
+                    &mut limits,
+                    &mut |_, bound| {
+                        CandidateSolutions::preliminary_solve(db, env, self.builder, bound)
+                    },
+                )?;
+                ControlFlow::Continue(selected.map(|(solution, _)| (solution, true)))
+            },
+            |solution, type_budget| {
+                for binding in &solution.solved_typevars {
+                    if let Err(error) = type_budget.charge_type(db, binding.solution) {
+                        return ControlFlow::Break(error);
                     }
                 }
-                for binding in &solution.solved_typevars {
-                    type_budget.charge_type(db, binding.solution)?;
-                }
-                Ok(())
-            };
-            match charge() {
-                Ok(()) => ControlFlow::Continue(()),
-                Err(error) => ControlFlow::Break(error),
-            }
-        }) {
+                ControlFlow::Continue(())
+            },
+        ) {
             ControlFlow::Continue(solutions) => Ok(solutions),
             ControlFlow::Break(error) => Err(error),
         }
@@ -267,12 +314,18 @@ impl<'db> CandidateSolutions<'db> {
 
         let mut retained = false;
         for candidate in candidates {
-            let Some((solution, incomplete)) =
-                (match Self::solve_path_with(db, env, inferable, candidate, limits, &mut choose) {
-                    ControlFlow::Continue(solution) => solution,
-                    ControlFlow::Break(error) => return Err(error),
-                })
-            else {
+            let Some((solution, incomplete)) = (match Self::solve_path_with(
+                db,
+                env,
+                inferable,
+                candidate,
+                limits,
+                budget,
+                &mut choose,
+            ) {
+                ControlFlow::Continue(solution) => solution,
+                ControlFlow::Break(error) => return Err(error),
+            }) else {
                 continue;
             };
             if !solution.is_valid() {

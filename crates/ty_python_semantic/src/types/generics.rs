@@ -2910,7 +2910,8 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         for (formal, actual) in argument_relations {
             let when =
                 actual.when_constraint_set_assignable_to(db, self.env, formal, self.constraints);
-            let analysis = self.analyze_constraint_set(when);
+            let solutions = when.diagnostic_solutions(db, self.env, self.inferable);
+            let analysis = self.analyze_solutions(solutions);
             self.project_for_legacy_fallback(&analysis);
         }
 
@@ -3573,6 +3574,13 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             },
         );
 
+        self.analyze_solutions(solutions)
+    }
+
+    fn analyze_solutions(
+        &self,
+        solutions: Result<Solutions<'db>, ProjectionError>,
+    ) -> ConstraintSetAnalysis<'db> {
         match solutions {
             Ok(Solutions::Unsatisfiable(solutions)) => {
                 let failures = solutions

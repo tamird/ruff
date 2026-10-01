@@ -1547,3 +1547,76 @@ def check(pair: Pair[int], box: Box[int], other: Box[str], nested: Nested[int], 
     pair(other)  # error: [invalid-argument-type]
     reveal_type(nested(lists))  # revealed: tuple[Box[list[int]], list[int]]
 ```
+
+## Receiver-derived invariant results
+
+Receiver specialization and protocol return inference share one choice of element type. The result
+retains that choice inside an invariant list. A second argument can require a wider element type,
+while an incompatible invariant result is rejected.
+
+```py
+from _typeshed import SupportsRAdd
+from collections.abc import Sequence
+from typing import Generic, TypeVar
+
+V = TypeVar("V", covariant=True)
+L = TypeVar("L")
+R = TypeVar("R")
+Result = TypeVar("Result")
+
+class Receiver(Generic[V]):
+    def __radd__(self: "Receiver[Sequence[L]]", other: list[R], /) -> list[L | R]:
+        raise NotImplementedError
+
+def reflected(other: SupportsRAdd[list[str], Result]) -> Result:
+    return other.__radd__(["x"])
+
+def objects(other: SupportsRAdd[list[str], list[object]]) -> None:
+    pass
+
+def integers(other: SupportsRAdd[list[str], list[int]]) -> None:
+    pass
+
+def correlated(other: SupportsRAdd[list[str], Result], expected: Result) -> Result:
+    return other.__radd__(["x"])
+
+def check(value: Receiver[list[str]]):
+    reveal_type(reflected(value))  # revealed: list[str]
+    reveal_type(value.__radd__(["x"]))  # revealed: list[str]
+    objects(value)  # no diagnostic
+    integers(value)  # error: [invalid-argument-type]
+    reveal_type(correlated(value, [object()]))  # revealed: list[object]
+    correlated(value, 1)  # no diagnostic: both list[str] and int fit the result
+    result: int = correlated(value, 1)  # error: [invalid-assignment]
+```
+
+## Shared specialization for invariant results
+
+Both output lists use the same specialization of the callback's type variable.
+
+```py
+from typing import Callable, TypeVar
+
+T = TypeVar("T")
+A = TypeVar("A")
+B = TypeVar("B")
+
+def make(value: T, /) -> tuple[list[T], list[T]]:
+    return [value], [value]
+
+def combine(callback: Callable[[str], tuple[A, B]], sink: Callable[[A, B], None]) -> None:
+    pass
+
+def strings(left: list[str], right: list[str]) -> None:
+    pass
+
+def objects(left: list[object], right: list[object]) -> None:
+    pass
+
+def mixed(left: list[str], right: list[object]) -> None:
+    pass
+
+combine(make, strings)  # no diagnostic
+combine(make, objects)  # no diagnostic
+combine(make, mixed)  # error: [invalid-argument-type]
+```

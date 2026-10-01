@@ -8,7 +8,7 @@ use crate::types::constraints::support::Support;
 use crate::types::constraints::variables::{Constraint, ExistentialBound};
 use crate::types::constraints::{
     ConstraintId, ConstraintSetStorage, InteriorNode, NodeId, OwnedConstraintSet,
-    OwnedConstraintSetInner, SourceOrder, SourceOrderId, SupportId,
+    OwnedConstraintSetInner, SourceOrder, SourceOrderId, SupportId, TypeVarId,
 };
 
 pub(super) struct OwnedConstraintSetBuilder {
@@ -22,7 +22,7 @@ pub(super) struct OwnedConstraintSetBuilder {
 
 impl OwnedConstraintSetBuilder {
     pub(super) fn build(
-        mut storage: ConstraintSetStorage<'_>,
+        storage: ConstraintSetStorage<'_>,
         root: InteriorNode,
         source_order: SourceOrderId,
     ) -> OwnedConstraintSet<'_> {
@@ -34,14 +34,91 @@ impl OwnedConstraintSetBuilder {
             source_orders: IndexVec::default(),
             mapped_source_orders: FxHashMap::default(),
         };
-        builder.mark_node_used(&mut storage, root.node());
+        builder.mark_node_used(&storage, root.node());
         let mapped_source_order = builder
-            .mark_source_order_used(&mut storage, source_order)
+            .mark_source_order_used(&storage, source_order)
             .expect("non-terminal BDD should have source_order");
         builder.finish(storage, root, mapped_source_order)
     }
 
-    fn mark_node_used(&mut self, storage: &mut ConstraintSetStorage<'_>, node: NodeId) {
+    /// Copies the graph reachable from one root without copying the builder's memo tables.
+    /// The typevar table stays intact so copied constraints retain their local IDs.
+    pub(super) fn snapshot<'db>(
+        storage: &ConstraintSetStorage<'db>,
+        root: InteriorNode,
+        source_order: SourceOrderId,
+    ) -> OwnedConstraintSet<'db> {
+        let overlay = storage.compacted.as_deref();
+        let mut builder = Self {
+            used_nodes: RankBitBox::bits_with_capacity(
+                storage.nodes.len() + overlay.map_or(0, |inner| inner.node_indices.len()),
+            ),
+            used_constraints: RankBitBox::bits_with_capacity(
+                storage.constraints.len()
+                    + overlay.map_or(0, |inner| inner.constraint_indices.len()),
+            ),
+            used_supports: RankBitBox::bits_with_capacity(
+                storage.supports.len() + overlay.map_or(0, |inner| inner.support_indices.len()),
+            ),
+            live_support: storage.node_support(root.node()).cloned(),
+            source_orders: IndexVec::default(),
+            mapped_source_orders: FxHashMap::default(),
+        };
+        builder.mark_node_used(storage, root.node());
+        let mapped_source_order = builder
+            .mark_source_order_used(storage, source_order)
+            .expect("non-terminal BDD should have source_order");
+        let nodes = builder
+            .used_nodes
+            .iter_ones()
+            .map(|id| storage.interior_node_data(NodeId::from_usize(id)))
+            .collect();
+        let node_supports = builder
+            .used_nodes
+            .iter_ones()
+            .map(|id| {
+                storage
+                    .node_support_id(NodeId::from_usize(id))
+                    .expect("marked nodes are nonterminal")
+            })
+            .collect();
+        let constraints = builder
+            .used_constraints
+            .iter_ones()
+            .map(|id| {
+                storage
+                    .constraint_data(ConstraintId::from_usize(id))
+                    .clone()
+            })
+            .collect();
+        let constraint_supports = builder
+            .used_constraints
+            .iter_ones()
+            .map(|id| storage.constraint_support_id(ConstraintId::from_usize(id)))
+            .collect();
+        let supports = builder
+            .used_supports
+            .iter_ones()
+            .map(|id| storage.support_data(SupportId::from_usize(id)).clone())
+            .collect();
+        let typevar_count =
+            storage.typevars.len() + overlay.map_or(0, |inner| inner.typevars.len());
+        let typevars = (0..typevar_count)
+            .map(|id| storage.typevar_data(TypeVarId::from_usize(id)))
+            .collect();
+        builder.finish_parts(
+            root,
+            mapped_source_order,
+            nodes,
+            node_supports,
+            constraints,
+            constraint_supports,
+            supports,
+            typevars,
+        )
+    }
+
+    fn mark_node_used(&mut self, storage: &ConstraintSetStorage<'_>, node: NodeId) {
         if node.is_terminal() || self.used_nodes[node.index()] {
             return;
         }
@@ -61,7 +138,7 @@ impl OwnedConstraintSetBuilder {
 
     fn mark_constraint_used(
         &mut self,
-        storage: &mut ConstraintSetStorage<'_>,
+        storage: &ConstraintSetStorage<'_>,
         constraint: ConstraintId,
     ) {
         if self.used_constraints[constraint.index()] {
@@ -77,7 +154,9 @@ impl OwnedConstraintSetBuilder {
             Constraint::Atomic(_) => {}
             Constraint::Existential(existential) => {
                 let ExistentialBound {
-                    body, source_order, ..
+                    body,
+                    source_order,
+                    .. // The constructor marker is private to `variables`.
                 } = *existential;
                 self.mark_node_used(storage, body);
                 if let Some(source_order) = source_order {
@@ -89,13 +168,13 @@ impl OwnedConstraintSetBuilder {
         }
     }
 
-    fn mark_support_used(&mut self, _storage: &mut ConstraintSetStorage<'_>, support: SupportId) {
+    fn mark_support_used(&mut self, _storage: &ConstraintSetStorage<'_>, support: SupportId) {
         self.used_supports.set(support.index(), true);
     }
 
     fn mark_source_order_used(
         &mut self,
-        storage: &mut ConstraintSetStorage<'_>,
+        storage: &ConstraintSetStorage<'_>,
         source_order: SourceOrderId,
     ) -> Option<SourceOrderId> {
         let source_order_data = storage.source_order_data(source_order);
@@ -136,18 +215,11 @@ impl OwnedConstraintSetBuilder {
     }
 
     fn finish(
-        mut self,
-        mut storage: ConstraintSetStorage<'_>,
+        self,
+        storage: ConstraintSetStorage<'_>,
         root: InteriorNode,
         mapped_source_order: SourceOrderId,
     ) -> OwnedConstraintSet<'_> {
-        let largest = self.used_nodes.last_one().map_or(0, |last| last + 1);
-        self.used_nodes.truncate(largest);
-        let largest = self.used_constraints.last_one().map_or(0, |last| last + 1);
-        self.used_constraints.truncate(largest);
-        let largest = self.used_supports.last_one().map_or(0, |last| last + 1);
-        self.used_supports.truncate(largest);
-
         let nodes = storage
             .nodes
             .into_iter()
@@ -160,23 +232,12 @@ impl OwnedConstraintSetBuilder {
             .zip(&self.used_nodes)
             .filter_map(|(support, used)| used.then_some(support))
             .collect();
-        let node_indices = RankBitBox::from_bits(self.used_nodes);
 
         let constraints = storage
             .constraints
             .into_iter()
             .zip(&self.used_constraints)
-            .filter_map(|(mut constraint, used)| {
-                if !used {
-                    return None;
-                }
-                if let Constraint::Existential(existential) = &mut constraint
-                    && let Some(source_order) = existential.source_order
-                {
-                    existential.source_order = self.mapped_source_orders[&source_order];
-                }
-                Some(constraint)
-            })
+            .filter_map(|(constraint, used)| used.then_some(constraint))
             .collect();
         let constraint_supports = storage
             .constraint_supports
@@ -184,7 +245,6 @@ impl OwnedConstraintSetBuilder {
             .zip(&self.used_constraints)
             .filter_map(|(support, used)| used.then_some(support))
             .collect();
-        let constraint_indices = RankBitBox::from_bits(self.used_constraints);
 
         let supports = storage
             .supports
@@ -192,9 +252,57 @@ impl OwnedConstraintSetBuilder {
             .zip(&self.used_supports)
             .filter_map(|(support, used)| used.then_some(support))
             .collect();
-        let support_indices = RankBitBox::from_bits(self.used_supports);
 
-        storage.typevars.shrink_to_fit();
+        self.finish_parts(
+            root,
+            mapped_source_order,
+            nodes,
+            node_supports,
+            constraints,
+            constraint_supports,
+            supports,
+            storage.typevars,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn finish_parts<'db>(
+        self,
+        root: InteriorNode,
+        mapped_source_order: SourceOrderId,
+        nodes: Box<[super::InteriorNodeData]>,
+        node_supports: Box<[SupportId]>,
+        mut constraints: Box<[Constraint<'db>]>,
+        constraint_supports: Box<[SupportId]>,
+        supports: Box<[Support]>,
+        mut typevars: IndexVec<TypeVarId, super::BoundTypeVarInstance<'db>>,
+    ) -> OwnedConstraintSet<'db> {
+        let Self {
+            mut used_nodes,
+            mut used_constraints,
+            mut used_supports,
+            live_support: _,
+            source_orders,
+            mapped_source_orders,
+        } = self;
+        let largest = used_nodes.last_one().map_or(0, |last| last + 1);
+        used_nodes.truncate(largest);
+        let largest = used_constraints.last_one().map_or(0, |last| last + 1);
+        used_constraints.truncate(largest);
+        let largest = used_supports.last_one().map_or(0, |last| last + 1);
+        used_supports.truncate(largest);
+
+        for constraint in &mut constraints {
+            if let Constraint::Existential(existential) = constraint
+                && let Some(source_order) = existential.source_order
+            {
+                existential.source_order = mapped_source_orders[&source_order];
+            }
+        }
+        let node_indices = RankBitBox::from_bits(used_nodes);
+        let constraint_indices = RankBitBox::from_bits(used_constraints);
+        let support_indices = RankBitBox::from_bits(used_supports);
+        typevars.shrink_to_fit();
 
         OwnedConstraintSet {
             node: root.node(),
@@ -203,13 +311,13 @@ impl OwnedConstraintSetBuilder {
                 constraints,
                 constraint_supports,
                 constraint_indices,
-                typevars: storage.typevars,
+                typevars,
                 nodes,
                 node_supports,
                 node_indices,
                 supports,
                 support_indices,
-                source_orders: self.source_orders.raw.into_boxed_slice(),
+                source_orders: source_orders.raw.into_boxed_slice(),
             })),
         }
     }

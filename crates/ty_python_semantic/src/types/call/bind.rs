@@ -6594,10 +6594,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     }
                 }
 
-                Some((
-                    preferred,
-                    matches!(solutions, SolutionPaths::BudgetExceeded(_)),
-                ))
+                Some((preferred, matches!(solutions, SolutionPaths::Incomplete(_))))
             })
             .unwrap_or_default();
 

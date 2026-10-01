@@ -9,9 +9,10 @@ use super::{ProjectionError, ProjectionTypeBudget, SolutionBudget, SolutionProje
 use crate::db::tests::{TestDb, setup_db};
 use crate::place::global_symbol;
 use crate::types::constraints::{
-    CandidateSolution, CandidateSolutions, CandidateTypeVarSolution, ConstraintFailureEvidence,
-    ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, PathBoundSolution, Solution,
-    SolutionPaths, SolutionValidity, SolutionViolationKind, Solutions, TypeVarSolution,
+    BoundedSolutionLimits, CandidateSolution, CandidateSolutions, CandidateTypeVarSolution,
+    ConstraintFailureEvidence, ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension,
+    PathBoundSolution, Solution, SolutionPaths, SolutionValidity, SolutionViolationKind, Solutions,
+    TypeVarSolution,
 };
 use crate::types::signatures::{Parameter, Parameters, Signature};
 use crate::types::typevar::{
@@ -390,6 +391,7 @@ fn incomplete_paramspec_does_not_reject_potentially_captured_typevar() {
                 CandidateTypeVarSolution::from_equivalence(paramspec, paramspec_value),
             ]),
             validity: SolutionValidity::Valid,
+            residual: None,
         }]),
     };
     let solve = |choice| {
@@ -408,7 +410,7 @@ fn incomplete_paramspec_does_not_reject_potentially_captured_typevar() {
         bindings.extend(fallback.map(|ty| binding(paramspec, ty)));
         assert_eq!(
             solve(PathBoundSolution::BudgetExceeded { fallback }),
-            Solutions::Constrained(SolutionPaths::BudgetExceeded(vec![solution(bindings)]))
+            Solutions::Constrained(SolutionPaths::Incomplete(vec![solution(bindings)]))
         );
     }
 
@@ -605,7 +607,7 @@ fn incomplete_solution_discards_the_projection() {
 
         assert_eq!(
             set.solutions_with(db, &env, inferable, budget, choose),
-            Ok(Solutions::Constrained(SolutionPaths::BudgetExceeded(
+            Ok(Solutions::Constrained(SolutionPaths::Incomplete(
                 alternatives.map(|ty| solution([binding(t, ty)])).into()
             )))
         );
@@ -722,7 +724,7 @@ fn valid_unsolved_path_is_not_unconstrained() {
         ),
         (
             PathBoundSolution::BudgetExceeded { fallback: None },
-            Solutions::Constrained(SolutionPaths::BudgetExceeded(vec![solution([])])),
+            Solutions::Constrained(SolutionPaths::Incomplete(vec![solution([])])),
             Err(ProjectionError::IncompleteSolution),
         ),
         (
@@ -909,6 +911,7 @@ class E: ...
                     typevars: Box::new([CandidateTypeVarSolution::from_equivalence(t, ty)])
                         as Box<[_]>,
                     validity: SolutionValidity::Valid,
+                    residual: None,
                 })
                 .into(),
         };
@@ -917,7 +920,7 @@ class E: ...
             paths.try_fold_with(
                 db,
                 &env,
-                &mut super::super::BoundedSolutionLimits {
+                &mut BoundedSolutionLimits {
                     remaining_paths: usize::MAX,
                     remaining_visits: usize::MAX,
                 },

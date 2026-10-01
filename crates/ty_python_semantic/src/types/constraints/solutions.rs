@@ -13,11 +13,11 @@ use crate::types::constraints::variables::{
     AtomicConstraint, Constraint, ConstraintProvenance, UnsatisfiableBound,
 };
 use crate::types::constraints::{
-    ALWAYS_FALSE, ALWAYS_TRUE, Assignment, AtomicConstraintId, CandidateSolution,
-    CandidateSolutions, CandidateTypeVarSolution, CandidateTypeVarSolver,
-    ConstraintFailureEvidence, ConstraintSetStorage, InteriorNodeData, Node, NodeId,
-    SolutionLimits, SolutionValidity, SolutionViolation, SolutionViolationKind,
-    UnboundedSolutionLimits,
+    ALWAYS_FALSE, ALWAYS_TRUE, Assignment, AtomicConstraintId, CandidateResidual,
+    CandidateSolution, CandidateSolutions, CandidateTypeVarSolution, CandidateTypeVarSolver,
+    ConstraintFailureEvidence, ConstraintId, ConstraintSetStorage, InteriorNodeData, Node, NodeId,
+    OwnedConstraintSet, OwnedConstraintSetBuilder, SolutionLimits, SolutionValidity,
+    SolutionViolation, SolutionViolationKind, UnboundedSolutionLimits,
 };
 use crate::types::typevar::{TypeVarBoundOrConstraints, TypeVarConstraints, TypeVarSet};
 use crate::types::{BoundTypeVarIdentity, BoundTypeVarInstance, Type, any_over_type};
@@ -166,6 +166,9 @@ pub(super) struct SolutionWalker<'db, L> {
     inferable_support: Support,
     limits: L,
 
+    positive_locals: Support,
+    negative_scopes: Vec<ConstraintId>,
+
     declared_constraint_solutions: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
 
     /// Nodes that we have already explored. We can't cache this only on the node ID, since the
@@ -211,6 +214,8 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             inferable,
             inferable_support,
             limits,
+            positive_locals: Support::default(),
+            negative_scopes: Vec::new(),
             declared_constraint_solutions: FxHashMap::default(),
             explored_nodes: FxHashSet::default(),
             pending: Vec::default(),
@@ -305,6 +310,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 relevant_path.sort_unstable_by_key(|(assignment, _)| {
                     assignment.constraint().into_inner().ordering()
                 });
+                // Quantified bodies and validation subwalks use `never_cache`.
+                debug_assert!(this.positive_locals.iter().next().is_none());
+                debug_assert!(this.negative_scopes.is_empty());
                 let key = (polarity, node, relevant_path);
                 ControlFlow::Continue(this.explored_nodes.insert(key))
             },
@@ -647,7 +655,14 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             &|this, storage, path| {
                 // Note that we never negate existential's body, even when we are walking the
                 // negation of the existential _node_.
-                this.visit_node_and_then(
+                let Constraint::Existential(existential) =
+                    storage.constraint_data(interior.constraint)
+                else {
+                    unreachable!("existential visitor requires an existential constraint");
+                };
+                let previous = this.positive_locals.clone();
+                this.positive_locals |= &existential.locals;
+                let result = this.visit_node_and_then(
                     db,
                     env,
                     storage,
@@ -657,7 +672,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     &never_cache,
                     prune_path,
                     process_satisfied,
-                )
+                );
+                this.positive_locals = previous;
+                result
             },
         )?;
 
@@ -708,7 +725,10 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     // least one solution.
                     return ControlFlow::Continue(());
                 }
-                process_satisfied(this, storage, path)
+                this.negative_scopes.push(interior.constraint);
+                let result = process_satisfied(this, storage, path);
+                this.negative_scopes.pop();
+                result
             },
         )
     }
@@ -1539,7 +1559,11 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             Some(_) if violations.is_empty() => return None,
             Some(_) => SolutionValidity::Invalid(violations.into_boxed_slice()),
         };
-        let candidate = CandidateSolution { typevars, validity };
+        let candidate = CandidateSolution {
+            typevars,
+            validity,
+            residual: None,
+        };
         let pending = PendingCandidateSolution {
             candidate,
             source_orders,
@@ -1554,10 +1578,63 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         storage: &mut ConstraintSetStorage<'db>,
         path: &PathAssignments,
     ) -> ControlFlow<Break<L::Break>, bool> {
-        let Some(pending) = self.pending_candidate_solution(db, env, storage, path, None) else {
+        let Some(mut pending) = self.pending_candidate_solution(db, env, storage, path, None)
+        else {
             return ControlFlow::Continue(false);
         };
         self.limits.satisfied_path().map_break(Break::Limits)?;
+        if self.positive_locals.iter().next().is_some() {
+            let mut node = ALWAYS_TRUE;
+            let mut source_order = None;
+            let mut assignments: Vec<_> = path.assignments.iter().collect();
+            // Keep the same evidence order as the independent candidate bounds, including
+            // stable ordering between assignments derived from the same source constraint.
+            assignments.sort_by_key(|(_, (source_constraint, _))| {
+                self.source_orders
+                    .get_index_of(source_constraint)
+                    .expect("every TDD constraint should have a source order")
+            });
+            for (&assignment, _) in assignments {
+                let (condition, order) = match assignment {
+                    Assignment::Positive(id) => Node::new_constraint(storage, id.into_inner()),
+                    Assignment::Negative(id) => {
+                        let (condition, order) = Node::new_constraint(storage, id.into_inner());
+                        (condition.negate(storage), order)
+                    }
+                    Assignment::Unconstrained(_) => continue,
+                };
+                node = node.and(storage, condition);
+                source_order = storage.ordered_source_order(source_order, order);
+            }
+            for scope in &self.negative_scopes {
+                let (condition, order) = Node::new_constraint(storage, *scope);
+                let condition = condition.negate(storage);
+                node = node.and(storage, condition);
+                source_order = storage.ordered_source_order(source_order, order);
+            }
+            let relation = match node.node() {
+                Node::Interior(root) => OwnedConstraintSetBuilder::snapshot(
+                    storage,
+                    root,
+                    source_order.expect("nonterminal path has source order"),
+                ),
+                Node::AlwaysTrue | Node::AlwaysFalse => OwnedConstraintSet {
+                    node,
+                    source_order: None,
+                    inner: None,
+                },
+            };
+            pending.candidate.residual = Some(CandidateResidual {
+                relation,
+                locals: TypeVarSet::from_typevars(
+                    db,
+                    self.positive_locals
+                        .iter()
+                        .map(|id| storage.typevar_data(id)),
+                ),
+                inferable: self.inferable,
+            });
+        }
         self.pending.push(pending);
         ControlFlow::Continue(true)
     }
@@ -1686,6 +1763,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         }
         if let [single] = self.pending.as_slice()
             && single.candidate.typevars.is_empty()
+            && single.candidate.residual.is_none()
         {
             return CandidateSolutions::Unconstrained;
         }
