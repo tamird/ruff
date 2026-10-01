@@ -241,10 +241,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             slice_ty,
                             ExprContext::Load,
                         )
-                        .map(|result| {
-                            self.bounded_subscript_result(
-                                subscript, value_ty, &result, ty, observed,
-                            )
+                        .map(|result| SubscriptResult {
+                            ty,
+                            inputs_proved: result.inputs_proved,
                         })
                         .map_err(|_| ty);
                 }
@@ -539,7 +538,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     }),
                     &constraint_keys,
                 );
-                self.bounded_subscript_result(subscript, value_ty, &result, ty, observed)
+                SubscriptResult {
+                    ty,
+                    inputs_proved: result.inputs_proved,
+                }
             })
             .map_err(|recovery_ty| {
                 self.narrow_expr_with_applicable_constraints(
@@ -548,52 +550,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     &constraint_keys,
                 )
             })
-    }
-
-    fn bounded_subscript_result(
-        &self,
-        subscript: &ast::ExprSubscript,
-        receiver_type: Type<'db>,
-        checked: &SubscriptResult<'db>,
-        ty: Type<'db>,
-        observed: Option<Type<'db>>,
-    ) -> SubscriptResult<'db> {
-        let &SubscriptResult {
-            ty: checked_ty,
-            inputs_proved,
-        } = checked;
-        if self.function_inference_mode != crate::FunctionInferenceMode::Conservative
-            || checked_ty == ty
-        {
-            return SubscriptResult { ty, inputs_proved };
-        }
-        let db = self.db();
-        let env = self.program_environment();
-        if checked_ty.satisfies_declared_output(db, env, ty) {
-            return SubscriptResult { ty, inputs_proved };
-        }
-        let evidence = observed
-            .or_else(|| {
-                crate::types::dictionary::proved_item_type(
-                    db,
-                    self.scope(),
-                    subscript,
-                    receiver_type,
-                    self.reachability_cache(),
-                )
-            })
-            .map_or(checked_ty, |observed| {
-                IntersectionType::from_two_elements(db, env, checked_ty, observed)
-            });
-        // Ordinary place refinements can outlive the values that established them.
-        // Keep independently observed refinements; otherwise let consumers check the
-        // getter's runtime result without granting gradual evidence a narrower type.
-        let ty = if evidence.satisfies_declared_output(db, env, ty) {
-            ty
-        } else {
-            evidence.top_materialization(db, env)
-        };
-        SubscriptResult { ty, inputs_proved }
     }
 
     pub(super) fn infer_explicit_class_specialization(

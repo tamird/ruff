@@ -877,20 +877,6 @@ fn is_builtin_allocation<'db>(
     }
 }
 
-fn fresh_local_allocation<'db>(db: &'db dyn Db, definition: Definition<'db>) -> KeyPreservation {
-    let scope = definition.scope(db);
-    let index = semantic_index(db, scope.program_file(db));
-    if !index
-        .place_table(scope.file_scope_id(db))
-        .place(definition.place(db))
-        .as_symbol()
-        .is_some_and(Symbol::is_local)
-    {
-        return KeyPreservation::Changed;
-    }
-    fresh_allocation(db, definition)
-}
-
 fn fresh_allocation<'db>(db: &'db dyn Db, definition: Definition<'db>) -> KeyPreservation {
     let scope = definition.scope(db);
     let module = parsed_module(db, scope.program_file(db).python_file(db)).load(db);
@@ -1525,7 +1511,6 @@ enum KeyHistoryOrigin<'a, 'db> {
         anchors: &'a [DefinitionState<'db>],
         name: Option<&'a str>,
     },
-    FreshAllocation,
     /// Ordinary member seeds may start at a parameter, but not after a known escape.
     UnexposedParent,
 }
@@ -1570,36 +1555,6 @@ fn parent_allows_seed<'db>(db: &'db dyn Db, owner: Definition<'db>) -> KeyPreser
     )
 }
 
-/// A residual local value is evidence only while its allocation has remained confined.
-/// Reuse the saved-predicate history; ordinary contents values and narrowing stay unchanged.
-pub(super) fn has_confined_origin<'db>(
-    db: &'db dyn Db,
-    scope: ScopeId<'db>,
-    receiver: &ast::Expr,
-) -> bool {
-    let index = semantic_index(db, scope.program_file(db));
-    let table = index.place_table(scope.file_scope_id(db));
-    let Some(place) = PlaceExpr::contents(receiver).and_then(|place| table.place_id(&place)) else {
-        return false;
-    };
-    let Some(use_id) = index.try_expression_use_id(receiver.into()) else {
-        return false;
-    };
-    let use_def = index.use_def_map(scope.file_scope_id(db));
-    let Some(bindings) = use_def.multi_bindings_at_use(use_id, place) else {
-        return false;
-    };
-    matches!(
-        check_contents_history(
-            db,
-            scope,
-            bindings.map(|binding| binding.binding).collect(),
-            KeyHistoryOrigin::FreshAllocation,
-        ),
-        KeyPreservation::Preserved
-    )
-}
-
 fn check_contents_history<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
@@ -1639,7 +1594,6 @@ fn check_contents_history<'db>(
                     } => {
                         return KeyPreservation::Changed;
                     }
-                    KeyHistoryOrigin::FreshAllocation => fresh_local_allocation(db, *definition),
                     KeyHistoryOrigin::UnexposedParent => {
                         if definition.kind(db).is_parameter_def() {
                             continue;
@@ -1673,7 +1627,6 @@ fn check_contents_history<'db>(
                             }
                         ),
                     },
-                    KeyHistoryOrigin::FreshAllocation => transfer.preserves_confinement(),
                     KeyHistoryOrigin::UnexposedParent => transfer.preserves_confinement(),
                 };
                 if !preserved {

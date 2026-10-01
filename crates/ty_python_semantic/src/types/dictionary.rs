@@ -153,17 +153,6 @@ pub(crate) fn required_item_type<'db>(
     kind.is_required().then_some(ty)
 }
 
-pub(crate) fn proved_item_type<'db>(
-    db: &'db dyn Db,
-    scope: ScopeId<'db>,
-    subscript: &ast::ExprSubscript,
-    receiver_type: Type<'db>,
-    reachability: &ReachabilityEvaluationCache<'db>,
-) -> Option<Type<'db>> {
-    let (ty, kind) = observed_item_type(db, scope, subscript, receiver_type, reachability)?;
-    (kind.is_required() || contents::has_confined_origin(db, scope, &subscript.value)).then_some(ty)
-}
-
 /// Publication of contents evidence. An impossible mapping is not an empty mapping, and
 /// must not fall back to the receiver's ordinary type when matching a keyword argument.
 #[derive(Clone, Copy)]

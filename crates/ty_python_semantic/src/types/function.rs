@@ -1308,10 +1308,10 @@ impl<'db> FunctionType<'db> {
 
     /// Returns the original signature of a function selected for contract validation.
     ///
-    /// The function's body scope must use `OutputProof` or `Conservative` inference. This
+    /// The function's body scope must use `OutputProof` inference. This
     /// admits one unmodified, nongeneric signature with named parameters and
     /// known types. Async, generator, overloaded and narrowing-predicate functions are
-    /// excluded. At call sites using the conservative contract, applications must compare
+    /// excluded. Applications must compare
     /// ordinary arguments with these raw parameter types using [`Type::satisfies_declared_output`]
     /// and account for every selected body's and default's checking, suppression and file
     /// obligations.
@@ -1376,51 +1376,6 @@ impl<'db> FunctionType<'db> {
             return None;
         }
         Some(signature)
-    }
-
-    pub(crate) fn conservative_contract_view(self, db: &'db dyn Db) -> Option<Self> {
-        let scope = self.literal(db).last_definition.body_scope(db);
-        if db.function_inference_mode(scope) != crate::FunctionInferenceMode::Conservative {
-            return None;
-        }
-        let signature = self.selected_contract_signature(db)?;
-        let env = ProgramEnvironment::from_scope(scope);
-        let parameters = crate::types::Parameters::from_annotation(
-            db,
-            signature.parameters().iter().cloned().map(|parameter| {
-                let ty = parameter.annotated_type().top_materialization(db, &env);
-                parameter.with_annotated_type(ty)
-            }),
-        );
-        let signature = signature
-            .clone()
-            .with_parameters(parameters)
-            .with_return_type(signature.return_type().top_materialization(db, &env));
-        Some(Self::new(
-            db,
-            self.literal(db),
-            UpdatedFunctionSignatures::new(Some(CallableSignature::single(signature)), None),
-        ))
-    }
-
-    // Argument inference needs the raw declared domain. A bounded callback formal
-    // can otherwise supply Bottom parameter types to the lambda body.
-    pub(crate) fn conservative_contract_parameter(
-        self,
-        db: &'db dyn Db,
-        index: usize,
-    ) -> Option<Type<'db>> {
-        if self.updated_signatures(db).is_none() {
-            return None;
-        }
-        let original = Self::new_internal(db, self.literal(db), None, None);
-        let projected = original.conservative_contract_view(db)?;
-        if projected != self {
-            return None;
-        }
-        let signature = original.selected_contract_signature(db)?;
-        let parameter = signature.parameters().get(index)?;
-        Some(parameter.annotated_type())
     }
 
     pub(crate) fn apply_type_mapping_impl<'a>(

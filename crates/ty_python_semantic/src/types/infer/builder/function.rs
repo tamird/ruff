@@ -276,19 +276,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if self.cycle_recovery.is_some() {
             return false;
         }
-        // Match the input view used to infer this body. The return relation still
-        // checks the original declared constraint in `accepts_under_constraints`.
-        let (input_variable, input_constraint) =
-            if self.function_inference_mode == crate::FunctionInferenceMode::Conservative {
-                let db = self.db();
-                let env = self.program_environment();
-                (
-                    variable.top_materialization(db, env),
-                    constraint.top_materialization(db, env),
-                )
-            } else {
-                (variable, constraint)
-            };
         let use_def = self
             .index
             .use_def_map(self.scope().file_scope_id(self.db()));
@@ -299,8 +286,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .project::<()>(path, |atom| {
                         ReachabilityAtom::Known(self.predicate_truthiness_for_constraint(
                             use_def.predicates()[atom],
-                            input_variable,
-                            input_constraint,
+                            variable,
+                            constraint,
                         ))
                     })
                     .is_always_false()
@@ -1714,10 +1701,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         &mut self,
         parameter: &'ast ast::Parameter,
         definition: Definition<'db>,
-    ) -> Option<Type<'db>> {
+    ) {
         let env = self.program_environment();
         let db = self.db();
-        let mut keyword_element = None;
 
         if let Some((annotation, annotated_type, flags)) = self.parameter_annotation_type(parameter)
         {
@@ -1770,7 +1756,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             {
                 annotated_type
             } else {
-                keyword_element = Some(annotated_type);
                 KnownClass::Dict.to_specialized_instance(
                     db,
                     env,
@@ -1779,7 +1764,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             };
             self.add_parameter_binding(parameter, definition, ty);
         } else {
-            keyword_element = Some(Type::unknown());
             let inferred_ty = KnownClass::Dict.to_specialized_instance(
                 db,
                 env,
@@ -1789,7 +1773,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.add_binding(parameter.into(), definition)
                 .insert(self, inferred_ty);
         }
-        keyword_element
     }
 
     /// Set initial declared type (if annotated) and inferred type for a lambda-parameter symbol,

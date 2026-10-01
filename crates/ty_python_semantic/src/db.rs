@@ -10,7 +10,7 @@ use ruff_db::files::File;
 use ty_python_core::definition::Definition;
 use ty_python_core::{Db as PythonCoreDb, ProgramFile};
 
-/// Selects the facts and runtime input view used for a function scope.
+/// Selects the facts retained for a function scope.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FunctionInferenceMode {
     /// Ordinary inference and diagnostics.
@@ -26,25 +26,6 @@ pub enum FunctionInferenceMode {
     /// contextual replay cases remain unproved. Function and file facts expose this status
     /// independently of diagnostic rule selection and source suppressions.
     OutputProof,
-    /// Upper-bound materialization of initial named-function parameter bindings and explicit
-    /// runtime module-global reads. Named parameter declarations, signatures and default checks
-    /// use ordinary inference. Contextual lambda parameter values with known types are bounded
-    /// in their signatures; body bindings consume those values through ordinary inference.
-    /// Homogeneous keyword dictionaries are fresh containers with bounded value types.
-    /// Captures and operations consume the types supplied by their bindings.
-    /// Original selected functions with a supported fixed signature use bounded parameter
-    /// values and results as modular call contracts. Their raw parameter types supply
-    /// argument inference context. At calls using these conservative contracts, applications
-    /// must compare ordinary actual arguments with raw parameter types using
-    /// [`crate::types::Type::satisfies_declared_output`] and account for all selected body
-    /// and file obligations.
-    /// Subscript results retain narrower ordinary values only when independently supported
-    /// by checked getter results or confined dictionary observations. Other results use the
-    /// upper materialization of that evidence for subsequent operations and branch selection.
-    /// Eager global snapshots and member results have no separate projection.
-    /// Ordinary assignments infer values without gradual inherited annotation hints;
-    /// the original declarations still govern assignment checking.
-    Conservative,
 }
 
 /// Database giving access to semantic information about a Python program.
@@ -62,9 +43,7 @@ pub trait Db: PythonCoreDb {
     /// Selects function inference using tracked configuration inputs.
     ///
     /// This changes the active configuration, not a simultaneous alternate view.
-    /// Output facts concern declared return types and selected argument checks; conservative
-    /// inputs constrain operations.
-    /// Neither mode establishes complete implementation evidence on its own.
+    /// Output facts concern declared return types and selected argument checks.
     fn function_inference_mode(
         &self,
         _scope: ty_python_core::scope::ScopeId<'_>,

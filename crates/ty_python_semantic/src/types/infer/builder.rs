@@ -1341,53 +1341,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             DefinitionKind::Comprehension(comprehension) => {
                 self.infer_comprehension_definition(comprehension, definition);
             }
-            DefinitionKind::Parameter(parameter) => {
-                let mut keyword_element = None;
-                match parameter {
-                    ParameterDefinitionNodeKind::VariadicPositionalParameter(parameter) => {
-                        self.infer_variadic_positional_parameter_definition(
-                            parameter.node(self.module()),
-                            definition,
-                        );
-                    }
-                    ParameterDefinitionNodeKind::VariadicKeywordParameter(parameter) => {
-                        keyword_element = self.infer_variadic_keyword_parameter_definition(
-                            parameter.node(self.module()),
-                            definition,
-                        );
-                    }
-                    ParameterDefinitionNodeKind::Parameter(parameter_with_default) => {
-                        self.infer_parameter_definition(
-                            parameter_with_default.node(self.module()),
-                            definition,
-                        );
-                    }
+            DefinitionKind::Parameter(parameter) => match parameter {
+                ParameterDefinitionNodeKind::VariadicPositionalParameter(parameter) => {
+                    self.infer_variadic_positional_parameter_definition(
+                        parameter.node(self.module()),
+                        definition,
+                    );
                 }
-                if self.function_inference_mode == crate::FunctionInferenceMode::Conservative {
-                    let db = self.db();
-                    let env = self.program_environment();
-                    let binding = self
-                        .bindings
-                        .get_mut(&definition)
-                        .expect("parameter inference installs its initial binding");
-                    // Declarations and default checks retain their ordinary types. Updating
-                    // the initial binding also bounds later loads through narrowing/captures.
-                    *binding = if let Some(element) = keyword_element {
-                        // The keyword dictionary is freshly allocated; only its values
-                        // can alias gradual inputs supplied by the caller.
-                        KnownClass::Dict.to_specialized_instance(
-                            db,
-                            env,
-                            &[
-                                KnownClass::Str.to_instance(db, env),
-                                element.top_materialization(db, env),
-                            ],
-                        )
-                    } else {
-                        binding.top_materialization(db, env)
-                    };
+                ParameterDefinitionNodeKind::VariadicKeywordParameter(parameter) => {
+                    self.infer_variadic_keyword_parameter_definition(
+                        parameter.node(self.module()),
+                        definition,
+                    );
                 }
-            }
+                ParameterDefinitionNodeKind::Parameter(parameter_with_default) => {
+                    self.infer_parameter_definition(
+                        parameter_with_default.node(self.module()),
+                        definition,
+                    );
+                }
+            },
             DefinitionKind::LambdaParameter(LambdaParameterDefinitionNodeKind {
                 index,
                 lambda,
@@ -1940,9 +1913,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // `str: "str" = ""`, that value lets the next iteration reject the annotation
                     // instead of leaving both the annotation and the binding divergent.
                     if !should_preserve_inferred_binding_type(inferred_ty)
-                        && (self.function_inference_mode
-                            != crate::FunctionInferenceMode::Conservative
-                            || declared_type.is_fully_static(db, env))
                         && !matches!(
                             declared_type,
                             Type::Dynamic(DynamicType::Unknown) | Type::Divergent(_)
@@ -3600,15 +3570,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let add = self.add_binding(target.into(), definition);
         let mut tcx = add.type_context();
-        if let Some(annotation) = tcx.annotation {
-            // Gradual inference hints can erase conservative input bounds. The declaration
-            // still governs assignment checking.
-            if self.function_inference_mode == crate::FunctionInferenceMode::Conservative
-                && !annotation.is_fully_static(self.db(), self.program_environment())
-            {
-                tcx = tcx.with_annotation(None);
-            }
-        } else if assignment.unpack().is_none()
+        if tcx.annotation.is_none()
+            && assignment.unpack().is_none()
             && target.is_name_expr()
             && let Some((_, context)) =
                 super::returned_local::returned_local_contexts(self.db(), self.scope())
@@ -9448,16 +9411,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .index
             .try_node_scope(NodeWithScopeRef::Lambda(lambda_expression))
             .map(|scope| scope.to_scope_id(db, self.program_file()));
-        let conservative_parameters = lambda_scope.is_some_and(|scope| {
-            db.function_inference_mode(scope) == crate::FunctionInferenceMode::Conservative
-        });
-        let contextual_parameter_type = |ty: Type<'db>| {
-            if conservative_parameters && ty.is_fully_static_except_any(db, env) {
-                ty.top_materialization(db, env)
-            } else {
-                ty
-            }
-        };
         let contextual_parameters = callable_tcx.map(Signature::parameters);
         let positional_context = |index| {
             let parameters = contextual_parameters?;
@@ -9494,9 +9447,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter));
                     if let Some(context) = context {
                         parameter
-                            .with_annotated_type(contextual_parameter_type(
-                                context.annotated_type(),
-                            ))
+                            .with_annotated_type(context.annotated_type())
                             .with_optional_default_type(
                                 default_type
                                     .filter(|_| context.has_default() || context.is_variadic()),
@@ -9550,8 +9501,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     && index == posonlyargs.len() + args.len()
                     && !context.has_starred_annotation()
                 {
-                    parameter
-                        .with_annotated_type(contextual_parameter_type(context.annotated_type()))
+                    parameter.with_annotated_type(context.annotated_type())
                 } else {
                     parameter
                 }
@@ -9591,18 +9541,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             .map(|parameter| {
                                 parameter
                                     .clone()
-                                    .with_annotated_type(contextual_parameter_type(
-                                        parameter.annotated_type(),
-                                    ))
                                     .with_source_parameter_index(Some(source_index))
                             }),
                     );
                     if let Some((_, parameter)) = context.keyword_variadic() {
                         parameters.push(
                             Parameter::keyword_variadic(kwarg.name().id.clone())
-                                .with_annotated_type(contextual_parameter_type(
-                                    parameter.annotated_type(),
-                                ))
+                                .with_annotated_type(parameter.annotated_type())
                                 .with_source_parameter_index(Some(source_index)),
                         );
                     }
@@ -11667,7 +11612,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     }
                 }
                 ImplicitPlaceLoad::ExplicitGlobalSymbol { file, name } => {
-                    self.global_input(explicit_global_symbol(db, file, &name))
+                    explicit_global_symbol(db, file, &name)
                 }
                 ImplicitPlaceLoad::ModuleImplicitGlobal { file, name } => {
                     module_type_implicit_global_symbol(db, file, &name)
@@ -11705,25 +11650,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             place.map_type(|ty| {
                 self.narrow_place_with_applicable_constraints(place_expr, ty, narrowing_constraints)
             })
-        }
-    }
-
-    fn global_input(&self, place: PlaceAndQualifiers<'db>) -> PlaceAndQualifiers<'db> {
-        if self.function_inference_mode == crate::FunctionInferenceMode::Conservative
-            && !self
-                .inference_flags()
-                .contains(InferenceFlags::IN_TYPE_EXPRESSION)
-        {
-            place.map_type(|ty| {
-                if let Type::FunctionLiteral(function) = ty
-                    && let Some(view) = function.conservative_contract_view(self.db())
-                {
-                    return Type::FunctionLiteral(view);
-                }
-                ty.top_materialization(self.db(), self.program_environment())
-            })
-        } else {
-            place
         }
     }
 
@@ -14164,12 +14090,6 @@ where
     K: std::fmt::Debug,
     V: std::fmt::Debug,
 {
-    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        self.0
-            .iter_mut()
-            .find_map(|(existing, value)| (existing == key).then_some(value))
-    }
-
     fn insert(&mut self, key: K, value: V) {
         debug_assert!(
             !self.0.iter().any(|(existing, _)| existing == &key),
