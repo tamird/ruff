@@ -8267,7 +8267,7 @@ impl<'db> Binding<'db> {
         let mut proved_receiver = None;
         let mut definitely_supplied = vec![false; parameters.len()];
         let mut supplied_keywords = FxHashSet::default();
-        let mut has_keyword_remainder = false;
+        let mut remainder_exclusions: Option<FxHashSet<Name>> = None;
         let mut capture_supported = true;
         let matched = arguments
             .iter()
@@ -8276,6 +8276,7 @@ impl<'db> Binding<'db> {
             .all(|(index, ((argument, types), matched))| {
                 let mut required_keywords = None;
                 let mut keyword_names = FxHashSet::default();
+                let mut excluded_keywords = FxHashSet::default();
                 let mut keyword_remainder = false;
                 let empty_keywords = match argument {
                     Argument::Variadic => return false,
@@ -8287,16 +8288,19 @@ impl<'db> Binding<'db> {
                             let KnownUnpacking::Keywords(keywords) = unpacking else {
                                 return false;
                             };
-                            if keywords
-                                .items
-                                .iter()
-                                .any(|item| item.kind == DictionaryItemKind::Residual)
-                                || !keywords.residual_values(db, env).is_never()
-                            {
-                                return false;
+                            for item in &keywords.items {
+                                if item.kind == DictionaryItemKind::Residual
+                                    && item.ty.resolve_type_alias(db).is_never()
+                                {
+                                    excluded_keywords.insert(item.name.clone());
+                                } else {
+                                    keyword_names.insert(item.name.clone());
+                                }
                             }
-                            keyword_names
-                                .extend(keywords.items.iter().map(|item| item.name.clone()));
+                            excluded_keywords.extend(keywords.excluded_names.iter().cloned());
+                            keyword_remainder = keywords
+                                .extra_items
+                                .is_some_and(|ty| !ty.resolve_type_alias(db).is_never());
                             required_keywords = Some(
                                 keywords
                                     .items
@@ -8305,23 +8309,22 @@ impl<'db> Binding<'db> {
                                     .map(|item| item.name.clone())
                                     .collect::<FxHashSet<_>>(),
                             );
-                            keywords.items.is_empty()
+                            keyword_names.is_empty() && !keyword_remainder
                         } else {
                             let Some(unpacked) = types.get_default().and_then(|ty| {
                                 extract_unpacked_typed_dict_from_value_type(db, env, ty)
                             }) else {
                                 return false;
                             };
-                            if unpacked
-                                .keys
-                                .values()
-                                .any(|key| key.kind == DictionaryItemKind::Residual)
-                                || (!unpacked.openness.is_closed()
-                                    && parameters.keyword_variadic().is_none())
-                            {
-                                return false;
+                            for (name, key) in &unpacked.keys {
+                                if key.kind == DictionaryItemKind::Residual
+                                    && key.value_ty.resolve_type_alias(db).is_never()
+                                {
+                                    excluded_keywords.insert(name.clone());
+                                } else {
+                                    keyword_names.insert(name.clone());
+                                }
                             }
-                            keyword_names.extend(unpacked.keys.keys().cloned());
                             keyword_remainder = !unpacked.openness.is_closed();
                             required_keywords = Some(
                                 unpacked
@@ -8331,7 +8334,7 @@ impl<'db> Binding<'db> {
                                     .map(|(name, _)| name.clone())
                                     .collect::<FxHashSet<_>>(),
                             );
-                            unpacked.keys.is_empty() && unpacked.openness.is_closed()
+                            keyword_names.is_empty() && !keyword_remainder
                         }
                     }
                     Argument::Synthetic => false,
@@ -8347,12 +8350,20 @@ impl<'db> Binding<'db> {
                 if !matched.matched || matched.parameters.is_empty() {
                     return false;
                 }
+                if parameters.keyword_variadic().is_none()
+                    && (keyword_remainder
+                        || keyword_names
+                            .iter()
+                            .any(|name| parameters.keyword_by_name(name).is_none()))
+                {
+                    return false;
+                }
                 // An implicit open tail is matched only to **kwargs by ordinary checking.
                 // Decline if it can also reach a named formal without a retained value pair.
                 if keyword_remainder
                     && parameters.iter().enumerate().any(|(index, parameter)| {
                         parameter.keyword_name().is_some_and(|name| {
-                            !keyword_names.contains(name)
+                            !excluded_keywords.contains(name)
                                 && !matched.iter().any(|matched| matched.index == index)
                         })
                     })
@@ -8433,17 +8444,21 @@ impl<'db> Binding<'db> {
                     true
                 });
                 // Different keyword sources must be disjoint even when they all feed **kwargs.
-                // An open remainder can overlap any name supplied by another source.
+                // An open remainder can overlap every name it does not explicitly exclude.
                 if !valid_pairs
-                    || (keyword_remainder && !supplied_keywords.is_empty())
-                    || (has_keyword_remainder && (keyword_remainder || !keyword_names.is_empty()))
+                    || (keyword_remainder && !supplied_keywords.is_subset(&excluded_keywords))
+                    || remainder_exclusions.as_ref().is_some_and(|excluded| {
+                        keyword_remainder || !keyword_names.is_subset(excluded)
+                    })
                     || keyword_names
                         .into_iter()
                         .any(|name| !supplied_keywords.insert(name))
                 {
                     return false;
                 }
-                has_keyword_remainder |= keyword_remainder;
+                if keyword_remainder {
+                    remainder_exclusions = Some(excluded_keywords);
+                }
                 true
             });
         if !matched {
@@ -13158,7 +13173,7 @@ bound = holder.read
                 "excluded",
                 Some(Type::string_literal(&db, "value")),
                 true,
-                false,
+                true,
             ),
             (
                 "empty",

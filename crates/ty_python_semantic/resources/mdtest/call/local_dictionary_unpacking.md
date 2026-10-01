@@ -450,6 +450,30 @@ def positive(source: NamedGhost | Integers):
     no_ghost(**{**source})  # error: [unknown-argument]
 ```
 
+## Names consumed by parameter binding
+
+A function's `**kwargs` excludes its positional-or-keyword and keyword-only parameter names.
+Positional-only names remain valid dictionary keys, and writing a consumed name back into the
+dictionary makes it available to a later call.
+
+```py
+from typing import Protocol
+
+def consume(name: int): ...
+def forward(name: int, **kwargs: int):
+    consume(**kwargs)  # error: [missing-argument]
+    kwargs["name"] = 1
+    consume(**kwargs)  # no diagnostic
+
+def positional_only(name: int, /, **kwargs: int):
+    consume(**kwargs)  # no diagnostic
+
+class Callback(Protocol):
+    def __call__(self, *, name: int, **kwargs: int) -> None: ...
+
+missing: Callback = lambda *, name, **kwargs: consume(**kwargs)  # error: [missing-argument]
+```
+
 ## Complete key sets
 
 A fresh local dictionary used only as a direct `**name` argument has a complete key set. Repeated

@@ -13,7 +13,7 @@ use ty_python_core::definition::{
 };
 use ty_python_core::place::ScopedPlaceId;
 use ty_python_core::place::{PlaceExpr, PlaceTable};
-use ty_python_core::scope::{FileScopeId, ScopeId};
+use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, ScopeId};
 use ty_python_core::symbol::Symbol;
 use ty_python_core::{
     BindingWithConstraintsIterator, NarrowingEvaluator, ProgramFile, Statement, semantic_index,
@@ -695,27 +695,32 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
     let Some(dictionary) = DictionaryItems::unpacked(db, &env, bound_type, source) else {
         return ContentsValue::Unavailable;
     };
+    let kwargs_parameters = match definition.kind(db) {
+        DefinitionKind::Parameter(parameter) => match parameter {
+            ParameterDefinitionNodeKind::VariadicKeywordParameter(_) => match scope.node(db) {
+                NodeWithScopeKind::Function(function) => {
+                    Some(function.node(&module).parameters.as_ref())
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        DefinitionKind::LambdaParameter(LambdaParameterDefinitionNodeKind {
+            index: _,
+            lambda,
+            parameter,
+        }) => match parameter {
+            ParameterDefinitionNodeKind::VariadicKeywordParameter(_) => {
+                lambda.node(&module).parameters.as_deref()
+            }
+            _ => None,
+        },
+        _ => None,
+    };
     let mut mapping = MappingContents {
         file,
         dictionary,
-        builtin: closed_typed_dict
-            || match definition.kind(db) {
-                DefinitionKind::Parameter(parameter) => {
-                    matches!(
-                        parameter,
-                        ParameterDefinitionNodeKind::VariadicKeywordParameter(_)
-                    )
-                }
-                DefinitionKind::LambdaParameter(LambdaParameterDefinitionNodeKind {
-                    index: _,
-                    lambda: _,
-                    parameter,
-                }) => matches!(
-                    parameter,
-                    ParameterDefinitionNodeKind::VariadicKeywordParameter(_)
-                ),
-                _ => false,
-            },
+        builtin: closed_typed_dict || kwargs_parameters.is_some(),
         uses_residual_presence: false,
         bound,
     };
@@ -771,6 +776,21 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         } else {
             mapping.expose(db, &env);
         }
+    }
+    if !closed_typed_dict && let Some(parameters) = kwargs_parameters {
+        // Binding consumes keyword-capable named parameters before allocating **kwargs.
+        // These exclusions are local contents facts; mutation and exposure can remove them.
+        mapping.dictionary.items = parameters
+            .args
+            .iter()
+            .chain(&parameters.kwonlyargs)
+            .map(|parameter| DictionaryItem {
+                name: parameter.parameter.name.id.clone(),
+                ty: Type::Never,
+                kind: DictionaryItemKind::Residual,
+                source: parameter.parameter.name.range(),
+            })
+            .collect();
     }
     ContentsValue::Mapping(mapping)
 }

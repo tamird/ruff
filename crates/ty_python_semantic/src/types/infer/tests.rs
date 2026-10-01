@@ -7339,6 +7339,12 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
         def mapping(value: dict[str, Named]) -> None:
             consume_named(**value)
 
+        def unknown_mapping(value: dict[str, Any]) -> None:
+            consume_named(**value)
+
+        def opaque_mapping(value: dict[str, Callable[..., None]]) -> None:
+            consume_named(**value)
+
         def open_objects(value: Open) -> None:
             consume_objects(**value)
 
@@ -7388,7 +7394,9 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
         ("open_forward", false),
         ("forward_unpacked", false),
         ("method_optional", false),
-        ("mapping", true),
+        ("mapping", false),
+        ("unknown_mapping", true),
+        ("opaque_mapping", true),
         ("open_objects", false),
         ("open_direct", true),
         ("open_positional_only", false),
@@ -7445,6 +7453,148 @@ fn keyword_unpack_correspondence() -> anyhow::Result<()> {
             .all(|(name, _)| !facts(&db, name).has_unproved_requirements)
     );
     assert_eq!(signatures(&db), ordinary_signatures);
+    Ok(())
+}
+
+#[test]
+fn kwargs_exclusions_preserve_input_proof() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Protocol
+        from typing_extensions import Never, NotRequired, TypedDict, Unpack
+
+        class Excluded(TypedDict, extra_items=int):
+            name: NotRequired[Never]
+
+        class Absent(TypedDict, closed=True):
+            name: NotRequired[Never]
+
+        class Optional(TypedDict, closed=True):
+            name: NotRequired[str]
+
+        class Open(TypedDict):
+            pass
+
+        class Fields(TypedDict, extra_items=int):
+            field: str
+
+        class Forwarder(Protocol):
+            def __call__(self, *, name: str, **kwargs: int) -> None: ...
+
+        def consume(*, name: str, **kwargs: int) -> None: pass
+        def named_only(*, name: str = "target") -> None: pass
+        def defaulted(*, name: str = "target", **kwargs: object) -> None: pass
+        def integers(**kwargs: int) -> None: pass
+        def fields(*, field: str, **kwargs: int) -> None: pass
+        def empty() -> None: pass
+        def expose(value: object) -> None: pass
+
+        def explicit_first(value: Excluded) -> None:
+            consume(name="target", **value)
+
+        def explicit_last(value: Excluded) -> None:
+            consume(**value, name="target")
+
+        def observed(value: Excluded) -> None:
+            consume(name="target", **{**value})
+
+        def excluded_only(value: Absent) -> None:
+            empty(**value)
+
+        def implicit_residual(value: Absent | Open) -> None:
+            defaulted(**value)
+
+        def optional_duplicate(value: Optional) -> None:
+            consume(name="target", **value)
+
+        def finite_name() -> None:
+            named_only(**{key: "value" for key in ("name",)})
+
+        def finite_extra() -> None:
+            named_only(**{key: "value" for key in ("name", "extra")})
+
+        def two_tails(left: Excluded, right: Excluded) -> None:
+            consume(name="target", **left, **right)
+
+        def forward(name: str, **kwargs: int) -> None:
+            consume(name=name, **kwargs)
+
+        def forward_last(*, name: str, **kwargs: int) -> None:
+            consume(**kwargs, name=name)
+
+        def make_forwarder() -> Forwarder:
+            return lambda *, name, **kwargs: consume(name=name, **kwargs)
+
+        def unpack_wrong(name: str, **kwargs: Unpack[Fields]) -> None:
+            integers(**kwargs)
+
+        def unpack_valid(name: str, **kwargs: Unpack[Fields]) -> None:
+            fields(**kwargs)
+
+        def missing(name: str, **kwargs: int) -> None:
+            consume(**kwargs)
+
+        def wrong_values(name: str, **kwargs: str) -> None:
+            consume(name=name, **kwargs)
+
+        def positional_only(name: str, /, **kwargs: int) -> None:
+            consume(name=name, **kwargs)
+
+        def inserted(name: str, **kwargs: int) -> None:
+            kwargs["name"] = 1
+            consume(name=name, **kwargs)
+
+        def escaped(name: str, **kwargs: int) -> None:
+            expose(kwargs)
+            consume(name=name, **kwargs)
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("explicit_first", false),
+        ("explicit_last", false),
+        ("observed", false),
+        ("excluded_only", false),
+        ("implicit_residual", true),
+        ("optional_duplicate", true),
+        ("finite_name", false),
+        ("finite_extra", true),
+        ("two_tails", true),
+        ("forward", false),
+        ("forward_last", false),
+        ("make_forwarder", false),
+        ("unpack_wrong", true),
+        ("unpack_valid", false),
+        ("missing", true),
+        ("wrong_values", true),
+        ("positional_only", true),
+        ("inserted", true),
+        ("escaped", true),
+    ];
+    db.select_function_inference(Some((
+        file,
+        cases
+            .map(|(name, _)| name.to_owned())
+            .into_iter()
+            .chain(["<lambda>".to_owned()])
+            .collect(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    let model = crate::SemanticModel::new(&db, program_file(&db, file));
+    let actual = cases.map(|(name, unproved)| {
+        let facts = model
+            .function_inference_facts(first_public_binding(&db, file, name))
+            .unwrap();
+        assert!(!facts.has_cycle_recovery, "{name}");
+        if !unproved {
+            assert!(!facts.has_errors, "{name}: {facts:?}");
+            assert_eq!(facts.return_type_correspondence, Some(true), "{name}");
+        }
+        (name, facts.has_unproved_requirements)
+    });
+    assert_eq!(actual, cases);
     Ok(())
 }
 
