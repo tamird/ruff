@@ -432,13 +432,34 @@ impl<'db> Contents<'db> {
         mut self,
         db: &'db dyn Db,
         scope: ScopeId<'db>,
-        place: ScopedPlaceId,
+        definition: Definition<'db>,
         constraint: &NarrowingEvaluator<'_, 'db>,
     ) -> Self {
+        if matches!(self.value, ContentsValue::Pending) {
+            return self;
+        }
+        let env = ProgramEnvironment::from_scope(scope);
+        // Receiver guards can exclude an initializer or establish its mapping type. Later
+        // history steps still obtain their contents through the recorded predecessors.
+        if let DefinitionKind::DictionaryContents(contents) = definition.kind(db)
+            && let DictionaryContentsDefinitionKind::Initialize {
+                definition: receiver,
+                range: _,
+            } = contents.as_ref()
+        {
+            let inference = infer_definition_types(db, *receiver);
+            let bound = inference.binding_type(*receiver);
+            let narrowed = constraint.narrow(db, &env, bound, receiver.place(db));
+            if narrowed.resolve_type_alias(db).is_never() {
+                self.value = ContentsValue::Unreachable;
+            } else if matches!(self.value, ContentsValue::Unavailable) && narrowed != bound {
+                self.value = initial_contents(db, *receiver, narrowed);
+            }
+        }
         let ContentsValue::Mapping(mapping) = &mut self.value else {
             return self;
         };
-        let env = ProgramEnvironment::from_scope(scope);
+        let place = definition.place(db);
         let index = semantic_index(db, scope.program_file(db));
         let table = index.place_table(scope.file_scope_id(db));
         for item in &mut mapping.dictionary.items {
@@ -539,7 +560,7 @@ fn definition_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Con
                 let incoming = definition_contents(db, binding.definition).narrow(
                     db,
                     scope,
-                    definition.place(db),
+                    binding.definition,
                     &use_def.narrowing_evaluator(binding.narrowing_constraint),
                 );
                 result = result.join(db, &env, incoming);
@@ -550,7 +571,14 @@ fn definition_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Con
             DictionaryContentsDefinitionKind::Initialize {
                 definition,
                 range: _,
-            } => Contents::new(initial_contents(db, *definition)),
+            } => {
+                let inference = infer_definition_types(db, *definition);
+                Contents::new(initial_contents(
+                    db,
+                    *definition,
+                    inference.binding_type(*definition),
+                ))
+            }
             DictionaryContentsDefinitionKind::LoopCapture { header, range: _ } => {
                 let Contents { value, captured } = definition_contents(db, *header);
                 match value {
@@ -654,7 +682,11 @@ fn capture_has_no_reachable_effects<'db>(
 /// Seed the contents graph from the same binding that owns ordinary value inference.
 /// Nominal dictionary parameters and members carry value refinements without a closed key set.
 /// A closed `TypedDict` retains its fields until a recorded mutation changes them.
-fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> ContentsValue<'db> {
+fn initial_contents<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    bound_type: Type<'db>,
+) -> ContentsValue<'db> {
     if crate::types::infer::is_discarded_dict_key_assignment(db, definition) {
         return ContentsValue::Unavailable;
     }
@@ -666,7 +698,6 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
     if StatementInference::Definition(definition, inference).is_provisional() {
         return ContentsValue::Pending;
     }
-    let bound_type = inference.binding_type(definition);
     let closed_typed_dict = is_closed_typed_dict(db, bound_type);
     if !closed_typed_dict && !super::has_dict_type(db, &env, bound_type) {
         return ContentsValue::Unavailable;
@@ -1726,7 +1757,7 @@ fn from_bindings<'db>(
             DefinitionState::Defined(definition) => definition_contents(db, definition).narrow(
                 db,
                 scope,
-                definition.place(db),
+                definition,
                 &binding.narrowing_constraint,
             ),
             DefinitionState::Undefined => Contents::new(ContentsValue::Unavailable),

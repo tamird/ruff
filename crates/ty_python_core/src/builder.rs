@@ -2749,7 +2749,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         &mut self,
         predicate: &PredicateOrLiteral<'db>,
     ) -> PossiblyNarrowedPlaces {
-        match predicate {
+        let mut places = match predicate {
             PredicateOrLiteral::Literal(_) => PossiblyNarrowedPlaces::default(),
             PredicateOrLiteral::Predicate(pred) => {
                 match pred.node {
@@ -2824,7 +2824,21 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     }
                 }
             }
-        }
+        };
+        // Receiver guards also determine which initialization paths can contribute contents.
+        // Only demanded contents places exist here; this does not register new observations.
+        let table = self.current_place_table();
+        let contents: SmallVec<[_; 2]> = places
+            .iter()
+            .filter_map(|place| {
+                let contents = MemberExprBuilder::from_place(table.place(*place))
+                    .with_contents()
+                    .and_then(PlaceExpr::try_from_member_expr)?;
+                table.place_id((&contents).into())
+            })
+            .collect();
+        places.extend(contents);
+        places
     }
 
     /// Negates the given predicate and then adds it as a narrowing constraint to the places

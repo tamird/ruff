@@ -329,6 +329,13 @@ def exposed(values: Exact[str, object]) -> None:
     expose(values)
     assert_type(first(values), object)
 
+def optional(values: Exact[str, int | None] | None) -> None:
+    if values is None:
+        return
+    item = list(values.values())[0]
+    if item is None:
+        assert_type(list(values.values())[0], None)
+
 def nominal(values: dict[str, object]) -> None:
     values.values()
     assert_type(observed(values), Literal[False])

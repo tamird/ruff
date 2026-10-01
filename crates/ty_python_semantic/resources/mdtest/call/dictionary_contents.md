@@ -1297,6 +1297,45 @@ def loop(source: dict[str, int | None], flags: list[bool]):
             reveal_type(list(values.values())[0])  # revealed: int | None
 ```
 
+## Receiver guards preserve dictionary contents
+
+Narrowing an optional receiver removes the non-dictionary initialization path. Recorded writes and
+exposure still determine the remaining dictionary contents.
+
+```py
+def optional(source: dict[str, int | None], flag: bool):
+    if flag:
+        values = dict(source)
+    else:
+        values = None
+    if values is None:
+        return
+    first = list(values.values())[0]
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: None
+
+def optional_written(flag: bool):
+    if flag:
+        values = {"first": None, "other": 1}
+        values["first"] = 2
+    else:
+        values = None
+    if values is None:
+        return
+    reveal_type(list(values.values())[0])  # revealed: Literal[2]
+
+def consume(value: object) -> None: ...
+def optional_exposed(flag: bool):
+    if flag:
+        values = {"first": None, "other": 1}
+    else:
+        values = None
+    consume(values)
+    if values is None:
+        return
+    reveal_type(list(values.values())[0])  # revealed: None | int
+```
+
 ## First-value guards use names from the current scope
 
 Nested function names and assignment targets have their own binding histories.
