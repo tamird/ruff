@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::ops::{ControlFlow, Range};
+use std::ops::Range;
 
 use indexmap::map::Entry;
 use itertools::Itertools;
@@ -18,8 +18,7 @@ use crate::types::constraints::variables::AtomicConstraint::{
     ConcreteEquivalence, ConcreteLower, ConcreteUpper, TypeVarEquivalence, TypeVarRange,
 };
 use crate::types::constraints::{
-    Assignment, AtomicConstraintId, ConstraintSetStorage, Node, NodeId, PathVisitor, SourceOrderId,
-    TypeVarId,
+    Assignment, AtomicConstraintId, ConstraintSetStorage, NodeId, SourceOrderId, TypeVarId,
 };
 use crate::{Db, FxIndexMap, FxIndexSet, ProgramEnvironment};
 
@@ -88,11 +87,6 @@ pub(crate) struct PathAssignments {
     discovered: FxIndexMap<AtomicConstraintId, bool>,
     /// Constraint pairs that we have already checked and added to `sequents`.
     elaborated_pairs: FxHashSet<(AtomicConstraintId, AtomicConstraintId)>,
-
-    /// Consequents grouped by the discovery call that introduced their sequents.
-    single_replay_consequents: FxHashMap<AtomicConstraintId, Vec<AtomicConstraintId>>,
-    pair_replay_consequents:
-        FxHashMap<(AtomicConstraintId, AtomicConstraintId), Vec<AtomicConstraintId>>,
 
     /// Type variables that only involve concrete constraints and so do not participate in sequent
     /// discovery.
@@ -206,8 +200,6 @@ impl Default for PathAssignments {
             remaining_overall_fuel: OVERALL_FUEL_BUDGET,
             discovered: FxIndexMap::default(),
             elaborated_pairs: FxHashSet::default(),
-            single_replay_consequents: FxHashMap::default(),
-            pair_replay_consequents: FxHashMap::default(),
             independent_typevars: FxHashSet::default(),
             assignment_queue: VecDeque::default(),
             new_assignments: FxIndexMap::default(),
@@ -216,70 +208,6 @@ impl Default for PathAssignments {
 }
 
 impl PathAssignments {
-    /// Orders projected facts by replaying the rules already discovered during this walk.
-    ///
-    /// Projection emits derived facts in TDD branch order. Retaining that order can prevent
-    /// recursive relations from converging when an equivalent diagram is rebuilt in a different
-    /// arena. Start with the original source order and visit each rule's consequences in order,
-    /// including intermediate facts that are themselves projected away. This only replays cached
-    /// rules; it does not derive more facts or change the walk's assignments and fuel.
-    pub(super) fn projection_source_order(
-        &self,
-        storage: &mut ConstraintSetStorage<'_>,
-        original_source_order: Option<SourceOrderId>,
-        derived_source_order: Option<SourceOrderId>,
-    ) -> Option<SourceOrderId> {
-        let emitted = storage.calculate_source_orders(derived_source_order);
-        if emitted.is_empty() {
-            return None;
-        }
-        let mut ordered = storage.calculate_source_orders(original_source_order);
-        ordered.retain(|constraint| self.discovered.contains_key(constraint));
-        let mut index = 0;
-        // Once all emitted facts have positions, later appends cannot change their relative order.
-        while !emitted.is_subset(&ordered)
-            && let Some(constraint) = ordered.get_index(index).copied()
-        {
-            if self.discovered.get(&constraint) == Some(&true) {
-                if let Some(consequents) = self.single_replay_consequents.get(&constraint) {
-                    ordered.extend(
-                        consequents
-                            .iter()
-                            .copied()
-                            .filter(|constraint| self.discovered.contains_key(constraint)),
-                    );
-                }
-            }
-            for earlier_index in 0..index {
-                let earlier = ordered[earlier_index];
-                // Pair rules are not commutative. Replay the orientation used by this walk,
-                // which can differ from the order in which the replay reaches its inputs.
-                let pair = [(earlier, constraint), (constraint, earlier)]
-                    .into_iter()
-                    .find(|pair| self.elaborated_pairs.contains(pair));
-                if let Some(consequents) =
-                    pair.and_then(|pair| self.pair_replay_consequents.get(&pair))
-                {
-                    ordered.extend(
-                        consequents
-                            .iter()
-                            .copied()
-                            .filter(|constraint| self.discovered.contains_key(constraint)),
-                    );
-                }
-            }
-            index += 1;
-        }
-        debug_assert!(emitted.is_subset(&ordered));
-        ordered
-            .into_iter()
-            .filter(|constraint| emitted.contains(constraint))
-            .fold(None, |source_order, constraint| {
-                let next = storage.atomic_constraint_source_order(constraint);
-                storage.ordered_source_order(source_order, Some(next))
-            })
-    }
-
     pub(super) fn new(
         constraints: impl IntoIterator<Item = AtomicConstraintId>,
         independent_typevars: FxHashSet<TypeVarId>,
@@ -302,122 +230,10 @@ impl PathAssignments {
             fuel_undo: Vec::default(),
             discovered,
             elaborated_pairs: FxHashSet::default(),
-            single_replay_consequents: FxHashMap::default(),
-            pair_replay_consequents: FxHashMap::default(),
             independent_typevars,
             remaining_overall_fuel: OVERALL_FUEL_BUDGET,
             assignment_queue: VecDeque::default(),
             new_assignments: FxIndexMap::default(),
-        }
-    }
-
-    pub(super) fn visit<'db, V>(
-        &mut self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        storage: &mut ConstraintSetStorage<'db>,
-        node: NodeId,
-        visitor: &mut V,
-    ) -> ControlFlow<V::Break, V::Result>
-    where
-        V: PathVisitor,
-    {
-        visitor.visit_node()?;
-        match node.node() {
-            Node::AlwaysTrue => visitor.visit_satisfied(db, storage, self),
-            Node::AlwaysFalse => visitor.visit_unsatisfied(db, storage, self),
-
-            Node::Interior(interior) => {
-                let interior_value = visitor.enter_interior(db, storage, interior)?;
-                let interior = storage.interior_node_data(node);
-                let Some(constraint) = interior.constraint.as_atomic(storage) else {
-                    panic!("cannot visit non-atomic constraint");
-                };
-
-                let if_true = self.walk_edge(
-                    db,
-                    env,
-                    storage,
-                    constraint.when_true(),
-                    |storage, path, new_range, found_conflict| {
-                        let subtree = if found_conflict {
-                            visitor.visit_impossible(db, storage, path)
-                        } else {
-                            path.visit(db, env, storage, interior.if_true, visitor)
-                        };
-                        match subtree {
-                            ControlFlow::Continue(subtree) => visitor.visit_edge(
-                                db,
-                                storage,
-                                &interior_value,
-                                subtree,
-                                path,
-                                new_range,
-                            ),
-                            ControlFlow::Break(b) => ControlFlow::Break(b),
-                        }
-                    },
-                )?;
-
-                let if_uncertain = self.walk_edge(
-                    db,
-                    env,
-                    storage,
-                    constraint.when_unconstrained(),
-                    |storage, path, new_range, found_conflict| {
-                        let subtree = if found_conflict {
-                            visitor.visit_impossible(db, storage, path)
-                        } else {
-                            path.visit(db, env, storage, interior.if_uncertain, visitor)
-                        };
-                        match subtree {
-                            ControlFlow::Continue(subtree) => visitor.visit_edge(
-                                db,
-                                storage,
-                                &interior_value,
-                                subtree,
-                                path,
-                                new_range,
-                            ),
-                            ControlFlow::Break(b) => ControlFlow::Break(b),
-                        }
-                    },
-                )?;
-
-                let if_false = self.walk_edge(
-                    db,
-                    env,
-                    storage,
-                    constraint.when_false(),
-                    |storage, path, new_range, found_conflict| {
-                        let subtree = if found_conflict {
-                            visitor.visit_impossible(db, storage, path)
-                        } else {
-                            path.visit(db, env, storage, interior.if_false, visitor)
-                        };
-                        match subtree {
-                            ControlFlow::Continue(subtree) => visitor.visit_edge(
-                                db,
-                                storage,
-                                &interior_value,
-                                subtree,
-                                path,
-                                new_range,
-                            ),
-                            ControlFlow::Break(b) => ControlFlow::Break(b),
-                        }
-                    },
-                )?;
-
-                visitor.leave_interior(
-                    db,
-                    storage,
-                    &interior_value,
-                    if_true,
-                    if_uncertain,
-                    if_false,
-                )
-            }
         }
     }
 
@@ -651,7 +467,7 @@ impl PathAssignments {
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
         map: &SequentMap<'db>,
-    ) -> Range<usize> {
+    ) {
         fn intern_sequents<'db>(
             db: &'db dyn Db,
             env: &ProgramEnvironment<'db>,
@@ -788,7 +604,6 @@ impl PathAssignments {
             }
         }
 
-        let start = self.sequents.len();
         for group in &map.sequents {
             match group {
                 SequentGroup::Ungrouped(sequents) => {
@@ -831,8 +646,6 @@ impl PathAssignments {
                 }
             }
         }
-        let end = self.sequents.len();
-        start..end
     }
 
     /// Update our sequent map to ensure that it holds all of the sequents that involve the given
@@ -856,23 +669,7 @@ impl PathAssignments {
 
         let constraint_data = storage.atomic_constraint_data(constraint);
         if let Some(map) = SequentMap::for_constraint(db, env, constraint_data) {
-            let added = self.add_sequents(db, env, storage, map);
-
-            // `projection_source_order` depends on knowing the order that sequents were discovered for
-            // each constraint. Since we are salsa-caching sequent derivation, we don't have easy
-            // access to that in ConstraintSetStorage, so we need to maintain a local view of that
-            // information here.
-            self.single_replay_consequents.insert(
-                constraint,
-                self.sequents[added]
-                    .iter()
-                    .filter_map(|sequent| match sequent {
-                        Sequent::SingleImplication { post, .. }
-                        | Sequent::PairImplication { post, .. } => Some(*post),
-                        _ => None,
-                    })
-                    .collect(),
-            );
+            self.add_sequents(db, env, storage, map);
         }
 
         for existing_index in 0..self.discovered.len() {
@@ -920,23 +717,7 @@ impl PathAssignments {
                 continue;
             };
             self.elaborated_pairs.insert((a, b));
-            let added = self.add_sequents(db, env, storage, map);
-
-            // `projection_source_order` depends on knowing the order that sequents were discovered for
-            // each constraint. Since we are salsa-caching sequent derivation, we don't have easy
-            // access to that in ConstraintSetStorage, so we need to maintain a local view of that
-            // information here.
-            self.pair_replay_consequents.insert(
-                (a, b),
-                self.sequents[added]
-                    .iter()
-                    .filter_map(|sequent| match sequent {
-                        Sequent::SingleImplication { post, .. }
-                        | Sequent::PairImplication { post, .. } => Some(*post),
-                        _ => None,
-                    })
-                    .collect(),
-            );
+            self.add_sequents(db, env, storage, map);
         }
     }
 

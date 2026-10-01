@@ -93,7 +93,7 @@ use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::iter;
 use std::marker::PhantomData;
-use std::ops::{ControlFlow, Range};
+use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
@@ -817,44 +817,6 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
         Self::from_node(builder, node, source_order)
     }
 
-    #[expect(dead_code, reason = "XXX: to be removed")]
-    pub(crate) fn old_reduce_inferable(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        builder: &'c ConstraintSetBuilder<'db>,
-        to_remove: TypeVarSet<'db>,
-    ) -> Self {
-        self.verify_builder(builder);
-        if to_remove == TypeVarSet::None {
-            return self;
-        }
-        let mut storage = builder.storage.borrow_mut();
-        let ControlFlow::Continue((node, derived_source_order)) = self.node.exists_with_limits(
-            db,
-            env,
-            &mut storage,
-            to_remove,
-            self.source_order,
-            &mut UnboundedSolutionLimits,
-        );
-        // The eliminated typevars must also leave the source-order history. Otherwise recursive
-        // relations can re-import each other's quantified constraints after their live graphs have
-        // stabilized. Keep the original order of the remaining entries and append derived facts.
-        let source_order = storage
-            .calculate_source_orders(self.source_order)
-            .into_iter()
-            .fold(None, |source_order, constraint| {
-                if storage.constraint_mentions_typevars(db, constraint.into_inner(), to_remove) {
-                    return source_order;
-                }
-                let constraint_source_order = storage.atomic_constraint_source_order(constraint);
-                storage.ordered_source_order(source_order, Some(constraint_source_order))
-            });
-        let source_order = storage.ordered_source_order(source_order, derived_source_order);
-        Self::from_node(builder, node, source_order)
-    }
-
     /// Applies a type mapping to every constraint in this constraint set.
     pub(crate) fn apply_type_mapping_impl(
         self,
@@ -1048,8 +1010,6 @@ pub(crate) struct ConstraintSetBuilder<'db> {
     storage: RefCell<ConstraintSetStorage<'db>>,
 }
 
-type ExistsCacheKey<'db> = (NodeId, TypeVarSet<'db>, Option<SourceOrderId>);
-
 #[derive(Debug, Default)]
 struct ConstraintSetStorage<'db> {
     /// Compacted owned storage overlaid onto this builder. This is used by
@@ -1109,9 +1069,6 @@ struct ConstraintSetStorage<'db> {
     negate_cache: FxHashMap<NodeId, NodeId>,
     or_cache: FxHashMap<(NodeId, NodeId), NodeId>,
     and_cache: FxHashMap<(NodeId, NodeId), NodeId>,
-    /// Existential abstraction derives new constraints in source order and returns their
-    /// source-order sidecar, so distinct orderings of the same BDD must not share a cache entry.
-    exists_cache: FxHashMap<ExistsCacheKey<'db>, (NodeId, Option<SourceOrderId>)>,
 }
 
 impl<'db> ConstraintSetStorage<'db> {
@@ -1595,10 +1552,6 @@ impl<'db> ConstraintSetStorage<'db> {
         self.intern_source_order(SourceOrder::Constraint(constraint))
     }
 
-    fn atomic_constraint_source_order(&mut self, constraint: AtomicConstraintId) -> SourceOrderId {
-        self.intern_source_order(SourceOrder::Constraint(constraint.into_inner()))
-    }
-
     fn source_order_data(&self, source_order: SourceOrderId) -> SourceOrder {
         if let Some(compacted) = &self.compacted {
             let index = source_order.index();
@@ -1686,17 +1639,6 @@ impl<'db> ConstraintSetStorage<'db> {
 
     fn constraint_support(&self, constraint: ConstraintId) -> &Support {
         self.support_data(self.constraint_support_id(constraint))
-    }
-
-    fn constraint_mentions_typevars(
-        &self,
-        db: &'db dyn Db,
-        constraint: ConstraintId,
-        typevars: TypeVarSet<'db>,
-    ) -> bool {
-        self.constraint_support(constraint)
-            .iter()
-            .any(|typevar| self.typevar_data(typevar).is_inferable(db, typevars))
     }
 
     fn node_support_id(&self, node: NodeId) -> Option<SupportId> {
@@ -2550,34 +2492,6 @@ impl Node {
             Some(storage.constraint_source_order(constraint)),
         )
     }
-
-    /// Creates a new BDD node for a positive, negative, or unconstrained individual constraint.
-    /// (For a positive constraint, this returns the same BDD node as
-    /// [`new_constraint`][Self::new_constraint]. For a negative constraint, it returns the
-    /// negation of that BDD node. For an unconstrained constraint, the result holds regardless
-    /// of the constraint's truth value.)
-    fn new_satisfied_constraint(
-        storage: &mut ConstraintSetStorage<'_>,
-        constraint: Assignment<ConstraintId>,
-    ) -> (NodeId, Option<SourceOrderId>) {
-        let constraint_id = constraint.constraint();
-        let node = match constraint {
-            Assignment::Positive(constraint) => {
-                NodeId::with_uncertain(storage, constraint, ALWAYS_TRUE, ALWAYS_FALSE, ALWAYS_FALSE)
-            }
-            Assignment::Negative(constraint) => {
-                NodeId::with_uncertain(storage, constraint, ALWAYS_FALSE, ALWAYS_FALSE, ALWAYS_TRUE)
-            }
-            // The result holds regardless of the constraint's truth value, so only
-            // `if_uncertain` needs to be `ALWAYS_TRUE` — `n? 0: 1: 0`. It would also be
-            // correct to use `n? 1: 1: 1` (i.e., `ALWAYS_TRUE` for all outgoing edges), but
-            // that would throw away some of the efficiency gains this representation gives us.
-            Assignment::Unconstrained(constraint) => {
-                NodeId::with_uncertain(storage, constraint, ALWAYS_FALSE, ALWAYS_TRUE, ALWAYS_FALSE)
-            }
-        };
-        (node, Some(storage.constraint_source_order(constraint_id)))
-    }
 }
 
 impl NodeId {
@@ -3044,38 +2958,6 @@ impl NodeId {
 
         let node = self.implies(storage, constraint);
         (node, constraint_source_order)
-    }
-
-    /// Returns a new BDD that is the _existential abstraction_ of `self` for a set of typevars.
-    /// The result will return true whenever `self` returns true for _any_ assignment of those
-    /// typevars. The result will not contain any constraints that mention those typevars.
-    fn exists_with_limits<'db, L: SolutionLimits>(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        storage: &mut ConstraintSetStorage<'db>,
-        bound_typevars: TypeVarSet<'db>,
-        source_order: Option<SourceOrderId>,
-        limits: &mut L,
-    ) -> ControlFlow<L::Break, (Self, Option<SourceOrderId>)> {
-        if bound_typevars == TypeVarSet::None {
-            return ControlFlow::Continue((self, None));
-        }
-
-        let Node::Interior(interior) = self.node() else {
-            return ControlFlow::Continue((self, None));
-        };
-
-        let key = (self, bound_typevars, source_order);
-        if let Some(result) = storage.exists_cache.get(&key) {
-            return ControlFlow::Continue(*result);
-        }
-
-        let result =
-            interior.exists_inner(db, env, storage, bound_typevars, source_order, limits)?;
-
-        storage.exists_cache.insert(key, result);
-        ControlFlow::Continue(result)
     }
 
     /// Invokes a closure for each unique BDD node that appears anywhere in a BDD.
@@ -4974,210 +4856,6 @@ impl InteriorNode {
         result
     }
 
-    fn exists_inner<'db, L: SolutionLimits>(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        storage: &mut ConstraintSetStorage<'db>,
-        bound_typevars: TypeVarSet<'db>,
-        source_order: Option<SourceOrderId>,
-        limits: &mut L,
-    ) -> ControlFlow<L::Break, (NodeId, Option<SourceOrderId>)> {
-        self.abstract_inner(
-            db,
-            env,
-            storage,
-            source_order,
-            limits,
-            // Remove any node that constrains one of `bound_typevars`, or that has a lower/upper
-            // bound that mentions one of them. Removed constraints are still added to `path`, so
-            // the sequent map can propagate any derived constraints that do not mention the
-            // quantified typevars.
-            &mut |storage: &ConstraintSetStorage<'_>, constraint| {
-                storage.constraint_mentions_typevars(db, constraint, bound_typevars)
-            },
-        )
-    }
-
-    fn abstract_inner<'db, F, L>(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        storage: &mut ConstraintSetStorage<'db>,
-        source_order: Option<SourceOrderId>,
-        limits: &mut L,
-        should_remove: F,
-    ) -> ControlFlow<L::Break, (NodeId, Option<SourceOrderId>)>
-    where
-        F: FnMut(&ConstraintSetStorage<'_>, ConstraintId) -> bool,
-        L: SolutionLimits,
-    {
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        enum Disposition {
-            Keep,
-            Remove,
-        }
-
-        struct AbstractVisitor<'a, F, L> {
-            should_remove: F,
-            limits: &'a mut L,
-        }
-
-        impl<F, L> PathVisitor for AbstractVisitor<'_, F, L>
-        where
-            F: FnMut(&ConstraintSetStorage<'_>, ConstraintId) -> bool,
-            L: SolutionLimits,
-        {
-            type Result = (NodeId, Option<SourceOrderId>);
-            type Interior = (Disposition, ConstraintId);
-            type Break = L::Break;
-
-            fn visit_node(&mut self) -> ControlFlow<Self::Break> {
-                self.limits.visit_node()
-            }
-
-            fn visit_satisfied<'db>(
-                &mut self,
-                _db: &'db dyn Db,
-                _storage: &mut ConstraintSetStorage<'db>,
-                _path: &PathAssignments,
-            ) -> ControlFlow<Self::Break, Self::Result> {
-                ControlFlow::Continue((ALWAYS_TRUE, None))
-            }
-
-            fn visit_unsatisfied<'db>(
-                &mut self,
-                _db: &'db dyn Db,
-                _storage: &mut ConstraintSetStorage<'db>,
-                _path: &PathAssignments,
-            ) -> ControlFlow<Self::Break, Self::Result> {
-                ControlFlow::Continue((ALWAYS_FALSE, None))
-            }
-
-            fn visit_impossible<'db>(
-                &mut self,
-                _db: &'db dyn Db,
-                _storage: &mut ConstraintSetStorage<'db>,
-                _path: &PathAssignments,
-            ) -> ControlFlow<Self::Break, Self::Result> {
-                ControlFlow::Continue((ALWAYS_FALSE, None))
-            }
-
-            fn enter_interior<'db>(
-                &mut self,
-                _db: &'db dyn Db,
-                storage: &mut ConstraintSetStorage<'db>,
-                interior: InteriorNode,
-            ) -> ControlFlow<Self::Break, Self::Interior> {
-                let interior = storage.interior_node_data(interior.node());
-                let disposition = if (self.should_remove)(storage, interior.constraint) {
-                    Disposition::Remove
-                } else {
-                    Disposition::Keep
-                };
-                ControlFlow::Continue((disposition, interior.constraint))
-            }
-
-            fn visit_edge<'db>(
-                &mut self,
-                _db: &'db dyn Db,
-                storage: &mut ConstraintSetStorage<'db>,
-                interior: &Self::Interior,
-                subtree: Self::Result,
-                path: &PathAssignments,
-                new_range: Range<usize>,
-            ) -> ControlFlow<Self::Break, Self::Result> {
-                let (disposition, _) = interior;
-                match disposition {
-                    // If we are keeping this node, we don't need to add any derived facts to the
-                    // result; we can always re-derive them later.
-                    Disposition::Keep => ControlFlow::Continue(subtree),
-
-                    // If we are removing this node, we have to check if there are any derived facts
-                    // that depend on the constraint we're about to remove. If so, we need to
-                    // "remember" them by AND-ing them in with the corresponding branch.
-                    Disposition::Remove => {
-                        let (mut result, mut result_source_order) = subtree;
-                        for (assignment, _) in &path.assignments[new_range] {
-                            // Don't add back any derived facts if they are ones that we would have
-                            // removed!
-                            if (self.should_remove)(storage, assignment.constraint().into_inner()) {
-                                continue;
-                            }
-                            let (assignment, assignment_source_order) =
-                                Node::new_satisfied_constraint(storage, assignment.into_inner());
-                            result = result.and(storage, assignment);
-                            result_source_order = storage
-                                .ordered_source_order(result_source_order, assignment_source_order);
-                        }
-                        ControlFlow::Continue((result, result_source_order))
-                    }
-                }
-            }
-
-            fn leave_interior<'db>(
-                &mut self,
-                _db: &'db dyn Db,
-                storage: &mut ConstraintSetStorage<'db>,
-                interior: &Self::Interior,
-                if_true: Self::Result,
-                if_uncertain: Self::Result,
-                if_false: Self::Result,
-            ) -> ControlFlow<Self::Break, Self::Result> {
-                let (disposition, constraint) = interior;
-                match disposition {
-                    // Preserve the uncertain branch when rebuilding the node. Recursive calls
-                    // can introduce derived constraints earlier in the variable ordering, so
-                    // use `ite_uncertain` rather than constructing a node directly.
-                    Disposition::Keep => {
-                        let (guard, guard_source_order) =
-                            Node::new_constraint(storage, *constraint);
-                        let (if_true, if_true_source_order) = if_true;
-                        let (if_uncertain, if_uncertain_source_order) = if_uncertain;
-                        let (if_false, if_false_source_order) = if_false;
-                        let node = guard.ite_uncertain(storage, if_true, if_uncertain, if_false);
-                        let left_source_order =
-                            storage.ordered_source_order(guard_source_order, if_true_source_order);
-                        let right_source_order = storage
-                            .ordered_source_order(if_uncertain_source_order, if_false_source_order);
-                        ControlFlow::Continue((
-                            node,
-                            storage.ordered_source_order(left_source_order, right_source_order),
-                        ))
-                    }
-
-                    // If we are removing this node, then we replace it with the OR of all of its
-                    // outgoing edges. That is, the result is true if there's any assignment of
-                    // this node's constraint that is true. (We will have already added any
-                    // necessary derived facts in the `visit_edge` method.)
-                    Disposition::Remove => {
-                        let (if_true, if_true_source_order) = if_true;
-                        let (if_uncertain, if_uncertain_source_order) = if_uncertain;
-                        let (if_false, if_false_source_order) = if_false;
-                        let node = if_true.or(storage, if_uncertain).or(storage, if_false);
-                        let source_order = storage
-                            .ordered_source_order(if_true_source_order, if_uncertain_source_order);
-                        ControlFlow::Continue((
-                            node,
-                            storage.ordered_source_order(source_order, if_false_source_order),
-                        ))
-                    }
-                }
-            }
-        }
-
-        let mut path = self.path_assignments(db, env, storage, source_order);
-        let mut visitor = AbstractVisitor {
-            should_remove,
-            limits,
-        };
-        let (node, derived_source_order) =
-            path.visit(db, env, storage, self.node(), &mut visitor)?;
-        let derived_source_order =
-            path.projection_source_order(storage, source_order, derived_source_order);
-        ControlFlow::Continue((node, derived_source_order))
-    }
-
     fn path_assignments<'db>(
         self,
         db: &'db dyn Db,
@@ -5430,113 +5108,6 @@ impl Assignment<AtomicConstraintId> {
     fn into_inner(self) -> Assignment<ConstraintId> {
         self.map(AtomicConstraintId::into_inner)
     }
-}
-
-/// A visitor for walking the paths of a BDD.
-///
-/// Each path starts at the root node and ends at a terminal node, and represents one family of
-/// typevar assignments described by the BDD. Each path can be either _satisfied_, meaning that
-/// this family of assignments is accepted by the constraint set; _unsatisfied_, meaning that this
-/// family of assignments is _not_ accepted by the constraint set; or _impossible_, meaning that
-/// this family of assignments contains a contradiction, and cannot possibly ever occur.
-///
-/// To visit the BDD paths:
-///
-/// - We start at the root node.
-///
-/// - Each time we encounter an interior node, we call the visitor's `enter_interior` method. We
-///   then process walk the interior node's `true`, `uncertain`, and `false` outgoing edges.
-///
-/// - To process an edge, we recursively visit the node that the edge points to (getting a `Result`
-///   for that subtree), and then call the visitor's `visit_edge` method. This lets you modify the
-///   subtree's value based on the assignments that were added to the path by this edge. (This
-///   includes at least the constraint checked by the interior node containing this edge, and can
-///   also include any additional derived facts that we learn based on whatever other assignments
-///   currently hold on the path.)
-///
-/// - Once we have processed all of the edges for an interior node, we call the visitor's
-///   `leave_interior` method. This lets you combine the `Result`s from each outgoing edge into a
-///   single `Result` that represents the subtree rooted at this interior node.
-///
-/// Throughout this process, if any of your methods return [`ControlFlow::Break`], we will abort
-/// the path walk and immediately return that value.
-trait PathVisitor {
-    type Result;
-    type Interior;
-    type Break;
-
-    /// Called before visiting any interior or terminal node. Returning `Break` prevents the
-    /// traversal from entering the node or deriving facts from its outgoing edges.
-    fn visit_node(&mut self) -> ControlFlow<Self::Break> {
-        ControlFlow::Continue(())
-    }
-
-    /// Called when we reach the end of a satisfied path. `path` will contain all of the
-    /// assignments on this path. The `Result` value that you return will be propagated back up as
-    /// we "unwind" this path.
-    fn visit_satisfied<'db>(
-        &mut self,
-        db: &'db dyn Db,
-        storage: &mut ConstraintSetStorage<'db>,
-        path: &PathAssignments,
-    ) -> ControlFlow<Self::Break, Self::Result>;
-
-    /// Called when we reach the end of an unsatisfied path. `path` will contain all of the
-    /// assignments on this path. The `Result` value that you return will be propagated back up as
-    /// we "unwind" this path.
-    fn visit_unsatisfied<'db>(
-        &mut self,
-        db: &'db dyn Db,
-        storage: &mut ConstraintSetStorage<'db>,
-        path: &PathAssignments,
-    ) -> ControlFlow<Self::Break, Self::Result>;
-
-    /// Called when we determine that a path is impossible, either because its assignments
-    /// contradict each other, or because an edge is structurally absent (such as the uncertain
-    /// edge when visiting a negated BDD). The `Result` value that you return will be propagated
-    /// back up as we "unwind" this path.
-    fn visit_impossible<'db>(
-        &mut self,
-        db: &'db dyn Db,
-        storage: &mut ConstraintSetStorage<'db>,
-        path: &PathAssignments,
-    ) -> ControlFlow<Self::Break, Self::Result>;
-
-    /// Called on the way down as we enter each interior node. You can create a
-    /// [`Interior`][Self::Interior] value that will be passed to the
-    /// [`visit_edge`][Self::visit_edge] and [`leave_interior`][Self::leave_interior] methods
-    /// when we call them for this node.
-    fn enter_interior<'db>(
-        &mut self,
-        db: &'db dyn Db,
-        storage: &mut ConstraintSetStorage<'db>,
-        interior_node: InteriorNode,
-    ) -> ControlFlow<Self::Break, Self::Interior>;
-
-    /// Called once for each edge in the BDD. You are given the [`Result`][Self::Result] value
-    /// of the subtree that the edge points to, as well as the origin and derived assignments that
-    /// are added by the edge.
-    fn visit_edge<'db>(
-        &mut self,
-        db: &'db dyn Db,
-        storage: &mut ConstraintSetStorage<'db>,
-        interior_value: &Self::Interior,
-        subtree: Self::Result,
-        path: &PathAssignments,
-        new_range: Range<usize>,
-    ) -> ControlFlow<Self::Break, Self::Result>;
-
-    /// Called on the way back up as we leave each interior node in the BDD. Combines the
-    /// [`Result`][Self::Result] values for each of the interior node's subtrees.
-    fn leave_interior<'db>(
-        &mut self,
-        db: &'db dyn Db,
-        storage: &mut ConstraintSetStorage<'db>,
-        interior_value: &Self::Interior,
-        if_true: Self::Result,
-        if_uncertain: Self::Result,
-        if_false: Self::Result,
-    ) -> ControlFlow<Self::Break, Self::Result>;
 }
 
 /// A single clause in the DNF representation of a BDD
@@ -8383,7 +7954,7 @@ class E: ...
                 .fold(None, |source_order, constraint| {
                     let constraint = storage.intern_atomic_constraint(db, &env, constraint);
                     let constraint_source_order =
-                        storage.atomic_constraint_source_order(constraint);
+                        storage.constraint_source_order(constraint.into_inner());
                     storage.ordered_source_order(source_order, Some(constraint_source_order))
                 });
             drop(storage);
@@ -9073,8 +8644,8 @@ class E: ...
             .interior_node_data(second.node)
             .constraint
             .expect_atomic(&storage);
-        let first_order = storage.atomic_constraint_source_order(first);
-        let second_order = storage.atomic_constraint_source_order(second);
+        let first_order = storage.constraint_source_order(first.into_inner());
+        let second_order = storage.constraint_source_order(second.into_inner());
         let mut source_order = storage.ordered_source_order(Some(second_order), Some(first_order));
 
         // Appending a repeated leaf creates a deep left spine without changing the order. The
@@ -9511,7 +9082,7 @@ class E: ...
                 .constraint
                 .expect_atomic(&storage);
             assert_eq!(
-                Some(storage.atomic_constraint_source_order(existing_constraint)),
+                Some(storage.constraint_source_order(existing_constraint.into_inner())),
                 set.source_order
             );
             drop(storage);
