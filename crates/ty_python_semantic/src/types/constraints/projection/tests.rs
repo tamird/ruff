@@ -384,6 +384,7 @@ fn incomplete_paramspec_does_not_reject_potentially_captured_typevar() {
     );
     let paramspec_value = Type::paramspec_value_callable(db, Parameters::empty());
     let candidates = CandidateSolutions::Constrained {
+        incomplete: false,
         inferable: TypeVarSet::from_typevars(db, [t, paramspec]),
         paths: Box::new([CandidateSolution {
             typevars: Box::new([
@@ -905,6 +906,7 @@ class E: ...
     // intersection constructor.
     for alternatives in [[left, right], [right, left]] {
         let paths = CandidateSolutions::Constrained {
+            incomplete: false,
             inferable: TypeVarSet::from_typevars(db, [t]),
             paths: alternatives
                 .map(|ty| CandidateSolution {

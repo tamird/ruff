@@ -287,11 +287,7 @@ def alternation[X: (int, str), Y: (int, str)]() -> None:
 
     # ∀Y. ∃X. R(X, Y)
     forall_y_exists_x = relation.exists(tuple[X]).for_all(tuple[Y])
-    # TODO: no error
-    # error: [static-assert-error]
     static_assert(forall_y_exists_x)
-    # TODO: no error
-    # error: [static-assert-error]
     static_assert(not ~forall_y_exists_x)
 
     # ∃X. ∀Y. R(X, Y)
@@ -300,8 +296,6 @@ def alternation[X: (int, str), Y: (int, str)]() -> None:
 
     # ∃Y. ∀X. ¬R(X, Y)
     counterexample = (~relation).for_all(tuple[X]).exists(tuple[Y])
-    # TODO: no error
-    # error: [static-assert-error]
     static_assert(not counterexample)
     static_assert(counterexample == ~forall_y_exists_x)
 

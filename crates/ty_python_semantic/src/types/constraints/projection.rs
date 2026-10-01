@@ -309,7 +309,16 @@ impl<'db> CandidateSolutions<'db> {
         let (inferable, candidates) = match self {
             Self::Unsatisfiable => return Ok(SolutionProjection::Unsatisfiable),
             Self::Unconstrained => return Ok(SolutionProjection::Unconstrained),
-            Self::Constrained { inferable, paths } => (*inferable, paths),
+            Self::Constrained {
+                inferable,
+                paths,
+                incomplete,
+            } => {
+                if *incomplete {
+                    return Err(ProjectionError::IncompleteSolution);
+                }
+                (*inferable, paths)
+            }
         };
 
         let mut retained = false;

@@ -3484,3 +3484,39 @@ def check_gradual(
     # error: [invalid-argument-type]
     map_item(integer_identity, item)
 ```
+
+## Constrained generic callbacks preserve gradual arguments
+
+A generic callback's constrained type variable is scoped to that callback. Its declared choices
+validate the inferred family after solving; choosing them before checking the callback would widen
+the gradual argument with other compatible declarations.
+
+```py
+from typing import Any, Callable, TypeVar
+
+Shape = TypeVar(
+    "Shape",
+    tuple[()],
+    tuple[int],
+    tuple[int, int],
+    tuple[int, int, int],
+    tuple[int, ...],
+)
+T = TypeVar("T", int, int | list[int])
+
+def preserve_shape(value: Shape) -> Shape:
+    return value
+
+def identity(value: T) -> T:
+    return value
+
+A = TypeVar("A")
+R = TypeVar("R")
+
+def apply(f: Callable[[A], R], value: A) -> R:
+    return f(value)
+
+def check(value: tuple[Any, Any], any_value: Any):
+    reveal_type(apply(preserve_shape, value))  # revealed: tuple[Any, Any]
+    reveal_type(apply(identity, any_value))  # revealed: Any
+```
