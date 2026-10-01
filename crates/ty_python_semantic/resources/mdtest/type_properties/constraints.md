@@ -1585,8 +1585,8 @@ def invariant_unfixed_declared_upper[I, N: int]() -> None:
 ### Declared non-inferable domains
 
 A positive constraint on a non-inferable variable must be compatible with its declared upper bound
-or finite domain, even though that variable is not returned. Complete reasoning about combinations
-of negative non-inferable constraints is intentionally deferred.
+or finite domain, even though that variable is not returned. Excluding every member of a declared
+finite domain also makes the constraint set unsatisfiable.
 
 ```py
 from ty_extensions._internal import ConstraintSet
@@ -1603,9 +1603,7 @@ def incompatible_bounded_noninferable[I, N: str]() -> None:
 
 def negative_finite_noninferable[I, N: (int, str)]() -> None:
     constraints = ~ConstraintSet.range(int, N, int) & ~ConstraintSet.range(str, N, str)
-    # TODO: Complete reasoning about negative non-inferable constraints would reject this path.
-    # TODO: revealed: None
-    reveal_type(constraints.solutions(inferable=tuple[I]))  # revealed: tuple[()]
+    reveal_type(constraints.solutions(inferable=tuple[I]))  # revealed: None
 ```
 
 ### Negative inferable decisions and correlated outputs
