@@ -98,6 +98,10 @@ pub(super) enum Sequent<C, FuelCost = (), Relation = ()> {
     /// path that assumes both is impossible and can be pruned.
     PairImpossibility { ante1: C, ante2: C },
 
+    /// `C₁` and `C₂` have the same truth value but different inference provenance.
+    /// Opposite assignments conflict; neither atom supplies evidence for the other.
+    PairEquivalence { left: C, right: C },
+
     /// Sequent of the form `C₁ ∧ C₂ ∧ C₃ → false`
     ///
     /// This indicates that `C₁`, `C₂` and `C₃` are mutually disjoint: it is not possible for all
@@ -158,6 +162,15 @@ impl<'db> SequentMap<'db> {
             for sequent in self.all_sequents() {
                 match sequent {
                     Sequent::SingleTautology { .. } => {}
+                    Sequent::PairEquivalence { left, right } => {
+                        maybe_write_prefix(f)?;
+                        write!(
+                            f,
+                            "{} ⇔ {}",
+                            left.display(db, env, Some(true)),
+                            right.display(db, env, Some(true))
+                        )?;
+                    }
                     Sequent::PairRelation {
                         ante1,
                         ante2,
@@ -461,7 +474,13 @@ impl<'db> SequentMap<'db> {
                 "add sequents for constraint pair",
             );
             let mut map = SequentMap::default();
-            left.add_sequents_with(db, env, &mut map, right);
+            if left.with_provenance(right.provenance()) == right {
+                // A declaration restricts the same specializations as matching call-site evidence,
+                // but deriving the evidence atom would change inference choices.
+                map.pending.push(Sequent::PairEquivalence { left, right });
+            } else {
+                left.add_sequents_with(db, env, &mut map, right);
+            }
             map.finish();
             map
         }

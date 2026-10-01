@@ -707,6 +707,15 @@ impl PathAssignments {
                         add_trigger(ante.when_false());
                         Sequent::SingleTautology { ante }
                     }
+                    Sequent::PairEquivalence { left, right } => {
+                        let left = storage.intern_atomic_constraint(db, env, *left);
+                        let right = storage.intern_atomic_constraint(db, env, *right);
+                        add_trigger(left.when_true());
+                        add_trigger(left.when_false());
+                        add_trigger(right.when_true());
+                        add_trigger(right.when_false());
+                        Sequent::PairEquivalence { left, right }
+                    }
                     Sequent::PairImpossibility { ante1, ante2 } => {
                         let ante1 = storage.intern_atomic_constraint(db, env, *ante1);
                         let ante2 = storage.intern_atomic_constraint(db, env, *ante2);
@@ -1113,6 +1122,17 @@ impl PathAssignments {
                 }
                 Ok(())
             }
+            Sequent::PairEquivalence { left, right } => {
+                if (self.assignment_holds(left.when_true())
+                    && self.assignment_holds(right.when_false()))
+                    || (self.assignment_holds(left.when_false())
+                        && self.assignment_holds(right.when_true()))
+                {
+                    Err(PathAssignmentConflict)
+                } else {
+                    Ok(())
+                }
+            }
             Sequent::SingleTautology { ante } => {
                 self.check_single_tautology(db, env, storage, ante)
             }
@@ -1333,6 +1353,106 @@ mod tests {
         let env = db.program_environment();
         let ty = bound.to_instance(db, &env);
         ConstraintSet::constrain_typevar_equivalence_bound(db, &env, builder, bound_typevar, ty)
+    }
+
+    #[test]
+    fn equivalent_provenance_conflicts_preserve_evidence() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let builder = ConstraintSetBuilder::new();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let u = Type::TypeVar(create_typevar(db, "U"));
+        let cases = [
+            create_constraint(db, &builder, t, KnownClass::Int),
+            ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, t, integer),
+            ConstraintSet::constrain_typevar_upper_bound(db, &env, &builder, t, integer),
+            ConstraintSet::constrain_typevar_upper_bound(db, &env, &builder, t, u),
+            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, t, u),
+        ];
+        let different = [
+            create_constraint(db, &builder, t, KnownClass::Str),
+            create_constraint(db, &builder, create_typevar(db, "V"), KnownClass::Int),
+        ];
+        let mut storage = builder.storage.borrow_mut();
+        let different = different.map(|set| {
+            storage
+                .interior_node_data(set.node)
+                .constraint
+                .expect_atomic(&storage)
+        });
+        for case in cases {
+            let original = storage
+                .interior_node_data(case.node)
+                .constraint
+                .expect_atomic(&storage);
+            let atom = storage.atomic_constraint_data(original);
+            let [validity, mixed, evidence] = [
+                ConstraintProvenance::Validity,
+                ConstraintProvenance::Mixed,
+                ConstraintProvenance::Evidence,
+            ]
+            .map(|provenance| {
+                storage.intern_atomic_constraint(db, &env, atom.with_provenance(provenance))
+            });
+            for first in [validity, mixed, evidence] {
+                for second in [validity, mixed, evidence] {
+                    let mut path = PathAssignments::new([first, second], FxHashSet::default());
+                    path.walk_edge(
+                        db,
+                        &env,
+                        &mut storage,
+                        first.when_true(),
+                        |storage, path, _, conflict| {
+                            assert!(!conflict);
+                            // Truth agrees across provenance, but a declaration alone must not become
+                            // new inference evidence.
+                            assert_eq!(path.assignment_holds(second.when_true()), first == second);
+                            for other in different {
+                                path.walk_edge(
+                                    db,
+                                    &env,
+                                    storage,
+                                    other.when_false(),
+                                    |_, _, _, conflict| {
+                                        assert!(!conflict);
+                                    },
+                                );
+                            }
+                            path.walk_edge(
+                                db,
+                                &env,
+                                storage,
+                                second.when_false(),
+                                |_, _, _, conflict| {
+                                    assert!(conflict);
+                                },
+                            );
+                        },
+                    );
+                    // Leaving the positive branch removes the conflicting assignment.
+                    path.walk_edge(
+                        db,
+                        &env,
+                        &mut storage,
+                        second.when_false(),
+                        |storage, path, _, conflict| {
+                            assert!(!conflict);
+                            path.walk_edge(
+                                db,
+                                &env,
+                                storage,
+                                first.when_true(),
+                                |_, _, _, conflict| {
+                                    assert!(conflict);
+                                },
+                            );
+                        },
+                    );
+                }
+            }
+        }
     }
 
     #[test]
