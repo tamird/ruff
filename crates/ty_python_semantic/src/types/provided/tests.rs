@@ -188,6 +188,63 @@ def erase(value: dict[str, int], schema: Row) -> None:
 }
 
 #[test]
+fn supplied_allocation_preserves_named_argument_proofs() -> anyhow::Result<()> {
+    for allocated in [false, true] {
+        for named in [false, true] {
+            for (value, proved) in [
+                ("1", true),
+                ("'wrong'", false),
+                ("unknown", false),
+                ("any_value", false),
+            ] {
+                let argument = format!("{{'value': {value}}}");
+                let call = if named {
+                    format!("attrs = {argument}\n    consume(attrs)")
+                } else {
+                    format!("consume({argument})")
+                };
+                let source = format!(
+                    "from typing import Any\ndef consume[K: str](attrs: dict[K, int]) -> None: ...\ndef make(unknown, any_value: Any) -> None:\n    {call}\n"
+                );
+                let builder = TestDbBuilder::new()
+                    .with_file(
+                        "/src/leaf.pyi",
+                        "from typing import final\n@final\nclass Exact[K, V](dict[K, V]): ...\n",
+                    )
+                    .with_file("/src/main.py", &source);
+                let builder = if allocated {
+                    builder.with_source_provider(AllocationSource)
+                } else {
+                    builder
+                };
+                let mut db = builder.build()?;
+                let file = system_path_to_file(&db, "/src/main.py")?;
+                db.select_function_inference(Some((
+                    file,
+                    vec!["make".into()],
+                    crate::FunctionInferenceMode::OutputProof,
+                )));
+                let program = db.program_file(file);
+                let function = crate::place::global_symbol(&db, program, "make")
+                    .place
+                    .expect_type()
+                    .as_function_literal()
+                    .ok_or_else(|| anyhow::anyhow!("expected make to be a function"))?;
+                let facts = SemanticModel::new(&db, program)
+                    .function_inference_facts(function.definition(&db))
+                    .ok_or_else(|| anyhow::anyhow!("expected selected function facts"))?;
+                assert_eq!(
+                    !facts.has_unproved_requirements && !facts.has_errors,
+                    proved,
+                    "allocated={allocated}, named={named}, value={value}, {facts:?}",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_allocation_preserves_later_generic_context() -> anyhow::Result<()> {
     for allocated in [false, true] {
         for (value, corresponds) in [("'value'", true), ("object()", false), ("unknown", false)] {

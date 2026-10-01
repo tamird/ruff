@@ -9697,15 +9697,8 @@ impl<'db> Binding<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> Option<Specialization<'db>> {
-        self.inference.map(|inference| {
-            inference.merged_specialization_with(db, |_, inferred| {
-                TypeVarProjection::Override(
-                    inferred
-                        .filter(|ty| !ty.has_provisional_marker(db, env))
-                        .unwrap_or(Type::Dynamic(DynamicType::UnspecializedTypeVar)),
-                )
-            })
-        })
+        self.inference
+            .map(|inference| inference.merged_partial_specialization(db, env))
     }
 
     pub(crate) fn errors(&self) -> &[BindingError<'db>] {

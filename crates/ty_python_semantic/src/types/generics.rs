@@ -40,10 +40,11 @@ use crate::types::visitor::{
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallableType, CallableTypes,
-    ClassLiteral, ErrorContext, FindLegacyTypeVarsVisitor, IntersectionType, KnownClass,
-    KnownInstanceType, MaterializationKind, RecursiveType, SubclassOfInner, Type, TypeAliasType,
-    TypeContext, TypeMapping, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance,
-    UnionAccumulator, UnionType, binding_type, infer_definition_types, inferred_declaration,
+    ClassLiteral, DynamicType, ErrorContext, FindLegacyTypeVarsVisitor, IntersectionType,
+    KnownClass, KnownInstanceType, MaterializationKind, RecursiveType, SubclassOfInner, Type,
+    TypeAliasType, TypeContext, TypeMapping, TypeVarBoundOrConstraints, TypeVarKind,
+    TypeVarVariance, UnionAccumulator, UnionType, binding_type, infer_definition_types,
+    inferred_declaration,
 };
 use crate::{Db, FxIndexMap, FxOrderMap, FxOrderSet};
 use ty_python_core::definition::{Definition, DefinitionKind};
@@ -2631,7 +2632,37 @@ impl<'db> TypeVarInference<'db> {
     pub(crate) fn merged_specialization_with(
         self,
         db: &'db dyn Db,
+        choose: impl FnMut(BoundTypeVarInstance<'db>, Option<Type<'db>>) -> TypeVarProjection<'db>,
+    ) -> Specialization<'db> {
+        self.project_merged_specialization(db, choose, None)
+    }
+
+    /// Keep missing and unresolved selections provisional when extracting inference evidence.
+    /// A gradual type supplied by an argument remains gradual.
+    pub(crate) fn merged_partial_specialization(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Specialization<'db> {
+        let unspecialized = Type::Dynamic(DynamicType::UnspecializedTypeVar);
+        self.project_merged_specialization(
+            db,
+            |_, inferred| {
+                TypeVarProjection::Override(
+                    inferred
+                        .filter(|ty| !ty.has_provisional_marker(db, env))
+                        .unwrap_or(unspecialized),
+                )
+            },
+            Some(unspecialized),
+        )
+    }
+
+    fn project_merged_specialization(
+        self,
+        db: &'db dyn Db,
         mut choose: impl FnMut(BoundTypeVarInstance<'db>, Option<Type<'db>>) -> TypeVarProjection<'db>,
+        unresolved_override: Option<Type<'db>>,
     ) -> Specialization<'db> {
         let context = self.generic_context(db);
         let env = ProgramEnvironment::from_program(context.program(db));
@@ -2670,7 +2701,7 @@ impl<'db> TypeVarInference<'db> {
                 .zip(unknown.types(db))
                 .map(|(solution, unknown)| match solution {
                     SolutionType::Resolved(ty) => *ty,
-                    SolutionType::Unresolved(_) => *unknown,
+                    SolutionType::Unresolved(_) => unresolved_override.unwrap_or(*unknown),
                 })
                 .collect::<Vec<_>>(),
         )
@@ -5474,6 +5505,10 @@ mod tests {
         assert_eq!(&*paths[0], [Some(Unresolved(Type::TypeVar(u))), None]);
         assert_eq!(inference.merged_types(db), [Some(Type::TypeVar(u)), None]);
         assert_eq!(inference.merged_specialization(db).types(db), [int, int]);
+        assert_eq!(
+            inference.merged_partial_specialization(db, &env).types(db),
+            [Type::Dynamic(DynamicType::UnspecializedTypeVar); 2],
+        );
         Ok(())
     }
 
@@ -5566,6 +5601,46 @@ mod tests {
     }
 
     #[test]
+    fn partial_specialization_preserves_gradual_evidence() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let typevars @ [t, u, _] = create_typevars(db, ["T", "U", "V"]);
+        let context = GenericContext::from_typevar_instances(db, &env, typevars);
+        let int = KnownClass::Int.to_instance(db, &env);
+        let unspecialized = Type::Dynamic(DynamicType::UnspecializedTypeVar);
+        for (merged, expected) in [
+            (
+                [Some(Type::TypeVar(u)), Some(Type::TypeVar(t)), Some(int)],
+                [unspecialized, unspecialized, int],
+            ),
+            (
+                [Some(Type::TypeVar(u)), Some(int), Some(Type::unknown())],
+                [int, int, Type::unknown()],
+            ),
+            (
+                [
+                    None,
+                    Some(Type::any()),
+                    Some(Type::Dynamic(DynamicType::UnknownLambdaParameter)),
+                ],
+                [unspecialized, Type::any(), unspecialized],
+            ),
+        ] {
+            let inference = TypeVarInference::new(
+                db,
+                context,
+                Box::from(merged),
+                TypeVarInferenceSolutions::Unavailable(TypeVarInferenceFallback::Unconstrained),
+            );
+            assert_eq!(
+                inference.merged_partial_specialization(db, &env).types(db),
+                expected,
+            );
+        }
+    }
+
+    #[test]
     fn merged_specialization_recovers_identity_bindings() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented("/src/a.py", "def f[T, *Ts, **P](): ...")?;
@@ -5583,6 +5658,11 @@ mod tests {
         assert_eq!(
             inference.merged_specialization(db),
             context.unknown_specialization(db, None),
+        );
+        let env = db.program_environment();
+        assert_eq!(
+            inference.merged_partial_specialization(db, &env).types(db),
+            [Type::Dynamic(DynamicType::UnspecializedTypeVar); 3],
         );
         Ok(())
     }
