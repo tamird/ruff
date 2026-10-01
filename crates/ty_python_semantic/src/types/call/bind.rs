@@ -11903,6 +11903,8 @@ def identity[T](value: list[T]) -> list[T]: ...
 
 fixed_copy = Copy[int]
 opaque_self_copy = cast(SelfCopy, None)
+int_self_copy = cast(SelfCopy[int], None)
+fixed_self_copy = SelfCopy[int]
 opaque_copy = cast(Copy, None)
 copy_init = opaque_copy.__init__
 int_copy = cast(Copy[int], None)
@@ -11962,7 +11964,14 @@ unbound_or = dict.__or__
             ("Copy", vec![list(unknown)], Some(lookup("int_copy")), false),
             ("fixed_copy", vec![list(unknown)], None, false),
             ("ExplicitCopy", vec![list(unknown)], None, false),
-            ("SelfCopy", vec![lookup("opaque_self_copy")], None, false),
+            ("SelfCopy", vec![lookup("opaque_self_copy")], None, true),
+            ("SelfCopy", vec![lookup("int_self_copy")], None, true),
+            (
+                "fixed_self_copy",
+                vec![lookup("opaque_self_copy")],
+                None,
+                false,
+            ),
             ("BoundedCopy", vec![list(unknown)], None, false),
             ("list_kind", vec![list(unknown)], None, true),
             ("dict_kind", vec![dict(unknown, unknown)], None, true),
@@ -12013,6 +12022,20 @@ unbound_or = dict.__or__
             if name == "Copy" && context.is_none() {
                 assert_eq!(ordinary_return, lookup("opaque_copy"));
                 assert!(!ordinary_return.satisfies_declared_output(db, &env, lookup("int_copy")));
+            }
+            if name == "SelfCopy" {
+                let (_, supplied) = arguments
+                    .iter()
+                    .exactly_one()
+                    .map_err(|_| anyhow::anyhow!("expected one SelfCopy argument"))?;
+                assert_eq!(Some(ordinary_return), supplied.get_default());
+                if ordinary_return == lookup("opaque_self_copy") {
+                    assert!(!ordinary_return.satisfies_declared_output(
+                        db,
+                        &env,
+                        lookup("int_self_copy")
+                    ));
+                }
             }
             assert_eq!(
                 bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
@@ -12078,7 +12101,7 @@ unbound_or = dict.__or__
             ("box_explicit", vec![int], true, false),
             ("list_append", vec![int], true, false),
             ("peer", vec![lookup("opaque_holder")], true, false),
-            ("clone", vec![], true, false),
+            ("clone", vec![], true, true),
             ("attached_transport", vec![dict(str, int)], true, false),
             ("unrelated_transport", vec![dict(str, int)], false, false),
             (
@@ -12127,9 +12150,10 @@ unbound_or = dict.__or__
                 let Ok((_, binding)) = callable.matching_overloads().exactly_one() else {
                     panic!("expected one clone overload");
                 };
-                assert!(
-                    binding.signature.return_type().contains_self(db, &env),
-                    "the selected clone signature must retain Self",
+                assert_eq!(
+                    binding.signature.return_type(),
+                    lookup("opaque_holder"),
+                    "the selected clone signature must capture Self",
                 );
                 let returned = bindings.return_type(db, &env);
                 assert_eq!(returned, lookup("opaque_holder"));

@@ -1639,4 +1639,71 @@ reveal_type(Child.attr)  # revealed: Child
 reveal_type(Child().attr)  # revealed: Child
 ```
 
+## Bound receiver in a reflected generic method
+
+Binding an inherited method fixes `Self` to its receiver before inferring the result of a generic
+reflected overload. The reflected method also infers its mapping element types from its own
+receiver.
+
+`reflected.pyi`:
+
+```pyi
+from typing import Generic, Literal, Mapping, Protocol, Self, TypeVar, final, overload
+from ty_extensions import Intersection
+
+class Reflected[Other, Result](Protocol):
+    def __ror__(self, other: Other, /) -> Result: ...
+
+class Dictionary[K, V](dict[K, V]):
+    def __or__[R](self, other: Reflected[Self, R], /) -> R: ...
+
+@final
+class Exact[K, V](Dictionary[K, V]): ...
+
+Value = TypeVar("Value", covariant=True)
+Kind = TypeVar("Kind", covariant=True)
+
+class Selected(Generic[Value, Kind]):
+    @overload
+    def __ror__[KL, L, KR, R](
+        self: Selected[Mapping[KL, L] | None, Literal["dict"]], other: Exact[KR, R], /
+    ) -> Selected[dict[KL | KR, L | R] | Intersection[Value, None], Kind]: ...
+    @overload
+    def __ror__[KL, L, KR, R, P](
+        self: Selected[Mapping[KL, L] | None, Literal["dict"]],
+        other: Intersection[Selected[Mapping[KR, R] | None, Literal["dict"]], Selected[P, Literal["dict"]]],
+        /,
+    ) -> Selected[dict[KL | KR, L | R] | Intersection[Value | P, None], Kind]: ...
+
+def make() -> Selected[Exact[str, str], Literal["dict"]]: ...
+def integer(other: Reflected[Exact[str, str], int]) -> None: ...
+```
+
+```py
+from reflected import Exact, integer, make
+
+value = make()
+left = Exact[str, str]()
+reveal_type(value.__ror__(left))  # revealed: Selected[dict[str, str], Literal["dict"]]
+reveal_type(left | value)  # revealed: Selected[dict[str, str], Literal["dict"]]
+reveal_type(left.__or__(value))  # revealed: Selected[dict[str, str], Literal["dict"]]
+integer(value)  # error: [invalid-argument-type]
+```
+
+## Receiver domain after descriptor binding
+
+Capturing a receiver through a descriptor must still check the method's receiver contract, including
+when the result uses `Self`.
+
+```py
+from typing import Self
+
+class Receiver:
+    def method(self) -> Self:
+        return self
+
+invalid = Receiver.method.__get__(object(), object)
+invalid()  # error: [invalid-argument-type]
+```
+
 [spec]: https://typing.python.org/en/latest/spec/generics.html#valid-locations-for-self
