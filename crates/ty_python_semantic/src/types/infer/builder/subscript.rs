@@ -519,7 +519,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             subscript,
             value_ty,
             self.reachability_cache(),
-        );
+        )
+        .or_else(|| {
+            crate::types::dictionary::first_value(
+                db,
+                env,
+                self.scope(),
+                subscript,
+                self.reachability_cache(),
+                |expression| self.try_expression_type(expression),
+            )
+        });
         checked
             .map(|result| {
                 let ty = self.narrow_expr_with_applicable_constraints(

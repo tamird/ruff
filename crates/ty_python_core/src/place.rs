@@ -15,6 +15,50 @@ use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::iter::FusedIterator;
 
+/// Syntax that may read the first value of a dictionary snapshot.
+/// Method and constructor identities are checked by semantic inference.
+pub struct DictionaryFirstValueRead<'ast> {
+    pub receiver: &'ast ast::Expr,
+    pub values: &'ast ast::ExprCall,
+    pub list: Option<&'ast ast::ExprCall>,
+}
+
+impl<'ast> DictionaryFirstValueRead<'ast> {
+    pub fn from_subscript(subscript: &'ast ast::ExprSubscript) -> Option<Self> {
+        let ast::Expr::NumberLiteral(index) = subscript.slice.as_ref() else {
+            return None;
+        };
+        if !matches!(&index.value, ast::Number::Int(value) if *value == 0)
+            || subscript.ctx != ast::ExprContext::Load
+        {
+            return None;
+        }
+        let call = subscript.value.as_call_expr()?;
+        let (values, list) = match call.arguments.args.as_ref() {
+            [argument] => {
+                if !call.arguments.keywords.is_empty() {
+                    return None;
+                }
+                (argument.as_call_expr()?, Some(call))
+            }
+            [] => (call, None),
+            _ => return None,
+        };
+        if !values.arguments.is_empty() {
+            return None;
+        }
+        let attribute = values.func.as_attribute_expr()?;
+        if attribute.attr.as_str() != "values" {
+            return None;
+        }
+        Some(Self {
+            receiver: &attribute.value,
+            values,
+            list,
+        })
+    }
+}
+
 /// Return the expressions whose existing bindings a match pattern can narrow.
 ///
 /// In addition to the subject itself, matching an attribute or subscript can narrow its base.

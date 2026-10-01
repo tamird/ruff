@@ -11,11 +11,87 @@ use crate::types::set_theoretic::UnionBuilder;
 use crate::types::typed_dict::{
     UnpackedTypedDict, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
 };
-use crate::types::{KnownClass, ProgramEnvironment, Type, UnionType};
+use crate::types::{KnownClass, MemberLookupPolicy, ProgramEnvironment, Type, UnionType};
 use crate::{Db, FxIndexMap};
 
 pub(crate) mod contents;
 pub(crate) mod records;
+
+/// The first value of an immediately indexed builtin dictionary snapshot.
+pub(crate) fn first_value<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    scope: ScopeId<'db>,
+    subscript: &ast::ExprSubscript,
+    reachability: &ReachabilityEvaluationCache<'db>,
+    expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+) -> Option<Type<'db>> {
+    let (_, first_entry) =
+        first_value_read(db, env, scope, subscript, reachability, expression_type)?;
+    match first_entry {
+        DictionaryFirstEntry::Entry { key: _, value } => Some(value),
+        DictionaryFirstEntry::Unknown => None,
+        DictionaryFirstEntry::Empty => None,
+    }
+}
+
+pub(crate) fn first_value_read<'ast, 'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    scope: ScopeId<'db>,
+    subscript: &'ast ast::ExprSubscript,
+    reachability: &ReachabilityEvaluationCache<'db>,
+    mut expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+) -> Option<(
+    ty_python_core::place::DictionaryFirstValueRead<'ast>,
+    DictionaryFirstEntry<'db>,
+)> {
+    let read = ty_python_core::place::DictionaryFirstValueRead::from_subscript(subscript)?;
+    if let Some(list) = read.list {
+        let Type::ClassLiteral(class) = expression_type(&list.func)? else {
+            return None;
+        };
+        if !class.is_known(db, KnownClass::List) {
+            return None;
+        }
+    } else {
+        let Type::NominalInstance(result) = expression_type(&subscript.value)? else {
+            return None;
+        };
+        if !result.has_known_class(db, KnownClass::List) {
+            return None;
+        }
+    }
+    let Type::BoundMethod(method) = expression_type(&read.values.func)? else {
+        return None;
+    };
+    let declared = KnownClass::Dict
+        .to_instance(db, env)
+        .member_lookup_with_policy(db, env, "values", MemberLookupPolicy::NO_INSTANCE_FALLBACK)
+        .place
+        .ignore_possibly_undefined()?;
+    let Type::BoundMethod(declared) = declared else {
+        return None;
+    };
+    if method.function(db)?.definition(db) != declared.function(db)?.definition(db) {
+        return None;
+    }
+    let receiver_type = expression_type(read.receiver)?;
+    let contents::ContentsValue::Mapping(mapping) = contents::snapshot_contents(
+        db,
+        scope,
+        read.receiver,
+        read.receiver.into(),
+        receiver_type,
+        reachability,
+    ) else {
+        return None;
+    };
+    if !mapping.builtin {
+        return None;
+    }
+    Some((read, mapping.dictionary.first_entry))
+}
 
 /// The nominal type is `dict`; runtime subclasses can still override its operations.
 pub(crate) fn has_dict_type<'db>(

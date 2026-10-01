@@ -1148,3 +1148,23 @@ def guarded(values: dict[Literal["value"], int | str]):
     if isinstance(values["value"], int):
         consume(**values)  # error: [invalid-argument-type]
 ```
+
+## First values of immediate snapshots
+
+An immediate list snapshot preserves the dictionary's observed first value. Overwriting a key
+preserves its position. Reading another index uses the ordinary value type.
+
+```py
+def first_value(flag: bool):
+    values = {"first": None, "other": 1}
+    reveal_type(list(values.values())[0])  # revealed: None
+    reveal_type(list(values.values())[1])  # revealed: int | None
+    values["first"] = 2
+    reveal_type(list(values.values())[0])  # revealed: Literal[2]
+
+    if flag:
+        values = {"first": None, "other": 1}
+    else:
+        values = {"other": 1, "first": None}
+    reveal_type(list(values.values())[0])  # revealed: None | Literal[1]
+```
