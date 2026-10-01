@@ -349,10 +349,6 @@ impl MemberExprBuilder {
         self.with_subscript(SegmentKind::Contents, "")
     }
 
-    pub(super) fn with_first_value(&self) -> Option<Self> {
-        self.with_subscript(SegmentKind::FirstValue, "")
-    }
-
     fn with_subscript(&self, kind: SegmentKind, key: &str) -> Option<Self> {
         let Self { path, segments } = self;
         let start_offset = path.text_len();
@@ -457,7 +453,6 @@ impl std::fmt::Display for MemberExpr {
                 SegmentKind::StringSubscript => write!(f, "[\"{}\"]", segment.text)?,
                 SegmentKind::BytesSubscript => write!(f, "[b\"{}\"]", segment.text)?,
                 SegmentKind::Contents => f.write_str(".<contents>")?,
-                SegmentKind::FirstValue => f.write_str(".<first-value>")?,
             }
         }
 
@@ -805,7 +800,6 @@ impl SegmentInfo {
             2 => SegmentKind::StringSubscript,
             3 => SegmentKind::BytesSubscript,
             4 => SegmentKind::Contents,
-            5 => SegmentKind::FirstValue,
             _ => panic!("Invalid SegmentKind bits"),
         }
     }
@@ -837,7 +831,6 @@ enum SegmentKind {
     StringSubscript = 2,
     BytesSubscript = 3,
     Contents = 4,
-    FirstValue = 5,
 }
 
 /// Iterator over segments that converts `SegmentInfo` to `Segment` with text slices.
@@ -933,10 +926,7 @@ impl SmallSegments {
         let mut prev_offset = TextSize::new(0);
 
         for (i, segment) in segments.iter().enumerate() {
-            if matches!(
-                segment.kind(),
-                SegmentKind::Contents | SegmentKind::FirstValue
-            ) {
+            if matches!(segment.kind(), SegmentKind::Contents) {
                 return None;
             }
             // Compute relative offset on-the-fly

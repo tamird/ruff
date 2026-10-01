@@ -24,41 +24,6 @@ use crate::use_def::{
 };
 
 impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
-    pub(super) fn first_value_sources(&self, expression: &ast::Expr) -> Vec<&'ast ast::Expr> {
-        struct Sources<'a, 'db, 'ast> {
-            builder: &'a SemanticIndexBuilder<'db, 'ast>,
-            receivers: Vec<&'ast ast::Expr>,
-        }
-        impl Visitor<'_> for Sources<'_, '_, '_> {
-            fn visit_expr(&mut self, expression: &ast::Expr) {
-                if expression.is_name_expr()
-                    && let Some(use_id) = self.builder.current_ast_ids().try_use_id(expression)
-                {
-                    let use_def = self.builder.current_use_def_map();
-                    let mut bindings = use_def.bindings_at_use(use_id);
-                    if let Some(first) = bindings.next()
-                        && bindings.all(|binding| binding.binding() == first.binding())
-                        && let Some(definition) = use_def.definition(first.binding()).definition()
-                        && let Some(subscript) = DictionaryFirstValueRead::assigned_subscript(
-                            definition.kind(self.builder.db),
-                            self.builder.module,
-                        )
-                        && let Some(read) = DictionaryFirstValueRead::from_subscript(subscript)
-                    {
-                        self.receivers.push(read.receiver);
-                    }
-                }
-                walk_expr(self, expression);
-            }
-        }
-        let mut sources = Sources {
-            builder: self,
-            receivers: Vec::new(),
-        };
-        sources.visit_expr(expression);
-        sources.receivers
-    }
-
     pub(super) fn record_contents_loop_capture(
         &mut self,
         place: ScopedPlaceId,
@@ -342,13 +307,6 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     }),
             );
         }
-        if expression.is_name_expr() {
-            places.extend(
-                self.first_value_sources(expression)
-                    .into_iter()
-                    .filter_map(|receiver| self.contents_place(receiver)),
-            );
-        }
         self.current_use_def_map_mut()
             .record_multi_use(places.into_iter(), use_id);
     }
@@ -605,16 +563,10 @@ pub(super) fn call_receivers<'ast>(call: &'ast ast::ExprCall) -> Vec<(&'ast ast:
     result
 }
 
-#[derive(Clone, Copy)]
-enum Observation {
-    Contents,
-    FirstValue,
-}
-
 struct Candidate<'ast> {
     receiver: &'ast ast::Expr,
     dependencies: Vec<usize>,
-    observation: Option<Observation>,
+    observed: bool,
     iteration_target: bool,
     list_literal: bool,
 }
@@ -639,7 +591,7 @@ impl<'ast> Candidates<'ast, '_> {
             self.nodes.push(Candidate {
                 receiver,
                 dependencies: Vec::new(),
-                observation: None,
+                observed: false,
                 iteration_target: false,
                 list_literal: false,
             });
@@ -656,9 +608,7 @@ impl<'ast> Candidates<'ast, '_> {
             self.demand(&binary.right);
         }
         if let Some(index) = self.place(receiver) {
-            self.nodes[index]
-                .observation
-                .get_or_insert(Observation::Contents);
+            self.nodes[index].observed = true;
         }
     }
 
@@ -675,9 +625,7 @@ impl<'ast> Candidates<'ast, '_> {
             _ => false,
         };
         if mapping_syntax {
-            self.nodes[index]
-                .observation
-                .get_or_insert(Observation::Contents);
+            self.nodes[index].observed = true;
         }
         self.source_dependencies(index, value);
     }
@@ -729,7 +677,7 @@ impl<'ast> Candidates<'ast, '_> {
         }
     }
 
-    fn finish(self) -> Vec<(&'ast ast::Expr, bool)> {
+    fn finish(self) -> Vec<&'ast ast::Expr> {
         let Self {
             exclusions: _,
             by_place: _,
@@ -738,12 +686,12 @@ impl<'ast> Candidates<'ast, '_> {
         let mut pending: Vec<_> = candidates
             .iter()
             .enumerate()
-            .filter_map(|(index, candidate)| candidate.observation.map(|_| index))
+            .filter_map(|(index, candidate)| candidate.observed.then_some(index))
             .collect();
         while let Some(index) = pending.pop() {
             for dependency in std::mem::take(&mut candidates[index].dependencies) {
-                if candidates[dependency].observation.is_none() {
-                    candidates[dependency].observation = Some(Observation::Contents);
+                if !candidates[dependency].observed {
+                    candidates[dependency].observed = true;
                     pending.push(dependency);
                 }
             }
@@ -754,12 +702,11 @@ impl<'ast> Candidates<'ast, '_> {
                 let Candidate {
                     receiver,
                     dependencies: _,
-                    observation,
+                    observed,
                     iteration_target: _,
                     list_literal: _,
                 } = candidate;
-                observation
-                    .map(|observation| (receiver, matches!(observation, Observation::FirstValue)))
+                observed.then_some(receiver)
             })
             .collect()
     }
@@ -841,7 +788,7 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
                 if let Some(read) = DictionaryFirstValueRead::from_subscript(subscript)
                     && let Some(index) = self.place(read.receiver)
                 {
-                    self.nodes[index].observation = Some(Observation::FirstValue);
+                    self.nodes[index].observed = true;
                 }
                 if matches!(
                     subscript.ctx,
@@ -853,9 +800,7 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
                     && let Some(index) = self.place(&subscript.value)
                     && self.nodes[index].iteration_target
                 {
-                    self.nodes[index]
-                        .observation
-                        .get_or_insert(Observation::Contents);
+                    self.nodes[index].observed = true;
                 }
             }
             ast::Expr::Call(call) => {
@@ -929,7 +874,7 @@ pub(super) fn candidates<'ast>(
     node: NodeWithScopeRef<'ast>,
     module: &'ast [ast::Stmt],
     exclusions: &SourceExclusions,
-) -> Vec<(&'ast ast::Expr, bool)> {
+) -> Vec<&'ast ast::Expr> {
     let mut visitor = Candidates {
         exclusions,
         by_place: FxHashMap::default(),

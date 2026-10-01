@@ -1169,25 +1169,26 @@ def first_value(flag: bool):
     reveal_type(list(values.values())[0])  # revealed: None | Literal[1]
 ```
 
-## Guards on saved first values
+## Saved values and later snapshots
 
-A guard on the first value describes a later read from the same dictionary snapshot. Other values
-retain their original type.
+A guard narrows the saved scalar. A later dictionary read retains its own value type; the guard
+does not establish a relation between the two reads.
 
 ```py
 def saved_first(source: dict[str, int | None]):
     values = dict(source)
     first = list(values.values())[0]
     if first is None:
-        reveal_type(list(values.values())[0])  # revealed: None
+        reveal_type(first)  # revealed: None
+        reveal_type(list(values.values())[0])  # revealed: int | None
         reveal_type(list(values.values())[1])  # revealed: int | None
         reveal_type(values)  # revealed: dict[str, int | None]
 ```
 
-## First-value guards preserve snapshot identity
+## First-value reads preserve snapshot identity
 
-A saved first value describes the dictionary at the read. Mutations, rebinding, and ambiguous
-saved-value definitions prevent that fact from narrowing a later read.
+Mutations and rebinding determine the contents of later snapshots. Saved scalars, lists, and views
+do not establish narrower dictionary contents.
 
 ```py
 from typing_extensions import reveal_type
@@ -1242,35 +1243,15 @@ def snapshots(source: dict[str, int | None]):
     first = list(view)[0]
     if first is None:
         reveal_type(list(values.values())[0])  # revealed: int | None
-
-def other_key(first_value: int | None):
-    values = {"first": first_value, "other": 1}
-    first = list(values.values())[0]
-    values["other"] = 2
-    if first is None:
-        reveal_type(list(values.values())[0])  # revealed: None
-    else:
-        reveal_type(list(values.values())[0])  # revealed: int
 ```
 
-## First-value guards require builtin reads
+## First-value reads require builtin operations
 
-The relationship comes from builtin snapshot operations. A dictionary annotation alone permits
-subclasses, and a similarly named method can return unrelated data.
+A dictionary annotation alone permits subclasses, and a similarly named method can return
+unrelated data. Both keep the ordinary value type.
 
 ```py
-from typing_extensions import TypeIs, reveal_type
-
-def is_none(value: object) -> TypeIs[None]:
-    return value is None
-
-def guarded(source: dict[str, int | None]):
-    values = dict(source)
-    first = list(values.values())[0]
-    if is_none(first):
-        reveal_type(list(values.values())[0])  # revealed: None
-    else:
-        reveal_type(list(values.values())[0])  # revealed: int
+from typing_extensions import reveal_type
 
 def subclassable(values: dict[str, int | None]):
     first = list(values.values())[0]
@@ -1303,17 +1284,6 @@ Narrowing an optional receiver removes the non-dictionary initialization path. R
 exposure still determine the remaining dictionary contents.
 
 ```py
-def optional(source: dict[str, int | None], flag: bool):
-    if flag:
-        values = dict(source)
-    else:
-        values = None
-    if values is None:
-        return
-    first = list(values.values())[0]
-    if first is None:
-        reveal_type(list(values.values())[0])  # revealed: None
-
 def optional_written(flag: bool):
     if flag:
         values = {"first": None, "other": 1}
@@ -1336,10 +1306,10 @@ def optional_exposed(flag: bool):
     reveal_type(list(values.values())[0])  # revealed: None | int
 ```
 
-## First-value guards retain saved value types
+## Saved first values retain ordinary scalar narrowing
 
-An unchanged first entry is the same value as the saved read. Its narrowed type remains available
-when aliasing has made the rest of the contents opaque.
+Scalar predicates still narrow saved values. Exposure and mutation determine subsequent dictionary
+observations independently.
 
 ```py
 from typing import Any, Literal
@@ -1354,7 +1324,6 @@ def alias(source: dict[str, dict[str, str] | None]):
     first = list(values.values())[0]
     if isinstance(first, dict):
         reveal_type(first)  # revealed: dict[str, str]
-        reveal_type(list(values.values())[0])  # revealed: dict[str, str]
 
 def gradual(source: dict[str, Any]):
     original = dict(source)
@@ -1381,10 +1350,8 @@ def replacement():
     reveal_type(first)  # revealed: Literal[1]
     if is_one_or_two(first):
         reveal_type(first)  # revealed: Literal[1, 2]
-        reveal_type(list(values.values())[0])  # revealed: Literal[1, 2]
         if first == 2:
             reveal_type(first)  # revealed: Literal[2]
-            reveal_type(list(values.values())[0])  # revealed: Literal[2]
 
 def joined(source: dict[str, int | str | None], flag: bool):
     values = dict(source)
@@ -1397,20 +1364,12 @@ def joined(source: dict[str, int | str | None], flag: bool):
             return
     if first is None or first == 1:
         reveal_type(first)  # revealed: None | Literal[1]
-        reveal_type(list(values.values())[0])  # revealed: None | Literal[1]
 
 def repeated(source: dict[str, int | None]):
     values = dict(source)
     first = list(values.values())[0]
     if first is None or first == 1:
         reveal_type(first)  # revealed: None | Literal[1]
-        reveal_type(list(values.values())[0])  # revealed: None | Literal[1]
-
-def rebound(source: dict[str, int | None]):
-    values = dict(source)
-    first = list(values.values())[0]
-    if first is None and (first := 1) and first == 1:
-        reveal_type(list(values.values())[0])  # revealed: None
 
 def mutated(source: dict[str, dict[str, str] | None]):
     original = dict(source)
@@ -1422,22 +1381,14 @@ def mutated(source: dict[str, dict[str, str] | None]):
         reveal_type(list(values.values())[0])  # revealed: None
 ```
 
-## First-value guards use names from the current scope
+## Rebinding a saved scalar preserves dictionary contents
 
-Nested function names and assignment targets have their own binding histories.
+Assignment to the saved scalar does not change the dictionary snapshot.
 
 ```py
-from typing_extensions import TypeIs, reveal_type
-
-def is_none(value: object, extra: object = None) -> TypeIs[None]:
-    return value is None
-
-def nested(source: dict[str, int | None]):
+def rebound(source: dict[str, int | None]):
     values = dict(source)
     first = list(values.values())[0]
-    if is_none(first, lambda: (first, first, first, first)):
-        reveal_type(list(values.values())[0])  # revealed: None
-
     if (first := None) is None:
         reveal_type(list(values.values())[0])  # revealed: int | None
 ```

@@ -24,32 +24,6 @@ pub struct DictionaryFirstValueRead<'ast> {
 }
 
 impl<'ast> DictionaryFirstValueRead<'ast> {
-    pub fn assigned_subscript(
-        kind: &crate::definition::DefinitionKind<'_>,
-        module: &'ast ParsedModuleRef,
-    ) -> Option<&'ast ast::ExprSubscript> {
-        use crate::definition::DefinitionKind;
-        let value = match kind {
-            DefinitionKind::Assignment(assignment) => {
-                if !assignment.is_single_target(module) || !assignment.target(module).is_name_expr()
-                {
-                    return None;
-                }
-                assignment.value(module)
-            }
-            DefinitionKind::AnnotatedAssignment(assignment) => {
-                if !assignment.target(module).is_name_expr() {
-                    return None;
-                }
-                assignment.value(module)?
-            }
-            _ => return None,
-        };
-        let subscript = value.as_subscript_expr()?;
-        Self::from_subscript(subscript)?;
-        Some(subscript)
-    }
-
     pub fn from_subscript(subscript: &'ast ast::ExprSubscript) -> Option<Self> {
         let ast::Expr::NumberLiteral(index) = subscript.slice.as_ref() else {
             return None;
@@ -160,12 +134,6 @@ impl PlaceExpr {
         let receiver = MemberExprBuilder::visit_expr(receiver.into())?;
         let contents = receiver.with_contents()?;
         Self::try_from_member_expr(contents)
-    }
-
-    pub fn first_value<'e>(receiver: impl Into<ast::ExprRef<'e>>) -> Option<Self> {
-        let receiver = MemberExprBuilder::visit_expr(receiver.into())?;
-        let contents = receiver.with_contents()?;
-        Self::try_from_member_expr(contents.with_first_value()?)
     }
 
     /// Tries to create a `PlaceExpr` from a member expression.
@@ -390,12 +358,6 @@ impl PlaceTable {
         let member = self.member(contents);
         let key = member.contents_key(name)?;
         self.members.member_id(&key).map(Into::into)
-    }
-
-    pub fn contents_first_value(&self, contents: ScopedPlaceId) -> Option<ScopedPlaceId> {
-        let builder = MemberExprBuilder::from_place(self.place(contents));
-        let first = MemberExpr::try_from_builder(builder.with_first_value()?)?;
-        self.members.member_id(&first).map(Into::into)
     }
 }
 

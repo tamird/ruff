@@ -583,13 +583,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             pending_captures: FxHashMap::default(),
         });
 
-        for (receiver, first_value) in
+        for receiver in
             dictionary_contents::candidates(node, self.module.suite(), &self.source_exclusions)
         {
             self.register_contents_place(receiver);
-            if first_value && let Some(place) = PlaceExpr::first_value(receiver) {
-                self.add_place(place);
-            }
         }
     }
 
@@ -2594,11 +2591,6 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
         self.register_narrowing_alias_predicates(predicate_node);
 
-        if !predicate_node.is_name_expr() {
-            let sources = self.first_value_sources(predicate_node);
-            self.record_contents_snapshot(predicate_node, &sources);
-        }
-
         let expression = self.add_standalone_expression(predicate_node);
 
         match resolve_to_literal(predicate_node) {
@@ -2746,7 +2738,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     /// This uses the closure-based approach to avoid calling Salsa queries that depend on
     /// the semantic index (which is still being built).
     fn compute_possibly_narrowed_places(
-        &mut self,
+        &self,
         predicate: &PredicateOrLiteral<'db>,
     ) -> PossiblyNarrowedPlaces {
         let mut places = match predicate {
@@ -2757,47 +2749,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     | PredicateNode::Condition(expression)
                     | PredicateNode::ChainedComparisonCondition(expression) => {
                         let expression_node = expression.node_ref(self.db).node(self.module);
-                        // A call can already have a pre-call snapshot. Only admit the first-value
-                        // target when its stored contents are current after the predicate; the
-                        // narrowing projector enforces this per-predicate target set.
-                        let first_values: Vec<_> = self
-                            .first_value_sources(expression_node)
-                            .into_iter()
-                            .filter(|receiver| {
-                                let Some(place) = self.contents_place(receiver) else {
-                                    return false;
-                                };
-                                let Some(use_id) =
-                                    self.current_ast_ids().try_use_id(expression_node)
-                                else {
-                                    return false;
-                                };
-                                let original = self
-                                    .current_use_def_map()
-                                    .multi_binding_ids_at_use(use_id, place);
-                                let current: SmallVec<[_; 2]> = self
-                                    .current_use_def_map_mut()
-                                    .current_bindings(place)
-                                    .map(|binding| binding.binding())
-                                    .collect();
-                                !original.is_empty() && original == current
-                            })
-                            .collect();
                         let place_table = self.current_place_table();
                         let mut places = PossiblyNarrowedPlacesBuilder::new(self.db, place_table)
                             .expression(expression_node);
                         self.add_alias_narrowed_places(expression_node, &mut places);
                         self.add_unpack_narrowed_places(expression_node, &mut places);
-                        for receiver in first_values {
-                            if let Some(contents) = self.contents_place(receiver) {
-                                places.insert(contents);
-                            }
-                            if let Some(first) = PlaceExpr::first_value(receiver)
-                                .and_then(|place| place_table.place_id((&place).into()))
-                            {
-                                places.insert(first);
-                            }
-                        }
                         places
                     }
                     PredicateNode::Pattern(pattern) => {

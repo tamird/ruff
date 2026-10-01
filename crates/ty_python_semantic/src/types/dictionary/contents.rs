@@ -484,36 +484,6 @@ impl<'db> Contents<'db> {
                 return self;
             }
         }
-        if let Some(first) = table.contents_first_value(place) {
-            let (previous, key) = match &mapping.dictionary.first_entry {
-                DictionaryFirstEntry::Entry { key, value } => (*value, key.clone()),
-                DictionaryFirstEntry::Unknown => (
-                    UnionType::from_elements(
-                        db,
-                        &env,
-                        mapping
-                            .dictionary
-                            .items
-                            .iter()
-                            .map(|item| item.ty)
-                            .chain([mapping.extra_value()]),
-                    ),
-                    None,
-                ),
-                DictionaryFirstEntry::Empty => return self,
-            };
-            let narrowed = constraint.narrow(db, &env, previous, first);
-            if narrowed != previous {
-                if narrowed.resolve_type_alias(db).is_never() {
-                    self.value = ContentsValue::Unreachable;
-                } else {
-                    mapping.dictionary.first_entry = DictionaryFirstEntry::Entry {
-                        key,
-                        value: narrowed,
-                    };
-                }
-            }
-        }
         self
     }
 }
@@ -1463,17 +1433,17 @@ pub(crate) fn alias_preserves_key<'db>(
         &read.value,
         read.into(),
         current,
-        Some(name),
+        name,
     ))
 }
 
-pub(crate) fn saved_read_preserved<'db>(
+fn saved_read_preserved<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
     receiver: &ast::Expr,
     original: ast::ExprRef<'_>,
     current: &ast::Expr,
-    name: Option<&str>,
+    name: &str,
 ) -> KeyPreservation {
     let index = semantic_index(db, scope.program_file(db));
     let table = index.place_table(scope.file_scope_id(db));
@@ -1509,7 +1479,7 @@ pub(crate) fn saved_read_preserved<'db>(
 enum KeyHistoryOrigin<'a, 'db> {
     SavedRead {
         anchors: &'a [DefinitionState<'db>],
-        name: Option<&'a str>,
+        name: &'a str,
     },
     /// Ordinary member seeds may start at a parameter, but not after a known escape.
     UnexposedParent,
@@ -1618,15 +1588,9 @@ fn check_contents_history<'db>(
                     continue;
                 }
                 let preserved = match origin {
-                    KeyHistoryOrigin::SavedRead { anchors: _, name } => match name {
-                        Some(name) => transfer.preserves_key(db, name),
-                        None => matches!(
-                            transfer,
-                            MappingTransfer::Keep {
-                                exposes_descendants: _
-                            }
-                        ),
-                    },
+                    KeyHistoryOrigin::SavedRead { anchors: _, name } => {
+                        transfer.preserves_key(db, name)
+                    }
                     KeyHistoryOrigin::UnexposedParent => transfer.preserves_confinement(),
                 };
                 if !preserved {

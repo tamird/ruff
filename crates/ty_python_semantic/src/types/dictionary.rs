@@ -24,28 +24,8 @@ pub(crate) fn first_value<'db>(
     scope: ScopeId<'db>,
     subscript: &ast::ExprSubscript,
     reachability: &ReachabilityEvaluationCache<'db>,
-    expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
-) -> Option<Type<'db>> {
-    let (_, first_entry) =
-        first_value_read(db, env, scope, subscript, reachability, expression_type)?;
-    match first_entry {
-        DictionaryFirstEntry::Entry { key: _, value } => Some(value),
-        DictionaryFirstEntry::Unknown => None,
-        DictionaryFirstEntry::Empty => None,
-    }
-}
-
-pub(crate) fn first_value_read<'ast, 'db>(
-    db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
-    scope: ScopeId<'db>,
-    subscript: &'ast ast::ExprSubscript,
-    reachability: &ReachabilityEvaluationCache<'db>,
     mut expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
-) -> Option<(
-    ty_python_core::place::DictionaryFirstValueRead<'ast>,
-    DictionaryFirstEntry<'db>,
-)> {
+) -> Option<Type<'db>> {
     let read = ty_python_core::place::DictionaryFirstValueRead::from_subscript(subscript)?;
     if let Some(list) = read.list {
         let Type::ClassLiteral(class) = expression_type(&list.func)? else {
@@ -90,7 +70,11 @@ pub(crate) fn first_value_read<'ast, 'db>(
     if !mapping.builtin {
         return None;
     }
-    Some((read, mapping.dictionary.first_entry))
+    match mapping.dictionary.first_entry {
+        DictionaryFirstEntry::Entry { key: _, value } => Some(value),
+        DictionaryFirstEntry::Unknown => None,
+        DictionaryFirstEntry::Empty => None,
+    }
 }
 
 /// The nominal type is `dict`; runtime subclasses can still override its operations.
