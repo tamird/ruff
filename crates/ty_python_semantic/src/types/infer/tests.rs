@@ -4072,6 +4072,101 @@ fn unary_argument_correspondence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn short_circuit_argument_correspondence() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import Any
+        from typing_extensions import Never, TypeIs
+
+        def is_string(value: object) -> TypeIs[str]:
+            return isinstance(value, str)
+
+        def is_integer(value: object) -> TypeIs[int]:
+            return isinstance(value, int)
+
+        def exhausted(value: str | None) -> str | None:
+            if value is None:
+                return None
+            if is_string(value):
+                return value
+            if is_integer(value) and (value == 0 or value == 1):
+                return None
+            raise ValueError
+
+        def literal(callback: Any) -> None:
+            False and callback()
+
+        def reachable(flag: bool, callback: Any) -> None:
+            flag and callback()
+
+        def left(value: Never) -> None:
+            value == 0
+
+        def right(value: Never) -> None:
+            0 == value
+
+        def gradual_left(value: Any) -> None:
+            value == 0
+
+        def gradual_right(value: Any) -> None:
+            0 < value
+
+        def raises() -> Never:
+            raise ValueError
+
+        def prior_call(callback: Any) -> None:
+            callback() == raises()
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    let cases = [
+        ("exhausted", false),
+        ("literal", false),
+        ("reachable", true),
+        ("left", false),
+        ("right", false),
+        ("gradual_left", true),
+        ("gradual_right", true),
+        ("prior_call", true),
+    ];
+    for mode in [
+        FunctionInferenceMode::Default,
+        FunctionInferenceMode::OutputProof,
+        FunctionInferenceMode::Default,
+    ] {
+        db.select_function_inference(Some((
+            file,
+            cases.map(|(name, _)| name.to_owned()).to_vec(),
+            mode,
+        )));
+        let model = crate::SemanticModel::new(&db, program_file(&db, file));
+        let mut requirements = Vec::new();
+        for (name, unproved) in cases {
+            let facts = model
+                .function_inference_facts(first_public_binding(&db, file, name))
+                .unwrap();
+            requirements.push((name, facts.has_unproved_requirements, unproved));
+            assert!(!facts.has_errors, "{mode:?} {name}: {facts:?}");
+            assert_eq!(
+                facts.return_type_correspondence,
+                (mode == FunctionInferenceMode::OutputProof).then_some(true),
+                "{mode:?} {name}",
+            );
+        }
+        assert!(
+            requirements.iter().all(|(_, actual, unproved)| {
+                *actual == (mode == FunctionInferenceMode::OutputProof && *unproved)
+            }),
+            "{mode:?}: {requirements:?}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn rich_comparison_argument_correspondence() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(

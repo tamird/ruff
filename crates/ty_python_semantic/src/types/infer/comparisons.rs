@@ -883,6 +883,15 @@ fn infer_binary_type_comparison_inner<'db>(
     let db = context.db();
     let env = &context.program_environment();
 
+    // Operand evaluation has already retained its own requirements. An empty operand domain
+    // cannot reach comparison dispatch, so it adds no method-input obligation.
+    if left.is_never() || right.is_never() {
+        return Ok(ComparisonResult {
+            ty: Type::Never,
+            inputs_proved: true,
+        });
+    }
+
     let try_dunder = |policy: MemberLookupPolicy| {
         let rich_comparison = |op| infer_rich_comparison(context, left, right, op, policy);
         let membership_test_comparison = |op, range: TextRange| {
