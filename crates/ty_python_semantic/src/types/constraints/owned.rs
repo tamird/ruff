@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ruff_index::{Idx, IndexVec};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use ty_python_core::rank::{RankBitBox, RankBitBoxVec};
 
 use crate::types::constraints::support::Support;
@@ -177,41 +177,42 @@ impl OwnedConstraintSetBuilder {
         storage: &ConstraintSetStorage<'_>,
         source_order: SourceOrderId,
     ) -> Option<SourceOrderId> {
-        let source_order_data = storage.source_order_data(source_order);
-        match source_order_data {
-            SourceOrder::Ordered(left, right) => {
-                let mapped_left = self.mark_source_order_used(storage, left);
-                let mapped_right = self.mark_source_order_used(storage, right);
-                match (mapped_left, mapped_right) {
-                    (None, None) => None,
-                    (None, other) | (other, None) => other,
-                    (Some(left), Some(right)) if left == right => Some(left),
-                    (Some(left), Some(right)) => {
-                        Some(self.source_orders.push(SourceOrder::Ordered(left, right)))
+        // Only first occurrences determine evidence order. Keep quantified constraints as
+        // scope markers; their bodies have separate sidecars normalized by mark_constraint_used.
+        let mut pending = vec![source_order];
+        let mut seen_constraints = FxHashSet::default();
+        let mut mapped = None;
+        while let Some(current) = pending.pop() {
+            match storage.source_order_data(current) {
+                SourceOrder::Ordered(left, right) => pending.extend([right, left]),
+                SourceOrder::Constraint(constraint) => {
+                    // Preserve ordering-only constraints when they share live variables.
+                    let constraint_support_id = storage.constraint_support_id(constraint);
+                    let constraint_support = storage.support_data(constraint_support_id);
+                    if !self.used_constraints[constraint.index()]
+                        && let Some(live_support) = self.live_support.as_ref()
+                        && live_support.is_complete()
+                        && constraint_support.is_complete()
+                        && !constraint_support.overlaps_with(live_support)
+                    {
+                        continue;
                     }
+                    if !seen_constraints.insert(constraint) {
+                        continue;
+                    }
+                    self.mark_constraint_used(storage, constraint);
+                    self.mark_support_used(storage, constraint_support_id);
+                    let next = self.source_orders.push(SourceOrder::Constraint(constraint));
+                    mapped = Some(match mapped {
+                        None => next,
+                        Some(previous) => self
+                            .source_orders
+                            .push(SourceOrder::Ordered(previous, next)),
+                    });
                 }
-            }
-            SourceOrder::Constraint(constraint) => {
-                // If a constraint is not used anywhere in the BDD, and doesn't mention any
-                // typevars that are used in the BDD, we don't have to include it in the compacted
-                // source_order list.
-                let constraint_support_id = storage.constraint_support_id(constraint);
-                let constraint_support = storage.support_data(constraint_support_id);
-                if !self.used_constraints[constraint.index()]
-                    && let Some(live_support) = self.live_support.as_ref()
-                    && live_support.is_complete()
-                    && constraint_support.is_complete()
-                    && !constraint_support.overlaps_with(live_support)
-                {
-                    return None;
-                }
-
-                self.mark_constraint_used(storage, constraint);
-                self.mark_support_used(storage, constraint_support_id);
-                let mapped = self.source_orders.push(SourceOrder::Constraint(constraint));
-                Some(mapped)
             }
         }
+        mapped
     }
 
     fn finish(

@@ -8855,6 +8855,73 @@ class E: ...
     }
 
     #[test]
+    fn owned_source_orders_preserve_first_occurrences_and_scopes() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let caller = create_typevar(db, "Caller");
+        let local = create_typevar(db, "Local");
+        for scoped in [false, true] {
+            let build = |duplicate: bool, reversed: bool| {
+                ConstraintSetBuilder::new().into_owned(|builder| {
+                    let make = |class| {
+                        let bound = create_constraint(db, builder, local, class);
+                        if scoped {
+                            bound
+                                .and(db, builder, || {
+                                    ConstraintSet::constrain_typevar_lower_bound(
+                                        db,
+                                        &env,
+                                        builder,
+                                        local,
+                                        Type::TypeVar(caller),
+                                    )
+                                })
+                                .reduce_inferable(
+                                    db,
+                                    &env,
+                                    builder,
+                                    TypeVarSet::from_typevars(db, [local]),
+                                )
+                        } else {
+                            bound
+                        }
+                    };
+                    let first = make(KnownClass::Int);
+                    let second = make(KnownClass::Str);
+                    let combined = if reversed {
+                        second.or(db, builder, || first)
+                    } else {
+                        first.or(db, builder, || second)
+                    };
+                    if duplicate {
+                        combined.or(db, builder, || first)
+                    } else {
+                        combined
+                    }
+                })
+            };
+            let original = build(false, false);
+            assert_eq!(original, build(true, false));
+            assert_ne!(original, build(false, true));
+            if scoped {
+                let inner = original
+                    .inner
+                    .as_ref()
+                    .expect("caller-dependent scopes remain");
+                assert_eq!(
+                    inner
+                        .constraints
+                        .iter()
+                        .filter(|constraint| { matches!(constraint, Constraint::Existential(_)) })
+                        .count(),
+                    2,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn owned_constraint_set_load_discards_unreferenced_typevars() {
         let db = setup_db();
         let db = &db;
