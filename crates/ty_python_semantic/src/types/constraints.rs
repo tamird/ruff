@@ -6366,6 +6366,73 @@ mod tests {
     }
 
     #[test]
+    fn existential_alternatives_check_each_body() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let string = KnownClass::Str.to_instance(db, &env);
+        let bytes = KnownClass::Bytes.to_instance(db, &env);
+        let caller = create_typevar(db, "Caller");
+        let first_local = create_typevar(db, "First");
+        let second_local = create_typevar(db, "Second");
+        for reversed in [false, true] {
+            let builder = ConstraintSetBuilder::new();
+            let arm = |local, ground| {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &builder, local, ground,
+                )
+                .and(db, &builder, || {
+                    ConstraintSet::constrain_typevar_equivalence_bound(
+                        db,
+                        &env,
+                        &builder,
+                        caller,
+                        Type::TypeVar(local),
+                    )
+                })
+                .reduce_inferable(
+                    db,
+                    &env,
+                    &builder,
+                    TypeVarSet::from_typevars(db, [local]),
+                )
+            };
+            let (first, second) = if reversed {
+                (arm(second_local, string), arm(first_local, integer))
+            } else {
+                (arm(first_local, integer), arm(second_local, string))
+            };
+            let either = first.or(db, &builder, || second);
+            for selected in [integer, string, bytes] {
+                let set = either.and(db, &builder, || {
+                    ConstraintSet::constrain_typevar_equivalence_bound(
+                        db, &env, &builder, caller, selected,
+                    )
+                });
+                let actual = set
+                    .solutions(db, &env, TypeVarSet::from_typevars(db, [caller]))
+                    .unwrap();
+                if selected == integer || selected == string {
+                    assert_eq!(
+                        actual,
+                        Solutions::Constrained(SolutionPaths::Complete(vec![solution([
+                            TypeVarSolution {
+                                bound_typevar: caller,
+                                solution: selected,
+                            },
+                        ])])),
+                        "reversed={reversed}, selected={}",
+                        selected.display(db, &env),
+                    );
+                } else {
+                    assert_matches!(actual, Solutions::Unsatisfiable(_));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn existential_witness_families_preserve_finite_domains() {
         let db = setup_db();
         let db = &db;

@@ -755,6 +755,8 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         // Walk the outgoing edge that depends on the existential holding. If we find any candidate
         // solutions, walk the existential's body to make sure there are valid existential
         // solutions that are compatible with that candidate solution.
+        // The continuation checks this binder's body, so visits under another binder cannot
+        // reuse cached results for the same outgoing node and path.
         self.visit_node_and_then(
             db,
             env,
@@ -762,7 +764,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             path,
             polarity,
             if_holds,
-            check_cache,
+            &never_cache,
             prune_path,
             &|this, storage, path| {
                 // Note that we never negate existential's body, even when we are walking the
@@ -841,7 +843,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             path,
             polarity,
             if_not_holds,
-            check_cache,
+            &never_cache,
             prune_path,
             &|this, storage, path| {
                 let prove = |this: &mut Self,

@@ -200,9 +200,15 @@ def convert(value: Result[T]) -> Result[T]: ...
 def convert(value: T | Result[T]) -> Result[T]:
     raise NotImplementedError
 
-# TODO: Preserve correlated overloaded-callback solutions (astral-sh/ty#2799) to infer
-# `map[Result[str]]`.
-reveal_type(map(convert, ["a"]))  # revealed: map[Unknown]
+reveal_type(map(convert, ["a"]))  # revealed: map[Result[str]]
+reveal_type(map(convert, [b"a"]))  # revealed: map[Result[bytes]]
+
+# error: [invalid-argument-type]
+map(convert, [1])
+
+def check_wrapped(value: Result[str]) -> None:
+    # TODO(astral-sh/ty#2799): Infer map[Result[str]] for the wrapped overload.
+    reveal_type(map(convert, [value]))  # revealed: map[Unknown]
 ```
 
 ## Decorated
