@@ -2837,6 +2837,12 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                                     builder.constraints,
                                     path_bound,
                                 )
+                            })
+                            .map(|ty| {
+                                builder.remove_inferable_typevar_artifacts_from_solution(
+                                    path_bound.bound_typevar,
+                                    ty,
+                                )
                             });
                         // Only this explicitly merged projection accepts fallback bindings as
                         // ordinary types. Correlated inference retains their incomplete outcome.
@@ -2990,6 +2996,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                             builder.env,
                             builder.constraints,
                             path_bound,
+                        )
+                    }).map(|ty| {
+                        builder.remove_inferable_typevar_artifacts_from_solution(
+                            path_bound.bound_typevar,
+                            ty,
                         )
                     })
                 },
@@ -3337,6 +3348,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
 
     /// Remove inferable type variables introduced by transitivity within the target's binding
     /// context while preserving intentional relationships to other generic contexts.
+    /// Apply this before dependency resolution so transitive terms cannot create spurious cycles.
     pub(crate) fn remove_inferable_typevar_artifacts_from_solution(
         &self,
         target: BoundTypeVarInstance<'db>,

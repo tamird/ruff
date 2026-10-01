@@ -12664,8 +12664,14 @@ b: B
 def infer_result[T, R](callback: Callable[[T], R], consumer: Callable[[T], None]) -> R:
     raise NotImplementedError
 
+def infer_bounded[T, R: str](callback: Callable[[T], R], consumer: Callable[[T], None], value: T) -> R:
+    raise NotImplementedError
+
 def identity[T](value: T) -> T:
     return value
+
+def constant[T](value: T) -> A:
+    return A()
 
 @overload
 def consume(value: A) -> None: ...
@@ -12683,7 +12689,10 @@ def consume(value: A | B) -> None: ...
         let consumer = global_symbol(db, file, "consume").place.expect_type();
         let inference = call_inference(db, callable, [callback, consumer], TypeContext::default())?;
         let TypeVarInferenceSolutions::Alternatives(paths) = inference.solutions(db) else {
-            anyhow::bail!("expected correlated alternatives");
+            anyhow::bail!(
+                "expected correlated alternatives, got {:?}",
+                inference.solutions(db)
+            );
         };
         let a = global_symbol(db, file, "a").place.expect_type();
         let b = global_symbol(db, file, "b").place.expect_type();
@@ -12704,6 +12713,31 @@ def consume(value: A | B) -> None: ...
                 .types(db)
                 .iter()
                 .all(|ty| ty.is_equivalent_to(db, &env, union))
+        );
+
+        // A callback with an independent result must not acquire the input's correlation.
+        let constant = global_symbol(db, file, "constant").place.expect_type();
+        let constant_inference =
+            call_inference(db, callable, [constant, consumer], TypeContext::default())?;
+        let TypeVarInferenceSolutions::Alternatives(paths) = constant_inference.solutions(db)
+        else {
+            anyhow::bail!(
+                "expected correlated alternatives, got {:?}",
+                constant_inference.solutions(db)
+            );
+        };
+        assert_eq!(
+            paths.iter().map(AsRef::as_ref).collect::<FxHashSet<_>>(),
+            FxHashSet::from_iter([
+                [Some(Resolved(a)), Some(Resolved(a))].as_slice(),
+                [Some(Resolved(b)), Some(Resolved(a))].as_slice(),
+            ])
+        );
+
+        // The concrete argument requires T = A, so identity cannot satisfy R's str bound.
+        let bounded = global_symbol(db, file, "infer_bounded").place.expect_type();
+        assert!(
+            call_inference(db, bounded, [callback, consumer, a], TypeContext::default()).is_err()
         );
         Ok(())
     }
