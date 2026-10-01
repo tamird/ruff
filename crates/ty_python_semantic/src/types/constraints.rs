@@ -5819,6 +5819,44 @@ mod tests {
     }
 
     #[test]
+    fn existential_witness_coverage_preserves_correlations() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let local = create_typevar(db, "Local");
+        let left = create_typevar(db, "Left");
+        let right = create_typevar(db, "Right");
+        let builder = ConstraintSetBuilder::new();
+        let left_int = create_constraint(db, &builder, left, KnownClass::Int);
+        let left_str = create_constraint(db, &builder, left, KnownClass::Str);
+        let right_int = create_constraint(db, &builder, right, KnownClass::Int);
+        let right_str = create_constraint(db, &builder, right, KnownClass::Str);
+        let int_str = left_int.and(db, &builder, || right_str);
+        let str_int = left_str.and(db, &builder, || right_int);
+        let body = create_constraint(db, &builder, local, KnownClass::Int)
+            .and(db, &builder, || int_str)
+            .or(db, &builder, || {
+                create_constraint(db, &builder, local, KnownClass::Str)
+                    .and(db, &builder, || str_int)
+            });
+        let quantified =
+            body.reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        let covered = int_str.or(db, &builder, || str_int);
+        assert!(
+            quantified
+                .iff(db, &builder, covered)
+                .is_always_satisfied(db, &env)
+        );
+        assert!(
+            quantified
+                .and(db, &builder, || left_int)
+                .and(db, &builder, || right_int)
+                .is_never_satisfied(db, &env),
+            "separate witnesses cannot exchange their caller conditions"
+        );
+    }
+
+    #[test]
     fn existential_negative_scope_uses_outer_conditions() {
         let db = setup_db();
         let db = &db;

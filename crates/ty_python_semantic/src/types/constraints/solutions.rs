@@ -1000,6 +1000,12 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             });
         }
 
+        // These are sufficient conditions for whole witnesses, not independent local bounds.
+        // Their union may cover the outer path even when no single witness covers it alone.
+        let mut covered = ALWAYS_FALSE;
+        let has_type_endpoint = |variable: BoundTypeVarInstance<'db>| {
+            !variable.is_paramspec(db) && !variable.is_typevartuple(db)
+        };
         for (candidate, locals, (node, source_order)) in witnesses {
             // Reuse normal bound selection and specialization in the same arenas. A witness
             // can mention rigid outer variables, but only scoped locals may be substituted.
@@ -1017,13 +1023,32 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                                 bound_typevar: bound.bound_typevar,
                                 solution,
                             }),
-                            PathBoundSolution::Unsolved => None,
+                            PathBoundSolution::Unsolved => {
+                                // Inference needs evidence; a proof may try the logical endpoint.
+                                // Signature and tuple packs need a witness in their own domain.
+                                has_type_endpoint(bound.bound_typevar).then(|| TypeVarSolution {
+                                    bound_typevar: bound.bound_typevar,
+                                    solution: bound.effective_lower(db, env),
+                                })
+                            }
                             PathBoundSolution::Unsatisfiable => None,
                             PathBoundSolution::BudgetExceeded { fallback: _ } => None,
                         }
                     })
                     .collect();
-                let selected = selected?;
+                let mut selected = selected?;
+                for local in locals.iter(db) {
+                    if has_type_endpoint(local)
+                        && !selected
+                            .iter()
+                            .any(|binding| binding.bound_typevar.is_same_typevar_as(db, local))
+                    {
+                        selected.push(TypeVarSolution {
+                            bound_typevar: local,
+                            solution: Type::Never,
+                        });
+                    }
+                }
                 let relation = ConstraintSet::from_node(&builder, node, source_order);
                 let (replay, _) = CandidateResidual::specialize_witness(
                     db,
@@ -1043,13 +1068,14 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             };
             self.source_orders
                 .extend(storage.calculate_source_orders(source_order));
+            covered = covered.or(storage, replay);
             let outcome = self.node_is_satisfiable_on_path(
                 db,
                 env,
                 storage,
                 path,
                 Polarity::Negative,
-                replay,
+                covered,
                 None,
             )?;
             if outcome == Satisfiability::Unsatisfiable {
