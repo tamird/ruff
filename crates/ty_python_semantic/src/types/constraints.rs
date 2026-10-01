@@ -941,17 +941,10 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
         constraints
     }
 
-    /// Universally abstracts constraints involving the given type variables from this TDD.
+    /// Universally quantifies the given type variables.
     ///
-    /// This is the Boolean dual of [`Self::reduce_inferable`]. Declared type variable bounds and
-    /// constraints are not applied implicitly, and must be encoded as implications in the input
-    /// constraint set.
-    ///
-    /// # Preconditions
-    ///
-    /// An atomic constraint must not relate a removed type variable to one that remains in the
-    /// result. Callers that need type-level quantification must project those relationships before
-    /// calling this method.
+    /// This is the Boolean dual of [`Self::reduce_inferable`]. Each quantified variable ranges
+    /// over the specializations allowed by its declared upper bound or constraints.
     pub(crate) fn for_all(
         self,
         db: &'db dyn Db,
@@ -964,8 +957,8 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
             return self;
         }
 
-        // Universal and existential quantification are duals. Reusing existential abstraction
-        // also keeps this operation on its cached, single-pass implementation.
+        // Negation keeps the variable scopes and declared domains shared with existential
+        // quantification.
         self.negate(db, builder)
             .reduce_inferable(db, env, builder, to_remove)
             .negate(db, builder)
@@ -5602,6 +5595,28 @@ mod tests {
                 assert_eq!(nested.is_never_satisfied(db, &env), !expected);
             }
         }
+    }
+
+    #[test]
+    fn existential_domains_preserve_free_declaration_policy() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let string = KnownClass::Str.to_instance(db, &env);
+        let free = create_typevar(db, "Free")
+            .map_bound_or_constraints(db, |_| Some(TypeVarBoundOrConstraints::UpperBound(integer)));
+        let local = create_typevar(db, "Local").map_bound_or_constraints(db, |_| {
+            Some(TypeVarBoundOrConstraints::UpperBound(Type::TypeVar(free)))
+        });
+        let builder = ConstraintSetBuilder::new();
+        let body =
+            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, local, string);
+        let quantified =
+            body.reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        // Only the binder's declarations apply: this query leaves Free rigid and ignores its
+        // declared upper bound, just as it does for a relation without a quantifier.
+        assert!(!quantified.is_never_satisfied(db, &env));
     }
 
     #[test]

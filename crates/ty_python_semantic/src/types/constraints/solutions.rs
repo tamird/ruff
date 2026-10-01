@@ -705,7 +705,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     .validation_support
                     .as_ref()
                     .map_or_else(|| locals.clone(), |validated| &locals - validated);
-                let validations = Validations::from_support(db, env, storage, &new_locals);
+                let validations = Validations::from_locals(db, env, storage, &new_locals);
                 let previous = this.positive_locals.clone();
                 this.positive_locals |= &locals;
                 let result = this.visit_node_and_then(
@@ -771,7 +771,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                         unreachable!("existential visitor requires an existential constraint");
                     };
                     let locals = existential.locals.clone();
-                    Validations::from_support(db, env, storage, &locals)
+                    Validations::from_locals(db, env, storage, &locals)
                 };
                 let has_any_solutions = this
                     .node_is_satisfiable_on_path(
@@ -1884,6 +1884,31 @@ struct DeclaredConstraint<'db> {
 }
 
 impl<'db> Validations<'db> {
+    /// A binder owns only its locals' declarations. Types mentioned by those declarations remain
+    /// free, and their declarations follow the outer query's validation policy.
+    fn from_locals(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        storage: &mut ConstraintSetStorage<'db>,
+        locals: &Support,
+    ) -> Self {
+        let mut result = Self::default();
+        let mut dependencies = Support::default();
+        let mut seen = locals.clone();
+        for local in locals.iter() {
+            let bound_typevar = storage.typevar_data(local);
+            result.add_typevar(
+                db,
+                env,
+                storage,
+                &mut dependencies,
+                &mut seen,
+                bound_typevar,
+            );
+        }
+        result
+    }
+
     fn from_support(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -1957,9 +1982,9 @@ impl<'db> Validations<'db> {
             })
             .collect();
 
-        // If any typevars are mentioned in the upper bound, we have to validate them too.
-        // TODO: Consider calculating this at construction time, so that here we have a fixed
-        // set of typevars to check.
+        // Outer-query validation also follows declarations of typevars mentioned in these bounds.
+        // Binder validation only checks its owned locals and leaves this dependency queue unused.
+        // TODO: Consider calculating dependencies at construction time.
         for constraint in constraints.iter().flatten() {
             let constraint_support = storage.constraint_support(constraint.into_inner());
             let new_typevars = constraint_support - &*seen_typevars;
