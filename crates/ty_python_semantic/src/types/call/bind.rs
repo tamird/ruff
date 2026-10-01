@@ -1643,9 +1643,9 @@ impl<'db> Bindings<'db> {
     /// Check the committed actual arguments against the selected parameter contracts.
     ///
     /// This query leaves ordinary overload selection and results unchanged. Multiple callable
-    /// contributors with explicit arguments, ambiguous overloads, multiple or omitted
-    /// constructor stages, and unresolved generic solutions for supplied values need additional
-    /// coverage to establish requirements.
+    /// contributors with explicit arguments, multiple or omitted constructor stages, and
+    /// unresolved generic solutions for supplied values need additional coverage to establish
+    /// requirements. Ambiguous overloads suffice when one signature covers every argument.
     /// The caller must also establish that argument inference committed the selected contexts;
     /// final binding pruning alone does not establish that child proof statuses were retained.
     pub(crate) fn arguments_satisfy_declared_parameters(
@@ -3759,7 +3759,11 @@ impl<'db> CallableBinding<'db> {
                     .as_ref()
                     .is_some_and(|proved| proved.matches(&arguments)),
                 OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => false,
-                OverloadCallResult::Ambiguous => false,
+                // A signature can cover the whole call even when other matching overloads
+                // leave its return type ambiguous.
+                OverloadCallResult::Ambiguous => self.matching_overloads().any(|(_, binding)| {
+                    binding.arguments_satisfy_declared_parameters(db, env, &arguments)
+                }),
             };
         }
         let Ok((_, binding)) = self.matching_overloads().exactly_one() else {
@@ -12233,6 +12237,79 @@ unbound_or = dict.__or__
                 ordinary,
                 &[(list(unknown), list(Type::TypeVar(t)))],
             ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_calls_can_have_proved_inputs() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+from typing import Literal, overload
+
+@overload
+def observe[T](value: list[T]) -> Literal["list"]: ...
+@overload
+def observe(value: object) -> str: ...
+def observe(value: object) -> str: ...
+
+@overload
+def partial(value: int) -> int: ...
+@overload
+def partial(value: str) -> str: ...
+def partial(value: int | str) -> int | str: ...
+
+@overload
+def correlated(left: int, right: object) -> int: ...
+@overload
+def correlated(left: object, right: int) -> str: ...
+def correlated(left: object, right: object) -> int | str: ...
+
+@overload
+def generic(value: int) -> int: ...
+@overload
+def generic[T](value: T) -> T: ...
+def generic(value: object) -> object: ...
+"#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        for (name, supplied, proved) in [
+            ("observe", vec![Type::any()], true),
+            ("observe", vec![Type::unknown()], true),
+            ("partial", vec![Type::any()], false),
+            ("correlated", vec![Type::any(), Type::any()], false),
+            ("generic", vec![Type::unknown()], false),
+        ] {
+            let callable = global_symbol(db, file, name).place.expect_type();
+            let arguments = CallArguments::positional(supplied);
+            let constraints = ConstraintSetBuilder::new();
+            let bindings = callable
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &constraints,
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                )
+                .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                proved,
+                "{name}",
+            );
+            assert!(
+                bindings.return_type(db, &env).is_dynamic(),
+                "{name}: {}",
+                bindings.return_type(db, &env).display(db, &env),
+            );
         }
         Ok(())
     }
