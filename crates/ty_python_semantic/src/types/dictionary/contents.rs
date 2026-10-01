@@ -29,8 +29,8 @@ use crate::types::{KnownClass, KnownFunction, ProgramEnvironment, Type, UnionBui
 use crate::{Db, FxIndexMap};
 
 use super::{
-    DictionaryExtraItems, DictionaryFallback, DictionaryItem, DictionaryItemKind, DictionaryItems,
-    DictionaryItemsBuilder, DictionaryObservation,
+    DictionaryExtraItems, DictionaryFallback, DictionaryFirstEntry, DictionaryItem,
+    DictionaryItemKind, DictionaryItems, DictionaryItemsBuilder, DictionaryObservation,
 };
 
 /// A cycle seed, unreachable control flow, missing history, and an inhabited mapping are
@@ -87,6 +87,7 @@ impl<'db> MappingContents<'db> {
     }
 
     fn expose(&mut self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) {
+        self.dictionary.first_entry = DictionaryFirstEntry::Unknown;
         self.dictionary.items = Box::default();
         self.generalize_presence(db, env);
     }
@@ -121,6 +122,9 @@ impl<'db> MappingContents<'db> {
         value: Type<'db>,
         source: TextRange,
     ) {
+        self.dictionary
+            .first_entry
+            .set(db, env, key.string_literal_value(db), value);
         if let Some(name) = key.string_literal_value(db) {
             let name = Name::new(name);
             let item = DictionaryItem {
@@ -168,6 +172,7 @@ impl<'db> MappingContents<'db> {
                     DictionaryItems {
                         items,
                         extra_items: DictionaryExtraItems::Closed,
+                        first_entry: DictionaryFirstEntry::Unknown,
                     },
                 );
                 self.dictionary = result.finish();
@@ -190,6 +195,19 @@ impl<'db> MappingContents<'db> {
         key: Type<'db>,
         source: TextRange,
     ) {
+        if let DictionaryFirstEntry::Entry {
+            key: first_key,
+            value: _,
+        } = &self.dictionary.first_entry
+        {
+            if first_key.as_ref().is_none_or(|first_key| {
+                key.string_literal_value(db)
+                    .is_none_or(|key| first_key == key)
+            }) {
+                // The named inventory does not establish which remaining entry comes next.
+                self.dictionary.first_entry = DictionaryFirstEntry::Unknown;
+            }
+        }
         if let Some(name) = key.string_literal_value(db) {
             let name = Name::new(name);
             let mut items = std::mem::take(&mut self.dictionary.items).into_vec();
@@ -300,6 +318,9 @@ impl<'db> MappingContents<'db> {
         Self {
             file: *file,
             dictionary: DictionaryItems {
+                first_entry: dictionary
+                    .first_entry
+                    .join(db, env, &other_dictionary.first_entry),
                 items: items.into_values().collect(),
                 extra_items: if extra_value.is_never() {
                     DictionaryExtraItems::Closed
@@ -347,6 +368,19 @@ impl<'db> ContentsValue<'db> {
         }
         let mut result = previous.clone().join(db, env, self);
         if let Self::Mapping(mapping) = &mut result {
+            if let DictionaryFirstEntry::Entry { key: _, value } =
+                &mut mapping.dictionary.first_entry
+            {
+                let previous_ty = match previous {
+                    Self::Mapping(previous) => match previous.dictionary.first_entry {
+                        DictionaryFirstEntry::Entry { key: _, value } => value,
+                        DictionaryFirstEntry::Unknown => Type::Never,
+                        DictionaryFirstEntry::Empty => Type::Never,
+                    },
+                    _ => Type::Never,
+                };
+                *value = value.cycle_normalized(db, env, previous_ty, cycle);
+            }
             for item in &mut mapping.dictionary.items {
                 let previous_ty = match previous {
                     Self::Mapping(previous) => previous.value_at(&item.name),
@@ -415,6 +449,17 @@ impl<'db> Contents<'db> {
             if item.is_required() && item.ty.resolve_type_alias(db).is_never() {
                 self.value = ContentsValue::Unreachable;
                 return self;
+            }
+        }
+        if let DictionaryFirstEntry::Entry {
+            key: Some(name),
+            value,
+        } = &mut mapping.dictionary.first_entry
+            && let Some(key) = table.contents_key(place, name)
+        {
+            *value = constraint.narrow(db, &env, *value, key);
+            if value.resolve_type_alias(db).is_never() {
+                self.value = ContentsValue::Unreachable;
             }
         }
         self
@@ -929,6 +974,7 @@ impl<'db> MappingTransfer<'db> {
             }
             Self::Clear => {
                 mapping.dictionary = DictionaryItems {
+                    first_entry: DictionaryFirstEntry::Empty,
                     items: Box::default(),
                     extra_items: if mapping.uses_residual_presence {
                         DictionaryExtraItems::Value(mapping.bound_value(db, env))

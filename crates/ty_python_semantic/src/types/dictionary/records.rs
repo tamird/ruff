@@ -331,14 +331,7 @@ fn element_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
     };
     let env = ProgramEnvironment::from_scope(scope);
     let mut result: Option<MappingContents<'db>> = None;
-    let mut add = |dictionary| {
-        let next = MappingContents {
-            file,
-            dictionary,
-            builtin: true,
-            uses_residual_presence: false,
-            bound: None,
-        };
+    let mut add = |next| {
         result = Some(match result.take() {
             Some(previous) => previous.join(db, &env, &next),
             None => next,
@@ -349,8 +342,8 @@ fn element_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
             StatementInference::Definition(definition, infer_definition_types(db, definition));
         for value in &initial.elts {
             match literal(db, &env, scope, value, &inference) {
-                Ok(dictionary) => add(dictionary),
-                Err(fallback) => return fallback,
+                ContentsValue::Mapping(mapping) => add(mapping),
+                fallback => return fallback,
             }
         }
     }
@@ -398,8 +391,8 @@ fn element_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
             return ContentsValue::Unavailable;
         }
         match literal(db, &env, scope, value, &inference) {
-            Ok(dictionary) => add(dictionary),
-            Err(fallback) => return fallback,
+            ContentsValue::Mapping(mapping) => add(mapping),
+            fallback => return fallback,
         }
     }
     result.map_or(ContentsValue::Unavailable, ContentsValue::Mapping)
@@ -411,12 +404,12 @@ fn literal<'db>(
     scope: ty_python_core::scope::ScopeId<'db>,
     value: &ast::Expr,
     inference: &StatementInference<'db>,
-) -> Result<DictionaryItems<'db>, ContentsValue<'db>> {
+) -> ContentsValue<'db> {
     if inference.is_provisional() {
-        return Err(ContentsValue::Pending);
+        return ContentsValue::Pending;
     }
     let ast::Expr::Dict(dictionary) = value else {
-        return Err(ContentsValue::Unavailable);
+        return ContentsValue::Unavailable;
     };
     if dictionary.items.iter().any(|item| {
         !item
@@ -424,7 +417,7 @@ fn literal<'db>(
             .as_ref()
             .is_some_and(ast::Expr::is_string_literal_expr)
     }) {
-        return Err(ContentsValue::Unavailable);
+        return ContentsValue::Unavailable;
     }
     let mut pending = false;
     let observed = DictionaryItems::expression(db, env, scope, value, &mut |expression| {
@@ -441,9 +434,18 @@ fn literal<'db>(
         Some(ty)
     });
     if pending {
-        Err(ContentsValue::Pending)
+        ContentsValue::Pending
     } else {
-        observed.map_err(|_| ContentsValue::Unavailable)
+        match observed {
+            Ok(dictionary) => ContentsValue::Mapping(MappingContents {
+                file: scope.program_file(db),
+                dictionary,
+                builtin: true,
+                uses_residual_presence: false,
+                bound: None,
+            }),
+            Err(_) => ContentsValue::Unavailable,
+        }
     }
 }
 

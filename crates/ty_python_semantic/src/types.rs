@@ -152,7 +152,9 @@ mod cyclic;
 mod dedicated;
 mod diagnostic;
 pub(crate) mod dictionary;
-pub use dictionary::{DictionaryExtraItems, DictionaryItem, DictionaryItemKind, DictionaryItems};
+pub use dictionary::{
+    DictionaryExtraItems, DictionaryFirstEntry, DictionaryItem, DictionaryItemKind, DictionaryItems,
+};
 mod display;
 mod enums;
 mod equality;

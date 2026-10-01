@@ -153,6 +153,69 @@ impl DictionaryItem<'_> {
 pub struct DictionaryItems<'db> {
     pub items: Box<[DictionaryItem<'db>]>,
     pub extra_items: DictionaryExtraItems<'db>,
+    /// Insertion-order evidence at this observation's snapshot, independent of `items` order.
+    pub first_entry: DictionaryFirstEntry<'db>,
+}
+
+/// Evidence about the first entry of a runtime dictionary.
+#[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
+pub enum DictionaryFirstEntry<'db> {
+    /// Neither emptiness nor the first entry is known.
+    Unknown,
+    Empty,
+    /// The dictionary is nonempty. Only exact string keys have a recorded name.
+    Entry {
+        key: Option<Name>,
+        value: Type<'db>,
+    },
+}
+
+impl<'db> DictionaryFirstEntry<'db> {
+    fn set(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: Option<&str>,
+        ty: Type<'db>,
+    ) {
+        match self {
+            Self::Unknown => {}
+            Self::Empty => {
+                *self = Self::Entry {
+                    key: name.map(Name::new),
+                    value: ty,
+                };
+            }
+            Self::Entry { key, value } => {
+                if let Some(key) = key.as_ref()
+                    && let Some(name) = name
+                {
+                    if key == name {
+                        *value = ty;
+                    }
+                } else {
+                    *value = UnionType::from_two_elements(db, env, *value, ty);
+                }
+            }
+        }
+    }
+
+    fn join(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Empty, Self::Empty) => Self::Empty,
+            (
+                Self::Entry { key, value },
+                Self::Entry {
+                    key: other_key,
+                    value: other_value,
+                },
+            ) => Self::Entry {
+                key: if key == other_key { key.clone() } else { None },
+                value: UnionType::from_two_elements(db, env, *value, *other_value),
+            },
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// Evidence about dictionary values beyond the named entries.
@@ -255,6 +318,7 @@ impl<'db> DictionaryItems<'db> {
                 Ok(Self {
                     items,
                     extra_items: DictionaryExtraItems::Closed,
+                    first_entry: DictionaryFirstEntry::Unknown,
                 })
             }
             ast::Expr::Call(call) => {
@@ -327,6 +391,10 @@ impl<'db> DictionaryItems<'db> {
                             source: name.range(),
                         }]),
                         extra_items: DictionaryExtraItems::Closed,
+                        first_entry: DictionaryFirstEntry::Entry {
+                            key: Some(name.id.clone()),
+                            value: ty,
+                        },
                     })
                 } else {
                     Self::unpacked_expression(db, env, scope, value, expression_type)
@@ -473,6 +541,7 @@ impl<'db> DictionaryItems<'db> {
                 source: key.range(),
             };
             // Repeated keys replace their values without changing insertion order.
+            dictionary.first_entry.set(db, env, Some(&name), ty);
             dictionary.items.insert(name, entry);
         }
         Ok(dictionary.finish())
@@ -486,6 +555,7 @@ impl<'db> DictionaryItems<'db> {
             has_implicit_extra_items,
         } = unpacked;
         Self {
+            first_entry: DictionaryFirstEntry::Unknown,
             items: keys
                 .into_iter()
                 .map(|(name, key)| {
@@ -538,6 +608,7 @@ impl<'db> DictionaryItems<'db> {
             return Some(Self {
                 items: Box::default(),
                 extra_items: DictionaryExtraItems::Closed,
+                first_entry: DictionaryFirstEntry::Empty,
             });
         }
         let str_ty = KnownClass::Str.to_instance(db, env);
@@ -550,15 +621,26 @@ impl<'db> DictionaryItems<'db> {
         Some(Self {
             items: Box::default(),
             extra_items: DictionaryExtraItems::Value(value_ty),
+            first_entry: DictionaryFirstEntry::Unknown,
         })
     }
 }
 
 /// An ordered overlay of mapping sources. The residual excludes every represented name.
-#[derive(Default)]
 struct DictionaryItemsBuilder<'db> {
     items: FxIndexMap<Name, DictionaryItem<'db>>,
     extra_items: Option<Type<'db>>,
+    first_entry: DictionaryFirstEntry<'db>,
+}
+
+impl Default for DictionaryItemsBuilder<'_> {
+    fn default() -> Self {
+        Self {
+            items: FxIndexMap::default(),
+            extra_items: None,
+            first_entry: DictionaryFirstEntry::Empty,
+        }
+    }
 }
 
 impl<'db> DictionaryItemsBuilder<'db> {
@@ -568,7 +650,35 @@ impl<'db> DictionaryItemsBuilder<'db> {
         env: &ProgramEnvironment<'db>,
         dictionary: DictionaryItems<'db>,
     ) {
-        let DictionaryItems { items, extra_items } = dictionary;
+        match &mut self.first_entry {
+            DictionaryFirstEntry::Empty => self.first_entry = dictionary.first_entry.clone(),
+            DictionaryFirstEntry::Unknown => {}
+            DictionaryFirstEntry::Entry { key, value } => {
+                if let Some(key) = key {
+                    if let Some(item) = dictionary.items.iter().find(|item| &item.name == key) {
+                        *value = if item.is_required() {
+                            item.ty
+                        } else {
+                            UnionType::from_two_elements(db, env, *value, item.ty)
+                        };
+                    } else if let DictionaryExtraItems::Value(ty) = dictionary.extra_items {
+                        *value = UnionType::from_two_elements(db, env, *value, ty);
+                    }
+                } else {
+                    for item in &dictionary.items {
+                        *value = UnionType::from_two_elements(db, env, *value, item.ty);
+                    }
+                    if let DictionaryExtraItems::Value(ty) = dictionary.extra_items {
+                        *value = UnionType::from_two_elements(db, env, *value, ty);
+                    }
+                }
+            }
+        }
+        let DictionaryItems {
+            items,
+            extra_items,
+            first_entry: _,
+        } = dictionary;
         let incoming_extra = match extra_items {
             DictionaryExtraItems::Closed => None,
             DictionaryExtraItems::Value(ty) => Some(ty),
@@ -616,8 +726,13 @@ impl<'db> DictionaryItemsBuilder<'db> {
     }
 
     fn finish(self) -> DictionaryItems<'db> {
-        let Self { items, extra_items } = self;
+        let Self {
+            items,
+            extra_items,
+            first_entry,
+        } = self;
         DictionaryItems {
+            first_entry,
             items: items.into_values().collect(),
             extra_items: extra_items
                 .map_or(DictionaryExtraItems::Closed, DictionaryExtraItems::Value),

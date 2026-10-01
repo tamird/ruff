@@ -14,8 +14,8 @@ use crate::types::ide_support::{
     definitions_for_keyword_argument, inlay_hint_call_argument_details,
 };
 use crate::types::{
-    CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryItem, DictionaryItemKind,
-    DictionaryItems, KnownClass, Parameter, Parameters, Signature,
+    CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryFirstEntry, DictionaryItem,
+    DictionaryItemKind, DictionaryItems, KnownClass, Parameter, Parameters, Signature,
 };
 use crate::{HasType, SemanticModel};
 
@@ -645,6 +645,7 @@ fn field_implication_factory<'db>(
     let DictionaryItems {
         items,
         extra_items: _,
+        first_entry: _,
     } = fields;
     let fields = items
         .into_iter()
@@ -1134,6 +1135,178 @@ def use() -> None:
 }
 
 #[test]
+fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
+    fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        if call.declaration()?.name(db)?.as_str() != "observe" {
+            return None;
+        }
+        let description = match call.dictionary_argument(db, "value") {
+            None => "unavailable".to_owned(),
+            Some(dictionary) => match dictionary.first_entry {
+                DictionaryFirstEntry::Unknown => "unknown".to_owned(),
+                DictionaryFirstEntry::Empty => "empty".to_owned(),
+                DictionaryFirstEntry::Entry { key, value } => format!(
+                    "{}: {}",
+                    key.as_deref().unwrap_or("?"),
+                    value.display(db, &ProgramEnvironment::from_file(call.file())),
+                ),
+            },
+        };
+        Some(Type::string_literal(db, description.as_str()))
+    }
+
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "def observe(value: object) -> str: ...\ndef expose(value: object) -> None: ...\nflag: bool\nkey: str\n",
+        )
+        .with_file("/src/main.py", "")
+.with_call_result_provider(|db, call| observe(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (source, expected) in [
+        ("result = observe({})", "empty"),
+        ("result = observe(dict())", "empty"),
+        (
+            "values = {'first': None, 'second': {}}\nresult = observe(values)",
+            "first: None",
+        ),
+        (
+            "result = observe({'first': 1, 'second': 2, 'first': 3})",
+            "first: Literal[3]",
+        ),
+        (
+            "values = {'first': 1, 'second': 2}\nvalues['first'] = 3\nresult = observe(values)",
+            "first: Literal[3]",
+        ),
+        (
+            "values = {'first': 1}\nvalues['second'] = 2\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {}\nvalues['first'] = 1\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\nvalues[key] = 2\nresult = observe(values)",
+            "first: Literal[1, 2]",
+        ),
+        (
+            "values = {'first': 1, 'second': 2}\ndel values['second']\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1, 'second': 2}\ndel values['first']\nvalues['first'] = 3\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\ndel values[key]\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\nvalues.clear()\nresult = observe(values)",
+            "empty",
+        ),
+        (
+            "values = {'first': 1}\nvalues.clear()\nvalues['second'] = 2\nresult = observe(values)",
+            "second: Literal[2]",
+        ),
+        (
+            "if flag:\n    values = {'first': 1, 'second': 2}\nelse:\n    values = {'second': 2, 'first': 1}\nresult = observe(values)",
+            "?: Literal[1, 2]",
+        ),
+        (
+            "if flag:\n    values = {'first': 1}\nelse:\n    values = {'first': 2}\nresult = observe(values)",
+            "first: Literal[1, 2]",
+        ),
+        (
+            "values = {'first': 1}\nif flag:\n    values.clear()\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\ncopy = dict(values)\nvalues.clear()\nresult = observe(copy)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\ncopy = {**values}\nvalues.clear()\nresult = observe(copy)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\ncopy = values | {'first': 2}\nvalues.clear()\nresult = observe(copy)",
+            "first: Literal[2]",
+        ),
+        (
+            "values = {'first': 1}\nvalues.update({'first': 2, 'second': 3})\nresult = observe(values)",
+            "first: Literal[2]",
+        ),
+        (
+            "values = {'first': 1}\nvalues.update({'second': 2})\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "extra = {'first': 2}\nif flag:\n    extra.clear()\nvalues = {'first': None}\nvalues.update(extra)\nresult = observe(values)",
+            "first: None | Literal[2]",
+        ),
+        (
+            "values = {}\nvalues[key] = 1\nresult = observe(values)",
+            "?: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\nexpose(values)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\nalias = values\nalias.clear()\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\nbefore = observe(values)\nvalues.clear()\nresult = before",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1 if flag else None}\nassert values['first'] is None\nresult = observe(values)",
+            "first: None",
+        ),
+        (
+            "values = {'first': 1 if flag else None}\nis_none = values['first'] is None\nassert is_none\nresult = observe(values)",
+            "first: None",
+        ),
+        (
+            "values = {'first': 1 if flag else None}\nis_none = values['first'] is None\nvalues['first'] = 2\nassert is_none\nresult = observe(values)",
+            "first: Literal[2]",
+        ),
+        (
+            "values = {'first': 1}\nwhile flag:\n    values['second'] = 2\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values: dict[str, tuple[int, ...]] = {'first': ()}\nwhile flag:\n    values['first'] += (1,)\nresult = observe(values)",
+            "first: tuple[()] | tuple[*tuple[Literal[1], ...], Literal[1]]",
+        ),
+        (
+            "values = {'first': 1 for _ in range(2)}\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "from typing_extensions import TypedDict\nclass Schema(TypedDict, closed=True):\n    first: int\n    second: str\ndef source() -> Schema:\n    return {'second': 's', 'first': 1}\nvalues = source()\nresult = observe(values)",
+            "unknown",
+        ),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!("from native import observe, expose, flag, key\n{source}\n"),
+        )?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let result = crate::place::global_symbol(&db, db.program_file(file), "result")
+            .place
+            .expect_type();
+        assert_eq!(result.string_literal_value(&db), Some(expected), "{source}");
+    }
+    Ok(())
+}
+
+#[test]
 fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
     fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
         if call.declaration()?.name(db)?.as_str() != "observe" {
@@ -1157,7 +1330,11 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         file: ProgramFile<'db>,
         entries: DictionaryItems<'db>,
     ) -> Type<'db> {
-        let DictionaryItems { items, extra_items } = entries;
+        let DictionaryItems {
+            items,
+            extra_items,
+            first_entry: _,
+        } = entries;
         let source = source_text(db, file.file(db));
         let env = ProgramEnvironment::from_file(file);
         let mut description = match extra_items {

@@ -1,6 +1,6 @@
 use crate::types::dictionary::{
-    DictionaryExtraItems, DictionaryFallback, DictionaryItem, DictionaryItemKind, DictionaryItems,
-    DictionaryObservation,
+    DictionaryExtraItems, DictionaryFallback, DictionaryFirstEntry, DictionaryItem,
+    DictionaryItemKind, DictionaryItems, DictionaryObservation,
 };
 use crate::{Db, FxIndexMap};
 use std::borrow::Cow;
@@ -36,11 +36,17 @@ pub(crate) fn collect_keyword_items<'db>(
 ) -> DictionaryObservation<'db> {
     let mut items: FxIndexMap<Name, DictionaryItem<'db>> = FxIndexMap::default();
     let mut extra_items = None;
+    let mut first_entry = DictionaryFirstEntry::Empty;
     for source in sources {
         let DictionaryItems {
             items: incoming,
             extra_items: incoming_extra,
+            first_entry: incoming_first,
         } = source?;
+        if incoming_first != DictionaryFirstEntry::Empty {
+            // This combines argument evidence, rather than observing a runtime mapping.
+            first_entry = DictionaryFirstEntry::Unknown;
+        }
         let incoming_extra = match incoming_extra {
             DictionaryExtraItems::Closed => None,
             DictionaryExtraItems::Value(ty) => Some(ty),
@@ -93,6 +99,7 @@ pub(crate) fn collect_keyword_items<'db>(
         }
     }
     Ok(DictionaryItems {
+        first_entry,
         items: items.into_values().collect(),
         extra_items: extra_items.map_or(DictionaryExtraItems::Closed, DictionaryExtraItems::Value),
     })
@@ -300,7 +307,11 @@ impl<'db> KnownUnpacking<'db> {
     }
 
     fn keywords(dictionary: DictionaryItems<'db>) -> Self {
-        let DictionaryItems { items, extra_items } = dictionary;
+        let DictionaryItems {
+            items,
+            extra_items,
+            first_entry: _,
+        } = dictionary;
         let extra_items = match extra_items {
             DictionaryExtraItems::Closed => None,
             DictionaryExtraItems::Value(ty) => Some(ty),

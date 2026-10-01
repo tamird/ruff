@@ -338,6 +338,7 @@ pub(super) fn refine_dict_snapshot_element_type<'db>(
     let DictionaryItems {
         items,
         extra_items: _,
+        first_entry: _,
     } = dictionary;
     let mut keys = UnionBuilder::new(db, env);
     for DictionaryItem {
