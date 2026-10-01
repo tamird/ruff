@@ -332,7 +332,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 }
                 relevant_typevars.close_over_constraints(
                     storage,
-                    Self::constrained_assignments(path).map(AtomicConstraintId::into_inner),
+                    Self::constrained_assignments(path)
+                        .chain(validations.into_iter().flat_map(Validations::constraints))
+                        .map(AtomicConstraintId::into_inner),
                 );
                 let mut relevant_path: Box<[_]> =
                     Self::constrained_assignments_mentioning(storage, path, &relevant_typevars)
@@ -352,7 +354,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 let mut visible_typevars = this.inferable_support.clone();
                 visible_typevars.close_over_constraints(
                     storage,
-                    Self::constrained_assignments(path).map(AtomicConstraintId::into_inner),
+                    Self::constrained_assignments(path)
+                        .chain(validations.into_iter().flat_map(Validations::constraints))
+                        .map(AtomicConstraintId::into_inner),
                 );
                 if let Some(node_support) = storage.node_support(node)
                     && visible_typevars.overlaps_with(node_support)
@@ -880,21 +884,8 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         let locals = existential.locals.clone();
         let validations = Validations::from_locals(db, env, storage, &locals);
         let mut support = storage.constraint_support(constraint).clone();
-        for constraints in validations
-            .upper_bounds
-            .values()
-            .map(|bound| &bound.constraints)
-            .chain(
-                validations
-                    .constrained
-                    .values()
-                    .flat_map(|bound| &bound.declared_constraints)
-                    .map(|bound| &bound.constraints),
-            )
-        {
-            for constraint in constraints.iter().flatten() {
-                support |= storage.constraint_support(constraint.into_inner());
-            }
+        for constraint in validations.constraints() {
+            support |= storage.constraint_support(constraint.into_inner());
         }
         let free = &support - &locals;
         if free.is_complete() && free.iter().next().is_none() {
@@ -2285,6 +2276,19 @@ struct DeclaredConstraint<'db> {
 }
 
 impl<'db> Validations<'db> {
+    fn constraints(&self) -> impl Iterator<Item = AtomicConstraintId> + Clone {
+        self.upper_bounds
+            .values()
+            .map(|bound| &bound.constraints)
+            .chain(
+                self.constrained
+                    .values()
+                    .flat_map(|bound| &bound.declared_constraints)
+                    .map(|bound| &bound.constraints),
+            )
+            .flat_map(|constraints| constraints.iter().flatten().copied())
+    }
+
     /// A binder owns only its locals' declarations. Types mentioned by those declarations remain
     /// free, and their declarations follow the outer query's validation policy.
     fn from_locals(

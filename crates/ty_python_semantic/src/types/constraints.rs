@@ -6325,6 +6325,53 @@ mod tests {
     }
 
     #[test]
+    fn existential_projection_preserves_declared_domains() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let string = KnownClass::Str.to_instance(db, &env);
+        let caller = create_typevar(db, "Caller");
+        let free = create_typevar(db, "Free");
+        let local = create_typevar(db, "Local").map_bound_or_constraints(db, |_| {
+            Some(TypeVarBoundOrConstraints::UpperBound(Type::TypeVar(caller)))
+        });
+        for chosen in [Type::object(), integer, Type::TypeVar(free)] {
+            let builder = ConstraintSetBuilder::new();
+            let set = ConstraintSet::constrain_typevar_equivalence_bound(
+                db, &env, &builder, local, string,
+            )
+            .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]))
+            .and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &builder, caller, chosen,
+                )
+            });
+            let result = set.solutions(db, &env, TypeVarSet::from_typevars(db, [caller]));
+            if chosen == Type::object() {
+                assert_eq!(
+                    result,
+                    Ok(Solutions::Constrained(SolutionPaths::Complete(vec![
+                        solution([TypeVarSolution {
+                            bound_typevar: caller,
+                            solution: chosen
+                        }])
+                    ])))
+                );
+            } else if chosen == integer {
+                assert_matches!(result, Ok(Solutions::Unsatisfiable(_)));
+            } else {
+                assert_eq!(
+                    result,
+                    Ok(Solutions::Constrained(SolutionPaths::Incomplete(vec![
+                        solution([])
+                    ])))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn existential_witness_selection_defers_local_bounds() {
         let db = setup_db();
         let db = &db;
