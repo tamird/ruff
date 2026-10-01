@@ -31,7 +31,7 @@ use crate::types::constraints::{
 use crate::types::cyclic::ActiveRecursionDetector;
 use crate::types::generics::{
     ApplySpecialization, GenericContext, Specialization, SpecializationBuilder, TypeVarInference,
-    walk_generic_context,
+    TypeVarProjection, walk_generic_context,
 };
 use crate::types::infer::{
     TypeExpressionFlags, infer_deferred_types, infer_function_default_types,
@@ -2063,9 +2063,13 @@ impl<'db> Signature<'db> {
 
         Some(
             inference.merged_specialization_with(db, |typevar, inferred| {
-                promoted_typevars
-                    .contains(&typevar.identity(db))
-                    .then(|| inferred.map_or(Type::TypeVar(typevar), |ty| ty.promote(db, env)))
+                if promoted_typevars.contains(&typevar.identity(db)) {
+                    inferred.map_or(TypeVarProjection::Retain, |ty| {
+                        TypeVarProjection::Override(ty.promote(db, env))
+                    })
+                } else {
+                    TypeVarProjection::Inferred
+                }
             }),
         )
     }

@@ -53,7 +53,7 @@ use crate::types::function::{
 };
 use crate::types::generics::{
     GenericContext, Specialization, SpecializationBuilder, SpecializationError, TypeVarInference,
-    TypeVarInferenceSolutions,
+    TypeVarInferenceSolutions, TypeVarProjection,
 };
 use crate::types::infer::original_class_type;
 use crate::types::known_instance::{
@@ -9040,8 +9040,12 @@ impl<'db> Binding<'db> {
         }
         .map(|inference| {
             inference.merged_specialization_with(db, |typevar, inferred| {
-                (mode.is_provisional() && inferred.is_none() && typevar.default_type(db).is_none())
-                    .then_some(Type::Dynamic(DynamicType::UnspecializedTypeVar))
+                if mode.is_provisional() && inferred.is_none() && typevar.default_type(db).is_none()
+                {
+                    TypeVarProjection::Override(Type::Dynamic(DynamicType::UnspecializedTypeVar))
+                } else {
+                    TypeVarProjection::Inferred
+                }
             })
         });
 
@@ -9544,7 +9548,7 @@ impl<'db> Binding<'db> {
     ) -> Option<Specialization<'db>> {
         self.inference.map(|inference| {
             inference.merged_specialization_with(db, |_, inferred| {
-                Some(
+                TypeVarProjection::Override(
                     inferred
                         .filter(|ty| !ty.has_provisional_marker(db, env))
                         .unwrap_or(Type::Dynamic(DynamicType::UnspecializedTypeVar)),

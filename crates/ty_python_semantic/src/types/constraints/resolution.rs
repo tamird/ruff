@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::TypeVarSolution;
 use crate::types::cyclic::CycleDetector;
@@ -14,7 +14,7 @@ use crate::types::typevar::{BoundTypeVarIdentity, TypeVarSet};
 use crate::types::visitor::{TypeKind, TypeVisitor, walk_non_atomic_type};
 use crate::types::{
     BoundTypeVarInstance, CallableType, KnownInstanceType, RecursiveType, Type, TypeAliasType,
-    TypeContext, TypeMapping,
+    TypeContext, TypeMapping, UnionType,
 };
 use crate::{Db, FxOrderMap, ProgramEnvironment};
 
@@ -37,27 +37,56 @@ pub(crate) fn resolve_solution<'db>(
     inferable: TypeVarSet<'db>,
     solution: &[TypeVarSolution<'db>],
 ) -> Box<[SolutionType<'db>]> {
-    let resolver = Resolver {
-        env,
-        inferable,
-        solution,
-        indices: solution
-            .iter()
-            .enumerate()
-            .map(|(index, binding)| (binding.bound_typevar.identity(db), index))
-            .collect(),
-        resolved: CycleDetector::new(None),
-    };
-    solution
+    Resolver::new(db, env, inferable, solution).resolve_all(db)
+}
+
+/// Closes a merged compatibility projection, including anchored positive-union cycles.
+/// Correlated solution paths use [`resolve_solution`] and preserve their original evidence.
+pub(crate) fn resolve_merged_solution<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    inferable: TypeVarSet<'db>,
+    solution: &[TypeVarSolution<'db>],
+) -> Box<[SolutionType<'db>]> {
+    let resolver = Resolver::new(db, env, inferable, solution);
+    let resolved = resolver.resolve_all(db);
+    if resolved
         .iter()
-        .enumerate()
-        .map(|(index, binding)| {
-            resolver.resolve(db, index).map_or(
-                SolutionType::Unresolved(binding.solution),
-                SolutionType::Resolved,
-            )
+        .all(|result| matches!(result, SolutionType::Resolved(_)))
+    {
+        return resolved;
+    }
+    let proposals: Vec<_> = solution
+        .iter()
+        .zip(&resolved)
+        .map(|(binding, result)| {
+            if matches!(result, SolutionType::Unresolved(_)) {
+                resolver.resolve_union(db, binding.solution)
+            } else {
+                None
+            }
         })
-        .collect()
+        .collect();
+    let mut recovered = solution.to_vec();
+    let mut changed = false;
+    for (proposal, replacement) in proposals.iter().zip(&mut recovered) {
+        // An anchor in a dependent does not close its dependencies: T = U | int
+        // remains unresolved when U = U has no anchor of its own.
+        if let Some((ty, dependencies)) = proposal
+            && dependencies.iter().all(|index| {
+                matches!(resolved[*index], SolutionType::Resolved(_)) || proposals[*index].is_some()
+            })
+        {
+            replacement.solution = *ty;
+            changed = true;
+        }
+    }
+    if changed {
+        // A structured dependent may now close through a recovered union component.
+        resolve_solution(db, env, inferable, &recovered)
+    } else {
+        resolved
+    }
 }
 
 struct ResolveBinding;
@@ -70,56 +99,119 @@ struct Resolver<'a, 'db> {
     resolved: CycleDetector<'db, ResolveBinding, Type<'db>, Option<Type<'db>>, 3>,
 }
 
-impl<'db> Resolver<'_, 'db> {
+impl<'a, 'db> Resolver<'a, 'db> {
+    fn new(
+        db: &'db dyn Db,
+        env: &'a ProgramEnvironment<'db>,
+        inferable: TypeVarSet<'db>,
+        solution: &'a [TypeVarSolution<'db>],
+    ) -> Self {
+        Self {
+            env,
+            inferable,
+            solution,
+            indices: solution
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| (binding.bound_typevar.identity(db), index))
+                .collect(),
+            resolved: CycleDetector::new(None),
+        }
+    }
+
+    fn resolve_all(&self, db: &'db dyn Db) -> Box<[SolutionType<'db>]> {
+        self.solution
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| {
+                self.resolve(db, index).map_or(
+                    SolutionType::Unresolved(binding.solution),
+                    SolutionType::Resolved,
+                )
+            })
+            .collect()
+    }
+
     fn resolve(&self, db: &'db dyn Db, index: usize) -> Option<Type<'db>> {
         let binding = &self.solution[index];
         self.resolved
             .visit(db, Type::TypeVar(binding.bound_typevar), || {
-                let original = binding.solution;
-                let replacements = RefCell::new(FxOrderMap::default());
-                if !Dependencies::check(db, self.env, self.inferable, original, |dependency| {
-                    let Some(&index) = self.indices.get(&dependency.identity(db)) else {
-                        return false;
-                    };
-                    let Some(ty) = self.resolve(db, index) else {
-                        return false;
-                    };
-                    replacements.borrow_mut().insert(index, ty);
-                    true
-                }) {
-                    return None;
-                }
-                let replacements = replacements.into_inner();
-                if replacements.is_empty() {
-                    return Some(original);
-                }
-
-                // Every replacement is already closed. One simultaneous substitution therefore
-                // suffices, and never substitutes a cycle with an arbitrary representative.
-                let context = GenericContext::from_typevar_instances(
-                    db,
-                    self.env,
-                    replacements
-                        .keys()
-                        .map(|index| self.solution[*index].bound_typevar),
-                );
-                let types: Vec<_> = replacements.values().copied().collect();
-                let mapped = original.apply_type_mapping(
-                    db,
-                    self.env,
-                    &TypeMapping::ApplySpecialization(ApplySpecialization::Partial {
-                        generic_context: context,
-                        types: &types,
-                        skip: None,
-                    }),
-                    TypeContext::default(),
-                );
-                // Some type forms preserve captured variables when specialized. For example, an
-                // alias changes its explicit arguments but can retain a free variable in its body.
-                // Verify closure on the actual result without performing further substitutions.
-                Dependencies::check(db, self.env, self.inferable, mapped, |_| false)
-                    .then_some(mapped)
+                self.resolve_type(db, binding.solution)
             })
+    }
+
+    fn resolve_type(&self, db: &'db dyn Db, original: Type<'db>) -> Option<Type<'db>> {
+        let replacements = RefCell::new(FxOrderMap::default());
+        if !Dependencies::check(db, self.env, self.inferable, original, |dependency| {
+            let Some(&index) = self.indices.get(&dependency.identity(db)) else {
+                return false;
+            };
+            let Some(ty) = self.resolve(db, index) else {
+                return false;
+            };
+            replacements.borrow_mut().insert(index, ty);
+            true
+        }) {
+            return None;
+        }
+        let replacements = replacements.into_inner();
+        if replacements.is_empty() {
+            return Some(original);
+        }
+
+        // Every replacement is already closed. One simultaneous substitution therefore
+        // suffices, and never substitutes a cycle with an arbitrary representative.
+        let context = GenericContext::from_typevar_instances(
+            db,
+            self.env,
+            replacements
+                .keys()
+                .map(|index| self.solution[*index].bound_typevar),
+        );
+        let types: Vec<_> = replacements.values().copied().collect();
+        let mapped = original.apply_type_mapping(
+            db,
+            self.env,
+            &TypeMapping::ApplySpecialization(ApplySpecialization::Partial {
+                generic_context: context,
+                types: &types,
+                skip: None,
+            }),
+            TypeContext::default(),
+        );
+        // Some type forms preserve captured variables when specialized. For example, an
+        // alias changes its explicit arguments but can retain a free variable in its body.
+        // Verify closure on the actual result without performing further substitutions.
+        Dependencies::check(db, self.env, self.inferable, mapped, |_| false).then_some(mapped)
+    }
+
+    fn resolve_union(
+        &self,
+        db: &'db dyn Db,
+        original: Type<'db>,
+    ) -> Option<(Type<'db>, FxHashSet<usize>)> {
+        let mut pending = vec![original];
+        let mut visited = FxHashSet::default();
+        let mut anchors = Vec::new();
+        while let Some(ty) = pending.pop() {
+            match ty {
+                Type::TypeVar(variable) => {
+                    if variable.is_inferable(db, self.inferable) {
+                        let index = *self.indices.get(&variable.identity(db))?;
+                        if visited.insert(index) {
+                            pending.push(self.solution[index].solution);
+                        }
+                    } else {
+                        anchors.push(ty);
+                    }
+                }
+                Type::Union(union) => pending.extend(union.elements(db).iter().copied()),
+                _ => anchors.push(self.resolve_type(db, ty)?),
+            }
+        }
+        // Flat positive-union equations collect every reachable closed anchor. Visiting all
+        // edges keeps X = Y | int, Y = X | str symmetric; a bare cycle has no anchor.
+        (!anchors.is_empty()).then(|| (UnionType::from_elements(db, self.env, anchors), visited))
     }
 }
 
@@ -251,14 +343,14 @@ mod tests {
     use ruff_python_ast::name::Name;
     use ty_python_core::ProgramFile;
 
-    use super::{SolutionType, resolve_solution};
+    use super::{SolutionType, resolve_merged_solution, resolve_solution};
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::global_symbol;
     use crate::types::constraints::TypeVarSolution;
     use crate::types::tuple::TupleType;
     use crate::types::typevar::TypeVarSet;
     use crate::types::{
-        BoundTypeVarInstance, KnownClass, KnownInstanceType, Type, TypeVarVariance,
+        BoundTypeVarInstance, KnownClass, KnownInstanceType, Type, TypeVarVariance, UnionType,
     };
 
     fn create_typevar<'db>(db: &'db TestDb, name: &str) -> BoundTypeVarInstance<'db> {
@@ -278,6 +370,129 @@ mod tests {
             bound_typevar,
             solution,
         }
+    }
+
+    #[test]
+    fn merged_union_cycles_collect_every_anchor() -> anyhow::Result<()> {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let dependent = create_typevar(db, "Dependent");
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let union = UnionType::from_two_elements(db, &env, int, str);
+        let list = KnownClass::List.to_specialized_instance(db, &env, &[union]);
+        let t_binding = binding(
+            t,
+            UnionType::from_two_elements(db, &env, Type::TypeVar(u), int),
+        );
+        let u_binding = binding(
+            u,
+            UnionType::from_two_elements(db, &env, Type::TypeVar(t), str),
+        );
+        let list_binding = binding(
+            dependent,
+            KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(t)]),
+        );
+        let inferable = TypeVarSet::from_typevars(db, [t, u, dependent]);
+        for selected in [
+            [t_binding, u_binding, list_binding],
+            [u_binding, t_binding, list_binding],
+        ] {
+            assert!(
+                resolve_solution(db, &env, inferable, &selected)
+                    .iter()
+                    .all(|result| matches!(result, SolutionType::Unresolved(_)))
+            );
+            for (binding, result) in selected
+                .iter()
+                .zip(resolve_merged_solution(db, &env, inferable, &selected))
+            {
+                let SolutionType::Resolved(ty) = result else {
+                    anyhow::bail!("expected all union anchors to close: {result:?}");
+                };
+                let expected = if binding.bound_typevar == dependent {
+                    list
+                } else {
+                    union
+                };
+                assert!(ty.is_equivalent_to(db, &env, expected));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn merged_union_cycles_require_closed_anchors() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let dependent = create_typevar(db, "Dependent");
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let inferable = TypeVarSet::from_typevars(db, [t, u, dependent]);
+        let list_u = KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(u)]);
+        for selected in [
+            vec![binding(
+                t,
+                UnionType::from_two_elements(db, &env, Type::TypeVar(u), int),
+            )],
+            vec![binding(t, Type::TypeVar(u)), binding(u, Type::TypeVar(t))],
+            vec![
+                binding(
+                    t,
+                    UnionType::from_two_elements(db, &env, Type::TypeVar(u), int),
+                ),
+                binding(u, Type::TypeVar(u)),
+                binding(
+                    dependent,
+                    UnionType::from_two_elements(db, &env, Type::TypeVar(t), str),
+                ),
+            ],
+            vec![
+                binding(t, Type::TypeVar(u).negate(db, &env)),
+                binding(u, Type::TypeVar(t)),
+            ],
+            vec![
+                binding(t, UnionType::from_two_elements(db, &env, list_u, int)),
+                binding(
+                    u,
+                    UnionType::from_two_elements(db, &env, Type::TypeVar(t), str),
+                ),
+            ],
+        ] {
+            assert_eq!(
+                resolve_merged_solution(db, &env, inferable, &selected),
+                resolve_solution(db, &env, inferable, &selected)
+            );
+        }
+        let selected = [
+            binding(
+                t,
+                UnionType::from_two_elements(db, &env, Type::TypeVar(u), Type::none(db, &env)),
+            ),
+            binding(u, int),
+        ];
+        assert_eq!(
+            resolve_merged_solution(db, &env, inferable, &selected),
+            resolve_solution(db, &env, inferable, &selected)
+        );
+        let outer = create_typevar(db, "Outer");
+        let selected = [
+            binding(
+                t,
+                UnionType::from_two_elements(db, &env, Type::TypeVar(u), Type::TypeVar(outer)),
+            ),
+            binding(u, Type::TypeVar(t)),
+        ];
+        assert_eq!(
+            resolve_merged_solution(db, &env, inferable, &selected).as_ref(),
+            [SolutionType::Resolved(Type::TypeVar(outer)); 2]
+        );
     }
 
     #[test]
