@@ -3895,13 +3895,6 @@ impl<'db> CandidateResidual<'db> {
                 let Some(bindings) = bindings else {
                     continue;
                 };
-                if locals.iter(db).any(|local| {
-                    !bindings
-                        .iter()
-                        .any(|binding| binding.bound_typevar == local)
-                }) {
-                    continue;
-                }
                 if bindings
                     .iter()
                     .filter(|binding| binding.bound_typevar.is_inferable(db, *locals))
@@ -3912,6 +3905,21 @@ impl<'db> CandidateResidual<'db> {
                 let replay = Self::specialize(db, env, when, &bindings);
                 let replay_holds = {
                     let mut storage = builder.storage.borrow_mut();
+                    // ParamSpec scopes include the base parameter even when the body only
+                    // uses its args and kwargs. An absent local needs no chosen witness.
+                    if let Some(support) = storage.node_support(replay.node)
+                        && locals.iter(db).any(|local| {
+                            !bindings
+                                .iter()
+                                .any(|binding| binding.bound_typevar.is_same_typevar_as(db, local))
+                                && (!support.is_complete()
+                                    || support.iter().any(|id| {
+                                        storage.typevar_data(id).is_same_typevar_as(db, local)
+                                    }))
+                        })
+                    {
+                        continue;
+                    }
                     let orders = storage.calculate_source_orders(replay.source_order);
                     let mut path =
                         replay
@@ -4356,6 +4364,9 @@ impl<'db> CandidateSolutions<'db> {
             };
             if solution.is_valid() {
                 check_solution(&solution, type_budget)?;
+                if path.residual.is_some() && !incomplete && solution.solved_typevars.is_empty() {
+                    return ControlFlow::Continue(Solutions::Unconstrained);
+                }
                 valid_incomplete |= incomplete;
                 valid_solutions.push(solution);
             } else {
