@@ -12523,6 +12523,100 @@ unbound_or = dict.__or__
     }
 
     #[test]
+    fn generic_transport_preserves_function_identity() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+from typing import Callable, overload
+from ty_extensions._internal import TypeOf
+
+def opaque(value): return value
+
+def annotated(value: object) -> object: return value
+
+def store[T](value: T) -> object: ...
+def identity[T](value: T) -> T: ...
+def exact(value: TypeOf[opaque]) -> object: ...
+def promise(value: Callable[[object], object]) -> object: ...
+
+@overload
+def implemented(value: int) -> int: ...
+@overload
+def implemented(value: str) -> str: ...
+def implemented[T](value: T) -> T: return value
+"#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let lookup = |name| global_symbol(db, file, name).place.expect_type();
+        for (name, actual, expected) in [
+            ("store", lookup("opaque"), true),
+            ("identity", lookup("opaque"), true),
+            ("exact", lookup("opaque"), true),
+            ("store", lookup("annotated"), true),
+            ("promise", lookup("opaque"), false),
+            ("opaque", Type::int_literal(1), false),
+            ("store", Type::unknown(), false),
+        ] {
+            let arguments = CallArguments::positional([actual]).with_input_proof_request(true);
+            let bindings = lookup(name)
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &ConstraintSetBuilder::new(),
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                )
+                .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                expected,
+                "{name}({})",
+                actual.display(db, &env),
+            );
+        }
+
+        // A real change to either the public signature or the implementation still maps the
+        // function. Applying the same substitution again leaves that mapped identity intact.
+        let int = KnownClass::Int.to_instance(db, &env);
+        for name in ["identity", "implemented"] {
+            let original = lookup(name);
+            let function = original.expect_function_literal();
+            let context = function
+                .last_definition_signature(db)
+                .generic_context
+                .unwrap();
+            let specialization = context.specialize(db, [int].as_slice());
+            let mapped = original.apply_specialization(db, specialization);
+            assert_ne!(mapped, original, "{name}");
+            assert_eq!(
+                mapped.apply_specialization(db, specialization),
+                mapped,
+                "{name}"
+            );
+            let mapped_function = mapped.expect_function_literal();
+            assert_eq!(
+                mapped_function.last_definition_signature(db).return_type(),
+                int
+            );
+            if name == "implemented" {
+                assert_eq!(mapped_function.signature(db), function.signature(db));
+                assert_ne!(
+                    mapped_function.implementation_callables(db),
+                    function.implementation_callables(db),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn equivalent_callback_witnesses_prove_inputs() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(

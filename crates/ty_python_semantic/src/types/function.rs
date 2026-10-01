@@ -1470,7 +1470,16 @@ impl<'db> FunctionType<'db> {
             )
         };
 
-        if updated_signature.is_none() && updated_implementation_callables.is_none() {
+        // A mapping that leaves the signatures unchanged preserves the function's identity.
+        // Rebuilding it would force later relations to compare gradual signatures instead of
+        // recognizing the same function value.
+        if updated_signature
+            .as_ref()
+            .is_none_or(|signature| signature == self.signature(db))
+            && updated_implementation_callables
+                .as_deref()
+                .is_none_or(|callables| callables == self.implementation_callables(db).as_ref())
+        {
             self
         } else {
             Self::new_internal(
