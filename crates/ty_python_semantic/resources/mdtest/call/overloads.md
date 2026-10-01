@@ -1485,6 +1485,9 @@ This is the step 5 of the overload call evaluation algorithm which specifies tha
 
 This is only performed if the previous step resulted in more than one matching overload.
 
+When the remaining overloads have different return types, their union is intersected with `Unknown`.
+The result retains a bound while allowing assignments and operations supported by any candidate.
+
 ### Single list argument
 
 `overloaded.pyi`:
@@ -1592,8 +1595,14 @@ def _(list_int: list[int], list_any: list[Any]):
     # All materializations of `list[Any]` are assignable to `list[int]` and `list[Any]`, but the
     # return type of first and second overloads are not equivalent, so the overload matching
     # is ambiguous.
-    reveal_type(f(list_any))  # revealed: Unknown
-    reveal_type(f(*(list_any,)))  # revealed: Unknown
+    reveal_type(f(list_any))  # revealed: (Unknown & int) | (Unknown & str)
+    reveal_type(f(*(list_any,)))  # revealed: (Unknown & int) | (Unknown & str)
+
+    result = f(list_any)
+    integer: int = result  # no diagnostic
+    string: str = result  # no diagnostic
+    result + 1  # no diagnostic
+    result.upper()  # no diagnostic
 ```
 
 ### Single tuple argument
@@ -1638,8 +1647,8 @@ def _(int_str: tuple[int, str], int_any: tuple[int, Any], any_any: tuple[Any, An
 
     # All materializations of `tuple[Any, Any]` are assignable to the parameters of all the
     # overloads, but the return types aren't equivalent, so the overload matching is ambiguous
-    reveal_type(f(any_any))  # revealed: Unknown
-    reveal_type(f(*(any_any,)))  # revealed: Unknown
+    reveal_type(f(any_any))  # revealed: (Unknown & int) | (Unknown & str)
+    reveal_type(f(*(any_any,)))  # revealed: (Unknown & int) | (Unknown & str)
 ```
 
 ### `Unknown` passed into an overloaded function annotated with protocols
@@ -1670,15 +1679,8 @@ def f(a: Foo, b: list[str], c: list[LiteralString], e):
     reveal_type(a.join(b))  # revealed: str
     reveal_type(a.join(c))  # revealed: LiteralString
 
-    # since both overloads match and they have return types that are not equivalent,
-    # step (5) of the overload evaluation algorithm says we must evaluate the result of the
-    # call as `Unknown`.
-    #
-    # Note: although the spec does not state as such (since intersections in general are not
-    # specified currently), `(str | LiteralString) & Unknown` might also be a reasonable type
-    # here (the union of all overload returns, intersected with `Unknown`) -- here that would
-    # simplify to `str & Unknown`.
-    reveal_type(a.join(e))  # revealed: Unknown
+    # Both overloads match. Their gradual result retains the common string bound.
+    reveal_type(a.join(e))  # revealed: Unknown & str
 ```
 
 ### Multiple arguments
@@ -1728,8 +1730,8 @@ def _(list_int: list[int], list_any: list[Any], int_str: tuple[int, str], int_an
     # All materializations of first argument is assignable to the second overload and for the second
     # argument, they're assignable to the third overload, so no overloads are filtered out; the
     # return types of the remaining overloads are not equivalent, so overload matching is ambiguous
-    reveal_type(f(list_int, any_any))  # revealed: Unknown
-    reveal_type(f(*(list_int, any_any)))  # revealed: Unknown
+    reveal_type(f(list_int, any_any))  # revealed: (Unknown & A) | (Unknown & B)
+    reveal_type(f(*(list_int, any_any)))  # revealed: (Unknown & A) | (Unknown & B)
 ```
 
 ### `LiteralString` and `str`
@@ -1760,9 +1762,9 @@ def _(literal: LiteralString, string: str, any: Any):
     reveal_type(f(*(string,)))  # revealed: str
 
     # `Any` matches both overloads, but the return types are not equivalent.
-    # Pyright and mypy both reveal `str` here, contrary to the spec.
-    reveal_type(f(any))  # revealed: Unknown
-    reveal_type(f(*(any,)))  # revealed: Unknown
+    # The gradual result remains assignable to `LiteralString`.
+    reveal_type(f(any))  # revealed: Unknown & str
+    reveal_type(f(*(any,)))  # revealed: Unknown & str
 ```
 
 ### Generics
@@ -1874,7 +1876,7 @@ def _(a_int: A[int], a_str: A[str], a_any: A[Any]):
 def _(b_int: B[int], b_str: B[str], b_any: B[Any]):
     reveal_type(b_int.method())  # revealed: int
     reveal_type(b_str.method())  # revealed: str
-    reveal_type(b_any.method())  # revealed: Unknown
+    reveal_type(b_any.method())  # revealed: (Unknown & int) | (Unknown & str)
 ```
 
 ### Variadic argument
@@ -1918,11 +1920,11 @@ def _(arg: list[Any]):
     # Matches both overload and the return types are equivalent
     reveal_type(f1(*arg))  # revealed: A
     # Matches both overload but the return types aren't equivalent
-    reveal_type(f2(*arg))  # revealed: Unknown
+    reveal_type(f2(*arg))  # revealed: (Unknown & A) | (Unknown & B)
     # Filters out the final overload and the return types are equivalent
     reveal_type(f3(*arg))  # revealed: A
     # Filters out the final overload but the return types aren't equivalent
-    reveal_type(f4(*arg))  # revealed: Unknown
+    reveal_type(f4(*arg))  # revealed: (Unknown & A) | (Unknown & B)
 ```
 
 ### Variadic argument with generics
@@ -2180,14 +2182,18 @@ from typing import Any
 from overloaded import A, B, C, f
 
 def _(arg: tuple[A | B, Any]):
-    reveal_type(f(arg))  # revealed: A | Unknown
-    reveal_type(f(*(arg,)))  # revealed: A | Unknown
+    reveal_type(f(arg))  # revealed: A | (Unknown & B) | (Unknown & C)
+    reveal_type(f(*(arg,)))  # revealed: A | (Unknown & B) | (Unknown & C)
+
+def reversed_expansion(arg: tuple[B | A, Any]):
+    reveal_type(f(arg))  # revealed: (Unknown & B) | (Unknown & C) | A
+    reveal_type(f(*(arg,)))  # revealed: (Unknown & B) | (Unknown & C) | A
 ```
 
 #### Both argument lists ambiguous
 
-Here, both argument lists created by expanding the argument type are ambiguous, so the final return
-type is `Any`.
+Here, both argument lists created by expanding the argument type are ambiguous. The final result
+combines their gradual return bounds.
 
 `overloaded.pyi`:
 
@@ -2214,8 +2220,8 @@ from typing import Any
 from overloaded import A, B, C, f
 
 def _(arg: tuple[A | B, Any]):
-    reveal_type(f(arg))  # revealed: Unknown
-    reveal_type(f(*(arg,)))  # revealed: Unknown
+    reveal_type(f(arg))  # revealed: (Unknown & A) | (Unknown & C) | (Unknown & B)
+    reveal_type(f(*(arg,)))  # revealed: (Unknown & A) | (Unknown & C) | (Unknown & B)
 ```
 
 ### Unknown argument with TypeVar overload
@@ -2255,6 +2261,63 @@ def _(s: str):
     reveal_type(f((s, s, None)))  # revealed: str
 
 reveal_type(f((None, None, None)))  # revealed: Literal[b""]
+```
+
+### Ambiguous predicate calls
+
+An ambiguous predicate call still returns a boolean. Its gradual result can be assigned to either
+candidate return type, but does not prove that the predicate returned `True` or narrow its argument.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+`predicate.pyi`:
+
+```pyi
+from typing import Any, Literal, overload
+from typing_extensions import TypeIs
+
+@overload
+def is_dictionary[K, V](value: dict[K, V]) -> Literal[True]: ...
+@overload
+def is_dictionary(value: object) -> TypeIs[dict[Any, Any]]: ...
+```
+
+```py
+from typing import Any, Literal
+from typing_extensions import TypeIs
+from ty_extensions import static_assert
+from ty_extensions._internal import TypeOf, is_assignable_to, is_subtype_of
+from predicate import is_dictionary
+
+def check(known: dict[str, int], dynamic: Any, unknown, broad: object, mixed: dict[str, int] | str):
+    reveal_type(is_dictionary(known))  # revealed: Literal[True]
+    # revealed: (Unknown & Literal[True]) | (Unknown & TypeIs[dict[Any, Any]])
+    dynamic_result = reveal_type(is_dictionary(dynamic))
+    # revealed: (Unknown & Literal[True]) | (Unknown & TypeIs[dict[Any, Any]])
+    unknown_result = reveal_type(is_dictionary(unknown))
+    static_assert(is_subtype_of(TypeOf[dynamic_result], bool))
+    static_assert(is_subtype_of(TypeOf[unknown_result], bool))
+    static_assert(not is_subtype_of(TypeOf[dynamic_result], Literal[True]))
+    static_assert(not is_subtype_of(TypeOf[unknown_result], Literal[True]))
+    static_assert(is_assignable_to(TypeOf[dynamic_result], Literal[True]))
+    static_assert(is_assignable_to(TypeOf[dynamic_result], TypeIs[dict[Any, Any]]))
+    if dynamic_result:
+        reveal_type(dynamic)  # revealed: Any
+    else:
+        reveal_type(dynamic)  # revealed: Any
+    if unknown_result:
+        reveal_type(unknown)  # revealed: Unknown
+    else:
+        reveal_type(unknown)  # revealed: Unknown
+    reveal_type(is_dictionary(broad))  # revealed: TypeIs[dict[Any, Any] @ broad]
+    reveal_type(is_dictionary(mixed))  # revealed: TypeIs[dict[Any, Any] @ mixed]
+    if is_dictionary(mixed):
+        reveal_type(mixed)  # revealed: dict[str, int]
+    else:
+        reveal_type(mixed)  # revealed: str
 ```
 
 ## Bidirectional Type Inference

@@ -316,7 +316,7 @@ impl<'db> CallableItem<'db> {
 
     fn return_type(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
         match self {
-            CallableItem::Regular(binding) => binding.return_type(),
+            CallableItem::Regular(binding) => binding.return_type(db, env),
             CallableItem::Constructor(binding) => binding.return_type(db, env),
         }
     }
@@ -4356,6 +4356,7 @@ impl<'db> CallableBinding<'db> {
             let mut inputs_proved = call_arguments.requests_input_proof();
 
             for expanded_arguments in &expanded_argument_lists {
+                self.overload_call_result = None;
                 // The spec mentions that each expanded argument list should be re-evaluated from
                 // step 2 but we need to re-evaluate from step 1 because our step 1 does more than
                 // what the spec mentions. Step 1 of the spec means only "eliminate impossible
@@ -4414,7 +4415,7 @@ impl<'db> CallableBinding<'db> {
                                 );
                                 None
                             }
-                            MatchingOverloadIndex::Single(_) => Some(self.return_type()),
+                            MatchingOverloadIndex::Single(_) => Some(self.return_type(db, env)),
                             MatchingOverloadIndex::Multiple(indexes) => {
                                 is_ambiguous = self.filter_overloads_using_any_or_unknown(
                                     db,
@@ -4430,7 +4431,7 @@ impl<'db> CallableBinding<'db> {
                                     "after step 5",
                                 );
 
-                                Some(self.return_type())
+                                Some(self.return_type(db, env))
                             }
                         }
                     }
@@ -4466,8 +4467,6 @@ impl<'db> CallableBinding<'db> {
 
                 if let Some(return_type) = return_type {
                     return_types.push(return_type);
-                    // The shared call result can still contain ambiguity from an earlier
-                    // expansion. Select overloads using this expansion's result instead.
                     let matching = self.matching_overloads();
                     let selected = if is_ambiguous {
                         Either::Left(matching)
@@ -4974,17 +4973,33 @@ impl<'db> CallableBinding<'db> {
     /// For a valid call, this is the return type of either a successful argument type expansion of
     /// an overloaded function, or the return type of the first overload that the arguments matched
     /// against.
+    /// Ambiguous calls retain a gradual bound from all remaining return types.
     ///
     /// For an invalid call to a non-overloaded function, this is the return type of the function.
     ///
     /// For an invalid call to an overloaded function, we return `Type::unknown`, since we cannot
     /// make any useful conclusions about which overload was intended to be called.
-    fn return_type(&self) -> Type<'db> {
+    fn return_type(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
         if let Some(overload_call_result) = &self.overload_call_result {
             return match overload_call_result {
                 OverloadCallResult::ArgumentTypeExpansion(expanded) => expanded.return_type,
                 OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => Type::unknown(),
-                OverloadCallResult::Ambiguous => Type::Dynamic(DynamicType::AmbiguousOverload),
+                OverloadCallResult::Ambiguous => {
+                    let bound = UnionType::from_elements(
+                        db,
+                        env,
+                        self.matching_overloads()
+                            .map(|(_, overload)| overload.return_type()),
+                    );
+                    // Preserve possible results while accepting operations from every candidate.
+                    // The ambiguity marker also preserves recursive-inference convergence.
+                    IntersectionType::from_two_elements(
+                        db,
+                        env,
+                        Type::Dynamic(DynamicType::AmbiguousOverload),
+                        bound,
+                    )
+                }
             };
         }
         if let Some((_, first_overload)) = self.matching_overloads().next() {
@@ -12332,7 +12347,9 @@ def generic(value: object) -> object: ...
                 "{name}",
             );
             assert!(
-                bindings.return_type(db, &env).is_dynamic(),
+                any_over_type(db, &env, bindings.return_type(db, &env), false, |ty| {
+                    matches!(ty, Type::Dynamic(DynamicType::AmbiguousOverload))
+                }),
                 "{name}: {}",
                 bindings.return_type(db, &env).display(db, &env),
             );
