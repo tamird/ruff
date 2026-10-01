@@ -405,6 +405,26 @@ def overlay(excluded: StringsExceptGhost, integers: dict[str, int], named: Named
     ghost_int(**{"ghost": 1, **excluded})
 ```
 
+The same exclusions apply when unpacking the parameter directly. An absent key neither supplies a
+required parameter nor collides with an explicit argument. Optional named keys still allow values
+from a later mapping to reach that parameter.
+
+```py
+def direct(excluded: StringsExceptGhost, named: NamedGhost, strings: dict[str, str]):
+    ghost_int(ghost=1, **excluded)  # no diagnostic
+    ghost_int(**excluded)  # error: [missing-argument]
+    all_ints(**excluded)  # error: [invalid-argument-type]
+    # error: [parameter-already-assigned]
+    # error: [invalid-argument-type]
+    ghost_int(**named, **strings)
+
+class OptionalGhostWithExtras(TypedDict, extra_items=str):
+    ghost: NotRequired[int]
+
+def declared_key_overrides_extras(value: OptionalGhostWithExtras):
+    ghost_int(**value)  # no diagnostic
+```
+
 Union normalization retains whether a field has a named source or only restricts values from
 additional keys.
 
@@ -414,6 +434,12 @@ class Absent(TypedDict, closed=True):
 
 class Integers(TypedDict, extra_items=int):
     pass
+
+def optional_int(ghost: int = 0, **other: object): ...
+def optional_str(ghost: str = "", **other: object): ...
+def direct_normalized(source: Absent | Integers):
+    optional_int(**source)  # no diagnostic
+    optional_str(**source)  # error: [invalid-argument-type]
 
 def normalized(source: Absent | Integers):
     no_ghost(**{**source})

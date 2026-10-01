@@ -65,7 +65,9 @@ use crate::types::signatures::{
     PartialApplication, PartialSignatureApplication,
 };
 use crate::types::tuple::{TupleLength, TupleSpec, TupleSpecBuilder, TupleType, VariableSegment};
-use crate::types::typed_dict::{TypedDictOpenness, extract_unpacked_typed_dict_from_value_type};
+use crate::types::typed_dict::{
+    TypedDictOpenness, UnpackedTypedDict, extract_unpacked_typed_dict_from_value_type,
+};
 use crate::types::typevar::{
     BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVarSet, walk_type_var_bounds,
 };
@@ -5988,19 +5990,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         } else if let Some(unpacked) =
             argument_type.and_then(|ty| extract_unpacked_typed_dict_from_value_type(db, env, ty))
         {
-            let openness = unpacked.openness;
-
-            // Special case TypedDict-shaped values because we know which keys are present.
-            for (name, unpacked_key) in unpacked.keys {
-                let _ = self.match_keyword(
-                    argument_index,
-                    Argument::Keywords,
-                    Some(unpacked_key.value_ty),
-                    name.as_str(),
-                    true,
-                );
-            }
-            self.match_typed_dict_openness(argument_index, openness);
+            self.match_typed_dict_keywords(argument_index, unpacked);
         } else {
             self.match_mapping_keywords(argument_index, |parameter_name| {
                 Some(match argument_type {
@@ -6051,16 +6041,34 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         }
     }
 
-    /// Match the possible arbitrary keyword arguments represented by a `TypedDict`'s openness.
+    /// Match named keys and possible extra keyword arguments from a `TypedDict`.
     ///
     /// Explicit extra items can constrain named parameters without satisfying required parameters,
     /// and require a keyword-variadic parameter to accept all remaining names. An open `TypedDict`
     /// only constrains an existing keyword-variadic parameter.
-    fn match_typed_dict_openness(
+    fn match_typed_dict_keywords(
         &mut self,
         argument_index: usize,
-        openness: TypedDictOpenness<'db>,
+        unpacked: UnpackedTypedDict<'db>,
     ) {
+        let UnpackedTypedDict {
+            keys,
+            openness,
+            has_implicit_extra_items: _,
+        } = unpacked;
+        for (name, key) in &keys {
+            if key.kind == DictionaryItemKind::Residual {
+                continue;
+            }
+            let _ = self.match_keyword(
+                argument_index,
+                Argument::Keywords,
+                Some(key.value_ty),
+                name.as_str(),
+                key.kind == DictionaryItemKind::Required,
+            );
+        }
+
         let (extra_items_ty, has_explicit_extra_items) = match openness {
             TypedDictOpenness::ImplicitlyOpen => (Type::object(), false),
             TypedDictOpenness::Closed => return,
@@ -6069,15 +6077,24 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
 
         if has_explicit_extra_items {
             for (parameter_index, parameter) in self.parameters.iter().enumerate() {
-                if self.parameter_info[parameter_index].skip_unknown_keywords
-                    || parameter.keyword_name().is_none()
-                {
+                let Some(name) = parameter.keyword_name() else {
+                    continue;
+                };
+                if self.parameter_info[parameter_index].skip_unknown_keywords {
                     continue;
                 }
+                let argument_type = match keys.get(name) {
+                    Some(key) => match key.kind {
+                        DictionaryItemKind::Residual => key.value_ty,
+                        DictionaryItemKind::Required => continue,
+                        DictionaryItemKind::Optional => continue,
+                    },
+                    None => extra_items_ty,
+                };
                 let matched_argument = &mut self.argument_matches[argument_index];
                 matched_argument.parameters.push(MatchedParameter {
                     index: parameter_index,
-                    argument_type: Some(extra_items_ty),
+                    argument_type: Some(argument_type),
                     expected_type: None,
                     provenance: InvalidArgumentTypeProvenance::Argument,
                 });
@@ -13096,6 +13113,92 @@ bound = holder.read
             if name == "produce" {
                 assert!(return_type.is_unknown());
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typed_dict_keywords_preserve_input_proof() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+            from typing_extensions import Never, NotRequired, TypedDict
+
+            class Required(TypedDict, closed=True):
+                name: str
+
+            class Optional(TypedDict, closed=True):
+                name: NotRequired[str]
+
+            class Excluded(TypedDict, extra_items=object):
+                name: NotRequired[Never]
+
+            class Empty(TypedDict, closed=True):
+                pass
+
+            required: Required
+            optional: Optional
+            excluded: Excluded
+            empty: Empty
+
+            def consume(*, name: str, **kwargs: object) -> None: ...
+            "#,
+        )?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/a.py")?;
+        let file = ProgramFile::new(&db, file, env.program(&db));
+        let lookup = |name| global_symbol(&db, file, name).place.expect_type();
+        let callable = lookup("consume");
+        for (name, explicit, accepted, proved) in [
+            ("required", None, true, true),
+            ("optional", None, true, false),
+            ("excluded", None, false, false),
+            (
+                "excluded",
+                Some(Type::string_literal(&db, "value")),
+                true,
+                false,
+            ),
+            (
+                "empty",
+                Some(Type::string_literal(&db, "value")),
+                true,
+                true,
+            ),
+            (
+                "empty",
+                Some(KnownClass::Int.to_instance(&db, &env)),
+                false,
+                false,
+            ),
+        ] {
+            let arguments: CallArguments = explicit
+                .map(|ty| (Argument::Keyword("name"), Some(ty)))
+                .into_iter()
+                .chain([(Argument::Keywords, Some(lookup(name)))])
+                .collect();
+            let result = callable
+                .bindings(&db, &env)
+                .match_parameters(&db, &env, &arguments)
+                .check_types(
+                    &db,
+                    &env,
+                    &ConstraintSetBuilder::new(),
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                );
+            assert_eq!(result.is_ok(), accepted, "{name}: {explicit:?}");
+            let bindings = match result {
+                Ok(bindings) => bindings,
+                Err(CallError(_, bindings)) => *bindings,
+            };
+            assert_eq!(
+                bindings.arguments_satisfy_declared_parameters(&db, &env, &arguments),
+                proved,
+                "{name}: {explicit:?}",
+            );
         }
         Ok(())
     }
