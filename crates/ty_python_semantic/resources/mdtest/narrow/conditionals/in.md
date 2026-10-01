@@ -1319,6 +1319,41 @@ def open_typed_dict_container(value: Literal["present", "other", "missing", 1], 
         reveal_type(value)  # revealed: Literal["present", "other", "missing"]
 ```
 
+## Explicit extra items retain their contracts
+
+A present key already has a field contract when extra items are explicit. Its value type and
+mutability remain available after the membership test.
+
+```py
+from typing_extensions import ReadOnly, TypedDict
+
+class MutableExtras(TypedDict, extra_items=int): ...
+class ReadOnlyExtras(TypedDict, extra_items=ReadOnly[int]): ...
+class HiddenExtras(TypedDict): ...
+class NoExtras(TypedDict, closed=True): ...
+
+def mutable(values: MutableExtras):
+    if "extra" in values:
+        reveal_type(values)  # revealed: MutableExtras
+        reveal_type(values["extra"])  # revealed: int
+        reveal_type(values.pop("extra"))  # revealed: int
+        values["extra"] = "wrong"  # error: [invalid-assignment]
+
+def readonly(values: ReadOnlyExtras):
+    if "extra" in values:
+        reveal_type(values)  # revealed: ReadOnlyExtras
+        reveal_type(values["extra"])  # revealed: int
+        values.pop("extra")  # error: [invalid-argument-type]
+
+def hidden(values: HiddenExtras):
+    if "extra" in values:
+        reveal_type(values["extra"])  # revealed: object
+
+def closed(values: NoExtras):
+    if "extra" in values:
+        reveal_type(values)  # revealed: Never
+```
+
 ## bool
 
 ```py

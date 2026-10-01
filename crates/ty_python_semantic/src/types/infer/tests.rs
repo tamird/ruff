@@ -7840,6 +7840,97 @@ fn dictionary_arguments_preserve_observed_exclusions() -> anyhow::Result<()> {
 }
 
 #[test]
+fn typed_dict_extra_item_operations_prove_inputs() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing_extensions import NotRequired, ReadOnly, TypedDict
+
+        class Fields(TypedDict, extra_items=object):
+            text: NotRequired[str | None]
+
+        class ReadOnlyFields(TypedDict, extra_items=ReadOnly[int]):
+            pass
+
+        def readonly_read(fields: ReadOnlyFields) -> int:
+            if "mode" in fields:
+                return fields["mode"]
+            return 0
+
+        def readonly_pop(fields: ReadOnlyFields) -> object:
+            if "mode" in fields:
+                return fields.pop("mode")
+            return None
+
+        def sink(**other: object) -> None: pass
+
+        def pop(fields: Fields) -> object:
+            return fields.pop("mode")
+
+        def guarded(fields: Fields) -> object:
+            if "mode" in fields:
+                return fields.pop("mode")
+            return None
+
+        def named(fields: Fields) -> object:
+            if "text" in fields:
+                return fields.pop("text")
+            return None
+
+        def transported(fields: Fields) -> None:
+            extra = {}
+            if "mode" in fields:
+                extra["mode"] = fields.pop("mode")
+            sink(**extra)
+
+        def nominal(fields: dict[str, object]) -> None:
+            extra = {}
+            if "mode" in fields:
+                extra["mode"] = fields.pop("mode")
+            sink(**extra)
+
+        def wrong_result(fields: Fields) -> str:
+            if "mode" in fields:
+                return fields.pop("mode")
+            return ""
+
+        def wrong_key(fields: Fields) -> object:
+            if "mode" in fields:
+                return fields.pop(1)
+            return None
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let cases = [
+        ("readonly_read", false),
+        ("readonly_pop", true),
+        ("pop", false),
+        ("guarded", false),
+        ("named", false),
+        ("transported", false),
+        ("nominal", false),
+        ("wrong_result", true),
+        ("wrong_key", true),
+    ];
+    db.select_function_inference(Some((
+        file,
+        cases.map(|(name, _)| name.to_owned()).into_iter().collect(),
+        FunctionInferenceMode::OutputProof,
+    )));
+    let model = crate::SemanticModel::new(&db, program_file(&db, file));
+    let actual = cases.map(|(name, _)| {
+        let facts = model
+            .function_inference_facts(first_public_binding(&db, file, name))
+            .unwrap();
+        assert!(!facts.has_cycle_recovery, "{name}");
+        (name, facts.has_unproved_requirements || facts.has_errors)
+    });
+    assert_eq!(actual, cases);
+    Ok(())
+}
+
+#[test]
 fn empty_generic_arguments_use_final_context() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_python_version(PythonVersion::PY313)

@@ -6141,7 +6141,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             {
                 Type::Never
             }
-            resolved if typeddict_declares_key(db, resolved, key) => resolved,
+            resolved if typeddict_supports_key(db, resolved, key) => resolved,
             // TODO: Extend this to subtypes of `Mapping[str, object]` whose membership and
             // subscript operations obey the `Mapping` contract.
             resolved if is_or_contains_typeddict(db, resolved) => constrain(
@@ -6358,18 +6358,18 @@ fn is_or_contains_typeddict<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
     }
 }
 
-fn typeddict_declares_key<'db>(db: &'db dyn Db, ty: Type<'db>, key: &str) -> bool {
+fn typeddict_supports_key<'db>(db: &'db dyn Db, ty: Type<'db>, key: &str) -> bool {
     match ty {
-        Type::TypedDict(typed_dict) => typed_dict.items(db).contains_key(key),
+        Type::TypedDict(typed_dict) => typed_dict.item(db, key).is_some(),
         Type::Intersection(intersection) => intersection
             .positive(db)
             .iter()
-            .any(|element| typeddict_declares_key(db, *element, key)),
+            .any(|element| typeddict_supports_key(db, *element, key)),
         Type::Union(union) => union
             .elements(db)
             .iter()
-            .any(|element| typeddict_declares_key(db, *element, key)),
-        Type::TypeAlias(alias) => typeddict_declares_key(db, alias.value_type(db), key),
+            .any(|element| typeddict_supports_key(db, *element, key)),
+        Type::TypeAlias(alias) => typeddict_supports_key(db, alias.value_type(db), key),
         _ => false,
     }
 }
