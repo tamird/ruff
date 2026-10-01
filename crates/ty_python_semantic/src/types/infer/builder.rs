@@ -5157,7 +5157,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // Perform loud inference without type context, as there may be multiple
                 // equally applicable type contexts for each union member.
                 let default_value_ty = infer_value_ty.infer_loud(self, TypeContext::default());
-                let mut inferred_silently = false;
+                let mut context_changed_type = false;
 
                 let mut operation_failed = false;
                 let Ok(result_ty) = state.try_map_union(db, env, union, |elem_type, state| {
@@ -5169,8 +5169,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             if tcx == TypeContext::default() {
                                 default_value_ty
                             } else {
-                                inferred_silently = true;
-                                infer_value_ty.infer_silent(builder, tcx)
+                                let contextual_type = infer_value_ty.infer_silent(builder, tcx);
+                                context_changed_type |= contextual_type != default_value_ty;
+                                contextual_type
                             }
                         },
                         state,
@@ -5184,9 +5185,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     Ok::<_, Infallible>(result_ty)
                 });
 
-                // Only the committed inference retains the RHS child requirements.
-                // Member-specific contexts still require speculative inference.
-                state.retain_argument_proof(!inferred_silently);
+                // The committed inference retains the RHS child requirements. Branch proofs
+                // apply to it only when every requested context produces that same type.
+                state.retain_argument_proof(!context_changed_type);
 
                 if operation_failed {
                     Err(result_ty)

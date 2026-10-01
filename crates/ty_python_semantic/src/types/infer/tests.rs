@@ -3525,6 +3525,19 @@ fn binary_and_augmented_argument_correspondence() -> anyhow::Result<()> {
             result = left
             result += lambda value: value
             return result
+
+        def union_context_name(left: ContextInt | ContextStr, callback: Callable[[int], int]) -> int | str:
+            result = left
+            result += callback
+            return result
+
+        def make_callback(callback: Callable[[Any], None]) -> Callable[[int], int]:
+            return lambda value: value
+
+        def union_context_child(left: ContextInt | ContextStr, callback: Callable[[str], None]) -> int | str:
+            result = left
+            result += make_callback(callback)
+            return result
         "#,
     )?;
     let file = system_path_to_file(&db, "/src/main.py")?;
@@ -3555,6 +3568,8 @@ fn binary_and_augmented_argument_correspondence() -> anyhow::Result<()> {
         ("union_default", false),
         ("union_child", true),
         ("union_context", true),
+        ("union_context_name", false),
+        ("union_context_child", true),
     ];
     let signatures = |db: &TestDb| {
         cases.map(|(name, _)| {
