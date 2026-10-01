@@ -3782,7 +3782,15 @@ impl<'db> CandidateResidual<'db> {
         selected: &[TypeVarSolution<'db>],
         budget: &mut ProjectionTypeBudget,
     ) -> Result<Option<(ConstraintSet<'db, 'c>, Vec<TypeVarSolution<'db>>)>, ProjectionError> {
-        let resolved = resolve_solution(db, env, inferable, selected);
+        let mut resolved = resolve_solution(db, env, inferable, selected);
+        if resolved
+            .iter()
+            .any(|ty| matches!(ty, SolutionType::Unresolved(_)))
+        {
+            // Caller variables may parameterize a solution family. Close the local
+            // witnesses against those symbolic anchors, then certify the whole family.
+            resolved = resolve_solution(db, env, locals, selected);
+        }
         let bindings: Option<Vec<_>> = selected
             .iter()
             .zip(resolved.iter())
@@ -6356,6 +6364,137 @@ mod tests {
                 assert_matches!(solutions, Solutions::Unsatisfiable(_));
             }
         }
+    }
+
+    #[test]
+    fn existential_alias_witness_preserves_caller_relationships() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let local = create_typevar(db, "Local");
+        let left = create_typevar(db, "Left");
+        let right = create_typevar(db, "Right");
+        let builder = ConstraintSetBuilder::new();
+        let body = ConstraintSet::constrain_typevar_upper_bound(
+            db,
+            &env,
+            &builder,
+            left,
+            Type::TypeVar(local),
+        )
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                local,
+                Type::TypeVar(right),
+            )
+        });
+        let quantified =
+            body.reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        let inferable = TypeVarSet::from_typevars(db, [left, right]);
+        let (candidates, _) = quantified
+            .bounded_path_bounds(db, &env, inferable, SolutionBudget::default())
+            .unwrap();
+        let CandidateSolutions::Constrained {
+            paths,
+            inferable: _,
+            incomplete: _,
+        } = &candidates
+        else {
+            panic!("expected scoped candidates, got {candidates:?}");
+        };
+        let locals = TypeVarSet::from_typevars(
+            db,
+            std::iter::once(local).chain(
+                paths
+                    .iter()
+                    .filter_map(|candidate| candidate.residual.as_ref())
+                    .flat_map(|residual| residual.locals.iter(db)),
+            ),
+        );
+        let actual = candidates.solve(db, &env, &builder);
+        let Solutions::Constrained(SolutionPaths::Complete(solutions)) = actual else {
+            panic!("expected a complete caller family, got {actual:?}");
+        };
+        let [solution] = solutions.as_slice() else {
+            panic!("expected one caller family, got {solutions:?}");
+        };
+        assert!(
+            !solution.solved_typevars.is_empty(),
+            "caller relationship was erased"
+        );
+        for binding in &solution.solved_typevars {
+            assert!(binding.bound_typevar.is_inferable(db, inferable));
+            assert!(!any_over_type_expanding_aliases(
+                db,
+                &env,
+                binding.solution,
+                |ty| { matches!(ty, Type::TypeVar(variable) if variable.is_inferable(db, locals)) }
+            ));
+        }
+        let replay = CandidateResidual::specialize(db, &env, quantified, &solution.solved_typevars);
+        assert!(replay.is_always_satisfied(db, &env));
+        for (a, b, valid) in [
+            (KnownClass::Str, KnownClass::Str, true),
+            (KnownClass::Str, KnownClass::Int, false),
+        ] {
+            let fixed = quantified
+                .and(db, &builder, || create_constraint(db, &builder, left, a))
+                .and(db, &builder, || create_constraint(db, &builder, right, b));
+            let actual = fixed.solutions(db, &env, inferable).unwrap();
+            assert_eq!(
+                matches!(actual, Solutions::Unsatisfiable(_)),
+                !valid,
+                "{actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn existential_witness_rejects_structural_caller_cycles() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let local = create_typevar(db, "Local");
+        let caller = create_typevar(db, "Caller");
+        let list_caller =
+            KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(caller)]);
+        let builder = ConstraintSetBuilder::new();
+        // Closing Local must not manufacture a solution to Caller = list[Caller].
+        let set = ConstraintSet::constrain_typevar_equivalence_bound(
+            db,
+            &env,
+            &builder,
+            local,
+            Type::TypeVar(caller),
+        )
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                local,
+                list_caller,
+            )
+        })
+        .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        let actual = set
+            .solutions(db, &env, TypeVarSet::from_typevars(db, [caller]))
+            .unwrap();
+        if let Solutions::Unsatisfiable(_) = actual {
+            return;
+        }
+        let Solutions::Constrained(SolutionPaths::Incomplete(solutions)) = actual else {
+            panic!("a recursive equation must not produce complete bindings: {actual:?}");
+        };
+        assert!(
+            solutions
+                .iter()
+                .all(|solution| solution.solved_typevars.is_empty()),
+            "unresolved caller equations must not escape: {solutions:?}"
+        );
     }
 
     #[test]
