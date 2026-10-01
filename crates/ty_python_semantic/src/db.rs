@@ -10,47 +10,9 @@ use ruff_db::files::File;
 use ty_python_core::definition::Definition;
 use ty_python_core::{Db as PythonCoreDb, ProgramFile};
 
-/// Selects the facts retained for a function scope.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum FunctionInferenceMode {
-    /// Ordinary inference and diagnostics.
-    #[default]
-    Default,
-    /// Ordinary inference with retained return-type correspondence facts and unresolved
-    /// requirements from explicit calls, including constructors with one `__new__` or `__init__`
-    /// stage, descriptor getters, indexed reads and writes, arithmetic and bitwise unary
-    /// operators, binary and augmented operators, comparisons, name declarations, source-annotated
-    /// defaults, contextual collection elements and supported `TypedDict` construction and storage.
-    /// These checks use the ordinary selected binding, field, declared domain or element type
-    /// without changing inference or branch selection. Unsupported binding, merged field and
-    /// contextual replay cases remain unproved. Function and file facts expose this status
-    /// independently of diagnostic rule selection and source suppressions.
-    OutputProof,
-}
-
 /// Database giving access to semantic information about a Python program.
 #[salsa::db]
 pub trait Db: PythonCoreDb {
-    /// Supplies a caller-visible contract while preserving the source body declaration.
-    /// Implementations must use tracked inputs and must not return the same function.
-    fn provided_function_contract<'db>(
-        &'db self,
-        _definition: Definition<'db>,
-    ) -> Option<crate::types::FunctionType<'db>> {
-        None
-    }
-
-    /// Selects function inference using tracked configuration inputs.
-    ///
-    /// This changes the active configuration, not a simultaneous alternate view.
-    /// Output facts concern declared return types and selected argument checks.
-    fn function_inference_mode(
-        &self,
-        _scope: ty_python_core::scope::ScopeId<'_>,
-    ) -> FunctionInferenceMode {
-        FunctionInferenceMode::Default
-    }
-
     /// Resolves a binding introduced by [`PythonCoreDb::provided_statements`].
     /// Implementations must read tracked inputs and preserve the target program's context.
     fn provided_binding<'db>(
@@ -97,18 +59,6 @@ pub trait Db: PythonCoreDb {
         &'db self,
         _definition: Definition<'db>,
     ) -> Option<crate::types::Type<'db>> {
-        None
-    }
-
-    /// Supplies a return contract for a function without a source annotation.
-    ///
-    /// The contract participates in ordinary signature and body checking. Native and supplied
-    /// source annotations take precedence. Implementations must read tracked inputs and must not
-    /// infer the function body or its enclosing scope while resolving this contract.
-    fn provided_return_type<'db>(
-        &'db self,
-        _definition: Definition<'db>,
-    ) -> Option<crate::provided::ProvidedReturnType<'db>> {
         None
     }
 
@@ -215,7 +165,6 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     use anyhow::Context;
-    use salsa::Setter;
     use ty_python_core::platform::PythonPlatform;
 
     use crate::{ProgramEnvironment, check_file_unwrap, default_lint_registry};
@@ -279,22 +228,9 @@ pub(crate) mod tests {
         ) -> Option<crate::types::Type<'db>> {
             None
         }
-
-        fn return_type<'db>(
-            &self,
-            _db: &'db TestDb,
-            _definition: Definition<'db>,
-        ) -> Option<crate::provided::ProvidedReturnType<'db>> {
-            None
-        }
     }
 
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
-    #[salsa::input]
-    struct FunctionInferenceSelection {
-        #[returns(ref)]
-        selected: Option<(File, Vec<String>, super::FunctionInferenceMode)>,
-    }
     type CallResultProvider =
         for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> crate::provided::ProvidedCallResult<'db>;
     type DeclarationPredicate = for<'db> fn(&'db TestDb, Definition<'db>) -> bool;
@@ -308,7 +244,6 @@ pub(crate) mod tests {
     #[salsa::db]
     #[derive(Clone)]
     pub(crate) struct TestDb {
-        function_inference_selection: Option<FunctionInferenceSelection>,
         storage: salsa::Storage<Self>,
         files: Files,
         system: TestSystem,
@@ -330,8 +265,7 @@ pub(crate) mod tests {
         fn new(vendored: VendoredFileSystem) -> Self {
             let events = Events::default();
             let program_settings = ProgramSettings::empty(&vendored);
-            let mut db = Self {
-                function_inference_selection: None,
+            Self {
                 storage: salsa::Storage::new(Some(Box::new({
                     let events = events.clone();
                     move |event| {
@@ -354,17 +288,6 @@ pub(crate) mod tests {
                 getattr_presence_provider: None,
                 keyword_field_factory: None,
                 source_provider: None,
-            };
-            db.function_inference_selection = Some(FunctionInferenceSelection::new(&db, None));
-            db
-        }
-
-        pub(crate) fn select_function_inference(
-            &mut self,
-            selected: Option<(File, Vec<String>, super::FunctionInferenceMode)>,
-        ) {
-            if let Some(selection) = self.function_inference_selection {
-                selection.set_selected(self).to(selected);
             }
         }
 
@@ -476,29 +399,6 @@ pub(crate) mod tests {
                 .and_then(|provider| provider.allocation_class(self, program, class))
         }
 
-        fn function_inference_mode(
-            &self,
-            scope: ty_python_core::scope::ScopeId<'_>,
-        ) -> super::FunctionInferenceMode {
-            let Some(selection) = self.function_inference_selection else {
-                return super::FunctionInferenceMode::Default;
-            };
-            let Some((file, names, mode)) = selection.selected(self) else {
-                return super::FunctionInferenceMode::Default;
-            };
-            if scope.program_file(self).python_file(self).file(self) != *file {
-                return super::FunctionInferenceMode::Default;
-            }
-            let module =
-                ruff_db::parsed::parsed_module(self, scope.program_file(self).python_file(self))
-                    .load(self);
-            if names.iter().any(|name| name == scope.name(self, &module)) {
-                *mode
-            } else {
-                super::FunctionInferenceMode::Default
-            }
-        }
-
         fn provided_binding<'db>(
             &'db self,
             definition: Definition<'db>,
@@ -557,15 +457,6 @@ pub(crate) mod tests {
             self.source_provider
                 .as_ref()
                 .and_then(|provider| provider.parameter_type(self, definition))
-        }
-
-        fn provided_return_type<'db>(
-            &'db self,
-            definition: Definition<'db>,
-        ) -> Option<crate::provided::ProvidedReturnType<'db>> {
-            self.source_provider
-                .as_ref()
-                .and_then(|provider| provider.return_type(self, definition))
         }
 
         fn check_file(&self, file: File) -> Vec<Diagnostic> {

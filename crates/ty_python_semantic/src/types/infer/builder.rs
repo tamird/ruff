@@ -277,8 +277,6 @@ const NUM_FIELD_SPECIFIERS_INLINE: usize = 1;
 /// assignment, type narrowing guard), we use the [`infer_expression_types()`] query to ensure we
 /// don't infer its types more than once.
 pub(super) struct TypeInferenceBuilder<'db, 'ast> {
-    function_inference_mode: crate::FunctionInferenceMode,
-    return_type_correspondence: Option<bool>,
     context: InferContext<'db, 'ast>,
 
     index: &'db SemanticIndex<'db>,
@@ -514,8 +512,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Self {
         let scope = region.scope(db);
         Self {
-            function_inference_mode: db.function_inference_mode(scope),
-            return_type_correspondence: None,
             context: InferContext::new(db, env, scope, file, program_file, module),
             index,
             region,
@@ -1679,7 +1675,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let slice_ty = self.get_or_infer_expression(slice, TypeContext::default());
             Some(
                 self.infer_subscript_expression_types(subscript, value_ty, slice_ty, *ctx)
-                    .map(|result| result.ty)
                     .unwrap_or_else(|recovery_ty| recovery_ty),
             )
         } else {
@@ -1815,14 +1810,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         })
         .place
         .ignore_possibly_undefined();
-        if let Some(inferred_ty) = inferred_ty {
-            self.record_declaration_requirement(
-                node,
-                declaration,
-                Some(ty.inner_type()),
-                inferred_ty,
-            );
-        }
         let inferred_ty = inferred_ty.unwrap_or(Type::Never);
         let ty = if inferred_ty.is_assignable_to(db, env, ty.inner_type()) {
             ty
@@ -1936,36 +1923,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.bindings.insert(definition, inferred_ty);
     }
 
-    /// Retain a name declaration's value requirement before its public type can replace
-    /// the inferred value. Missing declarations impose no requirement; present unknown
-    /// domains remain unproved, including qualifiers whose value type is unresolved.
-    fn record_declaration_requirement(
-        &self,
-        node: AnyNodeRef,
-        definition: Definition<'db>,
-        target_ty: Option<Type<'db>>,
-        value_ty: Type<'db>,
-    ) {
-        if self.function_inference_mode != crate::FunctionInferenceMode::OutputProof {
-            return;
-        }
-        let Some(target_ty) = target_ty else {
-            return;
-        };
-        let db = self.db();
-        // Member operations require their setter or field write contract.
-        if definition.place(db).as_symbol().is_none() {
-            return;
-        }
-        let env = self.program_environment();
-        if !target_ty.is_fully_static_except_any(db, env)
-            || value_ty.has_provisional_marker(db, env)
-            || !value_ty.satisfies_declared_output(db, env, target_ty)
-        {
-            self.context.record_unproved_requirement(node);
-        }
-    }
-
     /// Checks an assigned value against its target's declared type and reports any mismatch.
     ///
     /// Returns `true` when the value is assignable, even if the stricter `unsound-assignment`
@@ -1984,7 +1941,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> bool {
         let db = self.db();
         let env = self.program_environment();
-        self.record_declaration_requirement(target_node, definition, target_ty, value_ty);
         let target_ty = target_ty.unwrap_or(Type::unknown());
 
         if !value_ty.is_assignable_to(db, env, target_ty) {
@@ -3578,7 +3534,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .iter()
                     .find(|(candidate, _)| *candidate == definition)
         {
-            tcx = tcx.with_annotation(Some(*context));
+            tcx = TypeContext::new(Some(*context));
         }
         let target_ty = self.infer_assignment_definition_impl(assignment, definition, tcx);
         self.store_expression_type(target, target_ty);
@@ -4903,7 +4859,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // RHS (`list[T] | None`), in order to bind `T` to `OptionalList`.
             let previous_typevar_binding_context = self.typevar_binding_context.replace(definition);
 
-            let tcx = annotation.initializer_context(declared.inner_type());
+            let tcx = TypeContext::new(Some(declared.inner_type()));
             let inferred_ty = self.infer_maybe_standalone_expression_with_bindings_owner(
                 value,
                 tcx,
@@ -5120,7 +5076,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // Perform loud inference without type context, as there may be multiple
                 // equally applicable type contexts for each union member.
                 let default_value_ty = infer_value_ty.infer_loud(self, TypeContext::default());
-                let mut context_changed_type = false;
 
                 let mut operation_failed = false;
                 let Ok(result_ty) = state.try_map_union(db, env, union, |elem_type, state| {
@@ -5132,9 +5087,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             if tcx == TypeContext::default() {
                                 default_value_ty
                             } else {
-                                let contextual_type = infer_value_ty.infer_silent(builder, tcx);
-                                context_changed_type |= contextual_type != default_value_ty;
-                                contextual_type
+                                infer_value_ty.infer_silent(builder, tcx)
                             }
                         },
                         state,
@@ -5147,10 +5100,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     };
                     Ok::<_, Infallible>(result_ty)
                 });
-
-                // The committed inference retains the RHS child requirements. Branch proofs
-                // apply to it only when every requested context produces that same type.
-                state.retain_argument_proof(!context_changed_type);
 
                 if operation_failed {
                     Err(result_ty)
@@ -5168,7 +5117,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         infer_value_ty,
                     )
                 {
-                    state.retain_argument_proof(false);
                     return Ok(typed_dict_update_ty);
                 }
 
@@ -5186,11 +5134,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
                 match call {
                     Ok(outcome) => {
-                        let DunderCallOutcome {
-                            bindings: outcome,
-                            arguments_proved,
-                        } = outcome;
-                        state.retain_argument_proof(arguments_proved);
                         state.deprecated_functions.extend(
                             outcome
                                 .deprecated_functions(db)
@@ -5206,7 +5149,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         bindings: outcome,
                         unbound_on: _,
                     }) => {
-                        state.retain_argument_proof(false);
                         state.deprecated_functions.extend(
                             outcome
                                 .deprecated_functions(db)
@@ -5294,9 +5236,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let target_type = target_result.unwrap_or_else(|recovery_ty| recovery_ty);
         let mut state = BinaryInferenceState::default();
-        state.arguments_proved = (self.function_inference_mode
-            == crate::FunctionInferenceMode::OutputProof)
-            .then_some(true);
         let operation_result = self.infer_augmented_op(
             assignment,
             target_type,
@@ -5304,13 +5243,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             &mut |builder, tcx| builder.infer_expression(value, tcx),
             &mut state,
         );
-        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
-            && (state.arguments_proved == Some(false)
-                || target_result.is_err()
-                || operation_result.is_err())
-        {
-            self.context.record_unproved_requirement(assignment);
-        }
         self.report_deprecated_functions(assignment, state.deprecated_functions);
 
         match (target_result, operation_result) {
@@ -5391,26 +5323,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             //  but only if the target is a name. We should report a diagnostic here if the target isn't a name:
             //  `for a.x in not_iterable: ...
             let iterable_type = builder.infer_standalone_expression(iter, tcx);
-            // Preserve this path's existing synchronous result inference for async targets.
-            if *is_async {
-                builder.context.record_unproved_requirement(&**iter);
-            }
             if !*is_async
                 && let Some(element_type) = builder
                     .fixed_length_iterable_element_type(iter, |expr| builder.expression_type(expr))
             {
-                if builder.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
-                    let _ = iterable_type.try_iterate_with_context(
-                        &builder.context,
-                        &**iter,
-                        EvaluationMode::Sync,
-                    );
-                }
                 element_type
             } else {
                 let env = builder.program_environment();
                 iterable_type
-                    .try_iterate_with_context(&builder.context, &**iter, EvaluationMode::Sync)
+                    .try_iterate_with_mode(db, env, EvaluationMode::Sync)
                     .map_or_else(
                         |err| err.fallback_element_type(db, env),
                         |tuple| {
@@ -5458,20 +5379,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             self.expression_type(expr)
                         })
                 {
-                    if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
-                        let _ = iterable_type.try_iterate_with_context(
-                            &self.context,
-                            iterable,
-                            EvaluationMode::Sync,
-                        );
-                    }
                     element_type
                 } else {
                     let env = self.program_environment();
                     iterable_type
-                        .try_iterate_with_context(
-                            &self.context,
-                            iterable,
+                        .try_iterate_with_mode(
+                            db,
+                            env,
                             EvaluationMode::from_is_async(for_stmt.is_async()),
                         )
                         .map(|tuple| {
@@ -5906,16 +5820,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         argument_types: &mut CallArguments<'_, 'db>,
         infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
         call_expression_tcx: TypeContext<'db>,
-    ) -> Result<DunderCallOutcome<'db>, CallDunderError<'db>> {
+    ) -> Result<Bindings<'db>, CallDunderError<'db>> {
         let db = self.db();
         let env = self.program_environment();
-        let requested = self.function_inference_mode == crate::FunctionInferenceMode::OutputProof;
-        argument_types.set_input_proof_request(requested);
-        let lookup_policy = if requested {
-            lookup_policy | MemberLookupPolicy::PROVE_GETTER_INPUTS
-        } else {
-            lookup_policy
-        };
         let member = object
             .member_lookup_with_policy_and_receiver(db, env, name, lookup_policy, None)
             .unwrap_or_else(|error| error.fallback_member(db));
@@ -5926,18 +5833,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 provenance,
                 ..
             }) => {
-                let mut bindings = self
-                    .bindings_for_call(dunder_callable)
-                    .with_unproved_lookup_inputs(!member.inputs_proved(db))
-                    .match_parameters(db, env, argument_types);
+                let mut bindings = self.bindings_for_call(dunder_callable).match_parameters(
+                    db,
+                    env,
+                    argument_types,
+                );
 
-                // Implicit calls can infer children in a separate silent context. Their
-                // union contributors still need a certificate for that child replay.
-                let argument_context_supported = (bindings.is_single()
-                    || argument_types.len() == 0)
-                    && bindings
-                        .argument_correspondence_callables(argument_types)
-                        .is_some();
                 if let Err(call_error) = self.infer_and_check_argument_types(
                     ast_arguments,
                     &[],
@@ -5959,14 +5860,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         unbound_on: None,
                     });
                 }
-                let arguments_proved = self.function_inference_mode
-                    != crate::FunctionInferenceMode::OutputProof
-                    || (argument_context_supported
-                        && bindings.arguments_satisfy_declared_parameters(db, env, argument_types));
-                Ok(DunderCallOutcome {
-                    bindings,
-                    arguments_proved,
-                })
+                Ok(bindings)
             }
             Place::Undefined => Err(CallDunderError::MethodNotAvailable),
         }
@@ -6222,7 +6116,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Result<(), CallErrorKind> {
         let db = self.db();
         let env = self.program_environment();
-        let commit_mode = CallArgumentInferenceMode::commit(bindings, argument_types);
+        let commit_mode = CallArgumentInferenceMode::Commit;
         let requires_overload_evaluation = requires_overload_evaluation(candidates);
         let arguments_tcx = self.collect_call_arguments_type_context(
             collection_arguments,
@@ -6322,7 +6216,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         candidates: &OverloadSet,
     ) -> Result<(), CallErrorKind> {
         let db = self.db();
-        let commit_mode = CallArgumentInferenceMode::commit(bindings, argument_types);
+        let commit_mode = CallArgumentInferenceMode::Commit;
         let requires_overload_evaluation = requires_overload_evaluation(candidates);
 
         let mut arguments_tcx = self.collect_call_arguments_type_context(
@@ -6752,13 +6646,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             argument_tcx,
                             argument_types,
                         );
-
-                        if matches!(mode, CallArgumentInferenceMode::CommitAll)
-                            && (speculative_builder.context.has_unproved_requirements()
-                                || speculative_builder.cycle_recovery.is_some())
-                        {
-                            self.context.record_unproved_requirement(ast_argument);
-                        }
 
                         inferred_by_cache_key.insert(inference_cache_key, inferred_ty);
                         self.union_expected_types(&speculative_builder.expected_types);
@@ -7556,7 +7443,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let mut speculative_builder = self.speculate();
 
             let inferred_ty = speculative_builder
-                .infer_tuple_expression_impl(tuple, tcx.with_annotation(Some(*narrowed_ty)));
+                .infer_tuple_expression_impl(tuple, TypeContext::new(Some(*narrowed_ty)));
             if inferred_ty.is_assignable_to(db, env, *narrowed_ty) {
                 self.extend(speculative_builder);
                 if teardown_expression_cache {
@@ -7649,7 +7536,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 } else {
                     annotated_elt_ty
                 };
-                tcx.with_annotation(expected)
+                TypeContext::new(expected)
             } else {
                 TypeContext::default()
             };
@@ -7961,7 +7848,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         // the non-`TypedDict` arm of the union.
                         let mut speculative_builder = self.speculate_without_diagnostics();
                         has_dict_compatible_fallback = speculative_builder
-                            .infer_dict_expression(dict, tcx.with_annotation(Some(element)))
+                            .infer_dict_expression(dict, TypeContext::new(Some(element)))
                             .is_assignable_to(db, env, element);
                     }
                 }
@@ -8013,10 +7900,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     if !narrowed_tys.is_empty() {
                         // Candidate inference retains narrowed types without committing the
                         // contextual child requirements from its suppressed inference.
-                        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
-                        {
-                            self.context.record_unproved_requirement(dict);
-                        }
                         return UnionType::from_elements(db, env, narrowed_tys);
                     }
                 }
@@ -8071,7 +7954,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 collection_expr,
                 elts,
                 infer_elt_expression,
-                tcx.with_annotation(Some(narrowed_ty)),
+                TypeContext::new(Some(narrowed_ty)),
             )?;
 
             // Ensure the inferred return type is assignable to the narrowed declared type.
@@ -8104,32 +7987,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             infer_elt_expression,
             tcx,
         )
-    }
-
-    /// Check an adopted expression type in its execution scope. Comprehension specialization
-    /// can run in the parent scope even when the element itself is unreachable in the child.
-    fn expression_has_unproved_requirement(
-        &self,
-        element: &ast::Expr,
-        actual: Type<'db>,
-        expected: Type<'db>,
-    ) -> bool {
-        if self.function_inference_mode != crate::FunctionInferenceMode::OutputProof {
-            return false;
-        }
-        let db = self.db();
-        let env = self.program_environment();
-        if expected.is_fully_static_except_any(db, env)
-            && !actual.has_provisional_marker(db, env)
-            && actual.satisfies_declared_output(db, env, expected)
-        {
-            return false;
-        }
-        let scope = self
-            .index
-            .try_expression_scope_id(&ast::ExprRef::from(element))
-            .unwrap_or_else(|| self.scope().file_scope_id(db));
-        crate::reachability::is_range_reachable(db, self.index, scope, element.range())
     }
 
     // Infer the type of a collection literal expression.
@@ -8352,7 +8209,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // does not recursively re-infer nested collection literals on the slow path.
             let mut inferred_elts = Vec::with_capacity(elts.len());
             let mut compatible = true;
-            let mut unproved_element = None;
 
             for elts in elts {
                 let mut inferred_elt_tys = [None; N];
@@ -8365,15 +8221,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         elt_tcx
                     };
                     let inferred_elt_ty =
-                        infer_elt_expression(self, (i, elt, tcx.with_annotation(Some(elt_tcx))));
+                        infer_elt_expression(self, (i, elt, TypeContext::new(Some(elt_tcx))));
                     inferred_elt_tys[i] = Some(inferred_elt_ty);
 
                     if !inferred_elt_ty.is_assignable_to(db, env, elt_tcx) {
                         compatible = false;
-                    } else if unproved_element.is_none()
-                        && self.expression_has_unproved_requirement(elt, inferred_elt_ty, elt_tcx)
-                    {
-                        unproved_element = Some(elt.range());
                     }
                 }
                 inferred_elts.push(inferred_elt_tys);
@@ -8388,17 +8240,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     },
                 );
                 let result = Type::from(class_type).to_instance_approximation(db, env)?;
-                if let Some(element) = unproved_element {
-                    self.context.record_unproved_requirement(element);
-                }
+
                 return Some(result);
             }
 
             pre_inferred_elt_tys = Some(inferred_elts);
         }
-
-        // Publish requirements only after this contextual specialization is adopted.
-        let mut unproved_element = None;
 
         // Create a set of constraints to infer a precise type for `T`.
         let mut tuple_size_promotion_constraints = TupleSizePromotionConstraints::default();
@@ -8613,7 +8460,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .as_ref()
                     .and_then(|inferred_elts| inferred_elts[elts_index][i])
                     .unwrap_or_else(|| {
-                        infer_elt_expression(self, (i, elt, tcx.with_annotation(elt_tcx)))
+                        infer_elt_expression(self, (i, elt, TypeContext::new(elt_tcx)))
                     });
 
                 // Simplify the inference based on a non-covariant declared type.
@@ -8621,11 +8468,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     elt_tcx.filter(|_| !elt_tcx_variance[&elt_ty_identity].is_covariant())
                     && inferred_elt_ty.is_assignable_to(db, env, elt_tcx)
                 {
-                    if unproved_element.is_none()
-                        && self.expression_has_unproved_requirement(elt, inferred_elt_ty, elt_tcx)
-                    {
-                        unproved_element = Some(elt.range());
-                    }
                     continue;
                 }
 
@@ -8687,9 +8529,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             });
 
         let result = Type::from(class_type).to_instance_approximation(db, env)?;
-        if let Some(element) = unproved_element {
-            self.context.record_unproved_requirement(element);
-        }
+
         Some(result)
     }
 
@@ -9112,7 +8952,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             target,
             iter,
             ifs,
-            is_async,
+            is_async: _,
         } = comprehension;
 
         self.infer_target(target, iter, &|builder, tcx| {
@@ -9125,11 +8965,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 builder.infer_maybe_standalone_expression(iter, tcx)
             };
             // Preserve this path's existing synchronous result inference for async targets.
-            if *is_async {
-                builder.context.record_unproved_requirement(iter);
-            }
             iterable_type
-                .try_iterate_with_context(&builder.context, iter, EvaluationMode::Sync)
+                .try_iterate_with_mode(db, env, EvaluationMode::Sync)
                 .unwrap_or_else(|error| {
                     Cow::Owned(TupleSpec::homogeneous(error.fallback_element_type(db, env)))
                 })
@@ -9194,20 +9031,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let (iterable_type, element_type, result) = infer_iterable_type();
 
                 if let Some(element_type) = element_type {
-                    if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
-                        let _ = iterable_type.try_iterate_with_context(
-                            &self.context,
-                            iterable,
-                            EvaluationMode::Sync,
-                        );
-                    }
                     element_type
                 } else {
                     let env = self.program_environment();
                     iterable_type
-                        .try_iterate_with_context(
-                            &self.context,
-                            iterable,
+                        .try_iterate_with_mode(
+                            db,
+                            env,
                             EvaluationMode::from_is_async(comprehension.is_async()),
                         )
                         .map(|tuple| {
@@ -9670,9 +9500,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         |ty| self.dictionary_observation(expression, ty),
                     )
                 },
-            )
-            .with_input_proof_request(
-                self.function_inference_mode == crate::FunctionInferenceMode::OutputProof,
             );
 
         for arg in &arguments.args {
@@ -10153,12 +9980,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     Type::TypedDict(typed_dict_ty).display(db, env),
                                 ));
                             }
-                            if method_name == "setdefault"
-                                && self.function_inference_mode
-                                    == crate::FunctionInferenceMode::OutputProof
-                            {
-                                self.context.record_unproved_requirement(call_expression);
-                            }
+
                             return Type::unknown();
                         }
                     }
@@ -10194,7 +10016,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     default,
                                     TypeContext::new(Some(field.declared_ty)),
                                 );
-                                let valid = TypedDictKeyAssignment {
+                                TypedDictKeyAssignment {
                                     context: &self.context,
                                     typed_dict: typed_dict_ty,
                                     full_object_ty: None,
@@ -10207,29 +10029,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     emit_diagnostic: true,
                                 }
                                 .validate();
-                                if self.function_inference_mode
-                                    == crate::FunctionInferenceMode::OutputProof
-                                    && (!valid
-                                        || !first_arg.is_string_literal_expr()
-                                        || self.expression_has_unproved_requirement(
-                                            default,
-                                            default_ty,
-                                            field.declared_ty,
-                                        ))
-                                {
-                                    self.context.record_unproved_requirement(call_expression);
-                                }
                                 return field.declared_ty;
                             }
                             _ => {}
                         }
                     }
                 } else if method_name != "get" {
-                    if method_name == "setdefault"
-                        && self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
-                    {
-                        self.context.record_unproved_requirement(call_expression);
-                    }
                     // Key not found, report error with suggestion and return early
                     let key_ty = Type::string_literal(self.db(), key);
                     report_invalid_key_on_typed_dict(
@@ -10448,7 +10253,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }) {
             // An enclosing generic call can feed a provisional argument type back through
             // expected-result context. Neither pass may use it to constrain the initializer.
-            call_expression_tcx.with_annotation(None)
+            TypeContext::new(None)
         } else {
             call_expression_tcx
         };
@@ -10462,11 +10267,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             None
         };
 
-        // Intersections and constructor stages can discard contextual child statuses before
-        // pruning to one binding.
-        let argument_context_supported = bindings
-            .argument_correspondence_callables(&call_arguments)
-            .is_some();
         let bindings_result = self.infer_and_check_argument_types(
             ArgumentsIter::from_ast(arguments),
             &collection_argument_indices,
@@ -10514,15 +10314,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             &mut bindings,
             call_expression_tcx,
         );
-
-        // Argument replay is committed here. Proof failures must not change overload selection,
-        // contextual hints, or the result chosen by ordinary checking.
-        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
-            && (!argument_context_supported
-                || !bindings.arguments_satisfy_declared_parameters(db, env, &call_arguments))
-        {
-            self.context.record_unproved_requirement(call_expression);
-        }
 
         let mut bindings = match bindings_result {
             Ok(()) => bindings,
@@ -11946,7 +11737,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
             }
         }
-        let mut lookup_policy = if self.in_stub()
+        let lookup_policy = if self.in_stub()
             || self.is_in_type_checking_block(self.scope(), attribute)
             || self
                 .inference_flags()
@@ -11961,13 +11752,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } else {
             MemberLookupPolicy::RUNTIME_ATTRIBUTE
         };
-        let prove_getter_inputs = self.function_inference_mode
-            == crate::FunctionInferenceMode::OutputProof
-            && attribute.ctx != ExprContext::Del
-            && lookup_policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE);
-        if prove_getter_inputs {
-            lookup_policy |= MemberLookupPolicy::PROVE_GETTER_INPUTS;
-        }
         let member_lookup = value_type
             .member_lookup_with_policy_and_receiver(db, env, &attr.id, lookup_policy, None)
             .unwrap_or_else(|error| {
@@ -11979,9 +11763,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
                 error.fallback_member(db)
             });
-        if prove_getter_inputs && !member_lookup.inputs_proved(db) {
-            self.context.record_unproved_requirement(attribute);
-        }
         let fallback_place = member_lookup.member(db).map_type(|ty| {
             self.narrow_expr_with_applicable_constraints(attribute, ty, &constraint_keys)
         });
@@ -12370,26 +12151,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let db = self.db();
         let env = self.program_environment();
         let call_unary = |operand_type: Type<'db>, unary_dunder_method: &str| {
-            let mut arguments = CallArguments::none().with_input_proof_request(
-                self.function_inference_mode == crate::FunctionInferenceMode::OutputProof,
-            );
-            let result = operand_type.try_call_dunder_with_policy(
+            let mut arguments = CallArguments::none();
+
+            operand_type.try_call_dunder_with_policy(
                 db,
                 env,
                 unary_dunder_method,
                 &mut arguments,
                 TypeContext::default(),
                 MemberLookupPolicy::default(),
-            );
-            if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
-                && !result.as_ref().is_ok_and(|bindings| {
-                    !bindings.has_only_constructor_items()
-                        && bindings.arguments_satisfy_declared_parameters(db, env, &arguments)
-                })
-            {
-                self.context.record_unproved_requirement(unary);
-            }
-            result
+            )
         };
         let fallback_unary_expression_type = || {
             let unary_dunder_method = match op {
@@ -12442,17 +12213,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
             (ast::UnaryOp::Invert | ast::UnaryOp::UAdd | ast::UnaryOp::USub, Type::Dynamic(_))
-            | (_, Type::Divergent(_)) => {
-                if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
-                    && matches!(
-                        op,
-                        ast::UnaryOp::UAdd | ast::UnaryOp::USub | ast::UnaryOp::Invert
-                    )
-                {
-                    self.context.record_unproved_requirement(unary);
-                }
-                operand_type
-            }
+            | (_, Type::Divergent(_)) => operand_type,
             (_, Type::Never) => Type::Never,
 
             (_, Type::TypeAlias(alias)) => {
@@ -12803,9 +12564,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } = self.infer_chained_boolean_types(
             ast::BoolOp::And,
             false,
-            compare.iter().enumerate(),
+            compare.iter(),
             |_| false,
-            |builder, (comparison_index, (left, op, right)), _peer_ty| {
+            |builder, (left, op, right), _peer_ty| {
                 let left_ty = builder.expression_type(left);
                 let right_ty = builder.infer_expression(right, TypeContext::default());
 
@@ -12816,7 +12577,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     left_ty,
                     *op,
                     right,
-                    right_ty,
                     |element| builder.expression_type(element),
                 );
 
@@ -12830,22 +12590,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         range,
                     ),
                 };
-                if builder.function_inference_mode == crate::FunctionInferenceMode::OutputProof
-                    && !comparison.as_ref().is_ok_and(|result| {
-                        result.inputs_proved
-                            && (comparison_index + 1 == compare.ops.len()
-                                || (result.ty.is_fully_static(db, builder.program_environment())
-                                    && result.ty.is_subtype_of(
-                                        db,
-                                        builder.program_environment(),
-                                        KnownClass::Bool
-                                            .to_instance(db, builder.program_environment()),
-                                    )))
-                    })
-                {
-                    builder.context.record_unproved_requirement(range);
-                }
-                let ty = comparison.map(|result| result.ty).unwrap_or_else(|error| {
+                let ty = comparison.unwrap_or_else(|error| {
                     report_unsupported_comparison(
                         &builder.context,
                         &error,
@@ -12924,8 +12669,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Consume the results already collected by this builder without compacting them.
     fn into_expression_cache_entry(self) -> FullExpressionCacheEntry<'db> {
         let Self {
-            function_inference_mode: _,
-            return_type_correspondence: _,
             implicit_aliases,
             context,
             expressions,
@@ -12991,8 +12734,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_region();
 
         let Self {
-            function_inference_mode: _,
-            return_type_correspondence: _,
             implicit_aliases,
             context,
             expressions,
@@ -13113,8 +12854,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let Self {
-            function_inference_mode: _,
-            return_type_correspondence: _,
             implicit_aliases,
             context,
             expressions,
@@ -13168,8 +12907,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn finish_inferred_definition(self, definition: Definition<'db>) -> DefinitionInference<'db> {
         let Self {
-            function_inference_mode: _,
-            return_type_correspondence: _,
             implicit_aliases,
             context,
             expressions,
@@ -13316,8 +13053,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_region();
 
         let Self {
-            function_inference_mode: _,
-            return_type_correspondence,
             implicit_aliases,
             context,
             string_annotations,
@@ -13360,7 +13095,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             || !expected_types.is_empty()
             || !diagnostics.is_empty()
             || cycle_recovery.is_some()
-            || return_type_correspondence.is_some()
             || !type_expression_flags.is_empty()
             || !collection_use_constraints.is_empty()
             || !qualifiers.is_empty())
@@ -13374,7 +13108,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 type_expression_flags: FrozenMap::from(type_expression_flags),
                 collection_use_constraints,
                 cycle_recovery,
-                return_type_correspondence,
                 diagnostics,
             })
         });
@@ -13397,8 +13130,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn speculate(&self) -> Self {
         let db = self.db();
         let Self {
-            function_inference_mode: _,
-            return_type_correspondence: _,
             region,
             index,
             cycle_recovery,
@@ -13474,8 +13205,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Extend the current region with the results of a speculative [`TypeInferenceBuilder`].
     fn extend(&mut self, other: Self) {
         let Self {
-            function_inference_mode: _,
-            return_type_correspondence: _,
             implicit_aliases,
             context,
             expressions,
@@ -13730,16 +13459,6 @@ impl<'db> FullExpressionCacheEntry<'db> {
     }
 }
 
-/// A successful implicit call and its selected argument requirements.
-///
-/// The caller owns commitment of child inference: supplied argument-inference closures may
-/// run silently while choosing an ordinary operation branch. The caller publishes status
-/// after committing the selected inference.
-struct DunderCallOutcome<'db> {
-    bindings: Bindings<'db>,
-    arguments_proved: bool,
-}
-
 /// Manages the inference of a given expression.
 struct MultiInferenceGuard<'db, 'ast, 'infer> {
     infer_expr:
@@ -13818,27 +13537,11 @@ enum CallArgumentInferenceMode {
     /// Commit a default inference without type context, if there are multiple
     /// applicable type contexts.
     Commit,
-
-    /// Also retain requirements from every contextual inference of a union argument.
-    CommitAll,
 }
 
 impl CallArgumentInferenceMode {
-    fn commit<'db>(bindings: &Bindings<'db>, arguments: &CallArguments<'_, 'db>) -> Self {
-        if arguments.requests_input_proof()
-            && !bindings.is_single()
-            && bindings
-                .argument_correspondence_callables(arguments)
-                .is_some()
-        {
-            Self::CommitAll
-        } else {
-            Self::Commit
-        }
-    }
-
     fn requires_default_inference(self) -> bool {
-        matches!(self, Self::Commit | Self::CommitAll)
+        matches!(self, Self::Commit)
     }
 }
 
@@ -14372,271 +14075,4 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
 enum BoundOrConstraintsNodes<'ast> {
     Bound(&'ast ast::Expr),
     Constraints(&'ast [ast::Expr]),
-}
-
-#[cfg(test)]
-mod tests {
-    use ruff_db::files::system_path_to_file;
-    use ruff_db::parsed::parsed_module;
-    use ty_python_core::{global_scope, semantic_index};
-
-    use super::*;
-    use crate::db::tests::TestDbBuilder;
-    use crate::provided::ProvidedBindingValue;
-
-    #[test]
-    fn argument_proof_survives_expression_cache() -> anyhow::Result<()> {
-        let mut db = TestDbBuilder::new()
-            .with_file(
-                "/src/main.py",
-                "from typing import Any, Callable\n\
-                 def consume(callback: Callable[[list[Any]], int]) -> None: ...\n\
-                 def narrow(values: list[str]) -> int: return 1\n\
-                 def make() -> None:\n    return consume(narrow)\n",
-            )
-            .build()?;
-        let source = system_path_to_file(&db, "/src/main.py")?;
-        db.select_function_inference(Some((
-            source,
-            vec!["make".to_owned()],
-            crate::FunctionInferenceMode::OutputProof,
-        )));
-        let file = db.program_file(source);
-        let module = parsed_module(&db, file.python_file(&db)).load(&db);
-        let function = module.suite().last().unwrap();
-        let ast::Stmt::FunctionDef(function) = function else {
-            panic!("expected make function, got {function:?}");
-        };
-        let [ast::Stmt::Return(statement)] = function.body.as_slice() else {
-            panic!("expected one return statement, got {:?}", function.body);
-        };
-        let expression = statement.value.as_deref().expect("return value");
-        let index = semantic_index(&db, file);
-        let scope = index
-            .try_expression_scope_id(&ast::ExprRef::from(expression))
-            .unwrap()
-            .to_scope_id(&db, file);
-        let env = ProgramEnvironment::from_file(file);
-        let mut builder = TypeInferenceBuilder::new(
-            &db,
-            &env,
-            InferenceRegion::Scope(scope, TypeContext::default()),
-            source,
-            file,
-            index,
-            &module,
-        );
-        builder.context.defuse();
-        assert!(builder.setup_expression_cache());
-        let mut discarded = builder.speculate_without_diagnostics();
-        assert_eq!(
-            discarded.infer_expression(expression, TypeContext::default()),
-            Type::none(&db, &env),
-        );
-        drop(discarded.into_expression_cache_entry());
-        assert!(!builder.context.has_diagnostics());
-
-        let mut committed = builder.speculate();
-        assert_eq!(
-            committed.infer_expression(expression, TypeContext::default()),
-            Type::none(&db, &env),
-        );
-        assert!(!committed.context.has_diagnostics());
-        let cached = committed.into_expression_cache_entry();
-        assert!(cached.diagnostics.has_unproved_requirements());
-        assert!(cached.diagnostics.into_diagnostics().is_empty());
-        assert!(
-            !builder
-                .into_expression_cache_entry()
-                .diagnostics
-                .has_unproved_requirements()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn literal_cache_separates_structural_contracts() -> anyhow::Result<()> {
-        for (value, field_type, unproved) in [
-            ("1", "int", false),
-            ("opaque", "Callable[[Any], None]", true),
-            ("opaque", "Callable[..., None]", false),
-        ] {
-            let mut db = TestDbBuilder::new()
-                .with_file(
-                    "/src/main.py",
-                    &format!("from contracts import opaque\n{{'value': {value}, 'hidden': []}}\n"),
-                )
-                .with_file(
-                    "/src/contracts.pyi",
-                    &format!("from typing import Any, Callable, TypedDict\ndef opaque(value: str) -> None: ...\nclass Row(TypedDict):\n    value: {field_type}\nshape: Row\n"),
-                )
-                .build()?;
-            let source = system_path_to_file(&db, "/src/main.py")?;
-            for mode in [
-                crate::FunctionInferenceMode::Default,
-                crate::FunctionInferenceMode::OutputProof,
-            ] {
-                db.select_function_inference(Some((source, vec!["<module>".to_owned()], mode)));
-                let file = db.program_file(source);
-                let annotation = ProvidedBindingValue::Export {
-                    file: db.program_file(system_path_to_file(&db, "/src/contracts.pyi")?),
-                    name: Name::new_static("shape"),
-                }
-                .resolve_type(&db)
-                .expect("declared Row contract");
-                let module = parsed_module(&db, file.python_file(&db)).load(&db);
-                let [_, statement] = module.suite().as_slice() else {
-                    panic!("expected import and expression statements");
-                };
-                let ast::Stmt::Expr(statement) = statement else {
-                    panic!("expected an expression statement");
-                };
-                let env = ProgramEnvironment::from_file(file);
-                let mut builder = TypeInferenceBuilder::new(
-                    &db,
-                    &env,
-                    InferenceRegion::Scope(global_scope(&db, file), TypeContext::default()),
-                    source,
-                    file,
-                    semantic_index(&db, file),
-                    &module,
-                );
-                builder.context.defuse();
-                assert!(builder.setup_expression_cache());
-                for structural in [true, false, true, false] {
-                    let tcx = if structural {
-                        TypeContext::for_value_contract(annotation)
-                    } else {
-                        TypeContext::new(Some(annotation))
-                    };
-                    let mut attempt = builder.speculate();
-                    let inferred = attempt.infer_expression(&statement.value, tcx);
-                    let diagnostics = attempt.into_expression_cache_entry().diagnostics;
-                    assert_eq!(
-                        diagnostics.has_unproved_requirements(),
-                        mode == crate::FunctionInferenceMode::OutputProof && structural && unproved,
-                        "{field_type}, structural={structural}, mode={mode:?}",
-                    );
-                    let diagnostics = diagnostics.into_diagnostics();
-                    assert_eq!(inferred == annotation, structural);
-                    assert_eq!(diagnostics.is_empty(), structural, "{diagnostics:#?}");
-                    if !structural {
-                        assert!(
-                            diagnostics
-                                .iter()
-                                .any(|diagnostic| diagnostic.id().as_str() == "invalid-key"),
-                            "{diagnostics:#?}"
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-    #[test]
-    fn empty_collection_context_preserves_element_evidence() -> anyhow::Result<()> {
-        for (expression, context, expected, correspondence) in [
-            ("[]", Some("Sequence[str]"), "list[str]", Some(true)),
-            ("['x']", Some("Sequence[str]"), "list[str]", Some(true)),
-            (
-                "[]",
-                Some("Sequence[str] | dict[Any, Any] | None"),
-                "list[str]",
-                Some(true),
-            ),
-            (
-                "['x']",
-                Some("Sequence[str] | dict[Any, Any] | None"),
-                "list[str]",
-                Some(true),
-            ),
-            (
-                "[opaque]",
-                Some("Sequence[Named]"),
-                "list[(...) -> None]",
-                Some(false),
-            ),
-            (
-                "[*opaque_values]",
-                Some("Sequence[Named]"),
-                "list[(...) -> None]",
-                Some(false),
-            ),
-            ("[]", None, "list[Unknown]", None),
-        ] {
-            let mut db = TestDbBuilder::new()
-                .with_file(
-                    "/src/main.py",
-                    &format!(
-                        r#"
-from contracts import opaque, opaque_values
-{expression}
-"#,
-                    ),
-                )
-                .with_file(
-                    "/src/contracts.pyi",
-                    &format!(
-                        r#"
-from typing import Any, Callable, Protocol, Sequence
-class Named(Protocol):
-    def __call__(self, *, name: str) -> None: ...
-opaque: Callable[..., None]
-opaque_values: list[Callable[..., None]]
-target: {}
-"#,
-                        context.unwrap_or("object"),
-                    ),
-                )
-                .build()?;
-            let source = system_path_to_file(&db, "/src/main.py")?;
-            for mode in [
-                crate::FunctionInferenceMode::Default,
-                crate::FunctionInferenceMode::OutputProof,
-            ] {
-                db.select_function_inference(Some((source, vec!["<module>".to_owned()], mode)));
-                let file = db.program_file(source);
-                let target = ProvidedBindingValue::Export {
-                    file: db.program_file(system_path_to_file(&db, "/src/contracts.pyi")?),
-                    name: Name::new_static("target"),
-                }
-                .resolve_type(&db)
-                .unwrap();
-                let module = parsed_module(&db, file.python_file(&db)).load(&db);
-                let [_, ast::Stmt::Expr(statement)] = module.suite().as_slice() else {
-                    panic!("import and expression required")
-                };
-                let env = ProgramEnvironment::from_file(file);
-                let mut builder = TypeInferenceBuilder::new(
-                    &db,
-                    &env,
-                    InferenceRegion::Scope(global_scope(&db, file), TypeContext::default()),
-                    source,
-                    file,
-                    semantic_index(&db, file),
-                    &module,
-                );
-                builder.context.defuse();
-                let actual = builder
-                    .infer_expression(&statement.value, TypeContext::new(context.map(|_| target)));
-                let diagnostics = builder.into_expression_cache_entry().diagnostics;
-                assert_eq!(
-                    actual.display(&db, &env).to_string(),
-                    expected,
-                    "{expression}, {context:?}, {mode:?}"
-                );
-                if let Some(correspondence) = correspondence {
-                    assert_eq!(
-                        actual.satisfies_declared_output(&db, &env, target),
-                        correspondence,
-                        "{expression}, {context:?}, {mode:?}"
-                    );
-                }
-                assert!(!diagnostics.has_unproved_requirements());
-                let diagnostics = diagnostics.into_diagnostics();
-                assert!(diagnostics.is_empty(), "{diagnostics:?}");
-            }
-        }
-        Ok(())
-    }
 }

@@ -16,60 +16,18 @@ use ty_python_core::{ProgramFileKind, ProvidedAnnotation, semantic_index};
 
 use super::*;
 use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
-use crate::types::{KnownClass, TypedDictFieldBuilder, TypedDictType};
+use crate::types::KnownClass;
 use crate::{HasType, ProgramEnvironment, SemanticModel};
 
 /// Pairs top-level functions by name and their ordinary parameters by position.
 /// Signature compatibility is the consumer's responsibility; this fixture exercises
 /// annotation ownership after the consumer has selected a correspondence.
-/// Functions named `provided_*` also receive a structural return contract when present.
 enum ExternalSource {
     Annotation,
-    ValueContract,
     MixedFunctionAnnotations,
 }
 
-impl ExternalSource {
-    fn external<'db>(&self, file: ProgramFile<'db>, owner: NodeIndex) -> ProvidedAnnotation<'db> {
-        match self {
-            Self::Annotation => ProvidedAnnotation::External { file, owner },
-            Self::ValueContract => ProvidedAnnotation::ExternalValueContract { file, owner },
-            Self::MixedFunctionAnnotations => ProvidedAnnotation::External { file, owner },
-        }
-    }
-}
-
 impl SourceProvider for ExternalSource {
-    fn return_type<'db>(
-        &self,
-        db: &'db TestDb,
-        definition: Definition<'db>,
-    ) -> Option<ProvidedReturnType<'db>> {
-        let DefinitionKind::Function(function) = definition.kind(db) else {
-            return None;
-        };
-        let module = parsed_module(db, definition.python_file(db)).load(db);
-        if !function.node(&module).name.starts_with("provided_") {
-            return None;
-        }
-        let source = system_path_to_file(db, "/src/return.pyi").ok()?;
-        let value = ProvidedBindingValue::Export {
-            file: db.program_file(source),
-            name: Name::new_static("value"),
-        }
-        .resolve_type(db)?;
-        let schema = [(
-            Name::new_static("value"),
-            TypedDictFieldBuilder::new(value).required(true).build(),
-        )]
-        .into_iter()
-        .collect();
-        Some(ProvidedReturnType {
-            ty: Type::TypedDict(TypedDictType::from_schema_items(db, schema)),
-            source: Some(FileRange::new(source, TextRange::new(0.into(), 5.into()))),
-        })
-    }
-
     fn statements(&self, _db: &TestDb, _file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
         Vec::new()
     }
@@ -107,7 +65,10 @@ impl SourceProvider for ExternalSource {
                     };
                     (target.id == name.id).then_some(declaration)
                 })?;
-                return Some(self.external(target, foreign.node_index().load()));
+                return Some(ProvidedAnnotation::External {
+                    file: target,
+                    owner: foreign.node_index().load(),
+                });
             }
             let ast::Stmt::FunctionDef(function) = statement else {
                 continue;
@@ -128,7 +89,10 @@ impl SourceProvider for ExternalSource {
                     (target.id == function.name.id).then_some(declaration)
                 })
             {
-                return Some(self.external(target, foreign.node_index().load()));
+                return Some(ProvidedAnnotation::External {
+                    file: target,
+                    owner: foreign.node_index().load(),
+                });
             }
             let Some(foreign) = declarations.suite().iter().find_map(|statement| {
                 let ast::Stmt::FunctionDef(declaration) = statement else {
@@ -159,7 +123,10 @@ impl SourceProvider for ExternalSource {
                     parameter.as_parameter().annotation()?;
                     parameter.as_parameter().node_index().load()
                 };
-            return Some(self.external(target, foreign_owner));
+            return Some(ProvidedAnnotation::External {
+                file: target,
+                owner: foreign_owner,
+            });
         }
         None
     }
@@ -426,100 +393,6 @@ fourth = native()('ok')
             "Literal[1]",
             "Literal[\"ok\"]"
         ]
-    );
-    Ok(())
-}
-
-#[test]
-fn supplied_returns_check_bodies_and_track_contract_edits() -> anyhow::Result<()> {
-    let mut db = TestDbBuilder::new()
-        .with_file(
-            "/src/main.py",
-            "def provided_make():\n    return {'value': 1}\nobserved = provided_make()['value']\n",
-        )
-        .with_file("/src/return.pyi", "value: int\n")
-        .with_source_provider(ExternalSource::Annotation)
-        .build()?;
-    let file = system_path_to_file(&db, "/src/main.py")?;
-    for expected in ["int", "str", "int"] {
-        db.write_file("/src/return.pyi", format!("value: {expected}\n"))?;
-        let diagnostics = db.check_file(file);
-        assert_eq!(
-            diagnostics.is_empty(),
-            expected == "int",
-            "{diagnostics:#?}"
-        );
-        let program_file = db.program_file(file);
-        let module = parsed_module(&db, program_file.python_file(&db)).load(&db);
-        let ast::Stmt::Assign(observed) = &module.suite()[1] else {
-            panic!("expected observed assignment");
-        };
-        let model = SemanticModel::new(&db, program_file);
-        assert_eq!(
-            observed
-                .value
-                .inferred_type(&model)
-                .unwrap()
-                .display(&db, &model.program_environment())
-                .to_string(),
-            expected
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn supplied_returns_preserve_annotations_and_check_all_exits() -> anyhow::Result<()> {
-    let db = TestDbBuilder::new()
-        .with_file(
-            "/src/main.py",
-            "\
-def provided_missing():
-    return {}
-def provided_fallthrough(flag: bool):
-    if flag:
-        return {'value': 1}
-def provided_bare():
-    return
-def provided_native() -> int:
-    return 1
-def provided_external():
-    return 'ok'
-def provided_wrong():
-    return 1
-",
-        )
-        .with_file(
-            "/src/contracts.pyi",
-            "def provided_external() -> str: ...\n",
-        )
-        .with_file("/src/return.pyi", "value: int\n")
-        .with_source_provider(ExternalSource::Annotation)
-        .build()?;
-    let file = system_path_to_file(&db, "/src/main.py")?;
-    let diagnostics = db.check_file(file);
-    assert_eq!(
-        diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.id().as_str())
-            .collect::<Vec<_>>(),
-        [
-            "invalid-return-type",
-            "missing-typed-dict-key",
-            "invalid-return-type",
-            "invalid-return-type",
-            "invalid-return-type"
-        ],
-        "{diagnostics:#?}"
-    );
-    let contract = system_path_to_file(&db, "/src/return.pyi")?;
-    assert!(
-        diagnostics
-            .iter()
-            .flat_map(Diagnostic::annotations)
-            .any(|annotation| annotation.get_span().file()
-                == &ruff_db::diagnostic::UnifiedFile::Ty(contract)),
-        "{diagnostics:#?}"
     );
     Ok(())
 }
@@ -1861,126 +1734,18 @@ fn external_assignment_annotations_do_not_become_signature_annotations() -> anyh
 }
 
 #[test]
-fn external_value_contracts_check_fresh_literal_structure() -> anyhow::Result<()> {
-    let schema = "from typing_extensions import TypedDict, ReadOnly\nclass Row(TypedDict):\n    value: int\nclass Other(TypedDict):\n    other: str\nclass Nested(TypedDict):\n    rows: list[Row]\nclass Closed(TypedDict, closed=True):\n    value: int\nclass Extras(TypedDict, extra_items=ReadOnly[str]):\n    value: int\ntype Rows = list[Row]\n";
-    for (annotation, value, error) in [
-        ("Row", "{'value': 1, 'hidden': []}", None),
-        ("Rows", "[{'value': 1, 'hidden': []}]", None),
-        ("tuple[Row, ...]", "({'value': 1, 'hidden': []},)", None),
-        (
-            "dict[str, Row]",
-            "{'first': {'value': 1, 'hidden': []}}",
-            None,
-        ),
-        ("Nested", "{'rows': [{'value': 1, 'hidden': []}]}", None),
-        ("Row | Other", "{'value': 1, 'hidden': []}", None),
-        (
-            "list[Row] | tuple[Other, ...]",
-            "[{'value': 1, 'hidden': []}]",
-            None,
-        ),
-        ("Row | dict[str, int]", "{'unlisted': 1}", None),
-        ("Row", "{'hidden': []}", Some("missing-typed-dict-key")),
-        (
-            "Row",
-            "{'value': 'bad', 'hidden': []}",
-            Some("invalid-argument-type"),
-        ),
-        (
-            "Row | Other",
-            "{'value': 'bad', 'hidden': []}",
-            Some("invalid-assignment"),
-        ),
-        ("Row", "{'value': 1, 2: []}", Some("invalid-key")),
-        ("Closed", "{'value': 1, 'hidden': []}", Some("invalid-key")),
-        (
-            "Extras",
-            "{'value': 1, 'hidden': []}",
-            Some("invalid-argument-type"),
-        ),
-        ("Extras", "{'value': 1, 'hidden': 'ok'}", None),
-        (
-            "Row",
-            "{'value': 1, 'hidden': missing}",
-            Some("unresolved-reference"),
-        ),
-        ("Row", "Row(value=1, hidden=[])", Some("invalid-key")),
-        (
-            "dict[str, Row]",
-            "dict(first={'value': 1, 'hidden': []})",
-            Some("invalid-key"),
-        ),
-    ] {
-        let source = format!("from contracts import Row\nresult = {value}\n");
-        let db = TestDbBuilder::new()
-            .with_file("/src/main.py", &source)
-            .with_file(
-                "/src/contracts.pyi",
-                &format!("{schema}result: {annotation}\n"),
-            )
-            .with_source_provider(ExternalSource::ValueContract)
-            .build()?;
-        let file = system_path_to_file(&db, "/src/main.py")?;
-        let diagnostics = db.check_file(file);
-        if let Some(expected) = error {
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.id().as_str() == expected),
-                "{annotation}: {value}\n{diagnostics:#?}"
-            );
-        } else {
-            assert!(
-                diagnostics.is_empty(),
-                "{annotation}: {value}\n{diagnostics:#?}"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn external_value_contracts_contextualize_protocol_collections() -> anyhow::Result<()> {
-    let schema = "from typing import Protocol, TypedDict\nclass Row(TypedDict):\n    value: int\nclass Rows(Protocol):\n    def __getitem__(self, index: int, /) -> Row: ...\nresult: Rows\n";
-    for source in [
-        "from contracts import Row\nrows: list[Row] = [{'value': 1}]\nresult = rows\n",
-        "result = [{'value': 1}]\n",
-        "result = [{'value': 1, 'hidden': []}]\n",
-    ] {
-        let db = TestDbBuilder::new()
-            .with_file("/src/main.py", source)
-            .with_file("/src/contracts.pyi", schema)
-            .with_source_provider(ExternalSource::ValueContract)
-            .build()?;
-        let file = system_path_to_file(&db, "/src/main.py")?;
-        let diagnostics = db.check_file(file);
-        assert!(diagnostics.is_empty(), "{source}\n{diagnostics:#?}");
-    }
-    Ok(())
-}
-
-#[test]
-fn external_value_contracts_preserve_ordinary_annotation_and_call_checks() -> anyhow::Result<()> {
+fn external_annotations_preserve_dictionary_key_checks() -> anyhow::Result<()> {
     let schema =
         "from typing import TypedDict\nclass Row(TypedDict):\n    value: int\nresult: Row\n";
-    for (source, provider) in [
-        (
-            "from contracts import Row\nresult: Row = {'value': 1, 'hidden': []}\n",
-            ExternalSource::ValueContract,
-        ),
-        (
-            "result = {'value': 1, 'hidden': []}\n",
-            ExternalSource::Annotation,
-        ),
-        (
-            "from contracts import Row\ndef accept(value: Row) -> Row: return value\nresult = accept({'value': 1, 'hidden': []})\n",
-            ExternalSource::ValueContract,
-        ),
+    for source in [
+        "from contracts import Row\nresult: Row = {'value': 1, 'hidden': []}\n",
+        "result = {'value': 1, 'hidden': []}\n",
+        "from contracts import Row\ndef accept(value: Row) -> Row: return value\nresult = accept({'value': 1, 'hidden': []})\n",
     ] {
         let db = TestDbBuilder::new()
             .with_file("/src/main.py", source)
             .with_file("/src/contracts.pyi", schema)
-            .with_source_provider(provider)
+            .with_source_provider(ExternalSource::Annotation)
             .build()?;
         let file = system_path_to_file(&db, "/src/main.py")?;
         let diagnostics = db.check_file(file);
@@ -1991,38 +1756,5 @@ fn external_value_contracts_preserve_ordinary_annotation_and_call_checks() -> an
             "{source}\n{diagnostics:#?}"
         );
     }
-    Ok(())
-}
-
-#[test]
-fn external_value_contracts_are_assignment_only() -> anyhow::Result<()> {
-    let db = TestDbBuilder::new()
-        .with_file("/src/main.py", "def result(value): return value\n")
-        .with_file("/src/contracts.pyi", "def result(value: int) -> int: ...\n")
-        .with_source_provider(ExternalSource::ValueContract)
-        .build()?;
-    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
-    let module = parsed_module(&db, file.python_file(&db)).load(&db);
-    let [statement] = module.suite().as_slice() else {
-        panic!("expected one statement");
-    };
-    let ast::Stmt::FunctionDef(function) = statement else {
-        panic!("expected a function");
-    };
-    let [parameter] = function.parameters.args.as_slice() else {
-        panic!("expected one parameter");
-    };
-    assert!(
-        crate::types::string_annotation::SourceAnnotation::new(&db, file, function, None).is_none()
-    );
-    assert!(
-        crate::types::string_annotation::SourceAnnotation::new(
-            &db,
-            file,
-            &parameter.parameter,
-            None
-        )
-        .is_none()
-    );
     Ok(())
 }

@@ -1,7 +1,7 @@
 //! Inference for subscript expressions (e.g., `x[0]`, `list[int]`).
 
+use crate::Db;
 use crate::ProgramEnvironment;
-use crate::{Db, FunctionInferenceMode};
 use std::fmt::{self, Display};
 
 use compact_str::{CompactString, ToCompactString};
@@ -87,22 +87,6 @@ impl Display for LegacyGenericOrigin {
             Self::Generic => "Generic",
             Self::Protocol => "Protocol",
         })
-    }
-}
-
-/// The selected subscript result and correspondence of its runtime inputs.
-#[derive(Debug)]
-pub(super) struct SubscriptResult<'db> {
-    pub(super) ty: Type<'db>,
-    pub(super) inputs_proved: bool,
-}
-
-impl<'db> From<Type<'db>> for SubscriptResult<'db> {
-    fn from(ty: Type<'db>) -> Self {
-        Self {
-            ty,
-            inputs_proved: false,
-        }
     }
 }
 
@@ -419,21 +403,19 @@ fn map_subscript_alternatives<'db>(
     env: &ProgramEnvironment<'db>,
     full_object_ty: Type<'db>,
     alternatives: impl IntoIterator<Item = Type<'db>>,
-    mut map_fn: impl FnMut(Type<'db>) -> Result<SubscriptResult<'db>, SubscriptError<'db>>,
-) -> Result<SubscriptResult<'db>, SubscriptError<'db>> {
+    mut map_fn: impl FnMut(Type<'db>) -> Result<Type<'db>, SubscriptError<'db>>,
+) -> Result<Type<'db>, SubscriptError<'db>> {
     let mut builder = UnionBuilder::new(db, env);
     let mut errors = Vec::new();
     let mut preserves_typevar = matches!(full_object_ty, Type::TypeVar(_));
-    let mut inputs_proved = true;
 
     for element in alternatives {
         match map_fn(element) {
             Ok(result) => {
                 if preserves_typevar {
-                    preserves_typevar = result.ty.is_equivalent_to(db, env, element);
+                    preserves_typevar = result.is_equivalent_to(db, env, element);
                 }
-                inputs_proved &= result.inputs_proved;
-                builder = builder.add(result.ty);
+                builder = builder.add(result);
             }
             Err(error) => {
                 builder = builder.add(error.result_type());
@@ -451,13 +433,10 @@ fn map_subscript_alternatives<'db>(
         builder = builder.or_recursively_defined(union.recursively_defined(db));
     }
     if errors.is_empty() {
-        Ok(SubscriptResult {
-            ty: if preserves_typevar {
-                full_object_ty
-            } else {
-                builder.build()
-            },
-            inputs_proved,
+        Ok(if preserves_typevar {
+            full_object_ty
+        } else {
+            builder.build()
         })
     } else {
         Err(SubscriptError::with_errors(builder.build(), errors))
@@ -469,9 +448,9 @@ fn map_intersection_subscript<'db, F>(
     env: &ProgramEnvironment<'db>,
     intersection: IntersectionType<'db>,
     mut map_fn: F,
-) -> Result<SubscriptResult<'db>, SubscriptError<'db>>
+) -> Result<Type<'db>, SubscriptError<'db>>
 where
-    F: FnMut(Type<'db>) -> Result<SubscriptResult<'db>, SubscriptError<'db>>,
+    F: FnMut(Type<'db>) -> Result<Type<'db>, SubscriptError<'db>>,
 {
     if let Some(alternatives) = intersection.finite_alternative_union(db, env) {
         return map_fn(alternatives);
@@ -493,15 +472,10 @@ where
     // If any element succeeded, return the intersection of successful results.
     if !results.is_empty() {
         let mut builder = IntersectionBuilder::new(db, env);
-        let mut inputs_proved = true;
         for result in results {
-            inputs_proved &= result.inputs_proved;
-            builder.add_positive_in_place(result.ty);
+            builder.add_positive_in_place(result);
         }
-        return Ok(SubscriptResult {
-            ty: builder.build(),
-            inputs_proved,
-        });
+        return Ok(builder.build());
     }
 
     // All elements failed. Check if any element has the method available
@@ -544,15 +518,13 @@ fn typed_dict_subscript<'db>(
     env: &ProgramEnvironment<'db>,
     typed_dict: TypedDictType<'db>,
     slice_ty: Type<'db>,
-    mode: FunctionInferenceMode,
-) -> Result<SubscriptResult<'db>, SubscriptError<'db>> {
+) -> Result<Type<'db>, SubscriptError<'db>> {
     if let Some(fallback) = slice_ty.materialized_divergent_fallback() {
-        return typed_dict_subscript(db, env, typed_dict, fallback, mode)
-            .map(|result| result.ty.into());
+        return typed_dict_subscript(db, env, typed_dict, fallback);
     }
 
     if slice_ty.is_dynamic() {
-        return Ok(Type::unknown().into());
+        return Ok(Type::unknown());
     }
 
     let Some(key) = slice_ty
@@ -562,15 +534,7 @@ fn typed_dict_subscript<'db>(
         if typed_dict.explicit_extra_items(db).is_some()
             && slice_ty.is_assignable_to(db, env, KnownClass::Str.to_instance(db, env))
         {
-            return Ok(SubscriptResult {
-                ty: typed_dict.value_type(db, env),
-                inputs_proved: mode == FunctionInferenceMode::OutputProof
-                    && slice_ty.satisfies_declared_output(
-                        db,
-                        env,
-                        KnownClass::Str.to_instance(db, env),
-                    ),
-            });
+            return Ok(typed_dict.value_type(db, env));
         }
         let result_ty = if typed_dict.openness(db).is_closed()
             && slice_ty.is_assignable_to(db, env, KnownClass::Str.to_instance(db, env))
@@ -600,12 +564,7 @@ fn typed_dict_subscript<'db>(
                 },
             ))
         },
-        |field| {
-            Ok(SubscriptResult {
-                ty: field.declared_ty,
-                inputs_proved: true,
-            })
-        },
+        |field| Ok(field.declared_ty),
     )
 }
 
@@ -615,10 +574,8 @@ impl<'db> Type<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         slice_ty: Type<'db>,
-        mode: FunctionInferenceMode,
-    ) -> Result<SubscriptResult<'db>, CallDunderError<'db>> {
-        let mut arguments = CallArguments::positional([slice_ty])
-            .with_input_proof_request(mode == FunctionInferenceMode::OutputProof);
+    ) -> Result<Type<'db>, CallDunderError<'db>> {
+        let mut arguments = CallArguments::positional([slice_ty]);
         let bindings = self.try_call_dunder_with_policy(
             db,
             env,
@@ -627,26 +584,7 @@ impl<'db> Type<'db> {
             TypeContext::default(),
             MemberLookupPolicy::default(),
         )?;
-        let inputs_proved = mode == FunctionInferenceMode::OutputProof
-            && !bindings.has_only_constructor_items()
-            && bindings.arguments_satisfy_declared_parameters(db, env, &arguments);
-        Ok(SubscriptResult {
-            ty: bindings.return_type(db, env),
-            inputs_proved,
-        })
-    }
-
-    fn optimized_subscript_inputs_proved(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        slice_ty: Type<'db>,
-        mode: FunctionInferenceMode,
-    ) -> bool {
-        mode == FunctionInferenceMode::OutputProof
-            && self
-                .subscript_getitem(db, env, slice_ty, mode)
-                .is_ok_and(|result| result.inputs_proved)
+        Ok(bindings.return_type(db, env))
     }
 
     pub(super) fn subscript(
@@ -655,18 +593,13 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         slice_ty: Type<'db>,
         expr_context: ast::ExprContext,
-        mode: FunctionInferenceMode,
-    ) -> Result<SubscriptResult<'db>, SubscriptError<'db>> {
+    ) -> Result<Type<'db>, SubscriptError<'db>> {
         if let Some(fallback) = self.materialized_divergent_fallback() {
-            return fallback
-                .subscript(db, env, slice_ty, expr_context, mode)
-                .map(|result| result.ty.into());
+            return fallback.subscript(db, env, slice_ty, expr_context);
         }
 
         if let Some(fallback) = slice_ty.materialized_divergent_fallback() {
-            return self
-                .subscript(db, env, fallback, expr_context, mode)
-                .map(|result| result.ty.into());
+            return self.subscript(db, env, fallback, expr_context);
         }
 
         let value_ty = self;
@@ -675,43 +608,42 @@ impl<'db> Type<'db> {
             (Type::RecursiveVar(_), _) | (_, Type::RecursiveVar(_)) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
-            (Type::Dynamic(_) | Type::Divergent(_) | Type::Never, _) => Some(Ok(value_ty.into())),
+            (Type::Dynamic(_) | Type::Divergent(_) | Type::Never, _) => Some(Ok(value_ty)),
 
             (Type::Recursive(recursive), _) => Some(
                 recursive
                     .unfold(db, env)
-                    .map(|unfolded| unfolded.subscript(db, env, slice_ty, expr_context, mode))
-                    .unwrap_or(Ok(value_ty.into())),
+                    .map(|unfolded| unfolded.subscript(db, env, slice_ty, expr_context))
+                    .unwrap_or(Ok(value_ty)),
             ),
 
             (_, Type::Recursive(recursive)) => Some(
                 recursive
                     .unfold(db, env)
-                    .map(|unfolded| value_ty.subscript(db, env, unfolded, expr_context, mode))
-                    .unwrap_or(Ok(value_ty.into())),
+                    .map(|unfolded| value_ty.subscript(db, env, unfolded, expr_context))
+                    .unwrap_or(Ok(value_ty)),
             ),
 
-            (Type::TypeAlias(alias), _) => {
-                Some(
-                    alias
-                        .value_type(db)
-                        .subscript(db, env, slice_ty, expr_context, mode),
-                )
-            }
+            (Type::TypeAlias(alias), _) => Some(alias.value_type(db).subscript(
+                db,
+                env,
+                slice_ty,
+                expr_context,
+            )),
 
             (_, Type::TypeAlias(alias)) => {
-                Some(value_ty.subscript(db, env, alias.value_type(db), expr_context, mode))
+                Some(value_ty.subscript(db, env, alias.value_type(db), expr_context))
             }
 
             // Expand overlapping alternatives before collecting their subscript errors.
             (Type::Union(union), _) if union.has_aliases(db) => Some(
                 union
                     .expand_aliases(db, env)
-                    .subscript(db, env, slice_ty, expr_context, mode),
+                    .subscript(db, env, slice_ty, expr_context),
             ),
 
             (_, Type::Union(union)) if union.has_aliases(db) => {
-                Some(value_ty.subscript(db, env, union.expand_aliases(db, env), expr_context, mode))
+                Some(value_ty.subscript(db, env, union.expand_aliases(db, env), expr_context))
             }
 
             (Type::Union(union), _) => Some(map_subscript_alternatives(
@@ -719,7 +651,7 @@ impl<'db> Type<'db> {
                 env,
                 value_ty,
                 union.elements(db).iter().copied(),
-                |element| element.subscript(db, env, slice_ty, expr_context, mode),
+                |element| element.subscript(db, env, slice_ty, expr_context),
             )),
 
             (_, Type::Union(union)) => Some(map_subscript_alternatives(
@@ -727,7 +659,7 @@ impl<'db> Type<'db> {
                 env,
                 slice_ty,
                 union.elements(db).iter().copied(),
-                |element| value_ty.subscript(db, env, element, expr_context, mode),
+                |element| value_ty.subscript(db, env, element, expr_context),
             )),
 
             (Type::EnumComplement(complement), _) => {
@@ -736,7 +668,6 @@ impl<'db> Type<'db> {
                     env,
                     slice_ty,
                     expr_context,
-                    mode,
                 ))
             }
 
@@ -745,21 +676,20 @@ impl<'db> Type<'db> {
                 env,
                 complement.remaining_literal_union(db, env),
                 expr_context,
-                mode,
             )),
 
             (Type::Intersection(intersection), _) => Some(map_intersection_subscript(
                 db,
                 env,
                 intersection,
-                |element| element.subscript(db, env, slice_ty, expr_context, mode),
+                |element| element.subscript(db, env, slice_ty, expr_context),
             )),
 
             (_, Type::Intersection(intersection)) => Some(map_intersection_subscript(
                 db,
                 env,
                 intersection,
-                |element| value_ty.subscript(db, env, element, expr_context, mode),
+                |element| value_ty.subscript(db, env, element, expr_context),
             )),
 
             (Type::TypeVar(typevar), _)
@@ -771,13 +701,13 @@ impl<'db> Type<'db> {
                     env,
                     value_ty,
                     constraints.elements(db).iter().copied(),
-                    |constraint| constraint.subscript(db, env, slice_ty, expr_context, mode),
+                    |constraint| constraint.subscript(db, env, slice_ty, expr_context),
                 ))
             }
 
             // Ex) Given `person["name"]`, return `str`
             (Type::TypedDict(typed_dict), _) if expr_context != ast::ExprContext::Store => {
-                Some(typed_dict_subscript(db, env, typed_dict, slice_ty, mode))
+                Some(typed_dict_subscript(db, env, typed_dict, slice_ty))
             }
 
             (
@@ -821,11 +751,7 @@ impl<'db> Type<'db> {
                     )
                 });
 
-                Some(result.map(|ty| SubscriptResult {
-                    ty,
-                    inputs_proved:
-                        value_ty.optimized_subscript_inputs_proved(db, env, slice_ty, mode),
-                }))
+                Some(result)
             }
 
             // Ex) Given `("a", 1, Null)[0:2]`, return `("a", 1)`
@@ -839,11 +765,6 @@ impl<'db> Type<'db> {
                 Some(
                     tuple
                         .py_slice_type(db, env, start, stop, step)
-                        .map(|ty| SubscriptResult {
-                            ty,
-                            inputs_proved: value_ty
-                                .optimized_subscript_inputs_proved(db, env, slice_ty, mode),
-                        })
                         .map_err(|_| {
                             SubscriptError::new(
                                 Type::unknown(),
@@ -874,10 +795,7 @@ impl<'db> Type<'db> {
                     )),
                 };
 
-                Some(result.map(|ty| SubscriptResult {
-                    ty,
-                    inputs_proved: true,
-                }))
+                Some(result)
             }
 
             // Ex) Given `"value"[1:3]`, return `"al"`
@@ -900,10 +818,7 @@ impl<'db> Type<'db> {
                     )),
                 };
 
-                Some(result.map(|ty| SubscriptResult {
-                    ty,
-                    inputs_proved: true,
-                }))
+                Some(result)
             }
 
             (Type::LiteralValue(lhs_literal), Type::LiteralValue(rhs_literal))
@@ -912,19 +827,13 @@ impl<'db> Type<'db> {
                         || (rhs_literal.is_bool()
                             && KnownClass::bool_is_subclass_of_int(db, env))) =>
             {
-                Some(Ok(SubscriptResult {
-                    ty: Type::literal_string(),
-                    inputs_proved: true,
-                }))
+                Some(Ok(Type::literal_string()))
             }
 
             (Type::LiteralValue(literal), Type::NominalInstance(nominal))
                 if literal.is_literal_string() && nominal.slice_literal(db, env).is_some() =>
             {
-                Some(Ok(SubscriptResult {
-                    ty: Type::literal_string(),
-                    inputs_proved: true,
-                }))
+                Some(Ok(Type::literal_string()))
             }
 
             // Ex) Given `b"value"[1]`, return `97` (i.e., `ord(b"a")`)
@@ -948,10 +857,7 @@ impl<'db> Type<'db> {
                     )),
                 };
 
-                Some(result.map(|ty| SubscriptResult {
-                    ty,
-                    inputs_proved: true,
-                }))
+                Some(result)
             }
 
             // Ex) Given `b"value"[1:3]`, return `b"al"`
@@ -973,10 +879,7 @@ impl<'db> Type<'db> {
                     )),
                 };
 
-                Some(result.map(|ty| SubscriptResult {
-                    ty,
-                    inputs_proved: true,
-                }))
+                Some(result)
             }
 
             // Ex) Given `"value"[True]`, return `"a"`
@@ -984,47 +887,19 @@ impl<'db> Type<'db> {
                 if (lhs_literal.is_string() || lhs_literal.is_bytes())
                     && let Some(bool) = rhs_literal.as_bool() =>
             {
-                Some(
-                    value_ty
-                        .subscript(
-                            db,
-                            env,
-                            Type::int_literal(i64::from(bool)),
-                            expr_context,
-                            FunctionInferenceMode::Default,
-                        )
-                        .map(|result| SubscriptResult {
-                            ty: result.ty,
-                            inputs_proved: value_ty
-                                .optimized_subscript_inputs_proved(db, env, slice_ty, mode),
-                        }),
-                )
+                Some(value_ty.subscript(db, env, Type::int_literal(i64::from(bool)), expr_context))
             }
 
             (Type::NominalInstance(nominal), Type::LiteralValue(literal))
                 if let Some(bool) = literal.as_bool()
                     && nominal.tuple_spec(db, env).is_some() =>
             {
-                Some(
-                    value_ty
-                        .subscript(
-                            db,
-                            env,
-                            Type::int_literal(i64::from(bool)),
-                            expr_context,
-                            FunctionInferenceMode::Default,
-                        )
-                        .map(|result| SubscriptResult {
-                            ty: result.ty,
-                            inputs_proved: value_ty
-                                .optimized_subscript_inputs_proved(db, env, slice_ty, mode),
-                        }),
-                )
+                Some(value_ty.subscript(db, env, Type::int_literal(i64::from(bool)), expr_context))
             }
 
             (Type::KnownInstance(KnownInstanceType::SubscriptedProtocol(_)), _) => {
                 // TODO: emit a diagnostic
-                Some(Ok(todo_type!("doubly-specialized typing.Protocol").into()))
+                Some(Ok(todo_type!("doubly-specialized typing.Protocol")))
             }
 
             (Type::KnownInstance(KnownInstanceType::TypeAliasType(alias)), _)
@@ -1039,35 +914,31 @@ impl<'db> Type<'db> {
 
             (Type::KnownInstance(KnownInstanceType::SubscriptedGeneric(_)), _) => {
                 // TODO: emit a diagnostic
-                Some(Ok(todo_type!("doubly-specialized typing.Generic").into()))
+                Some(Ok(todo_type!("doubly-specialized typing.Generic")))
             }
 
             (Type::SpecialForm(SpecialFormType::Unpack), _) => {
                 // TODO: Emit an invalid-type-form diagnostic for runtime subscripting of `Unpack`.
-                Some(Ok(Type::unknown().into()))
+                Some(Ok(Type::unknown()))
             }
 
             (Type::SpecialForm(SpecialFormType::TypeQualifier(TypeQualifier::InitVar)), _) => {
                 // Subscripting `InitVar` gives you (bizarrely) an instance of `InitVar`,
                 // which isn't representable in our model because we don't recognise there as being
                 // an `InitVar` class at all. This doesn't really matter that much, so just infer `Any` here.
-                Some(Ok(Type::any().into()))
+                Some(Ok(Type::any()))
             }
 
             (Type::SpecialForm(special_form), _)
                 if special_form.class(db, env).is_special_form() =>
             {
-                Some(Ok(
-                    todo_type!("Inference of subscript on special form").into()
-                ))
+                Some(Ok(todo_type!("Inference of subscript on special form")))
             }
 
             (Type::KnownInstance(known_instance), _)
                 if known_instance.class(db).is_special_form() =>
             {
-                Some(Ok(
-                    todo_type!("Inference of subscript on special form").into()
-                ))
+                Some(Ok(todo_type!("Inference of subscript on special form")))
             }
 
             // Upper-bounded and unconstrained type variables use ordinary method lookup.
@@ -1110,7 +981,7 @@ impl<'db> Type<'db> {
         // If the class defines `__getitem__`, return its return type.
         //
         // See: https://docs.python.org/3/reference/datamodel.html#class-getitem-versus-getitem
-        match value_ty.subscript_getitem(db, env, slice_ty, mode) {
+        match value_ty.subscript_getitem(db, env, slice_ty) {
             Ok(outcome) => {
                 return Ok(outcome);
             }
@@ -1159,7 +1030,7 @@ impl<'db> Type<'db> {
                 TypeContext::default(),
             ) {
                 Ok(bindings) => {
-                    return Ok(bindings.return_type(db, env).into());
+                    return Ok(bindings.return_type(db, env));
                 }
                 Err(CallDunderError::PossiblyUnbound { bindings, .. }) => {
                     return Err(SubscriptError::new(
@@ -1189,7 +1060,7 @@ impl<'db> Type<'db> {
 
             if let Type::ClassLiteral(class) = value_ty {
                 if class.is_known(db, KnownClass::Type) {
-                    return Ok(KnownClass::GenericAlias.to_instance(db, env).into());
+                    return Ok(KnownClass::GenericAlias.to_instance(db, env));
                 }
 
                 if class.generic_context(db).is_some() {
@@ -1200,7 +1071,7 @@ impl<'db> Type<'db> {
                     // the type of the outer subscript slice as a value expression, which
                     // means we can't re-infer the inner specialization here as a type
                     // expression.
-                    return Ok(value_ty.into());
+                    return Ok(value_ty);
                 }
 
                 if class.iter_mro(db).any(|base| base == ClassBase::Generic) {
@@ -1228,6 +1099,6 @@ impl<'db> Type<'db> {
             ));
         }
 
-        Ok(Type::unknown().into())
+        Ok(Type::unknown())
     }
 }

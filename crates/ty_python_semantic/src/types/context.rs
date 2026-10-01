@@ -267,14 +267,9 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
         if !self.diagnostics_suppressed {
             let file = self.python_file();
             let db = self.db;
-            let program_file = self.program_file;
-            let scope = self.scope;
             self.diagnostics
                 .get_mut()
-                .extend_provided(db, file, diagnostics, |range| {
-                    let index = semantic_index(db, program_file);
-                    is_range_reachable(db, index, scope.file_scope_id(db), range)
-                });
+                .extend_provided(db, file, diagnostics);
         }
     }
 
@@ -282,26 +277,6 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
         self.diagnostics
             .borrow()
             .has_diagnostics_or_used_suppressions()
-    }
-
-    /// Include checking failures even when their diagnostics are suppressed by configuration.
-    pub(super) fn has_unproved_requirements(&self) -> bool {
-        let diagnostics = self.diagnostics.borrow();
-        diagnostics.has_checking_failures() || diagnostics.has_unproved_requirements()
-    }
-
-    /// Record a reachable selected requirement independently of diagnostic display policy.
-    /// The result travels with committed inference, including cached expression results.
-    pub(super) fn record_unproved_requirement(&self, node: impl Ranged) {
-        if self.diagnostics_suppressed
-            || !self.db.should_check_file(self.file)
-            || self.db.function_inference_mode(self.scope)
-                != crate::FunctionInferenceMode::OutputProof
-            || !self.is_range_reachable(node.range())
-        {
-            return;
-        }
-        self.diagnostics.borrow_mut().mark_unproved_requirement();
     }
 
     /// Prevents diagnostic construction for this inference context.
@@ -701,9 +676,6 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
         }
 
         if suppressed {
-            ctx.diagnostics
-                .borrow_mut()
-                .mark_reachable_suppression(lint_id);
             return None;
         }
 

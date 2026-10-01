@@ -61,14 +61,12 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
     ///
     /// The matched parameters must be the object, name, and optional default, in that order.
     /// Applications select the native operation declaration and establish its input contract.
-    /// This projection does not alter the call's implicit input requirements.
     pub fn getattr_return_type(&self, db: &'db dyn Db) -> Option<Type<'db>> {
         if self.has_binding_errors || self.bound_receiver {
             return None;
         }
         let env = ProgramEnvironment::from_file(self.file);
-        let (return_type, _inputs_proved) = self.binding.getattr_call_result(db, &env, false)?;
-        Some(return_type)
+        self.binding.getattr_call_result(db, &env)
     }
 
     pub fn has_binding_errors(&self) -> bool {
@@ -77,19 +75,6 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
 
     pub fn expression_type(&self, expression: &ast::Expr) -> Option<Type<'db>> {
         (self.expression_type)(expression)
-    }
-
-    /// Checks current arguments against one matched signature, including keyword inventories.
-    ///
-    /// Applications establish callable/overload coverage and child evaluation independently.
-    /// Returns false for binding recovery or an implicit receiver.
-    pub fn arguments_satisfy_declared_parameters(&self, db: &'db dyn Db) -> bool {
-        if self.has_binding_errors || self.bound_receiver {
-            return false;
-        }
-        let env = ProgramEnvironment::from_file(self.file);
-        self.binding
-            .arguments_satisfy_declared_parameters(db, &env, self.arguments)
     }
 
     pub fn argument(&self, name: &str) -> CheckedArgument<'a, 'db> {

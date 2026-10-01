@@ -2,7 +2,7 @@ use ruff_python_ast as ast;
 use ruff_text_size::Ranged;
 use smallvec::{SmallVec, smallvec};
 
-use super::{ArgumentsIter, DunderCallOutcome, MultiInferenceGuard, TypeInferenceBuilder};
+use super::{ArgumentsIter, MultiInferenceGuard, TypeInferenceBuilder};
 use crate::place::{DefinedPlace, Definedness, Place, PlaceAndQualifiers};
 use crate::types::attribute_write::{
     AttributeWriteRequirement, ClassAttributeWriteMember, DescriptorSetterDomain,
@@ -266,16 +266,7 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
             TypeContext::default(),
         );
         let value_ty = self.infer_with_last_context(emit_diagnostics);
-        (
-            setattr_result.map(|outcome| {
-                let DunderCallOutcome {
-                    bindings,
-                    arguments_proved: _,
-                } = outcome;
-                bindings
-            }),
-            value_ty,
-        )
+        (setattr_result, value_ty)
     }
 
     /// Validate the assignment and optionally record its accessor deprecations.

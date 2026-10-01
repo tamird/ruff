@@ -1835,11 +1835,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                             target_type,
                             target_materialization,
                         );
-                        if variance.is_covariant() {
-                            self.check_type_pair(db, source_type, target_type)
-                        } else {
-                            self.check_input_type_pair(db, source_type, target_type)
-                        }
+                        self.check_type_pair(db, source_type, target_type)
                     }
                     TypeVarVariance::Bivariant => self.always(),
                 }
@@ -1941,20 +1937,6 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         target_type: Type<'db>,
         target_materialization: Option<MaterializationKind>,
     ) -> ConstraintSet<'db, 'c> {
-        if matches!(
-            self.relation,
-            TypeRelation::DeclaredOutput { strict: false }
-        ) {
-            return self
-                .with_strict_inputs()
-                .check_relation_in_invariant_position(
-                    db,
-                    source_type,
-                    source_materialization,
-                    target_type,
-                    target_materialization,
-                );
-        }
         match (
             source_materialization,
             target_materialization,
@@ -2033,7 +2015,6 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 Some(target_mat),
                 TypeRelation::Subtyping
                 | TypeRelation::Redundancy { .. }
-                | TypeRelation::DeclaredOutput { .. }
                 | TypeRelation::SubtypingAssuming,
             ) => self.check_subtyping_in_invariant_position(
                 db,
@@ -2047,7 +2028,6 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 None,
                 TypeRelation::Subtyping
                 | TypeRelation::Redundancy { .. }
-                | TypeRelation::DeclaredOutput { .. }
                 | TypeRelation::SubtypingAssuming,
             ) => self.check_subtyping_in_invariant_position(
                 db,

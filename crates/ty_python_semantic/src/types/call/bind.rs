@@ -31,7 +31,7 @@ use crate::lint::LintMetadata;
 use crate::place::{DefinedPlace, Definedness, Place};
 use crate::subscript::PyIndex;
 use crate::types::call::arguments::{
-    CallArgumentExpansions, CallArgumentTypes, CallArgumentsSnapshot, Expansion, KnownUnpacking,
+    CallArgumentExpansions, CallArgumentTypes, Expansion, KnownUnpacking,
 };
 use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::{
@@ -53,7 +53,7 @@ use crate::types::function::{
 };
 use crate::types::generics::{
     GenericContext, Specialization, SpecializationBuilder, SpecializationError, TypeVarInference,
-    TypeVarInferenceSolutions, TypeVarProjection,
+    TypeVarProjection,
 };
 use crate::types::infer::original_class_type;
 use crate::types::known_instance::{
@@ -68,9 +68,7 @@ use crate::types::tuple::{TupleLength, TupleSpec, TupleSpecBuilder, TupleType, V
 use crate::types::typed_dict::{
     TypedDictOpenness, UnpackedTypedDict, extract_unpacked_typed_dict_from_value_type,
 };
-use crate::types::typevar::{
-    BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVarSet, walk_type_var_bounds,
-};
+use crate::types::typevar::{BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVarSet};
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
     TypeCollector, TypeKind, TypeVisitor, any_over_type, walk_non_atomic_type,
@@ -675,207 +673,6 @@ impl CheckTypesMode {
     }
 }
 
-/// Find the selected variables needed by supplied parameters and their declarations.
-/// Bounds and constraints determine dependencies; defaults supply omitted selections.
-fn parameter_typevars<'db>(
-    db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
-    context: GenericContext<'db>,
-    pairs: &[(Type<'db>, Type<'db>)],
-) -> FxHashSet<BoundTypeVarIdentity<'db>> {
-    struct ParameterTypeVars<'a, 'db> {
-        env: &'a ProgramEnvironment<'db>,
-        inferable: TypeVarSet<'db>,
-        variables: RefCell<FxHashSet<BoundTypeVarIdentity<'db>>>,
-        recursion_guard: TypeCollector<'db>,
-    }
-
-    impl<'db> TypeVisitor<'db> for ParameterTypeVars<'_, 'db> {
-        fn program_environment(&self) -> &ProgramEnvironment<'db> {
-            self.env
-        }
-
-        fn should_visit_lazy_type_attributes(&self) -> bool {
-            true
-        }
-
-        fn visit_bound_type_var_type(&self, db: &'db dyn Db, variable: BoundTypeVarInstance<'db>) {
-            if variable.is_inferable(db, self.inferable) {
-                self.variables.borrow_mut().insert(variable.identity(db));
-                if let Some(domain) = variable.typevar(db).bound_or_constraints(db, self.env) {
-                    walk_type_var_bounds(db, domain, self);
-                }
-            }
-        }
-
-        fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
-            walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
-        }
-    }
-
-    let visitor = ParameterTypeVars {
-        env,
-        inferable: context.inferable_typevars(db),
-        variables: RefCell::default(),
-        recursion_guard: TypeCollector::default(),
-    };
-    for (_, formal) in pairs {
-        visitor.visit_type(db, *formal);
-    }
-    visitor.variables.into_inner()
-}
-
-/// Prove generic transport while retaining opaque function values and nominal type slots.
-///
-/// Captures are local rigid variables. Solving only the callee variables establishes one
-/// specialization for each possible input domain; strict replay checks the resulting pairs.
-/// Erasing captures must reproduce the specialization already chosen by ordinary inference.
-fn generic_arguments_satisfy_declared_parameters<'db>(
-    db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
-    ordinary: Specialization<'db>,
-    pairs: &[(Type<'db>, Type<'db>)],
-) -> bool {
-    let concrete = |ty: Type<'db>| {
-        ty.is_fully_static(db, env)
-            && !any_over_type(db, env, ty, true, |ty| matches!(ty, Type::TypeVar(_)))
-    };
-    let context = ordinary.generic_context(db);
-    let mut inferable = Vec::new();
-    let mut fixed = Vec::new();
-    for (variable, solution) in context.variables(db).zip(ordinary.types(db)) {
-        if variable.is_paramspec(db) || variable.is_typevartuple(db) {
-            return false;
-        }
-        if let Some(domain) = variable.typevar(db).bound_or_constraints(db, env) {
-            let supported = match domain {
-                TypeVarBoundOrConstraints::UpperBound(bound) => concrete(bound),
-                TypeVarBoundOrConstraints::Constraints(constraints) => {
-                    constraints.elements(db).iter().copied().all(concrete)
-                }
-            };
-            if !concrete(*solution) || !supported {
-                return false;
-            }
-        }
-        if solution.is_fully_static(db, env) {
-            fixed.push(*solution);
-        } else {
-            inferable.push(variable);
-            fixed.push(Type::TypeVar(variable));
-        }
-    }
-    if inferable.is_empty() {
-        return false;
-    }
-    let fixed = context.specialize(db, fixed);
-    let mut captures = Vec::new();
-    let mut originals = Vec::new();
-    let mut capture = |original| {
-        // Each occurrence is rigid only within this proof. Erasure below must reproduce the
-        // ordinary specialization before the proof can certify the supplied arguments.
-        let variable = BoundTypeVarInstance::synthetic(
-            db,
-            env,
-            Name::new(format!("$argument_input_{}", captures.len())),
-            TypeVarVariance::Invariant,
-        );
-        captures.push(variable);
-        originals.push(original);
-        Type::TypeVar(variable)
-    };
-    let mut captured_pairs = Vec::new();
-    for (actual, formal) in pairs {
-        if actual.has_provisional_marker(db, env) || !formal.is_fully_static_except_any(db, env) {
-            return false;
-        }
-        let captured = if matches!(actual, Type::FunctionLiteral(_)) {
-            // Collection inference promotes a function value to its callable signature. Keep
-            // the value rigid during proof; only erasure uses that same promotion.
-            let promoted = actual.promote(db, env);
-            if promoted.is_fully_static(db, env) {
-                *actual
-            } else {
-                capture(promoted)
-            }
-        } else if actual.is_fully_static(db, env) {
-            *actual
-        } else {
-            let Type::NominalInstance(instance) = actual else {
-                return false;
-            };
-            if instance.tuple_spec(db, env).is_some() {
-                return false;
-            }
-            let Some((origin, specialization)) = actual.class_specialization(db, env) else {
-                return false;
-            };
-            if specialization.materialization_kind(db).is_some() {
-                return false;
-            }
-            let mut slots = Vec::new();
-            for (variable, slot) in specialization
-                .generic_context(db)
-                .variables(db)
-                .zip(specialization.types(db))
-            {
-                if variable.is_paramspec(db)
-                    || variable.is_typevartuple(db)
-                    || variable.typevar(db).bound_or_constraints(db, env).is_some()
-                {
-                    return false;
-                }
-                if slot.is_fully_static(db, env) {
-                    slots.push(*slot);
-                } else {
-                    slots.push(capture(*slot));
-                }
-            }
-            Type::instance(
-                db,
-                env,
-                origin.apply_specialization(db, |context| context.specialize(db, slots)),
-            )
-        };
-        captured_pairs.push((captured, formal.apply_specialization(db, fixed)));
-    }
-    if captures.is_empty() {
-        return false;
-    }
-    let constraints = ConstraintSetBuilder::new();
-    let context = GenericContext::from_typevar_instances(db, env, inferable);
-    let mut builder = SpecializationBuilder::new(db, env, &constraints, context);
-    for (actual, formal) in &captured_pairs {
-        if builder.infer(*formal, *actual).is_err() {
-            return false;
-        }
-    }
-    let Ok(inference) = builder.build_inference_with(|_, _| None) else {
-        return false;
-    };
-    if !matches!(inference.solutions(db), TypeVarInferenceSolutions::Single) {
-        return false;
-    }
-    let proof = inference.merged_specialization(db);
-    let erasure =
-        GenericContext::from_typevar_instances(db, env, captures).specialize(db, originals);
-    fixed
-        .types(db)
-        .iter()
-        .zip(ordinary.types(db))
-        .all(|(proof_type, ordinary_type)| {
-            proof_type
-                .apply_specialization(db, proof)
-                .apply_specialization(db, erasure)
-                == *ordinary_type
-        })
-        && captured_pairs.iter().all(|(actual, formal)| {
-            let expected = formal.apply_specialization(db, proof);
-            expected.is_fully_static_except_any(db, env)
-                && actual.satisfies_declared_output(db, env, expected)
-        })
-}
-
 impl<'db> Bindings<'db> {
     fn as_result(&self, db: &'db dyn Db) -> Result<(), CallErrorKind> {
         let mut all_ok = true;
@@ -1114,15 +911,6 @@ impl<'db> Bindings<'db> {
         for item in self.iter_callable_items_mut() {
             item.set_downstream_constructor(bindings);
         }
-    }
-
-    pub(crate) fn with_unproved_lookup_inputs(mut self, unproved: bool) -> Self {
-        if unproved {
-            for binding in self.iter_flat_mut() {
-                binding.lookup_has_unproved_inputs = true;
-            }
-        }
-        self
     }
 
     pub(crate) fn set_dunder_call_is_possibly_unbound(&mut self) {
@@ -1708,63 +1496,6 @@ impl<'db> Bindings<'db> {
         self.as_result(db)
     }
 
-    /// Check the committed actual arguments against the selected parameter contracts.
-    ///
-    /// This query leaves ordinary overload selection and results unchanged. Multiple callable
-    /// contributors with unresolved overloads, multiple or omitted constructor stages, and
-    /// unresolved generic solutions for supplied values need additional coverage to establish
-    /// requirements. Ambiguous overloads suffice when one signature covers every argument.
-    /// The caller must also establish that argument inference committed the selected contexts;
-    /// final binding pruning alone does not establish that child proof statuses were retained.
-    pub(crate) fn arguments_satisfy_declared_parameters(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        arguments: &CallArguments<'_, 'db>,
-    ) -> bool {
-        if self.as_result(db).is_err() {
-            return false;
-        }
-        let Some(mut callables) = self.argument_correspondence_callables(arguments) else {
-            return false;
-        };
-        callables.all(|callable| callable.arguments_satisfy_declared_parameters(db, env, arguments))
-    }
-
-    /// Return the callables covered by argument correspondence, before or after inference.
-    /// Constructor entry and downstream contexts must both be accounted for before checking.
-    /// Each union alternative must have one regular callable. With explicit arguments, each
-    /// callable must also have one declared signature so all contextual child requirements can
-    /// be retained during inference. Overload alternatives need existential coverage instead.
-    pub(crate) fn argument_correspondence_callables(
-        &self,
-        arguments: &CallArguments<'_, 'db>,
-    ) -> Option<impl Iterator<Item = &CallableBinding<'db>>> {
-        if let Some(item) = self.single_item() {
-            match item {
-                CallableItem::Regular(_) => {}
-                CallableItem::Constructor(constructor) => {
-                    if !matches!(
-                        constructor.context().kind(),
-                        ConstructorCallableKind::Init | ConstructorCallableKind::New
-                    ) || constructor.downstream_constructor.is_some()
-                        || constructor.has_omitted_stage
-                    {
-                        return None;
-                    }
-                }
-            }
-        } else if self.elements.len() <= 1
-            || !self.elements.iter().all(|element| {
-                matches!(element.items.as_slice(), [CallableItem::Regular(callable)]
-                    if arguments.len() == 0 || callable.overloads().len() == 1)
-            })
-        {
-            return None;
-        }
-        Some(self.iter_flat())
-    }
-
     /// Returns true if this is a single callable (not a union or intersection).
     pub(crate) fn is_single(&self) -> bool {
         match &*self.elements {
@@ -2003,12 +1734,7 @@ impl<'db> Bindings<'db> {
         // Each special case listed here should have a corresponding clause in `Type::bindings`.
         for binding in self.iter_flat_mut() {
             let binding_type = binding.callable_type;
-            // Expanded bindings retain only one parameter state per overload. That state
-            // cannot establish implicit-call requirements for every expanded alternative.
-            let request_input_proof =
-                call_arguments.requests_input_proof() && binding.overload_call_result.is_none();
             for (overload_index, overload) in binding.matching_overloads_mut() {
-                overload.nested_call_has_unproved_inputs = false;
                 match binding_type {
                     Type::KnownBoundMethod(KnownBoundMethodType::FunctionTypeDunderGet(
                         function,
@@ -2098,14 +1824,7 @@ impl<'db> Bindings<'db> {
                             },
                             [Some(Type::PropertyInstance(property)), Some(instance), ..] => {
                                 if let Some(getter) = property.getter(db) {
-                                    overload.check_property_getter(
-                                        db,
-                                        env,
-                                        getter,
-                                        *instance,
-                                        1,
-                                        request_input_proof,
-                                    );
+                                    overload.check_property_getter(db, env, getter, *instance, 1);
                                 } else {
                                     overload
                                         .errors
@@ -2131,14 +1850,7 @@ impl<'db> Bindings<'db> {
                             }
                             [Some(instance), ..] => {
                                 if let Some(getter) = property.getter(db) {
-                                    overload.check_property_getter(
-                                        db,
-                                        env,
-                                        getter,
-                                        *instance,
-                                        0,
-                                        request_input_proof,
-                                    );
+                                    overload.check_property_getter(db, env, getter, *instance, 0);
                                 } else {
                                     overload.set_return_type(Type::Never);
                                     overload
@@ -2853,7 +2565,7 @@ impl<'db> Bindings<'db> {
                         }
 
                         Some(KnownFunction::GetAttr) => {
-                            overload.infer_getattr(db, env, request_input_proof);
+                            overload.infer_getattr(db, env);
                         }
 
                         Some(KnownFunction::GetattrStatic) => {
@@ -3703,7 +3415,6 @@ impl<'db> From<Binding<'db>> for Bindings<'db> {
             signature_type,
             is_implicitly_invoked: false,
             dunder_call_is_possibly_unbound: false,
-            lookup_has_unproved_inputs: false,
             bound_type: None,
             overload_call_result: None,
             matching_overload_before_type_checking: None,
@@ -3750,9 +3461,6 @@ pub(crate) struct CallableBinding<'db> {
     /// If this is a callable object (i.e. called via a `__call__` method), the boundness of
     /// that call method.
     dunder_call_is_possibly_unbound: bool,
-
-    /// Input requirements of the lookup that produced this callable.
-    lookup_has_unproved_inputs: bool,
 
     /// The type of the bound `self` or `cls` parameter if this signature is for a bound method.
     pub(crate) bound_type: Option<Type<'db>>,
@@ -3813,43 +3521,6 @@ impl FailingOverloadSelection {
 }
 
 impl<'db> CallableBinding<'db> {
-    /// Check this callable's committed arguments, including its implicit receiver.
-    fn arguments_satisfy_declared_parameters(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        arguments: &CallArguments<'_, 'db>,
-    ) -> bool {
-        if self.lookup_has_unproved_inputs {
-            return false;
-        }
-        let arguments = arguments.with_self(self.bound_type);
-        if let Some(result) = &self.overload_call_result {
-            if self
-                .matching_overloads()
-                .any(|(_, binding)| binding.nested_call_has_unproved_inputs)
-            {
-                return false;
-            }
-            return match result {
-                OverloadCallResult::ArgumentTypeExpansion(expanded) => expanded
-                    .proved_arguments
-                    .as_ref()
-                    .is_some_and(|proved| proved.matches(&arguments)),
-                OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => false,
-                // A signature can cover the whole call even when other matching overloads
-                // leave its return type ambiguous.
-                OverloadCallResult::Ambiguous => self.matching_overloads().any(|(_, binding)| {
-                    binding.arguments_satisfy_declared_parameters(db, env, &arguments)
-                }),
-            };
-        }
-        let Ok((_, binding)) = self.matching_overloads().exactly_one() else {
-            return false;
-        };
-        binding.arguments_satisfy_declared_parameters(db, env, &arguments)
-    }
-
     pub(crate) fn from_overloads(
         signature_type: Type<'db>,
         overloads: impl IntoIterator<Item = Signature<'db>>,
@@ -3886,7 +3557,6 @@ impl<'db> CallableBinding<'db> {
             signature_type,
             is_implicitly_invoked: false,
             dunder_call_is_possibly_unbound: false,
-            lookup_has_unproved_inputs: false,
             bound_type: None,
             overload_call_result: None,
             matching_overload_before_type_checking: None,
@@ -3900,7 +3570,6 @@ impl<'db> CallableBinding<'db> {
             signature_type,
             is_implicitly_invoked: false,
             dunder_call_is_possibly_unbound: false,
-            lookup_has_unproved_inputs: false,
             bound_type: None,
             overload_call_result: None,
             matching_overload_before_type_checking: None,
@@ -4430,7 +4099,6 @@ impl<'db> CallableBinding<'db> {
             // The return types of each of the expanded argument lists that evaluated successfully.
             let mut return_types = Vec::new();
             let mut selected_overloads = SmallVec::<[usize; 2]>::new();
-            let mut inputs_proved = call_arguments.requests_input_proof();
             let mut type_guard_argument = TypeGuardArgument::NoTarget;
 
             for expanded_arguments in &expanded_argument_lists {
@@ -4515,21 +4183,6 @@ impl<'db> CallableBinding<'db> {
                     }
                 };
 
-                // Check each alternative while its exact argument matches are still available.
-                // The merged state below retains only one representative per overload.
-                inputs_proved = inputs_proved
-                    && !is_ambiguous
-                    && self
-                        .matching_overloads()
-                        .exactly_one()
-                        .is_ok_and(|(_, binding)| {
-                            binding.arguments_satisfy_declared_parameters(
-                                db,
-                                env,
-                                expanded_arguments,
-                            )
-                        });
-
                 // This split between initializing and updating the merged evaluation state is
                 // required because otherwise it's difficult to differentiate between the
                 // following:
@@ -4586,7 +4239,6 @@ impl<'db> CallableBinding<'db> {
                     Box::new(ExpandedOverloadCall {
                         return_type: UnionType::from_elements(db, env, return_types),
                         selected_overloads,
-                        proved_arguments: inputs_proved.then(|| call_arguments.snapshot()),
                         type_guard_argument,
                     }),
                 ));
@@ -5464,7 +5116,6 @@ enum OverloadCallResult<'db> {
 struct ExpandedOverloadCall<'db> {
     return_type: Type<'db>,
     selected_overloads: SmallVec<[usize; 2]>,
-    proved_arguments: Option<CallArgumentsSnapshot<'db>>,
     /// The target must agree before expansion snapshots discard individual argument matches.
     type_guard_argument: TypeGuardArgument,
 }
@@ -8210,9 +7861,6 @@ pub(crate) struct Binding<'db> {
     /// Return type of the call.
     pub(crate) return_ty: Type<'db>,
 
-    /// Requirements of implicit calls made by a known callable during this evaluation.
-    nested_call_has_unproved_inputs: bool,
-
     /// Constructor metadata used to normalize the declared return type before type checking.
     constructor_context: Option<ConstructorContext<'db>>,
 
@@ -8242,469 +7890,10 @@ pub(crate) struct Binding<'db> {
 }
 
 impl<'db> Binding<'db> {
-    /// Check one matched signature against arguments that already include any bound receiver.
-    pub(super) fn arguments_satisfy_declared_parameters(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        arguments: &CallArguments<'_, 'db>,
-    ) -> bool {
-        if self.nested_call_has_unproved_inputs {
-            return false;
-        }
-        let parameters = self.signature.parameters();
-        if !parameters.is_standard() {
-            return false;
-        }
-        if arguments.len() != self.argument_matches.len() {
-            return false;
-        }
-        // With no supplied values or implicit receiver, no input pair needs specialization.
-        if arguments.len() == 0 {
-            return true;
-        }
-        let mut pairs = Vec::new();
-        let mut proved_receiver = None;
-        let mut definitely_supplied = vec![false; parameters.len()];
-        let mut supplied_keywords = FxHashSet::default();
-        let mut remainder_exclusions: Option<FxHashSet<Name>> = None;
-        let mut capture_supported = true;
-        let matched = arguments
-            .iter()
-            .zip(&self.argument_matches)
-            .enumerate()
-            .all(|(index, ((argument, types), matched))| {
-                let mut required_keywords = None;
-                let mut keyword_names = FxHashSet::default();
-                let mut excluded_keywords = FxHashSet::default();
-                let mut keyword_remainder = false;
-                let empty_keywords = match argument {
-                    Argument::Variadic => return false,
-                    Argument::Keywords => {
-                        capture_supported = false;
-                        // Ordinary mapping matching can assume names are present. Proof requires
-                        // the existing inventory to cover the keys and every residual value.
-                        if let Some(unpacking) = arguments.known_unpacking(index) {
-                            let KnownUnpacking::Keywords(keywords) = unpacking else {
-                                return false;
-                            };
-                            for item in &keywords.items {
-                                if item.kind == DictionaryItemKind::Residual
-                                    && item.ty.resolve_type_alias(db).is_never()
-                                {
-                                    excluded_keywords.insert(item.name.clone());
-                                } else {
-                                    keyword_names.insert(item.name.clone());
-                                }
-                            }
-                            excluded_keywords.extend(keywords.excluded_names.iter().cloned());
-                            keyword_remainder = keywords
-                                .extra_items
-                                .is_some_and(|ty| !ty.resolve_type_alias(db).is_never());
-                            required_keywords = Some(
-                                keywords
-                                    .items
-                                    .iter()
-                                    .filter(|item| item.is_required())
-                                    .map(|item| item.name.clone())
-                                    .collect::<FxHashSet<_>>(),
-                            );
-                            keyword_names.is_empty() && !keyword_remainder
-                        } else {
-                            let Some(unpacked) = types.get_default().and_then(|ty| {
-                                extract_unpacked_typed_dict_from_value_type(db, env, ty)
-                            }) else {
-                                return false;
-                            };
-                            for (name, key) in &unpacked.keys {
-                                if key.kind == DictionaryItemKind::Residual
-                                    && key.value_ty.resolve_type_alias(db).is_never()
-                                {
-                                    excluded_keywords.insert(name.clone());
-                                } else {
-                                    keyword_names.insert(name.clone());
-                                }
-                            }
-                            keyword_remainder = !unpacked.openness.is_closed();
-                            required_keywords = Some(
-                                unpacked
-                                    .keys
-                                    .iter()
-                                    .filter(|(_, key)| key.kind == DictionaryItemKind::Required)
-                                    .map(|(name, _)| name.clone())
-                                    .collect::<FxHashSet<_>>(),
-                            );
-                            keyword_names.is_empty() && !keyword_remainder
-                        }
-                    }
-                    Argument::Synthetic => false,
-                    Argument::Positional => false,
-                    Argument::Keyword(name) => {
-                        keyword_names.insert(Name::new(name));
-                        false
-                    }
-                };
-                if empty_keywords {
-                    return matched.parameters.is_empty();
-                }
-                if !matched.matched || matched.parameters.is_empty() {
-                    return false;
-                }
-                if parameters.keyword_variadic().is_none()
-                    && (keyword_remainder
-                        || keyword_names
-                            .iter()
-                            .any(|name| parameters.keyword_by_name(name).is_none()))
-                {
-                    return false;
-                }
-                // An implicit open tail is matched only to **kwargs by ordinary checking.
-                // Decline if it can also reach a named formal without a retained value pair.
-                if keyword_remainder
-                    && parameters.iter().enumerate().any(|(index, parameter)| {
-                        parameter.keyword_name().is_some_and(|name| {
-                            !excluded_keywords.contains(name)
-                                && !matched.iter().any(|matched| matched.index == index)
-                        })
-                    })
-                {
-                    return false;
-                }
-                capture_supported &= matched.parameters.len() == 1;
-                let valid_pairs = matched.iter().all(|matched_parameter| {
-                    let Some(parameter) = parameters.get(matched_parameter.index) else {
-                        return false;
-                    };
-                    if matches!(argument, Argument::Synthetic | Argument::Positional)
-                        && let Some(name) = parameter.keyword_name()
-                    {
-                        keyword_names.insert(name.clone());
-                    }
-                    definitely_supplied[matched_parameter.index] |=
-                        required_keywords.as_ref().is_none_or(|required| {
-                            parameter
-                                .keyword_name()
-                                .is_some_and(|name| required.contains(name))
-                        });
-                    if parameter.has_starred_annotation() {
-                        return false;
-                    }
-                    let Some(actual) = matched_parameter.argument_type(parameter, types) else {
-                        return false;
-                    };
-                    let expected = matched_parameter
-                        .expected_type
-                        .unwrap_or_else(|| parameter.annotated_type());
-                    if actual.has_indeterminate_inference(db, env)
-                        || expected.has_indeterminate_inference(db, env)
-                    {
-                        return false;
-                    }
-                    if index == 0
-                        && matches!(argument, Argument::Synthetic)
-                        && matched_parameter.index == 0
-                        && self.signature.has_implicit_positional_receiver_annotation()
-                        && matches!(actual, Type::NominalInstance(_))
-                        && actual == expected
-                        && self.constructor_context.is_some_and(|context| {
-                            context.kind() == constructor::ConstructorCallableKind::Init
-                                && context.instance_type() == actual
-                        })
-                    {
-                        // Constructor binding creates this receiver with its call-local class
-                        // variables. Supplied arguments still determine their specialization.
-                        return true;
-                    }
-                    if index == 0
-                        && matches!(argument, Argument::Synthetic)
-                        && matched_parameter.index == 0
-                        && self.constructor_context.is_none()
-                        && let Type::BoundMethod(method) = self.callable_type
-                        && method.signature_receiver(db) == actual
-                        && self.signature.has_implicit_positional_receiver_annotation()
-                        && let Some(receiver) = self.signature.unused_self_typevar(db, env)
-                        && expected == Type::TypeVar(receiver)
-                        && let Some(bound) = receiver.typevar(db).upper_bound(db, env)
-                        && matches!(bound, Type::NominalInstance(_))
-                        && match actual {
-                            Type::NominalInstance(_) => actual == bound,
-                            Type::Intersection(intersection) => {
-                                intersection.positive(db).contains(&bound)
-                            }
-                            _ => false,
-                        }
-                    {
-                        // An unused inferred Self repeats the nominal domain established by
-                        // method binding. That same domain remains a positive intersection
-                        // component after narrowing; other components only restrict the receiver.
-                        proved_receiver = Some(receiver);
-                    } else {
-                        pairs.push((actual, expected));
-                    }
-                    true
-                });
-                // Different keyword sources must be disjoint even when they all feed **kwargs.
-                // An open remainder can overlap every name it does not explicitly exclude.
-                if !valid_pairs
-                    || (keyword_remainder && !supplied_keywords.is_subset(&excluded_keywords))
-                    || remainder_exclusions.as_ref().is_some_and(|excluded| {
-                        keyword_remainder || !keyword_names.is_subset(excluded)
-                    })
-                    || keyword_names
-                        .into_iter()
-                        .any(|name| !supplied_keywords.insert(name))
-                {
-                    return false;
-                }
-                if keyword_remainder {
-                    remainder_exclusions = Some(excluded_keywords);
-                }
-                true
-            });
-        if !matched {
-            return false;
-        }
-        // Ordinary binding accepts possibly present keyword fields. Input proof additionally
-        // requires every parameter without a default to be supplied on every represented path.
-        if parameters.iter().enumerate().any(|(index, parameter)| {
-            !parameter.has_default()
-                && !parameter.is_variadic()
-                && !parameter.is_keyword_variadic()
-                && !definitely_supplied[index]
-        }) {
-            return false;
-        }
-        let pair_is_proved = |actual: Type<'db>, expected: Type<'db>| {
-            (expected.is_fully_static_except_any(db, env)
-                && actual.satisfies_declared_output(db, env, expected))
-                // Subtyping checks every materialization, including the formal's unknown parts.
-                || actual.is_subtype_of(db, env, expected)
-        };
-        let complete_inference = match self.inference {
-            Some(inference) => {
-                matches!(inference.solutions(db), TypeVarInferenceSolutions::Single)
-            }
-            None => self.signature.generic_context.is_none(),
-        };
-        if !complete_inference {
-            // The rigid relation can prove a pair for every choice of the formal's variables.
-            // Inferable variables in the supplied type still depend on unfinished inference.
-            return pairs.iter().all(|(actual, expected)| {
-                !any_over_type(db, env, *actual, true, |ty| {
-                    ty.as_typevar()
-                        .is_some_and(|typevar| typevar.is_inferable(db, self.inferable_typevars))
-                }) && pair_is_proved(*actual, *expected)
-            });
-        }
-        let specialization = self.partial_specialization(db, env);
-        if let Some(specialization) = specialization {
-            for (actual, expected) in &mut pairs {
-                *actual = actual.apply_specialization(db, specialization);
-                let expected = expected.apply_specialization(db, specialization);
-                if actual.has_indeterminate_inference(db, env)
-                    || expected.has_indeterminate_inference(db, env)
-                {
-                    return false;
-                }
-            }
-        }
-        let declarations_proved = specialization.is_none_or(|specialization| {
-            let context = specialization.generic_context(db);
-            let required = parameter_typevars(db, env, context, &pairs);
-            context
-                .variables(db)
-                .zip(specialization.types(db))
-                .all(|(variable, solution)| {
-                    if !required.contains(&variable.identity(db)) {
-                        return true;
-                    }
-                    let satisfies = |bound: Type<'db>| {
-                        pair_is_proved(
-                            *solution,
-                            bound
-                                .apply_specialization(db, specialization)
-                                .top_materialization(db, env),
-                        )
-                    };
-                    let Some(domain) = variable.typevar(db).bound_or_constraints(db, env) else {
-                        return true;
-                    };
-                    match domain {
-                        TypeVarBoundOrConstraints::UpperBound(bound) => satisfies(bound),
-                        TypeVarBoundOrConstraints::Constraints(constraints) => {
-                            constraints.elements(db).iter().copied().any(satisfies)
-                        }
-                    }
-                })
-        });
-        let direct = declarations_proved
-            && pairs.iter().enumerate().all(|(index, (actual, expected))| {
-                let expected = specialization.map_or(*expected, |specialization| {
-                    expected.apply_specialization(db, specialization)
-                });
-                pair_is_proved(*actual, expected)
-                    || (index == 0
-                        && matches!(arguments.iter().next(), Some((Argument::Synthetic, _)))
-                        && self.explicit_receiver_satisfies_declared_parameter(
-                            db, env, *actual, expected,
-                        ))
-            });
-        direct
-            || (capture_supported
-                && self.signature.generic_context.is_some()
-                && specialization.is_some_and(|specialization| {
-                    let specialization = if let Some(receiver) = proved_receiver {
-                        let context = GenericContext::from_typevar_instances(
-                            db,
-                            env,
-                            specialization
-                                .generic_context(db)
-                                .variables(db)
-                                .filter(|variable| variable.identity(db) != receiver.identity(db)),
-                        );
-                        let Some(specialization) = specialization.restrict(db, context) else {
-                            return false;
-                        };
-                        specialization
-                    } else {
-                        specialization
-                    };
-                    generic_arguments_satisfy_declared_parameters(db, env, specialization, &pairs)
-                }))
-    }
-
-    /// Prove a captured receiver against its resolved explicit self annotation.
-    fn explicit_receiver_satisfies_declared_parameter(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        actual: Type<'db>,
-        expected: Type<'db>,
-    ) -> bool {
-        if self.constructor_context.is_some()
-            || self.signature.generic_context.is_some()
-            || self.signature.has_implicit_positional_receiver_annotation()
-            || self.source_parameter_index_offset != 0
-            || !matches!(actual, Type::NominalInstance(_))
-        {
-            return false;
-        }
-        let Type::BoundMethod(method) = self.callable_type else {
-            return false;
-        };
-        if method.class_method(db) || method.signature_receiver(db) != actual {
-            return false;
-        }
-        let Some(function) = method.function(db) else {
-            return false;
-        };
-        if function.is_staticmethod(db) || function.is_classmethod(db) {
-            return false;
-        }
-        let Some((origin, specialization)) = actual.class_specialization(db, env) else {
-            return false;
-        };
-        if specialization.materialization_kind(db).is_some() {
-            return false;
-        }
-        let resolve = |specialization| {
-            let class = origin.apply_specialization(db, |_| specialization);
-            let Place::Defined(DefinedPlace {
-                ty,
-                origin: _,
-                definedness: Definedness::AlwaysDefined,
-                public_type_policy: _,
-                provenance: _,
-            }) = class
-                .class_member(db, env, function.name(db), MemberLookupPolicy::empty())
-                .place
-            else {
-                return None;
-            };
-            ty.as_function_literal()
-        };
-        // Resolved members include decorators. Exact function and signature identity tie
-        // this overload to the class member whose class arguments we can reconstruct.
-        let Some(resolved) = resolve(specialization) else {
-            return false;
-        };
-        if resolved != function {
-            return false;
-        }
-        let select = |function: FunctionType<'db>| {
-            function
-                .signature(db)
-                .iter()
-                .enumerate()
-                .filter(|(index, signature)| {
-                    signature.source_overload_index().unwrap_or(*index)
-                        == self.source_overload_index
-                })
-                .exactly_one()
-                .ok()
-                .map(|(_, signature)| signature)
-        };
-        let Some(resolved_signature) = select(resolved) else {
-            return false;
-        };
-        if resolved_signature != &self.signature
-            || resolved_signature
-                .parameters()
-                .get(0)
-                .map(Parameter::annotated_type)
-                != Some(expected)
-        {
-            return false;
-        }
-        // Static class arguments stay fixed; class variables represent every possible
-        // materialization of each gradual argument.
-        let context = specialization.generic_context(db);
-        let mut slots = Vec::new();
-        for (variable, slot) in context.variables(db).zip(specialization.types(db)) {
-            if variable.is_paramspec(db)
-                || variable.is_typevartuple(db)
-                || variable.typevar(db).bound_or_constraints(db, env).is_some()
-            {
-                return false;
-            }
-            slots.push(if slot.is_fully_static(db, env) {
-                *slot
-            } else {
-                Type::TypeVar(variable)
-            });
-        }
-        let rigid = context.specialize(db, slots);
-        let Some(resolved_rigid) = resolve(rigid) else {
-            return false;
-        };
-        if resolved_rigid.literal(db) != function.literal(db) {
-            return false;
-        }
-        let Some(rigid_signature) = select(resolved_rigid) else {
-            return false;
-        };
-        let Some(receiver_parameter) = rigid_signature.parameters().get(0) else {
-            return false;
-        };
-        // Both sides share only class-derived slots. An independent bare annotation keeps
-        // its unknown domain, and every supplied argument is checked separately.
-        let receiver = Type::instance(db, env, origin.apply_specialization(db, |_| rigid));
-        receiver.is_subtype_of(db, env, receiver_parameter.annotated_type())
-    }
-
-    /// Infers finite runtime lookups while retaining their implicit call requirements.
-    fn infer_getattr(
-        &mut self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        request_input_proof: bool,
-    ) {
-        self.nested_call_has_unproved_inputs = true;
-        if let Some((return_type, inputs_proved)) =
-            self.getattr_call_result(db, env, request_input_proof)
-        {
+    /// Infers finite runtime lookups.
+    fn infer_getattr(&mut self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) {
+        if let Some(return_type) = self.getattr_call_result(db, env) {
             self.set_return_type(return_type);
-            self.nested_call_has_unproved_inputs = !(request_input_proof && inputs_proved);
         }
     }
 
@@ -8713,8 +7902,7 @@ impl<'db> Binding<'db> {
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
-        request_input_proof: bool,
-    ) -> Option<(Type<'db>, bool)> {
+    ) -> Option<Type<'db>> {
         let (instance, names, default) = match self.parameter_types() {
             [Some(instance), Some(names)] => (*instance, *names, None),
             [Some(instance), Some(names), default] => (*instance, *names, *default),
@@ -8724,13 +7912,9 @@ impl<'db> Binding<'db> {
             Type::Union(union) => union.expand_aliases(db, env),
             names => names,
         };
-        let mut policy = MemberLookupPolicy::RUNTIME_ATTRIBUTE
+        let policy = MemberLookupPolicy::RUNTIME_ATTRIBUTE
             | MemberLookupPolicy::PRESERVE_MISSING_ALTERNATIVES;
-        if request_input_proof {
-            policy |= MemberLookupPolicy::PROVE_GETTER_INPUTS;
-        }
-        let mut inputs_proved = true;
-        let mut lookup = |name: &Type<'db>| {
+        let lookup = |name: &Type<'db>| {
             let name = name.as_string_literal()?;
             let member = instance
                 .member_lookup_with_policy_and_receiver(db, env, name.value(db), policy, None)
@@ -8764,7 +7948,6 @@ impl<'db> Binding<'db> {
             if dynamic {
                 return None;
             }
-            inputs_proved &= member.inputs_proved(db);
             Some(ty)
         };
         let result = match names {
@@ -8774,9 +7957,11 @@ impl<'db> Binding<'db> {
         let result = result?;
         // A present descriptor can raise AttributeError, causing getattr to return
         // the supplied default. Static boundness does not establish getter totality.
-        Some((
-            UnionType::from_two_elements(db, env, result, default.unwrap_or(Type::Never)),
-            inputs_proved,
+        Some(UnionType::from_two_elements(
+            db,
+            env,
+            result,
+            default.unwrap_or(Type::Never),
         ))
     }
 
@@ -8788,16 +7973,10 @@ impl<'db> Binding<'db> {
         getter: Type<'db>,
         instance: Type<'db>,
         argument_index_offset: usize,
-        request_input_proof: bool,
     ) {
-        let arguments =
-            CallArguments::positional([instance]).with_input_proof_request(request_input_proof);
-        self.nested_call_has_unproved_inputs = true;
+        let arguments = CallArguments::positional([instance]);
         match getter.try_call(db, env, &arguments) {
             Ok(bindings) => {
-                self.nested_call_has_unproved_inputs = !(request_input_proof
-                    && !bindings.has_only_constructor_items()
-                    && bindings.arguments_satisfy_declared_parameters(db, env, &arguments));
                 self.set_return_type(bindings.return_type(db, env));
             }
             Err(CallError(_, bindings)) => {
@@ -8854,7 +8033,6 @@ impl<'db> Binding<'db> {
             signature_type,
             return_ty,
             constructor_context: None,
-            nested_call_has_unproved_inputs: false,
             inferable_typevars: TypeVarSet::None,
             inference: None,
             is_partial_application: false,
@@ -9768,7 +8946,6 @@ impl<'db> Binding<'db> {
     fn snapshot(&self) -> BindingSnapshot<'db> {
         BindingSnapshot {
             return_ty: self.return_ty,
-            nested_call_has_unproved_inputs: self.nested_call_has_unproved_inputs,
             inferable_typevars: self.inferable_typevars,
             inference: self.inference,
             argument_matches: self.argument_matches.clone(),
@@ -9780,7 +8957,6 @@ impl<'db> Binding<'db> {
     fn restore(&mut self, snapshot: BindingSnapshot<'db>) {
         let BindingSnapshot {
             return_ty,
-            nested_call_has_unproved_inputs,
             inferable_typevars,
             inference,
             argument_matches,
@@ -9789,7 +8965,6 @@ impl<'db> Binding<'db> {
         } = snapshot;
 
         self.return_ty = return_ty;
-        self.nested_call_has_unproved_inputs = nested_call_has_unproved_inputs;
         self.inferable_typevars = inferable_typevars;
         self.inference = inference;
         self.argument_matches = argument_matches;
@@ -9826,7 +9001,6 @@ impl<'db> Binding<'db> {
     /// Resets the state of this binding to its initial state.
     fn reset(&mut self, db: &'db dyn Db) {
         self.return_ty = self.initial_return_type(db);
-        self.nested_call_has_unproved_inputs = false;
         self.inferable_typevars = TypeVarSet::None;
         self.inference = None;
         self.argument_matches = Box::from([]);
@@ -9838,7 +9012,6 @@ impl<'db> Binding<'db> {
 #[derive(Clone, Debug)]
 struct BindingSnapshot<'db> {
     return_ty: Type<'db>,
-    nested_call_has_unproved_inputs: bool,
     inferable_typevars: TypeVarSet<'db>,
     inference: Option<TypeVarInference<'db>>,
     argument_matches: Box<[MatchedArgument<'db>]>,
@@ -9876,13 +9049,10 @@ impl<'db> CallableBindingSnapshot<'db> {
                 // evaluated successfully and this is the matching overload.
                 //
                 // Clear the errors from the snapshot of this overload to signal this change ...
-                let previously_matched = snapshot.errors.is_empty();
                 snapshot.errors.clear();
 
                 // ... and update the snapshot with the current state of the binding.
                 snapshot.return_ty = binding.return_ty;
-                snapshot.nested_call_has_unproved_inputs = binding.nested_call_has_unproved_inputs
-                    || (previously_matched && snapshot.nested_call_has_unproved_inputs);
                 snapshot.inferable_typevars = binding.inferable_typevars;
                 snapshot.inference = binding.inference;
                 snapshot
@@ -11635,12 +10805,11 @@ mod tests {
 
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::global_symbol;
-    use crate::types::BoundMethodType;
     use crate::types::constraints::resolution::SolutionType::Resolved;
     use crate::types::generics::TypeVarInferenceSolutions;
 
     #[test]
-    fn expanded_inputs_do_not_skip_implicit_calls() -> anyhow::Result<()> {
+    fn expanded_getattr_retains_overload_results() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(
             "/src/a.py",
@@ -11665,8 +10834,7 @@ mod tests {
         let receiver = global_symbol(&db, file, "receiver").place.expect_type();
         let names = ["a_bad", "b_good", "c_good"].map(|name| Type::string_literal(&db, name));
         let int = KnownClass::Int.to_instance(&db, &env);
-        // The first overload is selected twice. Its merged parameter state retains b_good,
-        // so evaluating implicit getters only after that merge cannot establish a_bad's inputs.
+        // The first overload is selected twice. Its merged parameter state retains b_good.
         let signatures = [
             UnionType::from_elements(&db, &env, names[..2].iter().copied()),
             names[2],
@@ -11686,8 +10854,7 @@ mod tests {
             (names[1], true),
             (UnionType::from_elements(&db, &env, names), false),
         ] {
-            let arguments =
-                CallArguments::positional([receiver, name]).with_input_proof_request(true);
+            let arguments = CallArguments::positional([receiver, name]);
             let bindings = Bindings::from(CallableBinding::from_overloads(
                 callable,
                 signatures.clone(),
@@ -11714,284 +10881,10 @@ mod tests {
                 let Some(result) = &callable.overload_call_result else {
                     anyhow::bail!("expected an overload result");
                 };
-                let OverloadCallResult::ArgumentTypeExpansion(expanded) = result else {
+                let OverloadCallResult::ArgumentTypeExpansion(_) = result else {
                     anyhow::bail!("expected successful argument expansion");
                 };
-                assert!(expanded.proved_arguments.is_some());
             }
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(&db, &env, &arguments),
-                expected
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn call_argument_correspondence_preserves_ordinary_binding() -> anyhow::Result<()> {
-        let mut db = setup_db();
-        db.write_dedented(
-            "/src/a.py",
-            r#"
-            from typing import Callable, Protocol
-
-            class Named(Protocol):
-                def __call__(self, *, name: str) -> None: ...
-
-            class Closed:
-                def __init__(self, callback: Named) -> None: ...
-
-            class Omitted:
-                def __init__(self, callback: Callable[..., None]) -> None: ...
-
-            class TwoStages:
-                def __new__(cls, callback: Callable[..., None]) -> TwoStages: ...
-                def __init__(self, callback: Named) -> None: ...
-
-            class Factory:
-                def __init__(self, cls: object, callback: Callable[..., None]) -> None: ...
-
-            class Wrapped:
-                __new__ = Factory
-                def __init__(self, callback: Named) -> None: ...
-
-            class NewClosed:
-                def __new__(cls, callback: Named) -> NewClosed: ...
-
-            class NewOmitted:
-                def __new__(cls, callback: Callable[..., None]) -> NewOmitted: ...
-
-            class NewFactory:
-                def __new__(cls, outer: object, callback: Callable[..., None]) -> NewFactory: ...
-                def __init__(self, outer: object, callback: Named) -> None: ...
-
-            class NewWrapped:
-                __new__ = NewFactory
-
-            integer = int
-            numeric_range = range
-            string = str
-
-            def closed(callback: Named) -> None: ...
-            def omitted(callback: Callable[..., None]) -> None: ...
-            values: list[Named] = []
-            append = values.append
-            "#,
-        )?;
-        let db = &db;
-        let env = db.program_environment();
-        let file = system_path_to_file(db, "/src/a.py")?;
-        let file = ProgramFile::new(db, file, env.program(db));
-        let name = Parameter::keyword_only(Name::new_static("name"))
-            .with_annotated_type(KnownClass::Str.to_instance(db, &env));
-        let parameters = Parameters::standard([name]);
-        let complete = Type::function_like_callable(
-            db,
-            Signature::new(parameters.clone(), Type::none(db, &env)),
-        );
-        let incomplete = Type::function_like_callable(
-            db,
-            Signature::new(parameters.with_incomplete_shape(), Type::none(db, &env)),
-        );
-        for (name, argument, expected, return_type, single_entry) in [
-            ("closed", complete, true, Some("None"), true),
-            ("closed", incomplete, false, Some("None"), true),
-            ("omitted", incomplete, true, Some("None"), true),
-            ("append", complete, true, Some("None"), true),
-            ("append", incomplete, false, Some("None"), true),
-            ("Closed", complete, true, Some("Closed"), true),
-            ("Closed", incomplete, false, Some("Closed"), true),
-            ("Omitted", incomplete, true, Some("Omitted"), true),
-            ("TwoStages", incomplete, false, Some("TwoStages"), false),
-            ("Wrapped", incomplete, true, None, false),
-            ("NewClosed", complete, true, Some("NewClosed"), true),
-            ("NewClosed", incomplete, false, Some("NewClosed"), true),
-            ("NewOmitted", incomplete, true, Some("NewOmitted"), true),
-            ("NewWrapped", incomplete, false, None, false),
-            (
-                "integer",
-                KnownClass::Str.to_instance(db, &env),
-                true,
-                Some("int"),
-                true,
-            ),
-            (
-                "numeric_range",
-                KnownClass::Int.to_instance(db, &env),
-                true,
-                Some("range"),
-                true,
-            ),
-            (
-                "string",
-                KnownClass::Object.to_instance(db, &env),
-                true,
-                Some("str"),
-                true,
-            ),
-        ] {
-            let callable = global_symbol(db, file, name).place.expect_type();
-            let arguments = CallArguments::positional([argument]);
-            let constraints = ConstraintSetBuilder::new();
-            let bindings = callable
-                .bindings(db, &env)
-                .match_parameters(db, &env, &arguments);
-            assert_eq!(
-                bindings
-                    .argument_correspondence_callables(&arguments)
-                    .is_some(),
-                single_entry,
-                "{name}",
-            );
-            let bindings = bindings
-                .check_types(
-                    db,
-                    &env,
-                    &constraints,
-                    &arguments,
-                    TypeContext::default(),
-                    &[],
-                )
-                .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
-            let ordinary_return = bindings.return_type(db, &env);
-            if let Some(return_type) = return_type {
-                assert_eq!(ordinary_return.display(db, &env).to_string(), return_type);
-            }
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                expected,
-                "{name}: {}",
-                argument.display(db, &env),
-            );
-            assert!(bindings.as_result(db).is_ok());
-            assert_eq!(bindings.return_type(db, &env), ordinary_return);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn argument_correspondence_preserves_gradual_input_domains() -> anyhow::Result<()> {
-        let mut db = setup_db();
-        db.write_dedented(
-            "/src/a.py",
-            r#"
-            type Recursive[T] = list[Recursive[T]] | T
-            type Growing[T] = T | list[Growing[list[T]]]
-            recursive: Recursive[int]
-            growing: Growing[int]
-            "#,
-        )?;
-        let env = db.program_environment();
-        let file = system_path_to_file(&db, "/src/a.py")?;
-        let file = ProgramFile::new(&db, file, env.program(&db));
-        let recursive = global_symbol(&db, file, "recursive").place.expect_type();
-        assert!(
-            any_over_type(&db, &env, recursive.resolve_type_alias(&db), false, |ty| {
-                ty == recursive
-            }),
-            "the fixture must retain its recursive reference: {}",
-            recursive.resolve_type_alias(&db).display(&db, &env),
-        );
-        let growing = global_symbol(&db, file, "growing").place.expect_type();
-        assert!(
-            matches!(
-                growing.to_type_identity(&db),
-                TypeIdentity::GrowingTypeAlias(_)
-            ),
-            "the fixture must retain potentially growing specialization",
-        );
-        let none = Type::none(&db, &env);
-        let any = Type::any();
-        let unknown = Type::unknown();
-        let str = KnownClass::Str.to_instance(&db, &env);
-        let optional_unknown = UnionType::from_two_elements(&db, &env, none, unknown);
-        let list = |element| KnownClass::List.to_specialized_instance(&db, &env, &[element]);
-        let object = KnownClass::Object.to_instance(&db, &env);
-        let provisional = UnionType::from_two_elements(
-            &db,
-            &env,
-            none,
-            Type::Dynamic(DynamicType::UnspecializedTypeVar),
-        );
-        let divergent = UnionType::from_two_elements(
-            &db,
-            &env,
-            none,
-            Type::divergent(salsa::plumbing::Id::from_bits(1)),
-        );
-        assert!(
-            any_over_type(&db, &env, divergent, false, |ty| ty.is_divergent()),
-            "the known union arm must retain divergence in the test input",
-        );
-        assert!(
-            provisional.has_provisional_marker(&db, &env),
-            "the known union arm must not erase the provisional test input",
-        );
-        let Type::TypeAlias(alias) = recursive else {
-            panic!("expected the recursive alias constructor");
-        };
-        let recursive_marker = Type::TypeAlias(
-            alias.apply_specialization(&db, |context| context.specialize(&db, vec![provisional])),
-        );
-        assert!(
-            recursive_marker
-                .resolve_type_alias(&db)
-                .has_provisional_marker(&db, &env),
-            "the recursive branch must retain its hidden placeholder",
-        );
-        let callable = |input| {
-            Type::function_like_callable(
-                &db,
-                Signature::new(
-                    Parameters::standard([
-                        Parameter::positional_only(None).with_annotated_type(input)
-                    ]),
-                    none,
-                ),
-            )
-        };
-        for (name, actual, expected, proved) in [
-            ("known arm", none, optional_unknown, true),
-            ("other type", str, optional_unknown, false),
-            ("unknown value", unknown, optional_unknown, false),
-            ("Any value", any, optional_unknown, false),
-            ("unknown domain", none, unknown, false),
-            ("invariant", list(none), list(optional_unknown), false),
-            ("broad callback", callable(object), callable(unknown), true),
-            ("narrow callback", callable(str), callable(unknown), false),
-            ("explicit Any domain", none, any, true),
-            ("explicit Any value", any, any, true),
-            ("provisional domain", none, provisional, false),
-            ("provisional value", provisional, object, false),
-            ("divergent domain", none, divergent, false),
-            ("divergent value", divergent, object, false),
-            ("divergent Any value", divergent, any, false),
-            ("recursive object", recursive, object, true),
-            ("recursive Any", recursive, any, true),
-            ("recursive marker", recursive_marker, object, false),
-            ("growing object", growing, object, false),
-        ] {
-            let arguments = CallArguments::positional([actual]);
-            let bindings = callable(expected)
-                .bindings(&db, &env)
-                .match_parameters(&db, &env, &arguments)
-                .check_types(
-                    &db,
-                    &env,
-                    &ConstraintSetBuilder::new(),
-                    &arguments,
-                    TypeContext::default(),
-                    &[],
-                )
-                .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
-            assert_eq!(bindings.return_type(&db, &env), none, "{name}");
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(&db, &env, &arguments),
-                proved,
-                "{name}: {} -> {}",
-                actual.display(&db, &env),
-                expected.display(&db, &env),
-            );
         }
         Ok(())
     }
@@ -12033,14 +10926,14 @@ mod tests {
         else {
             panic!("expected two type variables");
         };
-        for (name, argument, expected) in [
-            ("produce", Type::int_literal(1), true),
-            ("unresolved_actual", Type::TypeVar(variable), false),
-            ("bounded", Type::int_literal(1), true),
-            ("closed", narrow, false),
-            ("dependent", Type::unknown(), false),
-            ("optional", lookup("no_result"), true),
-            ("optional", lookup("gradual_input"), false),
+        for (name, argument) in [
+            ("produce", Type::int_literal(1)),
+            ("unresolved_actual", Type::TypeVar(variable)),
+            ("bounded", Type::int_literal(1)),
+            ("closed", narrow),
+            ("dependent", Type::unknown()),
+            ("optional", lookup("no_result")),
+            ("optional", lookup("gradual_input")),
         ] {
             let callable = global_symbol(db, file, name).place.expect_type();
             let arguments = CallArguments::positional([argument]);
@@ -12058,11 +10951,7 @@ mod tests {
                 )
                 .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
             let ordinary_return = bindings.return_type(db, &env);
-            let Ok(callable) = bindings
-                .argument_correspondence_callables(&arguments)
-                .unwrap()
-                .exactly_one()
-            else {
+            let Ok(callable) = bindings.iter_flat().exactly_one() else {
                 panic!("expected one callable for {name}");
             };
             let Ok((_, binding)) = callable.matching_overloads().exactly_one() else {
@@ -12085,474 +10974,6 @@ mod tests {
             } else {
                 assert!(ordinary_return.is_unknown());
             }
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                expected,
-                "{name}",
-            );
-            assert_eq!(bindings.return_type(db, &env), ordinary_return);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn generic_argument_correspondence_preserves_input_domains() -> anyhow::Result<()> {
-        let mut db = setup_db();
-        db.write_dedented(
-            "/src/a.py",
-            r#"
-from typing import Any, Callable, Iterable, Mapping, cast
-from typing_extensions import Self
-from ty_extensions._internal import TypeOf
-
-class Copy[T]:
-    items: list[T]
-    def __init__(self, items: Iterable[T]) -> None: ...
-
-class ExplicitCopy[T]:
-    items: list[T]
-    def __init__(self: "ExplicitCopy[int]", items: Iterable[T]) -> None: ...
-
-class SelfCopy[T]:
-    items: list[T]
-    def __init__(self, other: Self) -> None: ...
-
-class BoundedCopy[T: int]:
-    items: list[T]
-    def __init__(self, items: Iterable[T]) -> None: ...
-
-class Box[T]:
-    def accept(self, value: T) -> None: ...
-    def explicit(self: "Box[int]", value: int) -> None: ...
-
-class Ops:
-    def transport[K, V](self, value: dict[K, V]) -> None: ...
-
-def restricted_receiver(self: "Holder[str, int]") -> None: ...
-def replace(callback: object) -> TypeOf[restricted_receiver]: ...
-
-class Holder[K, V]:
-    items: dict[K, V]
-    def inspect(self: "Holder[K, V]") -> None: ...
-    def keyword(self: "Holder[K | str, V]") -> None: ...
-    def bare(self: "Holder") -> None: ...
-    @replace
-    def replaced(self: "Holder[K, V]") -> None: ...
-    def write(self: "Holder[K, V]", value: V) -> None: ...
-    def independent(self: "Holder[K, V]", other: "Holder[K, V]") -> None: ...
-    def transport[A, B](self, value: dict[A, B]) -> None: ...
-    def peer(self, other: Self) -> None: ...
-    def clone(self) -> Self: ...
-    def explicit[A, B](self: "Holder[str, int]", value: dict[A, B]) -> None: ...
-
-def attached[K, V](receiver, value: dict[K, V]) -> None: ...
-class Unrelated: ...
-
-type Identity[T] = T
-
-def list_kind[T](value: list[T]) -> str: ...
-def dict_kind[K, V](value: dict[K, V]) -> str: ...
-def select[K: str, V](value: Mapping[K, V]) -> V: ...
-def box_kind[T](value: Box[T]) -> str: ...
-def fixed(value: list) -> str: ...
-def declared_any(value: Any) -> str: ...
-def object_bound[T: object](value: list[T]) -> str: ...
-def unused_bound[T: int, U](value: U, unused: T = ...) -> str: ...
-def referenced_default[U: int, T = U](value: T) -> str: ...
-def bounded[T: int](value: list[T]) -> str: ...
-def constrained[T: (int, str)](value: list[T]) -> str: ...
-def constrained_pair[T: (int, str)](left: list[T], right: list[T]) -> str: ...
-def fixed_any[T](callback: Callable[[Any], int], other: list[T]) -> None: ...
-def correlate[T](left: list[T], right: list[T]) -> None: ...
-def put[T](values: list[T], value: T) -> None: ...
-def apply[T](callback: Callable[[T], int], value: T) -> int: ...
-def identity[T](value: list[T]) -> list[T]: ...
-
-fixed_copy = Copy[int]
-opaque_self_copy = cast(SelfCopy, None)
-int_self_copy = cast(SelfCopy[int], None)
-fixed_self_copy = SelfCopy[int]
-opaque_copy = cast(Copy, None)
-copy_init = opaque_copy.__init__
-int_copy = cast(Copy[int], None)
-opaque_box = cast(Box, None)
-ops = cast(Ops, None)
-opaque_holder = cast(Holder, None)
-static_holder = cast(Holder[str, int], None)
-incompatible_holder = cast(Holder[int, str], None)
-opaque_dict = cast(dict, None)
-static_dict = cast(dict[str, int], None)
-opaque_list = cast(list, None)
-ops_transport = ops.transport
-opaque_transport = opaque_holder.transport
-explicit_inspect = opaque_holder.inspect
-explicit_bare = opaque_holder.bare
-explicit_replaced = opaque_holder.replaced
-explicit_write = opaque_holder.write
-explicit_peer = opaque_holder.independent
-string_holder = cast(Holder[str, Any], None)
-explicit_keyword = string_holder.keyword
-peer = opaque_holder.peer
-clone = opaque_holder.clone
-unrelated = cast(Unrelated, None)
-static_explicit = static_holder.explicit
-static_transport = static_holder.transport
-explicit_transport = opaque_holder.explicit
-incompatible_transport = incompatible_holder.explicit
-box_accept = opaque_box.accept
-box_explicit = opaque_box.explicit
-list_append = opaque_list.append
-opaque_or = opaque_dict.__or__
-static_or = static_dict.__or__
-unbound_or = dict.__or__
-"#,
-        )?;
-        let db = &db;
-        let env = db.program_environment();
-        let file = system_path_to_file(db, "/src/a.py")?;
-        let file = ProgramFile::new(db, file, env.program(db));
-        let lookup = |name| global_symbol(db, file, name).place.expect_type();
-        let unknown = Type::unknown();
-        let int = KnownClass::Int.to_instance(db, &env);
-        let str = KnownClass::Str.to_instance(db, &env);
-        let list = |element| KnownClass::List.to_specialized_instance(db, &env, &[element]);
-        let dict = |key, value| KnownClass::Dict.to_specialized_instance(db, &env, &[key, value]);
-        let callback = Type::function_like_callable(
-            db,
-            Signature::new(
-                Parameters::standard([
-                    Parameter::positional_only(None).with_annotated_type(unknown)
-                ]),
-                int,
-            ),
-        );
-        let gradual_choice = IntersectionType::from_two_elements(
-            db,
-            &env,
-            Type::any(),
-            UnionType::from_two_elements(db, &env, int, str),
-        );
-        for (name, actuals, context, expected) in [
-            ("Copy", vec![list(unknown)], None, true),
-            ("Copy", vec![list(unknown)], Some(lookup("int_copy")), false),
-            ("fixed_copy", vec![list(unknown)], None, false),
-            ("ExplicitCopy", vec![list(unknown)], None, false),
-            ("SelfCopy", vec![lookup("opaque_self_copy")], None, true),
-            ("SelfCopy", vec![lookup("int_self_copy")], None, true),
-            (
-                "fixed_self_copy",
-                vec![lookup("opaque_self_copy")],
-                None,
-                false,
-            ),
-            ("BoundedCopy", vec![list(unknown)], None, false),
-            ("BoundedCopy", vec![list(Type::any())], None, false),
-            ("list_kind", vec![list(unknown)], None, true),
-            ("list_kind", vec![list(Type::any())], None, true),
-            ("declared_any", vec![Type::any()], None, true),
-            ("object_bound", vec![list(Type::any())], None, true),
-            ("unused_bound", vec![int], None, true),
-            ("referenced_default", vec![int], None, true),
-            ("referenced_default", vec![Type::any()], None, true),
-            ("dict_kind", vec![dict(unknown, unknown)], None, true),
-            ("select", vec![dict(str, list(unknown))], None, true),
-            ("box_kind", vec![lookup("opaque_box")], None, true),
-            ("fixed", vec![list(unknown)], None, false),
-            ("bounded", vec![list(unknown)], None, false),
-            ("bounded", vec![list(Type::any())], None, false),
-            ("bounded", vec![list(int)], None, true),
-            ("constrained", vec![list(unknown)], None, false),
-            ("constrained", vec![list(Type::any())], None, false),
-            ("constrained", vec![list(int)], None, true),
-            ("constrained", vec![list(gradual_choice)], None, false),
-            (
-                "constrained_pair",
-                vec![list(gradual_choice), list(gradual_choice)],
-                None,
-                false,
-            ),
-            (
-                "fixed_any",
-                vec![
-                    Type::function_like_callable(
-                        db,
-                        Signature::new(
-                            Parameters::standard([
-                                Parameter::positional_only(None).with_annotated_type(str)
-                            ]),
-                            int,
-                        ),
-                    ),
-                    list(unknown),
-                ],
-                None,
-                false,
-            ),
-            ("correlate", vec![list(unknown), list(unknown)], None, false),
-            ("put", vec![list(unknown), int], None, false),
-            ("apply", vec![callback, unknown], None, false),
-            ("identity", vec![list(unknown)], None, true),
-            ("identity", vec![list(unknown)], Some(list(str)), false),
-        ] {
-            let arguments = CallArguments::positional(actuals).with_input_proof_request(true);
-            let constraints = ConstraintSetBuilder::new();
-            let bindings = lookup(name)
-                .bindings(db, &env)
-                .match_parameters(db, &env, &arguments)
-                .check_types(
-                    db,
-                    &env,
-                    &constraints,
-                    &arguments,
-                    TypeContext::new(context),
-                    &[],
-                )
-                .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
-            let ordinary_return = bindings.return_type(db, &env);
-            if name == "Copy" && context.is_none() {
-                assert_eq!(ordinary_return, lookup("opaque_copy"));
-                assert!(!ordinary_return.satisfies_declared_output(db, &env, lookup("int_copy")));
-            }
-            if name == "SelfCopy" {
-                let (_, supplied) = arguments
-                    .iter()
-                    .exactly_one()
-                    .map_err(|_| anyhow::anyhow!("expected one SelfCopy argument"))?;
-                assert_eq!(Some(ordinary_return), supplied.get_default());
-                if ordinary_return == lookup("opaque_self_copy") {
-                    assert!(!ordinary_return.satisfies_declared_output(
-                        db,
-                        &env,
-                        lookup("int_self_copy")
-                    ));
-                }
-            }
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                expected,
-                "{name}, context={context:?}",
-            );
-            assert!(bindings.as_result(db).is_ok());
-            assert_eq!(bindings.return_type(db, &env), ordinary_return);
-            if name == "identity" && context.is_none() {
-                assert_eq!(ordinary_return, list(unknown));
-                assert!(!ordinary_return.satisfies_declared_output(db, &env, list(str)));
-            }
-        }
-
-        // Bound inferred receivers establish their own nominal domain. Independent method
-        // variables still preserve opaque inputs, while explicit and correlated domains remain
-        // obligations. Unbound and attached free functions do not inherit that receiver fact.
-        let Type::BoundMethod(transport) = lookup("opaque_transport") else {
-            panic!("expected a bound transport method");
-        };
-        let unrelated = Type::BoundMethod(transport.map_self_type(db, |_| lookup("unrelated")));
-        let Type::FunctionLiteral(attached) = lookup("attached") else {
-            panic!("expected a free function");
-        };
-        let attached = Type::BoundMethod(BoundMethodType::new(db, attached, lookup("ops")));
-        let Type::BoundMethod(replaced) = lookup("explicit_replaced") else {
-            panic!("expected the replacement function to bind as a method");
-        };
-        let Some(replacement) = replaced.function(db) else {
-            panic!("expected a replacement function literal");
-        };
-        let Type::FunctionLiteral(restricted) = lookup("restricted_receiver") else {
-            panic!("expected the declared replacement function");
-        };
-        assert_eq!(replacement.literal(db), restricted.literal(db));
-        let Some((holder, specialization)) = lookup("opaque_holder").class_specialization(db, &env)
-        else {
-            panic!("expected a specialized Holder instance");
-        };
-        let receiver = Type::instance(
-            db,
-            &env,
-            holder.apply_specialization(db, |_| {
-                specialization
-                    .generic_context(db)
-                    .specialize(db, &[str, unknown])
-            }),
-        );
-        let unknown_keyword = receiver.member(db, &env, "keyword").place.expect_type();
-        for (name, actuals, accepted, proved) in [
-            ("fixed_copy", vec![list(str)], false, false),
-            ("copy_init", vec![list(unknown)], true, false),
-            ("ops_transport", vec![dict(unknown, unknown)], true, true),
-            ("static_transport", vec![dict(unknown, unknown)], true, true),
-            ("static_explicit", vec![dict(unknown, unknown)], true, true),
-            ("explicit_transport", vec![dict(str, int)], true, false),
-            ("explicit_bare", vec![], true, false),
-            ("explicit_replaced", vec![], true, false),
-            ("explicit_write", vec![int], true, false),
-            ("explicit_peer", vec![lookup("opaque_holder")], true, false),
-            ("incompatible_transport", vec![dict(str, int)], false, false),
-            ("box_accept", vec![int], true, false),
-            ("box_explicit", vec![int], true, false),
-            ("list_append", vec![int], true, false),
-            ("peer", vec![lookup("opaque_holder")], true, false),
-            ("clone", vec![], true, true),
-            ("attached_transport", vec![dict(str, int)], true, false),
-            ("unrelated_transport", vec![dict(str, int)], false, false),
-            (
-                "unbound_or",
-                vec![dict(unknown, unknown), dict(str, int)],
-                true,
-                false,
-            ),
-            ("opaque_transport", vec![dict(unknown, unknown)], true, true),
-            ("opaque_transport", vec![dict(str, int)], true, true),
-            ("opaque_or", vec![dict(unknown, unknown)], true, true),
-            ("opaque_or", vec![dict(str, int)], true, true),
-            ("static_or", vec![dict(unknown, unknown)], true, true),
-            ("static_or", vec![dict(str, int)], true, true),
-            ("explicit_inspect", vec![], true, true),
-            ("explicit_keyword", vec![], true, true),
-            ("unknown_keyword", vec![], true, true),
-        ] {
-            let arguments = CallArguments::positional(actuals).with_input_proof_request(true);
-            let callable = match name {
-                "attached_transport" => attached,
-                "unrelated_transport" => unrelated,
-                "unknown_keyword" => unknown_keyword,
-                _ => lookup(name),
-            };
-            let result = callable
-                .bindings(db, &env)
-                .match_parameters(db, &env, &arguments)
-                .check_types(
-                    db,
-                    &env,
-                    &ConstraintSetBuilder::new(),
-                    &arguments,
-                    TypeContext::default(),
-                    &[],
-                );
-            assert_eq!(result.is_ok(), accepted, "{name}");
-            let bindings = match result {
-                Ok(bindings) => bindings,
-                Err(CallError(_, bindings)) => *bindings,
-            };
-            if name == "clone" {
-                let Ok(callable) = bindings.iter_flat().exactly_one() else {
-                    panic!("expected one clone callable");
-                };
-                let Ok((_, binding)) = callable.matching_overloads().exactly_one() else {
-                    panic!("expected one clone overload");
-                };
-                assert_eq!(
-                    binding.signature.return_type(),
-                    lookup("opaque_holder"),
-                    "the selected clone signature must capture Self",
-                );
-                let returned = bindings.return_type(db, &env);
-                assert_eq!(returned, lookup("opaque_holder"));
-                assert!(
-                    !returned.satisfies_declared_output(db, &env, lookup("static_holder")),
-                    "unknown class arguments must not prove a concrete output",
-                );
-            }
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                proved,
-                "{name}",
-            );
-        }
-        // Receiver binding cannot turn an unfinished class argument into proof.
-        for marker in [
-            Type::Dynamic(DynamicType::UnspecializedTypeVar),
-            Type::divergent(salsa::plumbing::Id::from_bits(1)),
-        ] {
-            let receiver = dict(marker, unknown);
-            assert!(
-                any_over_type(db, &env, receiver, false, |ty| ty == marker),
-                "the receiver must retain the unfinished class argument",
-            );
-            let result = Type::try_call_bin_op_result(
-                db,
-                &env,
-                receiver,
-                ast::Operator::BitOr,
-                dict(str, int),
-                MemberLookupPolicy::default(),
-                true,
-            )
-            .expect("dictionary union is callable");
-            assert!(
-                !result.arguments_proved,
-                "unfinished receiver: {}",
-                receiver.display(db, &env),
-            );
-        }
-        for (left, right) in [
-            (dict(unknown, unknown), dict(unknown, unknown)),
-            (dict(unknown, unknown), dict(str, int)),
-            (dict(str, int), dict(unknown, unknown)),
-            (dict(str, int), dict(str, int)),
-        ] {
-            let result = Type::try_call_bin_op_result(
-                db,
-                &env,
-                left,
-                ast::Operator::BitOr,
-                right,
-                MemberLookupPolicy::default(),
-                true,
-            )
-            .expect("dictionary union is callable");
-            assert!(
-                result.arguments_proved,
-                "{} | {}",
-                left.display(db, &env),
-                right.display(db, &env),
-            );
-        }
-
-        // A static solution containing a rigid variable is still conditional on that variable.
-        // Likewise, a static outer solution cannot discharge a bound that mentions an input.
-        let t = BoundTypeVarInstance::synthetic(
-            db,
-            &env,
-            Name::new_static("T"),
-            TypeVarVariance::Invariant,
-        );
-        let u = BoundTypeVarInstance::synthetic(
-            db,
-            &env,
-            Name::new_static("U"),
-            TypeVarVariance::Invariant,
-        );
-        let rigid = BoundTypeVarInstance::synthetic(
-            db,
-            &env,
-            Name::new_static("A"),
-            TypeVarVariance::Invariant,
-        );
-        let Type::KnownInstance(identity) = lookup("Identity") else {
-            panic!("expected a known alias instance");
-        };
-        let KnownInstanceType::TypeAliasType(identity) = identity else {
-            panic!("expected the identity type alias");
-        };
-        let aliased_rigid = Type::TypeAlias(identity.apply_specialization(db, |context| {
-            context.specialize(db, [Type::TypeVar(rigid)].as_slice())
-        }));
-        for (bound, solution) in [
-            (int, Type::TypeVar(rigid)),
-            (int, aliased_rigid),
-            (list(Type::TypeVar(t)), list(int)),
-        ] {
-            let bounded = u.map_bound_or_constraints(db, |_| {
-                Some(TypeVarBoundOrConstraints::UpperBound(bound))
-            });
-            let ordinary = GenericContext::from_typevar_instances(db, &env, [t, bounded])
-                .specialize(db, [unknown, solution].as_slice());
-            assert!(!generic_arguments_satisfy_declared_parameters(
-                db,
-                &env,
-                ordinary,
-                &[(list(unknown), list(Type::TypeVar(t)))],
-            ));
         }
         Ok(())
     }
@@ -12563,17 +10984,9 @@ unbound_or = dict.__or__
         db.write_dedented(
             "/src/a.py",
             r#"
-from typing import Callable, overload
-from ty_extensions._internal import TypeOf
+from typing import overload
 
-def opaque(value): return value
-
-def annotated(value: object) -> object: return value
-
-def store[T](value: T) -> object: ...
 def identity[T](value: T) -> T: ...
-def exact(value: TypeOf[opaque]) -> object: ...
-def promise(value: Callable[[object], object]) -> object: ...
 
 @overload
 def implemented(value: int) -> int: ...
@@ -12587,36 +11000,6 @@ def implemented[T](value: T) -> T: return value
         let file = system_path_to_file(db, "/src/a.py")?;
         let file = ProgramFile::new(db, file, env.program(db));
         let lookup = |name| global_symbol(db, file, name).place.expect_type();
-        for (name, actual, expected) in [
-            ("store", lookup("opaque"), true),
-            ("identity", lookup("opaque"), true),
-            ("exact", lookup("opaque"), true),
-            ("store", lookup("annotated"), true),
-            ("promise", lookup("opaque"), false),
-            ("opaque", Type::int_literal(1), false),
-            ("store", Type::unknown(), false),
-        ] {
-            let arguments = CallArguments::positional([actual]).with_input_proof_request(true);
-            let bindings = lookup(name)
-                .bindings(db, &env)
-                .match_parameters(db, &env, &arguments)
-                .check_types(
-                    db,
-                    &env,
-                    &ConstraintSetBuilder::new(),
-                    &arguments,
-                    TypeContext::default(),
-                    &[],
-                )
-                .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                expected,
-                "{name}({})",
-                actual.display(db, &env),
-            );
-        }
-
         // A real change to either the public signature or the implementation still maps the
         // function. Applying the same substitution again leaves that mapped identity intact.
         let int = KnownClass::Int.to_instance(db, &env);
@@ -12652,118 +11035,12 @@ def implemented[T](value: T) -> T: return value
     }
 
     #[test]
-    fn generic_storage_preserves_function_values() -> anyhow::Result<()> {
-        let mut db = setup_db();
-        db.write_dedented(
-            "/src/a.py",
-            r#"
-from typing import Callable
-
-def opaque(value): return value
-def store_dict[T](value: T) -> dict[str, T]: ...
-def store_list[T](value: T) -> list[T]: ...
-def promise(value: Callable[[object], object]) -> object: ...
-def invoke[T](func: Callable[[T], T], value: T) -> T: ...
-def consume[T](values: list[T], callback: Callable[[object], int]) -> None: ...
-def typed_callback(value: object) -> int: return 1
-unknown_values: list
-
-promised: dict[str, Callable[[object], object]]
-"#,
-        )?;
-        let db = &db;
-        let env = db.program_environment();
-        let file = system_path_to_file(db, "/src/a.py")?;
-        let file = ProgramFile::new(db, file, env.program(db));
-        let lookup = |name| global_symbol(db, file, name).place.expect_type();
-        let mut outcomes = Vec::new();
-        for (name, arguments, context, expected) in [
-            (
-                "store_dict",
-                CallArguments::positional([lookup("opaque")]),
-                None,
-                true,
-            ),
-            (
-                "store_list",
-                CallArguments::positional([lookup("opaque")]),
-                None,
-                true,
-            ),
-            (
-                "consume",
-                CallArguments::positional([lookup("unknown_values"), lookup("typed_callback")]),
-                None,
-                true,
-            ),
-            (
-                "store_dict",
-                CallArguments::positional([lookup("opaque")]),
-                Some(lookup("promised")),
-                false,
-            ),
-            (
-                "promise",
-                CallArguments::positional([lookup("opaque")]),
-                None,
-                false,
-            ),
-            (
-                "invoke",
-                CallArguments::positional([lookup("opaque"), Type::int_literal(1)]),
-                None,
-                false,
-            ),
-            (
-                "store_dict",
-                CallArguments::positional([Type::unknown()]),
-                None,
-                false,
-            ),
-        ] {
-            let arguments = arguments.with_input_proof_request(true);
-            let result = lookup(name)
-                .bindings(db, &env)
-                .match_parameters(db, &env, &arguments)
-                .check_types(
-                    db,
-                    &env,
-                    &ConstraintSetBuilder::new(),
-                    &arguments,
-                    TypeContext::new(context),
-                    &[],
-                );
-            if expected {
-                assert!(result.is_ok(), "{name}: expected a valid ordinary call");
-            }
-            let bindings = match result {
-                Ok(bindings) => bindings,
-                Err(CallError(_, bindings)) => *bindings,
-            };
-            let proved = bindings.arguments_satisfy_declared_parameters(db, &env, &arguments);
-            outcomes.push((
-                name,
-                proved,
-                expected,
-                bindings.return_type(db, &env).display(db, &env).to_string(),
-            ));
-        }
-        assert!(
-            outcomes
-                .iter()
-                .all(|(_, actual, expected, _)| actual == expected),
-            "{outcomes:#?}",
-        );
-        Ok(())
-    }
-
-    #[test]
     fn generic_callbacks_cover_unary_unions() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(
             "/src/a.py",
             r#"
-from typing import Any, Callable, overload
+from typing import Callable, overload
 
 class Label: ...
 type Scalar = str | bool | int | None | Label
@@ -12792,26 +11069,6 @@ def concrete(value: str) -> str: ...
 def concrete(value): ...
 
 def constrained[T: (int, str)](value: T) -> T: ...
-def integer(value: int) -> int: ...
-def opaque(value): ...
-
-@overload
-def missing[T](value: list[T]) -> list[T]: ...
-@overload
-def missing[T: (str, Label, int, bool, None)](value: T) -> T: ...
-def missing(value): ...
-
-@overload
-def overlapping[T](value: list[T]) -> str: ...
-@overload
-def overlapping(value: list[int]) -> bytes: ...
-@overload
-def overlapping(value: str) -> str: ...
-def overlapping(value): ...
-
-def keyword_only[T: (int, str)](*, value: T) -> T: ...
-unknown: Any
-
 def consume(callback: Callable[
     [Scalar | list[Scalar] | Mapping | dict[Scalar, Compound | Mapping]], object
 ]) -> None: ...
@@ -12820,8 +11077,6 @@ def consume_scalar(callback: Callable[[int | str], object]) -> None: ...
 def consume_int(callback: Callable[[int], object]) -> None: ...
 def consume_list(callback: Callable[[list[Scalar]], object]) -> None: ...
 def consume_dict(callback: Callable[[Mapping], object]) -> None: ...
-def consume_string(callback: Callable[[int | str], str]) -> None: ...
-def consume_overlapping(callback: Callable[[list[int] | str], str]) -> None: ...
 "#,
         )?;
         let db = &db;
@@ -12829,26 +11084,19 @@ def consume_overlapping(callback: Callable[[list[int] | str], str]) -> None: ...
         let file = system_path_to_file(db, "/src/a.py")?;
         let file = ProgramFile::new(db, file, env.program(db));
         let lookup = |name| global_symbol(db, file, name).place.expect_type();
-        for (consumer, callback, expected) in [
-            ("consume_int", "clone", true),
-            ("consume_scalar", "clone", true),
-            ("consume_list", "clone", true),
-            ("consume_dict", "clone", true),
-            ("consume", "clone", true),
-            ("consume_alias", "clone", true),
-            ("consume_scalar", "scalar", true),
-            ("consume_scalar", "constrained", true),
-            ("consume_scalar", "concrete", true),
-            ("consume", "integer", false),
-            ("consume", "opaque", false),
-            ("consume", "unknown", false),
-            ("consume", "missing", false),
-            ("consume_string", "constrained", false),
-            ("consume_overlapping", "overlapping", false),
-            ("consume_scalar", "keyword_only", false),
+        for (consumer, callback) in [
+            ("consume_int", "clone"),
+            ("consume_scalar", "clone"),
+            ("consume_list", "clone"),
+            ("consume_dict", "clone"),
+            ("consume", "clone"),
+            ("consume_alias", "clone"),
+            ("consume_scalar", "scalar"),
+            ("consume_scalar", "constrained"),
+            ("consume_scalar", "concrete"),
         ] {
             let actual = lookup(callback);
-            let arguments = CallArguments::positional([actual]).with_input_proof_request(true);
+            let arguments = CallArguments::positional([actual]);
             let result = lookup(consumer)
                 .bindings(db, &env)
                 .match_parameters(db, &env, &arguments)
@@ -12860,25 +11108,13 @@ def consume_overlapping(callback: Callable[[list[int] | str], str]) -> None: ...
                     TypeContext::default(),
                     &[],
                 );
-            let ordinary = result.is_ok();
-            let bindings = match result {
-                Ok(bindings) => bindings,
-                Err(CallError(_, bindings)) => *bindings,
-            };
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                expected,
-                "{consumer}({callback})",
-            );
-            if expected {
-                assert!(ordinary, "{consumer}({callback})");
-            }
+            assert!(result.is_ok(), "{consumer}({callback})");
         }
         Ok(())
     }
 
     #[test]
-    fn equivalent_callback_witnesses_prove_inputs() -> anyhow::Result<()> {
+    fn equivalent_callback_witnesses_preserve_return_type() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(
             "/src/a.py",
@@ -12891,7 +11127,6 @@ def callback[T](value: list[T]) -> T: ...
 def callback[T](value: Sequence[T]) -> T: ...
 def callback(value): ...
 
-def incompatible(value: list[int]) -> int: ...
 def consume[R](callback: Callable[[list[str]], R]) -> R: ...
 "#,
         )?;
@@ -12900,46 +11135,28 @@ def consume[R](callback: Callable[[list[str]], R]) -> R: ...
         let file = system_path_to_file(db, "/src/a.py")?;
         let file = ProgramFile::new(db, file, env.program(db));
         let lookup = |name| global_symbol(db, file, name).place.expect_type();
-        for (actual, expected) in [
-            (lookup("callback"), true),
-            (lookup("incompatible"), false),
-            (Type::unknown(), false),
-        ] {
-            let arguments = CallArguments::positional([actual]).with_input_proof_request(true);
-            let result = lookup("consume")
-                .bindings(db, &env)
-                .match_parameters(db, &env, &arguments)
-                .check_types(
-                    db,
-                    &env,
-                    &ConstraintSetBuilder::new(),
-                    &arguments,
-                    TypeContext::default(),
-                    &[],
-                );
-            let bindings = match result {
-                Ok(bindings) => bindings,
-                Err(CallError(_, bindings)) => *bindings,
-            };
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                expected,
-                "consume({}), returned {}",
-                actual.display(db, &env),
-                bindings.return_type(db, &env).display(db, &env)
-            );
-            if expected {
-                assert_eq!(
-                    bindings.return_type(db, &env),
-                    KnownClass::Str.to_instance(db, &env)
-                );
-            }
-        }
+        let arguments = CallArguments::positional([lookup("callback")]);
+        let bindings = lookup("consume")
+            .bindings(db, &env)
+            .match_parameters(db, &env, &arguments)
+            .check_types(
+                db,
+                &env,
+                &ConstraintSetBuilder::new(),
+                &arguments,
+                TypeContext::default(),
+                &[],
+            )
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        assert_eq!(
+            bindings.return_type(db, &env),
+            KnownClass::Str.to_instance(db, &env)
+        );
         Ok(())
     }
 
     #[test]
-    fn ambiguous_calls_can_have_proved_inputs() -> anyhow::Result<()> {
+    fn ambiguous_calls_preserve_return_type() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(
             "/src/a.py",
@@ -12975,12 +11192,12 @@ def generic(value: object) -> object: ...
         let env = db.program_environment();
         let file = system_path_to_file(db, "/src/a.py")?;
         let file = ProgramFile::new(db, file, env.program(db));
-        for (name, supplied, proved) in [
-            ("observe", vec![Type::any()], true),
-            ("observe", vec![Type::unknown()], true),
-            ("partial", vec![Type::any()], false),
-            ("correlated", vec![Type::any(), Type::any()], false),
-            ("generic", vec![Type::unknown()], false),
+        for (name, supplied) in [
+            ("observe", vec![Type::any()]),
+            ("observe", vec![Type::unknown()]),
+            ("partial", vec![Type::any()]),
+            ("correlated", vec![Type::any(), Type::any()]),
+            ("generic", vec![Type::unknown()]),
         ] {
             let callable = global_symbol(db, file, name).place.expect_type();
             let arguments = CallArguments::positional(supplied);
@@ -12997,11 +11214,6 @@ def generic(value: object) -> object: ...
                     &[],
                 )
                 .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                proved,
-                "{name}",
-            );
             assert!(
                 any_over_type(db, &env, bindings.return_type(db, &env), false, |ty| {
                     matches!(ty, Type::Dynamic(DynamicType::AmbiguousOverload))
@@ -13014,205 +11226,7 @@ def generic(value: object) -> object: ...
     }
 
     #[test]
-    fn empty_argument_correspondence_preserves_call_guards() -> anyhow::Result<()> {
-        let mut db = setup_db();
-        db.write_dedented(
-            "/src/a.py",
-            r#"
-from typing import overload
-
-def produce[T]() -> T: ...
-def required[T](value: T) -> T: ...
-
-@overload
-def ambiguous(value: int) -> int: ...
-@overload
-def ambiguous(value: str) -> str: ...
-def ambiguous(value: int | str) -> int | str: ...
-
-class Holder[T]:
-    def read(self) -> T: ...
-holder: Holder
-bound = holder.read
-"#,
-        )?;
-        let db = &db;
-        let env = db.program_environment();
-        let file = system_path_to_file(db, "/src/a.py")?;
-        let file = ProgramFile::new(db, file, env.program(db));
-        let lookup = |name| global_symbol(db, file, name).place.expect_type();
-        let incomplete = Type::function_like_callable(
-            db,
-            Signature::new(
-                Parameters::standard([]).with_incomplete_shape(),
-                Type::none(db, &env),
-            ),
-        );
-        for (name, callable, arguments, accepted, proved) in [
-            (
-                "produce",
-                lookup("produce"),
-                CallArguments::default(),
-                true,
-                true,
-            ),
-            (
-                "missing",
-                lookup("required"),
-                CallArguments::default(),
-                false,
-                false,
-            ),
-            (
-                "incomplete",
-                incomplete,
-                CallArguments::default(),
-                true,
-                false,
-            ),
-            (
-                "ambiguous",
-                lookup("ambiguous"),
-                CallArguments::positional([Type::any()]),
-                true,
-                false,
-            ),
-            (
-                "bound",
-                lookup("bound"),
-                CallArguments::default(),
-                true,
-                false,
-            ),
-            (
-                "unknown",
-                lookup("required"),
-                CallArguments::positional([Type::unknown()]),
-                true,
-                false,
-            ),
-        ] {
-            let constraints = ConstraintSetBuilder::new();
-            let result = callable
-                .bindings(db, &env)
-                .match_parameters(db, &env, &arguments)
-                .check_types(
-                    db,
-                    &env,
-                    &constraints,
-                    &arguments,
-                    TypeContext::default(),
-                    &[],
-                );
-            assert_eq!(result.is_ok(), accepted, "{name}");
-            let bindings = match result {
-                Ok(bindings) => bindings,
-                Err(CallError(_, bindings)) => *bindings,
-            };
-            let return_type = bindings.return_type(db, &env);
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                proved,
-                "{name}",
-            );
-            assert_eq!(bindings.return_type(db, &env), return_type);
-            if name == "produce" {
-                assert!(return_type.is_unknown());
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn inherited_explicit_receivers_preserve_class_slots() -> anyhow::Result<()> {
-        let mut db = setup_db();
-        db.write_dedented(
-            "/src/a.py",
-            r#"
-from typing import Any, cast
-
-class Base[K, V]:
-    def read(self: "Base[K, V]") -> None: ...
-    def independent(self: "Base") -> None: ...
-    def consume(self: "Base[K, V]", value: int) -> None: ...
-
-class Child[K, V](Base[K, V]): pass
-class Swapped[K, V](Base[V, K]): pass
-class Dynamic(Any, Base[str, list]): pass
-
-base = cast(Base[str, list], None)
-child = cast(Child[str, list], None)
-swapped = cast(Swapped[list, str], None)
-dynamic = cast(Dynamic, None)
-base_read = base.read
-child_read = child.read
-swapped_read = swapped.read
-independent = child.independent
-dynamic_read = dynamic.read
-consume = child.consume
-"#,
-        )?;
-        let db = &db;
-        let env = db.program_environment();
-        let file = system_path_to_file(db, "/src/a.py")?;
-        let file = ProgramFile::new(db, file, env.program(db));
-        let lookup = |name| global_symbol(db, file, name).place.expect_type();
-        let mut outcomes = Vec::new();
-        for (name, arguments, accepted, expected) in [
-            ("base_read", CallArguments::default(), true, true),
-            ("child_read", CallArguments::default(), true, true),
-            ("swapped_read", CallArguments::default(), true, true),
-            ("independent", CallArguments::default(), true, false),
-            ("dynamic_read", CallArguments::default(), true, false),
-            (
-                "consume",
-                CallArguments::positional([Type::int_literal(1)]),
-                true,
-                true,
-            ),
-            (
-                "consume",
-                CallArguments::positional([Type::string_literal(db, "wrong")]),
-                false,
-                false,
-            ),
-        ] {
-            let result = lookup(name)
-                .bindings(db, &env)
-                .match_parameters(db, &env, &arguments)
-                .check_types(
-                    db,
-                    &env,
-                    &ConstraintSetBuilder::new(),
-                    &arguments,
-                    TypeContext::default(),
-                    &[],
-                );
-            let ordinary = result.is_ok();
-            let bindings = match result {
-                Ok(bindings) => bindings,
-                Err(CallError(_, bindings)) => *bindings,
-            };
-            outcomes.push((
-                name,
-                ordinary,
-                accepted,
-                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
-                expected,
-            ));
-        }
-        assert!(
-            outcomes.iter().all(
-                |(_, ordinary, accepted, actual, expected)| ordinary == accepted
-                    && actual == expected
-            ),
-            "{outcomes:#?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn typed_dict_keywords_preserve_input_proof() -> anyhow::Result<()> {
+    fn typed_dict_keywords_match_parameters() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(
             "/src/a.py",
@@ -13244,28 +11258,13 @@ consume = child.consume
         let file = ProgramFile::new(&db, file, env.program(&db));
         let lookup = |name| global_symbol(&db, file, name).place.expect_type();
         let callable = lookup("consume");
-        for (name, explicit, accepted, proved) in [
-            ("required", None, true, true),
-            ("optional", None, true, false),
-            ("excluded", None, false, false),
-            (
-                "excluded",
-                Some(Type::string_literal(&db, "value")),
-                true,
-                true,
-            ),
-            (
-                "empty",
-                Some(Type::string_literal(&db, "value")),
-                true,
-                true,
-            ),
-            (
-                "empty",
-                Some(KnownClass::Int.to_instance(&db, &env)),
-                false,
-                false,
-            ),
+        for (name, explicit, accepted) in [
+            ("required", None, true),
+            ("optional", None, true),
+            ("excluded", None, false),
+            ("excluded", Some(Type::string_literal(&db, "value")), true),
+            ("empty", Some(Type::string_literal(&db, "value")), true),
+            ("empty", Some(KnownClass::Int.to_instance(&db, &env)), false),
         ] {
             let arguments: CallArguments = explicit
                 .map(|ty| (Argument::Keyword("name"), Some(ty)))
@@ -13284,15 +11283,6 @@ consume = child.consume
                     &[],
                 );
             assert_eq!(result.is_ok(), accepted, "{name}: {explicit:?}");
-            let bindings = match result {
-                Ok(bindings) => bindings,
-                Err(CallError(_, bindings)) => *bindings,
-            };
-            assert_eq!(
-                bindings.arguments_satisfy_declared_parameters(&db, &env, &arguments),
-                proved,
-                "{name}: {explicit:?}",
-            );
         }
         Ok(())
     }
@@ -13410,12 +11400,7 @@ def unrestricted[S](
                     TypeContext::default(),
                     &[],
                 );
-            let (accepted, bindings) = match result {
-                Ok(bindings) => (true, bindings),
-                Err(CallError(_, bindings)) => (false, *bindings),
-            };
-            let proved = bindings.arguments_satisfy_declared_parameters(db, &env, &arguments);
-            outcomes.push((callee, caller, accepted, proved));
+            outcomes.push((callee, caller, result.is_ok()));
         }
         let arguments = CallArguments::positional([lookup("gradual_values"), mapping]);
         let constraints = ConstraintSetBuilder::new();
@@ -13430,20 +11415,15 @@ def unrestricted[S](
                 TypeContext::default(),
                 &[],
             );
-        let (accepted, bindings) = match result {
-            Ok(bindings) => (true, bindings),
-            Err(CallError(_, bindings)) => (false, *bindings),
-        };
-        let proved = bindings.arguments_satisfy_declared_parameters(db, &env, &arguments);
-        outcomes.push(("correlate", "gradual_values", accepted, proved));
+        outcomes.push(("correlate", "gradual_values", result.is_ok()));
         assert_eq!(
             outcomes,
             [
-                ("bounded", "unrestricted", false, false),
-                ("constrained", "unrestricted", false, false),
-                ("constrained", "union_bounded", false, false),
-                ("constrained", "same_constraints", true, true),
-                ("correlate", "gradual_values", true, false),
+                ("bounded", "unrestricted", false),
+                ("constrained", "unrestricted", false),
+                ("constrained", "union_bounded", false),
+                ("constrained", "same_constraints", true),
+                ("correlate", "gradual_values", true),
             ]
         );
         for argument in [mapping, lookup("pairs"), lookup("mapping_or_pairs")] {

@@ -138,7 +138,7 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             }
             UnpackKind::Iterable { mode } => {
                 let env = self.context.program_environment();
-                match value_type.try_iterate_with_context(&self.context, value_expr, mode) {
+                match value_type.try_iterate_with_mode(db, env, mode) {
                     Ok(tuple) => {
                         let element = tuple.homogeneous_element_type(db, env);
                         refine_dict_snapshot_element_type(
@@ -302,7 +302,7 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                 .iter()
                 .map(|ty| {
                     let tuple = ty
-                        .try_iterate_with_context(&self.context, value_expr, EvaluationMode::Sync)
+                        .try_iterate_with_mode(db, env, EvaluationMode::Sync)
                         .unwrap_or_else(|err| {
                             complete = false;
                             err.report_diagnostic(&self.context, *ty, value_expr);

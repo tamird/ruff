@@ -1306,78 +1306,6 @@ impl<'db> FunctionType<'db> {
         )
     }
 
-    /// Returns the original signature of a function selected for contract validation.
-    ///
-    /// The function's body scope must use `OutputProof` inference. This
-    /// admits one unmodified, nongeneric signature with named parameters and
-    /// known types. Async, generator, overloaded and narrowing-predicate functions are
-    /// excluded. Applications must compare
-    /// ordinary arguments with these raw parameter types using [`Type::satisfies_declared_output`]
-    /// and account for every selected body's and default's checking, suppression and file
-    /// obligations.
-    /// This accessor identifies a modular declaration assumption.
-    pub fn selected_contract_signature(self, db: &'db dyn Db) -> Option<&'db Signature<'db>> {
-        #[salsa::tracked(returns(copy))]
-        fn supports_contract_calls<'db>(
-            db: &'db dyn Db,
-            implementation: OverloadLiteral<'db>,
-        ) -> bool {
-            let definition = implementation.definition(db);
-            let program_file = definition.program_file(db);
-            let python_file = program_file.python_file(db);
-            let module = parsed_module(db, python_file).load(db);
-            let node = implementation.node(db, python_file.file(db), &module);
-            !node.is_async
-                && node.decorator_list.is_empty()
-                && !implementation
-                    .body_scope(db)
-                    .file_scope_id(db)
-                    .is_generator_function(semantic_index(db, program_file))
-        }
-
-        if self.updated_signatures(db).is_some() || self.descriptor_kind(db).is_some() {
-            return None;
-        }
-        let literal = self.literal(db);
-        let scope = literal.last_definition.body_scope(db);
-        if db.function_inference_mode(scope) == crate::FunctionInferenceMode::Default
-            || literal.overloaded
-        {
-            return None;
-        }
-        if !supports_contract_calls(db, literal.last_definition) {
-            return None;
-        }
-        let [signature] = self.signature(db).overloads.as_slice() else {
-            return None;
-        };
-        if signature.generic_context.is_some()
-            || !signature.parameters().is_standard()
-            || signature.parameters().iter().any(|parameter| {
-                parameter.name().is_none()
-                    || parameter.is_variadic()
-                    || parameter.is_keyword_variadic()
-            })
-            || matches!(
-                signature.return_type().resolve_type_alias(db),
-                Type::TypeIs(_) | Type::TypeGuard(_)
-            )
-        {
-            return None;
-        }
-        let env = ProgramEnvironment::from_scope(scope);
-        if !signature.return_type().is_fully_static_except_any(db, &env)
-            || signature.parameters().iter().any(|parameter| {
-                !parameter
-                    .annotated_type()
-                    .is_fully_static_except_any(db, &env)
-            })
-        {
-            return None;
-        }
-        Some(signature)
-    }
-
     pub(crate) fn apply_type_mapping_impl<'a>(
         self,
         db: &'db dyn Db,
@@ -1730,9 +1658,6 @@ impl<'db> FunctionType<'db> {
         heap_size=ruff_memory_usage::heap_size,
     )]
     fn literal_signature(self, db: &'db dyn Db) -> CallableSignature<'db> {
-        if let Some(contract) = db.provided_function_contract(self.definition(db)) {
-            return contract.signature(db).clone();
-        }
         self.literal(db).signature(db)
     }
 

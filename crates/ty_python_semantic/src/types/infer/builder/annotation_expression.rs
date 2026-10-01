@@ -79,11 +79,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             } => DeferredExpressionState::InDetachedAnnotation(*owner),
             SourceAnnotation::External {
                 annotation: _,
-                purpose: _,
-                range: _,
-            } => return None,
-            SourceAnnotation::Provided {
-                annotation: _,
                 range: _,
             } => return None,
         };

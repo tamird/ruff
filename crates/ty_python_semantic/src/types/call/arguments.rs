@@ -122,7 +122,6 @@ pub(crate) enum Argument<'a> {
 /// Arguments for a single call, in source order, along with inferred types for each argument.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CallArguments<'a, 'db> {
-    request_input_proof: bool,
     items: Vec<CallArgument<'a, 'db>>,
 }
 
@@ -131,72 +130,6 @@ struct CallArgument<'a, 'db> {
     argument: Argument<'a>,
     types: CallArgumentTypes<'db>,
     known_unpacking: Option<KnownUnpacking<'db>>,
-}
-
-/// Arguments whose expanded alternatives have all satisfied their declared parameters.
-///
-/// Argument inference can replay after overload checking. Retain the complete inputs so a
-/// successful expansion cannot certify different committed arguments.
-#[derive(Clone, Debug)]
-pub(super) struct CallArgumentsSnapshot<'db> {
-    items: Box<[SavedCallArgument<'db>]>,
-}
-
-impl<'db> CallArgumentsSnapshot<'db> {
-    pub(super) fn matches(&self, arguments: &CallArguments<'_, 'db>) -> bool {
-        let Self { items } = self;
-        let CallArguments {
-            request_input_proof: _,
-            items: current_items,
-        } = arguments;
-        items.len() == current_items.len()
-            && items.iter().zip(current_items).all(|(saved, current)| {
-                let SavedCallArgument {
-                    argument,
-                    types,
-                    known_unpacking,
-                } = saved;
-                let CallArgument {
-                    argument: current_argument,
-                    types: current_types,
-                    known_unpacking: current_unpacking,
-                } = current;
-                argument.matches(*current_argument)
-                    && types.has_same_lookups(current_types)
-                    && known_unpacking == current_unpacking
-            })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct SavedCallArgument<'db> {
-    argument: OwnedArgument,
-    types: CallArgumentTypes<'db>,
-    known_unpacking: Option<KnownUnpacking<'db>>,
-}
-
-#[derive(Clone, Debug)]
-enum OwnedArgument {
-    Synthetic,
-    Positional,
-    Variadic,
-    Keyword(Name),
-    Keywords,
-}
-
-impl OwnedArgument {
-    fn matches(&self, argument: Argument<'_>) -> bool {
-        match argument {
-            Argument::Synthetic => matches!(self, Self::Synthetic),
-            Argument::Positional => matches!(self, Self::Positional),
-            Argument::Variadic => matches!(self, Self::Variadic),
-            Argument::Keyword(name) => match self {
-                Self::Keyword(saved) => saved == name,
-                _ => false,
-            },
-            Argument::Keywords => matches!(self, Self::Keywords),
-        }
-    }
 }
 
 /// Known elements of an unpacked argument.
@@ -335,15 +268,6 @@ pub(crate) struct CallArgumentTypes<'db> {
 }
 
 impl<'db> CallArgumentTypes<'db> {
-    /// Compare the types observed by binding, independently of redundant context entries.
-    fn has_same_lookups(&self, other: &Self) -> bool {
-        self.get_default() == other.get_default()
-            && self.types.keys().chain(other.types.keys()).all(|context| {
-                self.try_get_for_declared_type(*context)
-                    == other.try_get_for_declared_type(*context)
-            })
-    }
-
     fn new(fallback_ty: Option<Type<'db>>) -> Self {
         Self {
             fallback_type: fallback_ty,
@@ -414,37 +338,6 @@ impl<'db> CallArgumentTypes<'db> {
 }
 
 impl<'a, 'db> CallArguments<'a, 'db> {
-    pub(super) fn snapshot(&self) -> CallArgumentsSnapshot<'db> {
-        let Self {
-            request_input_proof: _,
-            items,
-        } = self;
-        CallArgumentsSnapshot {
-            items: items
-                .iter()
-                .map(|item| {
-                    let CallArgument {
-                        argument,
-                        types,
-                        known_unpacking,
-                    } = item;
-                    let argument = match argument {
-                        Argument::Synthetic => OwnedArgument::Synthetic,
-                        Argument::Positional => OwnedArgument::Positional,
-                        Argument::Variadic => OwnedArgument::Variadic,
-                        Argument::Keyword(name) => OwnedArgument::Keyword(Name::new(name)),
-                        Argument::Keywords => OwnedArgument::Keywords,
-                    };
-                    SavedCallArgument {
-                        argument,
-                        types: types.clone(),
-                        known_unpacking: known_unpacking.clone(),
-                    }
-                })
-                .collect(),
-        }
-    }
-
     /// Create `CallArguments` from AST arguments. We will use the provided callback to obtain the
     /// type of each splatted argument, so that we can determine its length. All other arguments
     /// will remain uninitialized.
@@ -454,7 +347,6 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     ) -> Self {
         let mut call_arguments = Self {
             items: Vec::with_capacity(arguments.len()),
-            request_input_proof: false,
         };
 
         for arg_or_keyword in arguments.iter_source_order() {
@@ -529,10 +421,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
         mut expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
         mut dictionary_items: impl FnMut(&ast::Expr) -> DictionaryObservation<'db>,
     ) -> Self {
-        let Self {
-            items,
-            request_input_proof: _,
-        } = &mut self;
+        let Self { items } = &mut self;
         for (item, argument) in items.iter_mut().zip(arguments.iter_source_order()) {
             if item.types.get_default().is_some_and(|ty| ty.is_never()) {
                 item.known_unpacking = None;
@@ -570,10 +459,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     }
 
     pub(super) fn known_unpacking(&self, index: usize) -> Option<&KnownUnpacking<'db>> {
-        let Self {
-            items,
-            request_input_proof: _,
-        } = self;
+        let Self { items } = self;
         let CallArgument {
             argument: _,
             types: _,
@@ -613,20 +499,6 @@ impl<'a, 'db> CallArguments<'a, 'db> {
             .into_iter()
             .map(|ty| (Argument::Positional, Some(ty)))
             .collect()
-    }
-
-    /// Request input requirements for implicit calls made while evaluating this call.
-    pub(crate) fn with_input_proof_request(mut self, requested: bool) -> Self {
-        self.request_input_proof = requested;
-        self
-    }
-
-    pub(crate) fn set_input_proof_request(&mut self, requested: bool) {
-        self.request_input_proof = requested;
-    }
-
-    pub(crate) fn requests_input_proof(&self) -> bool {
-        self.request_input_proof
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -687,10 +559,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                 known_unpacking: None,
             });
             items.extend(self.items.iter().cloned());
-            Cow::Owned(CallArguments {
-                items,
-                request_input_proof: self.request_input_proof,
-            })
+            Cow::Owned(CallArguments { items })
         } else {
             Cow::Borrowed(self)
         }
@@ -706,7 +575,6 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     fn start_from(&self, index: usize) -> Self {
         Self {
             items: self.items[index..].to_vec(),
-            request_input_proof: self.request_input_proof,
         }
     }
 
@@ -731,7 +599,6 @@ impl<'a, 'db> CallArguments<'a, 'db> {
         prefix_len: usize,
     ) -> Self {
         Self {
-            request_input_proof: self.request_input_proof,
             items: indices
                 .iter()
                 .map(|index| {
@@ -1065,10 +932,7 @@ impl<'a, 'db> FromIterator<(Argument<'a>, Option<Type<'db>>)> for CallArguments<
             });
         }
 
-        Self {
-            items,
-            request_input_proof: false,
-        }
+        Self { items }
     }
 }
 
@@ -1142,132 +1006,12 @@ mod tests {
     }
 
     #[test]
-    fn expanded_input_proof_checks_committed_arguments() -> anyhow::Result<()> {
-        let db = TestDbBuilder::new().with_file("/src/main.py", "").build()?;
-        let file = system_path_to_file(&db, "/src/main.py")?;
-        let env = ProgramEnvironment::from_file(db.program_file(file));
-        let int = KnownClass::Int.to_instance(&db, &env);
-        let object = KnownClass::Object.to_instance(&db, &env);
-        let str = KnownClass::Str.to_instance(&db, &env);
-        let left = Type::string_literal(&db, "left");
-        let right = Type::string_literal(&db, "right");
-        let signatures = [left, right].map(|kind| {
-            Signature::new(
-                Parameters::standard([
-                    Parameter::keyword_only(Name::new_static("kind")).with_annotated_type(kind),
-                    Parameter::keyword_only(Name::new_static("value")).with_annotated_type(int),
-                    Parameter::keyword_only(Name::new_static("tail")).with_annotated_type(int),
-                ]),
-                Type::none(&db, &env),
-            )
-        });
-        let arguments = CallArguments {
-            request_input_proof: true,
-            items: vec![
-                CallArgument {
-                    argument: Argument::Keyword("kind"),
-                    types: CallArgumentTypes::new(Some(UnionType::from_two_elements(
-                        &db, &env, left, right,
-                    ))),
-                    known_unpacking: None,
-                },
-                CallArgument {
-                    argument: Argument::Keyword("value"),
-                    types: CallArgumentTypes {
-                        fallback_type: None,
-                        types: [(int, int), (object, int)].into_iter().collect(),
-                    },
-                    known_unpacking: None,
-                },
-                CallArgument {
-                    argument: Argument::Keywords,
-                    types: CallArgumentTypes::new(Some(Type::unknown())),
-                    known_unpacking: Some(KnownUnpacking::Keywords(KnownKeywords {
-                        items: [DictionaryItem {
-                            name: Name::new_static("tail"),
-                            ty: int,
-                            kind: DictionaryItemKind::Required,
-                            source: TextRange::default(),
-                        }]
-                        .into(),
-                        extra_items: None,
-                        excluded_names: Vec::new(),
-                    })),
-                },
-            ],
-        };
-        let bindings = Bindings::from(CallableBinding::from_overloads(Type::unknown(), signatures))
-            .match_parameters(&db, &env, &arguments)
-            .check_types(
-                &db,
-                &env,
-                &ConstraintSetBuilder::new(),
-                &arguments,
-                TypeContext::default(),
-                &[],
-            )
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        assert!(bindings.arguments_satisfy_declared_parameters(&db, &env, &arguments));
-        assert_eq!(bindings.return_type(&db, &env), Type::none(&db, &env));
-
-        // Committed inference can add a fallback and remove redundant overload contexts.
-        let mut committed = arguments.clone();
-        committed.items[1].types.fallback_type = Some(int);
-        committed.items[1].types.types.remove(&object);
-        assert!(bindings.arguments_satisfy_declared_parameters(&db, &env, &committed));
-
-        // The default is unchanged, but an individual context now observes a different type.
-        for context in [object, str] {
-            let mut changed = committed.clone();
-            changed.items[1].types.types.insert(context, str);
-            assert_eq!(changed.items[1].types.get_default(), Some(int));
-            assert!(!bindings.arguments_satisfy_declared_parameters(&db, &env, &changed));
-        }
-        for argument in [Argument::Keyword("other"), Argument::Positional] {
-            let mut changed = arguments.clone();
-            changed.items[1].argument = argument;
-            assert!(!bindings.arguments_satisfy_declared_parameters(&db, &env, &changed));
-        }
-        let mut changed = arguments.clone();
-        changed.items.pop();
-        assert!(!bindings.arguments_satisfy_declared_parameters(&db, &env, &changed));
-
-        let Some(unpacking) = &arguments.items[2].known_unpacking else {
-            anyhow::bail!("expected known unpacked arguments");
-        };
-        let KnownUnpacking::Keywords(keywords) = unpacking else {
-            anyhow::bail!("expected known keyword arguments");
-        };
-        let mut optional = keywords.clone();
-        optional.items[0].kind = DictionaryItemKind::Optional;
-        let mut renamed = keywords.clone();
-        renamed.items[0].name = Name::new_static("other");
-        let mut wrong_value = keywords.clone();
-        wrong_value.items[0].ty = str;
-        let mut open = keywords.clone();
-        open.extra_items = Some(int);
-        let mut excluded = keywords.clone();
-        excluded.excluded_names.push(Name::new_static("prefix"));
-        for keywords in [optional, renamed, wrong_value, open, excluded] {
-            let mut changed = arguments.clone();
-            changed.items[2].known_unpacking = Some(KnownUnpacking::Keywords(keywords));
-            assert!(!bindings.arguments_satisfy_declared_parameters(&db, &env, &changed));
-        }
-        assert!(
-            !CallArgumentTypes::default()
-                .has_same_lookups(&CallArgumentTypes::new(Some(Type::unknown())))
-        );
-        Ok(())
-    }
-
-    #[test]
     fn residual_keywords_follow_paramspec_projection() -> anyhow::Result<()> {
         let db = TestDbBuilder::new().with_file("/src/main.py", "").build()?;
         let file = system_path_to_file(&db, "/src/main.py")?;
         let env = ProgramEnvironment::from_file(db.program_file(file));
         let forwarded = Type::string_literal(&db, "forwarded");
         let arguments = CallArguments {
-            request_input_proof: false,
             items: vec![CallArgument {
                 argument: Argument::Keywords,
                 types: CallArgumentTypes::new(Some(Type::unknown())),

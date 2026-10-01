@@ -1440,20 +1440,11 @@ declare_lint! {
     }
 }
 
-// Truthiness advisories are compatible with successful type checking. Unclassified
-// diagnostics, including application-supplied ones, conservatively remain checking failures.
-fn is_checking_failure(id: DiagnosticId) -> bool {
-    id != DiagnosticId::Lint(REDUNDANT_CONDITION.name())
-        && id != DiagnosticId::Lint(REDUNDANT_CONDITION_STRICT.name())
-}
-
 /// A collection of type check diagnostics.
 #[derive(Default, Eq, PartialEq, get_size2::GetSize)]
 pub struct TypeCheckDiagnostics {
     diagnostics: Vec<Diagnostic>,
     used_suppressions: FxHashSet<FileSuppressionId>,
-    has_reachable_suppressed_checking_failures: bool,
-    has_unproved_requirements: bool,
 }
 
 pub(crate) fn report_mismatched_type_name<'db>(
@@ -1491,9 +1482,6 @@ impl TypeCheckDiagnostics {
     pub(super) fn extend(&mut self, other: &TypeCheckDiagnostics) {
         self.diagnostics.extend_from_slice(&other.diagnostics);
         self.used_suppressions.extend(&other.used_suppressions);
-        self.has_reachable_suppressed_checking_failures |=
-            other.has_reachable_suppressed_checking_failures;
-        self.has_unproved_requirements |= other.has_unproved_requirements;
     }
 
     /// Extend with selected diagnostics while retaining all used suppressions.
@@ -1509,9 +1497,6 @@ impl TypeCheckDiagnostics {
                 .cloned(),
         );
         self.used_suppressions.extend(&other.used_suppressions);
-        self.has_reachable_suppressed_checking_failures |=
-            other.has_reachable_suppressed_checking_failures;
-        self.has_unproved_requirements |= other.has_unproved_requirements;
     }
 
     pub(super) fn extend_diagnostics(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
@@ -1524,7 +1509,6 @@ impl TypeCheckDiagnostics {
         db: &dyn Db,
         file: PythonFile<'_>,
         diagnostics: impl IntoIterator<Item = Diagnostic>,
-        mut should_record_suppression: impl FnMut(TextRange) -> bool,
     ) {
         for mut diagnostic in diagnostics {
             if let DiagnosticId::Lint(name) = diagnostic.id()
@@ -1541,9 +1525,6 @@ impl TypeCheckDiagnostics {
                 if let Some(range) = span.range()
                     && self.is_suppressed(db, file, range, lint)
                 {
-                    if should_record_suppression(range) {
-                        self.mark_reachable_suppression(lint);
-                    }
                     continue;
                 }
                 if source != LintSource::Default {
@@ -1580,23 +1561,6 @@ impl TypeCheckDiagnostics {
         self.used_suppressions.len()
     }
 
-    pub(crate) fn mark_reachable_suppression(&mut self, lint: LintId) {
-        self.has_reachable_suppressed_checking_failures |=
-            is_checking_failure(DiagnosticId::Lint(lint.name()));
-    }
-
-    pub(crate) fn has_reachable_suppressed_checking_failures(&self) -> bool {
-        self.has_reachable_suppressed_checking_failures
-    }
-
-    pub(crate) fn has_checking_failures(&self) -> bool {
-        self.has_reachable_suppressed_checking_failures
-            || self
-                .diagnostics
-                .iter()
-                .any(|diagnostic| is_checking_failure(diagnostic.id()))
-    }
-
     pub(crate) fn shrink_to_fit(&mut self) {
         self.used_suppressions.shrink_to_fit();
         self.diagnostics.shrink_to_fit();
@@ -1606,20 +1570,12 @@ impl TypeCheckDiagnostics {
         self.diagnostics
     }
 
-    pub(crate) fn mark_unproved_requirement(&mut self) {
-        self.has_unproved_requirements = true;
-    }
-
-    pub(crate) fn has_unproved_requirements(&self) -> bool {
-        self.has_unproved_requirements
-    }
-
     pub(crate) fn has_diagnostics_or_used_suppressions(&self) -> bool {
         !self.diagnostics.is_empty() || !self.used_suppressions.is_empty()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        !self.has_diagnostics_or_used_suppressions() && !self.has_unproved_requirements
+        !self.has_diagnostics_or_used_suppressions()
     }
 
     fn iter(&self) -> std::slice::Iter<'_, Diagnostic> {

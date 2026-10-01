@@ -34,9 +34,9 @@ use crate::types::list_members::{
     all_members, all_members_with_object_policy, all_reachable_members,
 };
 use crate::types::{
-    CycleDetector, DictionaryItems, ProgramEnvironment, SpecialFormType, Type,
-    TypeCheckDiagnostics, TypeQualifiers, binding_type, infer_complete_scope_types,
-    infer_definition_types, inferred_declaration, is_discarded_dict_key_assignment,
+    CycleDetector, DictionaryItems, ProgramEnvironment, SpecialFormType, Type, TypeQualifiers,
+    binding_type, infer_complete_scope_types, infer_definition_types, inferred_declaration,
+    is_discarded_dict_key_assignment,
 };
 use crate::types::{function_signature_annotation_info, function_signature_annotation_scope};
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
@@ -62,36 +62,6 @@ pub(crate) fn explicitly_reads_local_namespace(expression: &Expr) -> bool {
         "vars" => call.arguments.args.iter().all(Expr::is_starred_expr),
         _ => false,
     }
-}
-
-/// Facts retained by function-body and parameter-default inference in the current configuration.
-/// These do not establish static expression evidence or dependency availability.
-#[derive(Clone, Copy, Debug)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "Callers inspect these separate inference outcomes to apply their validation policy."
-)]
-pub struct FunctionInferenceFacts {
-    /// Whether effective returns correspond to normalized declared output types.
-    /// Positive explicit `Any` and bare callable ellipsis omit value and input-shape constraints.
-    /// Input domains, writes, and invariant storage require known compared types and pure
-    /// correspondence under their materialization.
-    /// `TypeGuard` results can retain a positive implication from a single returned runtime
-    /// type comparison of the original parameter. `TypeIs` checks both outcomes of that
-    /// comparison. Unsupported predicate bodies yield `None`.
-    /// `None` means output checking was not selected or could not be completed.
-    /// This fact does not establish operation safety, defaults, or complete body evidence.
-    pub return_type_correspondence: Option<bool>,
-    pub has_cycle_recovery: bool,
-    pub has_errors: bool,
-    /// Includes emitted and reachably suppressed checking failures, independently of severity.
-    /// Redundant-condition advisories do not count. Disabled checks and complete expression
-    /// evidence remain separate.
-    pub has_checking_failures: bool,
-    /// Whether selected input checks encountered a reachable requirement they could not prove.
-    /// Diagnostic rule selection and source suppressions do not clear this status. It covers
-    /// failures among selected checks; check selection and complete body evidence are separate.
-    pub has_unproved_requirements: bool,
 }
 
 /// The primary interface the LSP should use for querying semantic information about a [`File`].
@@ -145,131 +115,9 @@ impl<'db> SemanticModel<'db> {
         ProgramEnvironment::from_file(self.program_file())
     }
 
-    /// Returns body and default checking facts for a function in the active configuration.
-    /// Returns `None` for definitions that are not ordinary function declarations.
-    pub fn function_inference_facts(
-        &self,
-        definition: Definition<'db>,
-    ) -> Option<FunctionInferenceFacts> {
-        let DefinitionKind::Function(function) = definition.kind(self.db) else {
-            return None;
-        };
-        let file = definition.program_file(self.db);
-        let parsed = parsed_module(self.db, file.python_file(self.db)).load(self.db);
-        let scope = semantic_index(self.db, file)
-            .node_scope(ty_python_core::scope::NodeWithScopeRef::Function(
-                function.node(&parsed),
-            ))
-            .to_scope_id(self.db, file);
-        let body = infer_complete_scope_types(self.db, scope);
-        let defaults = crate::types::infer_function_default_types(self.db, definition);
-        let diagnostics = [body.diagnostics(), defaults.diagnostics()];
-        Some(FunctionInferenceFacts {
-            return_type_correspondence: body.return_type_correspondence(),
-            has_cycle_recovery: body.has_cycle_recovery() || defaults.is_provisional(),
-            has_errors: diagnostics.into_iter().flatten().any(|diagnostics| {
-                diagnostics
-                    .into_iter()
-                    .any(|diagnostic| diagnostic.severity() == ruff_db::diagnostic::Severity::Error)
-            }),
-            has_checking_failures: diagnostics
-                .into_iter()
-                .flatten()
-                .any(TypeCheckDiagnostics::has_checking_failures),
-            has_unproved_requirements: diagnostics
-                .into_iter()
-                .flatten()
-                .any(TypeCheckDiagnostics::has_unproved_requirements),
-        })
-    }
-
     /// Returns the inferred value of a binding, including application-supplied source bindings.
     pub fn definition_type(&self, definition: Definition<'db>) -> Type<'db> {
         binding_type(self.db, definition)
-    }
-
-    /// Proves that the indexed references to these names are confined to `allowed`.
-    ///
-    /// Each occurrence must belong to this model's current module AST and resolve to one
-    /// ordinary assignment in the same local scope. The returned definitions are aligned
-    /// with `allowed`, including repeated occurrences. Rebinding, deletion, loop-carried
-    /// bindings, captures, and any other possible indexed reference prevent proof.
-    ///
-    /// This checks raw lexical references indexed in the file. Callers establish any required
-    /// constraints on reflection, external aliases, and object lifetime. The check retains
-    /// possible references independently of expression types and semantic reachability.
-    pub fn confined_name_definitions(
-        &self,
-        allowed: &[&ast::ExprName],
-    ) -> Option<Vec<Definition<'db>>> {
-        if self.annotation_scope.is_some() {
-            return None;
-        }
-        let Some(first) = allowed.first() else {
-            return Some(Vec::new());
-        };
-        let index = semantic_index(self.db, self.file);
-        let scope = index.try_expression_scope_id(&ExprRef::from(*first))?;
-        let table = index.place_table(scope);
-        let use_def = index.use_def_map(scope);
-        let mut definitions = Vec::with_capacity(allowed.len());
-        let mut candidates = FxHashSet::default();
-        let mut names = FxHashSet::default();
-        let mut allowed_uses = FxHashSet::default();
-        for &name in allowed {
-            if index.try_expression_scope_id(&ExprRef::from(name))? != scope {
-                return None;
-            }
-            let symbol = table.symbol_id(&name.id)?;
-            if !table.symbol(symbol).is_local() {
-                return None;
-            }
-            let use_id = index.try_expression_use_id(name.into())?;
-            let mut bindings = use_def.bindings_at_use(use_id);
-            let DefinitionState::Defined(definition) = bindings.next()?.binding else {
-                return None;
-            };
-            if bindings.next().is_some()
-                || definition.scope(self.db).file_scope_id(self.db) != scope
-                || !matches!(definition.kind(self.db), DefinitionKind::Assignment(_))
-            {
-                return None;
-            }
-            if candidates.insert(definition) {
-                // Complete history prepends the scope-entry undefined sentinel. Every actual
-                // retained binding must be this assignment, including bindings after the use.
-                let mut history = use_def.reachable_symbol_bindings(symbol);
-                if history.next()?.binding != DefinitionState::Undefined {
-                    return None;
-                }
-                let first_binding = history.next()?.binding;
-                if first_binding != DefinitionState::Defined(definition)
-                    || history
-                        .any(|binding| binding.binding != DefinitionState::Defined(definition))
-                {
-                    return None;
-                }
-            }
-            definitions.push(definition);
-            names.insert(name.id.as_str());
-            allowed_uses.insert(ty_python_core::ExpressionNodeKey::from(ExprRef::from(name)));
-        }
-
-        let module = parsed_module(self.db, self.python_file()).load(self.db);
-        for (scope, expression, _) in index.expression_uses(&module) {
-            let ExprRef::Name(name) = expression else {
-                continue;
-            };
-            if !names.contains(name.id.as_str())
-                || allowed_uses.contains(&ty_python_core::ExpressionNodeKey::from(expression))
-            {
-                continue;
-            }
-            if self.name_may_reference_definitions(name, scope, &candidates)? {
-                return None;
-            }
-        }
-        Some(definitions)
     }
 
     pub(crate) fn name_may_reference_definitions(
@@ -1621,134 +1469,11 @@ impl HasType for ast::ExceptHandlerExceptHandler {
 #[cfg(test)]
 mod tests {
     use super::ObjectMembers;
-    use crate::db::tests::{TestDb, TestDbBuilder};
+    use crate::db::tests::TestDbBuilder;
     use crate::{Db as _, HasType, SemanticModel};
     use ruff_db::files::system_path_to_file;
     use ruff_db::parsed::parsed_module;
-    use ruff_db::system::DbWithWritableSystem as _;
-    use ruff_python_ast::ExprRef;
-    use ruff_text_size::Ranged;
     use ty_python_core::ProgramFile;
-    use ty_python_core::definition::DefinitionKind;
-    use ty_python_core::semantic_index;
-
-    fn names_are_confined(db: &TestDb, source: &str) -> anyhow::Result<bool> {
-        let file = db.program_file(system_path_to_file(db, "/src/main.py")?);
-        let module = parsed_module(db, file.python_file(db)).load(db);
-        let model = SemanticModel::new(db, file);
-        let start = source.find("ROOT =").expect("root assignment");
-        let end = source[start..]
-            .find('\n')
-            .map_or(source.len(), |end| start + end);
-        let names: Vec<_> = semantic_index(db, file)
-            .expression_uses(&module)
-            .filter_map(|(_, expression, _)| {
-                let ExprRef::Name(name) = expression else {
-                    return None;
-                };
-                (usize::from(name.start()) >= start && usize::from(name.end()) <= end)
-                    .then_some(name)
-            })
-            .collect();
-        assert!(!names.is_empty(), "root contains named leaves");
-        let Some(definitions) = model.confined_name_definitions(&names) else {
-            return Ok(false);
-        };
-        assert_eq!(definitions.len(), names.len());
-        for (definition, name) in definitions.into_iter().zip(names) {
-            let DefinitionKind::Assignment(assignment) = definition.kind(db) else {
-                panic!("confined definitions are assignments");
-            };
-            assert_eq!(
-                assignment.target(&module).as_name_expr().unwrap().id,
-                name.id
-            );
-        }
-        Ok(true)
-    }
-
-    #[test]
-    fn name_confinement_uses_raw_bindings_and_lexical_identity() -> anyhow::Result<()> {
-        for (source, expected) in [
-            ("leaf = ['a']\nROOT = [leaf, leaf]\n", true),
-            (
-                "first = ['a']\nsecond = ['b']\nROOT = [first, second, first]\n",
-                true,
-            ),
-            (
-                "leaf = ['a']\ndef other(leaf): return leaf\nROOT = [leaf]\n",
-                true,
-            ),
-            (
-                "leaf = ['a']\ndef other():\n    leaf = []\n    return leaf\nROOT = [leaf]\n",
-                true,
-            ),
-            (
-                "leaf = ['a']\nclass Other:\n    leaf = []\n    value = leaf\nROOT = [leaf]\n",
-                true,
-            ),
-            ("leaf = ['a']\ncorrupt(leaf)\nROOT = [leaf]\n", false),
-            ("leaf = ['a']\nROOT = [leaf]\ncorrupt(leaf)\n", false),
-            (
-                "leaf = ['a']\nROOT = [leaf]\nif False: corrupt(leaf)\n",
-                false,
-            ),
-            ("leaf = ['a']\nALIAS = leaf\nROOT = [leaf]\n", false),
-            ("leaf = ['a']\nmethod = leaf.append\nROOT = [leaf]\n", false),
-            (
-                "leaf = ['a']\nother = {'leaf': leaf}\nROOT = [leaf]\n",
-                false,
-            ),
-            ("leaf = ['a']\nleaf[0] = 'b'\nROOT = [leaf]\n", false),
-            ("leaf = ['a']\nROOT = [leaf]\ndel leaf\n", false),
-            ("leaf = ['a']\nROOT = [leaf]\nleaf += ['b']\n", false),
-            ("leaf = ['a']\nROOT = [leaf]\nleaf = []\n", false),
-            (
-                "for _ in range(2):\n    leaf = ['a']\n    ROOT = [leaf]\n",
-                false,
-            ),
-            ("leaf = ['a']\nROOT = [leaf]\ndef leaf(): pass\n", false),
-            (
-                "leaf = ['a']\ndef nested(): return leaf\nROOT = [leaf]\n",
-                false,
-            ),
-            (
-                "leaf = ['a']\ndef nested():\n    global leaf\n    return leaf\nROOT = [leaf]\n",
-                false,
-            ),
-            (
-                "def outer():\n    leaf = ['a']\n    def nested():\n        nonlocal leaf\n        return leaf\n    ROOT = [leaf]\n",
-                false,
-            ),
-            (
-                "leaf = ['a']\nclass Other:\n    value = leaf\n    leaf = []\nROOT = [leaf]\n",
-                false,
-            ),
-            ("if condition: leaf = ['a']\nROOT = [leaf]\n", false),
-        ] {
-            let db = TestDbBuilder::new()
-                .with_file("/src/main.py", source)
-                .build()?;
-            assert_eq!(names_are_confined(&db, source)?, expected, "{source}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn name_confinement_tracks_source_edits() -> anyhow::Result<()> {
-        let mut db = TestDbBuilder::new().with_file("/src/main.py", "").build()?;
-        for (source, expected) in [
-            ("leaf = ['a']\nROOT = [leaf, leaf]\n", true),
-            ("leaf = ['a']\nROOT = [leaf, leaf]\ncorrupt(leaf)\n", false),
-            ("leaf = ['a']\nROOT = [leaf, leaf]\n", true),
-            ("leaf = ['a']\nleaf = []\nROOT = [leaf, leaf]\n", false),
-            ("leaf = ['a']\nROOT = [leaf, leaf]\n", true),
-        ] {
-            db.write_file("/src/main.py", source)?;
-            assert_eq!(names_are_confined(&db, source)?, expected, "{source}");
-        }
-        Ok(())
-    }
 
     #[test]
     fn member_completion_can_exclude_object_declarations() -> anyhow::Result<()> {

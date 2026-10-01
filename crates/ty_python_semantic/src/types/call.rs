@@ -22,8 +22,6 @@ pub(super) use bind::{
 #[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
 pub(crate) struct BinaryOperationResult<'db> {
     pub(crate) return_type: Type<'db>,
-    /// Correspondence of the selected calls' inputs when argument proof was requested.
-    pub(crate) arguments_proved: bool,
     /// Deprecated implementations or overloads selected for the operation.
     pub(crate) deprecated_functions: Box<[OverloadLiteral<'db>]>,
 }
@@ -127,61 +125,35 @@ impl<'db> Type<'db> {
         right: Type<'db>,
         (dunder, reflected_dunder): (&'static str, &'static str),
         policy: MemberLookupPolicy,
-        prove_arguments: bool,
-    ) -> Option<(Type<'db>, bool)> {
+    ) -> Option<Type<'db>> {
         let call_dunder = |name, receiver: Type<'db>, argument: Type<'db>| {
-            let mut arguments =
-                CallArguments::positional([argument]).with_input_proof_request(prove_arguments);
-            let bindings = receiver.try_call_dunder_with_policy(
-                db,
-                env,
-                name,
-                &mut arguments,
-                TypeContext::default(),
-                policy,
-            )?;
-            let inputs_proved = prove_arguments
-                && !bindings.has_only_constructor_items()
-                && bindings.arguments_satisfy_declared_parameters(db, env, &arguments);
-            Ok::<_, CallDunderError<'db>>((bindings.return_type(db, env), inputs_proved))
+            let mut arguments = CallArguments::positional([argument]);
+            receiver
+                .try_call_dunder_with_policy(
+                    db,
+                    env,
+                    name,
+                    &mut arguments,
+                    TypeContext::default(),
+                    policy,
+                )
+                .map(|bindings| bindings.return_type(db, env))
         };
-        // A rejected or possibly-unbound call can still execute at runtime. Only an absent
-        // method lets the fallback prove every possible input requirement.
-
         match reflected_method_priority(db, env, left, right) {
-            ReflectedMethodPriority::Never => call_dunder(dunder, left, right).or_else(|error| {
-                call_dunder(reflected_dunder, right, left).map(|(ty, proved)| {
-                    (
-                        ty,
-                        proved && matches!(error, CallDunderError::MethodNotAvailable),
-                    )
-                })
-            }),
-            ReflectedMethodPriority::Possibly => {
-                match (
-                    call_dunder(dunder, left, right),
-                    call_dunder(reflected_dunder, right, left),
-                ) {
-                    (Ok((normal, normal_proved)), Ok((reflected, reflected_proved))) => Ok((
-                        UnionType::from_two_elements(db, env, normal, reflected),
-                        normal_proved && reflected_proved,
-                    )),
-                    (Ok((ty, proved)), Err(error)) | (Err(error), Ok((ty, proved))) => Ok((
-                        ty,
-                        proved && matches!(error, CallDunderError::MethodNotAvailable),
-                    )),
-                    (Err(error), Err(_)) => Err(error),
+            ReflectedMethodPriority::Never => call_dunder(dunder, left, right)
+                .or_else(|_| call_dunder(reflected_dunder, right, left)),
+            ReflectedMethodPriority::Possibly => match (
+                call_dunder(dunder, left, right),
+                call_dunder(reflected_dunder, right, left),
+            ) {
+                (Ok(normal), Ok(reflected)) => {
+                    Ok(UnionType::from_two_elements(db, env, normal, reflected))
                 }
-            }
+                (Ok(ty), Err(_)) | (Err(_), Ok(ty)) => Ok(ty),
+                (Err(error), Err(_)) => Err(error),
+            },
             ReflectedMethodPriority::Definitely => call_dunder(reflected_dunder, right, left)
-                .or_else(|error| {
-                    call_dunder(dunder, left, right).map(|(ty, proved)| {
-                        (
-                            ty,
-                            proved && matches!(error, CallDunderError::MethodNotAvailable),
-                        )
-                    })
-                }),
+                .or_else(|_| call_dunder(dunder, left, right)),
         }
         .ok()
     }
@@ -196,9 +168,8 @@ impl<'db> Type<'db> {
         op: ast::Operator,
         right_ty: Type<'db>,
         policy: MemberLookupPolicy,
-        prove_arguments: bool,
     ) -> Option<&'db BinaryOperationResult<'db>> {
-        #[salsa::tracked(returns(ref), cycle_initial=|_, _, _, _, _, _, _, _| None, heap_size=ruff_memory_usage::heap_size)]
+        #[salsa::tracked(returns(ref), cycle_initial=|_, _, _, _, _, _, _| None, heap_size=ruff_memory_usage::heap_size)]
         fn try_call_bin_op_result_impl<'db>(
             db: &'db dyn Db,
             program: Program<'db>,
@@ -206,14 +177,12 @@ impl<'db> Type<'db> {
             op: ast::Operator,
             right_ty: Type<'db>,
             policy: MemberLookupPolicy,
-            prove_arguments: bool,
         ) -> Option<BinaryOperationResult<'db>> {
             let env = &ProgramEnvironment::from_program(program);
-            Type::try_call_bin_op_impl(db, env, left_ty, op, right_ty, policy, prove_arguments)
+            Type::try_call_bin_op_impl(db, env, left_ty, op, right_ty, policy)
                 .ok()
-                .map(|(bindings, arguments_proved)| BinaryOperationResult {
+                .map(|bindings| BinaryOperationResult {
                     return_type: bindings.return_type(db, env),
-                    arguments_proved,
                     deprecated_functions: bindings
                         .deprecated_functions(db)
                         .map(|(_, function)| function)
@@ -221,16 +190,7 @@ impl<'db> Type<'db> {
                 })
         }
 
-        try_call_bin_op_result_impl(
-            db,
-            env.program(db),
-            left_ty,
-            op,
-            right_ty,
-            policy,
-            prove_arguments,
-        )
-        .as_ref()
+        try_call_bin_op_result_impl(db, env.program(db), left_ty, op, right_ty, policy).as_ref()
     }
 
     pub(crate) fn try_call_bin_op(
@@ -258,8 +218,7 @@ impl<'db> Type<'db> {
         right_ty: Type<'db>,
         policy: MemberLookupPolicy,
     ) -> Result<Bindings<'db>, CallBinOpError> {
-        Self::try_call_bin_op_impl(db, env, left_ty, op, right_ty, policy, false)
-            .map(|(bindings, _)| bindings)
+        Self::try_call_bin_op_impl(db, env, left_ty, op, right_ty, policy)
     }
 
     fn try_call_bin_op_impl(
@@ -269,8 +228,7 @@ impl<'db> Type<'db> {
         op: ast::Operator,
         right_ty: Type<'db>,
         policy: MemberLookupPolicy,
-        prove_arguments: bool,
-    ) -> Result<(Bindings<'db>, bool), CallBinOpError> {
+    ) -> Result<Bindings<'db>, CallBinOpError> {
         // We either want to call lhs.__op__ or rhs.__rop__. The full decision tree from
         // the Python spec [1] is:
         //
@@ -286,8 +244,7 @@ impl<'db> Type<'db> {
         // establish that priority conditionally.
         let reflected_priority = reflected_method_priority(db, env, left_ty, right_ty);
         let call_dunder = |receiver: Type<'db>, name, argument| {
-            let mut arguments =
-                CallArguments::positional([argument]).with_input_proof_request(prove_arguments);
+            let mut arguments = CallArguments::positional([argument]);
             let bindings = receiver.try_call_dunder_with_policy(
                 db,
                 env,
@@ -296,13 +253,8 @@ impl<'db> Type<'db> {
                 TypeContext::default(),
                 policy,
             )?;
-            let arguments_proved = !prove_arguments
-                || (!bindings.has_only_constructor_items()
-                    && bindings.arguments_satisfy_declared_parameters(db, env, &arguments));
-            Ok::<_, CallDunderError<'db>>((bindings, arguments_proved))
+            Ok::<_, CallDunderError<'db>>(bindings)
         };
-        // A rejected or possibly-unbound call can still execute at runtime. Only an absent
-        // method lets the fallback prove every possible input requirement.
 
         let left_class = left_ty.to_meta_type(db, env);
         let right_class = right_ty.to_meta_type(db, env);
@@ -318,50 +270,35 @@ impl<'db> Type<'db> {
             {
                 let call_on_right_instance = call_dunder(right_ty, reflected_dunder, left_ty);
                 if reflected_priority == ReflectedMethodPriority::Definitely {
-                    return Ok(call_on_right_instance.or_else(|error| {
-                        call_dunder(left_ty, op.dunder(), right_ty).map(|(bindings, proved)| {
-                            (
-                                bindings,
-                                proved && matches!(error, CallDunderError::MethodNotAvailable),
-                            )
-                        })
-                    })?);
+                    return Ok(call_on_right_instance
+                        .or_else(|_| call_dunder(left_ty, op.dunder(), right_ty))?);
                 }
 
                 let call_on_left_instance = call_dunder(left_ty, op.dunder(), right_ty);
                 return match (call_on_right_instance, call_on_left_instance) {
-                    (Ok((right_bindings, right_proved)), Ok((left_bindings, left_proved))) => {
+                    (Ok(right_bindings), Ok(left_bindings)) => {
                         let callable_type = UnionType::from_two_elements(
                             db,
                             env,
                             right_bindings.callable_type(),
                             left_bindings.callable_type(),
                         );
-                        Ok((
-                            Bindings::from_union(callable_type, [right_bindings, left_bindings]),
-                            right_proved && left_proved,
+                        Ok(Bindings::from_union(
+                            callable_type,
+                            [right_bindings, left_bindings],
                         ))
                     }
-                    (Ok((bindings, proved)), Err(error)) | (Err(error), Ok((bindings, proved))) => {
-                        Ok((
-                            bindings,
-                            proved && matches!(error, CallDunderError::MethodNotAvailable),
-                        ))
-                    }
+                    (Ok(bindings), Err(_)) | (Err(_), Ok(bindings)) => Ok(bindings),
                     (Err(_), Err(error)) => Err(error.into()),
                 };
             }
         }
 
-        call_dunder(left_ty, op.dunder(), right_ty).or_else(|error| {
+        call_dunder(left_ty, op.dunder(), right_ty).or_else(|_| {
             if left_ty == right_ty {
                 Err(CallBinOpError::NotSupported)
             } else {
-                let (bindings, proved) = call_dunder(right_ty, op.reflected_dunder(), left_ty)?;
-                Ok((
-                    bindings,
-                    proved && matches!(error, CallDunderError::MethodNotAvailable),
-                ))
+                call_dunder(right_ty, op.reflected_dunder(), left_ty).map_err(Into::into)
             }
         })
     }

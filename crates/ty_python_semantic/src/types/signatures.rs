@@ -2540,7 +2540,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 
         // Function assignability here is parameter-contravariant and return-covariant.
         let parameters_cover_target =
-            self.check_input_type_pair(db, other_parameter_type, parameter_type_union.build());
+            self.check_type_pair(db, other_parameter_type, parameter_type_union.build());
         let returns_match_target =
             || self.check_type_pair(db, return_type_union.build(), target_signature.return_ty);
         let aggregate_relation =
@@ -2818,11 +2818,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // satisfiability alone does not establish the original strict relation.
         if self.inferable == TypeVarSet::None
             && self.typevar_evaluation == TypeVarEvaluation::Eager
-            && matches!(
-                self.relation,
-                TypeRelation::Redundancy { pure: true }
-                    | TypeRelation::DeclaredOutput { strict: _ }
-            )
+            && matches!(self.relation, TypeRelation::Redundancy { pure: true })
             && source.has_supported_declared_domain(db, env)
             && target.generic_context.is_none()
             && target.supports_specialization(db, |ty| ty.is_fully_static_except_any(db, env))
@@ -2852,11 +2848,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 checker.typevar_evaluation = TypeVarEvaluation::Lazy;
             }
         } else if checker.typevar_evaluation == TypeVarEvaluation::Eager
-            && matches!(
-                checker.relation,
-                TypeRelation::Redundancy { pure: true }
-                    | TypeRelation::DeclaredOutput { strict: _ }
-            )
+            && matches!(checker.relation, TypeRelation::Redundancy { pure: true })
             && source.generic_context.is_some()
             && target.generic_context.is_none()
             && source.supports_static_inference(db, env)
@@ -3319,8 +3311,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 // The keyword must be uninhabited to avoid the collision. Keep this as a
                 // constraint so gradual types can materialize to `Never` and inferable type
                 // variables can be constrained to it.
-                let no_collision =
-                    self.check_input_type_pair(db, keyword.annotated_type(), Type::Never);
+                let no_collision = self.check_type_pair(db, keyword.annotated_type(), Type::Never);
                 if result
                     .intersect(db, self.constraints, no_collision)
                     .is_never_satisfied(db, env)
@@ -3359,7 +3350,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 _ => {}
             }
 
-            let constraint_set = self.check_input_type_pair(db, target_ty, source_ty);
+            let constraint_set = self.check_type_pair(db, target_ty, source_ty);
             if let Some(context) = self.report_context()
                 && constraint_set.is_never_satisfied(db, env)
             {
@@ -3385,20 +3376,6 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // The top signature is supertype of (and assignable from) all other signatures. It is a
         // subtype of no signature except itself, and assignable only to the gradual signature.
         if target_parameters.is_top() {
-            return result;
-        }
-        if matches!(
-            self.relation,
-            TypeRelation::DeclaredOutput { strict: false }
-        ) && !source.is_paramspec_value()
-            && !target.is_paramspec_value()
-            && target_parameters.kind() == ParametersKind::Gradual
-            && let [variadic, keyword_variadic] = target_parameters.as_slice()
-            && variadic.is_variadic()
-            && keyword_variadic.is_keyword_variadic()
-            && variadic.annotated_type().is_explicit_any(db)
-            && keyword_variadic.annotated_type().is_explicit_any(db)
-        {
             return result;
         }
 
@@ -4211,15 +4188,14 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 
             return match self.relation {
                 TypeRelation::Subtyping | TypeRelation::SubtypingAssuming => self.never(),
-                TypeRelation::Redundancy { .. } | TypeRelation::DeclaredOutput { .. } => result
-                    .intersect(
-                        db,
+                TypeRelation::Redundancy { .. } => result.intersect(
+                    db,
+                    self.constraints,
+                    ConstraintSet::from_bool(
                         self.constraints,
-                        ConstraintSet::from_bool(
-                            self.constraints,
-                            source_parameters.is_gradual() && target_parameters.is_gradual(),
-                        ),
+                        source_parameters.is_gradual() && target_parameters.is_gradual(),
                     ),
+                ),
                 TypeRelation::Assignability => result,
             };
         }
@@ -4601,8 +4577,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                                         TypeRelation::Assignability => result,
                                         TypeRelation::Subtyping
                                         | TypeRelation::SubtypingAssuming
-                                        | TypeRelation::Redundancy { .. }
-                                        | TypeRelation::DeclaredOutput { .. } => self.never(),
+                                        | TypeRelation::Redundancy { .. } => self.never(),
                                     };
                                 }
                                 continue;
@@ -6874,18 +6849,10 @@ mod tests {
             result,
         );
         let fixed = callable(Parameters::standard([name.clone()]), result);
-        let optional_unknown = callable(
-            Parameters::standard([
-                name,
-                Parameter::keyword_variadic(Name::new_static("kwargs")),
-            ]),
-            result,
-        );
-        let omitted = callable(Parameters::gradual_form(), result);
         let universal = callable(Parameters::bottom(), result);
         let top = callable(Parameters::top(), result);
 
-        // Ordinary consistency can use the known rows. Domain proof also needs the absent rows.
+        // Consistency can use the known rows. Subtyping also needs the absent rows.
         assert!(incomplete.is_assignable_to(&db, &env, fixed));
         assert!(!incomplete.is_subtype_of(&db, &env, fixed));
         assert!(!incomplete.is_pure_redundant_with(&db, &env, fixed));
@@ -6895,42 +6862,6 @@ mod tests {
         assert!(incomplete.is_pure_redundant_with(&db, &env, incomplete));
         assert!(universal.is_pure_redundant_with(&db, &env, incomplete));
         assert!(incomplete.is_pure_redundant_with(&db, &env, top));
-
-        for (source, target, expected) in [
-            (incomplete, fixed, false),
-            (fixed, incomplete, false),
-            (optional_unknown, fixed, true),
-            (incomplete, omitted, true),
-            (
-                incomplete,
-                callable(Parameters::gradual_form(), Type::any()),
-                true,
-            ),
-            (
-                incomplete,
-                callable(
-                    Parameters::gradual_form(),
-                    KnownClass::Int.to_instance(&db, &env),
-                ),
-                false,
-            ),
-            (
-                callable(Parameters::empty().with_incomplete_shape(), Type::unknown()),
-                omitted,
-                false,
-            ),
-            (universal, incomplete, true),
-            (top, incomplete, false),
-            (incomplete, top, true),
-        ] {
-            assert_eq!(
-                source.satisfies_declared_output(&db, &env, target),
-                expected,
-                "{} -> {}",
-                source.display(&db, &env),
-                target.display(&db, &env),
-            );
-        }
     }
 
     #[test]

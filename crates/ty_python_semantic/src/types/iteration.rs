@@ -430,95 +430,28 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         mode: EvaluationMode,
     ) -> Result<Cow<'db, TupleSpec<'db>>, IterationError<'db>> {
-        self.try_iterate_with_mode_and_proof(db, env, mode, false)
-            .map(
-                |IterationOutcome {
-                     tuple,
-                     inputs_proved: _,
-                 }| tuple,
-            )
-    }
-
-    /// Retain protocol input requirements at the expression that is actually iterated.
-    pub(super) fn try_iterate_with_context(
-        self,
-        context: &InferContext<'db, '_>,
-        node: impl Ranged,
-        mode: EvaluationMode,
-    ) -> Result<Cow<'db, TupleSpec<'db>>, IterationError<'db>> {
-        let db = context.db();
-        let request = db.function_inference_mode(context.scope())
-            == crate::FunctionInferenceMode::OutputProof;
-        let result =
-            self.try_iterate_with_mode_and_proof(db, context.program_environment(), mode, request);
-        if request
-            && !result.as_ref().is_ok_and(
-                |IterationOutcome {
-                     tuple: _,
-                     inputs_proved,
-                 }| *inputs_proved,
-            )
-        {
-            context.record_unproved_requirement(node);
-        }
-        result.map(
-            |IterationOutcome {
-                 tuple,
-                 inputs_proved: _,
-             }| tuple,
-        )
-    }
-
-    pub(super) fn try_iterate_with_mode_and_proof(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        mode: EvaluationMode,
-        request_input_proof: bool,
-    ) -> Result<IterationOutcome<'db>, IterationError<'db>> {
         fn non_async_special_case<'db>(
             db: &'db dyn Db,
             env: &ProgramEnvironment<'db>,
             ty: Type<'db>,
-            request_input_proof: bool,
-        ) -> Option<IterationOutcome<'db>> {
+        ) -> Option<Cow<'db, TupleSpec<'db>>> {
             // We will not infer precise heterogeneous tuple specs for literals with lengths above this threshold.
             // The threshold here is somewhat arbitrary and conservative; it could be increased if needed.
             // However, it's probably very rare to need heterogeneous unpacking inference for long string literals
             // or bytes literals, and creating long heterogeneous tuple specs has a performance cost.
             const MAX_TUPLE_LENGTH: usize = 128;
 
-            let known = |tuple| IterationOutcome {
-                tuple,
-                inputs_proved: true,
-            };
-
             match ty {
                 Type::RecursiveVar(_) => {
                     unreachable!("semantic operation on an unbound recursive variable")
                 }
-                Type::NominalInstance(nominal) => nominal.tuple_spec(db, env).map(|tuple| {
-                    // An inherited tuple shape need not describe an overridden iterator.
-                    let inputs_proved = nominal.own_tuple_spec(db).is_some();
-                    IterationOutcome {
-                        tuple,
-                        inputs_proved,
-                    }
-                }),
-                Type::NewTypeInstance(newtype) => non_async_special_case(
-                    db,
-                    env,
-                    newtype.concrete_base_type(db),
-                    request_input_proof,
-                ),
-                Type::GenericAlias(alias) if alias.origin(db).is_tuple(db) => {
-                    Some(IterationOutcome {
-                        tuple: Cow::Owned(TupleSpec::homogeneous(todo_type!(
-                            "*tuple[] annotations"
-                        ))),
-                        inputs_proved: false,
-                    })
+                Type::NominalInstance(nominal) => nominal.tuple_spec(db, env),
+                Type::NewTypeInstance(newtype) => {
+                    non_async_special_case(db, env, newtype.concrete_base_type(db))
                 }
+                Type::GenericAlias(alias) if alias.origin(db).is_tuple(db) => Some(Cow::Owned(
+                    TupleSpec::homogeneous(todo_type!("*tuple[] annotations")),
+                )),
                 Type::LiteralValue(literal) => match literal.kind() {
                     LiteralValueTypeKind::Bytes(bytes) => {
                         let bytes_literal = bytes.value(db);
@@ -531,7 +464,7 @@ impl<'db> Type<'db> {
                         } else {
                             TupleSpec::homogeneous(KnownClass::Int.to_instance(db, env))
                         };
-                        Some(known(Cow::Owned(spec)))
+                        Some(Cow::Owned(spec))
                     }
                     LiteralValueTypeKind::String(string_literal_ty) => {
                         if !str_supports_literal_iteration(db, env) {
@@ -547,11 +480,11 @@ impl<'db> Type<'db> {
                         } else {
                             TupleSpec::homogeneous(Type::literal_string())
                         };
-                        Some(known(Cow::Owned(spec)))
+                        Some(Cow::Owned(spec))
                     }
                     // N.B. This special case isn't strictly necessary, it's just an obvious optimization
                     LiteralValueTypeKind::LiteralString => str_supports_literal_iteration(db, env)
-                        .then(|| known(Cow::Owned(TupleSpec::homogeneous(ty)))),
+                        .then(|| Cow::Owned(TupleSpec::homogeneous(ty))),
                     _ => None,
                 },
                 Type::Never => {
@@ -560,27 +493,19 @@ impl<'db> Type<'db> {
                     // index into the tuple. Using `tuple[Unknown, ...]` avoids these false positives.
                     // TODO: Consider removing this special case, and instead hide the indexing
                     // diagnostic in unreachable code.
-                    Some(known(Cow::Owned(TupleSpec::homogeneous(Type::unknown()))))
+                    Some(Cow::Owned(TupleSpec::homogeneous(Type::unknown())))
                 }
-                Type::TypeAlias(alias) => {
-                    non_async_special_case(db, env, alias.value_type(db), request_input_proof)
+                Type::TypeAlias(alias) => non_async_special_case(db, env, alias.value_type(db)),
+                Type::Recursive(recursive) => {
+                    non_async_special_case(db, env, recursive.unfold(db, env).into_unfolded()?)
                 }
-                Type::Recursive(recursive) => non_async_special_case(
-                    db,
-                    env,
-                    recursive.unfold(db, env).into_unfolded()?,
-                    request_input_proof,
-                ),
                 Type::TypeVar(tvar) => match tvar.typevar(db).bound_or_constraints(db, env)? {
                     TypeVarBoundOrConstraints::UpperBound(bound) => {
-                        non_async_special_case(db, env, bound, request_input_proof)
+                        non_async_special_case(db, env, bound)
                     }
-                    TypeVarBoundOrConstraints::Constraints(constraints) => non_async_special_case(
-                        db,
-                        env,
-                        constraints.as_type(db, env),
-                        request_input_proof,
-                    ),
+                    TypeVarBoundOrConstraints::Constraints(constraints) => {
+                        non_async_special_case(db, env, constraints.as_type(db, env))
+                    }
                 },
                 Type::Union(union) => {
                     let elements = union.elements(db);
@@ -588,38 +513,18 @@ impl<'db> Type<'db> {
                         let mut elements_iter = elements.iter();
                         let first_element_spec = elements_iter
                             .next()?
-                            .try_iterate_with_mode_and_proof(
-                                db,
-                                env,
-                                EvaluationMode::Sync,
-                                request_input_proof,
-                            )
+                            .try_iterate_with_mode(db, env, EvaluationMode::Sync)
                             .ok()?;
-                        let IterationOutcome {
-                            tuple,
-                            mut inputs_proved,
-                        } = first_element_spec;
+                        let tuple = first_element_spec;
                         let mut builder = TupleSpecBuilder::from(&*tuple);
                         for element in elements_iter {
                             let outcome = element
-                                .try_iterate_with_mode_and_proof(
-                                    db,
-                                    env,
-                                    EvaluationMode::Sync,
-                                    request_input_proof,
-                                )
+                                .try_iterate_with_mode(db, env, EvaluationMode::Sync)
                                 .ok()?;
-                            let IterationOutcome {
-                                tuple,
-                                inputs_proved: element_inputs_proved,
-                            } = outcome;
-                            inputs_proved &= element_inputs_proved;
+                            let tuple = outcome;
                             builder = builder.union(db, env, &tuple);
                         }
-                        Some(IterationOutcome {
-                            tuple: Cow::Owned(builder.build()),
-                            inputs_proved,
-                        })
+                        Some(Cow::Owned(builder.build()))
                     } else {
                         None
                     }
@@ -646,76 +551,36 @@ impl<'db> Type<'db> {
                             .positive_elements_or_object(db)
                             .filter_map(|element| {
                                 element
-                                    .try_iterate_with_mode_and_proof(
-                                        db,
-                                        env,
-                                        EvaluationMode::Sync,
-                                        request_input_proof,
-                                    )
+                                    .try_iterate_with_mode(db, env, EvaluationMode::Sync)
                                     .ok()
-                                    .map(|outcome| (element, outcome))
                             });
-                        let (first_element, first_spec) = specs_iter.next()?;
-                        let IterationOutcome {
-                            tuple,
-                            inputs_proved: first_inputs_proved,
-                        } = first_spec;
-                        let mut has_non_any_contributor = first_element != Type::any();
-                        let mut inputs_proved = !has_non_any_contributor || first_inputs_proved;
+                        let first_spec = specs_iter.next()?;
+                        let tuple = first_spec;
                         let mut builder = TupleSpecBuilder::from(&*tuple);
-                        for (element, outcome) in specs_iter {
-                            let IterationOutcome {
-                                tuple,
-                                inputs_proved: element_inputs_proved,
-                            } = outcome;
-                            if element != Type::any() {
-                                has_non_any_contributor = true;
-                                inputs_proved &= element_inputs_proved;
-                            }
+                        for outcome in specs_iter {
+                            let tuple = outcome;
                             // Two tuples cannot have incompatible specs unless the tuples themselves
                             // are disjoint. `IntersectionBuilder` eagerly simplifies such
                             // intersections to `Never`, so this should always return `Some`.
                             let Some(intersected) = builder.intersect(db, env, &tuple) else {
-                                return Some(IterationOutcome {
-                                    tuple: Cow::Owned(TupleSpec::homogeneous(Type::unknown())),
-                                    inputs_proved: false,
-                                });
+                                return Some(Cow::Owned(TupleSpec::homogeneous(Type::unknown())));
                             };
                             builder = intersected;
                         }
-                        return Some(IterationOutcome {
-                            tuple: Cow::Owned(builder.build()),
-                            // Any contributes no additional iteration contract. Every other
-                            // successful constituent still owns the precision it contributes.
-                            inputs_proved: has_non_any_contributor && inputs_proved,
-                        });
+                        return Some(Cow::Owned(builder.build()));
                     }
 
                     // Flattening changed the type; recursively iterate the flattened result.
                     flattened
-                        .try_iterate_with_mode_and_proof(
-                            db,
-                            env,
-                            EvaluationMode::Sync,
-                            request_input_proof,
-                        )
+                        .try_iterate_with_mode(db, env, EvaluationMode::Sync)
                         .ok()
                 }
-                Type::EnumComplement(complement) => non_async_special_case(
-                    db,
-                    env,
-                    complement.remaining_literal_union(db, env),
-                    request_input_proof,
-                ),
+                Type::EnumComplement(complement) => {
+                    non_async_special_case(db, env, complement.remaining_literal_union(db, env))
+                }
                 // N.B. This special case isn't strictly necessary, it's just an obvious optimization
-                Type::Dynamic(_) => Some(IterationOutcome {
-                    tuple: Cow::Owned(TupleSpec::homogeneous(ty)),
-                    inputs_proved: false,
-                }),
-                Type::Divergent(_) => Some(IterationOutcome {
-                    tuple: Cow::Owned(TupleSpec::homogeneous(ty)),
-                    inputs_proved: false,
-                }),
+                Type::Dynamic(_) => Some(Cow::Owned(TupleSpec::homogeneous(ty))),
+                Type::Divergent(_) => Some(Cow::Owned(TupleSpec::homogeneous(ty))),
 
                 Type::FunctionLiteral(_)
                 | Type::GenericAlias(_)
@@ -752,12 +617,7 @@ impl<'db> Type<'db> {
             if let Type::Intersection(_) = self {
                 let flattened = self.flatten_typevars(db, env);
                 if flattened != self {
-                    return flattened.try_iterate_with_mode_and_proof(
-                        db,
-                        env,
-                        mode,
-                        request_input_proof,
-                    );
+                    return flattened.try_iterate_with_mode(db, env, mode);
                 }
             }
 
@@ -830,23 +690,16 @@ impl<'db> Type<'db> {
                 }
                 Err(CallDunderError::MethodNotAvailable) => Err(IterationError::UnboundAiterError),
             };
-            // Await protocol evaluation does not yet retain requested input proof.
-            return result.map(|tuple| IterationOutcome {
-                tuple,
-                inputs_proved: false,
-            });
+            return result;
         }
 
-        let result = if let Some(special_case) =
-            non_async_special_case(db, env, self, request_input_proof)
-        {
+        if let Some(special_case) = non_async_special_case(db, env, self) {
             Ok(special_case)
         } else {
             let mode = EvaluationMode::Sync;
             let try_call_dunder_getitem = || {
                 let mut arguments =
-                    CallArguments::positional([KnownClass::Int.to_instance(db, env)])
-                        .with_input_proof_request(request_input_proof);
+                    CallArguments::positional([KnownClass::Int.to_instance(db, env)]);
                 self.try_call_dunder_with_policy(
                     db,
                     env,
@@ -855,17 +708,11 @@ impl<'db> Type<'db> {
                     TypeContext::default(),
                     MemberLookupPolicy::default(),
                 )
-                .map(|bindings| {
-                    let inputs_proved = request_input_proof
-                        && !bindings.has_only_constructor_items()
-                        && bindings.arguments_satisfy_declared_parameters(db, env, &arguments);
-                    (bindings.return_type(db, env), inputs_proved)
-                })
+                .map(|bindings| bindings.return_type(db, env))
             };
 
             let try_call_dunder_next_on_iterator = |iterator: Type<'db>| {
-                let mut arguments =
-                    CallArguments::none().with_input_proof_request(request_input_proof);
+                let mut arguments = CallArguments::none();
                 iterator
                     .try_call_dunder_with_policy(
                         db,
@@ -875,15 +722,10 @@ impl<'db> Type<'db> {
                         TypeContext::default(),
                         MemberLookupPolicy::default(),
                     )
-                    .map(|bindings| {
-                        let inputs_proved = request_input_proof
-                            && !bindings.has_only_constructor_items()
-                            && bindings.arguments_satisfy_declared_parameters(db, env, &arguments);
-                        (bindings.return_type(db, env), inputs_proved)
-                    })
+                    .map(|bindings| bindings.return_type(db, env))
             };
 
-            let mut arguments = CallArguments::none().with_input_proof_request(request_input_proof);
+            let mut arguments = CallArguments::none();
             let dunder_iter_result = self.try_call_dunder_with_policy(
                 db,
                 env,
@@ -895,14 +737,8 @@ impl<'db> Type<'db> {
             match dunder_iter_result {
                 Ok(bindings) => {
                     let iterator = bindings.return_type(db, env);
-                    let iter_inputs_proved = request_input_proof
-                        && !bindings.has_only_constructor_items()
-                        && bindings.arguments_satisfy_declared_parameters(db, env, &arguments);
                     try_call_dunder_next_on_iterator(iterator)
-                        .map(|(ty, next_inputs_proved)| IterationOutcome {
-                            tuple: Cow::Owned(TupleSpec::homogeneous(ty)),
-                            inputs_proved: iter_inputs_proved && next_inputs_proved,
-                        })
+                        .map(|ty| Cow::Owned(TupleSpec::homogeneous(ty)))
                         .map_err(
                             |dunder_next_error| IterationError::IterReturnsInvalidIterator {
                                 iterator,
@@ -916,27 +752,19 @@ impl<'db> Type<'db> {
                     unbound_on: unbound_on_iter,
                 }) => {
                     let iterator = bindings.return_type(db, env);
-                    let iter_inputs_proved = request_input_proof
-                        && !bindings.has_only_constructor_items()
-                        && bindings.arguments_satisfy_declared_parameters(db, env, &arguments);
                     match try_call_dunder_next_on_iterator(iterator) {
-                        Ok((dunder_next_return, next_inputs_proved)) => {
+                        Ok(dunder_next_return) => {
                             try_call_dunder_getitem()
-                                .map(|(dunder_getitem_return_type, getitem_inputs_proved)| {
+                                .map(|dunder_getitem_return_type| {
                                     // A possibly absent __iter__ needs both successful routes.
-                                    IterationOutcome {
-                                        tuple: Cow::Owned(TupleSpec::homogeneous(
-                                            UnionType::from_two_elements(
-                                                db,
-                                                env,
-                                                dunder_next_return,
-                                                dunder_getitem_return_type,
-                                            ),
-                                        )),
-                                        inputs_proved: iter_inputs_proved
-                                            && next_inputs_proved
-                                            && getitem_inputs_proved,
-                                    }
+                                    Cow::Owned(TupleSpec::homogeneous(
+                                        UnionType::from_two_elements(
+                                            db,
+                                            env,
+                                            dunder_next_return,
+                                            dunder_getitem_return_type,
+                                        ),
+                                    ))
                                 })
                                 .map_err(|dunder_getitem_error| {
                                     IterationError::PossiblyUnboundIterAndGetitemError {
@@ -961,38 +789,15 @@ impl<'db> Type<'db> {
                     })
                 }
                 Err(CallDunderError::MethodNotAvailable) => try_call_dunder_getitem()
-                    .map(|(ty, inputs_proved)| IterationOutcome {
-                        tuple: Cow::Owned(TupleSpec::homogeneous(ty)),
-                        inputs_proved,
-                    })
+                    .map(|ty| Cow::Owned(TupleSpec::homogeneous(ty)))
                     .map_err(
                         |dunder_getitem_error| IterationError::UnboundIterAndGetitemError {
                             dunder_getitem_error,
                         },
                     ),
             }
-        };
-        result.map(
-            |IterationOutcome {
-                 tuple,
-                 mut inputs_proved,
-             }| {
-                if request_input_proof && self.has_indeterminate_inference(db, env) {
-                    inputs_proved = false;
-                }
-                IterationOutcome {
-                    tuple,
-                    inputs_proved,
-                }
-            },
-        )
+        }
     }
-}
-
-/// Successful iteration and the requested proof of its selected protocol inputs.
-pub(super) struct IterationOutcome<'db> {
-    pub(super) tuple: Cow<'db, TupleSpec<'db>>,
-    pub(super) inputs_proved: bool,
 }
 
 /// Error returned if a type is not (or may not be) iterable.

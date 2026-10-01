@@ -846,7 +846,7 @@ impl<'db> InferScope<'db> {
     }
 }
 
-/// The expected type and checking purpose for an expression.
+/// The expected type for an expression.
 ///
 /// Knowing the outer type context when inferring an expression can enable
 /// more precise inference results, aka "bidirectional type inference".
@@ -855,51 +855,11 @@ impl<'db> InferScope<'db> {
 )]
 pub(crate) struct TypeContext<'db> {
     pub(crate) annotation: Option<Type<'db>>,
-    purpose: TypeContextPurpose,
-}
-
-#[derive(
-    Default, Copy, Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue,
-)]
-pub(crate) enum TypeContextPurpose {
-    #[default]
-    Inference,
-    ValueContract,
 }
 
 impl<'db> TypeContext<'db> {
     pub(crate) fn new(annotation: Option<Type<'db>>) -> Self {
-        Self {
-            annotation,
-            purpose: TypeContextPurpose::Inference,
-        }
-    }
-
-    pub(crate) fn for_value_contract(annotation: Type<'db>) -> Self {
-        Self {
-            annotation: Some(annotation),
-            purpose: TypeContextPurpose::ValueContract,
-        }
-    }
-
-    /// Derive a literal child's expected type without losing the checking purpose.
-    /// An independently inferred child has the canonical empty context.
-    pub(crate) fn with_annotation(self, annotation: Option<Type<'db>>) -> Self {
-        let Self {
-            annotation: _,
-            purpose,
-        } = self;
-        match annotation {
-            Some(annotation) => Self {
-                annotation: Some(annotation),
-                purpose,
-            },
-            None => Self::default(),
-        }
-    }
-
-    pub(crate) fn is_value_contract(self) -> bool {
-        matches!(self.purpose, TypeContextPurpose::ValueContract)
+        Self { annotation }
     }
 
     /// If the type annotation is a specialized instance of the given `KnownClass`, returns the
@@ -915,7 +875,7 @@ impl<'db> TypeContext<'db> {
     }
 
     fn map(self, f: impl FnOnce(Type<'db>) -> Type<'db>) -> Self {
-        self.with_annotation(self.annotation.map(f))
+        Self::new(self.annotation.map(f))
     }
 
     fn is_typealias(&self) -> bool {
@@ -1123,9 +1083,6 @@ struct ScopeInferenceExtra<'db> {
     /// The fallback type for missing expressions/bindings/declarations or recursive type inference.
     cycle_recovery: Option<Type<'db>>,
 
-    /// Return correspondence computed by selected ordinary function inference.
-    return_type_correspondence: Option<bool>,
-
     /// The diagnostics for this region.
     diagnostics: TypeCheckDiagnostics,
 }
@@ -1173,16 +1130,6 @@ impl<'db> ScopeInference<'db> {
         }
 
         self
-    }
-
-    pub(crate) fn return_type_correspondence(&self) -> Option<bool> {
-        self.extra
-            .as_deref()
-            .and_then(|extra| extra.return_type_correspondence)
-    }
-
-    pub(crate) fn has_cycle_recovery(&self) -> bool {
-        self.fallback_type().is_some()
     }
 
     pub(crate) fn diagnostics(&self) -> Option<&TypeCheckDiagnostics> {
@@ -1884,22 +1831,6 @@ impl<'db> DefinitionInference<'db> {
                 "definition should belong to this TypeInference region and \
                 TypeInferenceBuilder should have inferred a type for it",
             )
-    }
-
-    pub(crate) fn diagnostics(&self) -> Option<&TypeCheckDiagnostics> {
-        let extra = self.extra.as_deref()?;
-        match extra {
-            DefinitionInferenceExtra::Diagnostics(diagnostics) => Some(diagnostics),
-            DefinitionInferenceExtra::Other(extra) => Some(&extra.diagnostics),
-            DefinitionInferenceExtra::Qualifiers(_) => None,
-            DefinitionInferenceExtra::Deferred(_) => None,
-            DefinitionInferenceExtra::Undecorated(_) => None,
-            DefinitionInferenceExtra::DeferredAndUndecorated(_) => None,
-            DefinitionInferenceExtra::CalledFunctions(_) => None,
-            DefinitionInferenceExtra::ExpectedTypes(_) => None,
-            DefinitionInferenceExtra::StringAnnotations(_) => None,
-            DefinitionInferenceExtra::DiscardsDictKeyAssignments => None,
-        }
     }
 
     /// Whether this result depends on provisional types from cycle recovery.

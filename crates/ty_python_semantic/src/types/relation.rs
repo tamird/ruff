@@ -171,20 +171,6 @@ pub(crate) enum TypeRelation {
     /// [materializations]: https://typing.python.org/en/latest/spec/glossary.html#term-materialize
     Redundancy { pure: bool },
 
-    /// Compares an inferred output with its declared contract.
-    ///
-    /// Positive output and readable-member positions use pure redundancy except that explicit
-    /// `Any` omits a value constraint and a bare gradual callable omits its parameter shape.
-    /// Callable inputs, writable members, and invariant arguments require known components and
-    /// pure redundancy. Nominal identity does not require checking unrelated members.
-    /// Implementation completeness is checked separately.
-    DeclaredOutput {
-        /// Once a comparison enters an input, write, or invariant position, omitted output
-        /// constraints stay disabled. Retaining this state also rejects unavailable components
-        /// exposed by a later structural callable comparison.
-        strict: bool,
-    },
-
     /// The "constraint implication" relationship, aka "implies subtype of".
     ///
     /// This relationship tests whether one type is a [subtype][Self::Subtyping] of another,
@@ -234,9 +220,7 @@ impl TypeRelation {
 
     const fn can_safely_assume_reflexivity(self, ty: Type<'_>) -> bool {
         match self {
-            TypeRelation::Assignability
-            | TypeRelation::Redundancy { .. }
-            | TypeRelation::DeclaredOutput { .. } => true,
+            TypeRelation::Assignability | TypeRelation::Redundancy { .. } => true,
             TypeRelation::Subtyping | TypeRelation::SubtypingAssuming => {
                 ty.subtyping_is_always_reflexive()
             }
@@ -772,31 +756,6 @@ impl<'db> Type<'db> {
             &ConstraintSetBuilder::new(),
             TypeVarSet::None,
             TypeRelation::Redundancy { pure: true },
-        )
-        .is_always_satisfied(db, &env)
-    }
-
-    /// Whether `self` fulfills the positive type constraints of a declared output.
-    ///
-    /// Explicit `Any` in an output or readable member imposes no value constraint. A bare
-    /// ellipsis callable omits its input shape, while its return type is still compared.
-    /// Input domains, writes, and invariant arguments require known type components and pure
-    /// redundancy, including signatures exposed by structural comparisons. Explicit materializations
-    /// determine the compared requirements. Implementation completeness is checked separately.
-    pub fn satisfies_declared_output(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        target: Type<'db>,
-    ) -> bool {
-        let env = ProgramEnvironment::from_program(env.program(db));
-        self.has_relation_to(
-            db,
-            &env,
-            target,
-            &ConstraintSetBuilder::new(),
-            TypeVarSet::None,
-            TypeRelation::DeclaredOutput { strict: false },
         )
         .is_always_satisfied(db, &env)
     }
@@ -1525,7 +1484,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 let source_ty = match self.relation {
                     TypeRelation::Subtyping
                     | TypeRelation::Redundancy { .. }
-                    | TypeRelation::DeclaredOutput { .. }
                     | TypeRelation::SubtypingAssuming => source,
                     TypeRelation::Assignability => source.bottom_materialization(db, self.env),
                 };
@@ -1536,7 +1494,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                         let negative = match self.relation {
                             TypeRelation::Subtyping
                             | TypeRelation::Redundancy { .. }
-                            | TypeRelation::DeclaredOutput { .. }
                             | TypeRelation::SubtypingAssuming => negative,
                             TypeRelation::Assignability => {
                                 negative.bottom_materialization(db, self.env)
@@ -1813,38 +1770,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         Some(self.check_type_pair(db, Type::TypeVar(source), target))
     }
 
-    /// Inputs retain their declared domain even when the enclosing output omits constraints.
-    pub(super) fn check_input_type_pair(
-        &self,
-        db: &'db dyn Db,
-        source: Type<'db>,
-        target: Type<'db>,
-    ) -> ConstraintSet<'db, 'c> {
-        if matches!(
-            self.relation,
-            TypeRelation::DeclaredOutput { strict: false }
-        ) {
-            self.with_strict_inputs()
-                .check_type_pair(db, source, target)
-        } else {
-            self.check_type_pair(db, source, target)
-        }
-    }
-
-    pub(super) fn with_strict_inputs(&self) -> Self {
-        Self {
-            relation: if matches!(
-                self.relation,
-                TypeRelation::DeclaredOutput { strict: false }
-            ) {
-                TypeRelation::DeclaredOutput { strict: true }
-            } else {
-                self.relation
-            },
-            ..self.clone()
-        }
-    }
-
     /// Return a constraint set indicating the conditions under which `self.relation` holds between `source` and `target`.
     pub(super) fn check_type_pair(
         &self,
@@ -1855,12 +1780,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         // Reflexivity and lazy constraints can bypass the RecursiveVar match arm below.
         source.assert_not_recursive_var();
         target.assert_not_recursive_var();
-        if matches!(self.relation, TypeRelation::DeclaredOutput { strict: true })
-            && (!source.is_fully_static_except_any(db, self.env)
-                || !target.is_fully_static_except_any(db, self.env))
-        {
-            return self.never();
-        }
         if let Some(source) = source.materialized_divergent_fallback() {
             return self.check_type_pair(db, source, target);
         }
@@ -1875,14 +1794,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         // Note that we could do a full equivalence check here, but that would be both expensive
         // and unnecessary. This early return is only an optimisation.
         if source == target && self.relation.can_safely_assume_reflexivity(source) {
-            return self.always();
-        }
-
-        if matches!(
-            self.relation,
-            TypeRelation::DeclaredOutput { strict: false }
-        ) && target.is_explicit_any(db)
-        {
             return self.always();
         }
 
@@ -2269,13 +2180,11 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 match self.relation {
                     TypeRelation::Subtyping | TypeRelation::SubtypingAssuming => false,
                     TypeRelation::Assignability => true,
-                    TypeRelation::Redundancy { .. } | TypeRelation::DeclaredOutput { .. } => {
-                        match target {
-                            Type::Dynamic(_) => true,
-                            Type::Union(union) => union.elements(db).iter().any(Type::is_dynamic),
-                            _ => false,
-                        }
-                    }
+                    TypeRelation::Redundancy { .. } => match target {
+                        Type::Dynamic(_) => true,
+                        Type::Union(union) => union.elements(db).iter().any(Type::is_dynamic),
+                        _ => false,
+                    },
                 },
             ),
             (_, Type::Dynamic(_)) => ConstraintSet::from_bool(
@@ -2283,7 +2192,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 match self.relation {
                     TypeRelation::Subtyping | TypeRelation::SubtypingAssuming => false,
                     TypeRelation::Assignability => true,
-                    TypeRelation::Redundancy { .. } | TypeRelation::DeclaredOutput { .. } => {
+                    TypeRelation::Redundancy { .. } => {
                         match source {
                             Type::Dynamic(_) => true,
                             Type::Intersection(intersection) => {

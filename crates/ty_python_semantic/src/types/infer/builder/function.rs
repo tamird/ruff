@@ -198,12 +198,6 @@ impl<'db> ExpectedReturnType<'db> {
         Self { public, lexical }
     }
 
-    /// Compare declared output constraints independently of the conservative view used
-    /// to check operations.
-    fn corresponds(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
-        self.accepts(db, env, ty, TypeRelation::DeclaredOutput { strict: false })
-    }
-
     /// A constrained variable selects one of its canonical constraints, even for subclass inputs.
     /// A fresh return must satisfy every choice that can still reach this statement.
     fn accepts_under_constraints(
@@ -365,52 +359,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             && expected.is_fully_static(self.db(), self.program_environment())
     }
 
-    fn type_predicate_body_correspondence(
-        &self,
-        function: &ast::StmtFunctionDef,
-        predicate: Type<'db>,
-    ) -> Option<bool> {
-        if self.cycle_recovery.is_some() {
-            return None;
-        }
-        // A single return has no earlier flow assumptions or reachability facts
-        // to certify. More general predicate implementations remain unproved.
-        let body = function.body.as_ref();
-        let body = if let [ast::Stmt::Expr(docstring), rest @ ..] = body
-            && docstring.value.is_string_literal_expr()
-        {
-            rest
-        } else {
-            body
-        };
-        let [ast::Stmt::Return(returned)] = body else {
-            return None;
-        };
-        let value = returned.value.as_deref()?;
-        let db = self.db();
-        let enclosing = nearest_enclosing_function(db, self.index, self.scope())?;
-        let signature =
-            same_module_uncached_raw_signature(db, enclosing, ReturnCallableTypeVarScope::Lexical);
-        if signature.generic_context.is_some() || enclosing.has_implicit_receiver(db) {
-            return None;
-        }
-        let parameter = function
-            .parameters
-            .posonlyargs
-            .first()
-            .or_else(|| function.parameters.args.first())?;
-        let (_, domain, _) = self.parameter_annotation_type(&parameter.parameter)?;
-        let definition = self.index.expect_single_definition(&parameter.parameter);
-        crate::types::narrow::type_predicate_return_correspondence(
-            db,
-            definition,
-            domain,
-            predicate,
-            value,
-            |expression| self.expression_type(expression),
-        )
-    }
-
     pub(super) fn infer_function_body(&mut self, function: &ast::StmtFunctionDef) {
         fn can_implicitly_return_none<'db>(db: &'db dyn Db, use_def: &UseDefMap<'db>) -> bool {
             !use_def
@@ -483,19 +431,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .return_ty;
             let expected_return = ExpectedReturnType::from_function(db, enclosing_function);
             let expected_ty = expected_return.public();
-            // Predicate postconditions require evidence beyond a Boolean result.
-            let mut correspondence =
-                if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof {
-                    match declared_ty.resolve_type_alias(db) {
-                        predicate @ (Type::TypeGuard(_) | Type::TypeIs(_)) => {
-                            self.type_predicate_body_correspondence(function, predicate)
-                        }
-                        _ => Some(true),
-                    }
-                } else {
-                    None
-                };
-
             let scope_id = self.index.node_scope(NodeWithScopeRef::Function(function));
             if scope_id.is_generator_function(self.index) {
                 // TODO: `AsyncGeneratorType` and `GeneratorType` are both generic classes.
@@ -538,20 +473,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     env,
                                     expected_return_ty,
                                 )
-                            } else if correspondence.is_some() {
-                                return_statement.ty.satisfies_declared_output(
-                                    db,
-                                    env,
-                                    expected_return_ty,
-                                )
                             } else {
                                 true
                             };
-                        if let Some(aggregate) = &mut correspondence
-                            && self.context.is_range_reachable(return_statement.range)
-                        {
-                            *aggregate &= corresponds;
-                        }
+
                         if !assignable {
                             report_invalid_return_type(
                                 &self.context,
@@ -576,13 +501,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     let use_def = self.index.use_def_map(scope_id);
 
                     let implicit_none = can_implicitly_return_none(db, use_def);
-                    if implicit_none && let Some(corresponds) = &mut correspondence {
-                        *corresponds &= Type::none(db, env).satisfies_declared_output(
-                            db,
-                            env,
-                            expected_return_ty,
-                        );
-                    }
+
                     if implicit_none
                         && !Type::none(db, env).is_assignable_to(db, env, expected_return_ty)
                     {
@@ -596,7 +515,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             no_return,
                         );
                     }
-                    self.return_type_correspondence = correspondence;
                 }
 
                 return;
@@ -637,16 +555,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let corresponds = assignable
                     && if check_soundness {
                         accepts(TypeRelation::Redundancy { pure: true })
-                    } else if correspondence.is_some() {
-                        accepts(TypeRelation::DeclaredOutput { strict: false })
                     } else {
                         true
                     };
-                if let Some(aggregate) = &mut correspondence
-                    && self.context.is_range_reachable(return_statement.range)
-                {
-                    *aggregate &= corresponds;
-                }
+
                 if !assignable {
                     report_invalid_return_type(
                         &self.context,
@@ -670,10 +582,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             let use_def = self.index.use_def_map(scope_id);
             let implicit_none = can_implicitly_return_none(db, use_def);
-            if implicit_none && let Some(corresponds) = &mut correspondence {
-                *corresponds &= expected_return.corresponds(db, env, Type::none(db, env));
-            }
-            self.return_type_correspondence = correspondence;
+
             if implicit_none && !Type::none(db, env).is_assignable_to(db, env, expected_ty) {
                 let no_return = self.return_types_and_ranges.is_empty();
                 report_implicit_return_type(
@@ -1114,21 +1023,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let annotated_ty = annotation
                 .as_ref()
                 .map(|annotation| annotation.inferred_type(db, definition));
-            let actual = self.infer_expression(default, TypeContext::new(annotated_ty));
-            if let Some(annotation) = annotation
-                && !matches!(
-                    annotation,
-                    SourceAnnotation::External {
-                        annotation: _,
-                        purpose: _,
-                        range: _
-                    }
-                )
-                && let Some(expected) = annotated_ty
-                && self.expression_has_unproved_requirement(default, actual, expected)
-            {
-                self.context.record_unproved_requirement(default);
-            }
+            self.infer_expression(default, TypeContext::new(annotated_ty));
         }
 
         self.deferred_state = previous_deferred_state;
@@ -1485,7 +1380,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     annotation,
                     SourceAnnotation::External {
                         annotation: _,
-                        purpose: _,
                         range: _
                     }
                 ) {

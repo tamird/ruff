@@ -75,7 +75,7 @@ impl SourceProvider for AllocationSource {
 
 #[test]
 fn supplied_allocation_uses_collection_and_constructor_inference() -> anyhow::Result<()> {
-    let mut db = TestDbBuilder::new()
+    let db = TestDbBuilder::new()
         .with_source_provider(AllocationSource)
         .with_file(
             "/src/leaf.pyi",
@@ -132,11 +132,6 @@ def erase(value: dict[str, int], schema: Row) -> None:
         )
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
-    db.select_function_inference(Some((
-        file,
-        vec!["generic_empty".into(), "generic_mutation".into()],
-        crate::FunctionInferenceMode::OutputProof,
-    )));
     let diagnostics = crate::types::check_types(&db, db.program_file(file));
     let ids: Vec<_> = diagnostics
         .iter()
@@ -184,109 +179,6 @@ def erase(value: dict[str, int], schema: Row) -> None:
             "Exact[str, None | (() -> None)]",
         ]
     );
-    Ok(())
-}
-
-#[test]
-fn supplied_allocation_preserves_named_argument_proofs() -> anyhow::Result<()> {
-    for allocated in [false, true] {
-        for named in [false, true] {
-            for (value, proved) in [
-                ("1", true),
-                ("'wrong'", false),
-                ("unknown", false),
-                ("any_value", false),
-            ] {
-                let argument = format!("{{'value': {value}}}");
-                let call = if named {
-                    format!("attrs = {argument}\n    consume(attrs)")
-                } else {
-                    format!("consume({argument})")
-                };
-                let source = format!(
-                    "from typing import Any\ndef consume[K: str](attrs: dict[K, int]) -> None: ...\ndef make(unknown, any_value: Any) -> None:\n    {call}\n"
-                );
-                let builder = TestDbBuilder::new()
-                    .with_file(
-                        "/src/leaf.pyi",
-                        "from typing import final\n@final\nclass Exact[K, V](dict[K, V]): ...\n",
-                    )
-                    .with_file("/src/main.py", &source);
-                let builder = if allocated {
-                    builder.with_source_provider(AllocationSource)
-                } else {
-                    builder
-                };
-                let mut db = builder.build()?;
-                let file = system_path_to_file(&db, "/src/main.py")?;
-                db.select_function_inference(Some((
-                    file,
-                    vec!["make".into()],
-                    crate::FunctionInferenceMode::OutputProof,
-                )));
-                let program = db.program_file(file);
-                let function = crate::place::global_symbol(&db, program, "make")
-                    .place
-                    .expect_type()
-                    .as_function_literal()
-                    .ok_or_else(|| anyhow::anyhow!("expected make to be a function"))?;
-                let facts = SemanticModel::new(&db, program)
-                    .function_inference_facts(function.definition(&db))
-                    .ok_or_else(|| anyhow::anyhow!("expected selected function facts"))?;
-                assert_eq!(
-                    !facts.has_unproved_requirements && !facts.has_errors,
-                    proved,
-                    "allocated={allocated}, named={named}, value={value}, {facts:?}",
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn supplied_allocation_preserves_later_generic_context() -> anyhow::Result<()> {
-    for allocated in [false, true] {
-        for (value, corresponds) in [("'value'", true), ("object()", false), ("unknown", false)] {
-            let source = format!(
-                "from typing import Any\ndef make[K](key: K, unknown: Any) -> tuple[dict[K, str | int], int]:\n    result = {{}}\n    for _ in range(1):\n        result[key] = {value}\n    return result, 0\n"
-            );
-            let builder = TestDbBuilder::new()
-                .with_file(
-                    "/src/leaf.pyi",
-                    "from typing import final\n@final\nclass Exact[K,V](dict[K,V]): ...\n",
-                )
-                .with_file("/src/main.py", &source);
-            let builder = if allocated {
-                builder.with_source_provider(AllocationSource)
-            } else {
-                builder
-            };
-            let mut db = builder.build()?;
-            let file = system_path_to_file(&db, "/src/main.py")?;
-            db.select_function_inference(Some((
-                file,
-                vec!["make".into()],
-                crate::FunctionInferenceMode::OutputProof,
-            )));
-            let program = db.program_file(file);
-            let function = crate::place::global_symbol(&db, program, "make")
-                .place
-                .expect_type()
-                .as_function_literal()
-                .unwrap();
-            let facts = SemanticModel::new(&db, program)
-                .function_inference_facts(function.definition(&db))
-                .unwrap();
-            assert_eq!(
-                facts.return_type_correspondence == Some(true)
-                    && !facts.has_checking_failures
-                    && !facts.has_unproved_requirements,
-                corresponds,
-                "allocated={allocated}, value={value}, {facts:?}"
-            );
-        }
-    }
     Ok(())
 }
 
@@ -465,42 +357,28 @@ fn supplied_call_diagnostics_follow_native_policy() -> anyhow::Result<()> {
         }
     }
 
-    for (source, enabled, expected, suppressed) in [
-        (
-            "result = make(1)\n",
-            true,
-            vec!["provided-call-check"],
-            false,
-        ),
+    for (source, enabled, expected) in [
+        ("result = make(1)\n", true, vec!["provided-call-check"]),
         (
             "result = make('bad')\n",
             true,
             vec!["invalid-argument-type", "provided-call-check"],
-            false,
         ),
         (
             "result = make('bad')\n",
             false,
             vec!["invalid-argument-type"],
-            false,
         ),
         (
             "result = make(1) # ty: ignore[provided-call-check]\n",
             true,
             vec![],
-            true,
         ),
-        (
-            "if False:\n    make(1)\nresult: int = 1\n",
-            true,
-            vec![],
-            false,
-        ),
+        ("if False:\n    make(1)\nresult: int = 1\n", true, vec![]),
         (
             "from typing import no_type_check\n@no_type_check\ndef skipped() -> int:\n    return make(1)\nresult: int = 1\n",
             true,
             vec![],
-            false,
         ),
     ] {
         let mut registry =
@@ -522,12 +400,8 @@ fn supplied_call_diagnostics_follow_native_policy() -> anyhow::Result<()> {
             )
             .build()?;
         let file = system_path_to_file(&db, "/src/main.py")?;
-        let crate::types::TypeCheckResult {
-            diagnostics,
-            has_suppressed_inference_failures,
-            has_unproved_requirements: _,
-        } = crate::types::check_types_with_diagnostics(&db, db.program_file(file), []);
-        assert_eq!(has_suppressed_inference_failures, suppressed, "{source}");
+        let diagnostics =
+            crate::types::check_types_with_diagnostics(&db, db.program_file(file), []);
         let mut ids: Vec<_> = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.id().as_str())
@@ -2463,12 +2337,12 @@ intercepted: Intercepted
         .expect_type();
     let str_type = KnownClass::Str.to_instance(&db, &env);
     let default_type = Type::int_literal(0);
-    for (name, inputs_proved) in [
-        ("record", true),
-        ("bad_receiver", false),
-        ("bad_name", false),
-        ("constructed", false),
-        ("intercepted", false),
+    for name in [
+        "record",
+        "bad_receiver",
+        "bad_name",
+        "constructed",
+        "intercepted",
     ] {
         let receiver = crate::place::global_symbol(&db, program, name)
             .place
@@ -2481,19 +2355,6 @@ intercepted: Intercepted
             MemberLookupPolicy::RUNTIME_ATTRIBUTE,
             None,
         );
-        let proved_member = receiver.member_lookup_with_policy_and_receiver(
-            &db,
-            &env,
-            "field",
-            MemberLookupPolicy::RUNTIME_ATTRIBUTE | MemberLookupPolicy::PROVE_GETTER_INPUTS,
-            None,
-        );
-        let ordinary = ordinary_member.unwrap_or_else(|error| error.fallback_member(&db));
-        let proved = proved_member.unwrap_or_else(|error| error.fallback_member(&db));
-        assert_eq!(ordinary.member(&db), proved.member(&db), "{name}");
-        assert_eq!(ordinary_member.is_ok(), proved_member.is_ok(), "{name}");
-        assert_eq!(proved.inputs_proved(&db), inputs_proved, "{name}");
-
         for default in [None, Some(default_type)] {
             let arguments = crate::types::CallArguments::positional(
                 [receiver, Type::string_literal(&db, "field")]
@@ -2501,25 +2362,13 @@ intercepted: Intercepted
                     .chain(default),
             );
             let ordinary = lookup.try_call(&db, &env, &arguments).unwrap();
-            let arguments = arguments.with_input_proof_request(true);
-            let proved = lookup.try_call(&db, &env, &arguments).unwrap();
-            assert_eq!(
-                ordinary.return_type(&db, &env),
-                proved.return_type(&db, &env),
-                "{name}"
-            );
-            assert_eq!(
-                proved.arguments_satisfy_declared_parameters(&db, &env, &arguments),
-                inputs_proved && default.is_some(),
-                "{name}, {default:?}",
-            );
             if name == "record" {
                 let expected = default.map_or(Type::any(), |default| {
                     crate::types::UnionType::from_two_elements(&db, &env, str_type, default)
                 });
                 assert_eq!(ordinary.return_type(&db, &env), expected);
                 assert!(
-                    !proved_member
+                    !ordinary_member
                         .unwrap()
                         .member(&db)
                         .place
@@ -2708,7 +2557,7 @@ def class_bound[T: OpenReceiver](value: type[T]):
 }
 
 #[test]
-fn optional_getters_retain_results_and_input_requirements() -> anyhow::Result<()> {
+fn optional_getters_retain_results() -> anyhow::Result<()> {
     let db = TestDbBuilder::new()
         .with_file(
             "/src/main.py",
@@ -2749,8 +2598,7 @@ combined: Present | MaybeFallback[Callable[[str], None]]
         let receiver = crate::place::global_symbol(&db, program, name)
             .place
             .expect_type();
-        let mut arguments =
-            crate::types::CallArguments::positional([name_type]).with_input_proof_request(true);
+        let mut arguments = crate::types::CallArguments::positional([name_type]);
         match receiver.try_call_dunder_with_policy(
             &db,
             &env,
@@ -2764,7 +2612,6 @@ combined: Present | MaybeFallback[Callable[[str], None]]
                 unbound_on: _,
             }) => {
                 assert_eq!(bindings.return_type(&db, &env), str_type);
-                assert!(!bindings.arguments_satisfy_declared_parameters(&db, &env, &arguments));
             }
             other => panic!("expected optional callable for {name}, got {other:?}"),
         }
@@ -2773,22 +2620,17 @@ combined: Present | MaybeFallback[Callable[[str], None]]
                 &db,
                 &env,
                 "field",
-                MemberLookupPolicy::RUNTIME_ATTRIBUTE | MemberLookupPolicy::PROVE_GETTER_INPUTS,
+                MemberLookupPolicy::RUNTIME_ATTRIBUTE,
                 None,
             )
             .unwrap();
         assert_eq!(member.member(&db).place.expect_type(), result, "{name}");
         assert!(!member.member(&db).place.is_definitely_bound());
-        assert!(!member.inputs_proved(&db));
         let default = Type::int_literal(0);
         let arguments = crate::types::CallArguments::positional([receiver, name_type, default]);
         let ordinary = lookup.try_call(&db, &env, &arguments).unwrap();
-        let arguments = arguments.with_input_proof_request(true);
-        let checked = lookup.try_call(&db, &env, &arguments).unwrap();
         let expected = crate::types::UnionType::from_two_elements(&db, &env, result, default);
         assert_eq!(ordinary.return_type(&db, &env), expected, "{name}");
-        assert_eq!(checked.return_type(&db, &env), expected, "{name}");
-        assert!(!checked.arguments_satisfy_declared_parameters(&db, &env, &arguments));
     }
     Ok(())
 }

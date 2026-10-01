@@ -711,13 +711,7 @@ fn divergent_type() {
     assert!(top_div.try_upcast_to_callable(db, &env).is_none());
     assert!(
         top_div
-            .subscript(
-                db,
-                &env,
-                Type::int_literal(0),
-                ast::ExprContext::Load,
-                crate::FunctionInferenceMode::Default
-            )
+            .subscript(db, &env, Type::int_literal(0), ast::ExprContext::Load,)
             .is_err()
     );
     assert_eq!(

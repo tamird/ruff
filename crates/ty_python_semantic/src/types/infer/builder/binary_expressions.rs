@@ -60,17 +60,10 @@ const MAX_TUPLE_ADDITION_ELEMENTS: usize = 4096;
 pub(super) struct BinaryInferenceState<'db> {
     emitted_division_by_zero_diagnostic: bool,
     pub(super) deprecated_functions: Vec<OverloadLiteral<'db>>,
-    pub(super) arguments_proved: Option<bool>,
     used_tuple_addition: bool,
 }
 
 impl<'db> BinaryInferenceState<'db> {
-    pub(super) fn retain_argument_proof(&mut self, proved: bool) {
-        if let Some(arguments_proved) = &mut self.arguments_proved {
-            *arguments_proved &= proved;
-        }
-    }
-
     fn tuple_alternative_count(db: &'db dyn Db, ty: Type<'db>) -> usize {
         match ty {
             Type::Union(union) => union
@@ -186,19 +179,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             BinaryExpressionOperandTypes::Inferred(left_ty, right_ty) => (left_ty, right_ty),
         };
 
-        let mut state = BinaryInferenceState {
-            arguments_proved: (self.function_inference_mode
-                == crate::FunctionInferenceMode::OutputProof)
-                .then_some(true),
-            ..BinaryInferenceState::default()
-        };
+        let mut state = BinaryInferenceState::default();
         let return_type =
             self.infer_binary_expression_type(binary.into(), left_ty, right_ty, *op, &mut state);
-        if self.function_inference_mode == crate::FunctionInferenceMode::OutputProof
-            && (state.arguments_proved == Some(false) || return_type.is_none())
-        {
-            self.context.record_unproved_requirement(binary);
-        }
         self.report_deprecated_functions(binary, state.deprecated_functions);
         return_type.unwrap_or_else(|| {
             report_unsupported_binary_operation(&self.context, binary, left_ty, right_ty, *op);
@@ -507,9 +490,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             op,
             right_ty,
             MemberLookupPolicy::default(),
-            state.arguments_proved.is_some(),
         )?;
-        state.retain_argument_proof(result.arguments_proved);
         state
             .deprecated_functions
             .extend(&result.deprecated_functions);
@@ -560,15 +541,6 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         {
             state.emitted_division_by_zero_diagnostic =
                 self.check_division_by_zero(node, op, left_ty);
-        }
-
-        if state.arguments_proved.is_some()
-            && (left_ty.is_dynamic()
-                || right_ty.is_dynamic()
-                || left_ty.has_provisional_marker(db, env)
-                || right_ty.has_provisional_marker(db, env))
-        {
-            state.retain_argument_proof(false);
         }
 
         match (left_ty, right_ty, op) {
@@ -641,14 +613,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             (Type::TypedDict(left_typed_dict), rhs, ast::Operator::BitOr)
                 if rhs.is_assignable_to(db, env, Type::TypedDict(left_typed_dict)) =>
             {
-                state.retain_argument_proof(false);
                 Some(Type::TypedDict(left_typed_dict))
             }
 
             (lhs, Type::TypedDict(right_typed_dict), ast::Operator::BitOr)
                 if lhs.is_assignable_to(db, env, Type::TypedDict(right_typed_dict)) =>
             {
-                state.retain_argument_proof(false);
                 Some(Type::TypedDict(right_typed_dict))
             }
 
@@ -1231,10 +1201,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 ast::Operator::BitOr,
                 right_ty,
                 MemberLookupPolicy::META_CLASS_NO_TYPE_FALLBACK,
-                state.arguments_proved.is_some(),
             )
             .map(|result| {
-                state.retain_argument_proof(result.arguments_proved);
                 state
                     .deprecated_functions
                     .extend(&result.deprecated_functions);

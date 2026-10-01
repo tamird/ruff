@@ -9,7 +9,6 @@ use crate::suppression::{
 };
 use crate::types::check_types;
 pub use db::Db;
-pub use db::FunctionInferenceMode;
 pub(crate) use diagnostic::add_inferred_python_version_hint_to_diagnostic;
 pub use diagnostic::inferred_python_version_source_annotation;
 pub use fixes::{fix_all_diagnostics, suppress_all_diagnostics};
@@ -20,8 +19,8 @@ use ruff_db::parsed::parsed_module;
 use ruff_db::source::{SourceTextError, source_text};
 use rustc_hash::FxHasher;
 pub use semantic_model::{
-    Completion, ExpectedStringLiteralCompletion, FunctionInferenceFacts, HasDefinition, HasType,
-    NameKind, ObjectMembers, SemanticModel,
+    Completion, ExpectedStringLiteralCompletion, HasDefinition, HasType, NameKind, ObjectMembers,
+    SemanticModel,
 };
 use std::hash::BuildHasherDefault;
 pub use suppression::suppress_single;

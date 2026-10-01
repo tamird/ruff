@@ -205,21 +205,8 @@ pub(crate) mod definition_resolution;
 mod property_tests;
 mod subscript;
 
-/// Diagnostics and suppression status from checking one file.
-#[derive(Debug)]
-pub struct TypeCheckResult {
-    pub diagnostics: Vec<Diagnostic>,
-    /// Whether file inference suppressed checking failures in reachable code, including in nested
-    /// scopes, defaults, and implicit aliases. Supplemental diagnostics and checks of
-    /// suppression comments themselves do not contribute to this flag.
-    pub has_suppressed_inference_failures: bool,
-    /// Whether selected inference encountered reachable input requirements it could not prove.
-    /// Includes committed nested scopes and defaults, independently of diagnostic display policy.
-    pub has_unproved_requirements: bool,
-}
-
 pub fn check_types(db: &dyn Db, file: ProgramFile<'_>) -> Vec<Diagnostic> {
-    check_types_with_diagnostics(db, file, []).diagnostics
+    check_types_with_diagnostics(db, file, [])
 }
 
 /// Checks a file and includes diagnostics supplied by the embedding application.
@@ -235,7 +222,7 @@ pub fn check_types_with_diagnostics(
     db: &dyn Db,
     file: ProgramFile<'_>,
     supplemental: impl IntoIterator<Item = Diagnostic>,
-) -> TypeCheckResult {
+) -> Vec<Diagnostic> {
     let source_file = file.file(db);
     let _span = tracing::trace_span!("check_types", ?source_file).entered();
     tracing::debug!("Checking file '{path}'", path = source_file.path(db));
@@ -304,10 +291,7 @@ pub fn check_types_with_diagnostics(
             .map(|error| Diagnostic::invalid_syntax(source_file, error, error)),
     );
 
-    let has_suppressed_inference_failures =
-        diagnostics.has_reachable_suppressed_checking_failures();
-    let has_unproved_requirements = diagnostics.has_unproved_requirements();
-    diagnostics.extend_provided(db, file.python_file(db), supplemental, |_| false);
+    diagnostics.extend_provided(db, file.python_file(db), supplemental);
     let diagnostics = check_suppressions(db, file.python_file(db), diagnostics);
 
     let elapsed = start.elapsed();
@@ -318,11 +302,7 @@ pub fn check_types_with_diagnostics(
         );
     }
 
-    TypeCheckResult {
-        diagnostics,
-        has_suppressed_inference_failures,
-        has_unproved_requirements,
-    }
+    diagnostics
 }
 
 /// Infer the type of a binding.
@@ -856,42 +836,24 @@ impl<'db> DescriptorGetError<'db> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
-pub(crate) struct DescriptorGetOutcome<'db> {
-    pub(crate) result: Result<Option<DescriptorGetResult<'db>>, DescriptorGetError<'db>>,
-    // Keep unavailable lookup distinct from proved getter absence even when both return None.
-    proof: bool,
-}
-
-impl DescriptorGetOutcome<'_> {
-    pub(crate) fn inputs_proved(self) -> bool {
-        self.proof
-    }
-}
-
 struct DescriptorAttributeOutcome<'db> {
     member: PlaceAndQualifiers<'db>,
     kind: AttributeKind,
     error: Option<DescriptorGetCallContext<'db>>,
-    proof: bool,
 }
 
 fn descriptor_get_result<'db>(
     return_type: Type<'db>,
     kind: AttributeKind,
     error: Option<DescriptorGetCallContext<'db>>,
-    proof: bool,
-) -> DescriptorGetOutcome<'db> {
+) -> Result<Option<DescriptorGetResult<'db>>, DescriptorGetError<'db>> {
     let result = DescriptorGetResult { return_type, kind };
-    DescriptorGetOutcome {
-        result: match error {
-            Some(context) => Err(DescriptorGetError {
-                fallback: result,
-                context,
-            }),
-            None => Ok(Some(result)),
-        },
-        proof,
+    match error {
+        Some(context) => Err(DescriptorGetError {
+            fallback: result,
+            context,
+        }),
+        None => Ok(Some(result)),
     }
 }
 
@@ -1058,20 +1020,17 @@ type MemberLookupResult<'db> = Result<ResolvedMember<'db>, MemberLookupError<'db
 enum ResolvedMember<'db> {
     /// A member with no deprecated property accessors.
     Plain(PlaceAndQualifiers<'db>),
-    /// Accessor deprecations or unresolved lookup inputs, stored separately to keep ordinary
-    /// lookups compact.
+    /// Accessor deprecations, stored separately to keep ordinary lookups compact.
     WithMetadata(MemberMetadata<'db>),
 }
 
-/// Only deprecations or unresolved lookup inputs need this additional storage.
+/// Only deprecations need this additional storage.
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
 struct MemberMetadata<'db> {
     #[returns(copy)]
     member: PlaceAndQualifiers<'db>,
     #[returns(copy)]
     properties: Option<PropertyDeprecations<'db>>,
-    #[returns(copy)]
-    inputs_proved: bool,
 }
 
 impl get_size2::GetSize for MemberMetadata<'_> {}
@@ -1133,13 +1092,6 @@ impl<'db> PropertyDeprecations<'db> {
 }
 
 impl<'db> ResolvedMember<'db> {
-    fn inputs_proved(self, db: &'db dyn Db) -> bool {
-        match self {
-            Self::Plain(_) => true,
-            Self::WithMetadata(member) => member.inputs_proved(db),
-        }
-    }
-
     fn member(self, db: &'db dyn Db) -> PlaceAndQualifiers<'db> {
         match self {
             Self::Plain(member) => member,
@@ -1158,12 +1110,11 @@ impl<'db> ResolvedMember<'db> {
         db: &'db dyn Db,
         member: PlaceAndQualifiers<'db>,
         properties: Option<PropertyDeprecations<'db>>,
-        inputs_proved: bool,
     ) -> Self {
-        if properties.is_none() && inputs_proved {
+        if properties.is_none() {
             Self::Plain(member)
         } else {
-            Self::WithMetadata(MemberMetadata::new(db, member, properties, inputs_proved))
+            Self::WithMetadata(MemberMetadata::new(db, member, properties))
         }
     }
 
@@ -1173,7 +1124,6 @@ impl<'db> ResolvedMember<'db> {
             db,
             self.member(db).map_type(f),
             self.deprecated_properties(db),
-            self.inputs_proved(db),
         )
     }
 }
@@ -1196,28 +1146,12 @@ fn member_lookup_result<'db>(
     member: PlaceAndQualifiers<'db>,
     error: Option<MemberLookupErrorKind<'db>>,
     properties: Option<PropertyDeprecations<'db>>,
-    inputs_proved: bool,
 ) -> MemberLookupResult<'db> {
-    let member = ResolvedMember::new(db, member, properties, inputs_proved);
+    let member = ResolvedMember::new(db, member, properties);
     match error {
         Some(kind) => Err(MemberLookupError::new(db, member, kind)),
         None => Ok(member),
     }
-}
-
-/// Preserve the ordinary lookup result while declining an unresolved implicit operation.
-fn unproved_member_lookup<'db>(
-    db: &'db dyn Db,
-    result: MemberLookupResult<'db>,
-) -> MemberLookupResult<'db> {
-    let member = result.unwrap_or_else(|error| error.fallback_member(db));
-    member_lookup_result(
-        db,
-        member.member(db),
-        result.err().map(|error| error.kind(db)),
-        member.deprecated_properties(db),
-        false,
-    )
 }
 
 fn map_member_lookup_type<'db>(
@@ -1249,7 +1183,6 @@ fn distribute_member_lookup_over_bound_or_constraints<'db>(
         TypeVarBoundOrConstraints::Constraints(constraints) => {
             let mut error = None;
             let mut properties = None;
-            let mut inputs_proved = true;
             let member = constraints.map_with_boundness_and_qualifiers(db, env, |constraint| {
                 let result = constraint.member_lookup_with_policy_and_receiver(
                     db,
@@ -1266,12 +1199,11 @@ fn distribute_member_lookup_over_bound_or_constraints<'db>(
                 });
                 error = error.or_else(|| result.err().map(|error| error.kind(db)));
                 let member = result.unwrap_or_else(|error| error.fallback_member(db));
-                inputs_proved &= member.inputs_proved(db);
                 properties =
                     union_deprecated_properties(db, properties, member.deprecated_properties(db));
                 policy.preserve_missing_alternative(db, *constraint, member.member(db))
             });
-            member_lookup_result(db, member, error, properties, inputs_proved)
+            member_lookup_result(db, member, error, properties)
         }
     }
 }
@@ -1308,7 +1240,6 @@ fn member_lookup_or_fall_back_to<'db>(
                     resolved.deprecated_properties(db),
                     fallback_member.deprecated_properties(db),
                 ),
-                resolved.inputs_proved(db) && fallback_member.inputs_proved(db),
             )
         }
     }
@@ -1330,20 +1261,7 @@ fn cycle_normalized_member_lookup<'db>(
     let normalized = member
         .member(db)
         .cycle_normalized(db, env, previous.member(db), cycle);
-    // Only the exact initial cycle seed can be discarded without retaining its unresolved
-    // lookup. Other prior results may contribute through type or place widening, even when
-    // their normalized value equals the current one.
-    let replaces_seed = match previous.member(db).place {
-        Place::Defined(place) => cycle.head_ids().any(|id| place.ty == Type::divergent(id)),
-        Place::Undefined => false,
-    };
-    member_lookup_result(
-        db,
-        normalized,
-        error,
-        member.deprecated_properties(db),
-        member.inputs_proved(db) && (replaces_seed || previous.inputs_proved(db)),
-    )
+    member_lookup_result(db, normalized, error, member.deprecated_properties(db))
 }
 
 impl<'db> From<PlaceAndQualifiers<'db>> for MemberLookupResult<'db> {
@@ -1373,9 +1291,6 @@ enum InstanceFallbackShadowsNonDataDescriptor {
 bitflags! {
     #[derive(Clone, Debug, Copy, PartialEq, Eq, Hash)]
     pub(crate) struct MemberLookupPolicy: u16 {
-        /// Prove the receiver and implicit getter inputs without changing lookup semantics.
-        const PROVE_GETTER_INPUTS = 1 << 8;
-
         /// Retain unknown values for undeclared alternatives when refining `getattr`.
         /// An undeclared member can exist on a subclass, independently of a default.
         const PRESERVE_MISSING_ALTERNATIVES = 1 << 9;
@@ -5293,67 +5208,36 @@ impl<'db> Type<'db> {
         instance: Option<Type<'db>>,
         owner: Type<'db>,
     ) -> Result<Option<DescriptorGetResult<'db>>, DescriptorGetError<'db>> {
-        self.try_call_dunder_get_with_proof(db, env, instance, owner, false)
-            .result
-    }
-
-    /// Preserve descriptor selection while optionally proving the retained getter arguments.
-    /// Ordinary lookup does no strict correspondence work; an executed unchecked getter remains
-    /// unproved if a later consumer requests its input requirements.
-    pub(crate) fn try_call_dunder_get_with_proof(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        instance: Option<Type<'db>>,
-        owner: Type<'db>,
-        request_input_proof: bool,
-    ) -> DescriptorGetOutcome<'db> {
-        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _, _, _, _, _| DescriptorGetOutcome { result: Ok(None), proof: false }, heap_size=ruff_memory_usage::heap_size)]
+        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _, _, _, _| Ok(None), heap_size=ruff_memory_usage::heap_size)]
         fn try_call_dunder_get_inner<'db>(
             db: &'db dyn Db,
             program: Program<'db>,
             ty: Type<'db>,
             instance: Option<Type<'db>>,
             owner: Type<'db>,
-            request_input_proof: bool,
-        ) -> DescriptorGetOutcome<'db> {
+        ) -> Result<Option<DescriptorGetResult<'db>>, DescriptorGetError<'db>> {
             let env = &ProgramEnvironment::from_program(program);
             if let Some(fallback) = ty.materialized_divergent_fallback() {
-                let mut outcome = fallback.try_call_dunder_get_with_proof(
-                    db,
-                    env,
-                    instance,
-                    owner,
-                    request_input_proof,
-                );
-                outcome.proof = false;
-                return outcome;
+                return fallback.try_call_dunder_get(db, env, instance, owner);
             }
 
             if let Some(dynamic) = ty.dynamic_descriptor_type() {
-                return descriptor_get_result(dynamic, AttributeKind::DataDescriptor, None, false);
+                return descriptor_get_result(dynamic, AttributeKind::DataDescriptor, None);
             }
 
             if let Some(union) = ty.as_union_like(db) {
                 let mut return_types = UnionBuilder::new(db, env);
                 let mut error = None;
                 let mut any_descriptor = false;
-                let mut proof = true;
                 let mut all_data_descriptors = true;
 
                 for alternative in union.elements(db) {
-                    let outcome = alternative.try_call_dunder_get_with_proof(
-                        db,
-                        env,
-                        instance,
-                        owner,
-                        request_input_proof,
-                    );
-                    proof &= outcome.proof;
-                    let result = outcome.result.unwrap_or_else(|failure| {
-                        error = error.or(Some(failure.context));
-                        Some(failure.fallback())
-                    });
+                    let result = alternative
+                        .try_call_dunder_get(db, env, instance, owner)
+                        .unwrap_or_else(|failure| {
+                            error = error.or(Some(failure.context));
+                            Some(failure.fallback())
+                        });
                     if let Some(DescriptorGetResult { return_type, kind }) = result {
                         any_descriptor = true;
                         all_data_descriptors &= kind.is_data();
@@ -5373,47 +5257,28 @@ impl<'db> Type<'db> {
                             AttributeKind::NormalOrNonDataDescriptor
                         },
                         error,
-                        proof,
                     )
                 } else {
-                    DescriptorGetOutcome {
-                        result: Ok(None),
-                        proof,
-                    }
+                    Ok(None)
                 };
             }
 
-            let (descr_get, descr_get_boundness, kind) = match ty.descriptor_get_method(db, env) {
-                Ok(Some(method)) => method,
-                Ok(None) => {
-                    return DescriptorGetOutcome {
-                        result: Ok(None),
-                        proof: true,
-                    };
-                }
-                Err(()) => {
-                    return DescriptorGetOutcome {
-                        result: Ok(None),
-                        proof: false,
-                    };
-                }
+            let Ok(method) = ty.descriptor_get_method(db, env) else {
+                return Ok(None);
             };
+            let Some(method) = method else {
+                return Ok(None);
+            };
+            let (descr_get, descr_get_boundness, kind) = method;
             let instance_ty = instance.unwrap_or_else(|| Type::none(db, env));
-            let arguments = CallArguments::positional([ty, instance_ty, owner])
-                .with_input_proof_request(request_input_proof);
-            let (return_type, error, proof) = match descr_get.try_call(db, env, &arguments) {
-                Ok(bindings) => {
-                    let proof = request_input_proof
-                        && !bindings.has_only_constructor_items()
-                        && bindings.arguments_satisfy_declared_parameters(db, env, &arguments);
-                    (bindings.return_type(db, env), None, proof)
-                }
+            let arguments = CallArguments::positional([ty, instance_ty, owner]);
+            let (return_type, error) = match descr_get.try_call(db, env, &arguments) {
+                Ok(bindings) => (bindings.return_type(db, env), None),
                 Err(error) => (
                     error.return_type(db, env),
                     Some(DescriptorGetCallContext::new(
                         db, ty, descr_get, instance, owner,
                     )),
-                    false,
                 ),
             };
             let return_type = if descr_get_boundness == Definedness::AlwaysDefined {
@@ -5422,7 +5287,7 @@ impl<'db> Type<'db> {
                 UnionType::from_two_elements(db, env, return_type, ty)
             };
 
-            descriptor_get_result(return_type, kind, error, proof)
+            descriptor_get_result(return_type, kind, error)
         }
 
         tracing::trace!(
@@ -5439,10 +5304,7 @@ impl<'db> Type<'db> {
         if matches!(self, Type::BoundMethod(_)) {
             // A stored bound method keeps its receiver. In Python 3.13+ its native `__get__`
             // returns the method itself; older versions have no descriptor slot on MethodType.
-            return DescriptorGetOutcome {
-                result: Ok(None),
-                proof: true,
-            };
+            return Ok(None);
         }
         // Bind known callable descriptors outside the tracked lookup. Checking a protocol
         // receiver can recursively access this method; the lookup's `None` cycle value would
@@ -5452,7 +5314,6 @@ impl<'db> Type<'db> {
                 return_type,
                 AttributeKind::NormalOrNonDataDescriptor,
                 None,
-                true,
             );
         }
 
@@ -5463,18 +5324,10 @@ impl<'db> Type<'db> {
                 instance.map_or(self, |_| descriptor.value_type(db)),
                 AttributeKind::DataDescriptor,
                 None,
-                true,
             );
         }
 
-        try_call_dunder_get_inner(
-            db,
-            env.program(db),
-            self,
-            instance,
-            owner,
-            request_input_proof,
-        )
+        try_call_dunder_get_inner(db, env.program(db), self, instance, owner)
     }
 
     /// Look up `__get__` on the meta-type of `attribute`, and call it with `attribute`, `instance`,
@@ -5486,7 +5339,6 @@ impl<'db> Type<'db> {
         attribute: PlaceAndQualifiers<'db>,
         instance: Option<Type<'db>>,
         owner: Type<'db>,
-        request_input_proof: bool,
     ) -> DescriptorAttributeOutcome<'db> {
         if let PlaceAndQualifiers {
             place:
@@ -5501,7 +5353,7 @@ impl<'db> Type<'db> {
         } = attribute
             && let Some(fallback) = ty.materialized_divergent_fallback()
         {
-            let mut outcome = Self::try_call_dunder_get_on_attribute(
+            return Self::try_call_dunder_get_on_attribute(
                 db,
                 env,
                 Place::Defined(DefinedPlace {
@@ -5514,13 +5366,9 @@ impl<'db> Type<'db> {
                 .with_qualifiers(qualifiers),
                 instance,
                 owner,
-                request_input_proof,
             );
-            outcome.proof = false;
-            return outcome;
         }
 
-        let mut proof = true;
         let (member, kind, error) = match attribute {
             // A directly dynamic attribute could be a data descriptor even though we cannot see
             // its methods. Preserve that uncertainty, along with the existing bottom and cycle
@@ -5532,10 +5380,7 @@ impl<'db> Type<'db> {
                         ..
                     }),
                 qualifiers: _,
-            } => {
-                proof = false;
-                (attribute, AttributeKind::DataDescriptor, None)
-            }
+            } => (attribute, AttributeKind::DataDescriptor, None),
 
             PlaceAndQualifiers {
                 place:
@@ -5552,15 +5397,8 @@ impl<'db> Type<'db> {
                 let mut error = None;
                 let place = union
                     .map_with_boundness(db, env, |elem| {
-                        let outcome = elem.try_call_dunder_get_with_proof(
-                            db,
-                            env,
-                            instance,
-                            owner,
-                            request_input_proof,
-                        );
-                        proof &= outcome.proof;
-                        let result = outcome.result.unwrap_or_else(|failure| {
+                        let outcome = elem.try_call_dunder_get(db, env, instance, owner);
+                        let result = outcome.unwrap_or_else(|failure| {
                             error = error.or(Some(failure.context));
                             Some(failure.fallback())
                         });
@@ -5611,16 +5449,8 @@ impl<'db> Type<'db> {
                 } else {
                     intersection
                         .map_with_boundness(db, env, |elem| {
-                            let outcome = elem.try_call_dunder_get_with_proof(
-                                db,
-                                env,
-                                instance,
-                                owner,
-                                request_input_proof,
-                            );
-                            proof &= outcome.proof;
+                            let outcome = elem.try_call_dunder_get(db, env, instance, owner);
                             let ty = outcome
-                                .result
                                 .unwrap_or_else(|failure| {
                                     error = error.or(Some(failure.context));
                                     Some(failure.fallback())
@@ -5657,15 +5487,8 @@ impl<'db> Type<'db> {
                 qualifiers: _,
             } => {
                 let mut error = None;
-                let outcome = attribute_ty.try_call_dunder_get_with_proof(
-                    db,
-                    env,
-                    instance,
-                    owner,
-                    request_input_proof,
-                );
-                proof &= outcome.proof;
-                let result = outcome.result.unwrap_or_else(|failure| {
+                let outcome = attribute_ty.try_call_dunder_get(db, env, instance, owner);
+                let result = outcome.unwrap_or_else(|failure| {
                     error = Some(failure.context);
                     Some(failure.fallback())
                 });
@@ -5694,7 +5517,6 @@ impl<'db> Type<'db> {
             member,
             kind,
             error,
-            proof,
         }
     }
 
@@ -5859,25 +5681,13 @@ impl<'db> Type<'db> {
                 },
             kind: meta_attr_kind,
             error: meta_attr_error,
-            proof: meta_proof,
-        } = Self::try_call_dunder_get_on_attribute(
-            db,
-            env,
-            meta_attr_plain,
-            Some(receiver),
-            owner,
-            key.policy(db)
-                .contains(MemberLookupPolicy::PROVE_GETTER_INPUTS),
-        );
+        } = Self::try_call_dunder_get_on_attribute(db, env, meta_attr_plain, Some(receiver), owner);
 
         let meta_attr_error = meta_attr_error.map(MemberLookupErrorKind::DescriptorGet);
         let meta_properties = meta_attr_ty.and_then(|ty| ty.property_deprecations(db));
         let fallback_error = fallback.err().map(|error| error.kind(db));
         let fallback_member = fallback.unwrap_or_else(|error| error.fallback_member(db));
         let fallback_properties = fallback_member.deprecated_properties(db);
-        // A recovered or mixed descriptor classification cannot prove that storage shadows
-        // every getter. Retain its requirements even when ordinary selection uses the fallback.
-        let fallback_inputs_proved = fallback_member.inputs_proved(db) && meta_proof;
         let mut fallback_member = fallback_member.member(db);
         let guaranteed_storage = fallback_member
             .qualifiers
@@ -5895,13 +5705,7 @@ impl<'db> Type<'db> {
             && matches!(meta_attr_ty, Some(Type::SlotDescriptor(_)))
             && !fallback_member.place.is_undefined()
         {
-            return member_lookup_result(
-                db,
-                fallback_member,
-                fallback_error,
-                fallback_properties,
-                fallback_inputs_proved,
-            );
+            return member_lookup_result(db, fallback_member, fallback_error, fallback_properties);
         }
 
         let PlaceAndQualifiers {
@@ -5917,7 +5721,6 @@ impl<'db> Type<'db> {
                 meta_attr.with_qualifiers(meta_attr_qualifiers),
                 meta_attr_error,
                 meta_properties,
-                meta_proof,
             ),
 
             // `meta_attr` is the return type of a data descriptor and definitely bound, so we
@@ -5934,7 +5737,6 @@ impl<'db> Type<'db> {
                 meta_attr.with_qualifiers(meta_attr_qualifiers),
                 meta_attr_error,
                 meta_properties,
-                meta_proof,
             ),
 
             // `meta_attr` is the return type of a data descriptor, but the attribute on the
@@ -5968,7 +5770,6 @@ impl<'db> Type<'db> {
                 .with_qualifiers(meta_attr_qualifiers.union(fallback_qualifiers)),
                 meta_attr_error.or(fallback_error),
                 union_deprecated_properties(db, meta_properties, fallback_properties),
-                fallback_inputs_proved,
             ),
 
             // `meta_attr` is *not* a data descriptor. This means that the `fallback` type has
@@ -5990,7 +5791,6 @@ impl<'db> Type<'db> {
                     fallback.with_qualifiers(fallback_qualifiers),
                     fallback_error,
                     fallback_properties,
-                    fallback_inputs_proved,
                 )
             }
 
@@ -6025,7 +5825,6 @@ impl<'db> Type<'db> {
                 .with_qualifiers(meta_attr_qualifiers.union(fallback_qualifiers)),
                 meta_attr_error.or(fallback_error),
                 union_deprecated_properties(db, meta_properties, fallback_properties),
-                fallback_inputs_proved,
             ),
 
             // If the attribute is not found on the meta-type, we simply return the fallback.
@@ -6034,7 +5833,6 @@ impl<'db> Type<'db> {
                 fallback.with_qualifiers(fallback_qualifiers),
                 fallback_error,
                 fallback_properties,
-                fallback_inputs_proved,
             ),
         }
     }
@@ -6181,7 +5979,7 @@ impl<'db> Type<'db> {
     ) -> MemberLookupResult<'db> {
         #[salsa::tracked(
             returns(copy),
-            cycle_initial=|db, id, _| Ok(ResolvedMember::new(db, Place::bound(Type::divergent(id)).into(), None, false)),
+            cycle_initial=|db, id, _| Ok(ResolvedMember::new(db, Place::bound(Type::divergent(id)).into(), None)),
             cycle_fn=|db, cycle, previous: &MemberLookupResult<'db>, member: MemberLookupResult<'db>, key: MemberLookupKey<'db>| {
                 cycle_normalized_member_lookup(db, &ProgramEnvironment::from_program(key.program(db)), member, *previous, cycle)
             },
@@ -6196,7 +5994,7 @@ impl<'db> Type<'db> {
 
         #[salsa::tracked(
             returns(copy),
-            cycle_initial=|db, id, _, _| Ok(ResolvedMember::new(db, Place::bound(Type::divergent(id)).into(), None, false)),
+            cycle_initial=|db, id, _, _| Ok(ResolvedMember::new(db, Place::bound(Type::divergent(id)).into(), None)),
             cycle_fn=|db, cycle, previous: &MemberLookupResult<'db>, member: MemberLookupResult<'db>, key: MemberLookupKey<'db>, _| {
                 cycle_normalized_member_lookup(db, &ProgramEnvironment::from_program(key.program(db)), member, *previous, cycle)
             },
@@ -6324,12 +6122,8 @@ impl<'db> Type<'db> {
                 name
             );
             if let Some(fallback) = this.materialized_divergent_fallback() {
-                return unproved_member_lookup(
-                    db,
-                    fallback.member_lookup_with_policy_and_receiver(
-                        db, env, name_str, policy, receiver,
-                    ),
-                );
+                return fallback
+                    .member_lookup_with_policy_and_receiver(db, env, name_str, policy, receiver);
             }
 
             match this {
@@ -6351,14 +6145,12 @@ impl<'db> Type<'db> {
                 Type::Union(union) => {
                     let mut error = None;
                     let mut properties = None;
-                    let mut inputs_proved = true;
                     let member = union.map_with_boundness_and_qualifiers(db, env, |elem| {
                         let result = elem.member_lookup_with_policy_and_receiver(
                             db, env, name_str, policy, receiver,
                         );
                         error = error.or_else(|| result.err().map(|error| error.kind(db)));
                         let member = result.unwrap_or_else(|error| error.fallback_member(db));
-                        inputs_proved &= member.inputs_proved(db);
                         properties = union_deprecated_properties(
                             db,
                             properties,
@@ -6366,7 +6158,7 @@ impl<'db> Type<'db> {
                         );
                         policy.preserve_missing_alternative(db, *elem, member.member(db))
                     });
-                    member_lookup_result(db, member, error, properties, inputs_proved)
+                    member_lookup_result(db, member, error, properties)
                 }
 
                 Type::Intersection(intersection) => {
@@ -6950,14 +6742,12 @@ impl<'db> Type<'db> {
                         member: class_attr_fallback,
                         kind: _,
                         error: class_attr_error,
-                        proof: class_attr_proof,
                     } = Type::try_call_dunder_get_on_attribute(
                         db,
                         env,
                         class_attr_plain,
                         None,
                         receiver,
-                        policy.contains(MemberLookupPolicy::PROVE_GETTER_INPUTS),
                     );
 
                     let result = Type::invoke_descriptor_protocol(
@@ -6970,7 +6760,6 @@ impl<'db> Type<'db> {
                             class_attr_fallback,
                             class_attr_error.map(MemberLookupErrorKind::DescriptorGet),
                             None,
-                            class_attr_proof,
                         ),
                         InstanceFallbackShadowsNonDataDescriptor::Yes,
                     );
@@ -7026,12 +6815,7 @@ impl<'db> Type<'db> {
                         bound_super.find_name_in_mro_after_pivot(db, env, name_str, policy);
 
                     bound_super
-                        .try_call_dunder_get_on_attribute(
-                            db,
-                            env,
-                            owner_attr,
-                            policy.contains(MemberLookupPolicy::PROVE_GETTER_INPUTS),
-                        )
+                        .try_call_dunder_get_on_attribute(db, env, owner_attr)
                         .unwrap_or_else(|| owner_attr.into())
                 }
             }
@@ -7044,21 +6828,11 @@ impl<'db> Type<'db> {
                     .place
                     .is_definitely_bound()
             {
-                let member = Place::bound(self.dunder_class(db, env)).into();
-                if policy.contains(MemberLookupPolicy::PROVE_GETTER_INPUTS)
-                    && self.has_indeterminate_inference(db, env)
-                {
-                    return unproved_member_lookup(db, member);
-                }
-                return member;
+                return Place::bound(self.dunder_class(db, env)).into();
             }
 
             if matches!(self, Type::Dynamic(_) | Type::Divergent(_) | Type::Never) {
-                let member = Place::bound(self).into();
-                if policy.contains(MemberLookupPolicy::PROVE_GETTER_INPUTS) && !self.is_never() {
-                    return unproved_member_lookup(db, member);
-                }
-                return member;
+                return Place::bound(self).into();
             }
         }
 
@@ -7630,9 +7404,7 @@ impl<'db> Type<'db> {
                         definedness: boundness,
                         ..
                     }) => {
-                        let mut bindings = dunder_callable
-                            .bindings_impl(db, env, recursion_guard)
-                            .with_unproved_lookup_inputs(!member.inputs_proved(db));
+                        let mut bindings = dunder_callable.bindings_impl(db, env, recursion_guard);
                         bindings.replace_callable_type(dunder_callable, self);
                         bindings.set_implicitly_invoked();
                         if boundness == Definedness::PossiblyUndefined {
@@ -8135,7 +7907,7 @@ impl<'db> Type<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         place: Place<'db>,
-    ) -> (Place<'db>, bool) {
+    ) -> Place<'db> {
         // If `__new__` itself resolved to `Any`, treat it as absent rather than as a real
         // constructor override. This preserves the known nominal constructor result for
         // subclasses of `Any` while still allowing explicitly typed `__new__` callables
@@ -8147,7 +7919,7 @@ impl<'db> Type<'db> {
                 ..
             })
         ) {
-            return (Place::Undefined, true);
+            return Place::Undefined;
         }
         place.try_call_dunder_get(db, env, self)
     }
@@ -8326,18 +8098,13 @@ impl<'db> Type<'db> {
                 .unwrap_or_else(|error| error.fallback_member(db));
 
             let new_bindings = if let Some(method) = &new_method
-                && let (
-                    Place::Defined(DefinedPlace {
-                        ty: new_callable,
-                        definedness,
-                        ..
-                    }),
-                    inputs_proved,
-                ) = self_type.resolve_dunder_new_callable(db, env, method.place)
+                && let Place::Defined(DefinedPlace {
+                    ty: new_callable,
+                    definedness,
+                    ..
+                }) = self_type.resolve_dunder_new_callable(db, env, method.place)
             {
-                let bindings = new_callable
-                    .bindings_impl(db, env, recursion_guard)
-                    .with_unproved_lookup_inputs(!inputs_proved);
+                let bindings = new_callable.bindings_impl(db, env, recursion_guard);
                 let mut bindings =
                     bind_constructor_new(db, env, bindings, self_type, constructor_instance_ty)
                         .into_constructor_bindings(
@@ -8368,7 +8135,6 @@ impl<'db> Type<'db> {
                 ) => {
                     let mut bindings = init_method
                         .bindings_impl(db, env, recursion_guard)
-                        .with_unproved_lookup_inputs(!init_method_no_object.inputs_proved(db))
                         .into_constructor_bindings(
                             constructor_instance_ty,
                             ConstructorCallableKind::Init,
@@ -8397,9 +8163,6 @@ impl<'db> Type<'db> {
                         }) => {
                             let mut bindings = init_method
                                 .bindings_impl(db, env, recursion_guard)
-                                .with_unproved_lookup_inputs(
-                                    !init_method_with_object.inputs_proved(db),
-                                )
                                 .into_constructor_bindings(
                                     constructor_instance_ty,
                                     ConstructorCallableKind::Init,
@@ -8462,7 +8225,6 @@ impl<'db> Type<'db> {
             {
                 let mut metaclass_bindings = metaclass_call_method
                     .bindings_impl(db, env, recursion_guard)
-                    .with_unproved_lookup_inputs(!metaclass_dunder_call.inputs_proved(db))
                     .into_constructor_bindings(
                         constructor_instance_ty,
                         ConstructorCallableKind::MetaclassCall,
@@ -8547,11 +8309,6 @@ impl<'db> Type<'db> {
         tcx: TypeContext<'db>,
         policy: MemberLookupPolicy,
     ) -> Result<Bindings<'db>, CallDunderError<'db>> {
-        let policy = if argument_types.requests_input_proof() {
-            policy | MemberLookupPolicy::PROVE_GETTER_INPUTS
-        } else {
-            policy
-        };
         if let Type::Intersection(intersection) = self {
             return intersection.try_call_dunder_with_policy(
                 db,
@@ -8602,7 +8359,6 @@ impl<'db> Type<'db> {
                 let constraints = ConstraintSetBuilder::new();
                 let bindings = dunder_callable
                     .bindings(db, env)
-                    .with_unproved_lookup_inputs(!member.inputs_proved(db))
                     .match_parameters(db, env, argument_types)
                     .check_types(db, env, &constraints, argument_types, tcx, &[]);
 
@@ -8640,11 +8396,7 @@ impl<'db> Type<'db> {
         argument_types: &CallArguments<'_, 'db>,
         tcx: TypeContext<'db>,
     ) -> Result<Bindings<'db>, CallDunderError<'db>> {
-        let policy = if argument_types.requests_input_proof() {
-            MemberLookupPolicy::PROVE_GETTER_INPUTS
-        } else {
-            MemberLookupPolicy::default()
-        };
+        let policy = MemberLookupPolicy::default();
         let member = self
             .member_lookup_with_policy_and_receiver(db, env, name, policy, None)
             .unwrap_or_else(|error| error.fallback_member(db));
@@ -8658,7 +8410,6 @@ impl<'db> Type<'db> {
                 let constraints = ConstraintSetBuilder::new();
                 let bindings = dunder_callable
                     .bindings(db, env)
-                    .with_unproved_lookup_inputs(!member.inputs_proved(db))
                     .match_parameters(db, env, argument_types)
                     .check_types(db, env, &constraints, argument_types, tcx, &[]);
 
@@ -8764,15 +8515,8 @@ impl<'db> Type<'db> {
         }
 
         let name_type = Type::string_literal(db, name);
-        let request_input_proof = policy.contains(MemberLookupPolicy::PROVE_GETTER_INPUTS);
-        let mut arguments =
-            CallArguments::positional([name_type]).with_input_proof_request(request_input_proof);
+        let mut arguments = CallArguments::positional([name_type]);
         let call_result = if let Some(receiver) = receiver {
-            let lookup_policy = if request_input_proof {
-                MemberLookupPolicy::PROVE_GETTER_INPUTS
-            } else {
-                MemberLookupPolicy::default()
-            };
             Self::try_call_dunder_member_impl(
                 db,
                 env,
@@ -8780,7 +8524,7 @@ impl<'db> Type<'db> {
                     db,
                     env,
                     "__getattr__",
-                    lookup_policy | MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+                    MemberLookupPolicy::NO_INSTANCE_FALLBACK,
                     Some(receiver),
                 ),
                 &mut arguments,
@@ -8811,7 +8555,6 @@ impl<'db> Type<'db> {
                         name: name_type,
                     }),
                     None,
-                    false,
                 );
             }
             Err(CallDunderError::MethodNotAvailable) => return Place::Undefined.into(),
@@ -8824,15 +8567,7 @@ impl<'db> Type<'db> {
         } else {
             bindings.getattr_result(db, env)
         };
-        member_lookup_result(
-            db,
-            place.into(),
-            None,
-            None,
-            request_input_proof
-                && !bindings.has_only_constructor_items()
-                && bindings.arguments_satisfy_declared_parameters(db, env, &arguments),
-        )
+        member_lookup_result(db, place.into(), None, None)
     }
 
     /// Apply `__getattr__` / `__getattribute__` fallback to an attribute-lookup result.
@@ -8870,9 +8605,7 @@ impl<'db> Type<'db> {
             TypeContext::default(),
             getattribute_policy,
         ) {
-            Ok(bindings) => {
-                unproved_member_lookup(db, Place::bound(bindings.return_type(db, env)).into())
-            }
+            Ok(bindings) => Place::bound(bindings.return_type(db, env)).into(),
             Err(CallDunderError::CallError(_, bindings, _)) => member_lookup_result(
                 db,
                 Place::bound(bindings.return_type(db, env)).into(),
@@ -8881,7 +8614,6 @@ impl<'db> Type<'db> {
                     name: name_type,
                 }),
                 None,
-                false,
             ),
             Err(CallDunderError::PossiblyUnbound { .. }) => Place::Undefined.into(),
             Err(CallDunderError::MethodNotAvailable) => {
@@ -8898,7 +8630,6 @@ impl<'db> Type<'db> {
                     .or_fall_back_to(db, env, || error.fallback_member(db).member(db)),
                 Some(error.kind(db)),
                 member.deprecated_properties(db),
-                false,
             );
         }
 
@@ -8913,11 +8644,7 @@ impl<'db> Type<'db> {
         };
 
         let result = member_lookup_or_fall_back_to(db, env, result, || custom_getattribute);
-        // The override executes even when ordinary lookup keeps a declared member type.
-        unproved_member_lookup(
-            db,
-            member_lookup_or_fall_back_to(db, env, result, custom_getattr_result),
-        )
+        member_lookup_or_fall_back_to(db, env, result, custom_getattr_result)
     }
 
     /// Flatten typevars in a union or intersection by resolving them to their upper bounds
@@ -11174,14 +10901,10 @@ impl<'db> IntersectionType<'db> {
         let mut error = None;
         let mut properties: Option<PropertyDeprecations<'db>> = None;
         let mut all_deprecated = true;
-        let mut inputs_proved = true;
         let member = self.map_with_boundness_and_qualifiers(db, env, |elem| {
             let result = lookup(*elem);
             error = error.or_else(|| result.err().map(|error| error.kind(db)));
             let member = result.unwrap_or_else(|error| error.fallback_member(db));
-            if !member.member(db).place.is_undefined() {
-                inputs_proved &= member.inputs_proved(db);
-            }
             if let Some(deprecated) = member.deprecated_properties(db) {
                 properties = Some(properties.map_or(deprecated, |properties| {
                     properties.intersection(db, deprecated)
@@ -11196,7 +10919,6 @@ impl<'db> IntersectionType<'db> {
             member,
             error,
             properties.filter(|_| all_deprecated && !member.place.is_undefined()),
-            inputs_proved,
         )
     }
 
@@ -11312,7 +11034,6 @@ impl<'db> UnionType<'db> {
         let mut builder = UnionBuilder::new(db, env);
         let mut unbound_on: Vec<Type<'db>> = Vec::new();
         let mut any_defined = false;
-        let mut inputs_proved = true;
         let mut possibly_undefined = false;
         let mut provenance = Provenance::Unknown;
 
@@ -11326,7 +11047,6 @@ impl<'db> UnionType<'db> {
                     None,
                 )
                 .unwrap_or_else(|error| error.fallback_member(db));
-            inputs_proved &= member.inputs_proved(db);
             match member.member(db).place {
                 Place::Defined(DefinedPlace {
                     ty,
@@ -11363,7 +11083,6 @@ impl<'db> UnionType<'db> {
         let constraints = ConstraintSetBuilder::new();
         let bindings = match dunder_callable
             .bindings(db, env)
-            .with_unproved_lookup_inputs(!inputs_proved)
             .match_parameters(db, env, argument_types)
             .check_types(db, env, &constraints, argument_types, tcx, &[])
         {
@@ -12695,7 +12414,6 @@ impl<'db> ModuleLiteralType<'db> {
                 },
                 error,
                 None,
-                false,
             );
         }
 

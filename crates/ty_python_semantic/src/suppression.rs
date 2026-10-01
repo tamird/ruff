@@ -959,28 +959,21 @@ mod tests {
     }
 
     #[test]
-    fn file_check_retains_suppressed_checking_failures() -> anyhow::Result<()> {
-        for (source, expected, diagnostic) in [
-            ("value = 1\n", false, None),
+    fn file_check_preserves_used_suppressions() -> anyhow::Result<()> {
+        for (source, diagnostic) in [
+            ("value = 1\n", None),
             (
                 "def make(): return 1\nif make: # ty: ignore[redundant-condition]\n    pass\n",
-                false,
                 None,
             ),
-            ("len(1) # ty: ignore[invalid-argument-type]\n", true, None),
-            (
-                "value = missing # ty: ignore[unresolved-reference]\n",
-                true,
-                None,
-            ),
+            ("len(1) # ty: ignore[invalid-argument-type]\n", None),
+            ("value = missing # ty: ignore[unresolved-reference]\n", None),
             (
                 "if False:\n    value = missing # ty: ignore[unresolved-reference]\n",
-                false,
                 None,
             ),
             (
                 "value = 1 # ty: ignore[unresolved-reference]\n",
-                false,
                 Some("unused-ignore-comment"),
             ),
         ] {
@@ -990,12 +983,10 @@ mod tests {
             let file = system_path_to_file(&db, "/src/main.py")?;
             let result = check_types_with_diagnostics(&db, db.program_file(file), []);
             let actual: Vec<_> = result
-                .diagnostics
                 .iter()
                 .map(|diagnostic| diagnostic.id().as_str())
                 .collect();
             assert_eq!(actual, diagnostic.into_iter().collect::<Vec<_>>());
-            assert_eq!(result.has_suppressed_inference_failures, expected);
         }
         Ok(())
     }
@@ -1038,8 +1029,7 @@ mod tests {
             };
             let result =
                 check_types_with_diagnostics(&db, program_file, [provided_diagnostic(file, range)]);
-            assert!(!result.has_suppressed_inference_failures);
-            assert!(result.diagnostics.is_empty(), "{source}: {result:?}");
+            assert!(result.is_empty(), "{source}: {result:?}");
         }
         Ok(())
     }
@@ -1066,8 +1056,7 @@ mod tests {
             let range = TextRange::at(source.find("pass").unwrap().try_into()?, 4.into());
             let mut expected = provided_diagnostic(file, range);
             let diagnostics =
-                check_types_with_diagnostics(&db, db.program_file(file), [expected.clone()])
-                    .diagnostics;
+                check_types_with_diagnostics(&db, db.program_file(file), [expected.clone()]);
             match setting {
                 Some(source) => {
                     if source != LintSource::Default {
@@ -1114,8 +1103,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            check_types_with_diagnostics(&db, db.program_file(file), diagnostics.clone())
-                .diagnostics,
+            check_types_with_diagnostics(&db, db.program_file(file), diagnostics.clone()),
             diagnostics
         );
         Ok(())

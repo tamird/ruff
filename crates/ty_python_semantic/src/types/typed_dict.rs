@@ -737,14 +737,6 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         if let TypedDictType::Synthesized(synthesized_target) = target
             && synthesized_target.is_patch(db)
         {
-            if matches!(
-                self.relation,
-                TypeRelation::DeclaredOutput { strict: false }
-            ) {
-                return self
-                    .with_strict_inputs()
-                    .check_typeddict_pair(db, source, target);
-            }
             let source_items = source.items(db);
             let target_items = synthesized_target.items(db);
             let target_openness = synthesized_target.openness(db);
@@ -898,13 +890,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     // invariants of self. For fully-static types, this is "equivalence".
                     // For gradual types, it depends on the relation, but mutual
                     // assignability is "consistency".
-                    self.check_input_type_pair(
+                    self.check_type_pair(
                         db,
                         source_item_field.declared_ty,
                         target_item_field.declared_ty,
                     )
                     .and(db, self.constraints, || {
-                        self.check_input_type_pair(
+                        self.check_type_pair(
                             db,
                             target_item_field.declared_ty,
                             source_item_field.declared_ty,
@@ -964,13 +956,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 
                         // As above, for mutable fields in the target, the relation needs
                         // to apply both ways.
-                        self.check_input_type_pair(
+                        self.check_type_pair(
                             db,
                             source_item_field.declared_ty,
                             target_item_field.declared_ty,
                         )
                         .and(db, self.constraints, || {
-                            self.check_input_type_pair(
+                            self.check_type_pair(
                                 db,
                                 target_item_field.declared_ty,
                                 source_item_field.declared_ty,
@@ -984,13 +976,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                         if source_extra_items.is_read_only() {
                             return self.never();
                         }
-                        self.check_input_type_pair(
+                        self.check_type_pair(
                             db,
                             source_extra_items.declared_ty,
                             target_item_field.declared_ty,
                         )
                         .and(db, self.constraints, || {
-                            self.check_input_type_pair(
+                            self.check_type_pair(
                                 db,
                                 target_item_field.declared_ty,
                                 source_extra_items.declared_ty,
@@ -1038,13 +1030,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 result.intersect(
                     db,
                     self.constraints,
-                    self.check_input_type_pair(
+                    self.check_type_pair(
                         db,
                         source_extra_items.declared_ty,
                         target_extra_items.declared_ty,
                     )
                     .and(db, self.constraints, || {
-                        self.check_input_type_pair(
+                        self.check_type_pair(
                             db,
                             target_extra_items.declared_ty,
                             source_extra_items.declared_ty,
@@ -1059,13 +1051,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                         result.intersect(
                             db,
                             self.constraints,
-                            self.check_input_type_pair(
+                            self.check_type_pair(
                                 db,
                                 source_item_field.declared_ty,
                                 target_extra_items.declared_ty,
                             )
                             .and(db, self.constraints, || {
-                                self.check_input_type_pair(
+                                self.check_type_pair(
                                     db,
                                     target_extra_items.declared_ty,
                                     source_item_field.declared_ty,
@@ -1595,8 +1587,6 @@ pub(super) enum TypedDictAssignmentKind {
     Subscript,
     /// For constructor arguments like `MyTypedDict(key=value)`
     Constructor,
-    /// A fresh literal checked against a supplied structural value contract.
-    ValueContract,
 }
 
 impl TypedDictAssignmentKind {
@@ -1604,7 +1594,6 @@ impl TypedDictAssignmentKind {
         match self {
             Self::Subscript => "assignment",
             Self::Constructor => "argument",
-            Self::ValueContract => "argument",
         }
     }
 
@@ -1612,7 +1601,6 @@ impl TypedDictAssignmentKind {
         match self {
             Self::Subscript => &INVALID_ASSIGNMENT,
             Self::Constructor => &INVALID_ARGUMENT_TYPE,
-            Self::ValueContract => &INVALID_ARGUMENT_TYPE,
         }
     }
 
@@ -1642,11 +1630,6 @@ impl<'db> TypedDictKeyAssignment<'_, 'db, '_> {
 
         // Check if key exists in `TypedDict` or is accepted by explicit extra items.
         let Some(item) = self.typed_dict.item(db, self.key) else {
-            if matches!(self.assignment_kind, TypedDictAssignmentKind::ValueContract)
-                && self.typed_dict.openness(db).is_implicitly_open()
-            {
-                return true;
-            }
             if self.emit_diagnostic {
                 report_invalid_key_on_typed_dict(
                     self.context,
@@ -2443,7 +2426,6 @@ fn validate_extracted_typed_dict_keys<'db, 'ast>(
     nodes: TypedDictAssignmentNodes<'ast>,
     full_object_ty: Option<Type<'db>>,
     ignored_keys: &OrderSet<Name>,
-    check_value: &mut impl FnMut(Type<'db>, Type<'db>),
 ) -> (OrderSet<Name>, bool) {
     let mut provided_keys = OrderSet::new();
     let mut valid = true;
@@ -2460,9 +2442,6 @@ fn validate_extracted_typed_dict_keys<'db, 'ast>(
         }
         if unpacked_key.kind.is_required() {
             provided_keys.insert(key_name.clone());
-        }
-        if let Some(field) = typed_dict.item(context.db(), key_name.as_str()) {
-            check_value(unpacked_key.value_ty, field.declared_ty);
         }
         valid &= TypedDictKeyAssignment {
             context,
@@ -2494,7 +2473,6 @@ fn validate_extracted_typed_dict_openness<'db, 'ast>(
     source_openness: TypedDictOpenness<'db>,
     nodes: TypedDictAssignmentNodes<'ast>,
     ignored_keys: &OrderSet<Name>,
-    check_value: &mut impl FnMut(Type<'db>, Type<'db>),
 ) -> bool {
     let db = context.db();
     let Some(extra_items) = source_openness.effective_extra_items() else {
@@ -2516,7 +2494,6 @@ fn validate_extracted_typed_dict_openness<'db, 'ast>(
                 if source_keys.contains_key(*name) || ignored_keys.contains(*name) {
                     return false;
                 }
-                check_value(extra_items_ty, field.declared_ty);
                 !extra_items_ty.is_assignable_to(db, env, field.declared_ty)
             })
         {
@@ -2535,7 +2512,6 @@ fn validate_extracted_typed_dict_openness<'db, 'ast>(
             return false;
         }
 
-        check_value(extra_items_ty, target_extra_items.declared_ty);
         if extra_items_ty.is_assignable_to(db, env, target_extra_items.declared_ty) {
             return true;
         }
@@ -2579,12 +2555,10 @@ pub(super) fn validate_typed_dict_copy<'db, 'ast>(
     source: &'ast ast::Expr,
     key_ty: Type<'db>,
     dictionary: DictionaryItems<'db>,
-    mut check_value: impl FnMut(Type<'db>, Type<'db>),
 ) -> bool {
     let db = context.db();
     let env = context.program_environment();
     let str_ty = KnownClass::Str.to_instance(db, env);
-    check_value(key_ty, str_ty);
     if !key_ty.is_assignable_to(db, env, str_ty) {
         if let Some(builder) = context.report_lint(&INVALID_ARGUMENT_TYPE, source) {
             builder.into_diagnostic(format_args!(
@@ -2630,15 +2604,8 @@ pub(super) fn validate_typed_dict_copy<'db, 'ast>(
         value: source.into(),
     };
     let ignored_keys = OrderSet::new();
-    let (provided_keys, mut valid) = validate_extracted_typed_dict_keys(
-        context,
-        typed_dict,
-        &keys,
-        nodes,
-        None,
-        &ignored_keys,
-        &mut check_value,
-    );
+    let (provided_keys, mut valid) =
+        validate_extracted_typed_dict_keys(context, typed_dict, &keys, nodes, None, &ignored_keys);
     valid &= validate_extracted_typed_dict_openness(
         context,
         typed_dict,
@@ -2646,7 +2613,6 @@ pub(super) fn validate_typed_dict_copy<'db, 'ast>(
         openness,
         nodes,
         &ignored_keys,
-        &mut check_value,
     );
     valid &= validate_typed_dict_required_keys(context, typed_dict, &provided_keys, source.into());
     valid
@@ -2691,7 +2657,6 @@ fn validate_from_typed_dict_argument<'db, 'ast>(
         nodes,
         full_object_ty_annotation(arg_ty),
         ignored_keys,
-        &mut |_, _| {},
     );
     valid &= validate_extracted_typed_dict_openness(
         context,
@@ -2700,7 +2665,6 @@ fn validate_from_typed_dict_argument<'db, 'ast>(
         source_openness,
         nodes,
         ignored_keys,
-        &mut |_, _| {},
     );
 
     Some((provided_keys, valid))
@@ -3069,7 +3033,7 @@ fn validate_merged_dict_literal<'db, 'ast>(
                         .arbitrary_key_initialization_type_excluding(db, env, shadowed_keys)
                     {
                         let value_ty =
-                            expression_type_fn(&item.value, tcx.with_annotation(Some(expected_ty)));
+                            expression_type_fn(&item.value, TypeContext::new(Some(expected_ty)));
                         if !value_ty.is_assignable_to(db, env, expected_ty) {
                             valid = false;
                             if let Some(builder) =
@@ -3111,7 +3075,7 @@ fn validate_merged_dict_literal<'db, 'ast>(
             if !is_shadowed {
                 let value_tcx = typed_dict
                     .item(db, key.as_str())
-                    .map(|field| tcx.with_annotation(Some(field.declared_ty)))
+                    .map(|field| TypeContext::new(Some(field.declared_ty)))
                     .unwrap_or_default();
                 let value_ty = expression_type_fn(&item.value, value_tcx);
                 valid &= TypedDictKeyAssignment {
@@ -3123,11 +3087,7 @@ fn validate_merged_dict_literal<'db, 'ast>(
                     typed_dict_node: nodes.typed_dict,
                     key_node: key_expr.into(),
                     value_node: (&item.value).into(),
-                    assignment_kind: if tcx.is_value_contract() {
-                        TypedDictAssignmentKind::ValueContract
-                    } else {
-                        TypedDictAssignmentKind::Constructor
-                    },
+                    assignment_kind: TypedDictAssignmentKind::Constructor,
                     emit_diagnostic: true,
                 }
                 .validate();
@@ -3209,7 +3169,6 @@ fn validate_merged_unpacked_keyword_argument<'db, 'ast>(
             nodes,
             full_object_ty_annotation(unpacked_type),
             &ignored_keys,
-            &mut |_, _| {},
         );
         unpacked_valid &= validate_extracted_typed_dict_openness(
             context,
@@ -3218,7 +3177,6 @@ fn validate_merged_unpacked_keyword_argument<'db, 'ast>(
             unpacked.openness,
             nodes,
             &ignored_keys,
-            &mut |_, _| {},
         );
 
         for (key_name, unpacked_key) in unpacked.keys {
@@ -3257,7 +3215,6 @@ fn validate_merged_unpacked_keyword_argument<'db, 'ast>(
                 TypedDictOpenness::extra(db, value_ty, true),
                 nodes,
                 shadowed_keys,
-                &mut |_, _| {},
             );
         }
     }

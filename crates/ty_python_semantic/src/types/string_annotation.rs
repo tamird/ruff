@@ -14,13 +14,10 @@ use ty_python_core::{
 use crate::Db;
 use crate::declare_lint;
 use crate::lint::{Level, LintStatus};
-use crate::provided::ProvidedReturnType;
 use crate::types::diagnostic::INVALID_TYPE_FORM;
 use crate::types::diagnostic::autofix_with_literal;
 use crate::types::generics::GenericContext;
-use crate::types::infer::{
-    InferenceFlags, TypeContext, TypeContextPurpose, TypeExpressionFlags, infer_definition_types,
-};
+use crate::types::infer::{InferenceFlags, TypeExpressionFlags, infer_definition_types};
 use crate::types::signatures::function_signature_annotation_info;
 use crate::types::{Type, TypeAndQualifiers};
 
@@ -72,12 +69,7 @@ pub(crate) enum SourceAnnotation<'a, 'db> {
     },
     External {
         annotation: ExternalAnnotation<'db>,
-        purpose: TypeContextPurpose,
         /// The local declaration is the diagnostic location for invalid annotation use.
-        range: TextRange,
-    },
-    Provided {
-        annotation: ProvidedReturnType<'db>,
         range: TextRange,
     },
 }
@@ -92,7 +84,6 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
     ) -> Option<(Definition<'db>, GenericContext<'db>)> {
         let Self::External {
             annotation,
-            purpose: _,
             range: _,
         } = Self::function_return(db, file, function)?
         else {
@@ -104,7 +95,6 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
             let parameter = parameter.as_parameter();
             let Self::External {
                 annotation,
-                purpose: _,
                 range: _,
             } = Self::new(db, file, parameter, parameter.annotation.as_deref())?
             else {
@@ -122,13 +112,7 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         file: ProgramFile<'db>,
         function: &'a ast::StmtFunctionDef,
     ) -> Option<Self> {
-        Self::new(db, file, function, function.returns.as_deref()).or_else(|| {
-            let definition = semantic_index(db, file).try_definition(function)?;
-            Some(Self::Provided {
-                annotation: db.provided_return_type(definition)?,
-                range: function.name.range,
-            })
-        })
+        Self::new(db, file, function, function.returns.as_deref())
     }
 
     pub(crate) fn new(
@@ -146,27 +130,7 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
                 file: foreign_file,
                 owner: foreign_owner,
             } => {
-                return Self::external(
-                    db,
-                    file,
-                    owner,
-                    foreign_file,
-                    foreign_owner,
-                    TypeContextPurpose::Inference,
-                );
-            }
-            ProvidedAnnotation::ExternalValueContract {
-                file: foreign_file,
-                owner: foreign_owner,
-            } => {
-                return Self::external(
-                    db,
-                    file,
-                    owner,
-                    foreign_file,
-                    foreign_owner,
-                    TypeContextPurpose::ValueContract,
-                );
+                return Self::external(db, file, owner, foreign_file, foreign_owner);
             }
         };
         let source = source_text(db, file.file(db));
@@ -184,7 +148,6 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         owner: impl HasNodeIndex + Ranged,
         foreign_file: ProgramFile<'db>,
         foreign_owner: NodeIndex,
-        purpose: TypeContextPurpose,
     ) -> Option<Self> {
         let annotation = external_annotation(db, foreign_file, foreign_owner)?;
         let local_module = parsed_module(db, file.python_file(db)).load(db);
@@ -197,29 +160,13 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
                 annotation.definition.kind(db),
                 DefinitionKind::AnnotatedAssignment(_)
             )
-            || (matches!(purpose, TypeContextPurpose::ValueContract) && !local_assignment)
         {
             return None;
         }
         Some(Self::External {
             annotation,
-            purpose,
             range: owner.range(),
         })
-    }
-
-    pub(crate) fn initializer_context(&self, annotation: Type<'db>) -> TypeContext<'db> {
-        if let Self::External {
-            annotation: _,
-            purpose,
-            range: _,
-        } = self
-            && matches!(purpose, TypeContextPurpose::ValueContract)
-        {
-            TypeContext::for_value_contract(annotation)
-        } else {
-            TypeContext::new(Some(annotation))
-        }
     }
 
     pub(crate) fn expression_or_report(&self, context: &InferContext) -> Option<&ast::Expr> {
@@ -245,11 +192,6 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
             } => parsed.as_ref().ok().map(Parsed::expr),
             Self::External {
                 annotation: _,
-                purpose: _,
-                range: _,
-            } => None,
-            Self::Provided {
-                annotation: _,
                 range: _,
             } => None,
         }
@@ -259,12 +201,8 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         match self {
             Self::External {
                 annotation,
-                purpose: _,
                 range: _,
             } => annotation.source,
-            Self::Provided { annotation, range } => annotation
-                .source
-                .unwrap_or_else(|| FileRange::new(file, *range)),
             Self::Native(_)
             | Self::Detached {
                 owner: _,
@@ -278,13 +216,8 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         match self {
             Self::External {
                 annotation,
-                purpose: _,
                 range: _,
             } => Some(annotation.inferred(db).0),
-            Self::Provided {
-                annotation,
-                range: _,
-            } => Some(annotation.ty),
             Self::Native(_)
             | Self::Detached {
                 owner: _,
@@ -297,7 +230,6 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
     pub(crate) fn external_declaration(&self, db: &'db dyn Db) -> Option<TypeAndQualifiers<'db>> {
         let Self::External {
             annotation,
-            purpose: _,
             range: _,
         } = self
         else {
@@ -310,13 +242,8 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         match self {
             Self::External {
                 annotation,
-                purpose: _,
                 range: _,
             } => annotation.starred,
-            Self::Provided {
-                annotation: _,
-                range: _,
-            } => false,
             Self::Native(_)
             | Self::Detached {
                 owner: _,
@@ -337,18 +264,10 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
     ) -> (Type<'db>, TypeExpressionFlags) {
         if let Self::External {
             annotation,
-            purpose: _,
             range: _,
         } = self
         {
             return annotation.inferred(db);
-        }
-        if let Self::Provided {
-            annotation,
-            range: _,
-        } = self
-        {
-            return (annotation.ty, TypeExpressionFlags::empty());
         }
         let Some(expression) = self.expression() else {
             return (Type::unknown(), TypeExpressionFlags::empty());
@@ -368,11 +287,6 @@ impl Ranged for SourceAnnotation<'_, '_> {
                 parsed: _,
             } => *range,
             Self::External {
-                annotation: _,
-                purpose: _,
-                range,
-            } => *range,
-            Self::Provided {
                 annotation: _,
                 range,
             } => *range,
