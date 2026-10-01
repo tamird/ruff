@@ -2854,7 +2854,7 @@ impl<'db> Type<'db> {
     }
 
     /// If this type is a class instance or class-backed `TypedDict`, returns its specialization.
-    fn class_specialization(
+    pub fn class_specialization(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,

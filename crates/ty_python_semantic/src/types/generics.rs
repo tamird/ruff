@@ -1139,7 +1139,7 @@ pub struct Specialization<'db> {
     #[returns(copy)]
     pub(crate) generic_context: GenericContext<'db>,
     #[returns(deref)]
-    pub(crate) types: Box<[Type<'db>]>,
+    pub types: Box<[Type<'db>]>,
     /// The materialization kind of the specialization. For example, given an invariant
     /// generic type `A`, `Top[A[Any]]` is a supertype of all materializations of `A[Any]`,
     /// and is represented here with `Some(MaterializationKind::Top)`. Similarly,
