@@ -2458,7 +2458,122 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             PredicateNode::StarImportPlaceholder(_) => return None,
         };
 
-        constraints.map(FrozenNarrowingConstraints::from)
+        constraints.map(|mut constraints| {
+            if let PredicateNode::Expression(expression)
+            | PredicateNode::Condition(expression)
+            | PredicateNode::ChainedComparisonCondition(expression) = self.predicate
+            {
+                self.project_first_values(expression, &mut constraints);
+            }
+            FrozenNarrowingConstraints::from(constraints)
+        })
+    }
+
+    fn project_first_values(
+        &mut self,
+        expression: Expression<'db>,
+        constraints: &mut NarrowingConstraints<'db>,
+    ) {
+        use crate::reachability::ReachabilityEvaluationCache;
+        use crate::types::dictionary::contents::KeyPreservation;
+        use crate::types::dictionary::{self, DictionaryFirstEntry};
+        use ruff_python_ast::visitor::{Visitor, walk_expr};
+        use ty_python_core::place::DictionaryFirstValueRead;
+
+        struct Names<'ast>(Vec<&'ast ast::ExprName>);
+        impl<'ast> Visitor<'ast> for Names<'ast> {
+            fn visit_expr(&mut self, expression: &'ast ast::Expr) {
+                if let ast::Expr::Name(name) = expression {
+                    self.0.push(name);
+                }
+                walk_expr(self, expression);
+            }
+        }
+        let db = self.db;
+        let scope = expression.scope(db);
+        let file = expression.program_file(db);
+        let index = semantic_index(db, file);
+        let table = index.place_table(scope.file_scope_id(db));
+        let use_def = index.use_def_map(scope.file_scope_id(db));
+        let node = expression.node_ref(db).node(self.module);
+        let mut names = Names(Vec::new());
+        names.visit_expr(node);
+        for name in names.0 {
+            if index.try_expression_scope_id(&ast::ExprRef::from(name))
+                != Some(scope.file_scope_id(db))
+            {
+                continue;
+            }
+            let Some(use_id) = index.try_expression_use_id(name.into()) else {
+                continue;
+            };
+            let Some(place) = table.place_id(&PlaceExpr::from_expr_name(name)) else {
+                continue;
+            };
+            let Some(constraint) = constraints.get(&place).cloned() else {
+                continue;
+            };
+            let mut bindings = use_def.bindings_at_use(use_id);
+            let Some(definition) = bindings
+                .next()
+                .and_then(|binding| binding.binding.definition())
+            else {
+                continue;
+            };
+            if definition.scope(db) != scope
+                || bindings.any(|binding| binding.binding != DefinitionState::Defined(definition))
+            {
+                continue;
+            }
+            let Some(subscript) =
+                DictionaryFirstValueRead::assigned_subscript(definition.kind(db), self.module)
+            else {
+                continue;
+            };
+            let inference = infer_definition_types(db, definition);
+            if inference.is_provisional() {
+                self.is_provisional = true;
+                continue;
+            }
+            let reachability =
+                ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
+            let Some((read, first)) = dictionary::first_value_read(
+                db,
+                &self.env,
+                scope,
+                subscript,
+                &reachability,
+                |expression| Some(inference.expression_type(expression)),
+            ) else {
+                continue;
+            };
+            let key = match &first {
+                DictionaryFirstEntry::Entry { key, value: _ } => key.as_deref(),
+                DictionaryFirstEntry::Unknown => None,
+                DictionaryFirstEntry::Empty => continue,
+            };
+            match dictionary::contents::saved_read_preserved(
+                db,
+                scope,
+                read.receiver,
+                read.receiver.into(),
+                node,
+                key,
+            ) {
+                KeyPreservation::Preserved => {}
+                KeyPreservation::Changed => continue,
+                KeyPreservation::Pending => {
+                    self.is_provisional = true;
+                    continue;
+                }
+            }
+            let Some(first) =
+                PlaceExpr::first_value(read.receiver).and_then(|place| table.place_id(&place))
+            else {
+                continue;
+            };
+            insert_narrowing_constraint(constraints, first, constraint);
+        }
     }
 
     fn evaluate_expression_predicate(

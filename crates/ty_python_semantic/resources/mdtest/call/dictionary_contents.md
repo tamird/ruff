@@ -1168,3 +1168,172 @@ def first_value(flag: bool):
         values = {"other": 1, "first": None}
     reveal_type(list(values.values())[0])  # revealed: None | Literal[1]
 ```
+
+## Guards on saved first values
+
+A guard on the first value describes a later read from the same dictionary snapshot. Other values
+retain their original type.
+
+```py
+def saved_first(source: dict[str, int | None]):
+    values = dict(source)
+    first = list(values.values())[0]
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: None
+        reveal_type(list(values.values())[1])  # revealed: int | None
+        reveal_type(values)  # revealed: dict[str, int | None]
+```
+
+## First-value guards preserve snapshot identity
+
+A saved first value describes the dictionary at the read. Mutations, rebinding, and ambiguous
+saved-value definitions prevent that fact from narrowing a later read.
+
+```py
+from typing_extensions import reveal_type
+
+def mutate(values: dict[str, int | None]) -> None:
+    values.clear()
+    values["replacement"] = 2
+
+def stale(source: dict[str, int | None]):
+    values = dict(source)
+    first = list(values.values())[0]
+    values["changed"] = 2
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: int | None
+
+    values = dict(source)
+    first = list(values.values())[0]
+    alias = values
+    alias.clear()
+    alias["replacement"] = 2
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: int | None
+
+    values = dict(source)
+    first = list(values.values())[0]
+    if first is mutate(values):
+        reveal_type(list(values.values())[0])  # revealed: int | None
+
+    values = dict(source)
+    first = list(values.values())[0]
+    values = {"replacement": 3}
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: Literal[3]
+
+def ambiguous(source: dict[str, int | None], flag: bool):
+    values = dict(source)
+    if flag:
+        first = list(values.values())[0]
+    else:
+        first = None
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: int | None
+
+def snapshots(source: dict[str, int | None]):
+    values = dict(source)
+    snapshot = list(values.values())
+    first = snapshot[0]
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: int | None
+
+    view = values.values()
+    first = list(view)[0]
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: int | None
+
+def other_key(first_value: int | None):
+    values = {"first": first_value, "other": 1}
+    first = list(values.values())[0]
+    values["other"] = 2
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: None
+    else:
+        reveal_type(list(values.values())[0])  # revealed: int
+```
+
+## First-value guards require builtin reads
+
+The relationship comes from builtin snapshot operations. A dictionary annotation alone permits
+subclasses, and a similarly named method can return unrelated data.
+
+```py
+from typing_extensions import TypeIs, reveal_type
+
+def is_none(value: object) -> TypeIs[None]:
+    return value is None
+
+def guarded(source: dict[str, int | None]):
+    values = dict(source)
+    first = list(values.values())[0]
+    if is_none(first):
+        reveal_type(list(values.values())[0])  # revealed: None
+    else:
+        reveal_type(list(values.values())[0])  # revealed: int
+
+def subclassable(values: dict[str, int | None]):
+    first = list(values.values())[0]
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: int | None
+
+class Other:
+    def values(self) -> list[int | None]:
+        return [None, 1]
+
+def custom(values: Other):
+    first = list(values.values())[0]
+    if first is None:
+        reveal_type(list(values.values())[0])  # revealed: int | None
+
+def loop(source: dict[str, int | None], flags: list[bool]):
+    values = dict(source)
+    first = list(values.values())[0]
+    for flag in flags:
+        if flag:
+            values.clear()
+            values["replacement"] = 2
+        if first is None:
+            reveal_type(list(values.values())[0])  # revealed: int | None
+```
+
+## First-value guards use names from the current scope
+
+Nested function names and assignment targets have their own binding histories.
+
+```py
+from typing_extensions import TypeIs, reveal_type
+
+def is_none(value: object, extra: object = None) -> TypeIs[None]:
+    return value is None
+
+def nested(source: dict[str, int | None]):
+    values = dict(source)
+    first = list(values.values())[0]
+    if is_none(first, lambda: (first, first, first, first)):
+        reveal_type(list(values.values())[0])  # revealed: None
+
+    if (first := None) is None:
+        reveal_type(list(values.values())[0])  # revealed: int | None
+```
+
+## Saved Boolean guards do not revive old first entries
+
+Changing the dictionary after computing a Boolean leaves the new first entry in place, including
+when the Boolean itself is aliased.
+
+```py
+from typing_extensions import reveal_type
+
+def saved_boolean(source: dict[str, int | None]):
+    values = dict(source)
+    first = list(values.values())[0]
+    flag = first is None
+    flag_alias = flag
+    values.clear()
+    values["replacement"] = 2
+    if flag:
+        reveal_type(list(values.values())[0])  # revealed: Literal[2]
+    if flag_alias:
+        reveal_type(list(values.values())[0])  # revealed: Literal[2]
+```

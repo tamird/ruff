@@ -460,6 +460,37 @@ impl<'db> Contents<'db> {
             *value = constraint.narrow(db, &env, *value, key);
             if value.resolve_type_alias(db).is_never() {
                 self.value = ContentsValue::Unreachable;
+                return self;
+            }
+        }
+        if let Some(first) = table.contents_first_value(place) {
+            let (previous, key) = match &mapping.dictionary.first_entry {
+                DictionaryFirstEntry::Entry { key, value } => (*value, key.clone()),
+                DictionaryFirstEntry::Unknown => (
+                    UnionType::from_elements(
+                        db,
+                        &env,
+                        mapping
+                            .dictionary
+                            .items
+                            .iter()
+                            .map(|item| item.ty)
+                            .chain([mapping.extra_value()]),
+                    ),
+                    None,
+                ),
+                DictionaryFirstEntry::Empty => return self,
+            };
+            let narrowed = constraint.narrow(db, &env, previous, first);
+            if narrowed != previous {
+                if narrowed.resolve_type_alias(db).is_never() {
+                    self.value = ContentsValue::Unreachable;
+                } else {
+                    mapping.dictionary.first_entry = DictionaryFirstEntry::Entry {
+                        key,
+                        value: narrowed,
+                    };
+                }
             }
         }
         self
@@ -1405,42 +1436,63 @@ pub(crate) fn alias_preserves_key<'db>(
     };
     reads.visit_expr(original);
     let read = reads.read?;
-    let place = PlaceExpr::contents(&read.value)?;
-    let place = table.place_id(&place)?;
     if reads.multiple || loop_carried {
         return Some(KeyPreservation::Changed);
     }
     let name = read.slice.as_string_literal_expr()?.value.to_str();
-    let use_def = index.use_def_map(scope.file_scope_id(db));
-    let Some(original_use) = index.try_expression_use_id(ast::ExprRef::from(read)) else {
-        return Some(KeyPreservation::Changed);
-    };
-    let Some(current_use) = index.try_expression_use_id(current.into()) else {
-        return Some(KeyPreservation::Changed);
-    };
-    let Some(original_bindings) = use_def.multi_bindings_at_use(original_use, place) else {
-        return Some(KeyPreservation::Changed);
-    };
-    let Some(current_bindings) = use_def.multi_bindings_at_use(current_use, place) else {
-        return Some(KeyPreservation::Changed);
-    };
-    let anchors: Vec<_> = original_bindings.map(|binding| binding.binding).collect();
-    Some(check_contents_history(
+    Some(saved_read_preserved(
         db,
         scope,
-        current_bindings.map(|binding| binding.binding).collect(),
+        &read.value,
+        read.into(),
+        current,
+        Some(name),
+    ))
+}
+
+pub(crate) fn saved_read_preserved<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    receiver: &ast::Expr,
+    original: ast::ExprRef<'_>,
+    current: &ast::Expr,
+    name: Option<&str>,
+) -> KeyPreservation {
+    let index = semantic_index(db, scope.program_file(db));
+    let table = index.place_table(scope.file_scope_id(db));
+    let Some(place) = PlaceExpr::contents(receiver).and_then(|place| table.place_id(&place)) else {
+        return KeyPreservation::Changed;
+    };
+    let Some(original_use) = index.try_expression_use_id(original) else {
+        return KeyPreservation::Changed;
+    };
+    let Some(current_use) = index.try_expression_use_id(current.into()) else {
+        return KeyPreservation::Changed;
+    };
+    let use_def = index.use_def_map(scope.file_scope_id(db));
+    let Some(original) = use_def.multi_bindings_at_use(original_use, place) else {
+        return KeyPreservation::Changed;
+    };
+    let Some(current) = use_def.multi_bindings_at_use(current_use, place) else {
+        return KeyPreservation::Changed;
+    };
+    let anchors: Vec<_> = original.map(|binding| binding.binding).collect();
+    check_contents_history(
+        db,
+        scope,
+        current.map(|binding| binding.binding).collect(),
         KeyHistoryOrigin::SavedRead {
             anchors: &anchors,
             name,
         },
-    ))
+    )
 }
 
 #[derive(Clone, Copy)]
 enum KeyHistoryOrigin<'a, 'db> {
     SavedRead {
         anchors: &'a [DefinitionState<'db>],
-        name: &'a str,
+        name: Option<&'a str>,
     },
     FreshAllocation,
     /// Ordinary member seeds may start at a parameter, but not after a known escape.
@@ -1581,9 +1633,15 @@ fn check_contents_history<'db>(
                     continue;
                 }
                 let preserved = match origin {
-                    KeyHistoryOrigin::SavedRead { anchors: _, name } => {
-                        transfer.preserves_key(db, name)
-                    }
+                    KeyHistoryOrigin::SavedRead { anchors: _, name } => match name {
+                        Some(name) => transfer.preserves_key(db, name),
+                        None => matches!(
+                            transfer,
+                            MappingTransfer::Keep {
+                                exposes_descendants: _
+                            }
+                        ),
+                    },
                     KeyHistoryOrigin::FreshAllocation => transfer.preserves_confinement(),
                     KeyHistoryOrigin::UnexposedParent => transfer.preserves_confinement(),
                 };

@@ -349,6 +349,10 @@ impl MemberExprBuilder {
         self.with_subscript(SegmentKind::Contents, "")
     }
 
+    pub(super) fn with_first_value(&self) -> Option<Self> {
+        self.with_subscript(SegmentKind::FirstValue, "")
+    }
+
     fn with_subscript(&self, kind: SegmentKind, key: &str) -> Option<Self> {
         let Self { path, segments } = self;
         let start_offset = path.text_len();
@@ -453,6 +457,7 @@ impl std::fmt::Display for MemberExpr {
                 SegmentKind::StringSubscript => write!(f, "[\"{}\"]", segment.text)?,
                 SegmentKind::BytesSubscript => write!(f, "[b\"{}\"]", segment.text)?,
                 SegmentKind::Contents => f.write_str(".<contents>")?,
+                SegmentKind::FirstValue => f.write_str(".<first-value>")?,
             }
         }
 
@@ -768,8 +773,8 @@ impl Segments {
 }
 
 /// Segment metadata - packed into a single u32
-/// Layout: [kind: 3 bits][offset: 29 bits]. The internal contents segment needs
-/// one more kind than the four Python member forms. Ordinary small paths retain
+/// Layout: [kind: 3 bits][offset: 29 bits]. Internal contents projections need
+/// more kinds than the four Python member forms. Ordinary small paths retain
 /// their two-bit inline encoding.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize)]
 struct SegmentInfo(u32);
@@ -800,6 +805,7 @@ impl SegmentInfo {
             2 => SegmentKind::StringSubscript,
             3 => SegmentKind::BytesSubscript,
             4 => SegmentKind::Contents,
+            5 => SegmentKind::FirstValue,
             _ => panic!("Invalid SegmentKind bits"),
         }
     }
@@ -831,6 +837,7 @@ enum SegmentKind {
     StringSubscript = 2,
     BytesSubscript = 3,
     Contents = 4,
+    FirstValue = 5,
 }
 
 /// Iterator over segments that converts `SegmentInfo` to `Segment` with text slices.
@@ -926,7 +933,10 @@ impl SmallSegments {
         let mut prev_offset = TextSize::new(0);
 
         for (i, segment) in segments.iter().enumerate() {
-            if segment.kind() == SegmentKind::Contents {
+            if matches!(
+                segment.kind(),
+                SegmentKind::Contents | SegmentKind::FirstValue
+            ) {
                 return None;
             }
             // Compute relative offset on-the-fly
