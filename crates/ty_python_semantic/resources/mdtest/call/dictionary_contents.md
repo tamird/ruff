@@ -1336,6 +1336,92 @@ def optional_exposed(flag: bool):
     reveal_type(list(values.values())[0])  # revealed: None | int
 ```
 
+## First-value guards retain saved value types
+
+An unchanged first entry is the same value as the saved read. Its narrowed type remains available
+when aliasing has made the rest of the contents opaque.
+
+```py
+from typing import Any, Literal
+from typing_extensions import TypeGuard
+from ty_extensions import static_assert
+from ty_extensions._internal import TypeOf, is_subtype_of
+
+def consume(value: object) -> None: ...
+def alias(source: dict[str, dict[str, str] | None]):
+    original = dict(source)
+    values = original
+    first = list(values.values())[0]
+    if isinstance(first, dict):
+        reveal_type(first)  # revealed: dict[str, str]
+        reveal_type(list(values.values())[0])  # revealed: dict[str, str]
+
+def gradual(source: dict[str, Any]):
+    original = dict(source)
+    values = original
+    first = list(values.values())[0]
+    if isinstance(first, dict):
+        current = list(values.values())[0]
+        static_assert(not is_subtype_of(TypeOf[current], dict[str, str]))
+
+def exposed(source: dict[str, dict[str, str] | None]):
+    original = dict(source)
+    values = original
+    first = list(values.values())[0]
+    consume(values)
+    if isinstance(first, dict):
+        reveal_type(list(values.values())[0])  # revealed: dict[str, str] | None
+
+def is_one_or_two(value: object) -> TypeGuard[Literal[1, 2]]:
+    return value in (1, 2)
+
+def replacement():
+    values: dict[str, int] = {"first": 1, "other": 3}
+    first = list(values.values())[0]
+    reveal_type(first)  # revealed: Literal[1]
+    if is_one_or_two(first):
+        reveal_type(first)  # revealed: Literal[1, 2]
+        reveal_type(list(values.values())[0])  # revealed: Literal[1, 2]
+        if first == 2:
+            reveal_type(first)  # revealed: Literal[2]
+            reveal_type(list(values.values())[0])  # revealed: Literal[2]
+
+def joined(source: dict[str, int | str | None], flag: bool):
+    values = dict(source)
+    first = list(values.values())[0]
+    if flag:
+        if first is not None:
+            return
+    else:
+        if not isinstance(first, int):
+            return
+    if first is None or first == 1:
+        reveal_type(first)  # revealed: None | Literal[1]
+        reveal_type(list(values.values())[0])  # revealed: None | Literal[1]
+
+def repeated(source: dict[str, int | None]):
+    values = dict(source)
+    first = list(values.values())[0]
+    if first is None or first == 1:
+        reveal_type(first)  # revealed: None | Literal[1]
+        reveal_type(list(values.values())[0])  # revealed: None | Literal[1]
+
+def rebound(source: dict[str, int | None]):
+    values = dict(source)
+    first = list(values.values())[0]
+    if first is None and (first := 1) and first == 1:
+        reveal_type(list(values.values())[0])  # revealed: None
+
+def mutated(source: dict[str, dict[str, str] | None]):
+    original = dict(source)
+    values = original
+    first = list(values.values())[0]
+    values.clear()
+    values["first"] = None
+    if isinstance(first, dict):
+        reveal_type(list(values.values())[0])  # revealed: None
+```
+
 ## First-value guards use names from the current scope
 
 Nested function names and assignment targets have their own binding histories.

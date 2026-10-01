@@ -34,7 +34,7 @@ use crate::types::{
     mapping_pattern_type, pattern_binding_fallthrough_type, sequence_pattern_type_builder,
     singleton_pattern_type, starred_sequence_pattern_type, typed_dict_matches_class_pattern,
 };
-use crate::{Db, ProgramEnvironment};
+use crate::{Db, FxIndexMap, ProgramEnvironment};
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState, TargetKind};
 use ty_python_core::expression::Expression;
@@ -2498,33 +2498,47 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         let node = expression.node_ref(db).node(self.module);
         let mut names = Names(Vec::new());
         names.visit_expr(node);
+        let mut occurrences = FxIndexMap::<_, Vec<_>>::default();
         for name in names.0 {
             if index.try_expression_scope_id(&ast::ExprRef::from(name))
                 != Some(scope.file_scope_id(db))
             {
                 continue;
             }
-            let Some(use_id) = index.try_expression_use_id(name.into()) else {
-                continue;
-            };
-            let Some(place) = table.place_id(&PlaceExpr::from_expr_name(name)) else {
-                continue;
-            };
+            if let Some(place) = table.place_id(&PlaceExpr::from_expr_name(name))
+                && constraints.contains_key(&place)
+            {
+                occurrences.entry(place).or_default().push(name);
+            }
+        }
+        'places: for (place, names) in occurrences {
             let Some(constraint) = constraints.get(&place).cloned() else {
                 continue;
             };
-            let mut bindings = use_def.bindings_at_use(use_id);
-            let Some(definition) = bindings
-                .next()
-                .and_then(|binding| binding.binding.definition())
-            else {
+            let mut saved_definition = None;
+            for name in &names {
+                let Some(use_id) = index.try_expression_use_id((*name).into()) else {
+                    continue 'places;
+                };
+                let mut bindings = use_def.bindings_at_use(use_id);
+                let Some(definition) = bindings
+                    .next()
+                    .and_then(|binding| binding.binding.definition())
+                else {
+                    continue 'places;
+                };
+                if definition.scope(db) != scope
+                    || bindings
+                        .any(|binding| binding.binding != DefinitionState::Defined(definition))
+                    || saved_definition.is_some_and(|saved| saved != definition)
+                {
+                    continue 'places;
+                }
+                saved_definition = Some(definition);
+            }
+            let Some(definition) = saved_definition else {
                 continue;
             };
-            if definition.scope(db) != scope
-                || bindings.any(|binding| binding.binding != DefinitionState::Defined(definition))
-            {
-                continue;
-            }
             let Some(subscript) =
                 DictionaryFirstValueRead::assigned_subscript(definition.kind(db), self.module)
             else {
@@ -2572,6 +2586,22 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             else {
                 continue;
             };
+            let occurrence = infer_expression_types(db, expression, TypeContext::default());
+            if occurrence.is_provisional() {
+                self.is_provisional = true;
+                continue;
+            }
+            // Occurrences can have different types after short-circuit conditions. Keep
+            // their entire incoming domain before applying the whole predicate once.
+            let current = UnionType::from_elements(
+                db,
+                &self.env,
+                names
+                    .iter()
+                    .map(|name| occurrence.expression_type(ast::ExprRef::from(*name))),
+            );
+            let constraint =
+                NarrowingConstraint::replacement(current).merge_constraint_and(constraint);
             insert_narrowing_constraint(constraints, first, constraint);
         }
     }
