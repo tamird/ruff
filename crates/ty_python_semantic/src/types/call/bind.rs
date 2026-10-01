@@ -8581,8 +8581,7 @@ impl<'db> Binding<'db> {
         actual: Type<'db>,
         expected: Type<'db>,
     ) -> bool {
-        if actual != expected
-            || self.constructor_context.is_some()
+        if self.constructor_context.is_some()
             || self.signature.generic_context.is_some()
             || self.signature.has_implicit_positional_receiver_annotation()
             || self.source_parameter_index_offset != 0
@@ -8617,8 +8616,7 @@ impl<'db> Binding<'db> {
                 public_type_policy: _,
                 provenance: _,
             }) = class
-                .own_class_member(db, env, None, function.name(db))
-                .inner
+                .class_member(db, env, function.name(db), MemberLookupPolicy::empty())
                 .place
             else {
                 return None;
@@ -8650,9 +8648,11 @@ impl<'db> Binding<'db> {
             return false;
         };
         if resolved_signature != &self.signature
-            || !resolved_signature
-                .definition()
-                .is_some_and(|definition| definition.scope(db) == origin.body_scope(db))
+            || resolved_signature
+                .parameters()
+                .get(0)
+                .map(Parameter::annotated_type)
+                != Some(expected)
         {
             return false;
         }
@@ -13129,6 +13129,94 @@ bound = holder.read
                 assert!(return_type.is_unknown());
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_explicit_receivers_preserve_class_slots() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+from typing import Any, cast
+
+class Base[K, V]:
+    def read(self: "Base[K, V]") -> None: ...
+    def independent(self: "Base") -> None: ...
+    def consume(self: "Base[K, V]", value: int) -> None: ...
+
+class Child[K, V](Base[K, V]): pass
+class Swapped[K, V](Base[V, K]): pass
+class Dynamic(Any, Base[str, list]): pass
+
+base = cast(Base[str, list], None)
+child = cast(Child[str, list], None)
+swapped = cast(Swapped[list, str], None)
+dynamic = cast(Dynamic, None)
+base_read = base.read
+child_read = child.read
+swapped_read = swapped.read
+independent = child.independent
+dynamic_read = dynamic.read
+consume = child.consume
+"#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let lookup = |name| global_symbol(db, file, name).place.expect_type();
+        let mut outcomes = Vec::new();
+        for (name, arguments, accepted, expected) in [
+            ("base_read", CallArguments::default(), true, true),
+            ("child_read", CallArguments::default(), true, true),
+            ("swapped_read", CallArguments::default(), true, true),
+            ("independent", CallArguments::default(), true, false),
+            ("dynamic_read", CallArguments::default(), true, false),
+            (
+                "consume",
+                CallArguments::positional([Type::int_literal(1)]),
+                true,
+                true,
+            ),
+            (
+                "consume",
+                CallArguments::positional([Type::string_literal(db, "wrong")]),
+                false,
+                false,
+            ),
+        ] {
+            let result = lookup(name)
+                .bindings(db, &env)
+                .match_parameters(db, &env, &arguments)
+                .check_types(
+                    db,
+                    &env,
+                    &ConstraintSetBuilder::new(),
+                    &arguments,
+                    TypeContext::default(),
+                    &[],
+                );
+            let ordinary = result.is_ok();
+            let bindings = match result {
+                Ok(bindings) => bindings,
+                Err(CallError(_, bindings)) => *bindings,
+            };
+            outcomes.push((
+                name,
+                ordinary,
+                accepted,
+                bindings.arguments_satisfy_declared_parameters(db, &env, &arguments),
+                expected,
+            ));
+        }
+        assert!(
+            outcomes.iter().all(
+                |(_, ordinary, accepted, actual, expected)| ordinary == accepted
+                    && actual == expected
+            ),
+            "{outcomes:#?}"
+        );
         Ok(())
     }
 
