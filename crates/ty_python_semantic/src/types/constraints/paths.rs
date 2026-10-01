@@ -1490,7 +1490,7 @@ mod tests {
                 // This branch discovers `T = object => str <= T`. Its consequence is then
                 // rolled back while the implication remains cached for sibling branches.
                 path.walk_edge(db, &env, storage, lower.when_true(), |_, _, _, conflict| {
-                    assert!(!conflict)
+                    assert!(!conflict);
                 });
                 path.walk_edge(
                     db,
@@ -1573,7 +1573,7 @@ mod tests {
                 );
                 // Removing either antecedent makes the negative consequence satisfiable.
                 path.walk_edge(db, &env, storage, post.when_false(), |_, _, _, conflict| {
-                    assert!(!conflict)
+                    assert!(!conflict);
                 });
             },
         );
@@ -1585,7 +1585,7 @@ mod tests {
             |storage, path, _, conflict| {
                 assert!(!conflict);
                 path.walk_edge(db, &env, storage, post.when_false(), |_, _, _, conflict| {
-                    assert!(!conflict)
+                    assert!(!conflict);
                 });
             },
         );
