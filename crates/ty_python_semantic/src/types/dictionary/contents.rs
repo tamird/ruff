@@ -48,8 +48,8 @@ pub(super) struct MappingContents<'db> {
     /// All ranges belong to this file. Copying from another file rebases them to the local use.
     pub(super) file: ProgramFile<'db>,
     pub(super) dictionary: DictionaryItems<'db>,
-    /// The object was allocated by builtin dictionary construction, so its operations cannot
-    /// dispatch to subclass overrides. Exposure changes contents, not this allocation fact.
+    /// Builtin construction or a checked final allocation class establishes builtin operations.
+    /// Exposure changes contents while preserving this class identity.
     pub(super) builtin: bool,
     /// Opaque exposure leaves only value restrictions, rather than evidence of key presence.
     /// A closed `TypedDict` retains its schema and can track subsequent mutations.
@@ -717,10 +717,14 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         },
         _ => None,
     };
+    let provided_allocation = bound_type.as_nominal_instance().is_some_and(|instance| {
+        KnownClass::Dict.provided_allocation_class(db, &env)
+            == Some(instance.class_literal(db, &env))
+    });
     let mut mapping = MappingContents {
         file,
         dictionary,
-        builtin: closed_typed_dict || kwargs_parameters.is_some(),
+        builtin: closed_typed_dict || provided_allocation || kwargs_parameters.is_some(),
         uses_residual_presence: false,
         bound,
     };
@@ -728,7 +732,7 @@ fn initial_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         && let Some(value) = value
     {
         // A constructor establishes allocation even when its keys cannot be enumerated.
-        mapping.builtin = closed_typed_dict || builtin_allocation;
+        mapping.builtin |= builtin_allocation;
         if PlaceExpr::try_from_expr(value).is_some() {
             let use_def = index.use_def_map(scope.file_scope_id(db));
             let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());

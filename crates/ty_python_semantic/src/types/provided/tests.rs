@@ -291,6 +291,79 @@ fn supplied_allocation_preserves_later_generic_context() -> anyhow::Result<()> {
 }
 
 #[test]
+fn supplied_allocation_preserves_parameter_contents() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_source_provider(AllocationSource)
+        .with_file(
+            "/src/leaf.pyi",
+            "from typing import final\n@final\nclass Exact[K, V](dict[K, V]): ...\n",
+        )
+        .with_file(
+            "/src/native.pyi",
+            "def observed(value: object) -> bool: ...\ndef first(value: object) -> object: ...\ndef expose(value: object) -> None: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from leaf import Exact
+from native import observed, first, expose
+from typing import Literal
+from typing_extensions import assert_type
+
+def exact(values: Exact[str, object]) -> None:
+    values.values()
+    assert_type(observed(values), Literal[True])
+    values.clear()
+    values['first'] = 1
+    assert_type(first(values), Literal[1])
+
+def assigned(original: Exact[str, object]) -> None:
+    values: Exact[str, object] = original
+    values.clear()
+    values['first'] = 1
+    assert_type(first(values), Literal[1])
+
+def exposed(values: Exact[str, object]) -> None:
+    values.clear()
+    values['first'] = 1
+    expose(values)
+    assert_type(first(values), object)
+
+def nominal(values: dict[str, object]) -> None:
+    values.values()
+    assert_type(observed(values), Literal[False])
+    values.clear()
+    values['first'] = 1
+    assert_type(first(values), object)
+"#,
+        )
+        .with_call_result_provider(|db, call| {
+            let name = call.declaration().and_then(|declaration| declaration.name(db));
+            let result = match name.as_deref() {
+                Some("observed") => Some(Type::bool_literal(
+                    call.dictionary_argument(db, "value").is_some(),
+                )),
+                Some("first") => Some(
+                    call.dictionary_argument(db, "value")
+                        .and_then(|dictionary| match dictionary.first_entry {
+                            DictionaryFirstEntry::Entry { key: _, value } => Some(value),
+                            DictionaryFirstEntry::Unknown => None,
+                            DictionaryFirstEntry::Empty => None,
+                        })
+                        .unwrap_or(Type::object()),
+                ),
+                _ => None,
+            };
+            result.into()
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
 fn supplied_allocation_follows_program_and_declaration_edits() -> anyhow::Result<()> {
     let leaf = "from typing import final\n@final\nclass Exact[K, V](dict[K, V]): ...\n";
     let mut db = TestDbBuilder::new()
