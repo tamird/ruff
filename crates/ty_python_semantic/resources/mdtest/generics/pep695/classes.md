@@ -665,6 +665,28 @@ class Box[T, U]:
         return Box[T, Self](value, self)  # error: [invalid-return-type]
 ```
 
+### Explicit constructor type arguments in an enclosing method
+
+An explicitly supplied class type argument remains fixed even when the call occurs inside the class
+that binds it. A bare constructor can still infer its type arguments.
+
+```py
+from typing import Self
+
+class Box[T, U]:
+    def __init__(self, value: T, receiver: U) -> None:
+        reveal_type(Box[T, Self](value, self))  # revealed: Box[T@Box, Self@__init__]
+        Box[T, str]("wrong", "ok")  # error: [invalid-argument-type]
+        reveal_type(Box("value", self))  # revealed: Box[str, Self@__init__]
+
+    def wrap(self, value: T) -> None:
+        reveal_type(Box[T, Self](value, self))  # revealed: Box[T@Box, Self@wrap]
+        Box[T, Self]("wrong", self)  # error: [invalid-argument-type]
+        Alias = Box[T, str]
+        Alias("wrong", "ok")  # error: [invalid-argument-type]
+        reveal_type(Box("value", self))  # revealed: Box[str, Self@wrap]
+```
+
 ### Identical `__new__` and `__init__` signatures
 
 ```py
@@ -1199,6 +1221,83 @@ reveal_type(DefaultChild[str].x)  # revealed: str
 reveal_type(PartiallyFixed.fixed)  # revealed: int
 # error: [invalid-attribute-access]
 reveal_type(PartiallyFixed.unresolved)  # revealed: Unknown
+```
+
+## Forwarding `cls` to a generic superclass constructor
+
+A generic subclass can pass its `cls` to the superclass's `__new__` method and retain its `Self`
+return type. The superclass's specialized parameter types still apply.
+
+```py
+from typing import Self
+
+class Base[T]:
+    def __new__(cls, value: T) -> Self:
+        return super().__new__(cls)
+
+class Child[T](Base[T]):
+    def __new__(cls, value: T) -> Self:
+        result = super().__new__(cls, value)
+        reveal_type(result)  # revealed: Self@__new__
+        return result
+
+class IntChild(Base[int]):
+    def __new__(cls, value: int) -> Self:
+        super().__new__(cls, "wrong")  # error: [invalid-argument-type]
+        return super().__new__(cls, value)  # no diagnostic
+```
+
+The `cls` argument can also be passed through a generic type alias.
+
+```py
+type Class[T] = type[T]
+
+class AliasedChild[T](Base[T]):
+    def __new__(cls, value: T) -> Self:
+        aliased_cls: Class[Self] = cls
+        result = super().__new__(aliased_cls, value)
+        reveal_type(result)  # revealed: Self@__new__
+        return result
+```
+
+The same applies to constructors inherited through a generic tuple subclass.
+
+```py
+class TupleBase[T](tuple[T]):
+    def __new__(cls, value: T) -> Self:
+        return super().__new__(cls, (value,))
+
+class TupleChild[T](TupleBase[T]):
+    def __new__(cls, value: T) -> Self:
+        return super().__new__(cls, value)  # no diagnostic
+```
+
+## Calling a generic superclass initializer from a classmethod
+
+A classmethod can allocate an instance and pass it to the unbound superclass initializer. The
+initializer still checks the other arguments against the superclass specialization.
+
+```py
+from typing import Self
+
+class Base[T]:
+    def __init__(self, value: T) -> None: ...
+
+class Child[T](Base[T]):
+    @classmethod
+    def build(cls, value: T) -> Self:
+        instance = cls.__new__(cls)
+        super().__init__(instance, value)  # no diagnostic
+        reveal_type(instance)  # revealed: Self@build
+        return instance
+
+class IntChild(Base[int]):
+    @classmethod
+    def build(cls, value: int) -> Self:
+        instance = cls.__new__(cls)
+        super().__init__(instance, "wrong")  # error: [invalid-argument-type]
+        super().__init__(instance, value)  # no diagnostic
+        return instance
 ```
 
 ## Fallback MROs preserve generic class identity
@@ -2308,6 +2407,72 @@ def inferred_result[T](a: Box[str], b: Box[T], cond: bool):
 def wrong_return[T](a: Box[str], b: Box[T], cond: bool) -> tuple[Box[str], str]:
     box = a if cond else b
     return box.pair()  # error: [invalid-return-type]
+```
+
+## Calling specialized bound methods through aliases and inheritance
+
+A class and its type arguments can be specialized through aliases without changing its bound method
+types.
+
+```py
+from typing import Self
+from ty_extensions import static_assert
+from ty_extensions._internal import TypeOf, is_equivalent_to, is_subtype_of
+
+class Box[T]:
+    value: T
+
+    def pair(self) -> tuple[Self, T]:
+        return self, self.value
+
+type BoxAlias[T] = Box[T]
+type IntAlias = int
+
+def repeated(a: Box[int], b: BoxAlias[int], cond: bool):
+    static_assert(is_equivalent_to(TypeOf[a.pair], TypeOf[b.pair]))
+    pair = a.pair if cond else b.pair
+    reveal_type(pair())  # revealed: tuple[Box[int], int]
+
+def aliased_argument(a: Box[int], b: Box[IntAlias], cond: bool):
+    static_assert(is_equivalent_to(TypeOf[a.pair], TypeOf[b.pair]))
+    pair = a.pair if cond else b.pair
+    reveal_type(pair())  # revealed: tuple[Box[int], int]
+
+def reordered_union(a: Box[int | str], b: Box[str | int], cond: bool):
+    static_assert(is_equivalent_to(TypeOf[a.pair], TypeOf[b.pair]))
+    pair = a.pair if cond else b.pair
+    reveal_type(pair())  # revealed: tuple[Box[int | str], int | str]
+```
+
+An inherited generic base retains the receiver and the specialized value type.
+
+```py
+class NestedBox[U](Box[list[U]]): ...
+
+def inherited(a: NestedBox[int], b: Box[list[int]], cond: bool):
+    static_assert(is_subtype_of(TypeOf[a.pair], TypeOf[b.pair]))
+    static_assert(not is_subtype_of(TypeOf[b.pair], TypeOf[a.pair]))
+    reveal_type(a.pair())  # revealed: tuple[NestedBox[int], list[int]]
+    reveal_type(b.pair())  # revealed: tuple[Box[list[int]], list[int]]
+    pair = a.pair if cond else b.pair
+    reveal_type(pair())  # revealed: tuple[Box[list[int]], list[int]]
+```
+
+For sibling subclasses, each result keeps the type of its own receiver.
+
+```py
+class First(Box[int]): ...
+class Second(Box[int]): ...
+
+def subclasses(a: First, b: Second, cond: bool):
+    reveal_type(a.pair())  # revealed: tuple[First, int]
+    reveal_type(b.pair())  # revealed: tuple[Second, int]
+    pair = a.pair if cond else b.pair
+    reveal_type(pair())  # revealed: tuple[First, int] | tuple[Second, int]
+
+def subclasses_reversed(a: First, b: Second, cond: bool):
+    pair = b.pair if cond else a.pair
+    reveal_type(pair())  # revealed: tuple[Second, int] | tuple[First, int]
 ```
 
 ## Calling a union of generic methods
