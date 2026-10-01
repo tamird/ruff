@@ -4467,6 +4467,10 @@ class ValidConstrainedReceiver(str):
 class RecursiveReceiverBound:
     def method[T: ReceiverOnly](self: T) -> None: ...
 
+class InvalidRecursiveReceiverBound:
+    def method[T: ReceiverOnly](self: T) -> int:
+        return 1
+
 static_assert(is_equivalent_to(LegacyFunctionScoped, NewStyleFunctionScoped))
 static_assert(is_assignable_to(NominalNewStyle, NewStyleFunctionScoped))
 static_assert(is_assignable_to(NominalNewStyle, LegacyFunctionScoped))
@@ -4531,6 +4535,8 @@ static_assert(is_subtype_of(ValidConstrainedReceiver, ReceiverOnly))
 # Verifying the receiver's bound recurses into the protocol relation currently being checked.
 static_assert(is_assignable_to(RecursiveReceiverBound, ReceiverOnly))
 static_assert(is_subtype_of(RecursiveReceiverBound, ReceiverOnly))
+static_assert(not is_assignable_to(InvalidRecursiveReceiverBound, ReceiverOnly))
+static_assert(not is_subtype_of(InvalidRecursiveReceiverBound, ReceiverOnly))
 
 # These test cases are taken from the typing conformance suite:
 class ShapeProtocolImplicitSelf(Protocol):
