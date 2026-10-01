@@ -784,11 +784,6 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
                 }
             }
         }
-        // An incomplete support can omit free occurrences. This only selects relations
-        // worth attempting to simplify; the proof below remains authoritative.
-        let no_known_free_variables = storage
-            .node_support(self.node)
-            .is_some_and(|support| (support - &locals).iter().next().is_none());
         let (node, source_order) = storage.quantify(
             db,
             env,
@@ -797,9 +792,10 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
             self.node,
             self.source_order,
         );
-        if no_known_free_variables {
+        if node != self.node {
             // Retaining a proved quantifier can grow an equivalent recursive query result
-            // at every iteration. Normalize truths before persisting those query results.
+            // at every iteration. A truth can depend parametrically on rigid free variables,
+            // so normalize changed scopes using the bounded proof rather than free support.
             let budget = SolutionBudget::default();
             let mut limits = BoundedSolutionLimits {
                 remaining_paths: budget.paths,
@@ -5667,6 +5663,26 @@ mod tests {
         ConstraintSet::constrain_typevar_equivalence_bound(db, &env, builder, bound_typevar, ty)
     }
 
+    /// Exercises scope representation without the truth normalization in `reduce_inferable`.
+    fn quantify_constraint<'db, 'c>(
+        db: &'db TestDb,
+        body: ConstraintSet<'db, 'c>,
+        locals: TypeVarSet<'db>,
+    ) -> ConstraintSet<'db, 'c> {
+        let env = db.program_environment();
+        let mut storage = body.builder.storage.borrow_mut();
+        let locals = Support::from_typevar_set(db, &mut storage, locals);
+        let (node, source_order) = storage.quantify(
+            db,
+            &env,
+            ConstraintProvenance::Evidence,
+            &locals,
+            body.node,
+            body.source_order,
+        );
+        ConstraintSet::from_node(body.builder, node, source_order)
+    }
+
     fn create_constraint_set_with_bounds<'db, 'c>(
         db: &'db TestDb,
         env: &ProgramEnvironment<'db>,
@@ -5841,6 +5857,31 @@ mod tests {
                 .iff(db, &builder, condition)
                 .is_always_satisfied(db, &env)
         );
+
+        let builder = ConstraintSetBuilder::new();
+        let with_free_lower = ConstraintSet::constrain_typevar_upper_bound(
+            db,
+            &env,
+            &builder,
+            right,
+            Type::TypeVar(left),
+        )
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_lower_bound(
+                db,
+                &env,
+                &builder,
+                right,
+                Type::TypeVar(free),
+            )
+        })
+        .reduce_inferable(
+            db,
+            &env,
+            &builder,
+            TypeVarSet::from_typevars(db, [left, right]),
+        );
+        assert_eq!(with_free_lower.node, ALWAYS_TRUE);
 
         // Logical endpoints remain subject to each local's full finite domain.
         let left = left.map_bound_or_constraints(db, |_| {
@@ -6193,10 +6234,9 @@ mod tests {
         let builder = ConstraintSetBuilder::new();
         let local = create_typevar(db, "Local");
         let locals = TypeVarSet::from_typevars(db, [local]);
-        let strings = create_constraint(db, &builder, local, KnownClass::Str)
-            .reduce_inferable(db, &env, &builder, locals);
-        let bytes = create_constraint(db, &builder, local, KnownClass::Bytes)
-            .reduce_inferable(db, &env, &builder, locals);
+        let quantify = |body| quantify_constraint(db, body, locals);
+        let strings = quantify(create_constraint(db, &builder, local, KnownClass::Str));
+        let bytes = quantify(create_constraint(db, &builder, local, KnownClass::Bytes));
         let independent = strings.and(db, &builder, || bytes);
         assert!(independent.is_always_satisfied(db, &env));
         assert!(!independent.is_never_satisfied(db, &env));
@@ -6205,19 +6245,17 @@ mod tests {
             Ok(Solutions::Unconstrained),
         );
 
-        let shared = create_constraint(db, &builder, local, KnownClass::Str)
-            .and(db, &builder, || {
-                create_constraint(db, &builder, local, KnownClass::Bytes)
-            })
-            .reduce_inferable(db, &env, &builder, locals);
+        let shared = quantify(create_constraint(db, &builder, local, KnownClass::Str).and(
+            db,
+            &builder,
+            || create_constraint(db, &builder, local, KnownClass::Bytes),
+        ));
         assert!(shared.is_never_satisfied(db, &env));
 
         // The outer binder owns the original occurrence; the inner binder retains its own.
-        let nested = strings
-            .and(db, &builder, || {
-                create_constraint(db, &builder, local, KnownClass::Bytes)
-            })
-            .reduce_inferable(db, &env, &builder, locals);
+        let nested = quantify(strings.and(db, &builder, || {
+            create_constraint(db, &builder, local, KnownClass::Bytes)
+        }));
         assert!(nested.is_always_satisfied(db, &env));
         assert!(!nested.is_never_satisfied(db, &env));
     }
@@ -6231,14 +6269,17 @@ mod tests {
         let local = create_typevar(db, "Local");
         let free = create_typevar(db, "Free");
         let locals = TypeVarSet::from_typevars(db, [local]);
-        let original = ConstraintSet::constrain_typevar_equivalence_bound(
+        let original = quantify_constraint(
             db,
-            &env,
-            &builder,
-            local,
-            Type::TypeVar(free),
-        )
-        .reduce_inferable(db, &env, &builder, locals);
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                local,
+                Type::TypeVar(free),
+            ),
+            locals,
+        );
         let mapped = |class: KnownClass| {
             original.apply_type_mapping_impl(
                 db,
@@ -6287,17 +6328,20 @@ mod tests {
         let peer = peer.as_typevar().unwrap();
         let locals = TypeVarSet::from_typevars(db, [local, peer]);
         let mut owned = ConstraintSetBuilder::new().into_owned(|builder| {
-            ConstraintSet::constrain_typevar_equivalence_bound(
+            quantify_constraint(
                 db,
-                &env,
-                builder,
-                local,
-                Type::TypeVar(free),
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db,
+                    &env,
+                    builder,
+                    local,
+                    Type::TypeVar(free),
+                )
+                .and(db, builder, || {
+                    create_constraint(db, builder, peer, KnownClass::Bytes)
+                }),
+                locals,
             )
-            .and(db, builder, || {
-                create_constraint(db, builder, peer, KnownClass::Bytes)
-            })
-            .reduce_inferable(db, &env, builder, locals)
         });
         owned = ConstraintSetBuilder::new().into_owned(|builder| builder.load(db, &env, &owned));
         for _ in 0..64 {
@@ -6352,8 +6396,6 @@ mod tests {
         let kwargs = paramspec.with_paramspec_attr(db, ParamSpecAttrKind::Kwargs);
         let builder = ConstraintSetBuilder::new();
         let string = KnownClass::Str.to_instance(db, &env);
-        // Keep a caller occurrence so this scope exercises component ownership instead
-        // of being normalized to a terminal truth.
         let free = create_typevar(db, "Free");
         let positional = Type::homogeneous_tuple(db, &env, Type::TypeVar(free));
         let keywords = KnownClass::Dict.to_specialized_instance(db, &env, &[string, string]);
@@ -6363,11 +6405,19 @@ mod tests {
         .and(db, &builder, || {
             ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, kwargs, keywords)
         });
-        let scoped = body.reduce_inferable(
+        // Reduction expands a base ParamSpec to both components, even if the result
+        // simplifies to a terminal. Inspect identity ownership on the unsimplified scope.
+        let reduced = body.reduce_inferable(
             db,
             &env,
             &builder,
             TypeVarSet::from_typevars(db, [paramspec]),
+        );
+        assert!(reduced.is_always_satisfied(db, &env));
+        let scoped = quantify_constraint(
+            db,
+            body,
+            TypeVarSet::from_typevars(db, [paramspec, args, kwargs]),
         );
         assert!(scoped.is_always_satisfied(db, &env));
         assert!(!scoped.is_never_satisfied(db, &env));
