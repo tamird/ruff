@@ -450,10 +450,10 @@ impl DynamicContent {
 }
 
 #[derive(Clone, Copy)]
-enum DynamicContentMode {
+pub(super) enum DynamicContentMode {
     All,
     NonAny,
-    /// Require enough information to prove that materialization preserves type requirements.
+    /// Inspect type requirements affected by materialization.
     Materialization,
 }
 
@@ -464,19 +464,6 @@ pub(super) fn dynamic_content<'db>(
     ty: Type<'db>,
 ) -> DynamicContent {
     dynamic_content_impl(db, env, ty, DynamicContentMode::All)
-}
-
-/// Whether both materializations preserve the requirements described by `ty`.
-///
-/// Unlike ordinary static-content checks, this proof cannot ignore lazy function signatures or
-/// the wrapped callable of a partial. It does not compare metadata such as parameter-default types,
-/// which do not affect whether one callable satisfies another's requirements.
-pub(super) fn materialization_is_noop<'db>(
-    db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
-    ty: Type<'db>,
-) -> bool {
-    dynamic_content_impl(db, env, ty, DynamicContentMode::Materialization).is_absent()
 }
 
 /// Determine whether `ty` contains a dynamic type other than `Any`.
@@ -503,7 +490,7 @@ pub(super) fn non_any_dynamic_content<'db>(
     dynamic_content_impl(db, env, ty, DynamicContentMode::NonAny)
 }
 
-fn dynamic_content_impl<'db>(
+pub(super) fn dynamic_content_impl<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
@@ -647,11 +634,12 @@ fn dynamic_content_impl<'db>(
             protocol: ProtocolInstanceType<'db>,
         ) {
             let protocol_ty = Type::ProtocolInstance(protocol);
-            let Some(class) = protocol.class_origin(db) else {
-                walk_protocol_instance_interface(db, protocol.interface(db), protocol_ty, self);
-                return;
-            };
-            let Some((origin, specialization)) = class.static_class_literal(db) else {
+            let Some((origin, specialization)) = protocol
+                .class_origin(db)
+                .and_then(|class| class.static_class_literal(db))
+            else {
+                // The synthesized interface is immutable. A changed member produces a different
+                // protocol type; lazy types inside its members are still inspected here.
                 walk_protocol_instance_interface(db, protocol.interface(db), protocol_ty, self);
                 return;
             };
@@ -677,11 +665,12 @@ fn dynamic_content_impl<'db>(
         }
 
         fn visit_typed_dict_type(&self, db: &'db dyn Db, typed_dict: TypedDictType<'db>) {
-            let Some(class) = typed_dict.defining_class() else {
-                walk_typed_dict_type(db, typed_dict, self);
-                return;
-            };
-            let Some((origin, _)) = class.static_class_literal(db) else {
+            let Some((origin, _)) = typed_dict
+                .defining_class()
+                .and_then(|class| class.static_class_literal(db))
+            else {
+                // Synthesized schemas and inline functional TypedDict schemas are immutable
+                // snapshots; definition-backed schemas re-read their tracked field queries.
                 walk_typed_dict_type(db, typed_dict, self);
                 return;
             };
@@ -1075,7 +1064,7 @@ mod tests {
     use crate::place::global_symbol;
     use crate::types::{DynamicType, KnownClass, Parameter, Parameters, SpecialFormType, Type};
 
-    use super::{CollectedTypes, dynamic_content, materialization_is_noop};
+    use super::{CollectedTypes, DynamicContentMode, dynamic_content, dynamic_content_impl};
 
     #[test]
     fn fully_static_paramspec_value_has_no_dynamic_content() {
@@ -1129,7 +1118,12 @@ mod tests {
         ] {
             let ty = global_symbol(&db, module, name).place.expect_type();
             assert_eq!(ty.is_fully_static(&db, &env), expected, "{name}");
-            assert_eq!(materialization_is_noop(&db, &env, ty), expected, "{name}");
+            assert_eq!(
+                dynamic_content_impl(&db, &env, ty, DynamicContentMode::Materialization)
+                    .is_absent(),
+                expected,
+                "{name}"
+            );
         }
         Ok(())
     }
@@ -1151,14 +1145,20 @@ mod tests {
                 @property
                 def callback(self) -> TypeOf[gradual_callback]: ...
 
+            class VariadicSetter(Protocol):
+                @property
+                def value(self) -> int: ...
+                @value.setter
+                def value(self, *values: Any) -> None: ...
+
             class Recursive[T](Protocol):
                 @property
                 def value(self) -> T: ...
                 @property
                 def child(self) -> Recursive[T]: ...
 
-            plain: Recursive[int]
             callbacks: Recursive[Callbacks]
+            variadic_setter: VariadicSetter
             partial_callback = partial(gradual_callback, 0)
             partial_call = partial_callback.__call__
             "#,
@@ -1166,14 +1166,18 @@ mod tests {
         let env = db.program_environment();
         let file = system_path_to_file(&db, "/src/a.py")?;
         let module = ProgramFile::new(&db, file, env.program(&db));
-        for (name, expected) in [
-            ("plain", true),
-            ("callbacks", false),
-            ("partial_callback", false),
-            ("partial_call", false),
+        for name in [
+            "callbacks",
+            "variadic_setter",
+            "partial_callback",
+            "partial_call",
         ] {
             let ty = global_symbol(&db, module, name).place.expect_type();
-            assert_eq!(materialization_is_noop(&db, &env, ty), expected, "{name}");
+            assert!(
+                !dynamic_content_impl(&db, &env, ty, DynamicContentMode::Materialization)
+                    .is_absent(),
+                "{name}"
+            );
         }
         Ok(())
     }
@@ -1189,7 +1193,10 @@ mod tests {
             divergent.top_materialization(&db, &env),
             divergent.bottom_materialization(&db, &env),
         ] {
-            assert!(!materialization_is_noop(&db, &env, ty));
+            assert!(
+                !dynamic_content_impl(&db, &env, ty, DynamicContentMode::Materialization)
+                    .is_absent()
+            );
         }
         let list = KnownClass::List.to_specialized_instance(&db, &env, &[divergent]);
         for ty in [
@@ -1197,7 +1204,10 @@ mod tests {
             list.bottom_materialization(&db, &env),
         ] {
             assert!(!ty.is_fully_static(&db, &env));
-            assert!(!materialization_is_noop(&db, &env, ty));
+            assert!(
+                !dynamic_content_impl(&db, &env, ty, DynamicContentMode::Materialization)
+                    .is_absent()
+            );
         }
     }
 
