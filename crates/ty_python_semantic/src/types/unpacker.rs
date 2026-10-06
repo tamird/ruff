@@ -11,6 +11,7 @@ use ruff_python_ast::{self as ast, AnyNodeRef};
 use ruff_text_size::Ranged;
 
 use crate::Db;
+use crate::types::dict::dict_literal_key_value_types;
 use crate::types::infer::{ExpressionInference, FrozenMap};
 use crate::types::iteration::refine_dict_snapshot_element_type;
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
@@ -138,32 +139,41 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             }
             UnpackKind::Iterable { mode } => {
                 let env = self.context.program_environment();
-                match value_type.try_iterate_with_mode(db, env, mode) {
-                    Ok(tuple) => {
-                        let element = tuple.homogeneous_element_type(db, env);
-                        refine_dict_snapshot_element_type(
-                            db,
-                            env,
-                            value.expression().scope(db),
-                            value_expr,
-                            element,
-                            mode,
-                            |expression| Some(value_inference.expression_type(expression)),
-                        )
-                        .unwrap_or(element)
-                    }
-                    Err(err) => {
-                        // Recovery can yield a complete tuple even when iteration failed.
-                        // It cannot establish a relationship between the unpacked targets.
-                        if filter.is_some() {
-                            return Err(UnpackFilterError::Unsupported);
+                if !mode.is_async()
+                    && let ast::Expr::Dict(dict) = value_expr
+                    && let Some((keys, _)) = dict_literal_key_value_types(db, env, dict, |expr| {
+                        value_inference.expression_type(expr)
+                    })
+                {
+                    keys
+                } else {
+                    match value_type.try_iterate_with_mode(db, env, mode) {
+                        Ok(tuple) => {
+                            let element = tuple.homogeneous_element_type(db, env);
+                            refine_dict_snapshot_element_type(
+                                db,
+                                env,
+                                value.expression().scope(db),
+                                value_expr,
+                                element,
+                                mode,
+                                |expression| Some(value_inference.expression_type(expression)),
+                            )
+                            .unwrap_or(element)
                         }
-                        err.report_diagnostic(
-                            &self.context,
-                            value_type,
-                            value.as_any_node_ref(self.db(), self.module()),
-                        );
-                        err.fallback_element_type(db, env)
+                        Err(err) => {
+                            // Recovery can yield a complete tuple even when iteration failed.
+                            // It cannot establish a relationship between the unpacked targets.
+                            if filter.is_some() {
+                                return Err(UnpackFilterError::Unsupported);
+                            }
+                            err.report_diagnostic(
+                                &self.context,
+                                value_type,
+                                value.as_any_node_ref(self.db(), self.module()),
+                            );
+                            err.fallback_element_type(db, env)
+                        }
                     }
                 }
             }

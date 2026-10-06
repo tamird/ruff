@@ -34,7 +34,7 @@ use super::{
     InferenceRegion, OtherDefinitionInferenceExtra, ScopeInference, ScopeInferenceExtra,
     extend_collection_use_constraints, infer_deferred_types, infer_definition_types,
     infer_definition_with_body_domain, infer_expression_types, infer_expression_with_body_domain,
-    infer_same_file_expression_type, infer_statement_with_body_domain, infer_unpack_types,
+    infer_statement_with_body_domain, infer_unpack_types,
 };
 use crate::diagnostic::format_enumeration;
 use crate::place::{
@@ -95,6 +95,7 @@ use crate::types::diagnostic::{
     report_unsound_assignment, report_unsound_yield, report_unsupported_augmented_assignment,
     report_unsupported_comparison,
 };
+use crate::types::dict::dict_literal_key_value_types;
 use crate::types::enums::{enum_ignored_names, is_enum_class_by_inheritance};
 use crate::types::function::{
     FunctionDecorators, FunctionType, KnownFunction, OverloadLiteral, report_revealed_type,
@@ -5312,13 +5313,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_definition(node);
     }
 
-    fn fixed_length_iterable_element_type(
+    fn precise_iterable_element_type(
         &self,
         iterable: &ast::Expr,
         expression_type: impl FnMut(&ast::Expr) -> Type<'db>,
     ) -> Option<Type<'db>> {
         let db = self.db();
         let env = self.program_environment();
+        if let ast::Expr::Dict(dict) = iterable {
+            return dict_literal_key_value_types(db, env, dict, expression_type)
+                .map(|(keys, _)| keys);
+        }
         let element_types =
             extract_fixed_length_iterable_element_types(db, env, iterable, expression_type)?;
 
@@ -5371,7 +5376,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let iterable_type = builder.infer_standalone_expression(iter, tcx);
             if !*is_async
                 && let Some(element_type) = builder
-                    .fixed_length_iterable_element_type(iter, |expr| builder.expression_type(expr))
+                    .precise_iterable_element_type(iter, |expr| builder.expression_type(expr))
             {
                 element_type
             } else {
@@ -5421,9 +5426,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 if !for_stmt.is_async()
                     && let Some(element_type) = self
-                        .fixed_length_iterable_element_type(iterable, |expr| {
-                            self.expression_type(expr)
-                        })
+                        .precise_iterable_element_type(iterable, |expr| self.expression_type(expr))
                 {
                     element_type
                 } else {
@@ -9159,25 +9162,40 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             target,
             iter,
             ifs,
-            is_async: _,
+            is_async,
         } = comprehension;
 
         self.infer_target(target, iter, &|builder, tcx| {
             // TODO: `infer_comprehension_definition` reports a diagnostic if `iter_ty` isn't iterable
             //  but only if the target is a name. We should report a diagnostic here if the target isn't a name:
             //  `[... for a.x in not_iterable]
-            let iterable_type = if is_first {
-                infer_same_file_expression_type(builder.db(), builder.index.expression(iter), tcx)
+            let (iterable_type, element_type) = if is_first {
+                let result =
+                    infer_expression_types(builder.db(), builder.index.expression(iter), tcx);
+                (
+                    result.expression_type(iter),
+                    builder
+                        .precise_iterable_element_type(iter, |expr| result.expression_type(expr)),
+                )
             } else {
-                builder.infer_maybe_standalone_expression(iter, tcx)
+                let iterable_type = builder.infer_maybe_standalone_expression(iter, tcx);
+                (
+                    iterable_type,
+                    builder
+                        .precise_iterable_element_type(iter, |expr| builder.expression_type(expr)),
+                )
             };
-            // Preserve this path's existing synchronous result inference for async targets.
-            iterable_type
-                .try_iterate_with_mode(db, env, EvaluationMode::Sync)
-                .unwrap_or_else(|error| {
-                    Cow::Owned(TupleSpec::homogeneous(error.fallback_element_type(db, env)))
-                })
-                .homogeneous_element_type(db, env)
+            if !*is_async && let Some(element_type) = element_type {
+                element_type
+            } else {
+                // Preserve this path's existing synchronous result inference for async targets.
+                iterable_type
+                    .try_iterate_with_mode(db, env, EvaluationMode::Sync)
+                    .unwrap_or_else(|error| {
+                        Cow::Owned(TupleSpec::homogeneous(error.fallback_element_type(db, env)))
+                    })
+                    .homogeneous_element_type(db, env)
+            }
         });
 
         for expr in ifs {
@@ -9207,9 +9225,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let element_type = if comprehension.is_async() {
                 None
             } else {
-                self.fixed_length_iterable_element_type(iterable, |expr| {
-                    result.expression_type(expr)
-                })
+                self.precise_iterable_element_type(iterable, |expr| result.expression_type(expr))
             };
 
             // Two things are different if it's the first comprehension:
@@ -9968,7 +9984,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn infer_call_expression_impl(
         &mut self,
         call_expression: &ast::ExprCall,
-        callable_type: Type<'db>,
+        mut callable_type: Type<'db>,
         call_expression_tcx: TypeContext<'db>,
     ) -> Type<'db> {
         fn report_missing_implicit_constructor_call<'db>(
@@ -10020,6 +10036,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             func,
             arguments,
         } = call_expression;
+
+        // A saved bound method exposes its mutable receiver through `__self__`. Preserve literal
+        // elements only when the view method is called directly on the dictionary literal.
+        if let ast::Expr::Attribute(attribute) = func.as_ref()
+            && matches!(attribute.attr.as_str(), "keys" | "values" | "items")
+            && let ast::Expr::Dict(dict) = attribute.value.as_ref()
+            && let Some((keys, values)) =
+                dict_literal_key_value_types(db, env, dict, |expr| self.expression_type(expr))
+        {
+            let receiver = KnownClass::Dict.to_specialized_instance(db, env, &[keys, values]);
+            callable_type = receiver
+                .member(db, env, attribute.attr.as_str())
+                .place
+                .ignore_possibly_undefined()
+                .unwrap_or(callable_type);
+        }
 
         // Empty builtin constructors share literal inference for contextual element types and
         // indexed future uses. Semantic indexing only tracks bare constructor names, so confirm

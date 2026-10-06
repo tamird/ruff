@@ -151,6 +151,7 @@ mod context_manager;
 mod cyclic;
 mod dedicated;
 mod diagnostic;
+mod dict;
 pub(crate) mod dictionary;
 pub use dictionary::{
     DictionaryExtraItems, DictionaryFirstEntry, DictionaryItem, DictionaryItemKind, DictionaryItems,
