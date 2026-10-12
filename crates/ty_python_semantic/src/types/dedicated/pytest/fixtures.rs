@@ -3236,7 +3236,7 @@ def test_use(core_value): ...
 "#,
             )],
             r#"
-def plugins():
+def plugins() -> tuple[str, ...]:
     return ("baseplugin",)
 
 default_plugins = plugins()
