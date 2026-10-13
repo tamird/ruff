@@ -1,7 +1,7 @@
 use crate::provided::ProvidedReturnType;
 use crate::{
     Db, DisplaySettings, FxIndexMap, ProgramEnvironment,
-    reachability::ReachabilityConstraintsExtension,
+    reachability::is_end_of_scope_reachable_in_domain,
     types::{
         CallableType, CheckedCall, ClassBase, ClassLiteral, ClassType, DynamicType,
         IntersectionBuilder, KnownClass, KnownInstanceType, NarrowingConstraint, ParamSpecAttrKind,
@@ -57,7 +57,7 @@ use ruff_diagnostics::{Edit, Fix};
 use ruff_python_edits::unwrapped_call_argument;
 use ty_module_resolver::{ImportingFile, ModuleName, resolve_module};
 use ty_python_core::{
-    Truthiness, UseDefMap,
+    Truthiness,
     definition::{Definition, DefinitionKind},
     place::PlaceExpr,
     place_table,
@@ -376,32 +376,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     pub(super) fn infer_function_body(&mut self, function: &ast::StmtFunctionDef) {
-        fn can_implicitly_return_none<'db>(
-            db: &'db dyn Db,
-            use_def: &UseDefMap<'db>,
-            domain: Option<crate::types::infer::FunctionBodyDomain<'db>>,
-        ) -> bool {
-            !domain
-                .map_or_else(
-                    || {
-                        use_def.reachability_constraints().evaluate(
-                            db,
-                            use_def.predicates(),
-                            use_def.end_of_scope_reachability(),
-                        )
-                    },
-                    |domain| {
-                        crate::reachability::evaluate_reachability_in_domain(
-                            db,
-                            domain.scope(db),
-                            use_def.end_of_scope_reachability(),
-                            Some(domain),
-                        )
-                    },
-                )
-                .is_always_false()
-        }
-
         let env = self.program_environment();
         let db = self.db();
 
@@ -580,13 +554,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         }
                     }
 
-                    let use_def = self.index.use_def_map(scope_id);
-
-                    let implicit_none =
-                        can_implicitly_return_none(db, use_def, self.context.body_domain);
-
-                    if implicit_none
-                        && !Type::none(db, env).is_assignable_to(db, env, expected_return_ty)
+                    if is_end_of_scope_reachable_in_domain(
+                        db,
+                        self.scope(),
+                        self.context.body_domain,
+                    ) && !Type::none(db, env).is_assignable_to(db, env, expected_return_ty)
                     {
                         let no_return = self.return_types_and_ranges.is_empty();
                         report_implicit_return_type(
@@ -663,10 +635,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             }
 
-            let use_def = self.index.use_def_map(scope_id);
-            let implicit_none = can_implicitly_return_none(db, use_def, self.context.body_domain);
-
-            if implicit_none && !Type::none(db, env).is_assignable_to(db, env, expected_ty) {
+            if is_end_of_scope_reachable_in_domain(db, self.scope(), self.context.body_domain)
+                && !Type::none(db, env).is_assignable_to(db, env, expected_ty)
+            {
                 let no_return = self.return_types_and_ranges.is_empty();
                 report_implicit_return_type(
                     &self.context,

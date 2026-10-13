@@ -2439,6 +2439,32 @@ pub(crate) fn is_range_reachable_in_domain<'db>(
     })
 }
 
+/// Returns whether control flow can reach the end of `scope`.
+///
+/// This can be used to check if a function can implicitly return `None`.
+pub(crate) fn is_end_of_scope_reachable<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> bool {
+    let use_def = use_def_map(db, scope);
+    is_reachable(db, use_def, use_def.end_of_scope_reachability())
+}
+
+pub(crate) fn is_end_of_scope_reachable_in_domain<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> bool {
+    let Some(domain) = domain else {
+        return is_end_of_scope_reachable(db, scope);
+    };
+    let use_def = use_def_map(db, scope);
+    evaluate_reachability_in_domain(
+        db,
+        domain.scope(db),
+        use_def.end_of_scope_reachability(),
+        Some(domain),
+    )
+    .may_be_true()
+}
+
 pub(crate) fn is_reachable<'db>(
     db: &'db dyn Db,
     use_def: &UseDefMap<'db>,
