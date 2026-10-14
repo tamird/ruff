@@ -8,7 +8,9 @@ use ruff_db::files::FileRange;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex};
+use ruff_text_size::TextRange;
 use ty_python_core::ProgramFile;
+use ty_python_core::definition::Definition;
 use ty_python_core::semantic_index;
 
 use crate::Db;
@@ -227,6 +229,36 @@ impl<'db> ProvidedClass<'db> {
 pub enum BuiltinUsage {
     Runtime,
     Annotation,
+}
+
+/// A resolved type application in the current annotation inference pass.
+pub struct ProvidedTypeApplication<'a, 'db> {
+    pub expression: &'a ast::ExprSubscript,
+    pub value_type: Type<'db>,
+    pub definition: Option<Definition<'db>>,
+}
+
+/// Ordinary inference of children of an application-defined type expression.
+///
+/// Child expressions must belong to the supplied application. Inference preserves the
+/// current lexical scope, type parameters, deferred annotation state, and IDE expression types.
+pub trait TypeExpressionContext<'db> {
+    fn program_file(&self) -> ProgramFile<'db>;
+
+    /// Infers a type expression, rejecting declaration qualifiers such as `Final`.
+    fn infer_type_expression(&mut self, expression: &ast::Expr) -> Type<'db>;
+
+    /// Infers a declaration annotation, retaining qualifiers for the application to validate.
+    fn infer_annotation_expression(
+        &mut self,
+        expression: &ast::Expr,
+    ) -> (Type<'db>, TypeQualifiers);
+
+    /// Records the type of application-owned syntax that does not use ordinary child inference.
+    fn store_expression_type(&mut self, expression: &ast::Expr, ty: Type<'db>);
+
+    /// Reports an invalid type form using the current diagnostic rules and suppressions.
+    fn report_invalid_type_form(&mut self, range: TextRange, message: &str);
 }
 
 /// The source of an application-supplied binding or builtin.

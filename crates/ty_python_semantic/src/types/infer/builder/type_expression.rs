@@ -11,6 +11,7 @@ use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange};
 
 use super::{DeferredExpressionState, TypeInferenceBuilder};
+use crate::provided::{ProvidedTypeApplication, TypeExpressionContext};
 use crate::types::call::CallArguments;
 use crate::types::definition_resolution::{ImportAliasResolution, resolve_definition};
 use crate::types::diagnostic::{
@@ -36,10 +37,38 @@ use crate::types::{
     BindingContext, CallableType, DynamicType, GenericContext, IntersectionBuilder,
     IntersectionType, InvalidTypeExpression, KnownClass, KnownInstanceType, LintDiagnosticGuard,
     Parameter, Parameters, SpecialFormType, SubclassOfType, Type, TypeContext, TypeFormType,
-    TypeGuardType, TypeIsType, TypeMapping, TypeVarKind, UnionBuilder, UnionType, any_over_type,
-    binding_type, todo_type,
+    TypeGuardType, TypeIsType, TypeMapping, TypeQualifiers, TypeVarKind, UnionBuilder, UnionType,
+    any_over_type, binding_type, todo_type,
 };
 use crate::{FxOrderSet, SemanticModel, add_inferred_python_version_hint_to_diagnostic};
+
+impl<'db> TypeExpressionContext<'db> for TypeInferenceBuilder<'db, '_> {
+    fn program_file(&self) -> ty_python_core::ProgramFile<'db> {
+        self.program_file()
+    }
+
+    fn infer_type_expression(&mut self, expression: &ast::Expr) -> Type<'db> {
+        self.infer_type_expression(expression)
+    }
+
+    fn infer_annotation_expression(
+        &mut self,
+        expression: &ast::Expr,
+    ) -> (Type<'db>, TypeQualifiers) {
+        let annotation = self.infer_annotation_expression(expression, self.deferred_state);
+        (annotation.inner_type(), annotation.qualifiers())
+    }
+
+    fn report_invalid_type_form(&mut self, range: TextRange, message: &str) {
+        if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, range) {
+            builder.into_diagnostic(message);
+        }
+    }
+
+    fn store_expression_type(&mut self, expression: &ast::Expr, ty: Type<'db>) {
+        self.store_expression_type(expression, ty);
+    }
+}
 
 /// Type expressions
 impl<'db> TypeInferenceBuilder<'db, '_> {
@@ -1319,6 +1348,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         value_ty: Type<'db>,
         definition: Option<Definition<'db>>,
     ) -> Type<'db> {
+        let application = ProvidedTypeApplication {
+            expression: subscript,
+            value_type: value_ty,
+            definition,
+        };
+        if let Some(ty) = self.db().provided_type_application(application, self) {
+            return ty;
+        }
         if let Some((alias, Some(parameters))) =
             self.recursive_implicit_alias_reference(value_ty, definition)
         {

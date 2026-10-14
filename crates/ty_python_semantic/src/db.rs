@@ -2,6 +2,7 @@ use crate::dependency::DependencyMetadata;
 use crate::lint::{LintRegistry, RuleSelection};
 use crate::provided::{
     BuiltinUsage, ProvidedBindingResolution, ProvidedBindingValue, ProvidedCallResult,
+    ProvidedTypeApplication, TypeExpressionContext,
 };
 use crate::types::CheckedCall;
 use crate::{AnalysisSettings, PythonVersionWithSource};
@@ -58,6 +59,20 @@ pub trait Db: PythonCoreDb {
     fn provided_parameter_type<'db>(
         &'db self,
         _definition: Definition<'db>,
+    ) -> Option<crate::types::Type<'db>> {
+        None
+    }
+
+    /// Interprets an application-defined type subscription after resolving its constructor.
+    ///
+    /// Implementations must identify the resolved declaration and infer child annotations
+    /// through `context`. Returning `None` preserves ordinary specialization and must not
+    /// infer children or report diagnostics. Implementations must read tracked inputs and
+    /// must not request completed inference of the scope currently being inferred.
+    fn provided_type_application<'db>(
+        &'db self,
+        _application: ProvidedTypeApplication<'_, 'db>,
+        _context: &mut dyn TypeExpressionContext<'db>,
     ) -> Option<crate::types::Type<'db>> {
         None
     }
@@ -233,6 +248,11 @@ pub(crate) mod tests {
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
     type CallResultProvider =
         for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> crate::provided::ProvidedCallResult<'db>;
+    type TypeApplicationProvider = for<'db> fn(
+        &'db TestDb,
+        ProvidedTypeApplication<'_, 'db>,
+        &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<crate::types::Type<'db>>;
     type DeclarationPredicate = for<'db> fn(&'db TestDb, Definition<'db>) -> bool;
     type TypeTestProvider = for<'db> fn(
         &'db TestDb,
@@ -255,6 +275,7 @@ pub(crate) mod tests {
         open_files: rustc_hash::FxHashSet<File>,
         program_settings: ProgramSettings,
         call_result_provider: Option<CallResultProvider>,
+        type_application_provider: Option<TypeApplicationProvider>,
         type_test_provider: Option<TypeTestProvider>,
         getattr_presence_provider: Option<DeclarationPredicate>,
         keyword_field_factory: Option<DeclarationPredicate>,
@@ -284,6 +305,7 @@ pub(crate) mod tests {
                 open_files: rustc_hash::FxHashSet::default(),
                 program_settings,
                 call_result_provider: None,
+                type_application_provider: None,
                 type_test_provider: None,
                 getattr_presence_provider: None,
                 keyword_field_factory: None,
@@ -430,6 +452,15 @@ pub(crate) mod tests {
                 })
         }
 
+        fn provided_type_application<'db>(
+            &'db self,
+            application: ProvidedTypeApplication<'_, 'db>,
+            context: &mut dyn TypeExpressionContext<'db>,
+        ) -> Option<crate::types::Type<'db>> {
+            self.type_application_provider
+                .and_then(|provider| provider(self, application, context))
+        }
+
         fn provided_keyword_field_factory(&self, definition: Definition<'_>) -> bool {
             self.keyword_field_factory
                 .is_some_and(|provider| provider(self, definition))
@@ -527,6 +558,7 @@ pub(crate) mod tests {
         rule_selection: Option<RuleSelection>,
         lint_registry: Option<LintRegistry>,
         call_result_provider: Option<CallResultProvider>,
+        type_application_provider: Option<TypeApplicationProvider>,
         type_test_provider: Option<TypeTestProvider>,
         getattr_presence_provider: Option<DeclarationPredicate>,
         keyword_field_factory: Option<DeclarationPredicate>,
@@ -545,6 +577,7 @@ pub(crate) mod tests {
                 rule_selection: None,
                 lint_registry: None,
                 call_result_provider: None,
+                type_application_provider: None,
                 type_test_provider: None,
                 getattr_presence_provider: None,
                 keyword_field_factory: None,
@@ -595,6 +628,14 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_type_application_provider(
+            mut self,
+            provider: TypeApplicationProvider,
+        ) -> Self {
+            self.type_application_provider = Some(provider);
+            self
+        }
+
         pub(crate) fn with_keyword_field_factory(mut self, provider: DeclarationPredicate) -> Self {
             self.keyword_field_factory = Some(provider);
             self
@@ -634,6 +675,7 @@ pub(crate) mod tests {
         pub(crate) fn build(self) -> anyhow::Result<TestDb> {
             let mut db = TestDb::new(self.vendored);
             db.call_result_provider = self.call_result_provider;
+            db.type_application_provider = self.type_application_provider;
             db.type_test_provider = self.type_test_provider;
             db.getattr_presence_provider = self.getattr_presence_provider;
             db.keyword_field_factory = self.keyword_field_factory;

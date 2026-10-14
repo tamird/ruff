@@ -962,7 +962,7 @@ impl<'db> IntersectionType<'db> {
     ///
     /// For performance reasons, consider using [`IntersectionType::from_two_elements`] if
     /// the intersection is constructed from exactly two elements.
-    pub(crate) fn from_elements<I, T>(
+    pub fn from_elements<I, T>(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         elements: I,
@@ -1012,7 +1012,7 @@ impl<'db> IntersectionType<'db> {
     }
 
     /// Create an intersection type `A & B` from two elements `A` and `B`.
-    pub(crate) fn from_two_elements(
+    pub fn from_two_elements(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         a: Type<'db>,

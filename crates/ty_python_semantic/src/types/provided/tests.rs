@@ -16,8 +16,122 @@ use crate::types::ide_support::{
 use crate::types::{
     CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryFirstEntry, DictionaryItem,
     DictionaryItemKind, DictionaryItems, KnownClass, Parameter, Parameters, Signature,
+    TypedDictFieldBuilder, TypedDictOpenness, TypedDictType,
 };
 use crate::{HasType, SemanticModel};
+
+#[test]
+fn supplied_type_applications_use_annotation_inference() -> anyhow::Result<()> {
+    fn application<'db>(
+        db: &'db TestDb,
+        application: ProvidedTypeApplication<'_, 'db>,
+        context: &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<Type<'db>> {
+        let ProvidedTypeApplication {
+            expression,
+            value_type,
+            definition: _,
+        } = application;
+        let Type::ClassLiteral(ClassLiteral::Static(class)) = value_type else {
+            return None;
+        };
+        if class.name(db) != "Field"
+            || class
+                .program_file(db)
+                .file(db)
+                .path(db)
+                .as_system_path()?
+                .as_str()
+                != "/src/schema.pyi"
+        {
+            return None;
+        }
+        let (ty, qualifiers) = context.infer_annotation_expression(&expression.slice);
+        let allowed =
+            TypeQualifiers::REQUIRED | TypeQualifiers::NOT_REQUIRED | TypeQualifiers::READ_ONLY;
+        if !allowed.contains(qualifiers) {
+            context.report_invalid_type_form(expression.slice.range(), "Invalid field qualifier");
+        }
+        let field = TypedDictFieldBuilder::new(ty)
+            .required(!qualifiers.contains(TypeQualifiers::NOT_REQUIRED))
+            .read_only(qualifiers.contains(TypeQualifiers::READ_ONLY))
+            .build();
+        Some(Type::TypedDict(
+            TypedDictType::from_schema_items_with_openness(
+                db,
+                [(Name::new_static("value"), field)].into_iter().collect(),
+                TypedDictOpenness::Closed,
+            ),
+        ))
+    }
+
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_type_application_provider(application)
+        .with_file("/src/schema.pyi", "class Field[T]: ...\n")
+        .with_file(
+            "/src/main.py",
+            r#"
+from schema import Field as Alias
+from typing import Final
+from typing_extensions import NotRequired, ReadOnly
+
+valid: Alias[int] = {"value": 1}
+optional: Alias[NotRequired[int]] = {}
+readonly: Alias[ReadOnly[int]] = {"value": 1}
+nested: list[Alias[str]] = [{"value": "ok"}]
+def forward(value: "Alias[Later]") -> "Alias[Later]":
+    return value
+
+class Later: ...
+
+def generic[T](value: T) -> Alias[T]:
+    return {"value": value}
+
+def shadow() -> None:
+    class Alias[T]: ...
+    shadowed: Alias[int] = Alias()
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    db.write_file(
+        "/src/main.py",
+        r#"
+from schema import Field
+from typing import Final
+from typing_extensions import ReadOnly
+
+wrong: Field[int] = {"value": "bad"}
+missing: Field[int] = {}
+extra: Field[int] = {"value": 1, "extra": 2}
+readonly: Field[ReadOnly[int]] = {"value": 1}
+readonly["value"] = 2
+invalid: Field[Final[int]] = {"value": 1}
+ordinary: list[int] = ["bad"]
+"#,
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-argument-type",
+            "missing-typed-dict-key",
+            "invalid-key",
+            "invalid-assignment",
+            "invalid-type-form",
+            "invalid-assignment"
+        ],
+        "{diagnostics:#?}",
+    );
+    Ok(())
+}
 
 struct AllocationSource;
 

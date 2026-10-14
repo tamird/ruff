@@ -81,7 +81,7 @@ impl<'db> TypedDictOpenness<'db> {
     /// class ByExtraItems(TypedDict, extra_items=Never): ...
     /// class ByClosed(TypedDict, closed=True): ...
     /// ```
-    pub(crate) fn extra(db: &'db dyn Db, declared_ty: Type<'db>, is_read_only: bool) -> Self {
+    pub fn extra(db: &'db dyn Db, declared_ty: Type<'db>, is_read_only: bool) -> Self {
         if declared_ty.resolve_type_alias(db).is_never() {
             Self::Closed
         } else {
@@ -632,8 +632,8 @@ impl<'db> TypedDictType<'db> {
         Self::from_schema_items_with_openness(db, items, TypedDictOpenness::ImplicitlyOpen)
     }
 
-    /// Creates a synthesized schema while preserving its undeclared-item policy.
-    pub(super) fn from_schema_items_with_openness(
+    /// Creates a structural dictionary type with the given undeclared-item policy.
+    pub fn from_schema_items_with_openness(
         db: &'db dyn Db,
         items: TypedDictSchema<'db>,
         openness: TypedDictOpenness<'db>,

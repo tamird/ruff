@@ -160,7 +160,7 @@ impl<'db> Type<'db> {
     }
 
     /// Synthesize a protocol instance type with a given set of read-only property members.
-    pub(super) fn protocol_with_readonly_members<'a, M>(
+    pub fn protocol_with_readonly_members<'a, M>(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         members: M,
