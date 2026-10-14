@@ -103,6 +103,7 @@ use crate::types::generics::{
     GenericContext, Specialization, SpecializationBuilder, bind_typevar, enclosing_binding_contexts,
 };
 use crate::types::infer::builder::binary_expressions::BinaryInferenceState;
+use crate::types::infer::builder::function::provided_function_return_type;
 use crate::types::infer::builder::named_tuple::NamedTupleKind;
 use crate::types::infer::builder::paramspec_validation::validate_paramspec_components;
 use crate::types::infer::{
@@ -5483,12 +5484,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // the expected type passed should be the "raw" type,
                     // i.e. type variables in the return type are non-inferable,
                     // and the return types of async functions are not wrapped in `CoroutineType[...]`.
-                    let return_ty = same_module_uncached_raw_signature(
-                        db,
-                        func,
-                        ReturnCallableTypeVarScope::Lexical,
-                    )
-                    .return_ty;
+                    let return_ty = provided_function_return_type(db, func).map_or_else(
+                        || {
+                            same_module_uncached_raw_signature(
+                                db,
+                                func,
+                                ReturnCallableTypeVarScope::Lexical,
+                            )
+                            .return_ty
+                        },
+                        |returns| returns.ty,
+                    );
 
                     // For generator functions, the declared return type is e.g.
                     // `Generator[YieldType, SendType, ReturnType]`. The type context

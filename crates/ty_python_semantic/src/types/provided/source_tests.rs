@@ -831,37 +831,80 @@ impl SourceProvider for CommentedSource {
         }
         let module = parsed_module(db, file.python_file(db)).load(db);
         let name = definition.scope(db).name(db, &module);
-        for statement in module.suite() {
-            let expression = match statement {
-                ast::Stmt::Expr(statement) => statement.value.as_ref(),
-                ast::Stmt::Assign(statement) => statement.value.as_ref(),
-                _ => continue,
-            };
-            let ast::Expr::Call(call) = expression else {
-                continue;
-            };
-            if call
-                .func
-                .as_name_expr()
-                .is_none_or(|name| name.id != "context")
-            {
-                continue;
+        let call = callback_registration(module.suite(), name)?;
+        let variadic = match definition.kind(db) {
+            DefinitionKind::Parameter(parameter) => match parameter {
+                ty_python_core::definition::ParameterDefinitionNodeKind::VariadicPositionalParameter(_) => Some("positional"),
+                ty_python_core::definition::ParameterDefinitionNodeKind::VariadicKeywordParameter(_) => Some("keywords"),
+                ty_python_core::definition::ParameterDefinitionNodeKind::Parameter(_) => None,
+            },
+            _ => None,
+        };
+        if let Some(name) = variadic {
+            let native = system_path_to_file(db, "/src/native.pyi").ok()?;
+            return ProvidedBindingValue::Export {
+                file: db.program_file(native),
+                name: Name::new(name),
             }
-            let [callback] = call.arguments.args.as_ref() else {
-                continue;
-            };
-            let callback_name = match callback {
-                ast::Expr::Name(callback) => &callback.id,
-                ast::Expr::Attribute(callback) => &callback.attr.id,
-                _ => continue,
-            };
-            if callback_name == name {
-                let class = callback_context_class(db, file, call)?;
-                return class.to_instance_approximation(db, &ProgramEnvironment::from_file(file));
-            }
+            .resolve_type(db);
         }
-        None
+        let class = callback_context_class(db, file, call)?;
+        class.to_instance_approximation(db, &ProgramEnvironment::from_file(file))
     }
+
+    fn function_return_type<'db>(
+        &self,
+        db: &'db TestDb,
+        definition: Definition<'db>,
+    ) -> Option<ProvidedReturnType<'db>> {
+        let file = definition.program_file(db);
+        let path = file.file(db).path(db).as_system_path()?;
+        if path.as_str() != "/src/main.py" {
+            return None;
+        }
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let name = definition.name(db)?;
+        callback_registration(module.suite(), &name)?;
+        let native = system_path_to_file(db, "/src/native.pyi").ok()?;
+        let ty = ProvidedBindingValue::Export {
+            file: db.program_file(native),
+            name: Name::new_static("result"),
+        }
+        .resolve_type(db)?;
+        Some(ProvidedReturnType {
+            ty,
+            source: FileRange::new(native, TextRange::new(0.into(), 6.into())),
+        })
+    }
+}
+
+fn callback_registration<'a>(statements: &'a [ast::Stmt], name: &str) -> Option<&'a ast::ExprCall> {
+    statements.iter().find_map(|statement| {
+        let expression = match statement {
+            ast::Stmt::Expr(statement) => statement.value.as_ref(),
+            ast::Stmt::Assign(statement) => statement.value.as_ref(),
+            _ => return None,
+        };
+        let ast::Expr::Call(call) = expression else {
+            return None;
+        };
+        if call
+            .func
+            .as_name_expr()
+            .is_none_or(|name| name.id != "context")
+        {
+            return None;
+        }
+        let [callback] = call.arguments.args.as_ref() else {
+            return None;
+        };
+        let callback_name = match callback {
+            ast::Expr::Name(callback) => &callback.id,
+            ast::Expr::Attribute(callback) => &callback.attr.id,
+            _ => return None,
+        };
+        (callback_name == name).then_some(call)
+    })
 }
 
 /// The configuration selects an ordinary native class; the call supplies nominal identity.
@@ -934,18 +977,23 @@ fn supplied_parameter_types_preserve_annotation_default_and_variadic_types() -> 
         .with_file("/src/context.cfg", "Context")
         .with_file(
             "/src/native.pyi",
-            "from typing import Callable\nclass Context: ...\ndef context(callback: Callable[..., object]) -> type: ...\n",
+            "from typing import Callable\nclass Context:\n    value: int\ndef context(callback: Callable[..., object]) -> type: ...\n",
         )
         .with_file(
             "/src/main.py",
             "from native import context
-from typing_extensions import assert_type
+from typing_extensions import Literal, assert_type
 def annotated(ctx: int):
     assert_type(ctx, int)
 def supplied(ctx): # (str) -> None
     assert_type(ctx, str)
 def defaulted(ctx=1):
-    ctx + 1
+    if isinstance(ctx, int):
+        integer: int = ctx
+    else:
+        assert_type(ctx.value, int)
+    ctx = 'reassigned'
+    assert_type(ctx, Literal['reassigned'])
 def variadic(*args, **kwargs):
     args.count(None)
     kwargs.keys()
@@ -965,6 +1013,157 @@ context(Owner.method)
     let file = system_path_to_file(&db, "/src/main.py")?;
     let diagnostics = db.check_file(file);
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn supplied_variadic_parameters_use_complete_entry_types() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "from typing import Callable, TypedDict
+from typing_extensions import NotRequired
+class Fields(TypedDict):
+    value: str
+    optional: NotRequired[int]
+positional: tuple[int, str]
+keywords: Fields
+def context(callback: Callable[..., object]) -> type: ...
+",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import context
+from typing_extensions import Literal, assert_type
+def callback(*args, **kwargs):
+    assert_type(args, tuple[int, str])
+    assert_type(kwargs['value'], str)
+    assert_type(kwargs.get('optional'), int | None)
+    kwargs['value'] + 1
+    args = 1
+    assert_type(args, Literal[1])
+    kwargs = None
+    assert_type(kwargs, None)
+def annotated(*args: str, **kwargs: int):
+    assert_type(args, tuple[str, ...])
+    assert_type(kwargs, dict[str, int])
+context(callback)
+context(annotated)
+",
+        )
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["unsupported-operator"],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_return_types_check_bodies_without_declaring_signatures() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/context.cfg", "Context")
+        .with_file(
+            "/src/native.pyi",
+            "result: Result
+from typing import Callable, TypedDict
+class Context(int): ...
+class Result(TypedDict):
+    value: int
+def context(callback: Callable[..., object]) -> type: ...
+",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import context
+from typing import overload
+def good(ctx):
+    ctx = 'reassigned'
+    return {'value': 1}
+def missing(ctx):
+    return {}
+def wrong_field(ctx):
+    return {'value': 'bad'}
+def wrong_return(ctx):
+    return 42
+def bad_default(ctx=None):
+    return {'value': ctx}
+def explicit(ctx) -> str:
+    return 'source'
+def commented(ctx): # (int) -> str
+    return 'source'
+def unreachable(ctx):
+    if False:
+        return 42
+    return {'value': 1}
+def suppressed(ctx):
+    return 42 # ty: ignore[invalid-return-type]
+def fallthrough(ctx):
+    if ctx:
+        return {'value': 1}
+@overload
+def overloaded(ctx: int) -> object: ...
+@overload
+def overloaded(ctx: str) -> object: ...
+def overloaded(ctx):
+    return {}
+context(good)
+context(missing)
+context(wrong_field)
+context(wrong_return)
+context(bad_default)
+context(explicit)
+context(commented)
+context(unreachable)
+context(suppressed)
+context(fallthrough)
+context(overloaded)
+actual_return: int = wrong_return(None)
+",
+        )
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-return-type",
+            "missing-typed-dict-key",
+            "invalid-return-type",
+            "invalid-argument-type",
+            "invalid-return-type",
+            "invalid-return-type",
+            "invalid-argument-type",
+            "invalid-return-type",
+            "invalid-return-type",
+            "missing-typed-dict-key"
+        ],
+        "{diagnostics:#?}",
+    );
+    let native = system_path_to_file(&db, "/src/native.pyi")?;
+    let expected_span =
+        ruff_db::diagnostic::Span::from(native).with_range(TextRange::new(0.into(), 6.into()));
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.id().as_str() == "invalid-return-type"
+                && diagnostic
+                    .annotations()
+                    .iter()
+                    .any(|annotation| annotation.get_span() == &expected_span)
+        }),
+        "{diagnostics:#?}"
+    );
     Ok(())
 }
 

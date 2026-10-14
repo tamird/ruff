@@ -534,7 +534,8 @@ impl<'db> TypedDictType<'db> {
         Some(extra_items.declared_ty)
     }
 
-    pub(crate) fn items(self, db: &'db dyn Db) -> &'db TypedDictSchema<'db> {
+    /// Returns the declared fields, excluding any extra-item policy.
+    pub fn items(self, db: &'db dyn Db) -> &'db TypedDictSchema<'db> {
         // Field annotations can recursively inspect this schema while the class fields are still
         // being collected, e.g. through `typing.Self` in a `TypedDict` field.
         #[salsa::tracked(
@@ -3393,11 +3394,15 @@ pub struct TypedDictField<'db> {
 }
 
 impl<'db> TypedDictField<'db> {
-    pub(crate) const fn is_required(&self) -> bool {
+    pub const fn declared_type(&self) -> Type<'db> {
+        self.declared_ty
+    }
+
+    pub const fn is_required(&self) -> bool {
         self.flags.contains(TypedDictFieldFlags::REQUIRED)
     }
 
-    pub(crate) const fn is_read_only(&self) -> bool {
+    pub const fn is_read_only(&self) -> bool {
         self.flags.contains(TypedDictFieldFlags::READ_ONLY)
     }
 

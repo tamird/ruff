@@ -1,3 +1,4 @@
+use crate::provided::ProvidedReturnType;
 use crate::{
     Db, DisplaySettings, FxIndexMap, ProgramEnvironment,
     reachability::ReachabilityConstraintsExtension,
@@ -164,6 +165,20 @@ struct ExpectedReturnType<'db> {
     public: Type<'db>,
     /// The return type as seen from inside the function body.
     lexical: Type<'db>,
+}
+
+pub(super) fn provided_function_return_type<'db>(
+    db: &'db dyn Db,
+    function: FunctionType<'db>,
+) -> Option<ProvidedReturnType<'db>> {
+    if function
+        .literal(db)
+        .last_definition
+        .has_explicit_return_annotation(db)
+    {
+        return None;
+    }
+    db.provided_function_return_type(function.definition(db))
 }
 
 impl<'db> ExpectedReturnType<'db> {
@@ -394,8 +409,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         self.infer_scope_body(&function.body);
 
-        if let Some(returns) = SourceAnnotation::function_return(db, self.program_file(), function)
-        {
+        let returns = SourceAnnotation::function_return(db, self.program_file(), function);
+        let supplied_return = if returns.is_none() {
+            db.provided_function_return_type(self.index.expect_single_definition(function))
+        } else {
+            None
+        };
+        let return_location = returns
+            .as_ref()
+            .map(|returns| (returns.source(self.context.file()), returns.range()))
+            .or_else(|| supplied_return.map(|returns| (returns.source, function.name.range())));
+        if let Some((return_source, return_range)) = return_location {
             let has_empty_body = self.return_types_and_ranges.is_empty()
                 && function_body_kind(db, env, self.index, function, |expr| {
                     self.expression_type(expr)
@@ -423,13 +447,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             let enclosing_function = nearest_enclosing_function(db, self.index, self.scope())
                 .expect("should be in a function body scope");
-            let declared_ty = same_module_uncached_raw_signature(
-                db,
-                enclosing_function,
-                ReturnCallableTypeVarScope::Public,
-            )
-            .return_ty;
-            let expected_return = ExpectedReturnType::from_function(db, enclosing_function);
+            let declared_ty = supplied_return.map_or_else(
+                || {
+                    same_module_uncached_raw_signature(
+                        db,
+                        enclosing_function,
+                        ReturnCallableTypeVarScope::Public,
+                    )
+                    .return_ty
+                },
+                |returns| returns.ty,
+            );
+            let expected_return = supplied_return.map_or_else(
+                || ExpectedReturnType::from_function(db, enclosing_function),
+                |returns| ExpectedReturnType {
+                    public: returns.ty,
+                    lexical: returns.ty,
+                },
+            );
             let expected_ty = expected_return.public();
             let scope_id = self.index.node_scope(NodeWithScopeRef::Function(function));
             if scope_id.is_generator_function(self.index) {
@@ -452,7 +487,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 {
                     report_invalid_generator_function_return_type(
                         &self.context,
-                        returns.range(),
+                        return_range,
                         inferred_return,
                         declared_ty,
                     );
@@ -481,7 +516,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             report_invalid_return_type(
                                 &self.context,
                                 return_statement.range,
-                                returns.source(self.context.file()),
+                                return_source,
                                 expected_return_ty,
                                 return_statement.ty,
                             );
@@ -491,7 +526,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             report_unsound_return_statement(
                                 &self.context,
                                 return_statement.range,
-                                returns.source(self.context.file()),
+                                return_source,
                                 expected_return_ty,
                                 return_statement.ty,
                             );
@@ -508,7 +543,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         let no_return = self.return_types_and_ranges.is_empty();
                         report_implicit_return_type(
                             &self.context,
-                            returns.range(),
+                            return_range,
                             expected_return_ty,
                             false,
                             None,
@@ -563,7 +598,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     report_invalid_return_type(
                         &self.context,
                         return_statement.range,
-                        returns.source(self.context.file()),
+                        return_source,
                         declared_ty,
                         return_statement.ty,
                     );
@@ -573,7 +608,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     report_unsound_return_statement(
                         &self.context,
                         return_statement.range,
-                        returns.source(self.context.file()),
+                        return_source,
                         declared_ty,
                         return_statement.ty,
                     );
@@ -587,7 +622,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let no_return = self.return_types_and_ranges.is_empty();
                 report_implicit_return_type(
                     &self.context,
-                    returns.range(),
+                    return_range,
                     declared_ty,
                     has_empty_body,
                     enclosing_class_context,
@@ -1419,7 +1454,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } else {
             let ty = if let Some(default_expr) = default_expr {
                 let default_ty = self.file_expression_type(default_expr);
-                UnionType::from_two_elements(db, env, Type::unknown(), default_ty)
+                let supplied_ty = if self
+                    .special_first_method_parameter_type(parameter)
+                    .is_none()
+                {
+                    db.provided_parameter_type(definition)
+                } else {
+                    None
+                };
+                UnionType::from_two_elements(
+                    db,
+                    env,
+                    supplied_ty.unwrap_or_else(Type::unknown),
+                    default_ty,
+                )
             } else if let Some(ty) = self.special_first_method_parameter_type(parameter) {
                 ty
             } else if let Some(ty) = db.provided_parameter_type(definition) {
@@ -1500,8 +1548,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             self.add_parameter_binding(parameter, definition, ty);
         } else {
-            let inferred_ty =
-                Type::homogeneous_tuple(db, self.program_environment(), Type::unknown());
+            let inferred_ty = db.provided_parameter_type(definition).unwrap_or_else(|| {
+                Type::homogeneous_tuple(db, self.program_environment(), Type::unknown())
+            });
             self.add_binding(parameter.into(), definition)
                 .insert(self, inferred_ty);
         }
@@ -1658,11 +1707,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             };
             self.add_parameter_binding(parameter, definition, ty);
         } else {
-            let inferred_ty = KnownClass::Dict.to_specialized_instance(
-                db,
-                env,
-                &[KnownClass::Str.to_instance(db, env), Type::unknown()],
-            );
+            let inferred_ty = db.provided_parameter_type(definition).unwrap_or_else(|| {
+                KnownClass::Dict.to_specialized_instance(
+                    db,
+                    env,
+                    &[KnownClass::Str.to_instance(db, env), Type::unknown()],
+                )
+            });
 
             self.add_binding(parameter.into(), definition)
                 .insert(self, inferred_ty);

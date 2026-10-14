@@ -265,6 +265,13 @@ pub struct ProvidedTypeApplication<'a, 'db> {
     pub definition: Option<Definition<'db>>,
 }
 
+/// The expected values returned by an unannotated callback body and their declaration source.
+#[derive(Clone, Copy, Debug)]
+pub struct ProvidedReturnType<'db> {
+    pub ty: Type<'db>,
+    pub source: FileRange,
+}
+
 /// Ordinary inference of children of an application-defined type expression.
 ///
 /// Child expressions must belong to the supplied application. Inference preserves the

@@ -2,7 +2,8 @@ use crate::dependency::DependencyMetadata;
 use crate::lint::{LintRegistry, RuleSelection};
 use crate::provided::{
     BuiltinUsage, ProvidedBindingResolution, ProvidedBindingValue, ProvidedCallResult,
-    ProvidedData, ProvidedInstanceFields, ProvidedTypeApplication, TypeExpressionContext,
+    ProvidedData, ProvidedInstanceFields, ProvidedReturnType, ProvidedTypeApplication,
+    TypeExpressionContext,
 };
 use crate::types::CheckedCall;
 use crate::{AnalysisSettings, PythonVersionWithSource};
@@ -51,15 +52,30 @@ pub trait Db: PythonCoreDb {
         None
     }
 
-    /// Supplies the initial body type of an unannotated ordinary parameter.
+    /// Supplies the initial body type of an unannotated parameter.
     ///
     /// This does not change the function's public signature or declare a type for later
-    /// assignments. Source annotations, defaults, and implicit method receivers take precedence.
+    /// assignments. Source annotations and implicit method receivers take precedence.
+    /// Source defaults contribute their inferred types to the initial binding.
+    /// For `*args` and `**kwargs`, supply the full tuple or dictionary type used in the body.
     /// Implementations must read tracked inputs and must not infer this parameter's body scope.
     fn provided_parameter_type<'db>(
         &'db self,
         _definition: Definition<'db>,
     ) -> Option<crate::types::Type<'db>> {
+        None
+    }
+
+    /// Supplies an expected return value for checking an unannotated function body.
+    ///
+    /// Source and external return annotations take precedence. The supplied type provides
+    /// context for return expressions and ordinary return diagnostics; it does not declare
+    /// the function's public return type. Implementations must read tracked inputs and must
+    /// not infer the function body whose returns are being checked.
+    fn provided_function_return_type<'db>(
+        &'db self,
+        _definition: Definition<'db>,
+    ) -> Option<ProvidedReturnType<'db>> {
         None
     }
 
@@ -224,6 +240,14 @@ pub(crate) mod tests {
     use ty_site_packages::{PythonVersionSource, PythonVersionWithSource};
 
     pub(crate) trait SourceProvider: Send + Sync {
+        fn function_return_type<'db>(
+            &self,
+            _db: &'db TestDb,
+            _definition: Definition<'db>,
+        ) -> Option<ProvidedReturnType<'db>> {
+            None
+        }
+
         fn allocation_class<'db>(
             &self,
             _db: &'db TestDb,
@@ -454,6 +478,15 @@ pub(crate) mod tests {
 
     #[salsa::db]
     impl Db for TestDb {
+        fn provided_function_return_type<'db>(
+            &'db self,
+            definition: Definition<'db>,
+        ) -> Option<ProvidedReturnType<'db>> {
+            self.source_provider
+                .as_ref()
+                .and_then(|provider| provider.function_return_type(self, definition))
+        }
+
         fn provided_allocation_class<'db>(
             &'db self,
             program: crate::Program<'db>,
