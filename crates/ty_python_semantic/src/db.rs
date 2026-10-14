@@ -2,7 +2,7 @@ use crate::dependency::DependencyMetadata;
 use crate::lint::{LintRegistry, RuleSelection};
 use crate::provided::{
     BuiltinUsage, ProvidedBindingResolution, ProvidedBindingValue, ProvidedCallResult,
-    ProvidedTypeApplication, TypeExpressionContext,
+    ProvidedData, ProvidedInstanceFields, ProvidedTypeApplication, TypeExpressionContext,
 };
 use crate::types::CheckedCall;
 use crate::{AnalysisSettings, PythonVersionWithSource};
@@ -74,6 +74,34 @@ pub trait Db: PythonCoreDb {
         _application: ProvidedTypeApplication<'_, 'db>,
         _context: &mut dyn TypeExpressionContext<'db>,
     ) -> Option<crate::types::Type<'db>> {
+        None
+    }
+
+    /// Interprets a resolved value used as a type annotation in an embedded program.
+    ///
+    /// Returning `None` preserves ordinary type conversion. Implementations must identify
+    /// the resolved declaration, read tracked inputs, and avoid requesting completed inference
+    /// of the scope containing the reference.
+    fn provided_type_reference<'db>(
+        &'db self,
+        _file: ProgramFile<'db>,
+        _value_type: crate::types::Type<'db>,
+        _definition: Option<Definition<'db>>,
+    ) -> Option<crate::types::Type<'db>> {
+        None
+    }
+
+    /// Resolves the immutable instance fields of a supplied nominal class.
+    ///
+    /// `file` owns the class's source anchor. The metadata identifies the field declaration;
+    /// it must be sufficient to create the class's identity without resolving these fields.
+    /// Implementations must read tracked inputs and retain field declaration locations.
+    /// Fields must not depend on a generic specialization of the supplied class.
+    fn provided_instance_fields<'db>(
+        &'db self,
+        _file: ProgramFile<'db>,
+        _source: &ProvidedData,
+    ) -> Option<ProvidedInstanceFields<'db>> {
         None
     }
 
@@ -253,6 +281,17 @@ pub(crate) mod tests {
         ProvidedTypeApplication<'_, 'db>,
         &mut dyn TypeExpressionContext<'db>,
     ) -> Option<crate::types::Type<'db>>;
+    type TypeReferenceProvider = for<'db> fn(
+        &'db TestDb,
+        ProgramFile<'db>,
+        crate::types::Type<'db>,
+        Option<Definition<'db>>,
+    ) -> Option<crate::types::Type<'db>>;
+    type InstanceFieldsProvider = for<'db> fn(
+        &'db TestDb,
+        ProgramFile<'db>,
+        &ProvidedData,
+    ) -> Option<ProvidedInstanceFields<'db>>;
     type DeclarationPredicate = for<'db> fn(&'db TestDb, Definition<'db>) -> bool;
     type TypeTestProvider = for<'db> fn(
         &'db TestDb,
@@ -276,6 +315,8 @@ pub(crate) mod tests {
         program_settings: ProgramSettings,
         call_result_provider: Option<CallResultProvider>,
         type_application_provider: Option<TypeApplicationProvider>,
+        type_reference_provider: Option<TypeReferenceProvider>,
+        instance_fields_provider: Option<InstanceFieldsProvider>,
         type_test_provider: Option<TypeTestProvider>,
         getattr_presence_provider: Option<DeclarationPredicate>,
         keyword_field_factory: Option<DeclarationPredicate>,
@@ -306,6 +347,8 @@ pub(crate) mod tests {
                 program_settings,
                 call_result_provider: None,
                 type_application_provider: None,
+                type_reference_provider: None,
+                instance_fields_provider: None,
                 type_test_provider: None,
                 getattr_presence_provider: None,
                 keyword_field_factory: None,
@@ -461,6 +504,25 @@ pub(crate) mod tests {
                 .and_then(|provider| provider(self, application, context))
         }
 
+        fn provided_type_reference<'db>(
+            &'db self,
+            file: ProgramFile<'db>,
+            value_type: crate::types::Type<'db>,
+            definition: Option<Definition<'db>>,
+        ) -> Option<crate::types::Type<'db>> {
+            self.type_reference_provider
+                .and_then(|provider| provider(self, file, value_type, definition))
+        }
+
+        fn provided_instance_fields<'db>(
+            &'db self,
+            file: ProgramFile<'db>,
+            source: &ProvidedData,
+        ) -> Option<ProvidedInstanceFields<'db>> {
+            self.instance_fields_provider
+                .and_then(|provider| provider(self, file, source))
+        }
+
         fn provided_keyword_field_factory(&self, definition: Definition<'_>) -> bool {
             self.keyword_field_factory
                 .is_some_and(|provider| provider(self, definition))
@@ -559,6 +621,8 @@ pub(crate) mod tests {
         lint_registry: Option<LintRegistry>,
         call_result_provider: Option<CallResultProvider>,
         type_application_provider: Option<TypeApplicationProvider>,
+        type_reference_provider: Option<TypeReferenceProvider>,
+        instance_fields_provider: Option<InstanceFieldsProvider>,
         type_test_provider: Option<TypeTestProvider>,
         getattr_presence_provider: Option<DeclarationPredicate>,
         keyword_field_factory: Option<DeclarationPredicate>,
@@ -578,6 +642,8 @@ pub(crate) mod tests {
                 lint_registry: None,
                 call_result_provider: None,
                 type_application_provider: None,
+                type_reference_provider: None,
+                instance_fields_provider: None,
                 type_test_provider: None,
                 getattr_presence_provider: None,
                 keyword_field_factory: None,
@@ -636,6 +702,22 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_type_reference_provider(
+            mut self,
+            provider: TypeReferenceProvider,
+        ) -> Self {
+            self.type_reference_provider = Some(provider);
+            self
+        }
+
+        pub(crate) fn with_instance_fields_provider(
+            mut self,
+            provider: InstanceFieldsProvider,
+        ) -> Self {
+            self.instance_fields_provider = Some(provider);
+            self
+        }
+
         pub(crate) fn with_keyword_field_factory(mut self, provider: DeclarationPredicate) -> Self {
             self.keyword_field_factory = Some(provider);
             self
@@ -676,6 +758,8 @@ pub(crate) mod tests {
             let mut db = TestDb::new(self.vendored);
             db.call_result_provider = self.call_result_provider;
             db.type_application_provider = self.type_application_provider;
+            db.type_reference_provider = self.type_reference_provider;
+            db.instance_fields_provider = self.instance_fields_provider;
             db.type_test_provider = self.type_test_provider;
             db.getattr_presence_provider = self.getattr_presence_provider;
             db.keyword_field_factory = self.keyword_field_factory;

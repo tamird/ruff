@@ -149,6 +149,22 @@ pub struct ProvidedInstanceFields<'db> {
     pub data: Option<ProvidedData>,
 }
 
+/// Immutable fields supplied eagerly or resolved from a source declaration on demand.
+///
+/// Deferred metadata contains no inferred types, so a nominal class can be created before
+/// its fields refer back to that class or another recursively declared class.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub enum ProvidedInstanceFieldsSource<'db> {
+    Eager(ProvidedInstanceFields<'db>),
+    Deferred(ProvidedData),
+}
+
+impl<'db> From<ProvidedInstanceFields<'db>> for ProvidedInstanceFieldsSource<'db> {
+    fn from(fields: ProvidedInstanceFields<'db>) -> Self {
+        Self::Eager(fields)
+    }
+}
+
 /// A relation between immutable stored fields on the same supplied instance.
 ///
 /// If the relative attribute path `guard` is truthy, `target` satisfies `ty`. Both paths
@@ -174,7 +190,7 @@ pub struct ProvidedClass<'db> {
     pub name: Name,
     pub bases: Box<[Type<'db>]>,
     pub class_members: Box<[(Name, Type<'db>)]>,
-    pub instance_fields: ProvidedInstanceFields<'db>,
+    pub instance_fields: ProvidedInstanceFieldsSource<'db>,
 }
 
 impl<'db> ProvidedClass<'db> {
@@ -184,13 +200,24 @@ impl<'db> ProvidedClass<'db> {
         file: ProgramFile<'db>,
         call: &ast::ExprCall,
     ) -> Option<Type<'db>> {
+        self.into_type_at_expression(db, file, ast::ExprRef::Call(call))
+    }
+
+    /// Creates a nominal class anchored to an expression from `file`'s canonical AST.
+    /// Returns `None` when the expression has no indexed scope.
+    pub fn into_type_at_expression(
+        self,
+        db: &'db dyn Db,
+        file: ProgramFile<'db>,
+        expression: ast::ExprRef<'_>,
+    ) -> Option<Type<'db>> {
         let index = semantic_index(db, file);
-        let file_scope = index.try_expression_scope_id(&ast::ExprRef::Call(call))?;
+        let file_scope = index.try_expression_scope_id(&expression)?;
         let scope = file_scope.to_scope_id(db, file);
         let scope_index = scope.node(db).node_index().unwrap_or(NodeIndex::from(0));
-        let call_index = call.node_index().load().as_u32()?;
+        let expression_index = expression.node_index().load().as_u32()?;
         let scope_index = scope_index.as_u32()?;
-        let offset = call_index.checked_sub(scope_index)?;
+        let offset = expression_index.checked_sub(scope_index)?;
         Some(
             self.into_type(db, |explicit_bases| DynamicClassAnchor::ScopeOffset {
                 scope,
@@ -484,7 +511,11 @@ impl<'db> Type<'db> {
         let ClassLiteral::Dynamic(class) = class else {
             return None;
         };
-        class.instance_fields(db).as_ref()?.data.as_ref()
+        let source = class.instance_fields_source(db).as_ref()?;
+        match source {
+            ProvidedInstanceFieldsSource::Eager(fields) => fields.data.as_ref(),
+            ProvidedInstanceFieldsSource::Deferred(data) => Some(data),
+        }
     }
 }
 

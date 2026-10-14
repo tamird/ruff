@@ -3,7 +3,10 @@ use ruff_db::{diagnostic::Span, parsed::parsed_module};
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::TextRange;
 
-use crate::provided::{ProvidedField, ProvidedFieldImplication, ProvidedInstanceFields};
+use crate::provided::{
+    ProvidedData, ProvidedField, ProvidedFieldImplication, ProvidedInstanceFields,
+    ProvidedInstanceFieldsSource,
+};
 use crate::{
     Db, TypeQualifiers,
     place::{Place, PlaceAndQualifiers},
@@ -20,7 +23,7 @@ use crate::{
         mro::{DynamicMroError, Mro, MroIterator},
     },
 };
-use ty_python_core::{definition::Definition, scope::ScopeId};
+use ty_python_core::{ProgramFile, definition::Definition, scope::ScopeId};
 
 /// A class created dynamically via a three-argument `type()` or `types.new_class()` call.
 ///
@@ -85,7 +88,7 @@ pub struct DynamicClassLiteral<'db> {
 
     /// Storage supplied by a factory, separate from the descriptor-bearing class namespace.
     #[returns(ref)]
-    pub(crate) instance_fields: Option<ProvidedInstanceFields<'db>>,
+    pub(crate) instance_fields_source: Option<ProvidedInstanceFieldsSource<'db>>,
 }
 
 /// Anchor for identifying a dynamic class literal.
@@ -170,6 +173,33 @@ pub(crate) fn dynamic_class_bases_argument(arguments: &ast::Arguments) -> Option
 
 #[salsa::tracked]
 impl<'db> DynamicClassLiteral<'db> {
+    pub(crate) fn instance_fields(
+        self,
+        db: &'db dyn Db,
+    ) -> Option<&'db ProvidedInstanceFields<'db>> {
+        #[salsa::tracked(
+            returns(ref),
+            cycle_initial=|_, _, _, _| None,
+            heap_size=ruff_memory_usage::heap_size
+        )]
+        fn deferred_instance_fields<'db>(
+            db: &'db dyn Db,
+            file: ProgramFile<'db>,
+            source: ProvidedData,
+        ) -> Option<ProvidedInstanceFields<'db>> {
+            db.provided_instance_fields(file, &source)
+        }
+
+        let source = self.instance_fields_source(db).as_ref()?;
+        match source {
+            ProvidedInstanceFieldsSource::Eager(fields) => Some(fields),
+            ProvidedInstanceFieldsSource::Deferred(source) => {
+                deferred_instance_fields(db, self.scope(db).program_file(db), source.clone())
+                    .as_ref()
+            }
+        }
+    }
+
     /// Returns the definition where this class is created, if it was assigned to a variable.
     pub(crate) fn definition(self, db: &'db dyn Db) -> Option<Definition<'db>> {
         match self.anchor(db) {
@@ -577,7 +607,7 @@ impl<'db> DynamicClassLiteral<'db> {
             self.members(db),
             self.has_dynamic_namespace(db),
             dataclass_params,
-            self.instance_fields(db),
+            self.instance_fields_source(db),
         )
     }
 }
@@ -607,13 +637,13 @@ impl<'db> DynamicClassLiteral<'db> {
             Some(params) => Some(params.recursive_type_normalized_impl(db, env, div, nested)?),
             None => None,
         };
-        let instance_fields = match self.instance_fields(db) {
-            Some(ProvidedInstanceFields {
+        let instance_fields = match self.instance_fields_source(db) {
+            Some(ProvidedInstanceFieldsSource::Eager(ProvidedInstanceFields {
                 fields,
                 has_dynamic_fields,
                 implications,
                 data,
-            }) => {
+            })) => {
                 let fields = fields
                     .iter()
                     .map(|ProvidedField { name, ty, source }| {
@@ -638,12 +668,17 @@ impl<'db> DynamicClassLiteral<'db> {
                         })
                     })
                     .collect::<Option<Box<_>>>()?;
-                Some(ProvidedInstanceFields {
-                    fields,
-                    has_dynamic_fields: *has_dynamic_fields,
-                    implications,
-                    data: data.clone(),
-                })
+                Some(ProvidedInstanceFieldsSource::Eager(
+                    ProvidedInstanceFields {
+                        fields,
+                        has_dynamic_fields: *has_dynamic_fields,
+                        implications,
+                        data: data.clone(),
+                    },
+                ))
+            }
+            Some(ProvidedInstanceFieldsSource::Deferred(source)) => {
+                Some(ProvidedInstanceFieldsSource::Deferred(source.clone()))
             }
             None => None,
         };

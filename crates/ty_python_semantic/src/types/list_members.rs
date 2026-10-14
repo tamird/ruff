@@ -682,11 +682,13 @@ impl<'db> AllMembers<'db> {
         class: super::class::DynamicClassLiteral<'db>,
         include_instance_fields: bool,
     ) {
-        let instance_fields = class
-            .instance_fields(db)
-            .as_ref()
-            .filter(|_| include_instance_fields)
-            .map_or([].as_slice(), |fields| fields.fields.as_ref());
+        let instance_fields = if include_instance_fields {
+            class
+                .instance_fields(db)
+                .map_or([].as_slice(), |fields| fields.fields.as_ref())
+        } else {
+            &[]
+        };
         for name in class
             .members(db)
             .iter()

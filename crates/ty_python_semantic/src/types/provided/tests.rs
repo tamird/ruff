@@ -1,10 +1,12 @@
 use std::fmt::Write;
 
+use anyhow::Context;
 use ruff_db::diagnostic::{Annotation, DiagnosticId, Severity, Span};
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_db::system::DbWithWritableSystem as _;
+use ruff_db::testing::assert_function_query_was_not_run_by_name;
 use ruff_text_size::{Ranged, TextLen, TextRange};
 
 use super::*;
@@ -19,6 +21,177 @@ use crate::types::{
     TypedDictFieldBuilder, TypedDictOpenness, TypedDictType,
 };
 use crate::{HasType, SemanticModel};
+
+#[test]
+fn deferred_nominal_fields_preserve_identity_and_follow_edits() -> anyhow::Result<()> {
+    fn annotation<'db>(
+        db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        value_type: Type<'db>,
+        _definition: Option<Definition<'db>>,
+    ) -> Option<Type<'db>> {
+        let Type::FunctionLiteral(function) = value_type else {
+            return None;
+        };
+        let definition = function.definition(db);
+        let file = definition.program_file(db);
+        let path = file.file(db).path(db).as_system_path()?;
+        if path.as_str() != "/src/native.pyi"
+            || !matches!(function.name(db).as_str(), "first" | "second")
+        {
+            return None;
+        }
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let ty_python_core::definition::DefinitionKind::Function(declaration) = definition.kind(db)
+        else {
+            return None;
+        };
+        let declaration = declaration.node(&module);
+        let expression = declaration.returns.as_deref()?;
+        let class = ProvidedClass {
+            name: function.name(db).clone(),
+            bases: Box::default(),
+            class_members: Box::default(),
+            instance_fields: ProvidedInstanceFieldsSource::Deferred(ProvidedData::new(
+                function.name(db).clone(),
+            )),
+        }
+        .into_type_at_expression(db, file, expression.into())?;
+        class.to_instance_approximation(db, &ProgramEnvironment::from_file(file))
+    }
+
+    fn fields<'db>(
+        db: &'db TestDb,
+        file: ProgramFile<'db>,
+        data: &ProvidedData,
+    ) -> Option<ProvidedInstanceFields<'db>> {
+        let name = data.downcast_ref::<Name>()?;
+        let other = match name.as_str() {
+            "first" => "second",
+            "second" => "first",
+            _ => return None,
+        };
+        let resolve = |name| {
+            crate::place::global_symbol(db, file, name)
+                .place
+                .ignore_possibly_undefined()
+        };
+        let constructor = resolve(name.as_str())?;
+        let peer = annotation(db, file, constructor, None)?;
+        let constructor = resolve(other)?;
+        let other = annotation(db, file, constructor, None)?;
+        let value = resolve("value")?;
+        Some(ProvidedInstanceFields {
+            fields: Box::from([
+                ProvidedField {
+                    name: Name::new_static("peer"),
+                    ty: peer,
+                    source: None,
+                },
+                ProvidedField {
+                    name: Name::new_static("other"),
+                    ty: other,
+                    source: None,
+                },
+                ProvidedField {
+                    name: Name::new_static("value"),
+                    ty: value,
+                    source: Some(FileRange::new(
+                        file.file(db),
+                        TextRange::new(0.into(), 5.into()),
+                    )),
+                },
+            ]),
+            has_dynamic_fields: false,
+            implications: Box::default(),
+            data: None,
+        })
+    }
+
+    let mut db = TestDbBuilder::new()
+        .with_type_reference_provider(annotation)
+        .with_instance_fields_provider(fields)
+        .with_file(
+            "/src/native.pyi",
+            "value: int\ndef first() -> int: ...\ndef second() -> int: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import first as First, second as Second
+def use(a: First, b: Second) -> None:
+    same: First = a.peer
+    other: Second = a.other
+    recursive: int = a.other.peer.other.value
+    wrong: First = b
+runtime: int = First()
+",
+        )
+        .build()?;
+    let native_file = system_path_to_file(&db, "/src/native.pyi")?;
+    {
+        let native = db.program_file(native_file);
+        let constructor = crate::place::global_symbol(&db, native, "first")
+            .place
+            .expect_type();
+        let first =
+            annotation(&db, native, constructor, None).context("missing nominal annotation")?;
+        let env = ProgramEnvironment::from_file(native);
+        assert_eq!(
+            first
+                .provided_data(&db, &env)
+                .and_then(ProvidedData::downcast_ref::<Name>),
+            Some(&Name::new_static("first"))
+        );
+        assert!(first.is_assignable_to(&db, &env, first));
+        let Type::NominalInstance(instance) = first else {
+            anyhow::bail!("Expected a nominal instance, got {first:?}");
+        };
+        let class = Type::ClassLiteral(instance.class_literal(&db, &env));
+        let members = crate::types::list_members::all_members(&db, &env, class);
+        assert!(!members.iter().any(|member| member.name == "value"));
+    }
+    let events = db.take_salsa_events();
+    assert_function_query_was_not_run_by_name(&db, "deferred_instance_fields", None, &events);
+
+    let native = db.program_file(native_file);
+    let constructor = crate::place::global_symbol(&db, native, "first")
+        .place
+        .expect_type();
+    let first = annotation(&db, native, constructor, None).context("missing nominal annotation")?;
+    let env = ProgramEnvironment::from_file(native);
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-assignment"],
+        "{diagnostics:#?}"
+    );
+    let members = crate::types::list_members::all_members(&db, &env, first);
+    assert!(members.iter().any(|member| member.name == "value"));
+    let source = FileRange::new(native.file(&db), TextRange::new(0.into(), 5.into()));
+    assert_eq!(
+        definitions_for_attribute(&db, &env, first, "value"),
+        [crate::types::ide_support::ResolvedDefinition::FileWithRange(source)]
+    );
+
+    db.write_file(
+        "/src/native.pyi",
+        "value: str\ndef first() -> int: ...\ndef second() -> int: ...\n",
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-assignment", "invalid-assignment"],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
 
 #[test]
 fn supplied_type_applications_use_annotation_inference() -> anyhow::Result<()> {
@@ -772,7 +945,8 @@ fn field_implication_factory<'db>(
                 has_dynamic_fields: false,
                 implications,
                 data: None,
-            },
+            }
+            .into(),
         },
     )
     .to_instance_approximation(db, &env)
@@ -1731,7 +1905,8 @@ fn factory_result<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<T
                 has_dynamic_fields: false,
                 implications: Box::default(),
                 data: Some(ProvidedData::new(Name::new("native record"))),
-            },
+            }
+            .into(),
         },
     );
     if name == "make_class" {
@@ -1774,7 +1949,8 @@ fn source_call_class_matches_factory_result_identity() -> anyhow::Result<()> {
                     has_dynamic_fields: false,
                     implications: Box::default(),
                     data: Some(ProvidedData::new(Name::new("native record"))),
-                },
+                }
+                .into(),
             },
         )
         .unwrap();
@@ -1817,7 +1993,8 @@ fn supplied_instance_storage_shadows_inherited_defaults_but_not_data_descriptors
                     has_dynamic_fields: name == "make_open",
                     implications: Box::default(),
                     data: None,
-                },
+                }
+                .into(),
             },
         );
         class.to_instance_approximation(db, &ProgramEnvironment::from_file(call.file()))
@@ -1949,24 +2126,27 @@ fn supplied_declarations_preserve_keyword_and_attribute_navigation() -> anyhow::
                 Type::none(db, &env),
             ),
         );
-        Some(call.class_type(
-            db,
-            ProvidedClass {
-                name: Name::new_static("Derived"),
-                bases: Box::from([base]),
-                class_members: Box::from([(Name::new_static("__init__"), init)]),
-                instance_fields: ProvidedInstanceFields {
-                    fields: Box::from([ProvidedField {
-                        name: Name::new_static("value"),
-                        ty: Type::int_literal(1),
-                        source: (name == "make").then_some(source),
-                    }]),
-                    has_dynamic_fields: false,
-                    implications: Box::default(),
-                    data: None,
+        Some(
+            call.class_type(
+                db,
+                ProvidedClass {
+                    name: Name::new_static("Derived"),
+                    bases: Box::from([base]),
+                    class_members: Box::from([(Name::new_static("__init__"), init)]),
+                    instance_fields: ProvidedInstanceFields {
+                        fields: Box::from([ProvidedField {
+                            name: Name::new_static("value"),
+                            ty: Type::int_literal(1),
+                            source: (name == "make").then_some(source),
+                        }]),
+                        has_dynamic_fields: false,
+                        implications: Box::default(),
+                        data: None,
+                    }
+                    .into(),
                 },
-            },
-        ))
+            ),
+        )
     }
 
     for (base, property, native_member) in [
@@ -2097,7 +2277,8 @@ Derived(1)
                             has_dynamic_fields: false,
                             implications: Box::default(),
                             data: None,
-                        },
+                        }
+                        .into(),
                     },
                 )
                 .unwrap();

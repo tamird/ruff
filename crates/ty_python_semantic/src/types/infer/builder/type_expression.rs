@@ -289,6 +289,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     ) -> Type<'db> {
         let db = self.db();
         let env = self.program_environment();
+        if let Some(ty) = db.provided_type_reference(self.program_file(), ty, definition) {
+            return ty;
+        }
         if let Some((alias, parameters)) = self.recursive_implicit_alias_reference(ty, definition) {
             return match parameters {
                 Some(parameters) => {

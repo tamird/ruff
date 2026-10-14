@@ -884,7 +884,7 @@ fn callback_context_class<'db>(
             name: Name::new_static("CallbackContext"),
             bases: Box::from([base]),
             class_members: Box::default(),
-            instance_fields: ProvidedInstanceFields::default(),
+            instance_fields: ProvidedInstanceFields::default().into(),
         },
     )
 }
@@ -1042,7 +1042,7 @@ fn supplied_class_identity_uses_the_source_call_without_inference() -> anyhow::R
                         name: Name::new(name),
                         bases: Box::default(),
                         class_members: Box::default(),
-                        instance_fields: ProvidedInstanceFields::default(),
+                        instance_fields: ProvidedInstanceFields::default().into(),
                     },
                 )
                 .unwrap()

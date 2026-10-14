@@ -88,7 +88,7 @@ enum DynamicClassHeaderAnchor<'db> {
 /// Identifies a dangling dynamic-class call relative to its enclosing scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
 pub enum DynamicClassScopeOffset {
-    /// A call in the module AST, identified by its scope-relative node index.
+    /// An expression in the module AST, identified by its scope-relative node index.
     Node(u32),
 
     /// A call in a detached annotation, whose nodes are not in the module AST.
@@ -132,11 +132,7 @@ fn dynamic_class_header_range<'db>(
                 let owner = module.get_by_index(absolute_index);
                 return relative_range + owner.start();
             }
-            let node: &ast::ExprCall = module
-                .get_by_index(absolute_index)
-                .try_into()
-                .expect("scope offset should point to ExprCall");
-            node.range()
+            module.get_by_index(absolute_index).range()
         }
     }
 }

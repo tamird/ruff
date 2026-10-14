@@ -1109,7 +1109,8 @@ WithMeta.meta_method
                         has_dynamic_fields: false,
                         implications: Box::default(),
                         data: None,
-                    },
+                    }
+                    .into(),
                 },
             )
             .unwrap();
