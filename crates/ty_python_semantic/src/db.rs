@@ -2,8 +2,8 @@ use crate::dependency::DependencyMetadata;
 use crate::lint::{LintRegistry, RuleSelection};
 use crate::provided::{
     BuiltinUsage, ProvidedBindingResolution, ProvidedBindingValue, ProvidedCallResult,
-    ProvidedData, ProvidedInstanceFields, ProvidedReturnType, ProvidedTypeApplication,
-    TypeExpressionContext,
+    ProvidedData, ProvidedGetattrPresence, ProvidedInstanceFields, ProvidedReturnType,
+    ProvidedTypeApplication, TypeExpressionContext,
 };
 use crate::types::CheckedCall;
 use crate::{AnalysisSettings, PythonVersionWithSource};
@@ -149,15 +149,19 @@ pub trait Db: PythonCoreDb {
         false
     }
 
-    /// Whether a supplied `__getattr__` declaration bounds the values of existing members
-    /// without guaranteeing that the requested member exists.
+    /// Describes the presence of an attribute handled by a supplied `__getattr__` declaration.
     ///
-    /// This describes the requested attribute, not the availability of the getter itself.
-    /// Ty preserves ordinary argument checking and the specialized return type, but marks
-    /// the fallback member as possibly undefined. Implementations must identify the resolved
-    /// declaration and read tracked inputs without inferring the getter's body.
-    fn provided_getattr_may_be_missing(&self, _definition: Definition<'_>) -> bool {
-        false
+    /// Ordinary argument checking still determines the getter's result type. An absent result
+    /// participates in ordinary missing-member lookup, including union alternatives and
+    /// `getattr` defaults. Implementations must identify the resolved declaration and read
+    /// tracked inputs without inferring the getter's body.
+    fn provided_getattr_presence<'db>(
+        &'db self,
+        _definition: Definition<'db>,
+        _receiver: crate::types::Type<'db>,
+        _attribute: &str,
+    ) -> ProvidedGetattrPresence {
+        ProvidedGetattrPresence::Present
     }
 
     /// Marks a supplied function declaration as usable only for type checking.
@@ -317,6 +321,12 @@ pub(crate) mod tests {
         &ProvidedData,
     ) -> Option<ProvidedInstanceFields<'db>>;
     type DeclarationPredicate = for<'db> fn(&'db TestDb, Definition<'db>) -> bool;
+    type GetattrPresenceProvider = for<'db> fn(
+        &'db TestDb,
+        Definition<'db>,
+        crate::types::Type<'db>,
+        &str,
+    ) -> ProvidedGetattrPresence;
     type TypeTestProvider = for<'db> fn(
         &'db TestDb,
         ProgramFile<'db>,
@@ -342,7 +352,7 @@ pub(crate) mod tests {
         type_reference_provider: Option<TypeReferenceProvider>,
         instance_fields_provider: Option<InstanceFieldsProvider>,
         type_test_provider: Option<TypeTestProvider>,
-        getattr_presence_provider: Option<DeclarationPredicate>,
+        getattr_presence_provider: Option<GetattrPresenceProvider>,
         keyword_field_factory: Option<DeclarationPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
@@ -561,9 +571,16 @@ pub(crate) mod tests {
                 .is_some_and(|provider| provider(self, definition))
         }
 
-        fn provided_getattr_may_be_missing(&self, definition: Definition<'_>) -> bool {
+        fn provided_getattr_presence<'db>(
+            &'db self,
+            definition: Definition<'db>,
+            receiver: crate::types::Type<'db>,
+            attribute: &str,
+        ) -> ProvidedGetattrPresence {
             self.getattr_presence_provider
-                .is_some_and(|provider| provider(self, definition))
+                .map_or(ProvidedGetattrPresence::Present, |provider| {
+                    provider(self, definition, receiver, attribute)
+                })
         }
 
         fn provided_type_test<'db>(
@@ -657,7 +674,7 @@ pub(crate) mod tests {
         type_reference_provider: Option<TypeReferenceProvider>,
         instance_fields_provider: Option<InstanceFieldsProvider>,
         type_test_provider: Option<TypeTestProvider>,
-        getattr_presence_provider: Option<DeclarationPredicate>,
+        getattr_presence_provider: Option<GetattrPresenceProvider>,
         keyword_field_factory: Option<DeclarationPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
@@ -758,7 +775,7 @@ pub(crate) mod tests {
 
         pub(crate) fn with_getattr_presence_provider(
             mut self,
-            provider: DeclarationPredicate,
+            provider: GetattrPresenceProvider,
         ) -> Self {
             self.getattr_presence_provider = Some(provider);
             self

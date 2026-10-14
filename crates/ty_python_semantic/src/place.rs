@@ -1274,7 +1274,7 @@ impl<'db> PlaceAndQualifiers<'db> {
         previous_place: Self,
         cycle: &salsa::Cycle,
     ) -> Self {
-        let qualifiers = if cycle.iteration() <= 1 {
+        let mut qualifiers = if cycle.iteration() <= 1 {
             self.qualifiers
         } else {
             previous_place.qualifiers.union(self.qualifiers)
@@ -1329,6 +1329,15 @@ impl<'db> PlaceAndQualifiers<'db> {
             }
             (Place::Undefined, Place::Undefined) => Place::Undefined,
         };
+        qualifiers.set(
+            TypeQualifiers::KNOWN_ABSENT,
+            place.is_undefined()
+                && self.qualifiers.contains(TypeQualifiers::KNOWN_ABSENT)
+                && (cycle.iteration() <= 1
+                    || previous_place
+                        .qualifiers
+                        .contains(TypeQualifiers::KNOWN_ABSENT)),
+        );
         PlaceAndQualifiers { place, qualifiers }
     }
 }

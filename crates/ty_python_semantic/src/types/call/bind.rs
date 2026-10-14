@@ -25,10 +25,12 @@ use smallvec::{SmallVec, smallvec, smallvec_inline};
 
 use self::constructor::{ConstructorBinding, ConstructorContext};
 use super::{Argument, CallArguments, CallError, CallErrorKind, InferContext, Signature, Type};
+use crate::TypeQualifiers;
 use crate::db::Db;
 use crate::dunder_all::dunder_all_names;
 use crate::lint::LintMetadata;
-use crate::place::{DefinedPlace, Definedness, Place};
+use crate::place::{DefinedPlace, Definedness, Place, PlaceAndQualifiers};
+use crate::provided::ProvidedGetattrPresence;
 use crate::subscript::PyIndex;
 use crate::types::call::arguments::{
     CallArgumentExpansions, CallArgumentTypes, Expansion, KnownUnpacking,
@@ -1143,31 +1145,64 @@ impl<'db> Bindings<'db> {
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
-    ) -> Place<'db> {
-        let may_be_missing = |overload: &Binding<'db>| {
-            overload
-                .signature
-                .definition()
-                .is_some_and(|definition| db.provided_getattr_may_be_missing(definition))
+        receiver: Type<'db>,
+        attribute: &str,
+    ) -> PlaceAndQualifiers<'db> {
+        let combine = |left, right| {
+            if left == right {
+                left
+            } else {
+                ProvidedGetattrPresence::PossiblyMissing
+            }
         };
-        let possibly_undefined = self.elements.iter().any(|element| {
-            element.callables().any(|binding| {
-                let mut selected = binding.selected_overloads().peekable();
-                if selected.peek().is_some() {
-                    selected.any(|(_, overload)| may_be_missing(overload))
-                } else {
-                    // Failed calls recover a sole overload's result, or Unknown for multiple
-                    // candidates. Recovery cannot guarantee presence through a marked getter.
-                    binding.overloads().iter().any(may_be_missing)
-                }
+        let item_presence = |item: &CallableItem<'db>| {
+            let binding = item.callable();
+            let mut selected = binding.selected_overloads().peekable();
+            let overloads = if selected.peek().is_some() {
+                Either::Left(selected.map(|(_, overload)| overload))
+            } else {
+                // Invalid calls retain the same recovery candidates as ordinary call inference.
+                Either::Right(binding.overloads().iter())
+            };
+            overloads
+                .map(|overload| {
+                    overload
+                        .signature
+                        .definition()
+                        .map_or(ProvidedGetattrPresence::Present, |definition| {
+                            db.provided_getattr_presence(definition, receiver, attribute)
+                        })
+                })
+                .reduce(combine)
+                .unwrap_or(ProvidedGetattrPresence::Present)
+        };
+        let mut removed_result = false;
+        let presence = self
+            .iter_callable_items()
+            .map(|item| {
+                let presence = item_presence(item);
+                removed_result |= presence == ProvidedGetattrPresence::Absent;
+                presence
             })
-        });
-        let definedness = if possibly_undefined {
+            .reduce(combine)
+            .unwrap_or(ProvidedGetattrPresence::Present);
+        if presence == ProvidedGetattrPresence::Absent {
+            return Place::Undefined.with_qualifiers(TypeQualifiers::KNOWN_ABSENT);
+        }
+        let definedness = if presence == ProvidedGetattrPresence::PossiblyMissing {
             Definedness::PossiblyUndefined
         } else {
             Definedness::AlwaysDefined
         };
-        Place::Defined(DefinedPlace::new(self.return_type(db, env)).with_definedness(definedness))
+        let result = if removed_result {
+            self.map_item_types(db, env, |item| {
+                (item_presence(item) != ProvidedGetattrPresence::Absent)
+                    .then(|| item.return_type(db, env))
+            })
+        } else {
+            self.return_type(db, env)
+        };
+        Place::Defined(DefinedPlace::new(result).with_definedness(definedness)).into()
     }
 
     /// Maps each `CallableBinding` to a type and combines results while preserving

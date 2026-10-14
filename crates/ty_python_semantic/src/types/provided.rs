@@ -272,6 +272,15 @@ pub struct ProvidedReturnType<'db> {
     pub source: FileRange,
 }
 
+/// Whether a supplied getter can provide a particular attribute on its receiver.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProvidedGetattrPresence {
+    #[default]
+    Present,
+    PossiblyMissing,
+    Absent,
+}
+
 /// Ordinary inference of children of an application-defined type expression.
 ///
 /// Child expressions must belong to the supplied application. Inference preserves the

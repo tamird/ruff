@@ -2586,9 +2586,144 @@ fn callable_metadata_survives_signature_transforms() -> anyhow::Result<()> {
 }
 
 #[test]
+fn supplied_getters_can_reject_attributes_on_specialized_receivers() -> anyhow::Result<()> {
+    fn presence<'db>(
+        db: &'db TestDb,
+        definition: Definition<'db>,
+        receiver: Type<'db>,
+        attribute: &str,
+    ) -> ProvidedGetattrPresence {
+        let file = definition.program_file(db);
+        if file
+            .file(db)
+            .path(db)
+            .as_system_path()
+            .is_none_or(|path| path.as_str() != "/src/native.pyi")
+            || definition.name(db).as_deref() != Some("__getattr__")
+        {
+            return ProvidedGetattrPresence::Present;
+        }
+        let Type::ClassLiteral(ClassLiteral::Static(class)) =
+            crate::place::global_symbol(db, file, "Store")
+                .place
+                .expect_type()
+        else {
+            return ProvidedGetattrPresence::Present;
+        };
+        let env = ProgramEnvironment::from_file(file);
+        let Some(specialization) = receiver.base_class_specialization(db, &env, class) else {
+            return ProvidedGetattrPresence::Present;
+        };
+        let [Type::TypedDict(schema)] = specialization.types(db) else {
+            return ProvidedGetattrPresence::PossiblyMissing;
+        };
+        if schema.items(db).contains_key(attribute) {
+            ProvidedGetattrPresence::Present
+        } else if schema.openness(db) == TypedDictOpenness::Closed {
+            ProvidedGetattrPresence::Absent
+        } else {
+            ProvidedGetattrPresence::PossiblyMissing
+        }
+    }
+
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_getattr_presence_provider(presence)
+        .with_file(
+            "/src/native.pyi",
+            "from typing_extensions import TypedDict
+class Closed(TypedDict, closed=True):
+    x: int
+class Open(TypedDict):
+    x: int
+class Store[S]:
+    def __getattr__(self, name: str) -> int: ...
+class Derived(Store[Closed]): ...
+class Known:
+    y: str
+class Plain: ...
+class Override(Derived):
+    y: str
+",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import Store, Closed, Open, Derived, Known, Plain, Override
+from typing import Any
+from typing_extensions import assert_type
+closed = Store[Closed]()
+open_ = Store[Open]()
+derived = Derived()
+closed.y
+derived.y
+assert_type(closed.x, int)
+assert_type(getattr(closed, 'y', None), None)
+assert_type(getattr(open_, 'y', None), int | None)
+assert_type(getattr(Plain(), 'missing', None), Any | None)
+assert_type(Override().y, str)
+assert_type(getattr(Override(), 'y', None), str | None)
+def combined(value: Store[Closed] | Known):
+    assert_type(getattr(value, 'y', None), str | None)
+def mixed(value: Store[Closed] | Store[Open]):
+    assert_type(getattr(value, 'y', None), int | None)
+",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["unresolved-attribute", "unresolved-attribute"],
+        "{diagnostics:#?}"
+    );
+    let program = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program);
+    let closed = crate::place::global_symbol(&db, program, "closed")
+        .place
+        .expect_type();
+    let fields = Type::protocol_with_readonly_members(
+        &db,
+        &env,
+        [("x", KnownClass::Int.to_instance(&db, &env))],
+    );
+    let intersection = crate::types::IntersectionType::from_two_elements(&db, &env, closed, fields);
+    assert!(intersection.member(&db, &env, "y").place.is_undefined());
+    assert_eq!(
+        intersection.member(&db, &env, "x").place.expect_type(),
+        KnownClass::Int.to_instance(&db, &env)
+    );
+    let native = db.program_file(system_path_to_file(&db, "/src/native.pyi")?);
+    let known = crate::place::global_symbol(&db, native, "Known")
+        .place
+        .expect_type()
+        .to_instance_approximation(&db, &env)
+        .context("missing Known instance")?;
+    let union = crate::types::UnionType::from_two_elements(&db, &env, closed, known);
+    let member = union.member(&db, &env, "y");
+    assert_eq!(
+        member.place.expect_type(),
+        KnownClass::Str.to_instance(&db, &env)
+    );
+    assert!(!member.qualifiers.contains(TypeQualifiers::KNOWN_ABSENT));
+    Ok(())
+}
+
+#[test]
 fn supplied_getter_inputs_and_defaults_remain_independent() -> anyhow::Result<()> {
-    fn presence(db: &TestDb, definition: ty_python_core::definition::Definition<'_>) -> bool {
-        definition.name(db).as_deref() == Some("__getattr__")
+    fn presence<'db>(
+        db: &'db TestDb,
+        definition: Definition<'db>,
+        _receiver: Type<'db>,
+        _attribute: &str,
+    ) -> ProvidedGetattrPresence {
+        if definition.name(db).as_deref() == Some("__getattr__") {
+            ProvidedGetattrPresence::PossiblyMissing
+        } else {
+            ProvidedGetattrPresence::Present
+        }
     }
     let db = TestDbBuilder::new()
         .with_file(
@@ -2932,7 +3067,12 @@ combined: Present | MaybeFallback[Callable[[str], None]]
 
 #[test]
 fn supplied_getters_preserve_attribute_presence() -> anyhow::Result<()> {
-    fn presence(db: &TestDb, definition: ty_python_core::definition::Definition<'_>) -> bool {
+    fn presence<'db>(
+        db: &'db TestDb,
+        definition: Definition<'db>,
+        _receiver: Type<'db>,
+        _attribute: &str,
+    ) -> ProvidedGetattrPresence {
         if definition
             .program_file(db)
             .file(db)
@@ -2940,24 +3080,29 @@ fn supplied_getters_preserve_attribute_presence() -> anyhow::Result<()> {
             .as_system_path()
             .is_none_or(|path| path.as_str() != "/src/native.pyi")
         {
-            return false;
+            return ProvidedGetattrPresence::Present;
         }
         let ty_python_core::definition::DefinitionKind::Function(function) = definition.kind(db)
         else {
-            return false;
+            return ProvidedGetattrPresence::Present;
         };
         let module = parsed_module(db, definition.python_file(db)).load(db);
         let function = function.node(&module);
         if function.name.as_str() != "__getattr__" {
-            return false;
+            return ProvidedGetattrPresence::Present;
         }
         let Some(parameter) = function.parameters.find("name") else {
-            return false;
+            return ProvidedGetattrPresence::Present;
         };
-        parameter
+        if parameter
             .annotation()
             .and_then(ast::Expr::as_name_expr)
             .is_some_and(|annotation| matches!(annotation.id.as_str(), "str" | "int"))
+        {
+            ProvidedGetattrPresence::PossiblyMissing
+        } else {
+            ProvidedGetattrPresence::Present
+        }
     }
     let original = r#"
 from typing import Literal, overload

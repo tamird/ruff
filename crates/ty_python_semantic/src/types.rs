@@ -1358,9 +1358,11 @@ impl MemberLookupPolicy {
         mut member: PlaceAndQualifiers<'db>,
     ) -> PlaceAndQualifiers<'db> {
         if self.contains(Self::PRESERVE_MISSING_ALTERNATIVES) && member.place.is_undefined() {
-            // None has no unknown instance storage or subclass that could supply the member.
-            // Keep the missing path so a supplied getattr default still contributes.
-            let ty = if receiver.is_none(db) {
+            // A known absent member contributes only the default to getattr. Other missing
+            // declarations can still have unknown instance storage supplied by a subclass.
+            let ty = if receiver.is_none(db)
+                || member.qualifiers.contains(TypeQualifiers::KNOWN_ABSENT)
+            {
                 Type::Never
             } else {
                 Type::unknown()
@@ -1368,6 +1370,7 @@ impl MemberLookupPolicy {
             member.place = Place::Defined(
                 DefinedPlace::new(ty).with_definedness(Definedness::PossiblyUndefined),
             );
+            member.qualifiers.remove(TypeQualifiers::KNOWN_ABSENT);
         }
         member
     }
@@ -2784,6 +2787,33 @@ impl<'db> Type<'db> {
         class
             .static_class_literal(db)
             .and_then(|(class_literal, specialization)| Some((class_literal, specialization?)))
+    }
+
+    /// Returns the specialization of a static class in this instance's method resolution order.
+    pub fn base_class_specialization(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        expected_class: StaticClassLiteral<'db>,
+    ) -> Option<Specialization<'db>> {
+        if let Type::Intersection(intersection) = self.resolve_type_alias(db) {
+            return intersection
+                .positive(db)
+                .iter()
+                .find_map(|element| element.base_class_specialization(db, env, expected_class));
+        }
+        let class = self.nominal_class(db, env)?;
+        class
+            .iter_mro(db)
+            .filter_map(ClassBase::into_class)
+            .find_map(|base| {
+                let (class, specialization) = base.static_class_literal(db)?;
+                if class == expected_class {
+                    specialization
+                } else {
+                    None
+                }
+            })
     }
 
     /// If this type is a class instance, returns its class.
@@ -8549,7 +8579,9 @@ impl<'db> Type<'db> {
             Err(CallDunderError::CallError(_, bindings, _)) => {
                 return member_lookup_result(
                     db,
-                    bindings.getattr_result(db, env).into(),
+                    bindings
+                        .getattr_result(db, env, receiver.unwrap_or(self), name)
+                        .into(),
                     Some(MemberLookupErrorKind::GetAttr {
                         receiver: self,
                         name: name_type,
@@ -8559,15 +8591,11 @@ impl<'db> Type<'db> {
             }
             Err(CallDunderError::MethodNotAvailable) => return Place::Undefined.into(),
         };
-        let place = if possibly_unbound {
-            Place::Defined(
-                DefinedPlace::new(bindings.return_type(db, env))
-                    .with_definedness(Definedness::PossiblyUndefined),
-            )
-        } else {
-            bindings.getattr_result(db, env)
-        };
-        member_lookup_result(db, place.into(), None, None)
+        let mut member = bindings.getattr_result(db, env, receiver.unwrap_or(self), name);
+        if possibly_unbound && let Place::Defined(defined) = member.place {
+            member.place = Place::Defined(defined.with_definedness(Definedness::PossiblyUndefined));
+        }
+        member_lookup_result(db, member, None, None)
     }
 
     /// Apply `__getattr__` / `__getattribute__` fallback to an attribute-lookup result.
@@ -11713,6 +11741,9 @@ bitflags! {
         /// Unlike a declaration alone, this storage shadows class defaults and non-data
         /// descriptors. Data descriptors retain their usual precedence.
         const GUARANTEED_INSTANCE_STORAGE = 1 << 8;
+        /// An undefined member proven absent by a supplied getter's runtime contract.
+        /// Ordinary missing declarations can still have unknown subclass or instance storage.
+        const KNOWN_ABSENT = 1 << 9;
     }
 }
 
@@ -11747,7 +11778,8 @@ impl TypeQualifiers {
     pub fn is_non_standard(self) -> bool {
         const NON_STANDARD: TypeQualifiers = TypeQualifiers::IMPLICIT_INSTANCE_ATTRIBUTE
             .union(TypeQualifiers::FROM_MODULE_GETATTR)
-            .union(TypeQualifiers::GUARANTEED_INSTANCE_STORAGE);
+            .union(TypeQualifiers::GUARANTEED_INSTANCE_STORAGE)
+            .union(TypeQualifiers::KNOWN_ABSENT);
         self.intersects(NON_STANDARD)
     }
 }
@@ -11772,7 +11804,7 @@ impl<'db> TypeAndQualifiers<'db> {
         Self {
             inner,
             origin,
-            qualifiers,
+            qualifiers: qualifiers.difference(TypeQualifiers::KNOWN_ABSENT),
             provenance: Provenance::Unknown,
         }
     }
