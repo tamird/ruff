@@ -785,6 +785,7 @@ pub(crate) mod tests {
         third_party_packages: bool,
         rule_selection: Option<RuleSelection>,
         lint_registry: Option<LintRegistry>,
+        analysis_settings: Option<AnalysisSettings>,
         call_result_provider: Option<CallResultProvider>,
         contextual_parameters_provider: Option<ContextualParametersProvider>,
         call_argument_context_provider: Option<CallArgumentContextProvider>,
@@ -810,6 +811,7 @@ pub(crate) mod tests {
                 third_party_packages: false,
                 rule_selection: None,
                 lint_registry: None,
+                analysis_settings: None,
                 call_result_provider: None,
                 contextual_parameters_provider: None,
                 call_argument_context_provider: None,
@@ -852,6 +854,11 @@ pub(crate) mod tests {
 
         pub(crate) fn with_lint_registry(mut self, registry: LintRegistry) -> Self {
             self.lint_registry = Some(registry);
+            self
+        }
+
+        pub(crate) fn with_analysis_settings(mut self, settings: AnalysisSettings) -> Self {
+            self.analysis_settings = Some(settings);
             self
         }
 
@@ -973,6 +980,10 @@ pub(crate) mod tests {
 
             if let Some(selection) = self.rule_selection {
                 db.rule_selection = Arc::new(selection);
+            }
+
+            if let Some(settings) = self.analysis_settings {
+                db.analysis_settings = Arc::new(settings);
             }
 
             for src_root in &self.src_roots {

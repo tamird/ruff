@@ -79,6 +79,32 @@ wrapped: BuiltinFunctionType = staticmethod(native).__func__
 }
 
 #[test]
+fn supplied_builtin_declaration_does_not_supply_an_implementation_return_type() -> anyhow::Result<()>
+{
+    let db = TestDbBuilder::new()
+        .with_analysis_settings(crate::AnalysisSettings {
+            return_type_inference: crate::ReturnTypeInference::Always,
+            ..crate::AnalysisSettings::default()
+        })
+        .with_builtin_function(|db, definition| definition.name(db).as_deref() == Some("native"))
+        .with_file(
+            "/src/main.py",
+            "def native(): pass\ndef ordinary(): pass\nnative_result = native()\nordinary_result = ordinary()\n",
+        )
+        .build()?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let env = ProgramEnvironment::from_file(file);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type()
+    };
+    assert_eq!(symbol("native_result"), Type::unknown());
+    assert_eq!(symbol("ordinary_result"), Type::none(&db, &env));
+    Ok(())
+}
+
+#[test]
 fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyhow::Result<()> {
     fn refine<'db>(
         db: &'db TestDb,

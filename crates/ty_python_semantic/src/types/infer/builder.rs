@@ -51,7 +51,7 @@ use crate::place_load::{
 };
 use crate::reachability::{
     BooleanIdentity, ReachabilityEvaluationCache, analyze_condition_expression,
-    evaluate_reachability_with_cache,
+    evaluate_reachability_with_cache, is_end_of_scope_reachable_in_domain,
 };
 use crate::types::abstract_methods::AbstractMethods;
 use crate::types::add_inferred_python_version_hint_to_diagnostic;
@@ -13433,8 +13433,60 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
+    /// Infer the return type of a function body based on the types of
+    /// expressions in reachable `return` statements.
+    fn inferred_return_type(&self) -> Option<Type<'db>> {
+        if !self.settings().return_type_inference.is_active() || self.in_stub() {
+            return None;
+        }
+
+        let db = self.db();
+        let function = self.scope().node(db).as_function()?.node(self.module());
+
+        // We never infer types for functions with an explicit return type annotation
+        if SourceAnnotation::function_return(db, self.program_file(), function).is_some()
+            || db.provided_function_is_builtin(self.index.expect_single_definition(function))
+        {
+            return None;
+        }
+
+        // TODO: Support return type inference for async functions and generators
+        if function.is_async
+            || self
+                .scope()
+                .file_scope_id(db)
+                .is_generator_function(self.index)
+        {
+            return None;
+        }
+
+        let env = self.program_environment();
+        let mut return_type = UnionBuilder::new(db, env);
+
+        // During cycle recovery, include `Divergent` to avoid inferring `Never`,
+        // which could make code after a recursive call appear unreachable.
+        if let Some(fallback) = self.cycle_recovery {
+            return_type = return_type.add(fallback);
+        }
+
+        // Union the types of all expressions in reachable `return` statements
+        for returned in &self.return_types_and_ranges {
+            if self.context.is_range_reachable(returned.range) {
+                return_type = return_type.add(returned.ty);
+            }
+        }
+
+        // Add `None` if the function can implicitly return it
+        if is_end_of_scope_reachable_in_domain(db, self.scope(), self.context.body_domain) {
+            return_type = return_type.add(Type::none(db, env));
+        }
+
+        Some(return_type.build())
+    }
+
     pub(super) fn finish_scope(mut self) -> ScopeInference<'db> {
         self.infer_region();
+        let return_type = self.inferred_return_type();
 
         let Self {
             implicit_aliases,
@@ -13481,7 +13533,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             || cycle_recovery.is_some()
             || !type_expression_flags.is_empty()
             || !collection_use_constraints.is_empty()
-            || !qualifiers.is_empty())
+            || !qualifiers.is_empty()
+            || return_type.is_some())
         .then(|| {
             collection_use_constraints.shrink_to_fit();
             Box::new(ScopeInferenceExtra {
@@ -13493,6 +13546,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 collection_use_constraints,
                 cycle_recovery,
                 diagnostics,
+                return_type,
             })
         });
 
