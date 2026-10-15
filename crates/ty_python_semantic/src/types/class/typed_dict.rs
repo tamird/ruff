@@ -829,8 +829,17 @@ fn synthesize_typed_dict_merge<'db>(
         let overload_three_parameters = [
             Parameter::positional_only(Some(Name::new_static("self")))
                 .with_annotated_type(instance_ty),
-            Parameter::positional_only(Some(Name::new_static("value")))
-                .with_annotated_type(dict_param_ty),
+            Parameter::positional_only(Some(Name::new_static("value"))).with_annotated_type(
+                UnionType::from_two_elements(
+                    db,
+                    env,
+                    dict_param_ty,
+                    Type::TypedDict(TypedDictType::from_schema_items(
+                        db,
+                        TypedDictSchema::default(),
+                    )),
+                ),
+            ),
         ];
         overloads.push(Signature::new_generic(
             Some(GenericContext::from_typevar_instances(

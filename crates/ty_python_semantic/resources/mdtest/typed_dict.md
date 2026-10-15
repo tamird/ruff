@@ -1135,6 +1135,149 @@ def shadowed(source: Source):
     copied: Source = dict(source)
 ```
 
+## Contextual dictionary unions
+
+The result of a dictionary union can satisfy a `TypedDict` whose fields come from both operands. The
+operands keep their own types. When neither operand describes the combined result, a union without a
+result annotation produces an ordinary dictionary.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing_extensions import NotRequired, ReadOnly, TypedDict
+
+class A(TypedDict, closed=True):
+    a: int
+
+class B(TypedDict, closed=True):
+    b: str
+
+class C(TypedDict, closed=True):
+    c: bool
+
+class AB(TypedDict, closed=True):
+    a: int
+    b: str
+
+class ABC(TypedDict, closed=True):
+    a: int
+    b: str
+    c: bool
+
+def consume(value: AB) -> None: ...
+def merge(a: A, b: B, c: C) -> AB:
+    ab: AB = a | b  # no diagnostic
+    consume(a | b)  # no diagnostic
+    reveal_type(a | b)  # revealed: dict[str, object]
+    reveal_type(a.__or__(b))  # revealed: dict[str, object]
+    abc: ABC = a | b | c  # no diagnostic
+    return a | b  # no diagnostic
+
+type AliasA = A
+type AliasB = B
+type AliasAB = AB
+
+def aliased(a: AliasA, b: AliasB) -> AliasAB:
+    return a | b  # no diagnostic
+
+def make_a() -> A:
+    return {"a": 1}
+
+def called(b: B) -> AB:
+    return make_a() | b  # no diagnostic
+```
+
+A required right-hand field replaces the old value. An optional field preserves both possible values
+and cannot establish a missing required key.
+
+```py
+class Text(TypedDict, closed=True):
+    a: str
+
+class MaybeText(TypedDict, closed=True):
+    a: NotRequired[str]
+
+class Either(TypedDict, closed=True):
+    a: int | str
+
+class Empty(TypedDict, closed=True): ...
+
+def overwrite(a: A, text: Text, maybe: MaybeText, empty: Empty):
+    replaced: Text = a | text  # no diagnostic
+    # error: [invalid-argument-type]
+    wrong_order: Text = text | a
+    preserved: Either = a | maybe  # no diagnostic
+    # error: [invalid-argument-type]
+    possibly_old: Text = a | maybe
+    # error: [missing-typed-dict-key]
+    possibly_missing: Text = empty | maybe
+```
+
+Open operands can contain hidden fields. A hidden right-hand field can overwrite a known left-hand
+field, and hidden left-hand fields survive the copy.
+
+```py
+class OpenB(TypedDict):
+    b: str
+
+class OpenAB(TypedDict, extra_items=ReadOnly[object]):
+    a: int
+    b: str
+
+def same(a: OpenB, b: OpenB) -> OpenB:
+    same: OpenB = a | b  # no diagnostic
+    return same
+
+def hidden(a: A, b: OpenB):
+    # error: [invalid-argument-type]
+    # error: [invalid-key]
+    unsafe_override: AB = a | b
+    # error: [invalid-key]
+    hidden_left: AB = b | a
+    # error: [invalid-argument-type]
+    allowed_extra_keys: OpenAB = a | b
+```
+
+The outer dictionary is fresh, but nested mutable values remain shared.
+
+```py
+class Readonly(TypedDict, closed=True):
+    values: ReadOnly[list[int]]
+
+class Mutable(TypedDict, closed=True):
+    values: list[int]
+    b: str
+
+class Wider(TypedDict, closed=True):
+    values: list[int | str]
+    b: str
+
+def shallow(source: Readonly, b: B):
+    mutable: Mutable = source | b  # no diagnostic
+    # error: [invalid-argument-type]
+    widened: Wider = source | b
+```
+
+Fresh literal values still receive contextual types for mutable containers and lambda parameters.
+
+```py
+from collections.abc import Callable
+
+class Config(TypedDict, closed=True):
+    values: list[object]
+
+class Callback(TypedDict, closed=True):
+    callback: Callable[[int], int]
+
+config: Config = {} | {"values": [1]}  # no diagnostic
+chain: Config = {"values": [1]} | {"values": [2]} | {"values": [3]}  # no diagnostic
+balanced: Config = ({} | {"values": [1]}) | ({} | {"values": [2]})  # no diagnostic
+callback: Callback = {} | {"callback": lambda value: reveal_type(value)}  # revealed: int
+```
+
 ## Copying observed dictionary contents
 
 A fresh dictionary can be checked against a `TypedDict` using the source's known entries and

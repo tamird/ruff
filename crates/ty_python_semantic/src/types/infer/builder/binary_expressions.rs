@@ -14,6 +14,7 @@ use crate::types::dictionary::DictionaryItems;
 use crate::types::function::OverloadLiteral;
 use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::tuple::{TupleSpecBuilder, TupleType};
+use crate::types::typed_dict::validate_typed_dict_copy;
 use crate::types::typevar::TypeVarConstraints;
 use crate::types::{
     DynamicType, InternedConstraintSet, KnownClass, KnownInstanceType, LiteralValueTypeKind,
@@ -48,6 +49,18 @@ fn is_union_type_operand(ty: Type<'_>) -> bool {
                     | KnownInstanceType::Sentinel(_)
             )
     )
+}
+
+fn has_dict_literal_operand(expression: &ast::Expr) -> bool {
+    match expression {
+        ast::Expr::Dict(_) => true,
+        ast::Expr::BinOp(binary) => {
+            binary.op == ast::Operator::BitOr
+                && (has_dict_literal_operand(&binary.left)
+                    || has_dict_literal_operand(&binary.right))
+        }
+        _ => false,
+    }
 }
 
 /// Repeated conditional concatenation can double the number of tuple alternatives at each step.
@@ -167,12 +180,60 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
 
         let ast::ExprBinOp {
-            left: _,
+            left,
             op,
-            right: _,
+            right,
             range: _,
             node_index: _,
         } = binary;
+
+        if *op == ast::Operator::BitOr
+            && !self.in_detached_annotation()
+            && let Some(typed_dict) = tcx
+                .annotation
+                .and_then(|ty| ty.resolve_type_alias(self.db()).as_typed_dict())
+            // Preserve bidirectional inference for fresh values in literal operands.
+            && !has_dict_literal_operand(left)
+            && !has_dict_literal_operand(right)
+        {
+            let mut candidate = self.speculate();
+            let result = candidate.infer_binary_expression(binary, TypeContext::default());
+            let db = candidate.db();
+            let env = candidate.program_environment();
+            if !result.has_provisional_marker(db, env)
+                && [left.as_ref(), right.as_ref()].into_iter().all(|operand| {
+                    candidate
+                        .try_expression_type(operand)
+                        .is_some_and(|ty| !ty.has_provisional_marker(db, env))
+                })
+            {
+                if result.is_assignable_to(db, env, Type::TypedDict(typed_dict)) {
+                    self.extend(candidate);
+                    return result;
+                }
+                if let Some((key_ty, _)) = result.unpack_keys_and_items(db, env)
+                    && let Ok(dictionary) = DictionaryItems::union(
+                        db,
+                        env,
+                        candidate.scope(),
+                        binary,
+                        &mut |expression| candidate.try_expression_type(expression),
+                    )
+                {
+                    // Validate the complete fresh result: intermediate unions need not contain
+                    // every required field, and a later operand can replace an earlier value.
+                    validate_typed_dict_copy(
+                        &candidate.context,
+                        typed_dict,
+                        binary.into(),
+                        key_ty,
+                        dictionary,
+                    );
+                    self.extend(candidate);
+                    return Type::TypedDict(typed_dict);
+                }
+            }
+        }
 
         let (left_ty, right_ty) = match self.infer_binary_expression_operand_types(binary, tcx) {
             BinaryExpressionOperandTypes::TypedDictResult(ty) => return ty,

@@ -301,31 +301,7 @@ impl<'db> DictionaryItems<'db> {
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
         match expression {
-            ast::Expr::BinOp(binary) => {
-                let ast::ExprBinOp {
-                    node_index: _,
-                    range: _,
-                    left,
-                    op,
-                    right,
-                } = binary;
-                if *op != ast::Operator::BitOr {
-                    return Err(DictionaryFallback::Unavailable);
-                }
-                let mut dictionary = DictionaryItemsBuilder::default();
-                for operand in [left.as_ref(), right.as_ref()] {
-                    let source = Self::builtin_source(
-                        db,
-                        env,
-                        scope,
-                        expression.into(),
-                        operand,
-                        expression_type,
-                    )?;
-                    dictionary.overlay(db, env, source);
-                }
-                Ok(dictionary.finish())
-            }
+            ast::Expr::BinOp(binary) => Self::union(db, env, scope, binary, expression_type),
             ast::Expr::Dict(_) => Self::literal(db, env, scope, expression, expression_type),
             ast::Expr::DictComp(comprehension) => {
                 let ast::ExprDictComp {
@@ -514,6 +490,47 @@ impl<'db> DictionaryItems<'db> {
             }
             observed => observed,
         }
+    }
+
+    pub(super) fn union(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
+        binary: &ast::ExprBinOp,
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+    ) -> DictionaryObservation<'db> {
+        let ast::ExprBinOp {
+            node_index: _,
+            range: _,
+            left,
+            op,
+            right,
+        } = binary;
+        if *op != ast::Operator::BitOr {
+            return Err(DictionaryFallback::Unavailable);
+        }
+        let mut dictionary = DictionaryItemsBuilder::default();
+        for operand in [left.as_ref(), right.as_ref()] {
+            let source =
+                Self::builtin_source(db, env, scope, binary.into(), operand, expression_type)
+                    .or_else(|fallback| match fallback {
+                        DictionaryFallback::Unavailable => {
+                            let ty = expression_type(operand).ok_or(fallback)?;
+                            let unpacked = extract_unpacked_typed_dict_from_value_type(db, env, ty)
+                                .ok_or(fallback)?;
+                            let has_implicit_extra_items = unpacked.has_implicit_extra_items;
+                            let mut source = Self::from_typed_dict(unpacked, operand.range());
+                            if has_implicit_extra_items {
+                                // A hidden RHS field can overwrite any known LHS field.
+                                source.extra_items = DictionaryExtraItems::Value(Type::object());
+                            }
+                            Ok(source)
+                        }
+                        DictionaryFallback::Unreachable => Err(fallback),
+                    })?;
+            dictionary.overlay(db, env, source);
+        }
+        Ok(dictionary.finish())
     }
 
     /// Union dispatch requires a builtin allocation, not just a nominal dictionary type.

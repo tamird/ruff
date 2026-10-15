@@ -337,7 +337,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
         let (key_ty, _) = source_ty.unpack_keys_and_items(self.db(), self.program_environment())?;
         let dictionary = self.dictionary_items(source, source_ty)?;
-        validate_typed_dict_copy(&self.context, typed_dict, source, key_ty, dictionary);
+        validate_typed_dict_copy(&self.context, typed_dict, source.into(), key_ty, dictionary);
         Some(Type::TypedDict(typed_dict))
     }
 

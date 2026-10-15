@@ -2553,7 +2553,7 @@ fn validate_extracted_typed_dict_openness<'db, 'ast>(
 pub(super) fn validate_typed_dict_copy<'db, 'ast>(
     context: &InferContext<'db, 'ast>,
     typed_dict: TypedDictType<'db>,
-    source: &'ast ast::Expr,
+    source: AnyNodeRef<'ast>,
     key_ty: Type<'db>,
     dictionary: DictionaryItems<'db>,
 ) -> bool {
@@ -2600,9 +2600,9 @@ pub(super) fn validate_typed_dict_copy<'db, 'ast>(
         DictionaryExtraItems::Value(ty) => TypedDictOpenness::extra(db, ty, true),
     };
     let nodes = TypedDictAssignmentNodes {
-        typed_dict: source.into(),
-        key: source.into(),
-        value: source.into(),
+        typed_dict: source,
+        key: source,
+        value: source,
     };
     let ignored_keys = OrderSet::new();
     let (provided_keys, mut valid) =
@@ -2615,7 +2615,7 @@ pub(super) fn validate_typed_dict_copy<'db, 'ast>(
         nodes,
         &ignored_keys,
     );
-    valid &= validate_typed_dict_required_keys(context, typed_dict, &provided_keys, source.into());
+    valid &= validate_typed_dict_required_keys(context, typed_dict, &provided_keys, source);
     valid
 }
 
