@@ -5322,11 +5322,17 @@ def accepts_dog(value: Dog) -> None: ...
 dog_consumer: Consumer[Dog] = Consumer(callback=accepts_animal)
 ```
 
-An incompatible callback reports its argument error without producing an additional assignment
-error.
+An incompatible contextual preference falls back to the callback's accepted parameter type. The
+result still fails assignment to the expected consumer. An explicitly specialized constructor
+instead checks the callback against that specialization.
 
 ```py
+# error: [invalid-assignment]
 animal_consumer: Consumer[Animal] = Consumer(
+    callback=accepts_dog,
+)
+
+explicit_consumer = Consumer[Animal](
     callback=accepts_dog,  # error: [invalid-argument-type]
 )
 ```
