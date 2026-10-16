@@ -1633,3 +1633,63 @@ def concrete(a: Box[str], b: Box[int], cond: bool):
     # error: [missing-argument]
     box.invoke(callback, 1)
 ```
+
+## Projecting a generic callback result
+
+Extracting a callback's result closes its local type variables. Returning the callback itself
+preserves its generic signature, and enclosing function variables remain available.
+
+```py
+from typing import Any, Callable, Generic, ParamSpec, TypeVar
+from ty_extensions import Top, static_assert
+from ty_extensions._internal import TypeOf, is_equivalent_to
+
+T = TypeVar("T")
+R = TypeVar("R")
+P = ParamSpec("P")
+
+class Info(Generic[T]):
+    @property
+    def value(self) -> T:
+        raise NotImplementedError
+    @property
+    def items(self) -> list[T]:
+        raise NotImplementedError
+
+def project(callback: Callable[P, R]) -> R:
+    raise NotImplementedError
+
+def decorate(callback: Callable[P, R]) -> Callable[P, R]:
+    return callback
+
+def generic(*, value: T) -> Info[T]:
+    raise NotImplementedError
+
+first = project(generic)
+second = project(generic)
+static_assert(is_equivalent_to(TypeOf[first], Top[Info[Any]]))
+# error: [invalid-argument-type]
+first.items.append(second.value)
+# error: [invalid-argument-type]
+first.items.extend(second.items)
+
+def caller(value: T) -> Info[T]:
+    def captured() -> Info[T]:
+        raise NotImplementedError
+    result = project(captured)
+    result.items.append(value)  # no diagnostic
+    return result
+
+class Owner(Generic[T]):
+    def captured(self) -> Info[T]:
+        raise NotImplementedError
+    def projected(self, value: T) -> Info[T]:
+        result = project(self.captured)
+        result.items.append(value)  # no diagnostic
+        return result
+
+decorated = decorate(generic)
+
+def use(value: str) -> Info[str]:
+    return decorated(value=value)  # no diagnostic
+```

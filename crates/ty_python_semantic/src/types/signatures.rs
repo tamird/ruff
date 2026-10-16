@@ -432,6 +432,46 @@ impl<'db> CallableSignature<'db> {
             type_mapping
         {
             Self::from_overloads(self.overloads.iter().flat_map(|signature| {
+                if visitor.preserve_callable_binders
+                    && let Some(context) = signature.generic_context
+                {
+                    let bindings: Vec<_> = context
+                        .variables(db)
+                        .filter(|variable| {
+                            specialization
+                                .get(db, *variable)
+                                .is_some_and(|mapped| mapped != Type::TypeVar(*variable))
+                        })
+                        .map(|variable| (variable, Type::TypeVar(variable)))
+                        .collect();
+                    if !bindings.is_empty() {
+                        // These variables are still quantified by the returned callable. Shadow
+                        // the outer projection while mapping its signature, including nested types.
+                        let specialization = ApplySpecialization::WithBindings {
+                            specialization,
+                            bindings: &bindings,
+                        };
+                        let mapping = match type_mapping {
+                            TypeMapping::ApplySpecialization(_) => {
+                                TypeMapping::ApplySpecialization(specialization)
+                            }
+                            TypeMapping::ApplySpecializationWithMaterialization {
+                                specialization: _,
+                                materialization_kind,
+                            } => TypeMapping::ApplySpecializationWithMaterialization {
+                                specialization,
+                                materialization_kind: *materialization_kind,
+                            },
+                            _ => unreachable!(),
+                        };
+                        // A different mapping must not reuse cached transformations from the
+                        // outer scope.
+                        let visitor = visitor.for_new_materialization_root();
+                        return Self::single(signature.clone())
+                            .apply_type_mapping_impl(db, &mapping, tcx, &visitor)
+                            .overloads;
+                    }
+                }
                 if let Some((prefix, paramspec)) = signature.parameters.as_paramspec_with_prefix()
                     && let Some(value) = specialization.get(db, paramspec)
                     && let Some(result) = try_apply_type_mapping_for_paramspec(

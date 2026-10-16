@@ -2628,3 +2628,108 @@ def concrete(a: Box[str], b: Box[int], cond: bool):
     # error: [missing-argument]
     box.invoke(callback, 1)
 ```
+
+## Projecting a generic callback result
+
+A callback's type parameters remain quantified when a decorator returns the callback. Projecting
+only its result must not let those parameters escape or correlate independent results.
+
+```py
+from typing import Any, Callable, assert_type
+from ty_extensions import Intersection, Top, static_assert
+from ty_extensions._internal import TypeOf, is_equivalent_to
+
+class Info[T]:
+    @property
+    def value(self) -> T:
+        raise NotImplementedError
+    @property
+    def items(self) -> list[T]:
+        raise NotImplementedError
+
+def project[**P, R](callback: Callable[P, R]) -> R:
+    raise NotImplementedError
+
+def decorate[**P, R](callback: Callable[P, R]) -> Callable[P, R]:
+    return callback
+
+def generic[T](*, value: T) -> Info[T]:
+    raise NotImplementedError
+
+first = project(generic)
+second = project(generic)
+static_assert(is_equivalent_to(TypeOf[first], Top[Info[Any]]))
+# error: [invalid-argument-type]
+first.items.append("wrong")
+# error: [invalid-argument-type]
+first.items.append(second.value)
+# error: [invalid-argument-type]
+first.items.extend(second.items)
+
+def caller[T](value: T) -> Info[T]:
+    def captured() -> Info[T]:
+        raise NotImplementedError
+    result = project(captured)
+    result.items.append(value)  # no diagnostic
+    return result
+
+class Owner[T]:
+    def captured(self) -> Info[T]:
+        raise NotImplementedError
+    def projected(self, value: T) -> Info[T]:
+        result = project(self.captured)
+        result.items.append(value)  # no diagnostic
+        return result
+
+decorated = decorate(generic)
+
+def use(value: str) -> Info[str]:
+    return decorated(value=value)  # no diagnostic
+
+class ProviderKey: ...
+
+class GenericKey(ProviderKey):
+    def __call__[T](self, *, value: T) -> Info[T]:
+        raise NotImplementedError
+
+class Target:
+    def __getitem__[**P, R](self, key: Intersection[ProviderKey, Callable[P, R]]) -> R:
+        raise NotImplementedError
+
+def independent_lookups(left: Target, right: Target, key: GenericKey):
+    first = left[key]
+    second = right[key]
+    # error: [invalid-argument-type]
+    first.items.append(second.value)
+    # error: [invalid-argument-type]
+    first.items.extend(second.items)
+
+def bounded[T: str = str](*, value: T) -> Info[T]:
+    raise NotImplementedError
+
+bounded_first = project(bounded)
+bounded_second = project(bounded)
+# error: [invalid-argument-type]
+bounded_first.items.append(bounded_second.value)
+
+def split[**P, R](callback: Callable[P, R]) -> tuple[R, Callable[P, R]]:
+    raise NotImplementedError
+
+opaque, preserved = split(generic)
+
+def independent_callable(value: str) -> Info[str]:
+    known = preserved(value=value)
+    # error: [invalid-argument-type]
+    opaque.items.append(known.value)
+    return known
+
+def unrelated[T](value: T):
+    result = project(generic)
+    # error: [invalid-argument-type]
+    result.items.append(value)
+
+def gradual(value: Any) -> Any:
+    return value
+
+assert_type(project(gradual), Any)
+```

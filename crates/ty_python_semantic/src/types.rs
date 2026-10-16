@@ -553,6 +553,8 @@ pub(crate) struct ApplyTypeMappingVisitor<'env, 'db> {
     recursion_context: Option<&'env TypeRecursionContext<'db>>,
     /// Whether materialization also transforms type-variable bounds and defaults.
     materialize_typevar_bounds_and_defaults: bool,
+    /// Keep variables quantified by nested callable signatures when closing free variables.
+    preserve_callable_binders: bool,
     default: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
     top_materialization: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
     bottom_materialization: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
@@ -569,6 +571,7 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
             env,
             recursion_context: None,
             materialize_typevar_bounds_and_defaults: true,
+            preserve_callable_binders: false,
             default: OnceCell::default(),
             top_materialization: OnceCell::default(),
             bottom_materialization: OnceCell::default(),
@@ -646,6 +649,7 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
             materialization_equivalence,
             recursion_context: self.recursion_context,
             materialize_typevar_bounds_and_defaults: self.materialize_typevar_bounds_and_defaults,
+            preserve_callable_binders: self.preserve_callable_binders,
             ..Self::new(self.env)
         }
     }
