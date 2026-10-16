@@ -1188,31 +1188,58 @@ impl<T, R> CycleDetectorCache<T, R> {
 /// goal, assume it for now" step, but completed results are not safe to reuse for future visits to
 /// the same abstract key.
 #[derive(Debug)]
-pub(crate) struct ActiveRecursionDetector<T> {
-    seen: RefCell<FxHashSet<T>>,
+pub(crate) struct ActiveRecursionDetector<T, C = ()> {
+    seen: RefCell<FxHashMap<T, C>>,
 }
 
-impl<T> Default for ActiveRecursionDetector<T> {
+impl<T, C> Default for ActiveRecursionDetector<T, C> {
     fn default() -> Self {
         Self {
-            seen: RefCell::new(FxHashSet::default()),
+            seen: RefCell::new(FxHashMap::default()),
         }
     }
 }
 
 impl<T: Hash + Eq + Clone> ActiveRecursionDetector<T> {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.seen.borrow().is_empty()
-    }
-
     pub(crate) fn visit<R>(
         &self,
         item: &T,
         on_cycle: impl FnOnce() -> R,
         func: impl FnOnce() -> R,
     ) -> R {
-        if !self.seen.borrow_mut().insert(item.clone()) {
-            return on_cycle();
+        self.visit_with_context(item, (), |(), ()| false, on_cycle, func)
+    }
+}
+
+impl<T: Hash + Eq + Clone, C: Clone> ActiveRecursionDetector<T, C> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.seen.borrow().is_empty()
+    }
+
+    /// Continue a repeated key only when its context makes progress relative to the nearest
+    /// active visit. The caller must supply a well-founded progress relation.
+    pub(crate) fn visit_with_context<R>(
+        &self,
+        item: &T,
+        context: C,
+        makes_progress: impl FnOnce(&C, &C) -> bool,
+        on_cycle: impl FnOnce() -> R,
+        func: impl FnOnce() -> R,
+    ) -> R {
+        let previous = match self.seen.borrow_mut().entry(item.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(context.clone());
+                None
+            }
+            Entry::Occupied(entry) => Some(entry.get().clone()),
+        };
+        if let Some(previous) = &previous {
+            if !makes_progress(previous, &context) {
+                return on_cycle();
+            }
+            // The progress check can re-enter this detector, so release the entry borrow before
+            // calling it and look up the key again only when a repeated visit makes progress.
+            self.seen.borrow_mut().insert(item.clone(), context);
         }
 
         // Keep the active-recursion state scoped even if `func` unwinds. In some cases, we catch
@@ -1220,20 +1247,26 @@ impl<T: Hash + Eq + Clone> ActiveRecursionDetector<T> {
         let _guard = ActiveRecursionGuard {
             seen: &self.seen,
             item,
+            previous,
         };
 
         func()
     }
 }
 
-struct ActiveRecursionGuard<'a, T: Hash + Eq> {
-    seen: &'a RefCell<FxHashSet<T>>,
+struct ActiveRecursionGuard<'a, T: Hash + Eq + Clone, C> {
+    seen: &'a RefCell<FxHashMap<T, C>>,
     item: &'a T,
+    previous: Option<C>,
 }
 
-impl<T: Hash + Eq> Drop for ActiveRecursionGuard<'_, T> {
+impl<T: Hash + Eq + Clone, C> Drop for ActiveRecursionGuard<'_, T, C> {
     fn drop(&mut self) {
-        self.seen.borrow_mut().remove(self.item);
+        if let Some(previous) = self.previous.take() {
+            self.seen.borrow_mut().insert(self.item.clone(), previous);
+        } else {
+            self.seen.borrow_mut().remove(self.item);
+        }
     }
 }
 
@@ -1242,8 +1275,8 @@ mod tests {
     use std::assert_matches;
 
     use super::{
-        CycleDetector, CycleDetectorVisit, Db, FlowEdge, FlowKind, HasIdentity,
-        RecursiveDefinition, SpecializationFlowGraph, TypeIdentity,
+        ActiveRecursionDetector, CycleDetector, CycleDetectorVisit, Db, FlowEdge, FlowKind,
+        HasIdentity, RecursiveDefinition, SpecializationFlowGraph, TypeIdentity,
     };
     use crate::ProgramEnvironment;
     use crate::db::tests::setup_db;
@@ -1258,6 +1291,51 @@ mod tests {
     struct TestVisit;
 
     type Detector<'db> = CycleDetector<'db, TestVisit, u8, u8, 1>;
+
+    #[test]
+    fn active_context_restores_nearest_visit() {
+        let detector = ActiveRecursionDetector::<u8, u8>::default();
+        let progress = |previous: &u8, current: &u8| current < previous;
+        detector.visit_with_context(
+            &0,
+            3,
+            progress,
+            || unreachable!(),
+            || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    detector.visit_with_context(
+                        &0,
+                        2,
+                        |previous, current| {
+                            // Progress checks may themselves invoke a guarded operation.
+                            detector.visit_with_context(&1, 0, progress, || false, || true)
+                                && progress(previous, current)
+                        },
+                        || unreachable!(),
+                        || {
+                            assert!(!detector.visit_with_context(
+                                &0,
+                                2,
+                                progress,
+                                || false,
+                                || true,
+                            ));
+                            panic!("unwind the inner context");
+                        },
+                    );
+                }));
+                assert_eq!(
+                    result
+                        .err()
+                        .and_then(|error| error.downcast::<&str>().ok())
+                        .as_deref(),
+                    Some(&"unwind the inner context"),
+                );
+                assert!(detector.visit_with_context(&0, 2, progress, || false, || true));
+            },
+        );
+        assert!(detector.is_empty());
+    }
 
     impl<'db> HasIdentity<'db> for u8 {
         type Id = Self;
