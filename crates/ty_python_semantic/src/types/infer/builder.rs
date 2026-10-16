@@ -8028,6 +8028,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         };
 
+        if elts.is_empty()
+            && let Some(context) = tcx.annotation
+            && context.is_divergent()
+        {
+            // The expected element type is still being inferred. Preserve that dependency
+            // instead of contributing Unknown to the cycle before the context is available.
+            return Some(Type::instance(
+                db,
+                env,
+                collection_alias
+                    .origin(db)
+                    .apply_specialization(db, |context_owner| {
+                        context_owner.repeat_specialization(db, context)
+                    }),
+            ));
+        }
+
         let constraints = ConstraintSetBuilder::new();
         let inferable = generic_context.inferable_typevars(db);
         let identity_instance = Type::instance(db, env, ClassType::Generic(collection_alias));

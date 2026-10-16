@@ -3323,6 +3323,60 @@ def use(callbacks: Sequence[Callable[[int], int]]) -> None:
 use(functions)
 ```
 
+## Empty values in subscript assignments
+
+An empty value assigned into an inferred collection receives context from the other values and uses
+of that collection. The provisional receiver type encountered during inference must not turn that
+empty value into permanent `Unknown` evidence.
+
+```py
+def branches(per_platform: dict[str, list[str]]) -> dict[str, list[str]]:
+    result = {platform: deps for platform, deps in per_platform.items()}
+    result["default"] = []
+    reveal_type(result)  # revealed: dict[str, list[str]]
+    reveal_type(result["default"])  # revealed: list[str]
+    return result
+
+def collect(platforms: list[str], inputs: dict[str, list[str]]) -> dict[str, set[str]]:
+    result = {}
+    for platform in platforms:
+        result[platform] = set()
+    for platform, deps in inputs.items():
+        existing = result.get(platform)
+        if existing is None:
+            result[platform] = set(deps)
+            continue
+        existing.update(deps)
+    reveal_type(result)  # revealed: dict[str, set[str]]
+    return result
+```
+
+Concrete incompatible values still contribute their element types, and genuinely gradual inputs
+remain gradual. An empty value with no element context still has an unknown element type.
+
+```py
+from typing import Any
+
+def mixed() -> dict[str, list[str]]:
+    result = {"known": ["text"]}
+    result["default"] = []
+    result["bad"] = [42]
+    reveal_type(result)  # revealed: dict[str, list[int] | list[str]]
+    return result  # error: [invalid-return-type]
+
+def gradual(values: list[Any]) -> None:
+    result = {"known": ["text"]}
+    result["default"] = []
+    result["unknown"] = values
+    reveal_type(result)  # revealed: dict[str, list[Any] | list[str]]
+
+def underconstrained() -> None:
+    result = {}
+    result["default"] = []
+    reveal_type(result)  # revealed: dict[str, list[Unknown]]
+    result["default"].append(1)  # no diagnostic
+```
+
 ## Collection context through lambda captures
 
 A helper call in a lambda can constrain a collection in its enclosing function. The lambda's

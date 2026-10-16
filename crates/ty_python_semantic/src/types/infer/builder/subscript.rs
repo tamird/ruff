@@ -1636,6 +1636,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         self.store_typed_dict_key_expected_type(slice, object_ty);
 
+        let mut checked_arguments = None;
         let is_valid_assignment = self.validate_subscript_assignment_impl(
             target,
             None,
@@ -1644,6 +1645,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             rhs_value,
             infer_rhs_value,
             true,
+            &mut checked_arguments,
         );
 
         // Record the constraints for the object of the subscript assignment, if the object is an
@@ -1651,17 +1653,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if is_valid_assignment
             && let Some(collection_def) = self.index.unannotated_collection_initializer(object)
             && let Some((class_literal, _)) = object_ty.class_specialization(db, env)
+            && let Some([checked_slice_ty, checked_value_ty]) = checked_arguments
+            && !any_over_type(db, env, checked_value_ty, false, |ty| ty.is_divergent())
         {
             let identity_instance =
                 Type::instance(db, env, class_literal.identity_specialization(db));
             let collection_generic_context = class_literal.generic_context(db);
 
-            let ast_arguments = [
-                ArgOrKeyword::Arg(&target.slice),
-                ArgOrKeyword::Arg(rhs_value),
-            ];
-
-            let mut call_arguments = CallArguments::positional([Type::unknown(), Type::unknown()]);
+            // Use the checked argument types so fresh empty values retain the receiver's
+            // context. A provisional value cannot constrain the initializer yet; its other
+            // elements and uses must first resolve the expected type.
+            let call_arguments = CallArguments::positional([checked_slice_ty, checked_value_ty]);
 
             if let Place::Defined(DefinedPlace {
                 ty: dunder_callable,
@@ -1676,32 +1678,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 )
                 .place
             {
-                let mut identity_bindings = dunder_callable
+                let identity_bindings = dunder_callable
                     .bindings(db, env)
                     .match_parameters(db, env, &call_arguments)
                     // Perform inference against the type variables on the receiver's generic context.
                     .with_generic_context(db, collection_generic_context);
 
-                let call_result = self
-                    .speculate_without_diagnostics()
-                    .infer_and_check_argument_types(
-                        ArgumentsIter::synthesized(&ast_arguments),
-                        &[],
-                        &mut call_arguments,
-                        &mut |builder, (_, expr, tcx)| {
-                            // TODO: The argument types have already been inferred and stored in `call_arguments`.
-                            // However, `object` would have been inferred to a be a collection with `Divergent`
-                            // element types, meaning the type context for a given argument, by which the inferred
-                            // type is keyed, may not be the same as the type context we get here. It is not immediately
-                            // clear how to retrieve those types, and so we just re-infer the argument expressions
-                            // for simplicity.
-                            builder.infer_maybe_standalone_expression(expr, tcx)
-                        },
-                        &mut identity_bindings,
-                        TypeContext::default(),
-                    );
-
-                if call_result.is_ok() && boundness == Definedness::AlwaysDefined {
+                let constraints = ConstraintSetBuilder::new();
+                if let Ok(identity_bindings) = identity_bindings.check_types(
+                    db,
+                    env,
+                    &constraints,
+                    &call_arguments,
+                    TypeContext::default(),
+                    &self.dataclass_field_specifiers,
+                ) && boundness == Definedness::AlwaysDefined
+                {
                     for call_specialization in identity_bindings
                         .iter_flat()
                         .flat_map(CallableBinding::matching_overloads)
@@ -1742,6 +1734,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         rhs_value_node: &ast::Expr,
         infer_rhs_value: &mut dyn FnMut(&mut Self, TypeContext<'db>) -> Type<'db>,
         emit_diagnostic: bool,
+        checked_arguments: &mut Option<[Type<'db>; 2]>,
     ) -> bool {
         let env = self.program_environment();
         let db = self.db();
@@ -1778,6 +1771,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         rhs_value_node,
                         &mut |builder, tcx| infer_rhs_value.infer_silent(builder, tcx),
                         emit_diagnostic,
+                        checked_arguments,
                     );
                 }
 
@@ -1799,6 +1793,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             rhs_value_node,
                             &mut |builder, tcx| infer_rhs_value.infer_silent(builder, tcx),
                             emit_diagnostic_and_short_circuit,
+                            checked_arguments,
                         );
 
                         if outcome || emit_diagnostic_and_short_circuit {
@@ -1827,6 +1822,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 rhs_value_node,
                 infer_rhs_value,
                 emit_diagnostic,
+                checked_arguments,
             ),
 
             Type::TypedDict(typed_dict) => {
@@ -1979,8 +1975,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     &mut infer_argument_ty,
                     TypeContext::default(),
                 );
-                let Err(call_dunder_err) = call_result else {
-                    return true;
+                let call_dunder_err = match call_result {
+                    Ok(bindings) => {
+                        *checked_arguments = Some([
+                            bindings.type_for_argument(&call_arguments, 0),
+                            bindings.type_for_argument(&call_arguments, 1),
+                        ]);
+                        return true;
+                    }
+                    Err(error) => error,
                 };
 
                 match call_dunder_err {
