@@ -3375,6 +3375,79 @@ def _(u: IntX | StrX) -> None:
     reveal_type(u.setdefault("x", 1))  # revealed: int | str
 ```
 
+## `get()` with literal union keys
+
+Keys with the same value type and requiredness share a `get()` overload. A union of those keys
+therefore preserves their value type, including through a saved method reference. Read-only fields
+can share an overload with writable fields:
+
+```py
+from typing import Any, Literal
+from typing_extensions import NotRequired, ReadOnly, TypedDict
+
+class RequiredValues(TypedDict):
+    left: int
+    right: ReadOnly[int]
+    other: str
+
+def required(values: RequiredValues, key: Literal["left", "right"]) -> None:
+    reveal_type(values.get(key))  # revealed: int
+    reveal_type(values.get(key, "missing"))  # revealed: int
+    get = values.get
+    reveal_type(get(key))  # revealed: int
+    reveal_type(RequiredValues.get(values, key))  # revealed: int
+```
+
+For optional keys, empty container defaults receive the shared field type as context. An
+incompatible default remains part of the result:
+
+```py
+class OptionalValues(TypedDict):
+    deps: NotRequired[list[str]]
+    dev_deps: NotRequired[list[str]]
+    by_platform: NotRequired[dict[str, list[str]]]
+    dev_by_platform: ReadOnly[NotRequired[dict[str, list[str]]]]
+
+def optional(
+    values: OptionalValues,
+    key: Literal["deps", "dev_deps"],
+    platform_key: Literal["by_platform", "dev_by_platform"],
+    default: Any,
+) -> None:
+    reveal_type(values.get(key))  # revealed: list[str] | None
+    reveal_type(values.get(key, []))  # revealed: list[str]
+    reveal_type(values.get(platform_key, {}))  # revealed: dict[str, list[str]]
+    reveal_type(values.get(key, "missing"))  # revealed: list[str] | Literal["missing"]
+    reveal_type(values.get(key, default))  # revealed: Unknown
+    wrong: int = values.get(key, [])  # error: [invalid-assignment]
+```
+
+A key union that includes an undeclared key still uses the broad string fallback:
+
+```py
+def unknown_key(values: OptionalValues, key: Literal["deps", "missing"], broad: str) -> None:
+    reveal_type(values.get(key))  # revealed: Unknown | None
+    reveal_type(values.get(broad))  # revealed: Unknown | None
+```
+
+Keys with different value types or requiredness currently also use that fallback:
+
+```py
+class MixedValues(TypedDict):
+    required: int
+    optional: NotRequired[int]
+    text: str
+
+def mixed(
+    values: MixedValues,
+    presence: Literal["required", "optional"],
+    kinds: Literal["required", "text"],
+) -> None:
+    # TODO: These results should preserve the selected field types.
+    reveal_type(values.get(presence, "missing"))  # revealed: Unknown | Literal["missing"]
+    reveal_type(values.get(kinds))  # revealed: Unknown | None
+```
+
 ## `get()` with literal union defaults
 
 ```toml
