@@ -149,6 +149,21 @@ pub trait Db: PythonCoreDb {
         false
     }
 
+    /// Whether a supplied function preserves a parameter's outer container contents.
+    ///
+    /// The declaration must neither change the container's key/value associations nor retain
+    /// or return that container. Values stored inside it may escape. This is a declaration
+    /// fact, independent of the parameter's annotation; ordinary `Mapping` annotations do not
+    /// provide this guarantee. Implementations must read tracked inputs and must not infer the
+    /// function body or the calling scope.
+    fn provided_parameter_preserves_contents(
+        &self,
+        _definition: Definition<'_>,
+        _parameter: &str,
+    ) -> bool {
+        false
+    }
+
     /// Describes an attribute handled by a supplied `__getattr__` declaration.
     ///
     /// Ordinary argument checking runs before the optional return-type refinement. An absent
@@ -321,6 +336,7 @@ pub(crate) mod tests {
         &ProvidedData,
     ) -> Option<ProvidedInstanceFields<'db>>;
     type DeclarationPredicate = for<'db> fn(&'db TestDb, Definition<'db>) -> bool;
+    type ParameterPredicate = for<'db> fn(&'db TestDb, Definition<'db>, &str) -> bool;
     type GetattrResultProvider = for<'db> fn(
         &'db TestDb,
         Definition<'db>,
@@ -354,6 +370,7 @@ pub(crate) mod tests {
         type_test_provider: Option<TypeTestProvider>,
         getattr_result_provider: Option<GetattrResultProvider>,
         keyword_field_factory: Option<DeclarationPredicate>,
+        parameter_contents_preserver: Option<ParameterPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
@@ -386,6 +403,7 @@ pub(crate) mod tests {
                 type_test_provider: None,
                 getattr_result_provider: None,
                 keyword_field_factory: None,
+                parameter_contents_preserver: None,
                 source_provider: None,
             }
         }
@@ -571,6 +589,15 @@ pub(crate) mod tests {
                 .is_some_and(|provider| provider(self, definition))
         }
 
+        fn provided_parameter_preserves_contents(
+            &self,
+            definition: Definition<'_>,
+            parameter: &str,
+        ) -> bool {
+            self.parameter_contents_preserver
+                .is_some_and(|provider| provider(self, definition, parameter))
+        }
+
         fn provided_getattr_result<'db>(
             &'db self,
             definition: Definition<'db>,
@@ -676,6 +703,7 @@ pub(crate) mod tests {
         type_test_provider: Option<TypeTestProvider>,
         getattr_result_provider: Option<GetattrResultProvider>,
         keyword_field_factory: Option<DeclarationPredicate>,
+        parameter_contents_preserver: Option<ParameterPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
     }
 
@@ -697,6 +725,7 @@ pub(crate) mod tests {
                 type_test_provider: None,
                 getattr_result_provider: None,
                 keyword_field_factory: None,
+                parameter_contents_preserver: None,
                 source_provider: None,
             }
         }
@@ -773,6 +802,14 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_parameter_contents_preserver(
+            mut self,
+            provider: ParameterPredicate,
+        ) -> Self {
+            self.parameter_contents_preserver = Some(provider);
+            self
+        }
+
         pub(crate) fn with_getattr_result_provider(
             mut self,
             provider: GetattrResultProvider,
@@ -813,6 +850,7 @@ pub(crate) mod tests {
             db.type_test_provider = self.type_test_provider;
             db.getattr_result_provider = self.getattr_result_provider;
             db.keyword_field_factory = self.keyword_field_factory;
+            db.parameter_contents_preserver = self.parameter_contents_preserver;
             db.source_provider = self.source_provider;
 
             if let Some(registry) = self.lint_registry {

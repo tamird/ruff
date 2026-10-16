@@ -2,6 +2,7 @@
 
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
+use ruff_python_ast::helpers::any_over_expr;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor::{Visitor, walk_expr};
 use ruff_text_size::{Ranged, TextRange};
@@ -21,6 +22,7 @@ use ty_python_core::{
 
 use crate::place::loop_header_reachability;
 use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
+use crate::types::call::CallArguments;
 use crate::types::infer::{
     DefinitionInference, StatementInference, infer_definition_types, infer_statement_types,
 };
@@ -1067,6 +1069,100 @@ fn operation_contents<'db>(
     })
 }
 
+/// Apply declaration effects only to direct arguments matched by the ordinary call binder.
+/// Other occurrences can expose the same container, including a nested argument or callee.
+fn call_preserves_contents<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    call: &ast::ExprCall,
+    receiver: &ast::Expr,
+    expression_type: &dyn Fn(&ast::Expr) -> Option<Type<'db>>,
+) -> bool {
+    let Some(receiver) = PlaceExpr::try_from_expr(receiver) else {
+        return false;
+    };
+    let mentions_receiver = |expression: &ast::Expr| {
+        any_over_expr(expression, |expression| {
+            PlaceExpr::try_from_expr(expression).as_ref() == Some(&receiver)
+        })
+    };
+    let Some(callee @ Type::FunctionLiteral(_)) = expression_type(&call.func) else {
+        return false;
+    };
+    if mentions_receiver(&call.func)
+        || call.arguments.args.iter().any(ast::Expr::is_starred_expr)
+        || call
+            .arguments
+            .keywords
+            .iter()
+            .any(|keyword| keyword.arg.is_none())
+    {
+        return false;
+    }
+    let bindings = callee.bindings(db, env);
+    let Some(callable) = bindings.single_element() else {
+        return false;
+    };
+    if callable.bound_type.is_some() {
+        return false;
+    }
+    let [binding] = callable.overloads() else {
+        return false;
+    };
+    let Some(declaration) = binding.signature.definition() else {
+        return false;
+    };
+    if !binding.signature.parameters().iter().any(|parameter| {
+        parameter.name().is_some_and(|name| {
+            db.provided_parameter_preserves_contents(declaration, name.as_str())
+        })
+    }) {
+        return false;
+    }
+    let arguments = CallArguments::from_arguments_typed(&call.arguments, |expression| {
+        expression_type(expression).unwrap_or(Type::unknown())
+    });
+    let bindings = bindings.match_parameters(db, env, &arguments);
+    let Some(callable) = bindings.single_element() else {
+        return false;
+    };
+    let [binding] = callable.overloads() else {
+        return false;
+    };
+    if !binding.errors().is_empty() || binding.argument_matches().len() != call.arguments.len() {
+        return false;
+    }
+    let mut found = false;
+    for (argument, matched) in call
+        .arguments
+        .iter_source_order()
+        .zip(binding.argument_matches())
+    {
+        let expression = match argument {
+            ast::ArgOrKeyword::Arg(expression) => expression,
+            ast::ArgOrKeyword::Keyword(keyword) => &keyword.value,
+        };
+        if PlaceExpr::try_from_expr(expression).as_ref() != Some(&receiver) {
+            if mentions_receiver(expression) {
+                return false;
+            }
+            continue;
+        }
+        let [parameter] = matched.parameters.as_slice() else {
+            return false;
+        };
+        let Some(name) = binding.signature.parameters()[parameter.index].name() else {
+            return false;
+        };
+        if !matched.matched || !db.provided_parameter_preserves_contents(declaration, name.as_str())
+        {
+            return false;
+        }
+        found = true;
+    }
+    found
+}
+
 fn mapping_transfer<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
@@ -1255,6 +1351,13 @@ fn mapping_transfer<'db>(
             {
                 return MappingTransfer::Keep {
                     exposes_descendants: false,
+                };
+            }
+            if call_preserves_contents(db, &env, call, receiver, &|expression| {
+                inference.try_expression_type(expression)
+            }) {
+                return MappingTransfer::Keep {
+                    exposes_descendants: true,
                 };
             }
             let method = call.func.as_attribute_expr().filter(|attribute| {

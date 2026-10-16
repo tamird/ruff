@@ -1689,15 +1689,69 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file(
             "/src/native.pyi",
-            "def observe(value: object) -> str: ...\ndef expose(value: object) -> None: ...\nflag: bool\nkey: str\n",
+            "def observe(value: object) -> str: ...\ndef expose(value: object) -> None: ...\ndef preserve(data: object, other: object = ...) -> object: ...\nflag: bool\nkey: str\n",
         )
         .with_file("/src/main.py", "")
 .with_call_result_provider(|db, call| observe(db, call).into())
+        .with_parameter_contents_preserver(|db, declaration, parameter| {
+            declaration.name(db).is_some_and(|name| name == "preserve")
+                && declaration
+                    .program_file(db)
+                    .file(db)
+                    .path(db)
+                    .as_system_path()
+                    .is_some_and(|path| path.as_str() == "/src/native.pyi")
+                && parameter == "data"
+        })
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     for (source, expected) in [
         ("result = observe({})", "empty"),
         ("result = observe(dict())", "empty"),
+        (
+            "values = {'first': 1}\npreserve(values)\npreserve(data=values)\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\nreader = preserve\nreader(data=values)\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\npreserve(data=values, other=values)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\npreserve(data=values, other=[values])\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\nalias = values\npreserve(data=values, other=alias)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\nalias = values\npreserve(data=values, other=[alias])\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\ndef mutate() -> None:\n    values.clear()\npreserve(data=values, other=mutate)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\npreserve(*[values])\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\npreserve(data=values, **{'other': values})\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'child': {'first': 1}}\npreserve(values)\nresult = observe(values['child'])",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\ndef preserve(data: object) -> None: pass\npreserve(values)\nresult = observe(values)",
+            "unknown",
+        ),
         (
             "values = {'first': None, 'second': {}}\nresult = observe(values)",
             "first: None",
@@ -1825,7 +1879,7 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
     ] {
         db.write_file(
             "/src/main.py",
-            format!("from native import observe, expose, flag, key\n{source}\n"),
+            format!("from native import observe, expose, preserve, flag, key\n{source}\n"),
         )?;
         let diagnostics = db.check_file(file);
         assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
