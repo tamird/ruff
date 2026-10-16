@@ -4796,6 +4796,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 }
             }
 
+            (formal @ Type::NominalInstance(_), actual @ Type::TypedDict(_)) => {
+                let when = self.constraint_for_relation(formal, actual, relation_polarity);
+                return self.infer_from_constraint_set(when);
+            }
+
             (formal @ Type::TypedDict(_), actual) => {
                 let when = self.constraint_for_relation(formal, actual, relation_polarity);
                 return self.infer_from_constraint_set(when);

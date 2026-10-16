@@ -4557,6 +4557,75 @@ def check(
     wrong: int | None = read(present)  # error: [invalid-assignment]
 ```
 
+### Inferring mapping views
+
+A typed dictionary contributes its canonical mapping view when inferring generic arguments. Closed
+schemas preserve their value types, while implicitly open schemas include possible extra values.
+Mutable dictionary compatibility still requires the schema's ordinary write guarantees.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Generic, Mapping, NotRequired, TypeVar
+from typing_extensions import TypedDict
+
+class Environment(TypedDict, closed=True):
+    MODE: str
+
+class Mixed(TypedDict, closed=True):
+    name: str
+    count: int
+
+class Open(TypedDict):
+    MODE: str
+
+class Gradual(TypedDict, closed=True):
+    value: Any
+
+class Mutable(TypedDict, extra_items=int):
+    value: NotRequired[int]
+
+S = TypeVar("S")
+S_contra = TypeVar("S_contra", contravariant=True)
+
+class Cell(Generic[S]): ...
+class Write(Generic[S_contra]): ...
+
+def mapping[K, V](value: Mapping[K, V]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def bounded[K: str, V: str](value: Mapping[K, V]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def mutable[K, V](value: dict[K, V]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def invariant[K, V](value: Cell[Mapping[K, V]]) -> None: ...
+def contravariant[K, V](value: Write[Mapping[K, V]]) -> None: ...
+def check(
+    environment: Environment,
+    mixed: Mixed,
+    opened: Open,
+    gradual: Gradual,
+    writable: Mutable,
+    cell: Cell[Environment],
+    writer: Write[Environment],
+) -> None:
+    reveal_type(bounded(environment))  # revealed: tuple[str, str]
+    reveal_type(mapping(mixed))  # revealed: tuple[str, int | str]
+    reveal_type(mapping(opened))  # revealed: tuple[str, object]
+    reveal_type(mapping(gradual))  # revealed: tuple[str, Any]
+    reveal_type(mutable(writable))  # revealed: tuple[str, int]
+    wrong: tuple[str, int] = bounded(environment)  # error: [invalid-assignment]
+    bounded(mixed)  # error: [invalid-argument-type]
+    mutable(environment)  # error: [invalid-argument-type]
+    invariant(cell)  # error: [invalid-argument-type]
+    contravariant(writer)  # error: [invalid-argument-type]
+```
+
 ### Inherited methods
 
 Methods on a generic `TypedDict` subclass use the subclass's type arguments when checking the
