@@ -2546,6 +2546,37 @@ impl<'db> Signature<'db> {
         Self { parameters, ..self }
     }
 
+    /// Supplies contextual types for ordinary parameters without authored annotations.
+    ///
+    /// The callback receives the parameter's canonical source definition. Explicit source and
+    /// external annotations, variadic parameters, defaults, and the return type are preserved.
+    /// This creates a separate signature view; it does not change the function's declaration or
+    /// establish that any caller supplies the contextual domain.
+    #[must_use]
+    pub fn with_inferred_parameter_context(
+        mut self,
+        mut context: impl FnMut(Definition<'db>) -> Option<Type<'db>>,
+    ) -> Self {
+        self.parameters =
+            self.parameters
+                .with_transformed_parameters(self.parameters.iter().cloned().map(|parameter| {
+                    if !parameter.inferred_annotation
+                        || parameter.is_variadic()
+                        || parameter.is_keyword_variadic()
+                    {
+                        return parameter;
+                    }
+                    let Some(definition) = parameter.definition() else {
+                        return parameter;
+                    };
+                    match context(definition) {
+                        Some(ty) => parameter.with_inferred_type(ty),
+                        None => parameter,
+                    }
+                }));
+        self
+    }
+
     /// Create a new signature with the given return type.
     #[must_use]
     pub fn with_return_type(self, return_ty: Type<'db>) -> Self {

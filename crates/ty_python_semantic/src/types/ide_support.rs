@@ -1301,14 +1301,22 @@ fn inferred_call_arguments<'a, 'db>(
     model: &SemanticModel<'db>,
     call_expr: &'a ast::ExprCall,
 ) -> CallArguments<'a, 'db> {
+    inferred_call_arguments_with_context(model, call_expr, &|_| None)
+}
+
+fn inferred_call_arguments_with_context<'a, 'db>(
+    model: &SemanticModel<'db>,
+    call_expr: &'a ast::ExprCall,
+    context: &impl Fn(&ast::Expr) -> Option<Type<'db>>,
+) -> CallArguments<'a, 'db> {
+    let expression_type =
+        |expression: &ast::Expr| context(expression).or_else(|| expression.inferred_type(model));
     CallArguments::from_arguments_typed(&call_expr.arguments, |expression| {
-        expression.inferred_type(model).unwrap_or(Type::unknown())
+        expression_type(expression).unwrap_or(Type::unknown())
     })
-    .with_known_unpacking(
-        &call_expr.arguments,
-        |expression| expression.inferred_type(model),
-        |expression| model.dictionary_observation(expression),
-    )
+    .with_known_unpacking(&call_expr.arguments, expression_type, |expression| {
+        model.dictionary_observation(expression)
+    })
 }
 
 fn bind_inferred_call<'db>(
@@ -1353,11 +1361,25 @@ pub fn call_input_types<'db>(
     model: &SemanticModel<'db>,
     call_expr: &ast::ExprCall,
 ) -> Result<Vec<Vec<CallInput<'db>>>, CallInputError> {
+    call_input_types_with_context(model, call_expr, |_| None)
+}
+
+/// Rechecks selected input contracts using established contextual argument types.
+///
+/// Applications must establish each replacement's contract at this particular argument use.
+/// The original expression and declaration types remain unchanged. Ordinary argument matching,
+/// specialization, and selection are repeated with the contextual values; returning `None` from
+/// `context` uses the expression's inferred type.
+pub fn call_input_types_with_context<'db>(
+    model: &SemanticModel<'db>,
+    call_expr: &ast::ExprCall,
+    context: impl Fn(&ast::Expr) -> Option<Type<'db>>,
+) -> Result<Vec<Vec<CallInput<'db>>>, CallInputError> {
     let func_type = call_expr
         .func
         .inferred_type(model)
         .ok_or(CallInputError::Incomplete)?;
-    let arguments = inferred_call_arguments(model, call_expr);
+    let arguments = inferred_call_arguments_with_context(model, call_expr, &context);
     let bindings =
         bind_inferred_call(model, func_type, &arguments).map_err(|_| CallInputError::Invalid)?;
     bindings

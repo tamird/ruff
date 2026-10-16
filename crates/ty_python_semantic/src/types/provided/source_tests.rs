@@ -949,13 +949,13 @@ fn supplied_parameter_types_are_initial_bindings_only() -> anyhow::Result<()> {
         .with_file("/src/context.cfg", "Context")
         .with_file(
             "/src/native.pyi",
-            "from typing import Callable\nclass Context:\n    value: int | None\ndef context(callback: Callable[..., object]) -> type: ...\n",
+            "from typing import Callable\nclass Context:\n    value: int | None\ndef context[**P, R](callback: Callable[P, R]) -> type: ...\n",
         )
         .with_file(
             "/src/main.py",
             "from native import context
 from typing_extensions import Literal, assert_type
-def callback(ctx):
+def callback(ctx) -> None:
     assert_type(ctx.value, int | None)
     if ctx.value is not None:
         assert_type(ctx.value, int)
@@ -979,6 +979,33 @@ callback(None)
         panic!("Expected one callback parameter, got {signature:?}");
     };
     assert_eq!(parameter.annotated_type(), Type::unknown());
+    let model = SemanticModel::new(&db, db.program_file(file));
+    let view = signature
+        .clone()
+        .with_inferred_parameter_context(|definition| Some(model.definition_type(definition)));
+    assert_eq!(view.return_type(), signature.return_type());
+    assert!(!view.parameters()[0].annotated_type().is_unknown());
+    let view = Type::single_callable(&db, view);
+    let module = parsed_module(&db, model.program_file().python_file(&db)).load(&db);
+    let call = callback_registration(module.suite(), "callback").unwrap();
+    let inputs =
+        crate::types::ide_support::call_input_types_with_context(&model, call, |expression| {
+            matches!(expression, ast::Expr::Name(name) if name.id == "callback").then_some(view)
+        })
+        .unwrap();
+    let [argument] = inputs.as_slice() else {
+        panic!("expected one contextual argument: {inputs:?}");
+    };
+    let [input] = argument.as_slice() else {
+        panic!("expected one contextual contract: {argument:?}");
+    };
+    let env = model.program_environment();
+    assert!(
+        input
+            .argument_type
+            .is_subtype_of(&db, &env, input.parameter_type)
+    );
+    assert_eq!(callback.last_definition_signature(&db), signature);
     Ok(())
 }
 
@@ -1024,6 +1051,30 @@ context(Owner.method)
     let file = system_path_to_file(&db, "/src/main.py")?;
     let diagnostics = db.check_file(file);
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let model = SemanticModel::new(&db, db.program_file(file));
+    for name in ["annotated", "supplied", "defaulted", "variadic"] {
+        let function = crate::place::global_symbol(&db, model.program_file(), name)
+            .place
+            .expect_type()
+            .expect_function_literal();
+        let signature = function.last_definition_signature(&db);
+        let view = signature
+            .clone()
+            .with_inferred_parameter_context(|definition| Some(model.definition_type(definition)));
+        if name == "defaulted" {
+            let [original] = signature.parameters().as_slice() else {
+                panic!("expected one defaulted parameter");
+            };
+            let [contextual] = view.parameters().as_slice() else {
+                panic!("expected one contextual parameter");
+            };
+            assert!(!contextual.annotated_type().is_unknown());
+            assert_eq!(contextual.default_type(&db), original.default_type(&db));
+            assert_eq!(view.return_type(), signature.return_type());
+        } else {
+            assert_eq!(&view, signature, "{name}");
+        }
+    }
     Ok(())
 }
 
