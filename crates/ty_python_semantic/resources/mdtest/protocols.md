@@ -6267,6 +6267,56 @@ def two(some_list: list[Any], some_tuple: tuple[int, str], some_sized: Sized):
     c: Sized = some_sized
 ```
 
+## Finite nesting in iterable protocols
+
+The `__iter__` and `__next__` requirements recur at each container level. A repeated method
+declaration does not establish that its different specializations are compatible.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from collections.abc import Collection, Iterable, Iterator
+
+class Items[T]:
+    def __iter__(self) -> Iterator[T]:
+        raise NotImplementedError
+
+    def __len__(self) -> int:
+        raise NotImplementedError
+
+    def __contains__(self, item: object) -> bool:
+        raise NotImplementedError
+
+type NestedInts = Items[int]
+type NestedStrings = Items[str]
+
+def nested(values: Iterable[Iterable[str]]) -> None: ...
+def collections(values: Iterable[Collection[str]]) -> None: ...
+def check(
+    wrong: Items[Items[int]],
+    right: Items[Items[str]],
+    wrong_list: list[list[int]],
+    right_list: list[list[str]],
+    wrong_tuple: tuple[tuple[int, ...], ...],
+    right_tuple: tuple[tuple[str, ...], ...],
+    wrong_alias: Items[NestedInts],
+    right_alias: Items[NestedStrings],
+) -> None:
+    nested(wrong)  # error: [invalid-argument-type]
+    nested(right)  # no diagnostic
+    collections(wrong)  # error: [invalid-argument-type]
+    collections(right)  # no diagnostic
+    nested(wrong_list)  # error: [invalid-argument-type]
+    nested(right_list)  # no diagnostic
+    nested(wrong_tuple)  # error: [invalid-argument-type]
+    nested(right_tuple)  # no diagnostic
+    nested(wrong_alias)  # error: [invalid-argument-type]
+    nested(right_alias)  # no diagnostic
+```
+
 ## Recursive protocols
 
 ### Properties

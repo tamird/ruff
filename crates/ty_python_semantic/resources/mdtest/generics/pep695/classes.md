@@ -2517,5 +2517,26 @@ def compare[T](first: dict[str, T], second: dict[str, int]) -> None:
             reveal_type(current.get(key))  # revealed: T@compare | None | int
 ```
 
+## Finite nesting in structural method comparisons
+
+Checking nested structural types revisits the same method declarations with smaller type arguments.
+Each level is checked, including the innermost value.
+
+```py
+from typing import Protocol
+
+class Value[T]:
+    def get(self) -> T:
+        raise NotImplementedError
+
+class HasValue[T](Protocol):
+    def get(self) -> T: ...
+
+def nested(value: HasValue[HasValue[str]]) -> None: ...
+def check(wrong: Value[Value[int]], right: Value[Value[str]]) -> None:
+    nested(wrong)  # error: [invalid-argument-type]
+    nested(right)  # no diagnostic
+```
+
 [crtp]: https://en.wikipedia.org/wiki/Curiously_recurring_template_pattern
 [f-bound]: https://en.wikipedia.org/wiki/Bounded_quantification#F-bounded_quantification

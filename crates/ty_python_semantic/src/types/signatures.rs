@@ -46,10 +46,10 @@ use crate::types::typevar::{
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarIdentity, BoundTypeVarInstance,
-    CallableType, ErrorContext, ErrorContextTree, FindLegacyTypeVarsVisitor, MaterializationKind,
-    ParamSpecAttrKind, ParameterDescription, SelfBinding, TypeContext, TypeMapping,
-    TypeVarBoundOrConstraints, TypeVarNonce, TypedDictType, UnionBuilder, VarianceInferable,
-    VarianceTerm, infer_complete_scope_types, todo_type,
+    CallableType, ClassType, ErrorContext, ErrorContextTree, FindLegacyTypeVarsVisitor,
+    MaterializationKind, ParamSpecAttrKind, ParameterDescription, SelfBinding, TypeContext,
+    TypeMapping, TypeVarBoundOrConstraints, TypeVarNonce, TypedDictType, UnionBuilder,
+    VarianceInferable, VarianceTerm, infer_complete_scope_types, todo_type,
 };
 use crate::{Db, FxOrderSet};
 use ruff_db::files::FileRange;
@@ -798,7 +798,112 @@ impl<'db> SignatureRelationKey<'db> {
     }
 }
 
-pub(crate) type SignatureRelationVisitor<'db> = ActiveRecursionDetector<SignatureRelationKey<'db>>;
+pub(crate) type SignatureRelationVisitor<'db> =
+    ActiveRecursionDetector<SignatureRelationKey<'db>, Option<(Type<'db>, Type<'db>)>>;
+
+/// Compare explicit type arguments and finite aliases without expanding recursive definitions,
+/// bounds, or class members, which can grow indefinitely.
+fn contains_type_argument<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    outer: Type<'db>,
+    inner: Type<'db>,
+) -> bool {
+    let mut pending = SmallVec::<[Type<'db>; 4]>::from_slice(&[outer]);
+    let mut visited = FxHashSet::default();
+    while let Some(ty) = pending.pop() {
+        if ty == inner {
+            return true;
+        }
+        if !visited.insert(ty) {
+            continue;
+        }
+        match ty {
+            Type::Union(union) => pending.extend_from_slice(union.elements(db)),
+            Type::Intersection(intersection) => {
+                pending.extend(intersection.positive(db).iter().copied());
+                pending.extend(intersection.negative(db).iter().copied());
+            }
+            Type::TypeAlias(alias) => {
+                if !alias.is_recursive(db) {
+                    pending.push(alias.value_type(db));
+                }
+            }
+            _ => {
+                if let Some(alias) =
+                    receiver_class(db, env, ty).and_then(ClassType::into_generic_alias)
+                {
+                    pending.extend_from_slice(alias.specialization(db).types(db));
+                }
+            }
+        }
+    }
+    false
+}
+
+fn receiver_class<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    receiver: Type<'db>,
+) -> Option<ClassType<'db>> {
+    match receiver {
+        Type::NominalInstance(instance) => Some(instance.class(db, env)),
+        Type::ProtocolInstance(protocol) => protocol.class_origin(db).map(|class| *class),
+        _ => None,
+    }
+}
+
+/// `Some(true)` means a strict decrease; `Some(false)` means unchanged arguments.
+fn receiver_arguments_decrease<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    previous: Type<'db>,
+    current: Type<'db>,
+) -> Option<bool> {
+    if previous == current {
+        return Some(false);
+    }
+    if previous
+        .as_protocol_instance()
+        .map(|ty| ty.materialization_kind(db))
+        != current
+            .as_protocol_instance()
+            .map(|ty| ty.materialization_kind(db))
+    {
+        return None;
+    }
+    let previous_alias = receiver_class(db, env, previous)?.into_generic_alias()?;
+    let current_alias = receiver_class(db, env, current)?.into_generic_alias()?;
+    let previous_specialization = previous_alias.specialization(db);
+    let current_specialization = current_alias.specialization(db);
+    if previous_specialization.materialization_kind(db)
+        != current_specialization.materialization_kind(db)
+    {
+        return None;
+    }
+    // Inherited methods can recur through different container classes, for example
+    // `Iterable[Collection[str]]` followed by `Collection[str]` through `__iter__`.
+    if contains_type_argument(db, env, previous, current) {
+        return Some(true);
+    }
+    if previous_alias.origin(db) != current_alias.origin(db)
+        || previous_specialization.types(db).len() != current_specialization.types(db).len()
+    {
+        return None;
+    }
+    let mut strict = false;
+    for (&previous, &current) in previous_specialization
+        .types(db)
+        .iter()
+        .zip(current_specialization.types(db))
+    {
+        if !contains_type_argument(db, env, previous, current) {
+            return None;
+        }
+        strict |= previous != current;
+    }
+    Some(strict)
+}
 
 pub(super) fn walk_signature<'db, V: super::visitor::TypeVisitor<'db> + ?Sized>(
     db: &'db dyn Db,
@@ -2864,7 +2969,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         {
             checker.typevar_evaluation = TypeVarEvaluation::LazyStatic;
         }
-        let when = checker.with_signature_recursion_guard(source, target, || {
+        let when = checker.with_signature_recursion_guard(db, source, target, || {
             source
                 .receiver_constraints_when_satisfied(db, &checker)
                 .and(db, self.constraints, || {
@@ -2897,7 +3002,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         let mut search = self.with_inferable_typevars(inferable);
         search.typevar_evaluation = TypeVarEvaluation::Lazy;
         let when = search.without_context_collection(|| {
-            search.with_signature_recursion_guard(source, target, || {
+            search.with_signature_recursion_guard(db, source, target, || {
                 search.check_signature_pair_inner(db, source, target)
             })
         });
@@ -2958,6 +3063,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 
     fn with_signature_recursion_guard(
         &self,
+        db: &'db dyn Db,
         source: &Signature<'db>,
         target: &Signature<'db>,
         work: impl FnOnce() -> ConstraintSet<'db, 'c>,
@@ -2971,14 +3077,31 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             return work();
         };
 
-        // Signature recursion through recursive protocols is coinductive in the same way as
-        // recursive type-relation checks: if checking this signature pair asks for the same
-        // declaration pair again, the inner obligation is the assumption currently being proved.
-        // Use `always` as the cycle value so valid fixed points can close; any real mismatch in
-        // the finite layer still bubbles out of `work`, because only exact active revisits take
-        // this branch and the result is not memoized.
-        self.signature_relation_visitor
-            .visit(&key, || self.always(), work)
+        // Repeated declarations can arise from finite nesting, such as comparing
+        // `Items[Items[int]]` with `Iterable[Iterable[str]]`. Continue when both receivers'
+        // arguments decrease componentwise and at least one decreases strictly. Comparing
+        // against the nearest active visit makes this a well-founded progress measure.
+        // Growing or unrecognized contexts retain the declaration-based approximation.
+        self.signature_relation_visitor.visit_with_context(
+            &key,
+            self.protocol_comparison,
+            |previous, current| {
+                let (Some((previous_source, previous_target)), Some((source, target))) =
+                    (*previous, *current)
+                else {
+                    return false;
+                };
+                let (Some(source_decreases), Some(target_decreases)) = (
+                    receiver_arguments_decrease(db, self.env, previous_source, source),
+                    receiver_arguments_decrease(db, self.env, previous_target, target),
+                ) else {
+                    return false;
+                };
+                source_decreases || target_decreases
+            },
+            || self.always(),
+            work,
+        )
     }
 
     fn check_signature_return_pair(
