@@ -1473,8 +1473,14 @@ impl KnownClass {
         env: &ProgramEnvironment<'db>,
         other: ClassType<'db>,
     ) -> bool {
-        self.lookup_class_literal(db, env)
-            .is_ok_and(|class| class.is_some_and(|class| class.is_subclass_of(db, None, other)))
+        self.lookup_class_literal(db, env).is_ok_and(|class| {
+            class.is_some_and(|class| match other {
+                ClassType::NonGeneric(_) => class.is_subclass_of(db, None, other),
+                ClassType::Generic(_) => class
+                    .default_specialization(db)
+                    .is_subclass_of(db, env, other),
+            })
+        })
     }
 
     pub(crate) fn when_subclass_of<'db, 'c>(

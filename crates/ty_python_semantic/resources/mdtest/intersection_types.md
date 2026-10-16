@@ -428,6 +428,51 @@ def _(
     reveal_type(i4)  # revealed: P
 ```
 
+### Negating generic ancestors of known values
+
+Known values retain their class's generic ancestors. For example, `range(3)` is a `Sequence[int]`
+and therefore also a `Sequence[object]` by covariance. It cannot satisfy the negation of either
+type.
+
+```py
+from collections.abc import Sequence
+from ty_extensions import Not, static_assert
+from ty_extensions._internal import TypeOf, is_disjoint_from, is_subtype_of
+
+type NonSequence = Not[Sequence[object]]
+
+def accept_scalar(value: NonSequence) -> None: ...
+def accept_sequence(value: Not[Not[Sequence[object]]]) -> None: ...
+
+nonempty = range(3)
+empty = range(0)
+static_assert(is_subtype_of(TypeOf[nonempty], Sequence[object]))
+static_assert(not is_subtype_of(TypeOf[nonempty], NonSequence))
+static_assert(not is_disjoint_from(TypeOf[nonempty], Sequence[object]))
+static_assert(not is_disjoint_from(Sequence[object], TypeOf[empty]))
+
+accept_scalar(range(3))  # error: [invalid-argument-type]
+accept_scalar(nonempty)  # error: [invalid-argument-type]
+accept_scalar(empty)  # error: [invalid-argument-type]
+accept_scalar("text")  # error: [invalid-argument-type]
+accept_scalar(b"bytes")  # error: [invalid-argument-type]
+accept_scalar([1])  # error: [invalid-argument-type]
+accept_scalar((1,))  # error: [invalid-argument-type]
+accept_scalar(1)
+accept_scalar(None)
+accept_sequence(nonempty)
+accept_sequence(empty)
+
+wrong: NonSequence = range(3)  # error: [invalid-assignment]
+
+class IntSequence(Sequence[int]): ...
+
+def check_other_sequences(value: IntSequence, condition: bool):
+    accept_scalar(value)  # error: [invalid-argument-type]
+    accept_scalar(range(3) if condition else None)  # error: [invalid-argument-type]
+    accept_sequence(value)
+```
+
 ## Simplification strategies
 
 In this section, we present various simplification strategies that go beyond the structure of the
