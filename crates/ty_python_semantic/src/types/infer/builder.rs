@@ -10337,6 +10337,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             call_expression_tcx,
         );
 
+        // A call cannot complete if evaluating an argument cannot complete. Use the source
+        // expressions, not matched parameters or unpacked elements (which may be `Never`
+        // without the argument expression itself being unreachable).
+        let never_argument = arguments.iter_source_order().any(|argument| {
+            self.try_expression_type(argument.value())
+                .is_some_and(|ty| ty == Type::Never)
+        });
+
         let mut bindings = match bindings_result {
             Ok(()) => bindings,
             Err(_) => {
@@ -10347,7 +10355,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     &mut bindings,
                     true,
                 );
-                return bindings.return_type(db, env);
+                return if never_argument {
+                    Type::Never
+                } else {
+                    bindings.return_type(db, env)
+                };
             }
         };
 
@@ -10574,6 +10586,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let db = self.db();
         self.refine_provided_call_results(call_expression, &call_arguments, &mut bindings, false);
+        if never_argument {
+            return Type::Never;
+        }
         let return_ty = bindings.return_type(db, env);
         let return_ty = match collection_initializer_class {
             Some(collection_class @ (KnownClass::List | KnownClass::Set))

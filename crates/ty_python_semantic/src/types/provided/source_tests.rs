@@ -1,3 +1,5 @@
+use std::assert_matches;
+
 use ruff_db::PythonFile;
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::parsed_module;
@@ -1554,6 +1556,110 @@ fn supplied_builtin_usage_selects_the_declaration() -> anyhow::Result<()> {
     let file = system_path_to_file(&db, "/src/main.py")?;
     let diagnostics = db.check_file(file);
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn supplied_builtin_calls_propagate_never_arguments() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "from typing import overload\nScalar = int\n@overload\ndef sentinel(value: int) -> str: ...\n@overload\ndef sentinel(value: str) -> bytes: ...\ndef identity[T](value: T) -> T: ...\ndef noargs() -> int: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from typing import Any
+from typing_extensions import Never, TypedDict
+from native import identity, noargs, sentinel
+
+class Record:
+    def method(self) -> None: ...
+
+def absent(value: Record):
+    if not hasattr(value, "method"):
+        Scalar(value)
+        sentinel(value)
+
+def bottom(value: Never):
+    Scalar(value)
+    Scalar(*value)
+    Scalar(**value)
+    Scalar(value, 1)
+
+def gradual(value: Any | int):
+    Scalar(value)
+    identity(value)
+
+def dynamic(value: Any):
+    identity(value)
+
+def reachable(value: int):
+    Scalar(value)
+
+class Empty(TypedDict, closed=True):
+    pass
+
+def empty(positional: tuple[()], keywords: Empty):
+    noargs(*positional)
+    noargs(**keywords)
+
+Scalar(None)
+"#,
+        )
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.id().as_str() == "no-matching-overload")
+    );
+    let file = db.program_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let model = SemanticModel::new(&db, file);
+    struct Calls<'a, 'db> {
+        model: &'a SemanticModel<'db>,
+        types: Vec<Type<'db>>,
+    }
+    impl<'ast> Visitor<'ast> for Calls<'_, '_> {
+        fn visit_expr(&mut self, expression: &'ast ast::Expr) {
+            if let ast::Expr::Call(call) = expression
+                && let ast::Expr::Name(name) = call.func.as_ref()
+                && matches!(
+                    name.id.as_str(),
+                    "Scalar" | "sentinel" | "identity" | "noargs"
+                )
+            {
+                self.types
+                    .push(expression.inferred_type(self.model).unwrap());
+            }
+            walk_expr(self, expression);
+        }
+    }
+    let mut calls = Calls {
+        model: &model,
+        types: Vec::new(),
+    };
+    calls.visit_body(module.suite());
+    let env = model.program_environment();
+    let string = KnownClass::Str.to_instance(&db, &env);
+    let integer = KnownClass::Int.to_instance(&db, &env);
+    assert_matches!(
+        calls.types.as_slice(),
+        [Type::Never, Type::Never, Type::Never, Type::Never, Type::Never, Type::Never,
+         gradual_overload, gradual, dynamic, reachable, empty_positional, empty_keywords, invalid]
+            if *gradual_overload == string
+                && !gradual.is_never()
+                && !gradual.is_fully_static(&db, &env)
+                && *dynamic == Type::any()
+                && *reachable == string
+                && *empty_positional == integer
+                && *empty_keywords == integer
+                && invalid.is_unknown()
+    );
     Ok(())
 }
 
