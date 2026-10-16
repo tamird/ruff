@@ -976,12 +976,14 @@ fn runtime_type_test<'db>(
     if path.as_str() != "/src/native.pyi" || name.as_str() != "category" {
         return None;
     }
+    let env = ProgramEnvironment::from_file(file);
     let class = match compared_value.string_literal_value(db)? {
         "list" => KnownClass::List,
+        "tuple" => return Some(Type::homogeneous_tuple(db, &env, Type::unknown())),
         "str" => KnownClass::Str,
         _ => return None,
     };
-    Some(class.to_instance_unknown(db, &ProgramEnvironment::from_file(file)))
+    Some(class.to_instance_unknown(db, &env))
 }
 
 #[test]
@@ -995,6 +997,7 @@ from typing import Any
 def category(value: object, *args: object, **kwargs: object) -> str: ...
 def unknown(): ...
 value: list[int] | str
+iterable: list[int] | tuple[int, ...] | str
 sequence: Sequence[int]
 dynamic: Any
 tag: str
@@ -1010,6 +1013,33 @@ tag: str
         ("", "category(value) != 'list'", "str", "list[int]"),
         ("", "'list' != category(value)", "str", "list[int]"),
         ("", "not (category(value) != 'list')", "list[int]", "str"),
+        ("", "category(value) in ('list',)", "list[int]", "str"),
+        ("", "category(value) not in ('list',)", "str", "list[int]"),
+        ("", "not (category(value) in ['list'])", "str", "list[int]"),
+        (
+            "value = iterable",
+            "category(value) in ('list', 'tuple')",
+            "list[int] | tuple[int, ...]",
+            "str",
+        ),
+        (
+            "value = iterable\ntags = ('list', 'tuple')",
+            "category(value) in tags",
+            "list[int] | tuple[int, ...]",
+            "str",
+        ),
+        (
+            "choice = 'list' if tag else 'str'",
+            "category(value) in (choice,)",
+            "list[int] | str",
+            "list[int] | str",
+        ),
+        (
+            "class Tags(tuple[str, ...]):\n    def __contains__(self, value: object) -> bool:\n        return True\ntags = Tags(('list',))",
+            "category(value) in tags",
+            "list[int] | str",
+            "list[int] | str",
+        ),
         (
             "",
             "category(value) == 'list' or category(value) == 'str'",
@@ -1066,7 +1096,7 @@ tag: str
         ),
     ] {
         let source = format!(
-            "from native import category, value, sequence, dynamic, unknown, tag\n{setup}\nif {condition}:\n    positive = value\nelse:\n    negative = value\n",
+            "from native import category, value, iterable, sequence, dynamic, unknown, tag\n{setup}\nif {condition}:\n    positive = value\nelse:\n    negative = value\n",
         );
         db.write_file("/src/main.py", &source)?;
         let diagnostics = db.check_file(file);
@@ -1092,6 +1122,9 @@ tag: str
         "category(value, extra=value) == 'list'",
         "category(value) is 'list'",
         "category(value) < 'list'",
+        "category(value) in ('list', tag)",
+        "category(value) in ('list', 'missing')",
+        "'list' in category(value)",
     ] {
         db.write_file(
             "/src/main.py",

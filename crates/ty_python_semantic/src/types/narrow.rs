@@ -193,8 +193,56 @@ impl<'db, 'ast> RuntimeTypeTest<'db, 'ast> {
                     kind: RuntimeTypeTestKind::ExactClass,
                 })
             }
+            ast::CmpOp::In | ast::CmpOp::NotIn if operand.expression_value().is_call_expr() => {
+                Self::from_membership(
+                    db,
+                    scope,
+                    operand,
+                    compared_value,
+                    is_positive == (op == ast::CmpOp::In),
+                    inferred_type,
+                )
+            }
             _ => None,
         }
+    }
+
+    fn from_membership(
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        operand: &'ast ast::Expr,
+        compared_value: Type<'db>,
+        is_positive: bool,
+        inferred_type: &impl Fn(&ast::Expr) -> Type<'db>,
+    ) -> Option<Self> {
+        let env = ProgramEnvironment::from_scope(scope);
+        let iterable = elements_of(db, &env, compared_value)?
+            .try_iterate(db, &env)
+            .ok()?;
+        let elements = iterable.as_fixed_length()?;
+        let mut subject = None;
+        let mut targets = UnionBuilder::new(db, &env);
+        for element in elements.all_elements() {
+            // Each slot must establish an exhaustive equality test. Combining the slot types
+            // first would incorrectly exclude all alternatives of a variable-valued slot.
+            let test = Self::from_comparison(
+                db,
+                scope,
+                operand,
+                *element,
+                ast::CmpOp::Eq,
+                true,
+                inferred_type,
+            )?;
+            subject = Some(test.subject);
+            targets.add_in_place(test.target);
+        }
+        Some(Self {
+            subject: subject?,
+            target: targets.build(),
+            is_positive,
+            kind: RuntimeTypeTestKind::Native,
+        })
     }
 
     fn constraint(
@@ -4876,7 +4924,11 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 rhs_ty
             };
 
-            for (operand, compared_value) in [(left, rhs_ty), (right, lhs_ty)] {
+            let reversed =
+                (!matches!(op, ast::CmpOp::In | ast::CmpOp::NotIn)).then_some((right, lhs_ty));
+            for (operand, compared_value) in
+                std::iter::once((left, lhs_narrowing_rhs_ty)).chain(reversed)
+            {
                 if let Some(test) = RuntimeTypeTest::from_comparison(
                     db,
                     self.scope(),
