@@ -1274,6 +1274,68 @@ fn supplied_class_identity_uses_the_source_call_without_inference() -> anyhow::R
 }
 
 #[test]
+fn supplied_class_identity_can_use_empty_declarations() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            "def outer():\n    class Empty: pass\n    def factory[T](value: T) -> T: return value\n    other = 1\n",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    db.clear_salsa_events();
+    {
+        let file = db.program_file(file);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let [ast::Stmt::FunctionDef(outer)] = module.suite().as_slice() else {
+            panic!("expected the enclosing function");
+        };
+        let [
+            ast::Stmt::ClassDef(class),
+            ast::Stmt::FunctionDef(function),
+            ast::Stmt::Assign(other),
+        ] = outer.body.as_slice()
+        else {
+            panic!("expected the nested declarations");
+        };
+        let index = semantic_index(&db, file);
+        let class_definition = index.expect_single_definition(class);
+        let function_definition = index.expect_single_definition(function);
+        let supplied = |definition| {
+            ProvidedClass {
+                name: Name::new_static("Key"),
+                bases: Box::default(),
+                class_members: Box::default(),
+                instance_fields: ProvidedInstanceFields::default().into(),
+            }
+            .into_type_at_definition(&db, definition)
+        };
+        let first = supplied(class_definition);
+        let second = supplied(function_definition);
+        assert!(first.is_some());
+        assert!(second.is_some());
+        assert_eq!(first, supplied(class_definition));
+        assert_eq!(second, supplied(function_definition));
+        assert_ne!(first, second);
+        let [target] = other.targets.as_slice() else {
+            panic!("expected one assignment target");
+        };
+        let ast::Expr::Name(target) = target else {
+            panic!("expected a name assignment");
+        };
+        assert_eq!(supplied(index.expect_single_definition(target)), None);
+    }
+    let events = db.take_salsa_events();
+    for query in [
+        "infer_scope_types_impl",
+        "infer_expression_types_impl",
+        "infer_definition_types",
+    ] {
+        assert_function_query_was_not_run_by_name(&db, query, None, &events);
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_export_refinements_keep_source_resolution() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file("/src/main.py", "include(\"refined\")\nrefined\n")

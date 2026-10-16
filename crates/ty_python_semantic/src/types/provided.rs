@@ -10,7 +10,8 @@ use ruff_python_ast::name::Name;
 use ruff_python_ast::{self as ast, HasNodeIndex, NodeIndex};
 use ruff_text_size::TextRange;
 use ty_python_core::ProgramFile;
-use ty_python_core::definition::Definition;
+use ty_python_core::definition::{Definition, DefinitionKind};
+use ty_python_core::scope::ScopeId;
 use ty_python_core::semantic_index;
 
 use crate::Db;
@@ -214,10 +215,30 @@ impl<'db> ProvidedClass<'db> {
         let index = semantic_index(db, file);
         let file_scope = index.try_expression_scope_id(&expression)?;
         let scope = file_scope.to_scope_id(db, file);
+        self.into_type_at_scope_node(db, scope, expression.node_index().load())
+    }
+
+    /// Creates a nominal class anchored to a source function or class declaration.
+    /// Returns `None` for other definition kinds.
+    pub fn into_type_at_definition(
+        self,
+        db: &'db dyn Db,
+        definition: Definition<'db>,
+    ) -> Option<Type<'db>> {
+        let node = provided_class_definition_node(db, definition)?;
+        self.into_type_at_scope_node(db, definition.scope(db), node)
+    }
+
+    fn into_type_at_scope_node(
+        self,
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        node: NodeIndex,
+    ) -> Option<Type<'db>> {
         let scope_index = scope.node(db).node_index().unwrap_or(NodeIndex::from(0));
-        let expression_index = expression.node_index().load().as_u32()?;
+        let node_index = node.as_u32()?;
         let scope_index = scope_index.as_u32()?;
-        let offset = expression_index.checked_sub(scope_index)?;
+        let offset = node_index.checked_sub(scope_index)?;
         Some(
             self.into_type(db, |explicit_bases| DynamicClassAnchor::ScopeOffset {
                 scope,
@@ -248,6 +269,21 @@ impl<'db> ProvidedClass<'db> {
             Some(instance_fields),
         )
         .into()
+    }
+}
+
+#[salsa::tracked(returns(copy))]
+fn provided_class_definition_node<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> Option<NodeIndex> {
+    match definition.kind(db) {
+        DefinitionKind::Function(function) => {
+            let module = parsed_module(db, definition.program_file(db).python_file(db)).load(db);
+            Some(function.node(&module).node_index().load())
+        }
+        DefinitionKind::Class(class) => Some(class.index()),
+        _ => None,
     }
 }
 

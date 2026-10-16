@@ -85,10 +85,10 @@ enum DynamicClassHeaderAnchor<'db> {
     ScopeOffset(DynamicClassScopeOffset),
 }
 
-/// Identifies a dangling dynamic-class call relative to its enclosing scope.
+/// Identifies a source location for a dynamic class relative to its enclosing scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
 pub enum DynamicClassScopeOffset {
-    /// An expression in the module AST, identified by its scope-relative node index.
+    /// A node in the module AST, identified by its scope-relative node index.
     Node(u32),
 
     /// A call in a detached annotation, whose nodes are not in the module AST.
