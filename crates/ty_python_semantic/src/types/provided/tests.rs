@@ -194,6 +194,75 @@ runtime: int = First()
 }
 
 #[test]
+fn intersections_preserve_unambiguous_provided_data() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/main.py", "first = 1\nsecond = 2\nthird = 3\n")
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let mut instances = Vec::new();
+    for (index, (statement, data)) in module.suite().iter().zip([1_u8, 1, 2]).enumerate() {
+        let ruff_python_ast::Stmt::Assign(assignment) = statement else {
+            anyhow::bail!("Expected an assignment");
+        };
+        let class = ProvidedClass {
+            name: Name::new(format!("Class{index}")),
+            bases: Box::default(),
+            class_members: Box::default(),
+            instance_fields: ProvidedInstanceFieldsSource::Eager(ProvidedInstanceFields {
+                fields: Box::default(),
+                has_dynamic_fields: false,
+                implications: Box::default(),
+                data: Some(ProvidedData::new(data)),
+            }),
+        }
+        .into_type_at_expression(&db, file, assignment.value.as_ref().into())
+        .context("missing provided class")?;
+        let instance = class
+            .to_instance_approximation(&db, &env)
+            .context("missing instance type")?;
+        instances.push(instance);
+    }
+    let [first, second, third] = instances.as_slice() else {
+        anyhow::bail!("Expected three provided instances");
+    };
+    let shape = Type::protocol_with_readonly_members(
+        &db,
+        &env,
+        [("value", KnownClass::Str.to_instance(&db, &env))],
+    );
+    for (left, right, expected) in [
+        (*first, shape, Some(1)),
+        (shape, *first, Some(1)),
+        (*first, *second, Some(1)),
+        (*first, *third, None),
+        (*third, *first, None),
+    ] {
+        let intersection =
+            crate::types::IntersectionType::from_two_elements(&db, &env, left, right);
+        assert!(
+            matches!(intersection, Type::Intersection(_)),
+            "{intersection:?}"
+        );
+        assert_eq!(
+            intersection
+                .provided_data(&db, &env)
+                .and_then(ProvidedData::downcast_ref::<u8>)
+                .copied(),
+            expected,
+        );
+    }
+    let negative = IntersectionBuilder::new(&db, &env)
+        .add_positive(shape)
+        .add_negative(*first)
+        .build();
+    assert_eq!(negative.provided_data(&db, &env), None);
+    Ok(())
+}
+
+#[test]
 fn supplied_type_applications_use_annotation_inference() -> anyhow::Result<()> {
     fn application<'db>(
         db: &'db TestDb,

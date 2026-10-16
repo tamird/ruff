@@ -522,6 +522,9 @@ impl<'db> Type<'db> {
     }
 
     /// Returns immutable application data attached to a synthesized callable, instance, or class.
+    ///
+    /// An intersection preserves data from its positive constituents when all data-bearing
+    /// constituents agree.
     pub fn provided_data(
         self,
         db: &'db dyn Db,
@@ -529,6 +532,14 @@ impl<'db> Type<'db> {
     ) -> Option<&'db ProvidedData> {
         let class = match self {
             Self::Callable(callable) => return callable.provided_data(db).as_ref(),
+            Self::Intersection(intersection) => {
+                let mut data = intersection
+                    .positive(db)
+                    .iter()
+                    .filter_map(|ty| ty.provided_data(db, env));
+                let first = data.next()?;
+                return data.all(|other| other == first).then_some(first);
+            }
             Self::ClassLiteral(class) => class,
             Self::NominalInstance(instance) => instance.class_literal(db, env),
             _ => return None,
