@@ -447,3 +447,62 @@ error[unsupported-operator]: Unsupported `+` operation
   | |     Has type `mod1.A`
   | Has type `mod2.A`
 ```
+
+## Generic operator result context
+
+Binary dunder calls use their expression's expected result type, just like explicit method calls.
+The context participates in cached resolution and is shared by normal and reflected dispatch.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+`tagged.pyi`:
+
+```pyi
+from typing import Generic, Literal, Mapping, Sequence, TypeVar
+
+V = TypeVar("V", covariant=True)
+K = TypeVar("K", covariant=True, default=object)
+L = TypeVar("L")
+R = TypeVar("R")
+
+class Tagged(Generic[V, K]):
+    def __add__(self: Tagged[Sequence[L], Literal["list"]], other: list[R] | tuple[R, ...], /) -> Tagged[list[L | R], K]: ...
+    def __radd__(self: Tagged[Sequence[L], Literal["list"]], other: list[R] | tuple[R, ...], /) -> Tagged[list[L | R], K]: ...
+
+def choose(values: Mapping[str, V]) -> Tagged[V, Literal["list"]]: ...
+```
+
+```py
+from typing import Any
+from tagged import Tagged, choose
+
+left = choose({"condition": ["a"], "default": [42]})
+normal: Tagged[list[str | int]] = left + []
+reveal_type(normal)  # revealed: Tagged[list[str | int], Literal["list"]]
+reflected: Tagged[list[str | int]] = [] + left
+reveal_type(reflected)  # revealed: Tagged[list[str | int], Literal["list"]]
+wrong: Tagged[list[str]] = normal  # error: [invalid-assignment]
+
+# Different contexts for the same operands must not reuse the first result.
+strings = choose({"condition": ["text"]})
+narrow: Tagged[list[str]] = strings + []
+broad: Tagged[list[str | int]] = strings + []
+reveal_type(narrow)  # revealed: Tagged[list[str], Literal["list"]]
+reveal_type(broad)  # revealed: Tagged[list[str | int], Literal["list"]]
+
+# The context does not override concrete argument evidence.
+bad: Tagged[list[str]] = strings + [42]  # error: [invalid-assignment]
+
+def check(gradual: list[Any]) -> None:
+    result: Tagged[list[str]] = strings + gradual
+    reveal_type(result)  # revealed: Tagged[list[str], Literal["list"]]
+    explicit: Tagged[list[str]] = strings.__add__(gradual)
+    reveal_type(explicit)  # revealed: Tagged[list[str], Literal["list"]]
+    reveal_type(strings + gradual)  # revealed: Tagged[list[str | Any], Literal["list"]]
+
+# An empty operand without result context remains unconstrained.
+reveal_type(strings + [])  # revealed: Tagged[list[str | Unknown], Literal["list"]]
+```

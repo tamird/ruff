@@ -177,8 +177,9 @@ impl<'db> Type<'db> {
         op: ast::Operator,
         right_ty: Type<'db>,
         policy: MemberLookupPolicy,
+        tcx: TypeContext<'db>,
     ) -> Option<&'db BinaryOperationResult<'db>> {
-        #[salsa::tracked(returns(ref), cycle_initial=|_, _, _, _, _, _, _| None, heap_size=ruff_memory_usage::heap_size)]
+        #[salsa::tracked(returns(ref), cycle_initial=|_, _, _, _, _, _, _, _| None, heap_size=ruff_memory_usage::heap_size)]
         fn try_call_bin_op_result_impl<'db>(
             db: &'db dyn Db,
             program: Program<'db>,
@@ -186,9 +187,10 @@ impl<'db> Type<'db> {
             op: ast::Operator,
             right_ty: Type<'db>,
             policy: MemberLookupPolicy,
+            tcx: TypeContext<'db>,
         ) -> Option<BinaryOperationResult<'db>> {
             let env = &ProgramEnvironment::from_program(program);
-            Type::try_call_bin_op_impl(db, env, left_ty, op, right_ty, policy)
+            Type::try_call_bin_op_impl(db, env, left_ty, op, right_ty, policy, tcx)
                 .ok()
                 .map(|bindings| BinaryOperationResult {
                     return_type: bindings.return_type(db, env),
@@ -199,7 +201,8 @@ impl<'db> Type<'db> {
                 })
         }
 
-        try_call_bin_op_result_impl(db, env.program(db), left_ty, op, right_ty, policy).as_ref()
+        try_call_bin_op_result_impl(db, env.program(db), left_ty, op, right_ty, policy, tcx)
+            .as_ref()
     }
 
     pub(crate) fn try_call_bin_op(
@@ -227,7 +230,15 @@ impl<'db> Type<'db> {
         right_ty: Type<'db>,
         policy: MemberLookupPolicy,
     ) -> Result<Bindings<'db>, CallBinOpError> {
-        Self::try_call_bin_op_impl(db, env, left_ty, op, right_ty, policy)
+        Self::try_call_bin_op_impl(
+            db,
+            env,
+            left_ty,
+            op,
+            right_ty,
+            policy,
+            TypeContext::default(),
+        )
     }
 
     fn try_call_bin_op_impl(
@@ -237,6 +248,7 @@ impl<'db> Type<'db> {
         op: ast::Operator,
         right_ty: Type<'db>,
         policy: MemberLookupPolicy,
+        tcx: TypeContext<'db>,
     ) -> Result<Bindings<'db>, CallBinOpError> {
         // We either want to call lhs.__op__ or rhs.__rop__. The full decision tree from
         // the Python spec [1] is:
@@ -254,14 +266,8 @@ impl<'db> Type<'db> {
         let reflected_priority = reflected_method_priority(db, env, left_ty, right_ty);
         let call_dunder = |receiver: Type<'db>, name, argument| {
             let mut arguments = CallArguments::positional([argument]);
-            let bindings = receiver.try_call_dunder_with_policy(
-                db,
-                env,
-                name,
-                &mut arguments,
-                TypeContext::default(),
-                policy,
-            )?;
+            let bindings =
+                receiver.try_call_dunder_with_policy(db, env, name, &mut arguments, tcx, policy)?;
             Ok::<_, CallDunderError<'db>>(bindings)
         };
 

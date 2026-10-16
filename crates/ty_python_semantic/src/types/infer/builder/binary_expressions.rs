@@ -74,6 +74,7 @@ pub(super) struct BinaryInferenceState<'db> {
     emitted_division_by_zero_diagnostic: bool,
     pub(super) deprecated_functions: Vec<OverloadLiteral<'db>>,
     used_tuple_addition: bool,
+    result_context: TypeContext<'db>,
 }
 
 impl<'db> BinaryInferenceState<'db> {
@@ -240,7 +241,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             BinaryExpressionOperandTypes::Inferred(left_ty, right_ty) => (left_ty, right_ty),
         };
 
-        let mut state = BinaryInferenceState::default();
+        let mut state = BinaryInferenceState {
+            emitted_division_by_zero_diagnostic: false,
+            deprecated_functions: Vec::new(),
+            used_tuple_addition: false,
+            result_context: tcx,
+        };
         let return_type =
             self.infer_binary_expression_type(binary.into(), left_ty, right_ty, *op, &mut state);
         self.report_deprecated_functions(binary, state.deprecated_functions);
@@ -315,8 +321,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         // ```
         // It doesn't make sense to pass the list type context to the `3` expression. It wouldn't
         // have any effect in this case, but it could in more complicated cases.
-        // TODO: When we support passing `tcx` through generic method calls, we can remove this
-        // special case and handle the relevant dunder method instead.
+        // Dunder return inference also receives `tcx`, but these operands still need context
+        // while being inferred, before their types are passed to the dunder call.
         let operand_tcx = |expr: &ast::Expr| -> TypeContext<'db> {
             match expr {
                 ast::Expr::List(_)
@@ -551,6 +557,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             op,
             right_ty,
             MemberLookupPolicy::default(),
+            state.result_context,
         )?;
         state
             .deprecated_functions
@@ -1262,6 +1269,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 ast::Operator::BitOr,
                 right_ty,
                 MemberLookupPolicy::META_CLASS_NO_TYPE_FALLBACK,
+                state.result_context,
             )
             .map(|result| {
                 state
