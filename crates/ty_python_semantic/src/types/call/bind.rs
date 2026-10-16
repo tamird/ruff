@@ -6534,10 +6534,9 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         // solution-level filtering (variance, inferable typevars, concrete content) works around
         // extracting solutions too early. When the builder maintains a single constraint set, the
         // combined set `(return_ty ≤ tcx) ∧ (∧ᵢ actual_i ≤ formal_i)` will naturally resolve the
-        // tension between type context preferences and argument constraints. If the combined set
-        // is unsatisfiable, we will fall back to argument constraints alone (which the current
-        // code does via `assignable_to_declared_type`).
-        let (preferred_type_mappings, preferred_solutions_incomplete) = return_with_tcx
+        // tension between type context preferences and argument constraints. Until then, reject
+        // conflicting preferences below and retry using argument constraints alone.
+        let (mut preferred_type_mappings, preferred_solutions_incomplete) = return_with_tcx
             .and_then(|(return_ty, tcx)| {
                 if !tcx
                     .filter_union(db, self.env, |ty| ty.may_prefer_declared_type(db, self.env))
@@ -6674,12 +6673,10 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             &mut specialization_errors,
         );
 
-        // If we failed to prefer the declared type, attempt inference again, ignoring
-        // the declared type.
-        //
-        // Note that this will still lead to an invalid specialization, but may
-        // produce more precise diagnostics.
+        // If the inferred argument types cannot satisfy the preferred return types, retry
+        // without those preferences. The resulting return type may still fail assignment.
         if !assignable_to_declared_type {
+            preferred_type_mappings.clear();
             builder = SpecializationBuilder::new(db, self.env, constraints, generic_context);
             specialization_errors.clear();
             self.constraint_set_errors.fill(false);
@@ -6692,14 +6689,14 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             );
         }
 
-        self.errors.extend(specialization_errors);
-
+        let env = self.env;
+        let return_ty = self.return_ty;
         // Attempt to promote any promotable types assigned to the specialization.
         // The hook receives (typevar, bounds) and returns Some(solution) to override the default
         // solution, or None to keep it.
         let maybe_promote = |typevar: BoundTypeVarInstance<'db>,
                              bounds: &CandidateTypeVarSolution<'db>| {
-            let bound_or_constraints = typevar.typevar(db).bound_or_constraints(db, self.env);
+            let bound_or_constraints = typevar.typevar(db).bound_or_constraints(db, env);
 
             // For constrained TypeVars, the inferred type is already one of the
             // constraints. Promoting literals would produce a type that doesn't
@@ -6714,31 +6711,30 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             let mut variance_in_return = TypeVarVariance::Bivariant;
 
             // Find all occurrences of the type variable in the return type.
-            self.return_ty
-                .visit_specialization(db, self.env, |ty, variance| {
-                    let occurrence = match ty {
-                        Type::TypeVar(other) => {
-                            if other != typevar {
-                                return;
-                            }
-                            variance
+            return_ty.visit_specialization(db, env, |ty, variance| {
+                let occurrence = match ty {
+                    Type::TypeVar(other) => {
+                        if other != typevar {
+                            return;
                         }
-                        Type::ProtocolInstance(protocol) => {
-                            if protocol.class_origin(db).is_some() {
-                                return;
-                            }
-                            // Synthesized interfaces have no class specialization for the
-                            // visitor to follow. Their fields contribute structural variance.
-                            variance.compose_thunk(|| {
-                                protocol
-                                    .variance_of(db, self.env, typevar.identity(db))
-                                    .evaluate(db)
-                            })
+                        variance
+                    }
+                    Type::ProtocolInstance(protocol) => {
+                        if protocol.class_origin(db).is_some() {
+                            return;
                         }
-                        _ => return,
-                    };
-                    variance_in_return = variance_in_return.join(occurrence);
-                });
+                        // Synthesized interfaces have no class specialization for the
+                        // visitor to follow. Their fields contribute structural variance.
+                        variance.compose_thunk(|| {
+                            protocol
+                                .variance_of(db, env, typevar.identity(db))
+                                .evaluate(db)
+                        })
+                    }
+                    _ => return,
+                };
+                variance_in_return = variance_in_return.join(occurrence);
+            });
 
             // Promotion is only useful if the type variable is in non-covariant position
             // in the return type.
@@ -6748,32 +6744,30 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
             // Promotion must preserve unsatisfiable outcomes and the completeness of fallbacks.
             Some(
-                CandidateSolutions::default_solve(db, self.env, constraints, bounds).map(
-                    |solution| {
-                        let promoted = solution.promote(db, self.env);
+                CandidateSolutions::default_solve(db, env, constraints, bounds).map(|solution| {
+                    let promoted = solution.promote(db, env);
 
-                        // If the TypeVar has an upper bound, only use the promoted type if it
-                        // still satisfies the bound.
-                        if let Some(TypeVarBoundOrConstraints::UpperBound(bound)) =
-                            bound_or_constraints
-                            && !promoted.is_assignable_to(db, self.env, bound)
-                        {
-                            return solution;
-                        }
+                    // If the TypeVar has an upper bound, only use the promoted type if it
+                    // still satisfies the bound.
+                    if let Some(TypeVarBoundOrConstraints::UpperBound(bound)) = bound_or_constraints
+                        && !promoted.is_assignable_to(db, env, bound)
+                    {
+                        return solution;
+                    }
 
-                        promoted
-                    },
-                ),
+                    promoted
+                }),
             )
         };
 
-        let mut choose = |typevar: BoundTypeVarInstance<'db>,
-                          bounds: Option<&CandidateTypeVarSolution<'db>>| {
+        let choose = |preferred_type_mappings: &FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
+                      typevar: BoundTypeVarInstance<'db>,
+                      bounds: Option<&CandidateTypeVarSolution<'db>>| {
             let preferred_ty = preferred_type_mappings.get(&typevar.identity(db)).copied();
 
             if let Some(bounds) = bounds {
-                let lower = bounds.inference_lower(db, self.env)?;
-                if preferred_ty.is_none_or(|ty| !lower.is_assignable_to(db, self.env, ty)) {
+                let lower = bounds.inference_lower(db, env)?;
+                if preferred_ty.is_none_or(|ty| !lower.is_assignable_to(db, env, ty)) {
                     return maybe_promote(typevar, bounds);
                 }
             }
@@ -6788,7 +6782,30 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             })
         };
 
-        let inference = match builder.build_inference_with(&mut choose) {
+        let mut inference = builder.build_inference_with(|typevar, bounds| {
+            choose(&preferred_type_mappings, typevar, bounds)
+        });
+        if inference.is_err() && !preferred_type_mappings.is_empty() {
+            // Preferred return types can conflict with invariant argument constraints even
+            // when every inferred lower bound fits. Retry the already checked arguments without
+            // those preferences; the result is still checked against the caller's annotation.
+            preferred_type_mappings.clear();
+            builder = SpecializationBuilder::new(db, self.env, constraints, generic_context);
+            specialization_errors.clear();
+            self.constraint_set_errors.fill(false);
+            self.infer_argument_constraints(
+                &mut builder,
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                &mut specialization_errors,
+            );
+            inference = builder.build_inference_with(|typevar, bounds| {
+                choose(&preferred_type_mappings, typevar, bounds)
+            });
+        }
+        self.errors.extend(specialization_errors);
+
+        let inference = match inference {
             Ok(inference) => inference,
             Err(errors) => {
                 for error in errors {
@@ -6813,7 +6830,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 builder.build_diagnostic_inference_with(
                     self.argument_relations()
                         .map(|relation| (relation.declared_type, relation.argument_type)),
-                    choose,
+                    |typevar, bounds| choose(&preferred_type_mappings, typevar, bounds),
                 )
             }
         };

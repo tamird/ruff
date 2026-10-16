@@ -3401,3 +3401,34 @@ def check(value: tuple[Any, Any], any_value: Any):
     reveal_type(apply(preserve_shape, value))  # revealed: tuple[Any, Any]
     reveal_type(apply(identity, any_value))  # revealed: Any
 ```
+
+## Return context conflicting with invariant arguments
+
+A preferred return type must not force an incompatible specialization of an existing mutable
+argument. When those constraints conflict, infer from the arguments and check the resulting type
+against the annotation. Fresh empty arguments can still use compatible result context.
+
+```py
+from typing import Mapping, TypeVar
+
+K1 = TypeVar("K1")
+V1 = TypeVar("V1")
+K2 = TypeVar("K2")
+V2 = TypeVar("V2")
+T = TypeVar("T")
+
+def merge(left: Mapping[K1, V1], right: dict[K2, V2]) -> dict[K1 | K2, V1 | V2]:
+    return {**left, **right}
+
+def identity(values: list[T]) -> list[T]:
+    return values
+
+def check(right: dict[str, str], numbers: list[int]) -> None:
+    result: dict[str, int | str] = merge({"a": 1}, right)
+    reveal_type(result)  # revealed: dict[str, int | str]
+    wrong: dict[str, int] = merge({"a": 1}, right)  # error: [invalid-assignment]
+    invariant: list[object] = identity(numbers)  # error: [invalid-assignment]
+    empty: list[str] = identity([])
+    reveal_type(empty)  # revealed: list[str]
+    identity(42)  # error: [invalid-argument-type]
+```

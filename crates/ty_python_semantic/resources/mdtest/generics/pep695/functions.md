@@ -3972,5 +3972,30 @@ def check_gradual(
     map_item(integer_identity, item)
 ```
 
+## Return context conflicting with invariant arguments
+
+A preferred return type must not force an incompatible specialization of an existing mutable
+argument. When those constraints conflict, infer from the arguments and check the resulting type
+against the annotation. Fresh empty arguments can still use compatible result context.
+
+```py
+from typing import Mapping
+
+def merge[K1, V1, K2, V2](left: Mapping[K1, V1], right: dict[K2, V2]) -> dict[K1 | K2, V1 | V2]:
+    return {**left, **right}
+
+def identity[T](values: list[T]) -> list[T]:
+    return values
+
+def check(right: dict[str, str], numbers: list[int]) -> None:
+    result: dict[str, int | str] = merge({"a": 1}, right)
+    reveal_type(result)  # revealed: dict[str, int | str]
+    wrong: dict[str, int] = merge({"a": 1}, right)  # error: [invalid-assignment]
+    invariant: list[object] = identity(numbers)  # error: [invalid-assignment]
+    empty: list[str] = identity([])
+    reveal_type(empty)  # revealed: list[str]
+    identity(42)  # error: [invalid-argument-type]
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

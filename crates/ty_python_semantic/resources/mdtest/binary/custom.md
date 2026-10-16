@@ -506,3 +506,32 @@ def check(gradual: list[Any]) -> None:
 # An empty operand without result context remains unconstrained.
 reveal_type(strings + [])  # revealed: Tagged[list[str | Unknown], Literal["list"]]
 ```
+
+## Result context with invariant operands
+
+Binary operators receive already inferred operand types. Contextual return inference must respect
+the operand's invariant element type, just as a direct method call with a prebound argument does.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Mapping
+
+class MappingValue[V]:
+    @property
+    def value(self) -> V:
+        raise NotImplementedError
+
+    def __or__[KL, L, KR, R](self: "MappingValue[Mapping[KL, L]]", other: dict[KR, R], /) -> "MappingValue[dict[KL | KR, L | R]]":
+        raise NotImplementedError
+
+def check(left: MappingValue[dict[str, int]], right: dict[str, str]) -> None:
+    combined: MappingValue[dict[str, int | str]] = left | right
+    direct: MappingValue[dict[str, int | str]] = left.__or__(right)
+    reveal_type(combined)  # revealed: MappingValue[dict[str, int | str]]
+    reveal_type(direct)  # revealed: MappingValue[dict[str, int | str]]
+    wrong: MappingValue[dict[str, int]] = left | right  # error: [invalid-assignment]
+```
