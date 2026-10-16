@@ -579,6 +579,7 @@ impl SourceProvider for AllocationSource {
         Some(ProvidedBindingValue::Export {
             file: db.program_file(file),
             name: Name::new_static("Exact"),
+            value: None,
         })
     }
 

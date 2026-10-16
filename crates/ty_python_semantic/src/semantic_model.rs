@@ -1155,7 +1155,11 @@ impl<'db> SemanticModel<'db> {
         let kind = definition.kind(self.db);
         if matches!(kind, DefinitionKind::ProvidedBinding(_)) {
             match self.db.provided_binding(definition).value {
-                ProvidedBindingValue::Export { file, name } => {
+                ProvidedBindingValue::Export {
+                    file,
+                    name,
+                    value: _,
+                } => {
                     self.extend_exported_definitions(file, &name, definitions);
                 }
                 ProvidedBindingValue::Value(_) => {}

@@ -587,6 +587,7 @@ fn semantic_file_kind_is_independent_of_parser_grammar() -> anyhow::Result<()> {
                 let ty = ProvidedBindingValue::Export {
                     file,
                     name: Name::new_static("value"),
+                    value: None,
                 }
                 .resolve_type(&db);
                 assert_eq!(
@@ -792,12 +793,16 @@ impl SourceProvider for CommentedSource {
         definition: Definition<'db>,
     ) -> ProvidedBindingResolution<'db> {
         let file = system_path_to_file(db, "/src/native.pyi").unwrap();
+        let name = match definition.kind(db) {
+            DefinitionKind::ProvidedBinding(binding) => binding.binding.name.clone(),
+            kind => panic!("expected supplied binding, got {kind:?}"),
+        };
+        let env = ProgramEnvironment::from_file(definition.program_file(db));
+        let value = (name == "refined").then(|| KnownClass::Str.to_instance(db, &env));
         ProvidedBindingValue::Export {
             file: db.program_file(file),
-            name: match definition.kind(db) {
-                DefinitionKind::ProvidedBinding(binding) => binding.binding.name.clone(),
-                kind => panic!("expected supplied binding, got {kind:?}"),
-            },
+            name,
+            value,
         }
         .into()
     }
@@ -819,6 +824,7 @@ impl SourceProvider for CommentedSource {
                 BuiltinUsage::Runtime => "sentinel",
                 BuiltinUsage::Annotation => "Scalar",
             }),
+            value: None,
         })
     }
 
@@ -847,6 +853,7 @@ impl SourceProvider for CommentedSource {
             return ProvidedBindingValue::Export {
                 file: db.program_file(native),
                 name: Name::new(name),
+                value: None,
             }
             .resolve_type(db);
         }
@@ -871,6 +878,7 @@ impl SourceProvider for CommentedSource {
         let ty = ProvidedBindingValue::Export {
             file: db.program_file(native),
             name: Name::new_static("result"),
+            value: None,
         }
         .resolve_type(db)?;
         Some(ProvidedReturnType {
@@ -921,6 +929,7 @@ fn callback_context_class<'db>(
     let base = ProvidedBindingValue::Export {
         file: db.program_file(native),
         name: Name::new(name.trim()),
+        value: None,
     }
     .resolve_type(db)?;
     SemanticModel::new(db, file).provided_class_at_call(
@@ -1260,6 +1269,74 @@ fn supplied_class_identity_uses_the_source_call_without_inference() -> anyhow::R
         "infer_definition_types",
     ] {
         assert_function_query_was_not_run_by_name(&db, query, None, &events);
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_export_refinements_keep_source_resolution() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", "include(\"refined\")\nrefined\n")
+        .with_file("/src/native.pyi", "refined: int\n")
+        .with_source_provider(CommentedSource)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let native = system_path_to_file(&db, "/src/native.pyi")?;
+    for present in [true, false, true] {
+        db.write_file(
+            "/src/native.pyi",
+            if present { "refined: int\n" } else { "" },
+        )?;
+        let file = db.program_file(file);
+        let native = db.program_file(native);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let [_, ast::Stmt::Expr(statement)] = module.suite().as_slice() else {
+            panic!("expected the supplied binding and its use");
+        };
+        let model = SemanticModel::new(&db, file);
+        let definitions = crate::definitions_for_name(
+            &model,
+            "refined",
+            statement.value.as_ref().into(),
+            crate::ImportAliasResolution::ResolveAliases,
+        );
+        let env = model.program_environment();
+        if present {
+            assert_eq!(
+                statement.value.inferred_type(&model),
+                Some(KnownClass::Str.to_instance(&db, &env)),
+            );
+            let native_module = parsed_module(&db, native.python_file(&db)).load(&db);
+            let [ast::Stmt::AnnAssign(declaration)] = native_module.suite().as_slice() else {
+                panic!("expected the exported declaration");
+            };
+            let expected = semantic_index(&db, native).expect_single_definition(declaration);
+            assert_eq!(
+                definitions,
+                [crate::ResolvedDefinition::Definition(expected)]
+            );
+            let diagnostics = crate::check_file_unwrap(&db, file);
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        } else {
+            assert_eq!(
+                definitions,
+                crate::definitions_for_name(
+                    &model,
+                    "refined",
+                    statement.value.as_ref().into(),
+                    crate::ImportAliasResolution::PreserveAliases,
+                ),
+            );
+            assert_eq!(
+                ProvidedBindingValue::Export {
+                    file: native,
+                    name: Name::new_static("refined"),
+                    value: Some(KnownClass::Str.to_instance(&db, &env)),
+                }
+                .resolve_type(&db),
+                None,
+            );
+        }
     }
     Ok(())
 }

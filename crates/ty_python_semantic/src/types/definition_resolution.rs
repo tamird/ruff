@@ -720,7 +720,11 @@ fn resolve_definition_recursive<'db>(
             match db.provided_binding(definition).value {
                 ProvidedBindingValue::Value(_) => vec![ResolvedDefinition::Definition(definition)],
                 ProvidedBindingValue::Unresolved => Vec::new(),
-                ProvidedBindingValue::Export { file, name } => {
+                ProvidedBindingValue::Export {
+                    file,
+                    name,
+                    value: _,
+                } => {
                     let target_env = ProgramEnvironment::from_file(file);
                     find_symbol_in_scope(db, global_scope(db, file), &name)
                         .into_iter()

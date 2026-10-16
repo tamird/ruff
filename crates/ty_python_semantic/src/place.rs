@@ -548,8 +548,9 @@ pub(crate) fn provided_binding_value<'db>(
 ) -> PlaceAndQualifiers<'db> {
     match value {
         ProvidedBindingValue::Value(ty) => Place::bound(ty).into(),
-        ProvidedBindingValue::Export { file, name } => {
-            exported_symbol(db, file, &name, RequiresExplicitReExport::No)
+        ProvidedBindingValue::Export { file, name, value } => {
+            let export = exported_symbol(db, file, &name, RequiresExplicitReExport::No);
+            export.map_type(|ty| value.unwrap_or(ty))
         }
         ProvidedBindingValue::Unresolved => Place::Undefined.into(),
     }
@@ -716,7 +717,11 @@ fn builtins_symbol_impl<'db>(
         && let Some(value) = db.provided_builtin(file, symbol, usage)
     {
         let scope = match &value {
-            ProvidedBindingValue::Export { file, name } => Some(BuiltinSource {
+            ProvidedBindingValue::Export {
+                file,
+                name,
+                value: _,
+            } => Some(BuiltinSource {
                 scope: global_scope(db, *file),
                 name: (name.as_str() != symbol).then(|| name.clone()),
             }),

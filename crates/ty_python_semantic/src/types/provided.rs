@@ -337,7 +337,13 @@ pub enum ProvidedBindingValue<'db> {
     /// A native declaration without an implementation in a source file.
     Value(Type<'db>),
     /// The public value of a source symbol at the end of its module.
-    Export { file: ProgramFile<'db>, name: Name },
+    Export {
+        file: ProgramFile<'db>,
+        name: Name,
+        /// An application-owned value for the resolved export. The source still determines
+        /// whether the name is defined and supplies its definition for navigation.
+        value: Option<Type<'db>>,
+    },
     /// The name is unavailable. For builtin lookup, this suppresses Python builtin fallback.
     Unresolved,
 }
