@@ -263,6 +263,85 @@ fn intersections_preserve_unambiguous_provided_data() -> anyhow::Result<()> {
 }
 
 #[test]
+fn supplied_readonly_fields_use_return_variance() -> anyhow::Result<()> {
+    fn application<'db>(
+        db: &'db TestDb,
+        application: ProvidedTypeApplication<'_, 'db>,
+        context: &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<Type<'db>> {
+        let ProvidedTypeApplication {
+            expression,
+            value_type,
+            definition: _,
+        } = application;
+        let Type::ClassLiteral(class) = value_type else {
+            return None;
+        };
+        let ClassLiteral::Static(class) = class else {
+            return None;
+        };
+        if class.name(db) != "Field" {
+            return None;
+        }
+        let path = class.program_file(db).file(db).path(db).as_system_path()?;
+        if path.as_str() != "/src/schema.pyi" {
+            return None;
+        }
+        let (ty, _) = context.infer_annotation_expression(&expression.slice);
+        Some(Type::protocol_with_readonly_members(
+            db,
+            &ProgramEnvironment::from_file(context.program_file()),
+            [("value", ty)],
+        ))
+    }
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_type_application_provider(application)
+        .with_file("/src/schema.pyi", "class Field[T]: ...\n")
+        .with_file(
+            "/src/main.py",
+            r#"
+from schema import Field
+from typing import Callable, Literal
+
+def scalar[T](value: T) -> Field[T]:
+    raise NotImplementedError
+
+def mutable[T](value: T) -> Field[list[T]]:
+    raise NotImplementedError
+
+def accepts[T](value: T) -> Callable[[Field[T]], None]:
+    raise NotImplementedError
+
+literal: Literal["text"] = scalar("text").value
+values = mutable("text").value
+values.append("other")
+context: Field[list[str]] = mutable("text")
+accepts("text")(scalar("other"))
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let source = source_text(&db, file).to_string();
+    db.write_file(
+        "/src/main.py",
+        format!("{source}\nvalues.append(42)\naccepts(\"text\")(scalar(42))\n"),
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type", "invalid-argument-type"],
+        "{diagnostics:#?}",
+    );
+    Ok(())
+}
+
+#[test]
 fn supplied_type_applications_use_annotation_inference() -> anyhow::Result<()> {
     fn application<'db>(
         db: &'db TestDb,

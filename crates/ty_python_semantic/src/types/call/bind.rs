@@ -6566,11 +6566,28 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             // Find all occurrences of the type variable in the return type.
             self.return_ty
                 .visit_specialization(db, self.env, |ty, variance| {
-                    if ty != Type::TypeVar(typevar) {
-                        return;
-                    }
-
-                    variance_in_return = variance_in_return.join(variance);
+                    let occurrence = match ty {
+                        Type::TypeVar(other) => {
+                            if other != typevar {
+                                return;
+                            }
+                            variance
+                        }
+                        Type::ProtocolInstance(protocol) => {
+                            if protocol.class_origin(db).is_some() {
+                                return;
+                            }
+                            // Synthesized interfaces have no class specialization for the
+                            // visitor to follow. Their fields contribute structural variance.
+                            variance.compose_thunk(|| {
+                                protocol
+                                    .variance_of(db, self.env, typevar.identity(db))
+                                    .evaluate(db)
+                            })
+                        }
+                        _ => return,
+                    };
+                    variance_in_return = variance_in_return.join(occurrence);
                 });
 
             // Promotion is only useful if the type variable is in non-covariant position
