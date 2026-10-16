@@ -281,6 +281,24 @@ pub enum ProvidedGetattrPresence {
     Absent,
 }
 
+/// Presence and optional value refinement for a supplied getter's attribute.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProvidedGetattrResult<'db> {
+    pub presence: ProvidedGetattrPresence,
+    /// Replaces the checked getter result when the attribute can be present.
+    /// `None` preserves ordinary return inference; absent attributes have no value.
+    pub return_type: Option<Type<'db>>,
+}
+
+impl<'db> From<ProvidedGetattrPresence> for ProvidedGetattrResult<'db> {
+    fn from(presence: ProvidedGetattrPresence) -> Self {
+        Self {
+            presence,
+            return_type: None,
+        }
+    }
+}
+
 /// Ordinary inference of children of an application-defined type expression.
 ///
 /// Child expressions must belong to the supplied application. Inference preserves the

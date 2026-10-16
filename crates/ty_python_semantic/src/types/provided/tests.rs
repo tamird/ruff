@@ -2895,12 +2895,12 @@ fn callable_metadata_survives_signature_transforms() -> anyhow::Result<()> {
 
 #[test]
 fn supplied_getters_can_reject_attributes_on_specialized_receivers() -> anyhow::Result<()> {
-    fn presence<'db>(
+    fn result<'db>(
         db: &'db TestDb,
         definition: Definition<'db>,
         receiver: Type<'db>,
         attribute: &str,
-    ) -> ProvidedGetattrPresence {
+    ) -> ProvidedGetattrResult<'db> {
         let file = definition.program_file(db);
         if file
             .file(db)
@@ -2909,39 +2909,47 @@ fn supplied_getters_can_reject_attributes_on_specialized_receivers() -> anyhow::
             .is_none_or(|path| path.as_str() != "/src/native.pyi")
             || definition.name(db).as_deref() != Some("__getattr__")
         {
-            return ProvidedGetattrPresence::Present;
+            return ProvidedGetattrResult::default();
         }
         let Type::ClassLiteral(ClassLiteral::Static(class)) =
             crate::place::global_symbol(db, file, "Store")
                 .place
                 .expect_type()
         else {
-            return ProvidedGetattrPresence::Present;
+            return ProvidedGetattrResult::default();
         };
         let env = ProgramEnvironment::from_file(file);
         let Some(specialization) = receiver.base_class_specialization(db, &env, class) else {
-            return ProvidedGetattrPresence::Present;
+            return ProvidedGetattrResult::default();
         };
         let [Type::TypedDict(schema)] = specialization.types(db) else {
-            return ProvidedGetattrPresence::PossiblyMissing;
+            return ProvidedGetattrPresence::PossiblyMissing.into();
         };
-        if schema.items(db).contains_key(attribute) {
-            ProvidedGetattrPresence::Present
+        if let Some(field) = schema.items(db).get(attribute) {
+            ProvidedGetattrResult {
+                presence: if field.is_required() {
+                    ProvidedGetattrPresence::Present
+                } else {
+                    ProvidedGetattrPresence::PossiblyMissing
+                },
+                return_type: Some(field.declared_type()),
+            }
         } else if schema.openness(db) == TypedDictOpenness::Closed {
-            ProvidedGetattrPresence::Absent
+            ProvidedGetattrPresence::Absent.into()
         } else {
-            ProvidedGetattrPresence::PossiblyMissing
+            ProvidedGetattrPresence::PossiblyMissing.into()
         }
     }
 
     let db = TestDbBuilder::new()
         .with_python_version(ruff_python_ast::PythonVersion::PY313)
-        .with_getattr_presence_provider(presence)
+        .with_getattr_result_provider(result)
         .with_file(
             "/src/native.pyi",
-            "from typing_extensions import TypedDict
+            "from typing_extensions import NotRequired, TypedDict
 class Closed(TypedDict, closed=True):
     x: int
+    compiler: NotRequired[str]
 class Open(TypedDict):
     x: int
 class Store[S]:
@@ -2957,7 +2965,7 @@ class Override(Derived):
         .with_file(
             "/src/main.py",
             "from native import Store, Closed, Open, Derived, Known, Plain, Override
-from typing import Any
+from typing import Any, Protocol
 from typing_extensions import assert_type
 closed = Store[Closed]()
 open_ = Store[Open]()
@@ -2965,6 +2973,16 @@ derived = Derived()
 closed.y
 derived.y
 assert_type(closed.x, int)
+assert_type(closed.compiler, str)
+assert_type(getattr(closed, 'compiler', None), str | None)
+class Required(Protocol):
+    @property
+    def compiler(self) -> str: ...
+def consume(value: Required): ...
+consume(closed)
+if hasattr(closed, 'compiler'):
+    consume(closed)
+    assert_type(closed.compiler, str)
 assert_type(getattr(closed, 'y', None), None)
 assert_type(getattr(open_, 'y', None), int | None)
 assert_type(getattr(Plain(), 'missing', None), Any | None)
@@ -2984,7 +3002,11 @@ def mixed(value: Store[Closed] | Store[Open]):
             .iter()
             .map(|diagnostic| diagnostic.id().as_str())
             .collect::<Vec<_>>(),
-        ["unresolved-attribute", "unresolved-attribute"],
+        [
+            "unresolved-attribute",
+            "unresolved-attribute",
+            "invalid-argument-type"
+        ],
         "{diagnostics:#?}"
     );
     let program = db.program_file(file);
@@ -3065,7 +3087,9 @@ constructed: Constructed
 intercepted: Intercepted
 "#,
         )
-        .with_getattr_presence_provider(presence)
+        .with_getattr_result_provider(|db, definition, receiver, attribute| {
+            presence(db, definition, receiver, attribute).into()
+        })
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     let program = db.program_file(file);
@@ -3375,12 +3399,12 @@ combined: Present | MaybeFallback[Callable[[str], None]]
 
 #[test]
 fn supplied_getters_preserve_attribute_presence() -> anyhow::Result<()> {
-    fn presence<'db>(
+    fn result<'db>(
         db: &'db TestDb,
         definition: Definition<'db>,
         _receiver: Type<'db>,
         _attribute: &str,
-    ) -> ProvidedGetattrPresence {
+    ) -> ProvidedGetattrResult<'db> {
         if definition
             .program_file(db)
             .file(db)
@@ -3388,28 +3412,34 @@ fn supplied_getters_preserve_attribute_presence() -> anyhow::Result<()> {
             .as_system_path()
             .is_none_or(|path| path.as_str() != "/src/native.pyi")
         {
-            return ProvidedGetattrPresence::Present;
+            return ProvidedGetattrResult::default();
         }
         let ty_python_core::definition::DefinitionKind::Function(function) = definition.kind(db)
         else {
-            return ProvidedGetattrPresence::Present;
+            return ProvidedGetattrResult::default();
         };
         let module = parsed_module(db, definition.python_file(db)).load(db);
         let function = function.node(&module);
         if function.name.as_str() != "__getattr__" {
-            return ProvidedGetattrPresence::Present;
+            return ProvidedGetattrResult::default();
         }
         let Some(parameter) = function.parameters.find("name") else {
-            return ProvidedGetattrPresence::Present;
+            return ProvidedGetattrResult::default();
         };
         if parameter
             .annotation()
             .and_then(ast::Expr::as_name_expr)
             .is_some_and(|annotation| matches!(annotation.id.as_str(), "str" | "int"))
         {
-            ProvidedGetattrPresence::PossiblyMissing
+            ProvidedGetattrPresence::PossiblyMissing.into()
         } else {
-            ProvidedGetattrPresence::Present
+            ProvidedGetattrResult {
+                presence: ProvidedGetattrPresence::Present,
+                return_type: Some(KnownClass::Str.to_instance(
+                    db,
+                    &ProgramEnvironment::from_file(definition.program_file(db)),
+                )),
+            }
         }
     }
     let original = r#"
@@ -3428,7 +3458,7 @@ class Malformed:
         .with_python_version(ruff_python_ast::PythonVersion::PY313)
         .with_file("/src/native.pyi", original)
         .with_file("/src/main.py", "")
-        .with_getattr_presence_provider(presence)
+        .with_getattr_result_provider(result)
         .build()?;
     let source = r#"
 from typing import Protocol
@@ -3461,7 +3491,8 @@ class Intercept(Record[str]):
 assert_type(Intercept().other, int)
 selected = Selected()
 consume(selected)
-assert_type(selected.run, object)
+assert_type(selected.run, str)
+assert_type(selected.other, object)
 malformed = Malformed()
 consume(malformed)
 malformed.other

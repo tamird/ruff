@@ -32,7 +32,7 @@ use crate::db::Db;
 use crate::dunder_all::dunder_all_names;
 use crate::lint::LintMetadata;
 use crate::place::{DefinedPlace, Definedness, Place, PlaceAndQualifiers};
-use crate::provided::ProvidedGetattrPresence;
+use crate::provided::{ProvidedGetattrPresence, ProvidedGetattrResult};
 use crate::subscript::PyIndex;
 use crate::types::call::arguments::{
     CallArgumentExpansions, CallArgumentTypes, Expansion, KnownUnpacking,
@@ -1248,33 +1248,81 @@ impl<'db> Bindings<'db> {
                 ProvidedGetattrPresence::PossiblyMissing
             }
         };
-        let item_presence = |item: &CallableItem<'db>| {
+        let item_result = |item: &CallableItem<'db>| {
             let binding = item.callable();
             let mut selected = binding.selected_overloads().peekable();
             let overloads = if selected.peek().is_some() {
-                Either::Left(selected.map(|(_, overload)| overload))
+                Either::Left(selected)
             } else {
                 // Invalid calls retain the same recovery candidates as ordinary call inference.
-                Either::Right(binding.overloads().iter())
+                Either::Right(binding.overloads().iter().enumerate())
             };
-            overloads
-                .map(|overload| {
-                    overload
+            let results: SmallVec<[_; 1]> = overloads
+                .map(|(index, overload)| {
+                    let result = overload
                         .signature
                         .definition()
-                        .map_or(ProvidedGetattrPresence::Present, |definition| {
-                            db.provided_getattr_presence(definition, receiver, attribute)
-                        })
+                        .map_or_else(ProvidedGetattrResult::default, |definition| {
+                            db.provided_getattr_result(definition, receiver, attribute)
+                        });
+                    (index, result)
                 })
+                .collect();
+            let presence = results
+                .iter()
+                .map(|(_, result)| result.presence)
                 .reduce(combine)
-                .unwrap_or(ProvidedGetattrPresence::Present)
+                .unwrap_or(ProvidedGetattrPresence::Present);
+            if !results
+                .iter()
+                .any(|(_, result)| result.return_type.is_some())
+            {
+                return (presence, None);
+            }
+            let expanded = binding.overload_call_result.as_ref().is_some_and(|result| {
+                matches!(
+                    result,
+                    OverloadCallResult::ArgumentTypeExpansion(_)
+                        | OverloadCallResult::ArgumentTypeExpansionLimitReached(_)
+                )
+            });
+            if expanded {
+                // Expansion retains only the last per-overload argument snapshot. Preserve
+                // its combined result unless all present declarations supply the same value.
+                let mut present = results
+                    .iter()
+                    .filter(|(_, result)| result.presence != ProvidedGetattrPresence::Absent);
+                let replacement = present.next().and_then(|(_, result)| result.return_type);
+                let replacement = replacement.filter(|replacement| {
+                    present.all(|(_, result)| result.return_type == Some(*replacement))
+                });
+                return (presence, replacement);
+            }
+            let mut refined = binding.clone();
+            for (index, result) in results {
+                let ProvidedGetattrResult {
+                    presence,
+                    return_type,
+                } = result;
+                let replacement = if presence == ProvidedGetattrPresence::Absent {
+                    Type::Never
+                } else {
+                    return_type.unwrap_or_else(|| match item {
+                        CallableItem::Regular(_) => binding.overloads[index].return_type(),
+                        CallableItem::Constructor(_) => item.return_type(db, env),
+                    })
+                };
+                refined.overloads[index].set_return_type(replacement);
+            }
+            (presence, Some(refined.return_type(db, env)))
         };
-        let mut removed_result = false;
+        let mut changed_result = false;
         let presence = self
             .iter_callable_items()
             .map(|item| {
-                let presence = item_presence(item);
-                removed_result |= presence == ProvidedGetattrPresence::Absent;
+                let (presence, replacement) = item_result(item);
+                changed_result |=
+                    presence == ProvidedGetattrPresence::Absent || replacement.is_some();
                 presence
             })
             .reduce(combine)
@@ -1287,10 +1335,11 @@ impl<'db> Bindings<'db> {
         } else {
             Definedness::AlwaysDefined
         };
-        let result = if removed_result {
+        let result = if changed_result {
             self.map_item_types(db, env, |item| {
-                (item_presence(item) != ProvidedGetattrPresence::Absent)
-                    .then(|| item.return_type(db, env))
+                let (presence, replacement) = item_result(item);
+                (presence != ProvidedGetattrPresence::Absent)
+                    .then(|| replacement.unwrap_or_else(|| item.return_type(db, env)))
             })
         } else {
             self.return_type(db, env)
