@@ -3952,5 +3952,28 @@ def narrow_intersection_bounded(value: Intersection[Parent[BoundedS], Other[Boun
         reveal_type(value)  # revealed: ChildBoth[BoundedS@narrow_intersection_bounded]
 ```
 
+## Finite nesting in structural method comparisons
+
+Checking nested structural types revisits the same method declarations with smaller type arguments.
+Each level is checked, including the innermost value.
+
+```py
+from typing import Protocol, Generic, TypeVar
+
+T = TypeVar("T", covariant=True)
+
+class Value(Generic[T]):
+    def get(self) -> T:
+        raise NotImplementedError
+
+class HasValue(Protocol[T]):
+    def get(self) -> T: ...
+
+def nested(value: HasValue[HasValue[str]]) -> None: ...
+def check(wrong: Value[Value[int]], right: Value[Value[str]]) -> None:
+    nested(wrong)  # error: [invalid-argument-type]
+    nested(right)  # no diagnostic
+```
+
 [crtp]: https://en.wikipedia.org/wiki/Curiously_recurring_template_pattern
 [f-bound]: https://en.wikipedia.org/wiki/Bounded_quantification#F-bounded_quantification

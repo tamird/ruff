@@ -825,6 +825,17 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         ty: Type<'db>,
         protocol: ProtocolInstanceType<'db>,
     ) -> ConstraintSet<'db, 'c> {
+        let mut checker = self.clone();
+        checker.protocol_comparison = Some((ty, Type::ProtocolInstance(protocol)));
+        checker.check_type_satisfies_protocol_inner(db, ty, protocol)
+    }
+
+    fn check_type_satisfies_protocol_inner(
+        &self,
+        db: &'db dyn Db,
+        ty: Type<'db>,
+        protocol: ProtocolInstanceType<'db>,
+    ) -> ConstraintSet<'db, 'c> {
         // Explicit protocol inheritance establishes subtyping even when a subclass overrides
         // members incompatibly.
         let mut result = self.never();

@@ -469,6 +469,7 @@ impl<'db> Type<'db> {
             perform_expensive_checks: true,
             relation_visitor: &HasRelationToVisitor::default(&builder),
             disjointness_visitor: &IsDisjointVisitor::default(&builder),
+            protocol_comparison: None,
             signature_relation_visitor: &SignatureRelationVisitor::default(),
             materialization_visitor: &ApplyTypeMappingVisitor::new(env),
         };
@@ -817,6 +818,7 @@ impl<'db> Type<'db> {
             perform_expensive_checks: true,
             relation_visitor: &relation_visitor,
             disjointness_visitor: &disjointness_visitor,
+            protocol_comparison: None,
             signature_relation_visitor: &signature_relation_visitor,
             materialization_visitor: &materialization_visitor,
         };
@@ -1138,6 +1140,7 @@ pub(super) struct TypeRelationChecker<'a, 'c, 'db> {
     // any other more "low-level" method.
     relation_visitor: &'a HasRelationToVisitor<'db, 'c>,
     disjointness_visitor: &'a IsDisjointVisitor<'db, 'c>,
+    pub(super) protocol_comparison: Option<(Type<'db>, Type<'db>)>,
     pub(super) signature_relation_visitor: &'a SignatureRelationVisitor<'db>,
     pub(super) materialization_visitor: &'a ApplyTypeMappingVisitor<'a, 'db>,
 }
@@ -1166,6 +1169,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             perform_expensive_checks: true,
             relation_visitor,
             disjointness_visitor,
+            protocol_comparison: None,
             signature_relation_visitor,
             materialization_visitor,
         }
@@ -1234,6 +1238,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             perform_expensive_checks: true,
             relation_visitor,
             disjointness_visitor,
+            protocol_comparison: None,
             signature_relation_visitor,
             materialization_visitor,
         }
@@ -1258,6 +1263,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             perform_expensive_checks: true,
             relation_visitor,
             disjointness_visitor,
+            protocol_comparison: None,
             signature_relation_visitor,
             materialization_visitor,
         }
@@ -3189,6 +3195,7 @@ impl<'c, 'db> EquivalenceChecker<'_, 'c, 'db> {
             inferable: TypeVarSet::None,
             relation_visitor: self.relation_visitor,
             disjointness_visitor: self.disjointness_visitor,
+            protocol_comparison: None,
             signature_relation_visitor: self.signature_relation_visitor,
             materialization_visitor,
         }
@@ -3283,6 +3290,7 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
             perform_expensive_checks: self.perform_expensive_checks,
             relation_visitor: self.relation_visitor,
             disjointness_visitor: self.disjointness_visitor,
+            protocol_comparison: None,
             signature_relation_visitor: self.signature_relation_visitor,
             materialization_visitor: self.materialization_visitor,
         }
