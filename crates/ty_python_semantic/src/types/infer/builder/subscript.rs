@@ -1704,6 +1704,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         // Record the constraints on the receiver's generic context formed by
                         // the arguments to this dunder call.
                         let Some(constraints) = self.collection_use_constraint_from_specialization(
+                            collection_def.file_scope(db),
                             identity_instance,
                             collection_generic_context,
                             call_specialization,

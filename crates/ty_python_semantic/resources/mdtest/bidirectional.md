@@ -3323,6 +3323,72 @@ def use(callbacks: Sequence[Callable[[int], int]]) -> None:
 use(functions)
 ```
 
+## Collection elements from enclosing type variables
+
+A function or class type variable is in scope for an inferred collection. It can constrain the
+elements even when the collection is consumed through indexing rather than returned directly.
+
+```py
+from collections.abc import Callable
+from typing import TypeVar
+
+def first[T](values: list[T]) -> T:
+    kept = []
+    for value in values:
+        kept.append(value)
+    reveal_type(kept)  # revealed: list[T@first]
+    return kept[0]
+
+def nested[T](values: list[T]) -> Callable[[], T]:
+    def first() -> T:
+        kept = []
+        for value in values:
+            kept.append(value)
+        reveal_type(kept)  # revealed: list[T@nested]
+        return kept[0]
+
+    return first
+
+class Values[T]:
+    def first(self, values: list[T]) -> T:
+        kept = []
+        for value in values:
+            kept.append(value)
+        reveal_type(kept)  # revealed: list[T@Values]
+        return kept[0]
+
+Legacy = TypeVar("Legacy")
+
+def legacy_first(values: list[Legacy]) -> Legacy:
+    kept = []
+    for value in values:
+        kept.append(value)
+    reveal_type(kept)  # revealed: list[Legacy@legacy_first]
+    return kept[0]
+
+def wrong[T](value: T) -> T:
+    kept = []
+    kept.append("wrong")
+    return kept[0]  # error: [invalid-return-type]
+
+reveal_type(first([1]))  # revealed: int
+wrong_result: str = first([1])  # error: [invalid-assignment]
+```
+
+Type variables introduced by a nested helper must not escape into an outer collection.
+
+```py
+def outer() -> None:
+    values = []
+
+    def add[T](value: T) -> None:
+        values.append(value)
+
+    add(1)
+    add("text")
+    reveal_type(values)  # revealed: list[Unknown]
+```
+
 ## Empty values in subscript assignments
 
 An empty value assigned into an inferred collection receives context from the other values and uses

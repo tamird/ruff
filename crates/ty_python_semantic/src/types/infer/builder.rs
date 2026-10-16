@@ -100,7 +100,8 @@ use crate::types::function::{
     same_module_uncached_raw_signature,
 };
 use crate::types::generics::{
-    GenericContext, Specialization, SpecializationBuilder, bind_typevar, enclosing_binding_contexts,
+    GenericContext, Specialization, SpecializationBuilder, bind_typevar,
+    enclosing_binding_contexts, resolve_typevar_reference,
 };
 use crate::types::infer::builder::binary_expressions::BinaryInferenceState;
 use crate::types::infer::builder::function::provided_function_return_type;
@@ -9560,6 +9561,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     // https://github.com/astral-sh/ty/issues/3507
     fn collection_use_constraint_from_specialization(
         &self,
+        collection_scope: FileScopeId,
         identity_instance: Type<'db>,
         receiver_generic_context: Option<GenericContext<'db>>,
         call_specialization: Specialization<'db>,
@@ -9567,8 +9569,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Method-local typevars describe requirements imposed by the method, not concrete element
         // types learned for the collection. A generic callback binds its own variables, so those
         // variables can remain inside its signature without escaping into the collection's scope.
+        // Variables already bound in the collection's lexical scope can also describe its elements.
         struct CollectionConstraintVisitor<'a, 'db> {
             env: &'a ProgramEnvironment<'db>,
+            index: &'db SemanticIndex<'db>,
+            scope: FileScopeId,
             contexts: RefCell<SmallVec<[GenericContext<'db>; 4]>>,
             active: ActiveRecursionDetector<Type<'db>>,
             has_free_typevar: Cell<bool>,
@@ -9593,6 +9598,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .borrow()
                         .iter()
                         .any(|context| context.contains(db, typevar.identity(db)))
+                    && !resolve_typevar_reference(db, self.index, self.scope, typevar.typevar(db))
+                        .is_some_and(|bound| bound.identity(db) == typevar.identity(db))
                 {
                     self.has_free_typevar.set(true);
                     return;
@@ -9625,6 +9632,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let visitor = CollectionConstraintVisitor {
             env,
+            index: self.index,
+            scope: collection_scope,
             contexts: RefCell::new([receiver_generic_context].into_iter().collect()),
             active: ActiveRecursionDetector::default(),
             has_free_typevar: Cell::new(false),
@@ -10527,6 +10536,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                         // Project the call's constraints onto the collection's type variables.
                         let Some(constraints) = self.collection_use_constraint_from_specialization(
+                            collection_def.file_scope(db),
                             identity_instance,
                             collection_generic_context,
                             call_specialization,
