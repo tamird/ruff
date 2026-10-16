@@ -598,11 +598,25 @@ fn dynamic_content_impl<'db>(
         }
 
         fn visit_generic_alias_type(&self, db: &'db dyn Db, alias: GenericAlias<'db>) {
+            let specialization = alias.specialization(db);
+            if specialization.materialization_kind(db).is_some() {
+                // Invariant materializations retain their original arguments, but those
+                // arguments no longer denote gradual types. Provisional inference still
+                // prevents proving that the materialization is complete.
+                if specialization
+                    .types(db)
+                    .iter()
+                    .any(|ty| ty.has_indeterminate_inference(db, self.env))
+                {
+                    self.record(DynamicContent::Indeterminate);
+                }
+                return;
+            }
             // Use `walk_specialization_types` rather than `walk_specialization` to avoid walking
             // the bounds/constraints/defaults of the generic context.
             // Only the types the class was actually specialized with are relevant to whether
             // the `GenericAlias` contains a dynamic type.
-            walk_specialization_types(db, alias.specialization(db), self);
+            walk_specialization_types(db, specialization, self);
         }
 
         fn visit_typeis_type(&self, db: &'db dyn Db, type_is: TypeIsType<'db>) {
@@ -1059,7 +1073,7 @@ mod tests {
 
     use crate::db::tests::setup_db;
     use crate::place::global_symbol;
-    use crate::types::{DynamicType, Parameter, Parameters, SpecialFormType, Type};
+    use crate::types::{DynamicType, KnownClass, Parameter, Parameters, SpecialFormType, Type};
 
     use super::{CollectedTypes, dynamic_content, materialization_is_noop};
 
@@ -1074,6 +1088,50 @@ mod tests {
             ]),
         );
         assert!(dynamic_content(&db, &env, paramspec_value).is_absent());
+    }
+
+    #[test]
+    fn materialized_specializations_have_no_dynamic_content() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+            from typing import Any, Callable
+            from ty_extensions import Bottom, Top, Unknown
+            from ty_extensions._internal import RegularCallableTypeOf
+
+            def factory[**P, R](init: Callable[P, R] | None = None) -> None: ...
+
+            upper: Top[dict[str, Any]]
+            lower: Bottom[dict[str, Any]]
+            missing_upper: Top[dict[str, Unknown]]
+            callback: RegularCallableTypeOf[factory]
+            gradual: dict[str, Any]
+            missing: dict[str, Unknown]
+            nested_gradual: tuple[Top[dict[str, Any]], Any]
+            gradual_callback: Callable[..., Any]
+            missing_callback: Callable[[Unknown], None]
+            "#,
+        )?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/a.py")?;
+        let module = ProgramFile::new(&db, file, env.program(&db));
+        for (name, expected) in [
+            ("upper", true),
+            ("lower", true),
+            ("missing_upper", true),
+            ("callback", true),
+            ("gradual", false),
+            ("missing", false),
+            ("nested_gradual", false),
+            ("gradual_callback", false),
+            ("missing_callback", false),
+        ] {
+            let ty = global_symbol(&db, module, name).place.expect_type();
+            assert_eq!(ty.is_fully_static(&db, &env), expected, "{name}");
+            assert_eq!(materialization_is_noop(&db, &env, ty), expected, "{name}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -1131,6 +1189,14 @@ mod tests {
             divergent.top_materialization(&db, &env),
             divergent.bottom_materialization(&db, &env),
         ] {
+            assert!(!materialization_is_noop(&db, &env, ty));
+        }
+        let list = KnownClass::List.to_specialized_instance(&db, &env, &[divergent]);
+        for ty in [
+            list.top_materialization(&db, &env),
+            list.bottom_materialization(&db, &env),
+        ] {
+            assert!(!ty.is_fully_static(&db, &env));
             assert!(!materialization_is_noop(&db, &env, ty));
         }
     }
