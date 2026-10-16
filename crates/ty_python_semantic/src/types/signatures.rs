@@ -1448,6 +1448,41 @@ impl<'db> Signature<'db> {
         })
     }
 
+    /// This signature's result after projecting its own type variables to static upper views.
+    ///
+    /// Only this signature's own type variables are projected, ignoring their defaults.
+    /// Variables bound by returned callable signatures remain bound there, and captured
+    /// variables from enclosing scopes retain their identity.
+    pub fn upper_specialized_return_type(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Type<'db> {
+        self.upper_specialize_type(db, env, self.return_ty)
+    }
+
+    pub(super) fn upper_specialize_type(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+    ) -> Type<'db> {
+        let Some(context) = self.generic_context else {
+            return ty;
+        };
+        let mapping = TypeMapping::ApplySpecializationWithMaterialization {
+            specialization: ApplySpecialization::specialization(
+                context.unknown_specialization(db, None),
+            ),
+            materialization_kind: MaterializationKind::Top,
+        };
+        let visitor = ApplyTypeMappingVisitor {
+            preserve_callable_binders: true,
+            ..ApplyTypeMappingVisitor::new(env)
+        };
+        ty.apply_type_mapping_impl(db, &mapping, TypeContext::default(), &visitor)
+    }
+
     /// Adds an implicit annotation to the first parameter of this signature, if that parameter is
     /// positional and does not already have an annotation. We do not check whether that's the
     /// right thing to do! The caller must determine whether the first parameter is actually a
@@ -6914,6 +6949,55 @@ mod tests {
             .place
             .expect_type()
             .expect_function_literal()
+    }
+
+    #[test]
+    fn upper_result_ignores_defaults_and_preserves_foreign_binders() {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            "
+            from ty_extensions import Top, Unknown, TypeOf
+            def identity[U](value: U) -> U: ...
+            def f[T = str](value: T) -> tuple[list[T], TypeOf[identity]]: ...
+            def expected() -> tuple[Top[list[Unknown]], TypeOf[identity]]: ...
+            ",
+        )
+        .unwrap();
+        let function = get_function_f(&db, "/src/a.py");
+        let signature = function.last_definition_signature(&db);
+        let env = db.program_environment();
+        let file = signature.definition().unwrap().program_file(&db);
+        let expected = global_symbol(&db, file, "expected")
+            .place
+            .expect_type()
+            .expect_function_literal()
+            .last_definition_signature(&db)
+            .return_type();
+        let upper = signature.upper_specialized_return_type(&db, &env);
+        assert_eq!(upper, expected);
+        assert_ne!(upper, signature.default_specialized_return_type(&db));
+
+        // A context belonging to another function remains rigid even when embedded in this
+        // signature's result. A nongeneric signature does not materialize authored gradual types.
+        let identity = global_symbol(&db, file, "identity")
+            .place
+            .expect_type()
+            .expect_function_literal()
+            .last_definition_signature(&db);
+        let foreign = identity.return_type();
+        assert_eq!(
+            signature
+                .clone()
+                .with_return_type(foreign)
+                .upper_specialized_return_type(&db, &env),
+            foreign,
+        );
+        assert_eq!(
+            Signature::new(Parameters::empty(), Type::any())
+                .upper_specialized_return_type(&db, &env),
+            Type::any(),
+        );
     }
 
     #[track_caller]

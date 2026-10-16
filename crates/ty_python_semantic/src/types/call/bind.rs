@@ -56,8 +56,8 @@ use crate::types::function::{
     OverloadLiteral,
 };
 use crate::types::generics::{
-    ApplySpecialization, GenericContext, Specialization, SpecializationBuilder,
-    SpecializationError, TypeVarInference, TypeVarProjection,
+    GenericContext, Specialization, SpecializationBuilder, SpecializationError, TypeVarInference,
+    TypeVarProjection,
 };
 use crate::types::infer::original_class_type;
 use crate::types::known_instance::{
@@ -79,13 +79,13 @@ use crate::types::visitor::{
     walk_type_with_recursion_guard,
 };
 use crate::types::{
-    ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallableType, CallableTypes,
-    ClassLiteral, CycleDetector, DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType,
-    GenericAlias, InternedConstraintSet, IntersectionType, KnownBoundMethodType, KnownClass,
-    KnownInstanceType, LiteralValueTypeKind, MaterializationKind, MemberLookupPolicy,
-    NominalInstanceType, PropertyInstanceType, TypeContext, TypeIdentity, TypeMapping,
-    TypeVarBoundOrConstraints, TypeVarVariance, UnionAccumulator, UnionBuilder, UnionType,
-    WrapperDescriptorKind, enums, is_property_method, list_members,
+    BindingContext, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
+    DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType, GenericAlias,
+    InternedConstraintSet, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
+    LiteralValueTypeKind, MaterializationKind, MemberLookupPolicy, NominalInstanceType,
+    PropertyInstanceType, TypeContext, TypeIdentity, TypeMapping, TypeVarBoundOrConstraints,
+    TypeVarVariance, UnionAccumulator, UnionBuilder, UnionType, WrapperDescriptorKind, enums,
+    is_property_method, list_members,
 };
 use crate::types::{DictionaryItemKind, ProgramEnvironment};
 use crate::{DisplaySettings, FxOrderSet};
@@ -6849,25 +6849,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 continue;
             }
             for signature in &callable.signatures(db).overloads {
-                let Some(context) = signature.generic_context else {
-                    continue;
-                };
-                let mapping = TypeMapping::ApplySpecializationWithMaterialization {
-                    specialization: ApplySpecialization::specialization(
-                        context.unknown_specialization(db, None),
-                    ),
-                    materialization_kind: MaterializationKind::Top,
-                };
-                let visitor = ApplyTypeMappingVisitor {
-                    preserve_callable_binders: true,
-                    ..ApplyTypeMappingVisitor::new(self.env)
-                };
-                self.return_ty = self.return_ty.apply_type_mapping_impl(
-                    db,
-                    &mapping,
-                    TypeContext::default(),
-                    &visitor,
-                );
+                self.return_ty = signature.upper_specialize_type(db, self.env, self.return_ty);
             }
         }
         self.inference = Some(inference);
