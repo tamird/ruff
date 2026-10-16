@@ -1023,6 +1023,11 @@ def return_invalid_dict() -> TD:
 
 ## Contextual built-in dictionary copies
 
+```toml
+[environment]
+python-version = "3.12"
+```
+
 A `dict` call in a `TypedDict` context checks a positional `TypedDict` source and its keyword
 overrides using the same field rules as the target's constructor. Without that context, the call
 continues to infer an ordinary dictionary.
@@ -1083,6 +1088,30 @@ class Configured(TypedDict):
 def configure(source: Source):
     configured: Configured = dict(source, values=[], render=lambda n: str(reveal_type(n)))  # revealed: int
     reveal_type(configured["values"])  # revealed: list[int]
+```
+
+Named aliases preserve the same contextual constructor checks and keyword inference.
+
+```py
+type SourceAlias = Source
+type TargetAlias = Target
+type NestedTargetAlias = TargetAlias
+type ConfiguredAlias = Configured
+
+def return_alias(source: SourceAlias) -> NestedTargetAlias:
+    return dict(source, enabled=True)
+
+def alias_overrides(source: SourceAlias, old: OldSource, maybe: MaybeName):
+    required: TargetAlias = dict(maybe, name="new", enabled=True)
+    # error: [invalid-argument-type]
+    wrong_source: TargetAlias = dict(old, enabled=True)
+    # error: [invalid-argument-type]
+    wrong_override: TargetAlias = dict(source, enabled="bad")
+    # error: [invalid-argument-type]
+    missing: TargetAlias = dict(source)
+
+def configure_alias(source: SourceAlias) -> ConfiguredAlias:
+    return dict(source, values=[], render=lambda n: str(reveal_type(n)))  # revealed: int
 ```
 
 Copying creates a fresh outer dictionary; the nested values remain shared. A readonly source field

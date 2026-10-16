@@ -23,6 +23,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         // supplies fields that can be overwritten by keyword arguments.
         if let Some(tcx) = call_expression_tcx.annotation
             && let Some(typed_dict) = tcx
+                .resolve_type_alias(db)
                 .filter_union(db, self.program_environment(), Type::is_typed_dict)
                 .as_typed_dict()
         {
