@@ -3389,6 +3389,87 @@ def outer() -> None:
     reveal_type(values)  # revealed: list[Unknown]
 ```
 
+## Materialized collection contexts
+
+A materialized invariant container does not provide an exact element specialization. Infer that
+specialization from the contextual relation instead of copying the stored gradual argument. Empty
+literals can choose `Never`, while nonempty literals still contribute their element types.
+
+```py
+from typing import Any
+from ty_extensions import Top, Bottom
+
+def upper_list(value: Top[list[Any]]) -> None: ...
+def upper_dict(value: Top[dict[Any, Any]]) -> None: ...
+
+upper_list(reveal_type([]))  # revealed: list[Never]
+upper_dict(reveal_type({}))  # revealed: dict[Never, Never]
+upper_list(reveal_type([1]))  # revealed: list[int]
+upper_dict(reveal_type({"key": 1}))  # revealed: dict[str, int]
+
+values: Top[list[Any]] = reveal_type([])  # revealed: list[Never]
+fields: Top[dict[Any, Any]] = reveal_type({})  # revealed: dict[Never, Never]
+
+type AnyList = Top[list[Any]]
+
+def upper_alias(value: AnyList) -> None: ...
+
+upper_alias(reveal_type([]))  # revealed: list[Never]
+```
+
+Gradual elements must not disappear just because they are assignable to the contextual `Never`.
+Prebound arguments retain their own types as well.
+
+```py
+def gradual(value: Any, values: list[Any], fields: dict[str, Any]) -> None:
+    upper_list(reveal_type([value]))  # revealed: list[Any]
+    upper_dict(reveal_type({"key": value}))  # revealed: dict[str, Any]
+    upper_dict(reveal_type({**fields}))  # revealed: dict[str, Any]
+    upper_list(reveal_type(values))  # revealed: list[Any]
+    upper_dict(reveal_type(fields))  # revealed: dict[str, Any]
+
+def unknown(value) -> None:
+    upper_list(reveal_type([value]))  # revealed: list[Unknown]
+    upper_dict(reveal_type({"key": value}))  # revealed: dict[str, Unknown]
+```
+
+The same applies when context filtering retains a materialized branch or a union of container types.
+
+```py
+from typing import Mapping, Sequence
+
+def optional_list(value: Top[list[Any]] | None) -> None: ...
+def union_list(value: Top[list[Any]] | Sequence[int]) -> None: ...
+def optional_dict(value: Top[dict[Any, Any]] | None) -> None: ...
+def union_dict(value: Top[dict[Any, Any]] | Mapping[str, int]) -> None: ...
+def union_gradual(value: Any) -> None:
+    optional_list(reveal_type([value]))  # revealed: list[Any]
+    union_list(reveal_type([value]))  # revealed: list[Any]
+    optional_dict(reveal_type({"key": value}))  # revealed: dict[str, Any]
+    union_dict(reveal_type({"key": value}))  # revealed: dict[str, Any]
+```
+
+A lower materialization cannot supply a concrete specialization for an empty mutable literal.
+Nonempty literals must still satisfy the ordinary contextual relation.
+
+```py
+def lower_list(value: Bottom[list[Any]]) -> None: ...
+def lower_dict(value: Bottom[dict[Any, Any]]) -> None: ...
+
+lower_list(reveal_type([]))  # revealed: list[Unknown]
+lower_dict(reveal_type({}))  # revealed: dict[Unknown, Unknown]
+
+# error: [invalid-argument-type]
+lower_list(reveal_type([1]))  # revealed: list[int]
+# error: [invalid-argument-type]
+lower_dict(reveal_type({"key": 1}))  # revealed: dict[str, int]
+
+def lower_gradual(value: Any) -> None:
+    lower_list(reveal_type([value]))  # revealed: list[Any]
+    # error: [invalid-argument-type]
+    lower_dict(reveal_type({"key": value}))  # revealed: dict[str, Any]
+```
+
 ## Empty values in subscript assignments
 
 An empty value assigned into an inferred collection receives context from the other values and uses

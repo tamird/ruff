@@ -8081,6 +8081,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     && let Some(specialization) = tcx
                         .known_specialization(db, env, collection_class)
                         .or_else(|| tcx.specialization_of(db, env, collection_alias.origin(db)))
+                    && specialization.materialization_kind(db).is_none()
                     && generic_context.variables(db).all(|typevar| {
                         !typevar.is_paramspec(db)
                             && typevar.typevar(db).bound_or_constraints(db, env).is_none()
@@ -8088,7 +8089,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 {
                     // The builtin and its checked allocation class have corresponding generic
                     // slots. Project either direct specialization without losing caller typevars
-                    // from an empty literal's context.
+                    // from an empty literal's context. Materialized specializations instead
+                    // need the relation below: their stored arguments do not describe an exact
+                    // element type.
                     for (typevar, inferred_ty) in
                         generic_context.variables(db).zip(specialization.types(db))
                     {
@@ -8183,6 +8186,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             };
         let (elt_tcx_constraints, elt_tcx_variance) =
             project_element_context(tcx.annotation, &builder);
+        let materialized_context = tcx.annotation.is_some_and(|annotation| {
+            annotation
+                .resolve_type_alias(db)
+                .class_specialization(db, env)
+                .is_some_and(|(_, specialization)| {
+                    specialization.materialization_kind(db).is_some()
+                })
+        });
+        // A materialized context can select Never as a concrete element solution. Gradual
+        // assignability to that solution must not discard an actual Any or Unknown element.
+        let element_matches_context = |actual: Type<'db>, expected: Type<'db>| {
+            if materialized_context {
+                actual.is_subtype_of(db, env, expected)
+            } else {
+                actual.is_assignable_to(db, env, expected)
+            }
+        };
 
         // Dictionary unpacking always contributes constraints on the inferred key and value types,
         // even when the unpacked mapping is assignable to the context. Keep it on the general path
@@ -8238,7 +8258,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         infer_elt_expression(self, (i, elt, TypeContext::new(Some(elt_tcx))));
                     inferred_elt_tys[i] = Some(inferred_elt_ty);
 
-                    if !inferred_elt_ty.is_assignable_to(db, env, elt_tcx) {
+                    if !element_matches_context(inferred_elt_ty, elt_tcx) {
                         compatible = false;
                     }
                 }
@@ -8480,7 +8500,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // Simplify the inference based on a non-covariant declared type.
                 if let Some(elt_tcx) =
                     elt_tcx.filter(|_| !elt_tcx_variance[&elt_ty_identity].is_covariant())
-                    && inferred_elt_ty.is_assignable_to(db, env, elt_tcx)
+                    && element_matches_context(inferred_elt_ty, elt_tcx)
                 {
                     continue;
                 }
