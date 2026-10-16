@@ -8281,7 +8281,7 @@ impl<'db> Binding<'db> {
     ///
     /// [`CallableBinding`] prepends a synthetic bound receiver before matching bound methods, while
     /// inference still iterates over source call arguments. This method centralizes that offset.
-    pub(super) fn matched_argument_for_call_argument(
+    pub(crate) fn matched_argument_for_call_argument(
         &self,
         bound_receiver: bool,
         argument_index: usize,

@@ -9,6 +9,7 @@ use crate::types::CheckedCall;
 use crate::{AnalysisSettings, PythonVersionWithSource};
 use ruff_db::diagnostic::Diagnostic;
 use ruff_db::files::File;
+use ruff_python_ast::name::Name;
 use ty_python_core::definition::Definition;
 use ty_python_core::{Db as PythonCoreDb, ProgramFile};
 
@@ -136,6 +137,30 @@ pub trait Db: PythonCoreDb {
         _call: &CheckedCall<'_, 'db>,
     ) -> ProvidedCallResult<'db> {
         ProvidedCallResult::default()
+    }
+
+    /// Parameters whose argument context depends on other arguments of a supplied call.
+    ///
+    /// This declaration fact opts a single-signature call into sibling argument inference,
+    /// including nongeneric calls. Implementations must read tracked inputs without inferring
+    /// the declaration body or the calling scope. Unlisted parameters use ordinary context.
+    fn provided_contextual_parameters(&self, _definition: Definition<'_>) -> Box<[Name]> {
+        Box::default()
+    }
+
+    /// Supplies argument context after a provisional pass of ordinary argument checking.
+    ///
+    /// The call can contain incomplete child types and binding errors. Implementations must
+    /// identify the declaration and use this view's child types rather than requesting completed
+    /// inference of the calling scope. The context is recomputed during sibling inference;
+    /// it guides inference without replacing final argument checking or the declared signature.
+    /// Overloaded and union callees retain ordinary inference.
+    fn provided_call_argument_context<'db>(
+        &'db self,
+        _call: &CheckedCall<'_, 'db>,
+        _parameter: &str,
+    ) -> Option<crate::types::Type<'db>> {
+        None
     }
 
     /// Whether a factory stores direct named keyword arguments unchanged in same-named
@@ -319,6 +344,9 @@ pub(crate) mod tests {
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
     type CallResultProvider =
         for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> crate::provided::ProvidedCallResult<'db>;
+    type ContextualParametersProvider = for<'db> fn(&'db TestDb, Definition<'db>) -> Box<[Name]>;
+    type CallArgumentContextProvider =
+        for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>, &str) -> Option<crate::types::Type<'db>>;
     type TypeApplicationProvider = for<'db> fn(
         &'db TestDb,
         ProvidedTypeApplication<'_, 'db>,
@@ -364,6 +392,8 @@ pub(crate) mod tests {
         open_files: rustc_hash::FxHashSet<File>,
         program_settings: ProgramSettings,
         call_result_provider: Option<CallResultProvider>,
+        contextual_parameters_provider: Option<ContextualParametersProvider>,
+        call_argument_context_provider: Option<CallArgumentContextProvider>,
         type_application_provider: Option<TypeApplicationProvider>,
         type_reference_provider: Option<TypeReferenceProvider>,
         instance_fields_provider: Option<InstanceFieldsProvider>,
@@ -397,6 +427,8 @@ pub(crate) mod tests {
                 open_files: rustc_hash::FxHashSet::default(),
                 program_settings,
                 call_result_provider: None,
+                contextual_parameters_provider: None,
+                call_argument_context_provider: None,
                 type_application_provider: None,
                 type_reference_provider: None,
                 instance_fields_provider: None,
@@ -556,6 +588,20 @@ pub(crate) mod tests {
                 })
         }
 
+        fn provided_contextual_parameters(&self, definition: Definition<'_>) -> Box<[Name]> {
+            self.contextual_parameters_provider
+                .map_or_else(Box::default, |provider| provider(self, definition))
+        }
+
+        fn provided_call_argument_context<'db>(
+            &'db self,
+            call: &CheckedCall<'_, 'db>,
+            parameter: &str,
+        ) -> Option<crate::types::Type<'db>> {
+            self.call_argument_context_provider
+                .and_then(|provider| provider(self, call, parameter))
+        }
+
         fn provided_type_application<'db>(
             &'db self,
             application: ProvidedTypeApplication<'_, 'db>,
@@ -697,6 +743,8 @@ pub(crate) mod tests {
         rule_selection: Option<RuleSelection>,
         lint_registry: Option<LintRegistry>,
         call_result_provider: Option<CallResultProvider>,
+        contextual_parameters_provider: Option<ContextualParametersProvider>,
+        call_argument_context_provider: Option<CallArgumentContextProvider>,
         type_application_provider: Option<TypeApplicationProvider>,
         type_reference_provider: Option<TypeReferenceProvider>,
         instance_fields_provider: Option<InstanceFieldsProvider>,
@@ -719,6 +767,8 @@ pub(crate) mod tests {
                 rule_selection: None,
                 lint_registry: None,
                 call_result_provider: None,
+                contextual_parameters_provider: None,
+                call_argument_context_provider: None,
                 type_application_provider: None,
                 type_reference_provider: None,
                 instance_fields_provider: None,
@@ -770,6 +820,16 @@ pub(crate) mod tests {
 
         pub(crate) fn with_call_result_provider(mut self, provider: CallResultProvider) -> Self {
             self.call_result_provider = Some(provider);
+            self
+        }
+
+        pub(crate) fn with_call_argument_context_provider(
+            mut self,
+            parameters: ContextualParametersProvider,
+            context: CallArgumentContextProvider,
+        ) -> Self {
+            self.contextual_parameters_provider = Some(parameters);
+            self.call_argument_context_provider = Some(context);
             self
         }
 
@@ -844,6 +904,8 @@ pub(crate) mod tests {
         pub(crate) fn build(self) -> anyhow::Result<TestDb> {
             let mut db = TestDb::new(self.vendored);
             db.call_result_provider = self.call_result_provider;
+            db.contextual_parameters_provider = self.contextual_parameters_provider;
+            db.call_argument_context_provider = self.call_argument_context_provider;
             db.type_application_provider = self.type_application_provider;
             db.type_reference_provider = self.type_reference_provider;
             db.instance_fields_provider = self.instance_fields_provider;

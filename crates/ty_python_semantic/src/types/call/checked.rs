@@ -24,6 +24,10 @@ pub enum CheckedArgument<'a, 'db> {
 
 /// A call after ordinary argument matching and type checking.
 ///
+/// Argument-context providers receive a provisional check during sibling inference; its child
+/// types and binding errors may change before the final check. Result providers receive the
+/// completed check. Neither view requests completed inference of the enclosing scope.
+///
 /// Native refinements can update the return type through this view. Applications receive
 /// read-only access. Child types come from the current inference result, so inspecting them
 /// cannot recursively request the enclosing scope. Source nodes belong to the original call.

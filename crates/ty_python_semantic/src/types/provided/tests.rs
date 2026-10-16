@@ -3198,6 +3198,178 @@ intercepted: Intercepted
 }
 
 #[test]
+fn supplied_argument_context_uses_checked_siblings() -> anyhow::Result<()> {
+    fn parameters(db: &TestDb, definition: Definition<'_>) -> Box<[Name]> {
+        let file = definition.program_file(db).file(db);
+        if file
+            .path(db)
+            .as_system_path()
+            .is_some_and(|path| path.as_str() == "/src/native.pyi")
+            && definition.name(db).is_some_and(|name| name != "plain")
+        {
+            Box::from([Name::new("callback")])
+        } else {
+            Box::default()
+        }
+    }
+
+    fn context<'db>(
+        db: &'db TestDb,
+        call: &CheckedCall<'_, 'db>,
+        parameter: &str,
+    ) -> Option<Type<'db>> {
+        assert_eq!(parameter, "callback");
+        assert!(
+            call.call()
+                .func
+                .as_name_expr()
+                .is_none_or(|name| name.id != "selected")
+        );
+        let name = call.declaration()?.name(db)?;
+        assert!(matches!(
+            name.as_str(),
+            "register" | "generic" | "strict" | "bounded" | "optional"
+        ));
+        if call.has_binding_errors() {
+            return None;
+        }
+        let fields = call.dictionary_argument(db, "schema")?;
+        let field = fields.items.iter().find(|field| field.name == "value")?;
+        let parameter = Parameter::positional_only(None).with_annotated_type(field.ty);
+        let parameter = if name == "optional" {
+            parameter.with_default_type(field.ty)
+        } else {
+            parameter
+        };
+        Some(Type::function_like_callable(
+            db,
+            Signature::new(Parameters::standard([parameter]), Type::object()),
+        ))
+    }
+
+    let declarations = r#"
+from typing import Callable, overload
+
+def register(callback: Callable[..., object], schema: dict[str, object]) -> None: ...
+def generic[**P, R](callback: Callable[P, R], schema: dict[str, object]) -> R: ...
+def strict(callback: Callable[[str], object], schema: dict[str, object]) -> None: ...
+def bounded[R: int](callback: Callable[..., R], schema: dict[str, object]) -> R: ...
+def optional(callback: Callable[..., object], schema: dict[str, object]) -> None: ...
+class Registry:
+    def register(self, callback: Callable[..., object], schema: dict[str, object]) -> None: ...
+registry: Registry
+def plain(callback: Callable[..., object], schema: dict[str, object]) -> None: ...
+@overload
+def overloaded(callback: Callable[..., object], schema: dict[str, int]) -> int: ...
+@overload
+def overloaded(callback: Callable[..., object], schema: dict[str, str]) -> str: ...
+seed: int
+text: str
+"#;
+    let source = r#"
+from typing_extensions import assert_type
+from native import register, generic, strict, bounded, optional, registry, plain, overloaded, seed, text
+
+def require_int(value: int) -> int:
+    return value
+
+def require_str(value: str) -> str:
+    return value
+
+register(lambda value: assert_type(value, int), {'value': seed})
+register(lambda value: assert_type(value, str), {'value': text})
+registry.register(lambda value: assert_type(value, int), {'value': seed})
+optional(lambda value=0: assert_type(value, int), {'value': seed})
+register(schema={'value': seed}, callback=lambda value: assert_type(value, int))
+alias = register
+alias(lambda value: require_int(value), {'value': seed})
+assert_type(generic(lambda value: require_int(value), {'value': seed}), int)
+
+def deferred() -> None:
+    register(lambda value: assert_type(value, int), {'value': seed})
+
+plain(lambda value: value, {'value': seed})
+overloaded(lambda value: value, {'value': seed})
+
+def union(flag: bool) -> None:
+    selected = register if flag else plain
+    selected(lambda value: value, {'value': seed})
+"#;
+    let builder = || {
+        TestDbBuilder::new()
+            .with_python_version(ruff_python_ast::PythonVersion::PY313)
+            .with_file("/src/native.pyi", declarations)
+            .with_file("/src/main.py", source)
+    };
+    let ordinary = builder().build()?;
+    let file = system_path_to_file(&ordinary, "/src/main.py")?;
+    let diagnostics = ordinary.check_file(file);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.id().as_str() == "type-assertion-failure"),
+        "ordinary inference must not derive a callback parameter from this schema: {diagnostics:#?}"
+    );
+
+    let mut db = builder()
+        .with_call_argument_context_provider(parameters, context)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    db.write_file(
+        "/src/native.pyi",
+        declarations.replace("seed: int", "seed: str"),
+    )?;
+    let diagnostics = db.check_file(file);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.id().as_str() == "invalid-argument-type"),
+        "{diagnostics:#?}"
+    );
+    db.write_file("/src/native.pyi", declarations)?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    for (call, expected) in [
+        (
+            "register(lambda value: require_str(value), {'value': seed})",
+            "invalid-argument-type",
+        ),
+        (
+            "strict(lambda value: value, {'value': seed})",
+            "invalid-argument-type",
+        ),
+        (
+            "bounded(lambda value: 'wrong', {'value': seed})",
+            "invalid-argument-type",
+        ),
+        (
+            "optional(lambda value='wrong': require_int(value), {'value': seed})",
+            "invalid-argument-type",
+        ),
+        (
+            "register(lambda value: value, {'value': seed}, 42)",
+            "too-many-positional-arguments",
+        ),
+        ("register(lambda value: value)", "missing-argument"),
+        ("register(lambda value: value, 42)", "invalid-argument-type"),
+    ] {
+        db.write_file("/src/main.py", format!("{source}\n{call}\n"))?;
+        let diagnostics = db.check_file(file);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id().as_str() == expected),
+            "{call}: {diagnostics:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_getattr_refines_matched_operands() -> anyhow::Result<()> {
     fn refine<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
         if call

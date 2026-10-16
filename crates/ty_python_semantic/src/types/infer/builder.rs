@@ -5927,6 +5927,42 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             overload_candidates.push(candidate_overload_indices);
         });
 
+        let provided_arguments: Vec<_> = ast_arguments
+            .call()
+            .and_then(|_| bindings.iter_flat().exactly_one().ok())
+            .and_then(|callable| {
+                let [overload] = callable.overloads() else {
+                    return None;
+                };
+                let declaration = overload.signature.definition()?;
+                let parameters = db.provided_contextual_parameters(declaration);
+                if parameters.is_empty() {
+                    return None;
+                }
+                Some(
+                    (0..argument_types.len())
+                        .filter(|&index| !argument_types.is_variadic(index))
+                        .filter_map(|index| {
+                            let matched = overload.matched_argument_for_call_argument(
+                                callable.bound_type.is_some(),
+                                index,
+                            )?;
+                            let [parameter] = matched.parameters.as_slice() else {
+                                return None;
+                            };
+                            let name = overload.signature.parameters()[parameter.index].name()?;
+                            parameters.contains(name).then(|| (index, name.clone()))
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        for (index, _) in &provided_arguments {
+            generic_arguments[*index] = true;
+        }
+        // Supplied contexts can change even when the declaration has no type variables.
+        max_typevar_occurrences += provided_arguments.len();
+
         let generic_arguments: SmallVec<_> = generic_arguments
             .into_iter()
             .enumerate()
@@ -5988,6 +6024,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     &constraints,
                     narrowed_tcx,
                     &generic_arguments,
+                    &provided_arguments,
                     max_typevar_occurrences,
                     &overload_candidates,
                 )
@@ -6074,6 +6111,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 &constraints,
                 call_expression_tcx,
                 &generic_arguments,
+                &provided_arguments,
                 max_typevar_occurrences,
                 &overload_candidates,
             )
@@ -6209,7 +6247,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         constraints: &ConstraintSetBuilder<'db>,
         call_expression_tcx: TypeContext<'db>,
         generic_arguments: &SmallVec<[usize; 4]>,
-        typevar_occurrences: usize,
+        provided_arguments: &[(usize, Name)],
+        max_iterations: usize,
         candidates: &OverloadSet,
     ) -> Result<(), CallErrorKind> {
         let db = self.db();
@@ -6255,7 +6294,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // If the inferred types have converged, and already evaluated the bindings from the
             // previous iteration, we are done.
-            if iteration > 0 && inferred_types_converged {
+            if iteration > 0 && inferred_types_converged && provided_arguments.is_empty() {
                 break (speculative_builder, next_argument_types);
             }
 
@@ -6271,15 +6310,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 CheckTypesMode::Provisional,
             );
 
-            // The number of occurrences of inferable typevars forms an upper bound for the number
-            // of fixpoint iterations, and so if the types have converged, or we have reached the
-            // upper bound, we are done.
-            if inferred_types_converged || iteration == typevar_occurrences {
+            // Bound inference by the type-variable occurrences and supplied contextual slots.
+            // The final call check remains authoritative if context does not converge.
+            if (inferred_types_converged && provided_arguments.is_empty())
+                || iteration == max_iterations
+            {
                 break (speculative_builder, next_argument_types);
             }
 
             // Collect the argument constraints based on the newly inferred types.
-            let next_arguments_tcx = self.collect_call_arguments_type_context(
+            let mut next_arguments_tcx = self.collect_call_arguments_type_context(
                 collection_arguments,
                 &next_argument_types,
                 &next_bindings,
@@ -6287,6 +6327,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 constraints,
                 call_expression_tcx,
                 &[],
+            );
+
+            speculative_builder.refine_provided_argument_contexts(
+                ast_arguments,
+                &next_argument_types,
+                &mut next_bindings,
+                provided_arguments,
+                &mut next_arguments_tcx,
             );
 
             // If the argument constraints have converged, the inferred types will be identical,
@@ -6316,7 +6364,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             })
             .collect();
         let (converged_builder, converged_argument_types) = if !final_arguments.is_empty() {
-            let arguments_tcx = self.collect_call_arguments_type_context(
+            let mut arguments_tcx = self.collect_call_arguments_type_context(
                 collection_arguments,
                 &converged_argument_types,
                 &next_bindings,
@@ -6324,6 +6372,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 constraints,
                 call_expression_tcx,
                 &final_arguments,
+            );
+            converged_builder.refine_provided_argument_contexts(
+                ast_arguments,
+                &converged_argument_types,
+                &mut next_bindings,
+                provided_arguments,
+                &mut arguments_tcx,
             );
             let mut final_builder = self.speculate();
             let mut final_argument_types = argument_types.clone();
@@ -10313,7 +10368,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         let bindings_result = self.infer_and_check_argument_types(
-            ArgumentsIter::from_ast(arguments),
+            ArgumentsIter::from_call(call_expression),
             &collection_argument_indices,
             &mut call_arguments,
             &mut |builder, (_, expr, tcx)| {
@@ -10521,7 +10576,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let call_result = self
                 .speculate_without_diagnostics()
                 .infer_and_check_argument_types(
-                    ArgumentsIter::from_ast(arguments),
+                    ArgumentsIter::from_call(call_expression),
                     &[],
                     &mut call_arguments,
                     // TODO: Reuse the argument types stored in `call_arguments`. Collection
@@ -10638,6 +10693,60 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             arguments,
             |expression| self.try_expression_type(expression),
         )
+    }
+
+    fn refine_provided_argument_contexts(
+        &self,
+        ast_arguments: &ArgumentsIter<'_>,
+        arguments: &CallArguments<'_, 'db>,
+        bindings: &mut Bindings<'db>,
+        parameters: &[(usize, Name)],
+        contexts: &mut [Option<MatchingArgumentTypeContext<'db>>],
+    ) {
+        if parameters.is_empty() {
+            return;
+        }
+        let Some(call) = ast_arguments.call() else {
+            return;
+        };
+        let Ok(callable) = bindings.iter_flat_mut().exactly_one() else {
+            return;
+        };
+        let bound_receiver = callable.bound_type.is_some();
+        let Some(binding) = callable.single_overload_mut() else {
+            return;
+        };
+        let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
+        let dictionary_items = |expression: &ast::Expr, ty| self.dictionary_items(expression, ty);
+        let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
+            scope: self.scope(),
+            offset: self.dynamic_class_scope_offset(call),
+            explicit_bases,
+        };
+        let has_binding_errors = !binding.errors().is_empty();
+        let context = crate::types::CheckedCall {
+            binding,
+            arguments,
+            bound_receiver,
+            file: self.scope().program_file(self.db()),
+            call,
+            expression_type: &expression_type,
+            dictionary_items: &dictionary_items,
+            class_anchor: &class_anchor,
+            has_binding_errors,
+        };
+        for (index, name) in parameters {
+            if let Some(parameter_type) = self.db().provided_call_argument_context(&context, name)
+                && let Some(MatchingArgumentTypeContext::Unique(Some(
+                    ArgumentTypeContext::Standard {
+                        raw_parameter_type: _,
+                        parameter_type: inferred_context,
+                    },
+                ))) = contexts.get_mut(*index).and_then(Option::as_mut)
+            {
+                *inferred_context = parameter_type;
+            }
+        }
     }
 
     /// Applications can refine factory results without replacing binding or argument inference.
@@ -13677,13 +13786,33 @@ fn prefer_collection_literal_peer_context<'db>(
 /// An iterator over arguments to a functional call.
 #[derive(Clone)]
 enum ArgumentsIter<'a> {
-    FromAst(ArgumentsSourceOrder<'a>),
+    FromAst {
+        arguments: ArgumentsSourceOrder<'a>,
+        call: Option<&'a ast::ExprCall>,
+    },
     Synthesized(std::slice::Iter<'a, ArgOrKeyword<'a>>),
 }
 
 impl<'a> ArgumentsIter<'a> {
     fn from_ast(arguments: &'a ast::Arguments) -> Self {
-        Self::FromAst(arguments.iter_source_order())
+        Self::FromAst {
+            arguments: arguments.iter_source_order(),
+            call: None,
+        }
+    }
+
+    fn from_call(call: &'a ast::ExprCall) -> Self {
+        Self::FromAst {
+            arguments: call.arguments.iter_source_order(),
+            call: Some(call),
+        }
+    }
+
+    fn call(&self) -> Option<&'a ast::ExprCall> {
+        match self {
+            Self::FromAst { arguments: _, call } => *call,
+            Self::Synthesized(_) => None,
+        }
     }
 
     fn synthesized(arguments: &'a [ArgOrKeyword<'a>]) -> Self {
@@ -13696,7 +13825,7 @@ impl<'a> Iterator for ArgumentsIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            ArgumentsIter::FromAst(args) => args.next(),
+            ArgumentsIter::FromAst { arguments, call: _ } => arguments.next(),
             ArgumentsIter::Synthesized(args) => args.next().copied(),
         }
     }
