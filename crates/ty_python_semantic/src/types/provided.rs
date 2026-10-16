@@ -20,7 +20,7 @@ use crate::types::CheckedCall;
 use crate::types::ClassLiteral;
 use crate::types::class::{DynamicClassAnchor, DynamicClassLiteral, DynamicClassScopeOffset};
 use crate::types::{
-    ClassType, IntersectionBuilder, KnownClass, MemberLookupPolicy, Type, TypeQualifiers,
+    ClassType, IntersectionBuilder, KnownClass, MemberLookupPolicy, Signature, Type, TypeQualifiers,
 };
 
 impl KnownClass {
@@ -296,6 +296,15 @@ pub trait TypeExpressionContext<'db> {
         &mut self,
         expression: &ast::Expr,
     ) -> (Type<'db>, TypeQualifiers);
+
+    /// Specializes a signature's result using the application's explicit type arguments.
+    ///
+    /// Type argument inference, defaults, and validation follow ordinary generic applications.
+    fn infer_specialized_return_type(
+        &mut self,
+        subscript: &ast::ExprSubscript,
+        signature: &Signature<'db>,
+    ) -> Type<'db>;
 
     /// Records the type of application-owned syntax that does not use ordinary child inference.
     fn store_expression_type(&mut self, expression: &ast::Expr, ty: Type<'db>);

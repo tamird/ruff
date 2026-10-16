@@ -306,6 +306,113 @@ ordinary: list[int] = ["bad"]
     Ok(())
 }
 
+#[test]
+fn supplied_type_applications_specialize_signature_results() -> anyhow::Result<()> {
+    fn signature<'db>(db: &'db TestDb, value: Type<'db>) -> Option<&'db Signature<'db>> {
+        let Type::FunctionLiteral(function) = value else {
+            return None;
+        };
+        let file = function.definition(db).program_file(db);
+        let path = file.file(db).path(db).as_system_path()?;
+        if path.as_str() != "/src/schema.pyi" {
+            return None;
+        }
+        let [signature] = function.signature(db).overloads.as_slice() else {
+            return None;
+        };
+        Some(signature)
+    }
+
+    fn application<'db>(
+        db: &'db TestDb,
+        application: ProvidedTypeApplication<'_, 'db>,
+        context: &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<Type<'db>> {
+        let ProvidedTypeApplication {
+            expression,
+            value_type,
+            definition: _,
+        } = application;
+        let signature = signature(db, value_type)?;
+        Some(context.infer_specialized_return_type(expression, signature))
+    }
+
+    fn annotation<'db>(
+        db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        value_type: Type<'db>,
+        _definition: Option<Definition<'db>>,
+    ) -> Option<Type<'db>> {
+        let signature = signature(db, value_type)?;
+        Some(signature.default_specialized_return_type(db))
+    }
+
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_type_application_provider(application)
+        .with_type_reference_provider(annotation)
+        .with_file(
+            "/src/schema.pyi",
+            "def Items[T = str]() -> list[T]: ...\n\
+             def Bounded[T: str]() -> list[T]: ...\n\
+             def Plain() -> int: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from schema import Items as Alias, Bounded, Plain
+
+explicit: Alias[int] = [1]
+default: Alias = ["ok"]
+empty: Alias[()] = ["ok"]
+bounded: Bounded[str] = ["ok"]
+plain: Plain = 1
+
+def generic[T](value: T) -> Alias[T]:
+    return [value]
+
+def shadow() -> None:
+    class Alias[T]: ...
+    value: Alias[int] = Alias()
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    db.write_file(
+        "/src/main.py",
+        r#"
+from schema import Items, Bounded, Plain
+
+explicit: Items[int] = ["bad"]
+default: Items = [1]
+bound: Bounded[int] = [1]
+excess: Items[int, str] = []
+missing: Bounded[()] = []
+nongeneric: Plain[str] = 1
+"#,
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-assignment",
+            "invalid-assignment",
+            "invalid-type-arguments",
+            "invalid-type-arguments",
+            "invalid-type-arguments",
+            "not-subscriptable",
+        ],
+        "{diagnostics:#?}",
+    );
+    Ok(())
+}
+
 struct AllocationSource;
 
 impl SourceProvider for AllocationSource {

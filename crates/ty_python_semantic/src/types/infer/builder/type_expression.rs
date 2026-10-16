@@ -59,6 +59,24 @@ impl<'db> TypeExpressionContext<'db> for TypeInferenceBuilder<'db, '_> {
         (annotation.inner_type(), annotation.qualifiers())
     }
 
+    fn infer_specialized_return_type(
+        &mut self,
+        subscript: &ast::ExprSubscript,
+        signature: &Signature<'db>,
+    ) -> Type<'db> {
+        let db = self.db();
+        let context = signature.generic_context.unwrap_or_else(|| {
+            GenericContext::from_typevar_instances(db, self.program_environment(), [])
+        });
+        let value_ty = Type::single_callable(db, signature.clone());
+        self.infer_explicit_callable_specialization(subscript, value_ty, context, &|arguments| {
+            signature.return_type().apply_specialization(
+                db,
+                context.specialize_partial(db, arguments.iter().copied()),
+            )
+        })
+    }
+
     fn report_invalid_type_form(&mut self, range: TextRange, message: &str) {
         if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, range) {
             builder.into_diagnostic(message);

@@ -1295,6 +1295,14 @@ impl<'db> Signature<'db> {
         self.return_ty
     }
 
+    /// The result type after applying this signature's default type arguments.
+    pub fn default_specialized_return_type(&self, db: &'db dyn Db) -> Type<'db> {
+        self.generic_context.map_or(self.return_ty, |context| {
+            self.return_ty
+                .apply_specialization(db, context.default_specialization(db, None))
+        })
+    }
+
     /// Adds an implicit annotation to the first parameter of this signature, if that parameter is
     /// positional and does not already have an annotation. We do not check whether that's the
     /// right thing to do! The caller must determine whether the first parameter is actually a
