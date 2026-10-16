@@ -1620,3 +1620,55 @@ combine(make, strings)  # no diagnostic
 combine(make, objects)  # no diagnostic
 combine(make, mixed)  # error: [invalid-argument-type]
 ```
+
+## Generic callable subtyping
+
+A generic source can satisfy a fixed callback type by choosing one specialization shared by its
+parameters and return type. Caller-owned variables stay fixed, and strict subtyping cannot use `Any`
+to supply missing evidence.
+
+```py
+from typing import Any, Callable, TypeVar
+from ty_extensions import static_assert
+from ty_extensions._internal import TypeOf, is_subtype_of
+
+T = TypeVar("T")
+U = TypeVar("U")
+B = TypeVar("B", bound=str)
+C = TypeVar("C", int, str)
+
+def identity(value: T) -> T:
+    return value
+
+def pair(left: list[T], right: list[T]) -> list[T]:
+    return left
+
+def key(value: tuple[T, dict[T, bool]]) -> int:
+    return len(value[1])
+
+def gradual(value: T) -> Any:
+    return value
+
+static_assert(is_subtype_of(TypeOf[identity], Callable[[int], int]))
+static_assert(not is_subtype_of(TypeOf[identity], Callable[[int], str]))
+static_assert(is_subtype_of(TypeOf[pair], Callable[[list[int], list[int]], list[int]]))
+static_assert(not is_subtype_of(TypeOf[pair], Callable[[list[int], list[str]], list[int]]))
+static_assert(not is_subtype_of(TypeOf[gradual], Callable[[int], int]))
+static_assert(not is_subtype_of(TypeOf[identity], Callable[[Any], int]))
+
+def caller(value: U) -> None:
+    static_assert(is_subtype_of(TypeOf[identity], Callable[[U], U]))
+    static_assert(is_subtype_of(TypeOf[key], Callable[[tuple[U, dict[U, bool]]], int]))
+    static_assert(not is_subtype_of(TypeOf[identity], Callable[[U], str]))
+
+def bounded(value: B) -> B:
+    return value
+
+def constrained(value: C) -> C:
+    return value
+
+static_assert(is_subtype_of(TypeOf[bounded], Callable[[str], str]))
+static_assert(not is_subtype_of(TypeOf[bounded], Callable[[int], int]))
+static_assert(is_subtype_of(TypeOf[constrained], Callable[[int], int]))
+static_assert(not is_subtype_of(TypeOf[constrained], Callable[[bytes], bytes]))
+```

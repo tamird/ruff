@@ -2946,7 +2946,10 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // satisfiability alone does not establish the original strict relation.
         if self.inferable == TypeVarSet::None
             && self.typevar_evaluation == TypeVarEvaluation::Eager
-            && matches!(self.relation, TypeRelation::Redundancy { pure: true })
+            && matches!(
+                self.relation,
+                TypeRelation::Subtyping | TypeRelation::Redundancy { pure: true }
+            )
             && source.has_supported_declared_domain(db, env)
             && target.generic_context.is_none()
             && target.supports_specialization(db, |ty| ty.is_fully_static_except_any(db, env))
@@ -2976,7 +2979,10 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 checker.typevar_evaluation = TypeVarEvaluation::Lazy;
             }
         } else if checker.typevar_evaluation == TypeVarEvaluation::Eager
-            && matches!(checker.relation, TypeRelation::Redundancy { pure: true })
+            && matches!(
+                checker.relation,
+                TypeRelation::Subtyping | TypeRelation::Redundancy { pure: true }
+            )
             && source.generic_context.is_some()
             && target.generic_context.is_none()
             && source.supports_static_inference(db, env)

@@ -1637,3 +1637,50 @@ combine(make, strings)  # no diagnostic
 combine(make, objects)  # no diagnostic
 combine(make, mixed)  # error: [invalid-argument-type]
 ```
+
+## Generic callable subtyping
+
+A generic source can satisfy a fixed callback type by choosing one specialization shared by its
+parameters and return type. Caller-owned variables stay fixed, and strict subtyping cannot use `Any`
+to supply missing evidence.
+
+```py
+from typing import Any, Callable
+from ty_extensions import static_assert
+from ty_extensions._internal import TypeOf, is_subtype_of
+
+def identity[T](value: T) -> T:
+    return value
+
+def pair[T](left: list[T], right: list[T]) -> list[T]:
+    return left
+
+def key[T](value: tuple[T, dict[T, bool]]) -> int:
+    return len(value[1])
+
+def gradual[T](value: T) -> Any:
+    return value
+
+static_assert(is_subtype_of(TypeOf[identity], Callable[[int], int]))
+static_assert(not is_subtype_of(TypeOf[identity], Callable[[int], str]))
+static_assert(is_subtype_of(TypeOf[pair], Callable[[list[int], list[int]], list[int]]))
+static_assert(not is_subtype_of(TypeOf[pair], Callable[[list[int], list[str]], list[int]]))
+static_assert(not is_subtype_of(TypeOf[gradual], Callable[[int], int]))
+static_assert(not is_subtype_of(TypeOf[identity], Callable[[Any], int]))
+
+def caller[U](value: U) -> None:
+    static_assert(is_subtype_of(TypeOf[identity], Callable[[U], U]))
+    static_assert(is_subtype_of(TypeOf[key], Callable[[tuple[U, dict[U, bool]]], int]))
+    static_assert(not is_subtype_of(TypeOf[identity], Callable[[U], str]))
+
+def bounded[T: str](value: T) -> T:
+    return value
+
+def constrained[T: (int, str)](value: T) -> T:
+    return value
+
+static_assert(is_subtype_of(TypeOf[bounded], Callable[[str], str]))
+static_assert(not is_subtype_of(TypeOf[bounded], Callable[[int], int]))
+static_assert(is_subtype_of(TypeOf[constrained], Callable[[int], int]))
+static_assert(not is_subtype_of(TypeOf[constrained], Callable[[bytes], bytes]))
+```
