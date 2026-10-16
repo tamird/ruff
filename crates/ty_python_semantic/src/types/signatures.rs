@@ -1430,6 +1430,11 @@ impl<'db> Signature<'db> {
             .find_legacy_typevars_impl(db, env, binding_context, typevars, visitor);
     }
 
+    /// Whether this signature binds type variables, including legacy type variables.
+    pub fn is_generic(&self) -> bool {
+        self.generic_context.is_some()
+    }
+
     /// Return the parameters in this signature.
     pub fn parameters(&self) -> &Parameters<'db> {
         &self.parameters
@@ -6988,7 +6993,10 @@ mod tests {
         db.write_dedented(
             "/src/a.py",
             "
+            from typing import TypeVar
             from ty_extensions import Top, Unknown, TypeOf
+            T = TypeVar(\"T\")
+            def legacy(value: T) -> T: ...
             def identity[U](value: U) -> U: ...
             def f[T = str](value: T) -> tuple[list[T], TypeOf[identity]]: ...
             def expected() -> tuple[Top[list[Unknown]], TypeOf[identity]]: ...
@@ -6997,14 +7005,22 @@ mod tests {
         .unwrap();
         let function = get_function_f(&db, "/src/a.py");
         let signature = function.last_definition_signature(&db);
+        assert!(signature.is_generic());
         let env = db.program_environment();
         let file = signature.definition().unwrap().program_file(&db);
-        let expected = global_symbol(&db, file, "expected")
+        let legacy = global_symbol(&db, file, "legacy")
             .place
             .expect_type()
             .expect_function_literal()
-            .last_definition_signature(&db)
-            .return_type();
+            .last_definition_signature(&db);
+        assert!(legacy.is_generic());
+        let expected_signature = global_symbol(&db, file, "expected")
+            .place
+            .expect_type()
+            .expect_function_literal()
+            .last_definition_signature(&db);
+        assert!(!expected_signature.is_generic());
+        let expected = expected_signature.return_type();
         let upper = signature.upper_specialized_return_type(&db, &env);
         assert_eq!(upper, expected);
         assert_ne!(upper, signature.default_specialized_return_type(&db));
