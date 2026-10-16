@@ -613,8 +613,19 @@ impl<'db> DictionaryItems<'db> {
         Ok(dictionary.finish())
     }
 
+    /// Recover declared TypedDict entries when expression observations are unavailable.
+    pub(crate) fn from_typed_dict_type(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        source: TextRange,
+    ) -> Option<Self> {
+        let unpacked = extract_unpacked_typed_dict_from_value_type(db, env, ty)?;
+        Some(Self::from_typed_dict(unpacked, source))
+    }
+
     /// Retain declared keys and their presence while preserving unknown hidden fields.
-    pub(crate) fn from_typed_dict(unpacked: UnpackedTypedDict<'db>, source: TextRange) -> Self {
+    fn from_typed_dict(unpacked: UnpackedTypedDict<'db>, source: TextRange) -> Self {
         let UnpackedTypedDict {
             keys,
             openness,

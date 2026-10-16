@@ -2073,11 +2073,31 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
             "def merge(**values: int):\n    values['added'] = 1\n    return observe(values)",
             "extra: int; added~: Literal[1] at 'added'",
         ),
+        (
+            "def nested():\n    from typing_extensions import TypedDict, NotRequired\n    class Row(TypedDict, closed=True):\n        required: int\n        optional: NotRequired[str]\n    def make() -> Row: return {'required': 1}\n    return observe(make())",
+            "complete; optional?: str at make(); required: int at make()",
+        ),
+        (
+            "def nested():\n    from typing_extensions import TypedDict, NotRequired\n    class Row(TypedDict):\n        required: int\n        optional: NotRequired[str]\n    def make() -> Row: return {'required': 1}\n    return observe(make())",
+            "extra: Unknown; optional?: str at make(); required: int at make()",
+        ),
+        (
+            "def nested():\n    from typing_extensions import TypedDict, NotRequired\n    class Row(TypedDict, extra_items=bool):\n        required: int\n        optional: NotRequired[str]\n    def make() -> Row: return {'required': 1}\n    return observe(make())",
+            "extra: bool; optional?: str at make(); required: int at make()",
+        ),
+        (
+            "def nested():\n    def make() -> dict[str, int]: return {'required': 1}\n    return observe(make())",
+            "unavailable",
+        ),
     ] {
         db.write_file(
             "/src/main.py",
             format!("from native import observe\n{source}\nannotation: \"{{'key': int}}\"\n"),
         )?;
+        let diagnostics = db.check_file(file);
+        // The detached dictionary literal below deliberately is not a valid annotation.
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-type-form");
         let file = db.program_file(file);
         let model = SemanticModel::new(&db, file);
         let parsed = parsed_module(&db, file.python_file(&db)).load(&db);

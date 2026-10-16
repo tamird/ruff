@@ -6,7 +6,6 @@ use ty_python_core::definition::Definition;
 use super::arguments::CallArgumentTypes;
 use super::{Binding, CallArguments};
 use crate::types::class::DynamicClassAnchor;
-use crate::types::typed_dict::extract_unpacked_typed_dict_from_value_type;
 use crate::types::{DictionaryItems, Type};
 use crate::{Db, ProgramEnvironment};
 
@@ -118,11 +117,7 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
     ) -> Option<DictionaryItems<'db>> {
         (self.dictionary_items)(expression, ty).or_else(|| {
             let env = ProgramEnvironment::from_file(self.file);
-            let unpacked = extract_unpacked_typed_dict_from_value_type(db, &env, ty)?;
-            Some(DictionaryItems::from_typed_dict(
-                unpacked,
-                expression.range(),
-            ))
+            DictionaryItems::from_typed_dict_type(db, &env, ty, expression.range())
         })
     }
 

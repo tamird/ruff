@@ -220,9 +220,21 @@ impl<'db> SemanticModel<'db> {
     ///
     /// Literals, builtin dictionary copies, and indexed mappings retain named entries and
     /// residual values at this use. Reaching mutations update those entries; exposure weakens
-    /// presence evidence while preserving ordinary value refinements.
+    /// presence evidence while preserving ordinary value refinements. Declared TypedDict
+    /// fields supply their required or optional presence when no observation is available.
     pub fn dictionary_items(&self, expression: &Expr) -> Option<DictionaryItems<'db>> {
-        self.dictionary_observation(expression).ok()
+        if self.annotation_scope.is_some() {
+            return None;
+        }
+        match self.dictionary_observation(expression) {
+            Ok(items) => Some(items),
+            Err(crate::types::dictionary::DictionaryFallback::Unavailable) => {
+                let env = ProgramEnvironment::from_file(self.file);
+                let ty = expression.inferred_type(self)?;
+                DictionaryItems::from_typed_dict_type(self.db, &env, ty, expression.range())
+            }
+            Err(crate::types::dictionary::DictionaryFallback::Unreachable) => None,
+        }
     }
 
     pub(crate) fn dictionary_observation(
