@@ -24,7 +24,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec, smallvec_inline};
 
 use self::constructor::{ConstructorBinding, ConstructorContext};
-use super::{Argument, CallArguments, CallError, CallErrorKind, InferContext, Signature, Type};
+use super::{
+    Argument, CallArguments, CallError, CallErrorKind, CallInput, InferContext, Signature, Type,
+};
 use crate::TypeQualifiers;
 use crate::db::Db;
 use crate::dunder_all::dunder_all_names;
@@ -1025,6 +1027,97 @@ impl<'db> Bindings<'db> {
     /// individual `Binding`s via `CallableBinding`'s `IntoIterator` implementation.
     pub(crate) fn iter_flat(&self) -> impl Iterator<Item = &CallableBinding<'db>> {
         self.elements.iter().flat_map(BindingsElement::callables)
+    }
+
+    /// Returns the specialized parameter types matched to each source argument.
+    ///
+    /// Keep alternatives separate: unioning them could erase a gradual parameter type. Argument
+    /// expansion currently retains only the last successful specialization of each overload, so
+    /// it cannot provide a complete account of the checked input types.
+    pub(crate) fn input_types(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        arguments: &CallArguments<'_, 'db>,
+    ) -> Option<Vec<Vec<CallInput<'db>>>> {
+        fn collect<'db>(
+            db: &'db dyn Db,
+            bindings: &Bindings<'db>,
+            env: &ProgramEnvironment<'db>,
+            arguments: &CallArguments<'_, 'db>,
+            inputs: &mut [Vec<CallInput<'db>>],
+        ) -> Option<()> {
+            for item in bindings.iter_callable_items() {
+                let callable = item.callable();
+                if let Some(result) = &callable.overload_call_result {
+                    match result {
+                        OverloadCallResult::ArgumentTypeExpansion(_) => return None,
+                        OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => return None,
+                        OverloadCallResult::Ambiguous => {}
+                    }
+                }
+                let mut selected = callable.selected_overloads().peekable();
+                selected.peek()?;
+                let bound_arguments = arguments.with_self(callable.bound_type);
+                for (_, overload) in selected {
+                    let specialization = overload.merged_specialization(db);
+                    let signature = overload.signature.specialize_for_call(db, specialization);
+                    if signature.parameters().is_gradual()
+                        || signature.parameters().is_incomplete()
+                        || signature.parameters().as_paramspec_with_prefix().is_some()
+                    {
+                        return None;
+                    }
+                    let mut matched = Binding::single(overload.signature_type, signature);
+                    matched.match_parameters(db, env, bound_arguments.as_ref());
+                    if !matched.errors.is_empty() {
+                        return None;
+                    }
+                    for ((index, types), (_, argument_types)) in
+                        inputs.iter_mut().enumerate().zip(arguments.iter())
+                    {
+                        let argument = matched.matched_argument_for_call_argument(
+                            callable.bound_type.is_some(),
+                            index,
+                        )?;
+                        if !argument.matched {
+                            return None;
+                        }
+                        for matched_parameter in &argument.parameters {
+                            let parameter =
+                                &matched.signature.parameters()[matched_parameter.index];
+                            let argument_type =
+                                matched_parameter.argument_type(parameter, argument_types)?;
+                            let input = CallInput {
+                                argument_type: specialization.map_or(
+                                    argument_type,
+                                    |specialization| {
+                                        argument_type
+                                            .apply_call_argument_specialization(db, specialization)
+                                    },
+                                ),
+                                parameter_type: matched_parameter
+                                    .expected_type
+                                    .unwrap_or_else(|| parameter.annotated_type()),
+                            };
+                            if !types.contains(&input) {
+                                types.push(input);
+                            }
+                        }
+                    }
+                }
+                if let Some(constructor) = item.as_constructor()
+                    && let Some(downstream) = constructor.downstream_constructor()
+                {
+                    collect(db, downstream, env, arguments, inputs)?;
+                }
+            }
+            Some(())
+        }
+
+        let mut inputs = vec![Vec::new(); arguments.len()];
+        collect(db, self, env, arguments, &mut inputs)?;
+        Some(inputs)
     }
 
     /// Returns a mutable iterator over all `CallableBinding`s, flattening the two-level structure.

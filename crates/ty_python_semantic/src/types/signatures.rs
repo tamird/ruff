@@ -2084,6 +2084,21 @@ impl<'db> Signature<'db> {
         )
     }
 
+    /// Specializes a checked call's parameters, expanding resolved variadic parameters before
+    /// matching source arguments against the resulting signature.
+    pub(crate) fn specialize_for_call(
+        &self,
+        db: &'db dyn Db,
+        specialization: Option<Specialization<'db>>,
+    ) -> Self {
+        let signature = specialization.map_or_else(
+            || self.clone(),
+            |specialization| self.apply_specialization(db, specialization),
+        );
+        let parameters = signature.parameters.expand_paramspec_variadics(db);
+        signature.with_parameters(parameters)
+    }
+
     /// Specializes a partial's full signature before matching its bound arguments again.
     pub(crate) fn specialize_for_partial_application(
         &self,

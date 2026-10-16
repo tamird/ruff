@@ -1,0 +1,65 @@
+---
+source: crates/ty_python_semantic/src/types/ide_support.rs
+expression: "call_inputs(r#\"\nfrom typing import Any, Callable, overload\n\n@overload\ndef choose(value: int) -> int: ...\n@overload\ndef choose(value: str, other: Any) -> str: ...\ndef choose(value, other=None): ...\n\ndef optional(value: int = 1, *, other: Any = None) -> None: ...\ndef generic[T](value: T) -> T: ...\nclass C:\n    def method(self, value: str) -> None: ...\nclass Construct:\n    def __new__(cls, value: int) -> Construct: ...\n    def __init__(self, value: object) -> None: ...\ndef unsafe(value: Any) -> None: ...\n\nchoose(1)\noptional()\noptional(other=1, value=2)\ngeneric(1)\nC().method(\"x\")\nConstruct(1)\nunsafe(1)\nchoose(None)\ndef caller[T](value: T) -> T:\n    return generic(value)\n\"#,)?"
+---
+[
+    Ok(
+        [
+            [
+                "Literal[1] <: int: true",
+            ],
+        ],
+    ),
+    Ok(
+        [],
+    ),
+    Ok(
+        [
+            [
+                "Literal[1] <: Any: false",
+            ],
+            [
+                "Literal[2] <: int: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "Literal[1] <: Literal[1]: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "Literal[\"x\"] <: str: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "Literal[1] <: int: true",
+                "Literal[1] <: object: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "Literal[1] <: Any: false",
+            ],
+        ],
+    ),
+    Err(
+        Invalid,
+    ),
+    Ok(
+        [
+            [
+                "T@caller <: T@caller: true",
+            ],
+        ],
+    ),
+]

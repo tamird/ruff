@@ -18,6 +18,15 @@ pub(super) use bind::{
     Binding, Bindings, CallDiagnosticOverride, CallableBinding, MatchedArgument,
 };
 
+/// One argument type and the specialized parameter type against which it was checked.
+///
+/// For an unpacked argument, this describes one supplied element rather than its container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallInput<'db> {
+    pub argument_type: Type<'db>,
+    pub parameter_type: Type<'db>,
+}
+
 /// The return type and deprecations retained from binary operator resolution.
 #[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
 pub(crate) struct BinaryOperationResult<'db> {

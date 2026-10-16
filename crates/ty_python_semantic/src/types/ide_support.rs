@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 use crate::FxIndexSet;
 use crate::place::implicit_builtins_symbol_source;
 use crate::reachability::is_range_reachable;
+pub use crate::types::call::CallInput;
 use crate::types::call::bind::CheckTypesMode;
 use crate::types::call::{CallArguments, CallError, MatchedArgument};
 use crate::types::class::{DynamicClassAnchor, DynamicEnumAnchor, DynamicNamedTupleAnchor};
@@ -1291,33 +1292,77 @@ fn full_type_bindings_for_call<'db>(
     func_type: Type<'db>,
     call_expr: &ast::ExprCall,
 ) -> crate::types::call::Bindings<'db> {
+    let call_arguments = inferred_call_arguments(model, call_expr);
+    bind_inferred_call(model, func_type, &call_arguments)
+        .unwrap_or_else(|CallError(_, bindings)| *bindings)
+}
+
+fn inferred_call_arguments<'a, 'db>(
+    model: &SemanticModel<'db>,
+    call_expr: &'a ast::ExprCall,
+) -> CallArguments<'a, 'db> {
+    CallArguments::from_arguments_typed(&call_expr.arguments, |expression| {
+        expression.inferred_type(model).unwrap_or(Type::unknown())
+    })
+    .with_known_unpacking(
+        &call_expr.arguments,
+        |expression| expression.inferred_type(model),
+        |expression| model.dictionary_observation(expression),
+    )
+}
+
+fn bind_inferred_call<'db>(
+    model: &SemanticModel<'db>,
+    func_type: Type<'db>,
+    call_arguments: &CallArguments<'_, 'db>,
+) -> Result<crate::types::call::Bindings<'db>, CallError<'db>> {
     let db = model.db();
     let env = &model.program_environment();
-    let call_arguments =
-        CallArguments::from_arguments_typed(&call_expr.arguments, |splatted_value| {
-            splatted_value
-                .inferred_type(model)
-                .unwrap_or(Type::unknown())
-        })
-        .with_known_unpacking(
-            &call_expr.arguments,
-            |expression| expression.inferred_type(model),
-            |expression| model.dictionary_observation(expression),
-        );
     let constraints = ConstraintSetBuilder::new();
 
     func_type
         .bindings(db, env)
-        .match_parameters(db, env, &call_arguments)
+        .match_parameters(db, env, call_arguments)
         .check_types(
             db,
             env,
             &constraints,
-            &call_arguments,
+            call_arguments,
             TypeContext::default(),
             &[],
         )
-        .unwrap_or_else(|CallError(_, bindings)| *bindings)
+}
+
+/// Why the input contracts of a call cannot be resolved completely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallInputError {
+    /// Ordinary argument matching or type checking rejected the call.
+    Invalid,
+    /// A gradual signature or argument expansion leaves some input contracts unknown.
+    Incomplete,
+}
+
+/// Returns the selected, specialized input contracts for each source argument.
+///
+/// The outer vector follows source argument order. Unpacked arguments can match several
+/// parameters, and ambiguous calls can retain several contracts for one argument. Those types
+/// remain separate so that a gradual alternative is not lost through union simplification.
+/// Omitted parameters and synthetic receivers are excluded. The call's result and each argument
+/// expression's complete type can be obtained independently from the semantic model.
+pub fn call_input_types<'db>(
+    model: &SemanticModel<'db>,
+    call_expr: &ast::ExprCall,
+) -> Result<Vec<Vec<CallInput<'db>>>, CallInputError> {
+    let func_type = call_expr
+        .func
+        .inferred_type(model)
+        .ok_or(CallInputError::Incomplete)?;
+    let arguments = inferred_call_arguments(model, call_expr);
+    let bindings =
+        bind_inferred_call(model, func_type, &arguments).map_err(|_| CallInputError::Invalid)?;
+    bindings
+        .input_types(model.db(), &model.program_environment(), &arguments)
+        .ok_or(CallInputError::Incomplete)
 }
 
 // These are the callables whose arguments were historically classified as type expressions.
@@ -2273,7 +2318,8 @@ pub fn constructor_signature(model: &SemanticModel, call_expr: &ast::ExprCall) -
 #[cfg(test)]
 mod tests {
     use super::{
-        CallArgumentForm, ImportAliasResolution, call_argument_forms, definitions_for_name,
+        CallArgumentForm, CallInputError, ImportAliasResolution, call_argument_forms,
+        call_input_types, definitions_for_name,
     };
     use crate::SemanticModel;
     use crate::db::tests::TestDbBuilder;
@@ -2283,6 +2329,163 @@ mod tests {
     use ruff_db::testing::assert_function_query_was_not_run_by_name;
     use ruff_python_ast as ast;
     use ty_python_core::ProgramFile;
+
+    fn call_inputs(source: &str) -> anyhow::Result<Vec<Result<Vec<Vec<String>>, CallInputError>>> {
+        let db = TestDbBuilder::new()
+            .with_python_version(ast::PythonVersion::PY314)
+            .with_file("/src/foo.py", source)
+            .build()?;
+        let file = system_path_to_file(&db, "/src/foo.py")?;
+        let file = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, file);
+        let env = model.program_environment();
+        Ok(parsed
+            .suite()
+            .iter()
+            .filter_map(|statement| {
+                if let Some(expression) = statement.as_expr_stmt() {
+                    return expression.value.as_call_expr();
+                }
+                let function = statement.as_function_def_stmt()?;
+                let returned = function.body.last()?.as_return_stmt()?;
+                returned.value.as_ref()?.as_call_expr()
+            })
+            .map(|call| {
+                call_input_types(&model, call).map(|arguments| {
+                    arguments
+                        .into_iter()
+                        .map(|types| {
+                            types
+                                .into_iter()
+                                .map(|input| {
+                                    format!(
+                                        "{} <: {}: {}",
+                                        input.argument_type.display(&db, &env),
+                                        input.parameter_type.display(&db, &env),
+                                        input.argument_type.is_subtype_of(
+                                            &db,
+                                            &env,
+                                            input.parameter_type
+                                        ),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect()
+                })
+            })
+            .collect())
+    }
+
+    #[test]
+    fn call_inputs_select_supplied_parameters() -> anyhow::Result<()> {
+        insta::assert_debug_snapshot!(call_inputs(
+            r#"
+from typing import Any, Callable, overload
+
+@overload
+def choose(value: int) -> int: ...
+@overload
+def choose(value: str, other: Any) -> str: ...
+def choose(value, other=None): ...
+
+def optional(value: int = 1, *, other: Any = None) -> None: ...
+def generic[T](value: T) -> T: ...
+class C:
+    def method(self, value: str) -> None: ...
+class Construct:
+    def __new__(cls, value: int) -> Construct: ...
+    def __init__(self, value: object) -> None: ...
+def unsafe(value: Any) -> None: ...
+
+choose(1)
+optional()
+optional(other=1, value=2)
+generic(1)
+C().method("x")
+Construct(1)
+unsafe(1)
+choose(None)
+def caller[T](value: T) -> T:
+    return generic(value)
+"#,
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn call_inputs_preserve_unpacked_and_forwarded_parameters() -> anyhow::Result<()> {
+        insta::assert_debug_snapshot!(call_inputs(
+            r#"
+from typing import Callable, TypedDict, Unpack
+
+class Options(TypedDict):
+    count: int
+    name: str
+def target(count: int, *, name: str) -> None: ...
+def invoke[**P, R](f: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R: ...
+def fields(**kwargs: Unpack[Options]) -> None: ...
+def pair(first: int, second: str) -> None: ...
+options: Options = {"count": 1, "name": "x"}
+pair(*(1, "x"))
+fields(**options)
+invoke(target, 1, name="x")
+"#,
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn call_inputs_report_incomplete_signatures_and_expansion() -> anyhow::Result<()> {
+        insta::assert_debug_snapshot!(call_inputs(
+            r#"
+from typing import Any, Callable, overload
+
+@overload
+def choose(value: int) -> int: ...
+@overload
+def choose(value: str) -> str: ...
+def choose(value): ...
+def union() -> int | str: ...
+def dynamic() -> Any: ...
+def gradual() -> Callable[..., None]: ...
+
+choose(dynamic())
+choose(union())
+gradual()()
+dynamic()()
+"#,
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn call_inputs_specialize_optional_generics_and_bound_methods() -> anyhow::Result<()> {
+        insta::assert_debug_snapshot!(call_inputs(
+            r#"
+from typing import Callable
+from _typeshed import SupportsRichComparisonT
+
+def factory[**P, R](init: Callable[P, R] | None = None) -> None: ...
+def optional_key[T](key: Callable[[str], T] | None = None) -> None: ...
+def by_key[T, K: SupportsRichComparisonT](values: list[T], key: Callable[[T], K] | None = None) -> list[T]: ...
+values: dict[str, int] = {}
+other: dict[str, int] = {}
+
+factory()
+factory(init=None)
+optional_key(key=None)
+values.update(other)
+dict(other)
+sorted(["x"])
+sorted(["x"], key=None)
+sorted(["x"], key=len)
+by_key(["x"], key=len)
+"#,
+        )?);
+        Ok(())
+    }
 
     #[test]
     fn builtin_definition_lookup_does_not_infer_scope() -> anyhow::Result<()> {
