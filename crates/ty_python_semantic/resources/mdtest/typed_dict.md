@@ -4499,6 +4499,64 @@ static_assert(is_assignable_to(Items[Any], Items[int]))
 static_assert(not is_subtype_of(Items[Any], Items[int]))
 ```
 
+### Inferring nested schemas
+
+Generic inference collects constraints from a `TypedDict` schema nested inside another generic
+argument, including read-only optional fields. The enclosing generic's variance still determines the
+direction of the schema relation.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Generic, NotRequired, TypeVar
+from typing_extensions import ReadOnly, TypedDict
+
+S_co = TypeVar("S_co", covariant=True)
+S_contra = TypeVar("S_contra", contravariant=True)
+S = TypeVar("S")
+
+class Read(Generic[S_co]): ...
+class Write(Generic[S_contra]): ...
+class Cell(Generic[S]): ...
+
+class Present(TypedDict):
+    item: ReadOnly[str]
+
+class Optional[T](TypedDict):
+    item: ReadOnly[NotRequired[T]]
+
+class Mutable[T](TypedDict):
+    item: T
+
+class Empty(TypedDict, closed=True): ...
+
+def read[T](value: Read[Optional[T]]) -> T | None: ...
+def write[T](value: Write[Optional[T]], item: T) -> None: ...
+def exchange[T](value: Cell[Mutable[T]], item: T) -> T:
+    raise NotImplementedError
+
+def check(
+    present: Read[Present],
+    optional: Read[Optional[str]],
+    empty: Read[Empty],
+    gradual: Read[Optional[Any]],
+    output: Write[Optional[str]],
+    cell: Cell[Mutable[str]],
+) -> None:
+    reveal_type(read(present))  # revealed: str | None
+    reveal_type(read(optional))  # revealed: str | None
+    reveal_type(read(empty))  # revealed: Unknown | None
+    reveal_type(read(gradual))  # revealed: Any | None
+    write(output, "text")
+    write(output, 42)  # error: [invalid-argument-type]
+    reveal_type(exchange(cell, "text"))  # revealed: str
+    exchange(cell, 42)  # error: [invalid-argument-type]
+    wrong: int | None = read(present)  # error: [invalid-assignment]
+```
+
 ### Inherited methods
 
 Methods on a generic `TypedDict` subclass use the subclass's type arguments when checking the
