@@ -3890,6 +3890,71 @@ def _():
     reveal_type(x3)  # revealed: list[Any | tuple[int, str]]
 ```
 
+## Self-referential subscript assignments
+
+A read from the collection can depend on the write currently constraining its element type. Keep
+independent evidence from the call's other overloads until that dependency resolves.
+
+```py
+def direct():
+    values = {}
+    values["key"] = values.get("key", 0)
+    reveal_type(values)  # revealed: dict[str, int]
+
+def aggregate(items: list[tuple[str, int]]) -> int:
+    per_key = {}
+    for key, value in items:
+        per_key[key] = max(per_key.get(key, 0), value)
+    reveal_type(per_key)  # revealed: dict[str, int]
+    total = 0
+    for value in per_key.values():
+        total += value
+    return total
+```
+
+Only the value written to the collection constrains it; an intermediate default need not be stored:
+
+```py
+def transformed():
+    values = {}
+    values["key"] = str(values.get("key", 0))
+    reveal_type(values)  # revealed: dict[str, str]
+
+def unrelated():
+    values = {}
+    other = {}
+    other["key"] = values.get("key", 0)
+    reveal_type(values)  # revealed: dict[Unknown, Unknown]
+```
+
+Concrete incompatible values and genuine gradual inputs still contribute to the element type:
+
+```py
+from typing import Any
+
+def mixed() -> dict[str, int]:
+    values = {}
+    values["other"] = "text"
+    values["key"] = values.get("key", 0)
+    reveal_type(values)  # revealed: dict[str, str | int]
+    return values  # error: [invalid-return-type]
+
+def gradual(value: Any):
+    values = {}
+    values["other"] = value
+    values["key"] = values.get("key", 0)
+    reveal_type(values)  # revealed: dict[str, Any | int]
+```
+
+A cycle with no independent value evidence remains unknown:
+
+```py
+def self_only():
+    values = {}
+    values["key"] = values["key"]
+    reveal_type(values)  # revealed: dict[str, Unknown]
+```
+
 ## Multi-inference diagnostics
 
 Diagnostics unrelated to the type-context are only reported once:

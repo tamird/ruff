@@ -4504,15 +4504,18 @@ impl<'db> CallableBinding<'db> {
                 }),
             );
 
-            if top_materialized_argument_type
-                .when_assignable_to(
-                    db,
-                    env,
-                    parameter_types,
-                    constraints,
-                    self.overloads[*current_index].inferable_typevars,
-                )
-                .is_always_satisfied(db, env)
+            // A provisional parameter accepts every argument, but cannot yet establish that
+            // this prefix covers later overloads. Their results may break the inference cycle.
+            if !any_over_type(db, env, parameter_types, false, |ty| ty.is_divergent())
+                && top_materialized_argument_type
+                    .when_assignable_to(
+                        db,
+                        env,
+                        parameter_types,
+                        constraints,
+                        self.overloads[*current_index].inferable_typevars,
+                    )
+                    .is_always_satisfied(db, env)
             {
                 filter_remaining_overloads = true;
             }
@@ -4765,6 +4768,11 @@ impl<'db> CallableBinding<'db> {
                                 .map(|(_, overload)| overload.return_type()),
                         )
                     });
+                    if any_over_type(db, env, bound, false, |ty| ty.is_divergent()) {
+                        // Keep the unresolved dependency without introducing a lasting gradual
+                        // marker before overload selection has enough information.
+                        return bound;
+                    }
                     // Preserve possible results while accepting operations from every candidate.
                     // The ambiguity marker also preserves recursive-inference convergence.
                     IntersectionType::from_two_elements(

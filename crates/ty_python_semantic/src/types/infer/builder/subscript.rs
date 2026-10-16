@@ -1654,16 +1654,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             && let Some(collection_def) = self.index.unannotated_collection_initializer(object)
             && let Some((class_literal, _)) = object_ty.class_specialization(db, env)
             && let Some([checked_slice_ty, checked_value_ty]) = checked_arguments
-            && !any_over_type(db, env, checked_value_ty, false, |ty| ty.is_divergent())
+            && let inferred_value_ty =
+                checked_value_ty.filter_union(db, env, |ty| !ty.is_divergent())
+            && (!inferred_value_ty.is_never() || checked_value_ty.is_never())
+            && !any_over_type(db, env, inferred_value_ty, false, |ty| ty.is_divergent())
         {
             let identity_instance =
                 Type::instance(db, env, class_literal.identity_specialization(db));
             let collection_generic_context = class_literal.generic_context(db);
 
             // Use the checked argument types so fresh empty values retain the receiver's
-            // context. A provisional value cannot constrain the initializer yet; its other
-            // elements and uses must first resolve the expected type.
-            let call_arguments = CallArguments::positional([checked_slice_ty, checked_value_ty]);
+            // context. Concrete union arms can constrain a self-referential write while the
+            // other arm is still provisional. Nested provisional elements need more context.
+            let call_arguments = CallArguments::positional([checked_slice_ty, inferred_value_ty]);
 
             if let Place::Defined(DefinedPlace {
                 ty: dunder_callable,
