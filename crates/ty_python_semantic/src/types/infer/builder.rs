@@ -9284,8 +9284,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // Defaults execute in the enclosing scope even when the context restricts the
                     // inferred callable to calls that supply this argument.
                     let default_type = source.default().map(|default| {
-                        self.infer_expression(default, TypeContext::default())
-                            .replace_parameter_defaults(db, env)
+                        self.infer_expression(
+                            default,
+                            TypeContext::new(context.map(Parameter::annotated_type)),
+                        )
+                        .replace_parameter_defaults(db, env)
                     });
                     let parameter = parameter
                         .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter));

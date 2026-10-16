@@ -275,6 +275,29 @@ gradual: Callable[..., int] = lambda value="bad": 1
 reveal_type(gradual())  # revealed: Literal[1]
 ```
 
+An empty default receives the contextual parameter type. Nonempty incompatible defaults still
+contribute their actual element types to the body input.
+
+```py
+from collections.abc import Mapping, Sequence
+
+class Sequences(Protocol):
+    def __call__(self, values: Sequence[str] = ...) -> Sequence[str]: ...
+
+sequences: Sequences = lambda values=[]: (reveal_type(values), values)[1]  # revealed: Sequence[str]
+# error: [invalid-assignment]
+wrong_elements: Sequences = lambda values=[1]: values
+
+class Keywords(Protocol):
+    def __call__(self, *, values: Mapping[str, int] = ...) -> Mapping[str, int]: ...
+
+keywords: Keywords = lambda *, values={}: (reveal_type(values), values)[1]  # revealed: Mapping[str, int]
+# error: [invalid-assignment]
+wrong_values: Keywords = lambda *, values={"key": "bad"}: values
+
+unconstrained = lambda values=[]: (reveal_type(values), values)[1]  # revealed: Unknown | list[Unknown]
+```
+
 ## Callback variadic parameters
 
 A matching fixed positional prefix lets a homogeneous variadic parameter describe each remaining
