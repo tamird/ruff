@@ -614,7 +614,14 @@ impl<'db> CallableSignature<'db> {
                 .overloads
                 .iter()
                 .map(|signature| {
-                    signature.apply_self_with_receiver(db, env, receiver_type, self_type)
+                    let binding_context = signature.definition.map(BindingContext::Definition);
+                    let mapping = TypeMapping::BindSelf(SelfBinding::new(
+                        db,
+                        env,
+                        self_type,
+                        binding_context,
+                    ));
+                    signature.apply_self_mapping_with_receiver(db, env, receiver_type, &mapping)
                 })
                 .collect(),
         }
@@ -647,8 +654,31 @@ impl<'db> CallableSignature<'db> {
                 if !receiver.is_positional() || !signature.needs_self_mapping(db, env, parameters) {
                     return signature.clone();
                 }
+                // Class specialization can introduce a caller's `Self` with the same source
+                // definition but a different receiver domain. Capture only this signature's
+                // own variable, preserving those already-bound type arguments.
+                let Some(definition) = signature.definition else {
+                    return signature.clone();
+                };
+                let Some(context) = signature.generic_context else {
+                    return signature.clone();
+                };
+                let Ok(self_typevar) = context
+                    .variables(db)
+                    .filter(|variable| {
+                        variable.typevar(db).is_self(db)
+                            && variable.binding_context(db).definition() == Some(definition)
+                    })
+                    .exactly_one()
+                else {
+                    return signature.clone();
+                };
+                let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Single(
+                    self_typevar,
+                    self_type,
+                ));
                 let mut captured =
-                    signature.apply_self_with_receiver(db, env, receiver_type, self_type);
+                    signature.apply_self_mapping_with_receiver(db, env, receiver_type, &mapping);
                 captured.parameters = captured.parameters.with_transformed_parameters(
                     std::iter::once(receiver.clone())
                         .chain(captured.parameters.iter().skip(1).cloned()),
@@ -2027,22 +2057,19 @@ impl<'db> Signature<'db> {
         ))
     }
 
-    fn apply_self_with_receiver(
+    fn apply_self_mapping_with_receiver(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         receiver_type: Type<'db>,
-        self_type: Type<'db>,
+        self_mapping: &TypeMapping<'_, 'db>,
     ) -> Self {
-        let binding_context = self.definition.map(BindingContext::Definition);
         let receiver_mapping = TypeMapping::BindSelf(SelfBinding::new(
             db,
             env,
             receiver_type,
             Some(BindingContext::Synthetic(env.program(db))),
         ));
-        let self_mapping =
-            TypeMapping::BindSelf(SelfBinding::new(db, env, self_type, binding_context));
         let receiver_visitor = ApplyTypeMappingVisitor::new(env);
         let self_visitor = ApplyTypeMappingVisitor::new(env);
         let receiver_constraints = self
@@ -2056,7 +2083,7 @@ impl<'db> Signature<'db> {
                 Self::map_constraints(
                     db,
                     &constraints,
-                    &self_mapping,
+                    self_mapping,
                     TypeContext::default(),
                     &self_visitor,
                 )
@@ -2077,13 +2104,13 @@ impl<'db> Signature<'db> {
 
         let parameters = self.parameters.apply_type_mapping_impl(
             db,
-            &self_mapping,
+            self_mapping,
             TypeContext::default(),
             &self_visitor,
         );
         let return_ty = self.return_ty.apply_type_mapping_impl(
             db,
-            &self_mapping,
+            self_mapping,
             TypeContext::default(),
             &self_visitor,
         );

@@ -1690,6 +1690,26 @@ reveal_type(left.__or__(value))  # revealed: Selected[dict[str, str], Literal["d
 integer(value)  # error: [invalid-argument-type]
 ```
 
+## Captured Self in a recursive generic method
+
+A class specialization can carry the caller's `Self` into another invocation of the same method.
+Binding that method captures its receiver without replacing the `Self` in its type arguments.
+
+```py
+from typing import Self
+
+class Box[T]:
+    def pair(self, value: T) -> tuple[Self, T]:
+        nested = Box[Self]()
+        reveal_type(nested.pair(self))  # revealed: tuple[Box[Self@pair], Self@pair]
+        nested.pair(42)  # error: [invalid-argument-type]
+        return self, value
+
+def check(box: Box[str]) -> None:
+    reveal_type(box.pair("value"))  # revealed: tuple[Box[str], str]
+    box.pair(42)  # error: [invalid-argument-type]
+```
+
 ## Receiver domain after descriptor binding
 
 Capturing a receiver through a descriptor must still check the method's receiver contract, including
