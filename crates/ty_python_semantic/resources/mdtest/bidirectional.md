@@ -2886,6 +2886,63 @@ async def _():
     reveal_type(x3)  # revealed: list[int | None]
 ```
 
+## Empty constructor contexts
+
+Bare empty constructors use the same element context as empty literals, including covariant iterable
+contexts. The resulting mutable container keeps that inferred element type.
+
+```py
+from collections.abc import Iterable
+from typing import Any, Callable
+
+empty_list: Iterable[int] = list()
+reveal_type(empty_list)  # revealed: list[int]
+empty_list.append(1)  # no diagnostic
+empty_list.append("bad")  # error: [invalid-argument-type]
+
+empty_set: Iterable[int] = set()
+reveal_type(empty_set)  # revealed: set[int]
+empty_set.add(1)  # no diagnostic
+empty_set.add("bad")  # error: [invalid-argument-type]
+
+def takes_ints(values: Iterable[int]) -> None: ...
+
+takes_ints(reveal_type(list()))  # revealed: list[int]
+takes_ints(reveal_type(set()))  # revealed: set[int]
+takes_ints(set(["bad"]))  # error: [invalid-argument-type]
+```
+
+An iterable context does not constrain dictionary values.
+
+```py
+empty_dict: Iterable[int] = {}
+reveal_type(empty_dict)  # revealed: dict[Unknown, Unknown]
+empty_dict_call: Iterable[int] = dict()
+reveal_type(empty_dict_call)  # revealed: dict[Unknown, Unknown]
+```
+
+Existing argument evidence still determines nonempty constructor results, including gradual types.
+
+```py
+def supplied(any_items: Iterable[Any], unknown_items: Iterable) -> None:  # error: [missing-type-argument]
+    from_any: Iterable[int] = list(any_items)
+    reveal_type(from_any)  # revealed: list[Any]
+    from_unknown: Iterable[int] = set(unknown_items)
+    reveal_type(from_unknown)  # revealed: set[Unknown]
+```
+
+The allocation shortcut does not apply to aliases or shadowed builtin names.
+
+```py
+set_alias = set
+aliased: Iterable[int] = set_alias()
+reveal_type(aliased)  # revealed: set[Unknown]
+
+def shadowed(set: Callable[[], str]) -> None:
+    result = set()
+    reveal_type(result)  # revealed: str
+```
+
 ## Container inference
 
 Empty, unannotated container literals are inferred based on future uses that extend throughout the

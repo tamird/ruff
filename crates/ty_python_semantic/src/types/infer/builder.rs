@@ -9883,14 +9883,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             arguments,
         } = call_expression;
 
-        // Semantic indexing recognizes only bare empty constructor calls. Confirm that the name
-        // still resolves to the corresponding builtin before using later collection constraints.
+        // Empty builtin constructors share literal inference for contextual element types and
+        // indexed future uses. Semantic indexing only tracks bare constructor names, so confirm
+        // that the name still resolves to the corresponding builtin.
         let collection_initializer_class = if arguments.is_empty()
-            && self
-                .index
-                .try_expression(call_expression)
-                .and_then(|expression| expression.assigned_to(self.db()))
-                .is_some()
             && let Some(name) = func.as_name_expr()
             && let Some(known_class) = callable_type
                 .as_class_literal()
