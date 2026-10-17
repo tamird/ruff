@@ -8815,6 +8815,14 @@ impl<'db> Binding<'db> {
                     });
                 let argument_constraints = argument_specialization
                     .and_then(|specialization| specialization.get(db, typevar))
+                    .and_then(|ty| {
+                        // Provisional lambda arms carry no evidence, but concrete siblings can
+                        // still provide context. Keep nested placeholders for the check below.
+                        let filtered = ty.filter_union(db, env, |element| {
+                            !matches!(element, Type::Dynamic(DynamicType::UnknownLambdaParameter))
+                        });
+                        (!filtered.is_never() || ty.is_never()).then_some(filtered)
+                    })
                     .filter(|ty| {
                         !ty.has_provisional_marker(db, env)
                             && !ty.has_unspecialized_type_var(db, env)
@@ -11106,6 +11114,65 @@ mod tests {
     use crate::place::global_symbol;
     use crate::types::constraints::resolution::SolutionType::Resolved;
     use crate::types::generics::TypeVarInferenceSolutions;
+
+    #[test]
+    fn argument_context_keeps_concrete_union_arms() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented("/src/a.py", "def identity[T](value: T) -> T: ...")?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/a.py")?;
+        let file = ProgramFile::new(&db, file, env.program(&db));
+        let callable = global_symbol(&db, file, "identity").place.expect_type();
+        let bindings = callable.bindings(&db, &env);
+        let callable = bindings
+            .single_element()
+            .ok_or_else(|| anyhow::anyhow!("expected one callable"))?;
+        let [binding] = callable.overloads.as_slice() else {
+            anyhow::bail!("expected one overload");
+        };
+        let mut binding = binding.clone();
+        let context = binding
+            .signature
+            .generic_context
+            .ok_or_else(|| anyhow::anyhow!("expected a generic callable"))?;
+        let int = KnownClass::Int.to_instance(&db, &env);
+        let unspecialized = Type::Dynamic(DynamicType::UnspecializedTypeVar);
+        let lambda_parameter = Type::Dynamic(DynamicType::UnknownLambdaParameter);
+        let nested = KnownClass::List.to_specialized_instance(&db, &env, &[lambda_parameter]);
+        let union = |left, right| UnionType::from_two_elements(&db, &env, left, right);
+        for (inferred, expected) in [
+            (union(lambda_parameter, int), int),
+            (union(unspecialized, int), unspecialized),
+            (union(lambda_parameter, unspecialized), unspecialized),
+            (union(nested, int), unspecialized),
+            (union(Type::any(), int), union(Type::any(), int)),
+            (union(Type::unknown(), int), union(Type::unknown(), int)),
+            (Type::Never, Type::Never),
+        ] {
+            binding.inference = Some(TypeVarInference::new(
+                &db,
+                context,
+                Box::from([Some(inferred)]),
+                TypeVarInferenceSolutions::Single,
+            ));
+            let specialization = binding
+                .argument_type_context_specialization(
+                    &db,
+                    &env,
+                    &ConstraintSetBuilder::new(),
+                    TypeContext::default(),
+                    ArgumentTypeContextSource::All,
+                    CheckTypesMode::Provisional,
+                )
+                .ok_or_else(|| anyhow::anyhow!("expected argument context"))?;
+            assert_eq!(
+                specialization.types(&db),
+                [expected],
+                "inferred: {inferred:?}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn expanded_getattr_retains_overload_results() -> anyhow::Result<()> {

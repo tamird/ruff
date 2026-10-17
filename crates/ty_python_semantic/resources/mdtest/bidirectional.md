@@ -2787,6 +2787,20 @@ def _(value: Unknown):
     reveal_type(apply(lambda x: x, value))  # revealed: Unknown
 ```
 
+Concrete sibling evidence must not hide gradual arguments that participate in the same cycle:
+
+```py
+def mixed[U, V](extract: Callable[[U], V], store: Callable[[V], U], value: U, anchor: U) -> V:
+    raise NotImplementedError
+
+def mixed_gradual(value: Any, unknown: Unknown) -> None:
+    # TODO: Callback-first inference loses the concrete union member.
+    reveal_type(mixed(lambda x: x, lambda x: x, value, 1))  # revealed: Unknown
+    reveal_type(mixed(value=value, anchor=1, store=lambda x: x, extract=lambda x: x))  # revealed: Any | int
+    reveal_type(mixed(lambda x: x, lambda x: x, unknown, 1))  # revealed: Unknown
+    reveal_type(mixed(value=unknown, anchor=1, store=lambda x: x, extract=lambda x: x))  # revealed: Unknown | int
+```
+
 ## Type-variable defaults as type context
 
 An explicit type-variable default can provide fallback context when arguments do not determine a
