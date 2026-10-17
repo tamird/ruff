@@ -36,6 +36,138 @@ def _(x: None | Literal[1]):
         reveal_type(x)  # revealed: Literal[1]
 ```
 
+## Lists and `None` with non-strict equality semantics
+
+The default equality policy treats a broad `list` annotation as using builtin list comparison. Lists
+cannot equal `None`, so either operand order separates the alternatives of an optional list.
+
+```toml
+[analysis]
+strict-equality-semantics = false
+```
+
+```py
+def optional_list(value: list[str] | None):
+    if value == None:
+        reveal_type(value)  # revealed: None
+    else:
+        reveal_type(value)  # revealed: list[str]
+
+    if None == value:
+        reveal_type(value)  # revealed: None
+    else:
+        reveal_type(value)  # revealed: list[str]
+
+    if value != None:
+        reveal_type(value)  # revealed: list[str]
+    else:
+        reveal_type(value)  # revealed: None
+
+    if None != value:
+        reveal_type(value)  # revealed: list[str]
+    else:
+        reveal_type(value)  # revealed: None
+
+def list_results(value: list[str], other: list[int]):
+    reveal_type(value == None)  # revealed: Literal[False]
+    reveal_type(None == value)  # revealed: Literal[False]
+    reveal_type(value != None)  # revealed: Literal[True]
+    reveal_type(None != value)  # revealed: Literal[True]
+
+    # Distinct lists can be empty, regardless of their element annotations.
+    reveal_type(value == other)  # revealed: bool
+    reveal_type(value != other)  # revealed: bool
+```
+
+## Lists and `None` with strict equality semantics
+
+Strict equality accounts for subclasses that override list comparison. A final subclass with
+inherited comparison methods has known behavior, while explicit overrides remain authoritative.
+
+```toml
+[analysis]
+strict-equality-semantics = true
+```
+
+```py
+from typing import final
+
+@final
+class FinalList(list[str]): ...
+
+@final
+class CustomEq(list[str]):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+@final
+class CustomNe(list[str]):
+    def __ne__(self, other: object) -> bool:
+        return False
+
+def broad(value: list[str] | None):
+    if value == None:
+        reveal_type(value)  # revealed: list[str] | None
+    else:
+        reveal_type(value)  # revealed: list[str]
+
+    if None != value:
+        reveal_type(value)  # revealed: list[str]
+    else:
+        reveal_type(value)  # revealed: list[str] | None
+
+def inherited(value: FinalList | None):
+    if value == None:
+        reveal_type(value)  # revealed: None
+    else:
+        reveal_type(value)  # revealed: FinalList
+
+    if None == value:
+        reveal_type(value)  # revealed: None
+    else:
+        reveal_type(value)  # revealed: FinalList
+
+    if value != None:
+        reveal_type(value)  # revealed: FinalList
+    else:
+        reveal_type(value)  # revealed: None
+
+    if None != value:
+        reveal_type(value)  # revealed: FinalList
+    else:
+        reveal_type(value)  # revealed: None
+
+def overridden(eq: CustomEq | None, ne: CustomNe | None):
+    if eq == None:
+        reveal_type(eq)  # revealed: CustomEq | None
+    if None != eq:
+        reveal_type(eq)  # revealed: CustomEq
+    else:
+        reveal_type(eq)  # revealed: CustomEq | None
+
+    if ne == None:
+        reveal_type(ne)  # revealed: None
+    if None != ne:
+        reveal_type(ne)  # revealed: CustomNe
+    else:
+        reveal_type(ne)  # revealed: CustomNe | None
+
+def results(broad: list[str], inherited: FinalList, eq: CustomEq, ne: CustomNe):
+    reveal_type(broad == None)  # revealed: bool
+    reveal_type(None != broad)  # revealed: bool
+    reveal_type(inherited == None)  # revealed: Literal[False]
+    reveal_type(None == inherited)  # revealed: Literal[False]
+    reveal_type(inherited != None)  # revealed: Literal[True]
+    reveal_type(None != inherited)  # revealed: Literal[True]
+    reveal_type(eq == None)  # revealed: bool
+    reveal_type(None == eq)  # revealed: bool
+    reveal_type(eq != None)  # revealed: bool
+    reveal_type(None != eq)  # revealed: bool
+    reveal_type(ne == None)  # revealed: Literal[False]
+    reveal_type(ne != None)  # revealed: bool
+    reveal_type(None != ne)  # revealed: bool
+```
+
 ## `!=` for other singleton types
 
 ### Bool

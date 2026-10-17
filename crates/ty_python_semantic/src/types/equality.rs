@@ -1769,6 +1769,7 @@ enum KnownComparisonSemantics {
     Str,
     Bytes,
     Tuple,
+    List,
     Dict,
 }
 
@@ -1890,18 +1891,21 @@ impl KnownComparisonSemantics {
         if dunder.place.is_undefined() {
             if operator == ComparisonOperator::Inequality {
                 let equality = lookup_dunder(db, env, class, "__eq__");
-                // `tuple.__ne__` delegates to its builtin equality implementation.
-                if equality
-                    == lookup_dunder(
-                        db,
-                        env,
-                        KnownClass::Tuple.to_class_literal(db, env),
-                        "__eq__",
-                    )
-                {
-                    return Some(Self::Tuple);
-                }
                 if !equality.place.is_undefined() {
+                    // List and tuple inequality use their builtin equality implementation,
+                    // although typeshed does not declare their `__ne__` methods.
+                    for (known_class, semantics) in [
+                        (KnownClass::Tuple, Self::Tuple),
+                        (KnownClass::List, Self::List),
+                    ] {
+                        if same_member_implementation(
+                            db,
+                            equality,
+                            lookup_dunder(db, env, known_class.to_class_literal(db, env), "__eq__"),
+                        ) {
+                            return Some(semantics);
+                        }
+                    }
                     return None;
                 }
             }
@@ -1913,6 +1917,7 @@ impl KnownComparisonSemantics {
             (KnownClass::Str, Self::Str),
             (KnownClass::Bytes, Self::Bytes),
             (KnownClass::Tuple, Self::Tuple),
+            (KnownClass::List, Self::List),
             (KnownClass::Dict, Self::Dict),
         ] {
             if same_member_implementation(
