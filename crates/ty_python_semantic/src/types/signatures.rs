@@ -4379,9 +4379,26 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             return result;
         }
 
+        // Gradual tails do not erase explicit named parameters. Compare those parameters with
+        // the ordinary matcher, which also checks their call modes and requiredness.
+        let gradual_fixed_parameters =
+            (matches!(source_parameters.kind(), ParametersKind::Gradual)
+                || matches!(target_parameters.kind(), ParametersKind::Gradual))
+                && source_parameters
+                    .iter()
+                    .chain(target_parameters.iter())
+                    .any(|parameter| !parameter.is_variadic() && !parameter.is_keyword_variadic());
+        let target_gradual_remainder = gradual_fixed_parameters
+            && target_parameters.is_gradual()
+            && matches!(
+                self.relation,
+                TypeRelation::Assignability | TypeRelation::Redundancy { .. }
+            );
+
         // A gradual parameter list is a supertype of the "bottom" parameter list (*args: object,
         // **kwargs: object).
-        if target_parameters.is_gradual()
+        if !gradual_fixed_parameters
+            && target_parameters.is_gradual()
             && (matches!(target_parameters.kind(), ParametersKind::Gradual)
                 || self.typevar_evaluation == TypeVarEvaluation::Lazy)
             && !source_parameters.is_top()
@@ -4408,7 +4425,8 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // any other parameter list, but not a subtype or supertype of any other parameter list. An
         // unpacked target TypeVarTuple instead continues to the ordinary parameter comparison so it
         // can be constrained from the source parameters.
-        if target_typevartuple.is_none()
+        if !gradual_fixed_parameters
+            && target_typevartuple.is_none()
             && (source_parameters.is_gradual() || target_parameters.is_gradual())
         {
             match (source_parameters.kind(), target_parameters.kind()) {
@@ -4619,6 +4637,22 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             };
         }
 
+        if gradual_fixed_parameters {
+            match self.relation {
+                TypeRelation::Subtyping | TypeRelation::SubtypingAssuming => {
+                    if source_parameters.is_gradual() {
+                        return self.never();
+                    }
+                }
+                TypeRelation::Redundancy { .. } => {
+                    if !source_parameters.is_gradual() || !target_parameters.is_gradual() {
+                        return self.never();
+                    }
+                }
+                TypeRelation::Assignability => {}
+            }
+        }
+
         // Align the fixed target prefix and suffix before entering the parameter loop so that the
         // target TypeVarTuple captures only the source parameter entries between them.
         let typevartuple_source_parameter_count = if let Some((typevartuple_index, _)) =
@@ -4729,7 +4763,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                             // For `source <: target` to be valid, if there are no more parameters
                             // in `target`, then the non-variadic parameters in `source` must have a
                             // default value.
-                            if default_type.is_none() {
+                            if default_type.is_none() && !target_gradual_remainder {
                                 if let Some(context) = self.report_context() {
                                     let parameter = ParameterDescription::new(
                                         target_index,
@@ -4749,6 +4783,12 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 }
 
                 EitherOrBoth::Right(target_parameter) => {
+                    if target_gradual_remainder
+                        && (target_parameter.is_variadic()
+                            || target_parameter.is_keyword_variadic())
+                    {
+                        continue;
+                    }
                     if let Some(source_parameter_count) = as_target_typevartuple(target_parameter) {
                         assert_eq!(
                             source_parameter_count, 0,
@@ -5002,6 +5042,12 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                                 continue;
                             }
 
+                            if target_gradual_remainder && !source_param.is_variadic() {
+                                // This tail can materialize to the remaining source parameters.
+                                // Retain their names for matching explicit target keywords below.
+                                parameters.next_target();
+                                break;
+                            }
                             if !source_param.is_variadic() {
                                 if let Some(context) = self.report_context()
                                     && target_parameters.as_paramspec_with_prefix().is_none()
@@ -5132,7 +5178,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     // previous loop. They cannot be matched against any parameter in `target` which
                     // only contains keyword-only and keyword-variadic parameters. However, if the
                     // parameter has a default, it's valid because callers don't need to provide it.
-                    if default_type.is_none() {
+                    if default_type.is_none() && !target_gradual_remainder {
                         if let Some(context) = self.report_context() {
                             if let Some(source_name) = source_param.name()
                                 && target_parameters
@@ -5237,6 +5283,9 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     }
                 }
                 ParameterKind::KeywordVariadic { .. } => {
+                    if target_gradual_remainder {
+                        continue;
+                    }
                     let Some(source_keyword_variadic) = source_keyword_variadic else {
                         // For a `source <: target` relationship, if `target` has a keyword variadic
                         // parameter, `source` must also have a keyword variadic parameter.
@@ -5297,7 +5346,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             reason = "any required unmatched keyword parameter makes the relation invalid"
         )]
         for (_, source_param) in source_keywords {
-            if !source_param.has_default() {
+            if !source_param.has_default() && !target_gradual_remainder {
                 if let Some(context) = self.report_context() {
                     let parameter = ParameterDescription::new(target_index, source_param.name());
                     context.push(ErrorContext::ExtraRequiredParameter { parameter });
@@ -5339,11 +5388,11 @@ pub(crate) enum ParametersKind<'db> {
     /// required, so these rows alone cannot establish the callable's full input domain.
     Incomplete,
 
-    /// Represents a gradual parameter list using `...` as the only parameter.
+    /// Represents a gradual parameter list, possibly with explicit fixed parameters.
     ///
     /// Per [the typing specification], any signature with a variadic and a keyword-variadic
     /// argument, both annotated (explicitly or implicitly) as `Any` or `Unknown`, is considered
-    /// equivalent to `...`.
+    /// equivalent to `...`. Other explicit parameters retain their types and call modes.
     ///
     /// The display implementation utilizes this flag to use `...` instead of displaying the
     /// individual variadic and keyword-variadic parameters.

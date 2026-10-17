@@ -1511,6 +1511,88 @@ c: Callable[..., Any] = variadic_without_annotation
 c: Callable[..., Any] = variadic_with_annotation
 ```
 
+### Fixed parameters beside a gradual remainder
+
+A gradual `*args`/`**kwargs` pair can represent additional parameters, including required ones. The
+explicit parameters retain their names, call modes, types, and defaults.
+
+```py
+from typing import Any, Callable, Concatenate, Literal, Protocol
+from ty_extensions import static_assert
+from ty_extensions._internal import Unknown, RegularCallableTypeOf, is_assignable_to, is_subtype_of
+
+def gradual(*args: Any, name: str, **kwargs: Any) -> None: ...
+def same(*, name: str) -> None: ...
+def broad(*, name: object) -> None: ...
+def wrong(*, name: int) -> None: ...
+def narrow(*, name: Literal["only"]) -> None: ...
+def unknown(*args: Unknown, name: str, **kwargs: Unknown) -> None: ...
+def missing() -> None: ...
+def positional(name: str, /) -> None: ...
+def extra(src: bytes, *, name: str, flag: bool) -> None: ...
+def gradual_wrong(*args: Any, name: int, **kwargs: Any) -> None: ...
+def objects_wrong(*args: object, name: int, **kwargs: object) -> None: ...
+def objects(*args: object, name: object, **kwargs: object) -> None: ...
+def optional_objects(*args: object, name: object = None, **kwargs: object) -> None: ...
+def optional_named(name: object = None, *args: object, **kwargs: object) -> None: ...
+def optional_wrong(*args: object, name: int = 0, **kwargs: object) -> None: ...
+
+static_assert(is_assignable_to(RegularCallableTypeOf[same], RegularCallableTypeOf[gradual]))
+static_assert(is_assignable_to(RegularCallableTypeOf[broad], RegularCallableTypeOf[gradual]))
+static_assert(is_assignable_to(RegularCallableTypeOf[extra], RegularCallableTypeOf[gradual]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[wrong], RegularCallableTypeOf[gradual]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[narrow], RegularCallableTypeOf[gradual]))
+static_assert(is_assignable_to(RegularCallableTypeOf[same], RegularCallableTypeOf[unknown]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[wrong], RegularCallableTypeOf[unknown]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[missing], RegularCallableTypeOf[gradual]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[positional], RegularCallableTypeOf[gradual]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[gradual_wrong], RegularCallableTypeOf[gradual]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[objects_wrong], RegularCallableTypeOf[gradual]))
+static_assert(is_assignable_to(RegularCallableTypeOf[objects], RegularCallableTypeOf[gradual]))
+static_assert(is_subtype_of(RegularCallableTypeOf[objects], RegularCallableTypeOf[gradual]))
+static_assert(not is_subtype_of(RegularCallableTypeOf[objects_wrong], RegularCallableTypeOf[gradual]))
+static_assert(is_assignable_to(RegularCallableTypeOf[objects], Callable[..., None]))
+static_assert(not is_subtype_of(RegularCallableTypeOf[objects], Callable[..., None]))
+static_assert(is_subtype_of(RegularCallableTypeOf[optional_objects], Callable[..., None]))
+# Ellipsis permits calling with both a positional value and name=..., which would collide.
+static_assert(not is_subtype_of(RegularCallableTypeOf[optional_named], Callable[..., None]))
+static_assert(not is_subtype_of(RegularCallableTypeOf[optional_wrong], Callable[..., None]))
+
+static_assert(is_assignable_to(RegularCallableTypeOf[gradual], RegularCallableTypeOf[same]))
+static_assert(is_assignable_to(RegularCallableTypeOf[gradual], RegularCallableTypeOf[extra]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[gradual], RegularCallableTypeOf[wrong]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[gradual], RegularCallableTypeOf[missing]))
+static_assert(is_assignable_to(RegularCallableTypeOf[gradual], Callable[..., None]))
+static_assert(is_assignable_to(Callable[..., None], RegularCallableTypeOf[gradual]))
+static_assert(not is_subtype_of(RegularCallableTypeOf[same], RegularCallableTypeOf[gradual]))
+static_assert(not is_subtype_of(RegularCallableTypeOf[gradual], RegularCallableTypeOf[same]))
+
+def optional(*args: Any, name: str = "", **kwargs: Any) -> None: ...
+def named(name: str, *args: Any, **kwargs: Any) -> None: ...
+def prefixed(value: float, /, *args: Any, name: str, **kwargs: Any) -> None: ...
+def concrete(value: float, count: int, /, *, name: str, enabled: bool) -> None: ...
+def bad_prefix(value: str, /, *, name: str) -> None: ...
+
+static_assert(not is_assignable_to(RegularCallableTypeOf[same], RegularCallableTypeOf[optional]))
+static_assert(is_assignable_to(RegularCallableTypeOf[optional], RegularCallableTypeOf[same]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[same], RegularCallableTypeOf[named]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[positional], RegularCallableTypeOf[named]))
+static_assert(is_assignable_to(RegularCallableTypeOf[concrete], RegularCallableTypeOf[prefixed]))
+static_assert(is_assignable_to(RegularCallableTypeOf[prefixed], RegularCallableTypeOf[concrete]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[bad_prefix], RegularCallableTypeOf[prefixed]))
+static_assert(is_assignable_to(RegularCallableTypeOf[prefixed], Callable[Concatenate[float, ...], None]))
+static_assert(is_assignable_to(Callable[Concatenate[float, ...], None], RegularCallableTypeOf[prefixed]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[prefixed], Callable[Concatenate[str, ...], None]))
+static_assert(not is_assignable_to(Callable[Concatenate[str, ...], None], RegularCallableTypeOf[prefixed]))
+
+# Specializing a concrete variadic annotation with Any does not introduce a gradual remainder.
+class ConcreteTail[T](Protocol):
+    def __call__(self, *args: T, name: str, **kwargs: T) -> None: ...
+
+static_assert(not is_assignable_to(RegularCallableTypeOf[same], ConcreteTail[Any]))
+static_assert(not is_assignable_to(RegularCallableTypeOf[same], ConcreteTail[Unknown]))
+```
+
 ### Method types
 
 ```py
