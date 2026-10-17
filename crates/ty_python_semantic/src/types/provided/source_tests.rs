@@ -646,6 +646,77 @@ fn semantic_namespaces_share_python_support_types() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn semantic_namespaces_preserve_generic_callable_materialization() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            r"from typing import Any, Callable, ParamSpec, TypeVar
+P = ParamSpec('P')
+R = TypeVar('R')
+class Factory:
+    def consume(self, callback: Callable[P, R]) -> None: ...
+    def gradual(self, callback: Callable[P, Any]) -> None: ...
+factory: Factory
+",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import factory\nfactory.consume\nfactory.gradual\n",
+        )
+        .build()?;
+    let source = system_path_to_file(&db, "/src/main.py")?;
+    let file = db.program_file(source);
+    let default = file.program(&db);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let model = SemanticModel::new(&db, file);
+    let expressions: Vec<_> = module
+        .suite()
+        .iter()
+        .filter_map(ast::Stmt::as_expr_stmt)
+        .collect();
+    assert_eq!(expressions.len(), 2);
+    let original_env = ProgramEnvironment::from_program(default);
+    let gradual_tuple = Type::homogeneous_tuple(&db, &original_env, Type::any());
+    for program in [
+        default,
+        ty_python_core::program::Program::with_semantic_namespace(
+            &db,
+            default.python_platform(&db),
+            default.resolver_environment(&db),
+            &Name::new("consumer"),
+        ),
+    ] {
+        let env = ProgramEnvironment::from_program(program);
+        // A consumer can inspect a native declaration without rebinding it to its namespace.
+        for (expression, fully_static) in expressions.iter().zip([true, false]) {
+            let ty = expression.value.inferred_type(&model).unwrap();
+            for materialized in [
+                ty.top_materialization(&db, &env),
+                ty.bottom_materialization(&db, &env),
+            ] {
+                assert_eq!(
+                    ty.is_equivalent_to(&db, &env, materialized),
+                    fully_static,
+                    "{} vs {}",
+                    ty.display(&db, &env),
+                    materialized.display(&db, &env),
+                );
+            }
+        }
+        // Elements still transform, including normalization of an empty variable segment.
+        assert_eq!(
+            gradual_tuple.top_materialization(&db, &env),
+            Type::homogeneous_tuple(&db, &original_env, Type::object()),
+        );
+        assert_eq!(
+            gradual_tuple.bottom_materialization(&db, &env),
+            Type::homogeneous_tuple(&db, &original_env, Type::Never),
+        );
+    }
+    Ok(())
+}
+
 /// A deliberately small source adapter: `include("name")` exports a native declaration,
 /// trailing comments supply assignment, parameter, and return annotations; and
 /// `context(callback)` supplies a native context to the callback's ordinary parameters.
