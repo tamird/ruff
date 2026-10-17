@@ -220,7 +220,7 @@ impl<'db> SemanticModel<'db> {
     ///
     /// Literals, builtin dictionary copies, and indexed mappings retain named entries and
     /// residual values at this use. Reaching mutations update those entries; exposure weakens
-    /// presence evidence while preserving ordinary value refinements. Declared TypedDict
+    /// presence evidence while preserving ordinary value refinements. Declared `TypedDict`
     /// fields supply their required or optional presence when no observation is available.
     pub fn dictionary_items(&self, expression: &Expr) -> Option<DictionaryItems<'db>> {
         if self.annotation_scope.is_some() {

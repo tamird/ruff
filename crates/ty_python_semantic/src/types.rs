@@ -3039,6 +3039,7 @@ impl<'db> Type<'db> {
     ///
     /// Aliases nested inside non-union types remain unexpanded. This allows consumers to
     /// inspect the possible outer types without traversing container arguments.
+    #[must_use]
     pub fn expand_top_level_aliases(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Self {
         match self.resolve_type_alias(db) {
             Type::Union(union) if union.has_aliases(db) => union.expand_aliases(db, env),
@@ -8584,9 +8585,7 @@ impl<'db> Type<'db> {
             Err(CallDunderError::CallError(_, bindings, _)) => {
                 return member_lookup_result(
                     db,
-                    bindings
-                        .getattr_result(db, env, receiver.unwrap_or(self), name)
-                        .into(),
+                    bindings.getattr_result(db, env, receiver.unwrap_or(self), name),
                     Some(MemberLookupErrorKind::GetAttr {
                         receiver: self,
                         name: name_type,

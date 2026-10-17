@@ -173,6 +173,7 @@ pub(crate) fn dynamic_class_bases_argument(arguments: &ast::Arguments) -> Option
 
 #[salsa::tracked]
 impl<'db> DynamicClassLiteral<'db> {
+    #[expect(clippy::needless_pass_by_value, reason = "Salsa owns the query key")]
     pub(crate) fn instance_fields(
         self,
         db: &'db dyn Db,

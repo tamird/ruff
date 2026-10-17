@@ -326,7 +326,7 @@ pub struct ProvidedGetattrResult<'db> {
     pub return_type: Option<Type<'db>>,
 }
 
-impl<'db> From<ProvidedGetattrPresence> for ProvidedGetattrResult<'db> {
+impl From<ProvidedGetattrPresence> for ProvidedGetattrResult<'_> {
     fn from(presence: ProvidedGetattrPresence) -> Self {
         Self {
             presence,

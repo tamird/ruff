@@ -613,7 +613,7 @@ impl<'db> DictionaryItems<'db> {
         Ok(dictionary.finish())
     }
 
-    /// Recover declared TypedDict entries when expression observations are unavailable.
+    /// Recover declared `TypedDict` entries when expression observations are unavailable.
     pub(crate) fn from_typed_dict_type(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
