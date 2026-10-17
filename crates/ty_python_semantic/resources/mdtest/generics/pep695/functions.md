@@ -3196,9 +3196,7 @@ regression test.
 from functools import reduce
 
 def _(keys: list[str]):
-    # TODO: revealed: int
-    # revealed: Unknown | Literal[0]
-    reveal_type(reduce(lambda total, k: total + len(k), keys, 0))
+    reveal_type(reduce(lambda total, k: total + len(k), keys, 0))  # revealed: int
 ```
 
 ### Transitive constraints preserve typevar domains
