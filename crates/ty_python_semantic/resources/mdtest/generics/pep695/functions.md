@@ -2539,8 +2539,8 @@ def _(x: list[int], y: dict[int, int]):
     reveal_type(h(y))  # revealed: int | None
 ```
 
-A bounded type variable should still be enforced when it appears in multiple union members and the
-argument is itself a union. This currently exposes <https://github.com/astral-sh/ty/issues/4277>:
+A bounded type variable is enforced when it appears in multiple union members and the argument is
+itself a union:
 
 ```py
 class Box[T]: ...
@@ -2549,11 +2549,11 @@ def unbox[T: bytes](value: Box[T] | T) -> T:
     raise NotImplementedError
 
 def invalid_union(value: int | str) -> None:
-    # TODO: This should report [invalid-argument-type]: neither `int` nor `str` satisfies `T: bytes`.
+    # error: [invalid-argument-type]
     reveal_type(unbox(value))  # revealed: Unknown
 ```
 
-The same missing constraint lets an incompatible generic overload win over a matching overload:
+An incompatible generic overload must not win over a matching overload:
 
 ```py
 from typing import assert_type, overload
@@ -2566,8 +2566,6 @@ def select(value: object) -> object:
     raise NotImplementedError
 
 def selects_invalid_overload(value: int | str) -> None:
-    # TODO: This should select the second overload and infer `bool`.
-    # error: [type-assertion-failure] "Type `Unknown` does not match asserted type `bool`"
     assert_type(select(value), bool)
 ```
 
@@ -3995,6 +3993,79 @@ def check(right: dict[str, str], numbers: list[int]) -> None:
     empty: list[str] = identity([])
     reveal_type(empty)  # revealed: list[str]
     identity(42)  # error: [invalid-argument-type]
+```
+
+## A type variable or its wrapper
+
+A parameter accepting `T | Box[T]` keeps both alternatives available while other arguments constrain
+`T`. A callback accepting `str` selects the wrapped alternative for `Box[str]`, regardless of
+argument order.
+
+```py
+from typing import Any, Callable, assert_type
+from ty_extensions._internal import Unknown
+
+class Box[T]:
+    def get(self) -> T:
+        raise NotImplementedError
+
+def map_value[T, R](func: Callable[[T], R], value: T | Box[T]) -> R:
+    raise NotImplementedError
+
+def map_reversed[T, R](value: T | Box[T], func: Callable[[T], R]) -> R:
+    raise NotImplementedError
+
+def upper(value: str) -> str:
+    return value.upper()
+
+def integer(value: int) -> int:
+    return value
+
+def check(plain: str, boxed: Box[str], either: str | Box[str]):
+    assert_type(map_value(upper, plain), str)
+    assert_type(map_value(upper, boxed), str)
+    assert_type(map_value(upper, either), str)
+    assert_type(map_reversed(boxed, upper), str)
+    assert_type(map_reversed(either, upper), str)
+    assert_type(map_value(lambda value: value.upper(), either), str)
+    map_value(integer, boxed)  # error: [invalid-argument-type]
+    map_value(integer, either)  # error: [invalid-argument-type]
+```
+
+Declared bounds also constrain the choice. Without such evidence, the argument alone can match
+either alternative. Gradual arguments and callback results retain their uncertainty.
+
+```py
+def unbox[T](value: T | Box[T]) -> T:
+    raise NotImplementedError
+
+def bounded[T: str](value: T | Box[T]) -> T:
+    raise NotImplementedError
+
+def gradual_result(value: str) -> Any:
+    raise NotImplementedError
+
+def check_bounds(boxed: Box[str], wrong: Box[int]):
+    assert_type(bounded(boxed), str)
+    bounded(wrong)  # error: [invalid-argument-type]
+    assert_type(map_value(gradual_result, boxed), Any)
+
+def check_gradual(
+    dynamic: Any,
+    unknown: Unknown,
+    boxed: Box[Any],
+    boxed_unknown: Box[Unknown],
+    mixed: Box[str] | Any,
+    scalar: str | Any,
+    mixed_boxed: Box[Any] | str,
+):
+    reveal_type(unbox(dynamic))  # revealed: Any
+    reveal_type(unbox(unknown))  # revealed: Unknown
+    reveal_type(unbox(boxed))  # revealed: Box[Any] | Any
+    reveal_type(unbox(boxed_unknown))  # revealed: Box[Unknown] | Unknown
+    reveal_type(unbox(mixed))  # revealed: Unknown
+    reveal_type(unbox(scalar))  # revealed: Unknown
+    reveal_type(unbox(mixed_boxed))  # revealed: Box[Any] | Any | str
 ```
 
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md

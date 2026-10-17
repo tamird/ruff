@@ -3432,3 +3432,82 @@ def check(right: dict[str, str], numbers: list[int]) -> None:
     reveal_type(empty)  # revealed: list[str]
     identity(42)  # error: [invalid-argument-type]
 ```
+
+## A type variable or its wrapper
+
+A parameter accepting `T | Box[T]` keeps both alternatives available while other arguments constrain
+`T`. A callback accepting `str` selects the wrapped alternative for `Box[str]`, regardless of
+argument order.
+
+```py
+from typing import Any, Callable, Generic, TypeVar
+from typing_extensions import assert_type
+from ty_extensions._internal import Unknown
+
+T_co = TypeVar("T_co", covariant=True)
+T = TypeVar("T")
+R = TypeVar("R")
+S = TypeVar("S", bound=str)
+
+class Box(Generic[T_co]):
+    def get(self) -> T_co:
+        raise NotImplementedError
+
+def map_value(func: Callable[[T], R], value: T | Box[T]) -> R:
+    raise NotImplementedError
+
+def map_reversed(value: T | Box[T], func: Callable[[T], R]) -> R:
+    raise NotImplementedError
+
+def upper(value: str) -> str:
+    return value.upper()
+
+def integer(value: int) -> int:
+    return value
+
+def check(plain: str, boxed: Box[str], either: str | Box[str]):
+    assert_type(map_value(upper, plain), str)
+    assert_type(map_value(upper, boxed), str)
+    assert_type(map_value(upper, either), str)
+    assert_type(map_reversed(boxed, upper), str)
+    assert_type(map_reversed(either, upper), str)
+    assert_type(map_value(lambda value: value.upper(), either), str)
+    map_value(integer, boxed)  # error: [invalid-argument-type]
+    map_value(integer, either)  # error: [invalid-argument-type]
+```
+
+Declared bounds also constrain the choice. Without such evidence, the argument alone can match
+either alternative. Gradual arguments and callback results retain their uncertainty.
+
+```py
+def unbox(value: T | Box[T]) -> T:
+    raise NotImplementedError
+
+def bounded(value: S | Box[S]) -> S:
+    raise NotImplementedError
+
+def gradual_result(value: str) -> Any:
+    raise NotImplementedError
+
+def check_bounds(boxed: Box[str], wrong: Box[int]):
+    assert_type(bounded(boxed), str)
+    bounded(wrong)  # error: [invalid-argument-type]
+    assert_type(map_value(gradual_result, boxed), Any)
+
+def check_gradual(
+    dynamic: Any,
+    unknown: Unknown,
+    boxed: Box[Any],
+    boxed_unknown: Box[Unknown],
+    mixed: Box[str] | Any,
+    scalar: str | Any,
+    mixed_boxed: Box[Any] | str,
+):
+    reveal_type(unbox(dynamic))  # revealed: Any
+    reveal_type(unbox(unknown))  # revealed: Unknown
+    reveal_type(unbox(boxed))  # revealed: Box[Any] | Any
+    reveal_type(unbox(boxed_unknown))  # revealed: Box[Unknown] | Unknown
+    reveal_type(unbox(mixed))  # revealed: Unknown
+    reveal_type(unbox(scalar))  # revealed: Unknown
+    reveal_type(unbox(mixed_boxed))  # revealed: Box[Any] | Any | str
+```

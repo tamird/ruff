@@ -4069,6 +4069,15 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         } else {
             polarity
         };
+        let contains_self_or_variadic = |ty| {
+            any_over_type(db, self.env, ty, false, |ty| {
+                ty.as_typevar().is_some_and(|typevar| {
+                    typevar.typevar(db).is_self(db)
+                        || typevar.is_paramspec(db)
+                        || typevar.is_typevartuple(db)
+                })
+            })
+        };
 
         match (formal, actual) {
             // Expand type aliases in the formal type.
@@ -4134,9 +4143,8 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 }
             }
 
-            // Composite union alternatives use the complete relation where ordinary type
-            // variables can be inferred together. Bare variables, Self, and variadics still
-            // require the specialized inference rules below.
+            // Union alternatives use the complete relation where ordinary type variables can
+            // be inferred together. Self and variadics still require the specialized rules below.
             (Type::Union(formal_union), Type::Union(actual_union)) => {
                 // First, if both formal and actual are unions, and precisely one formal union
                 // element contains type variables, infer through that element after removing
@@ -4155,31 +4163,33 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 //     reveal_type(g(x))  # revealed: str | int
                 // ```
                 // The generic element can be composite, such as `Sequence[T]` in
-                // `Sequence[T] | None`. Multiple composite generic elements share a relation,
-                // while choices involving bare variables remain unsupported: `T | list[T]`
-                // against `int | list[int]` should infer `T = int`.
+                // `Sequence[T] | None`. Multiple generic elements share a relation, including
+                // a single bare variable: `T | list[T]` can infer `T = int` from
+                // `int | list[int]` when other arguments constrain that choice.
                 if actual_union.elements(db).iter().any(|ty| ty.is_type_var()) {
                     return Ok(());
                 }
-                let contains_self_or_variadic = |ty| {
-                    any_over_type(db, self.env, ty, false, |ty| {
-                        ty.as_typevar().is_some_and(|typevar| {
-                            typevar.typevar(db).is_self(db)
-                                || typevar.is_paramspec(db)
-                                || typevar.is_typevartuple(db)
-                        })
-                    })
-                };
                 let types_have_typevars = formal_union
                     .elements(db)
                     .iter()
                     .filter(|ty| ty.has_typevar(db, self.env));
                 let Ok(generic_element) = types_have_typevars.exactly_one() else {
+                    let mut bare_typevars = formal_union
+                        .elements(db)
+                        .iter()
+                        .filter(|ty| ty.is_type_var());
+                    let has_bare_typevar = bare_typevars.next().is_some();
                     // Keep all alternatives in one relation so tuple discriminators and later
                     // arguments constrain the same solution. Zero generic elements need no
-                    // inference; bare variables, Self, and packs retain their existing rules.
+                    // inference; multiple bare variables, Self, and packs retain their rules.
                     if !formal.has_typevar(db, self.env)
-                        || formal_union.elements(db).iter().any(|ty| ty.is_type_var())
+                        || bare_typevars.next().is_some()
+                        // A gradual alternative can leave the relation unconstrained. Preserve
+                        // the existing gradual result instead of using only the concrete arms.
+                        || (has_bare_typevar
+                            && actual_union.elements(db).iter().any(|ty| {
+                                ty.resolve_type_alias(db).is_dynamic()
+                            }))
                         || contains_self_or_variadic(formal)
                         || self
                             .inferable
@@ -4254,29 +4264,31 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     .elements(db)
                     .iter()
                     .filter_map(|ty| ty.as_typevar());
+                let bare_typevar = bound_typevars.next();
 
                 // TODO:
                 // Handling more than one bare typevar is something that we can't handle yet.
-                if bound_typevars.nth(1).is_some() {
+                if bound_typevars.next().is_some() {
                     return Ok(());
                 }
 
-                // Preserve the complete composite-union relation and its polarity so later
-                // arguments constrain the same choices.
-                let has_bare_typevar = union_formal
-                    .elements(db)
-                    .iter()
-                    .any(|element| element.is_type_var());
+                // Preserve the complete union relation and its polarity so later arguments
+                // constrain the same choices, including a bare variable or its wrapper.
+                // A wholly gradual argument can satisfy the union without constraints; retain
+                // the direct variable mapping so its Any or Unknown evidence is not discarded.
+                let requires_direct_mapping = bare_typevar.is_some()
+                    && (contains_self_or_variadic(formal)
+                        || actual.resolve_type_alias(db).is_dynamic());
                 let has_variadic = self
                     .inferable
                     .iter(db)
                     .any(|typevar| typevar.is_paramspec(db) || typevar.is_typevartuple(db));
-                if !has_bare_typevar && !has_variadic {
+                if !requires_direct_mapping && !has_variadic {
                     let when = self.constraint_for_relation(formal, actual, relation_polarity);
                     return self.infer_from_constraint_set(when);
                 }
 
-                // Bare type variables and variadics retain the legacy mappings inferred from
+                // Direct variable mappings and variadics retain the legacy inference from
                 // individual union elements.
                 let mut first_error = None;
                 let mut found_matching_element = false;
