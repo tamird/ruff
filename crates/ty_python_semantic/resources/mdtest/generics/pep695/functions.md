@@ -4068,5 +4068,93 @@ def check_gradual(
     reveal_type(unbox(mixed_boxed))  # revealed: Box[Any] | Any | str
 ```
 
+## Nominal union arguments
+
+Every compatible alternative contributes constraints to the same specialization. Bounds and
+invariant parameters still constrain that solution, and gradual alternatives retain uncertainty.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Generic, Literal, Mapping, TypeVar, assert_type
+from ty_extensions._internal import Unknown
+
+V_co = TypeVar("V_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+CellT = TypeVar("CellT")
+
+class Attr(Generic[V_co]): ...
+
+class Cell(Generic[CellT]):
+    value: CellT
+
+class Sink(Generic[T_contra]):
+    def consume(self, value: T_contra) -> None: ...
+
+def with_default[D: Attr[object] = Attr[Any]](attrs: Mapping[str, D]) -> D:
+    raise NotImplementedError
+
+def without_default[B: Attr[object]](attrs: Mapping[str, B]) -> B:
+    raise NotImplementedError
+
+def mapped[T](value: Mapping[str, T]) -> T:
+    raise NotImplementedError
+
+def keyed[K: str, T](value: Mapping[K, T]) -> tuple[K, T]:
+    raise NotImplementedError
+
+def invariant[T](value: Cell[T], expected: Cell[T]) -> T:
+    raise NotImplementedError
+
+def bounded[S: str](value: Mapping[str, S]) -> S:
+    raise NotImplementedError
+
+def contravariant[T](value: Sink[T]) -> T:
+    raise NotImplementedError
+
+def check(
+    attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]],
+    booleans: Mapping[str, Attr[bool]],
+    strings: Mapping[str, Attr[str]],
+    keys: Mapping[Literal["key"], bool] | Mapping[Literal["key"], str],
+    values: Mapping[str, str] | Mapping[str, int],
+    mutable: Cell[str] | Cell[int],
+    integer: Cell[int],
+    wrong_arm: Mapping[str, int] | str,
+):
+    assert_type(with_default(booleans), Attr[bool])
+    assert_type(with_default(strings), Attr[str])
+    assert_type(without_default(booleans), Attr[bool])
+    assert_type(without_default(strings), Attr[str])
+    assert_type(with_default(attrs), Attr[bool] | Attr[str])
+    assert_type(without_default(attrs), Attr[bool] | Attr[str])
+    assert_type(keyed(keys), tuple[Literal["key"], bool | str])
+    assert_type(mapped(values), str | int)
+    invariant(mutable, integer)  # error: [invalid-argument-type]
+    bounded(values)  # error: [invalid-argument-type]
+    mapped(wrong_arm)  # error: [invalid-argument-type]
+
+type DynamicPart = Any
+
+def gradual(
+    nested_any: Mapping[str, Any] | Mapping[str, int],
+    nested_unknown: Mapping[str, Unknown] | Mapping[str, int],
+    direct_any: Any | Mapping[str, int],
+    direct_unknown: Unknown | Mapping[str, int],
+    aliased_any: DynamicPart | Mapping[str, int],
+):
+    reveal_type(mapped(nested_any))  # revealed: Any | int
+    reveal_type(mapped(nested_unknown))  # revealed: Unknown | int
+    reveal_type(mapped(direct_any))  # revealed: Unknown
+    reveal_type(mapped(direct_unknown))  # revealed: Unknown
+    reveal_type(mapped(aliased_any))  # revealed: Unknown
+
+def contra(values: Sink[str] | Sink[int]):
+    reveal_type(contravariant(values))  # revealed: Never
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

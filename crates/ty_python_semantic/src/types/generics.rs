@@ -4673,15 +4673,22 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 }
             }
 
-            // Each alternative in a tuple union contributes constraints. The element-wise
-            // tuple path below only accepts a single actual tuple, while the constraint solver
-            // handles the entire union. Variadic type parameters still require legacy inference.
-            (formal @ Type::NominalInstance(formal_instance), actual @ Type::Union(_))
-                if formal_instance.tuple_spec(db, self.env).is_some()
-                    && !self
-                        .inferable
-                        .iter(db)
-                        .any(|typevar| typevar.is_paramspec(db) || typevar.is_typevartuple(db)) =>
+            // Each alternative in a nominal union contributes constraints. The structural
+            // paths below only accept a single actual instance, while the constraint solver
+            // handles the entire union. Self and variadics retain their existing inference.
+            // A gradual or provisional alternative must not leave only concrete evidence.
+            (
+                formal @ Type::NominalInstance(formal_instance),
+                actual @ Type::Union(actual_union),
+            ) if (formal_instance.tuple_spec(db, self.env).is_some()
+                || (!contains_self_or_variadic(formal)
+                    && !contains_self_or_variadic(actual)
+                    && !actual.has_indeterminate_inference(db, self.env)
+                    && !actual_union.elements(db).iter().any(Type::is_dynamic)))
+                && !self
+                    .inferable
+                    .iter(db)
+                    .any(|typevar| typevar.is_paramspec(db) || typevar.is_typevartuple(db)) =>
             {
                 let when = self.constraint_for_relation(formal, actual, relation_polarity);
                 return self.infer_from_constraint_set(when);
@@ -4937,6 +4944,43 @@ mod tests {
         // Skipping U while resolving U -> Self must not replace U inside Self's bound with Never.
         let specialization = context.specialize_recursive(db, [Some(Type::TypeVar(captured))]);
         assert_eq!(specialization.get(db, u), Some(Type::TypeVar(captured)));
+    }
+
+    #[test]
+    fn nominal_union_inference_preserves_provisional_arguments() -> anyhow::Result<()> {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let [t] = create_typevars(db, ["T"]);
+        let context = GenericContext::from_typevar_instances(db, &env, [t]);
+        let formal = KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(t)]);
+        let int = KnownClass::Int.to_instance(db, &env);
+        let integers = KnownClass::List.to_specialized_instance(db, &env, &[int]);
+        for marker in [
+            Type::Dynamic(DynamicType::UnspecializedTypeVar),
+            Type::Dynamic(DynamicType::UnknownLambdaParameter),
+            Type::divergent(salsa::plumbing::Id::from_bits(1)),
+        ] {
+            for alternative in [
+                marker,
+                KnownClass::List.to_specialized_instance(db, &env, &[marker]),
+            ] {
+                let actual = UnionType::from_two_elements(db, &env, integers, alternative);
+                let constraints = ConstraintSetBuilder::new();
+                let mut builder = SpecializationBuilder::new(db, &env, &constraints, context);
+                builder
+                    .infer(formal, actual)
+                    .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
+                let inference = builder
+                    .build_inference_with(|_, _| None)
+                    .map_err(|_| anyhow::anyhow!("expected unconstrained inference"))?;
+                assert_eq!(
+                    inference.merged_specialization(db).types(db),
+                    [Type::unknown()]
+                );
+            }
+        }
+        Ok(())
     }
 
     fn exact_alternatives<'db, 'c, const N: usize>(

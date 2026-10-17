@@ -2437,6 +2437,32 @@ def caller[T](value: T) -> T:
     }
 
     #[test]
+    fn call_inputs_preserve_nominal_union_arguments() -> anyhow::Result<()> {
+        insta::assert_debug_snapshot!(call_inputs(
+            r#"
+from typing import Any, Generic, Mapping, TypeVar
+
+V_co = TypeVar("V_co", covariant=True)
+class Attr(Generic[V_co]): ...
+def defaulted[T: Attr[object] = Attr[Any]](attrs: Mapping[str, T]) -> T: ...
+def required[T: Attr[object]](attrs: Mapping[str, T]) -> T: ...
+
+def first(attrs: Mapping[str, Attr[bool]]):
+    return defaulted(attrs)
+def second(attrs: Mapping[str, Attr[str]]):
+    return required(attrs)
+def both_defaulted(attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]]):
+    return defaulted(attrs)
+def both_required(attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]]):
+    return required(attrs)
+def gradual(attrs: Mapping[str, Attr[Any]] | Mapping[str, Attr[str]]):
+    return required(attrs)
+"#,
+        )?);
+        Ok(())
+    }
+
+    #[test]
     fn call_inputs_preserve_unpacked_and_forwarded_parameters() -> anyhow::Result<()> {
         insta::assert_debug_snapshot!(call_inputs(
             r#"
