@@ -8086,7 +8086,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         if elts.is_empty()
             && let Some(context) = tcx.annotation
-            && context.is_divergent()
+            && (context.is_divergent()
+                || context == Type::Dynamic(DynamicType::UnspecializedTypeVar))
         {
             // The expected element type is still being inferred. Preserve that dependency
             // instead of contributing Unknown to the cycle before the context is available.

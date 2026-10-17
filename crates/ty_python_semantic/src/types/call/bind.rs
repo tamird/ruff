@@ -8648,12 +8648,18 @@ impl<'db> Binding<'db> {
             (callable.kind(db) == CallableTypeKind::ParamSpecValue).then_some(callable)
         };
 
-        // If the parameter is a single non-ParamSpec type variable with an upper bound,
-        // e.g., `typing.Self`, use the upper bound as type context. ParamSpec components
-        // need to reach generic call specialization below, where earlier arguments can
-        // specialize the full `ParamSpec`.
+        // Use the bound when this call cannot infer the variable, or when argument evidence
+        // is excluded to avoid feeding a collection initializer back into itself. Ordinary
+        // local variables instead use the provisional specialization below, so sibling inputs
+        // can supply a narrower context before an empty collection adopts the whole bound.
         if let Type::TypeVar(typevar) = parameter_type
             && !typevar.is_paramspec(db)
+            && (source == ArgumentTypeContextSource::WithoutArguments
+                || typevar.typevar(db).is_self(db)
+                || self
+                    .signature
+                    .generic_context
+                    .is_none_or(|context| !context.contains(db, typevar.identity(db))))
             && let Some(TypeVarBoundOrConstraints::UpperBound(bound)) =
                 typevar.typevar(db).bound_or_constraints(db, env)
         {
@@ -8848,12 +8854,15 @@ impl<'db> Binding<'db> {
                     call_expression_constraints
                         .or(argument_constraints)
                         // During iteration, an unresolved slot carries no input evidence. Final
-                        // inference uses ordinary Unknown for slots that remain unresolved.
+                        // inference can use its bound when no input or result supplied context.
                         .unwrap_or_else(|| match mode {
                             CheckTypesMode::Provisional => {
                                 Type::Dynamic(DynamicType::UnspecializedTypeVar)
                             }
-                            CheckTypesMode::Finalize => Type::unknown(),
+                            CheckTypesMode::Finalize => typevar
+                                .typevar(db)
+                                .upper_bound(db, env)
+                                .unwrap_or_else(Type::unknown),
                         }),
                 )
             }),

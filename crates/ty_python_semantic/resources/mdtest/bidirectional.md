@@ -4308,3 +4308,84 @@ def required_shadow(values: list[int] | None):
     # error: [invalid-argument-type]
     values or list(42)
 ```
+
+## Bounded argument contexts from sibling inputs
+
+A variable's bound limits valid inputs, but does not determine the type of a fresh collection when
+another argument provides a narrower type. Empty collections retain provisional context until that
+input is known; calls without such evidence can still use the bound.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Callable, Literal, Mapping, Protocol, Sequence, assert_type
+
+class Rule[D](Protocol):
+    def __call__(self, *args: Any, data: D, **kwargs: Any) -> object: ...
+
+def listed(*, data: list[str]) -> None: ...
+def literal(*, data: list[Literal["ok"]]) -> None: ...
+def invoke[D: Sequence[str | int]](rule: Rule[D], *, data: D) -> D:
+    rule(data=data)
+    return data
+
+assert_type(invoke(listed, data=[]), list[str])
+assert_type(invoke(listed, data=["ok"]), list[str])
+assert_type(invoke(literal, data=["ok"]), list[Literal["ok"]])
+assert_type(invoke(data=[], rule=listed), list[str])
+assert_type(invoke(data=["ok"], rule=literal), list[Literal["ok"]])
+# error: [invalid-argument-type]
+invoke(listed, data=[42])
+# error: [invalid-argument-type]
+invoke(literal, data=["wrong"])
+
+def mapped(value: dict[str, str]) -> None: ...
+def invoke_mapping[D: Mapping[str, str | int]](rule: Callable[[D], None], data: D) -> D:
+    rule(data)
+    return data
+
+assert_type(invoke_mapping(mapped, {}), dict[str, str])
+assert_type(invoke_mapping(mapped, {"key": "value"}), dict[str, str])
+# error: [invalid-argument-type]
+invoke_mapping(mapped, {"key": 42})
+
+def bounded[T: Sequence[str | int]](data: T) -> T:
+    return data
+
+def defaulted[T: Sequence[str | int] = list[str]](data: T) -> T:
+    return data
+
+assert_type(bounded([]), list[str | int])
+assert_type(defaulted([]), list[str | int])
+
+def gradual(any_value: Any, unknown_value):
+    reveal_type(bounded(any_value))  # revealed: Any
+    reveal_type(bounded(unknown_value))  # revealed: Unknown
+    reveal_type(invoke(listed, data=any_value))  # revealed: list[str] & Any
+    reveal_type(invoke(listed, data=unknown_value))  # revealed: list[str] & Unknown
+```
+
+```py
+def mapped_bound[T: Mapping[str, str | int]](data: T) -> T:
+    return data
+
+assert_type(mapped_bound({}), dict[str, str | int])
+assert_type(invoke(listed, data=list()), list[str])
+assert_type(invoke_mapping(mapped, dict()), dict[str, str])
+
+def nested(value: list[list[str]]) -> None: ...
+def invoke_nested[D: Sequence[Sequence[str | int]]](rule: Callable[[D], None], data: D) -> D:
+    return data
+
+assert_type(invoke_nested(nested, [["ok"]]), list[list[str]])
+# error: [invalid-argument-type]
+invoke_nested(nested, [[42]])
+
+def prebound_gradual(values: list[Any], mapping: dict[str, Any], unknown):
+    reveal_type(bounded(values))  # revealed: list[Any]
+    reveal_type(mapped_bound(mapping))  # revealed: dict[str, Any]
+    reveal_type(bounded([unknown]))  # revealed: list[Unknown]
+```
