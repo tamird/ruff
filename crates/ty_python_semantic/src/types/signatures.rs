@@ -2398,6 +2398,12 @@ impl<'db> Signature<'db> {
         {
             return None;
         }
+        if (self.is_generic() || overload.is_generic())
+            && (!self.supports_specialization(db, |ty| ty.is_fully_static(db, env))
+                || !overload.supports_specialization(db, |ty| ty.is_fully_static(db, env)))
+        {
+            return None;
+        }
         if self.is_non_generic() {
             return Some(self.clone());
         }
@@ -7113,6 +7119,7 @@ mod tests {
             def bounded[T: int](value: T) -> T: ...
             def variadic[T](*values: T) -> T: ...
             def gradual(value: Any) -> Any: ...
+            def unannotated(value) -> object: ...
             def limited[T](value: int, other: T) -> T: ...
             def wrong_inputs(value: str, other: str) -> str: ...
             def correlated[T](left: T, right: list[T]) -> T: ...
@@ -7181,6 +7188,24 @@ mod tests {
                 signature("gradual"),
             )
         );
+        for name in ["gradual", "unannotated"] {
+            assert!(
+                !signature(name).supports_overload_implementation_consistency_with(
+                    &db,
+                    &env,
+                    signature("generic"),
+                ),
+                "{name}",
+            );
+            assert!(
+                signature(name).supports_overload_implementation_consistency_with(
+                    &db,
+                    &env,
+                    signature("strings"),
+                ),
+                "{name}",
+            );
+        }
         assert!(
             !signature("limited").supports_overload_implementation_consistency_with(
                 &db,
