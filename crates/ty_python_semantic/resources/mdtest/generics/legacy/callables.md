@@ -1672,3 +1672,128 @@ static_assert(not is_subtype_of(TypeOf[bounded], Callable[[int], int]))
 static_assert(is_subtype_of(TypeOf[constrained], Callable[[int], int]))
 static_assert(not is_subtype_of(TypeOf[constrained], Callable[[bytes], bytes]))
 ```
+
+## Optional generic callable parameters
+
+A source's unused optional parameters need no inferred type argument. Their type variables remain
+rigid during the final subtype check. A generic target's variables also stay rigid: a source
+specialization must work for every permitted target specialization.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from collections.abc import Mapping
+from typing import Any, Callable, Generic, Protocol, Unpack
+from typing_extensions import TypeVar, TypedDict
+from ty_extensions import static_assert
+from ty_extensions._internal import TypeOf, Unknown, is_subtype_of
+
+K = TypeVar("K", bound=str)
+N = TypeVar("N", bound=float)
+E = TypeVar("E", bound=str)
+V = TypeVar("V", bound=float)
+C = TypeVar("C", int, float)
+D = TypeVar("D", bound=float, default=Any)
+T = TypeVar("T", bound=str)
+U = TypeVar("U")
+Complex = TypeVar("Complex", bound=complex)
+
+class Environment(Protocol):
+    def __call__(self, *, env: dict[str, str] | None = ...) -> None: ...
+
+class Resources(Protocol):
+    def __call__(
+        self, *, env: dict[str, str] | None = ..., resource_set: dict[K, N] | Callable[[str, int], dict[K, N]] | None = ...
+    ) -> None: ...
+
+def environment(*, env: Mapping[K, str] | None = None) -> None:
+    pass
+
+def unrelated(*, env: Mapping[K, str] | None = None, resource: V | None = None) -> None:
+    pass
+
+def action(
+    *, env: Mapping[E, str] | None = None, resource_set: dict[K, N] | Callable[[str, int], dict[K, N]] | None = None
+) -> None:
+    pass
+
+static_assert(is_subtype_of(TypeOf[environment], Environment))
+static_assert(is_subtype_of(TypeOf[unrelated], Environment))
+static_assert(is_subtype_of(TypeOf[action], Environment))
+static_assert(is_subtype_of(TypeOf[action], Resources))
+
+class ResourceArguments(TypedDict, Generic[K, N], total=False, closed=True):
+    env: dict[str, str] | None
+    resource_set: dict[K, N] | Callable[[str, int], dict[K, N]] | None
+
+class UnpackedResources(Protocol):
+    def __call__(self, **kwargs: Unpack[ResourceArguments[K, N]]) -> None: ...
+
+class OpenResourceArguments(TypedDict, total=False):
+    env: dict[str, str] | None
+
+class OpenEnvironment(Protocol):
+    def __call__(self, **kwargs: Unpack[OpenResourceArguments]) -> None: ...
+
+class BroadResources(Protocol):
+    def __call__(self, *, env: dict[str, str] | None = ..., resource_set: dict[U, Complex] | None = ...) -> None: ...
+
+class ExposedResource(Protocol):
+    def __call__(self, *, env: dict[str, str] | None = ..., resource: str | None = ...) -> None: ...
+
+class GradualEnvironment(Protocol):
+    def __call__(self, *, env: dict[str, Any] | None = ...) -> None: ...
+
+class UnknownEnvironment(Protocol):
+    def __call__(self, *, env: dict[str, Unknown] | None = ...) -> None: ...
+
+def required(*, env: Mapping[K, str] | None = None, resource: V) -> None:
+    pass
+
+def returned(*, env: Mapping[K, str] | None = None) -> C:
+    raise NotImplementedError
+
+def gradual(*, env: Mapping[K, Any] | None = None, resource: V | None = None) -> None:
+    pass
+
+def unknown(*, env: Mapping[K, Unknown] | None = None, resource: V | None = None) -> None:
+    pass
+
+def defaulted(*, env: Mapping[K, str] | None = None, resource: D | None = None) -> None:
+    pass
+
+static_assert(is_subtype_of(TypeOf[action], UnpackedResources))
+static_assert(not is_subtype_of(TypeOf[action], OpenEnvironment))
+static_assert(not is_subtype_of(TypeOf[action], BroadResources))
+static_assert(not is_subtype_of(TypeOf[unrelated], ExposedResource))
+static_assert(not is_subtype_of(TypeOf[required], Environment))
+static_assert(not is_subtype_of(TypeOf[returned], Environment))
+static_assert(not is_subtype_of(TypeOf[gradual], Environment))
+static_assert(not is_subtype_of(TypeOf[unknown], Environment))
+static_assert(not is_subtype_of(TypeOf[unrelated], GradualEnvironment))
+static_assert(not is_subtype_of(TypeOf[unrelated], UnknownEnvironment))
+static_assert(is_subtype_of(TypeOf[defaulted], Environment))
+static_assert(not is_subtype_of(TypeOf[defaulted], ExposedResource))
+
+class Correlated(Protocol):
+    def __call__(self, value: T) -> tuple[T, T]: ...
+
+class Broader(Protocol):
+    def __call__(self, value: U) -> tuple[U, U]: ...
+
+def correlated(value: T, *, unused: V | None = None) -> tuple[T, T]:
+    return value, value
+
+def mismatched(value: T, *, unused: V | None = None) -> tuple[T, str]:
+    return value, "extra"
+
+static_assert(is_subtype_of(TypeOf[correlated], Correlated))
+# TODO: The existing fallback infers both signatures' variables existentially.
+# The source's str bound cannot cover every specialization of the target.
+# error: [static-assert-error]
+static_assert(not is_subtype_of(TypeOf[correlated], Broader))
+static_assert(not is_subtype_of(TypeOf[mismatched], Correlated))
+```

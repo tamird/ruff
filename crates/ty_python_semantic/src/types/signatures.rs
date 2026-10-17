@@ -3166,8 +3166,8 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             target
         };
 
-        // With no caller-owned inference variables, a complete source specialization can be
-        // checked directly. Declared domains must pass the solver before existential reduction;
+        // With no caller-owned inference variables, a source specialization can be checked
+        // directly. Declared domains must pass the solver before existential reduction;
         // satisfiability alone does not establish the original strict relation.
         if self.inferable == TypeVarSet::None
             && self.typevar_evaluation == TypeVarEvaluation::Eager
@@ -3176,7 +3176,6 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 TypeRelation::Subtyping | TypeRelation::Redundancy { pure: true }
             )
             && source.has_supported_declared_domain(db, env)
-            && target.generic_context.is_none()
             && target.supports_specialization(db, |ty| ty.is_fully_static_except_any(db, env))
             && self.proves_declared_domain_specialization(db, source, target)
         {
@@ -3244,6 +3243,11 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         let Some(context) = source.generic_context else {
             return false;
         };
+        // Target variables describe every accepted specialization. Keep them rigid throughout
+        // the search and replay, including when the target itself is a generic callable.
+        let mut target = target.clone();
+        target.generic_context = None;
+        let target = &target;
         let inferable = context.inferable_typevars(db);
         let mut search = self.with_inferable_typevars(inferable);
         search.typevar_evaluation = TypeVarEvaluation::Lazy;
@@ -3273,9 +3277,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             let types: Option<Vec<_>> = context
                 .variables(db)
                 .map(|variable| {
-                    let index = solved_typevars.iter().position(|binding| {
+                    let Some(index) = solved_typevars.iter().position(|binding| {
                         binding.bound_typevar.identity(db) == variable.identity(db)
-                    })?;
+                    }) else {
+                        // Optional source parameters absent from the target need no inferred
+                        // type. Retain their variables rigidly for the full strict replay.
+                        return Some(Type::TypeVar(variable));
+                    };
                     match resolved[index] {
                         SolutionType::Resolved(ty) => Some(ty),
                         SolutionType::Unresolved(_) => None,
@@ -3287,12 +3295,6 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             };
             let specialization = context.specialize(db, types);
             let mut specialized = source.apply_specialization(db, specialization);
-            if specialized
-                .generic_context
-                .is_some_and(|context| context.variables(db).next().is_some())
-            {
-                continue;
-            }
             specialized.generic_context = None;
             // Search and replay use different recursion entries. Replay only after the search
             // entry has been removed, and retain the original strict relation for nested members.
