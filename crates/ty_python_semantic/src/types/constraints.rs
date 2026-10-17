@@ -4680,6 +4680,24 @@ impl<'db> CandidateSolutions<'db> {
                 }
             }
 
+            // A provisional allocation needs context from the other inputs. An inferred
+            // upper bound can provide that context before argument re-inference replaces
+            // the marker with a concrete lower bound. Genuine gradual data is not a slot
+            // to fill, and the accumulated upper bounds above still check known components.
+            if lower.has_unspecialized_type_var(db, env)
+                && !any_over_type_expanding_aliases(db, env, lower, |ty| match ty {
+                    Type::Dynamic(dynamic) => dynamic != DynamicType::UnspecializedTypeVar,
+                    Type::Divergent(_) => true,
+                    _ => false,
+                })
+                && path_bound.has_upper_inference()
+                && let Some(upper) = path_bound.as_single_upper_bound(db, env)
+                && upper.is_fully_static(db, env)
+                && !upper.has_indeterminate_inference(db, env)
+            {
+                return PathBoundSolution::Solved(upper);
+            }
+
             return PathBoundSolution::Solved(lower);
         }
 
@@ -7499,6 +7517,107 @@ mod tests {
             .solve(db, &env, &builder,),
             Solutions::Constrained(SolutionPaths::Complete(vec![solution([])]))
         );
+    }
+
+    #[test]
+    fn provisional_lower_uses_compatible_inferred_upper() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let builder = ConstraintSetBuilder::new();
+        let marker = Type::Dynamic(DynamicType::UnspecializedTypeVar);
+        let int = known_instance(db, KnownClass::Int);
+        let string = known_instance(db, KnownClass::Str);
+        let list = |element| KnownClass::List.to_specialized_instance(db, &env, &[element]);
+        let divergent = Type::divergent(salsa::plumbing::Id::from_bits(1));
+        let tuple = |second| Type::heterogeneous_tuple(db, &env, [list(marker), second]);
+        let known_tuple = |second| Type::heterogeneous_tuple(db, &env, [list(string), second]);
+
+        for (lower, upper, provenance, expected) in [
+            (
+                list(marker),
+                list(string),
+                ConstraintProvenance::Evidence,
+                list(string),
+            ),
+            (
+                tuple(int),
+                known_tuple(int),
+                ConstraintProvenance::Evidence,
+                known_tuple(int),
+            ),
+            // Temporary context may be broader; argument re-inference retains concrete values.
+            (
+                tuple(int),
+                known_tuple(Type::object()),
+                ConstraintProvenance::Evidence,
+                known_tuple(Type::object()),
+            ),
+            // Genuine gradual components are not unresolved allocation slots.
+            (
+                tuple(Type::any()),
+                known_tuple(int),
+                ConstraintProvenance::Evidence,
+                tuple(Type::any()),
+            ),
+            (
+                tuple(Type::unknown()),
+                known_tuple(int),
+                ConstraintProvenance::Evidence,
+                tuple(Type::unknown()),
+            ),
+            (
+                tuple(divergent),
+                known_tuple(int),
+                ConstraintProvenance::Evidence,
+                tuple(divergent),
+            ),
+            // A declared bound alone must not supply new input evidence.
+            (
+                list(marker),
+                list(string),
+                ConstraintProvenance::Validity,
+                list(marker),
+            ),
+            (
+                list(marker),
+                list(Type::any()),
+                ConstraintProvenance::Evidence,
+                list(marker),
+            ),
+            (
+                list(marker),
+                list(Type::unknown()),
+                ConstraintProvenance::Evidence,
+                list(marker),
+            ),
+            (
+                list(marker),
+                list(divergent),
+                ConstraintProvenance::Evidence,
+                list(marker),
+            ),
+        ] {
+            let mut upper_bound = UpperBound::unconstrained();
+            upper_bound.add_clause(provenance, upper);
+            let bounds = CandidateTypeVarSolution {
+                bound_typevar: t,
+                evidence_lower: Some(lower),
+                mixed_lower: None,
+                validity_lower: Type::Never,
+                upper: upper_bound,
+                has_only_non_concrete_evidence: None,
+                selected_declared_constraint: None,
+            };
+            assert_eq!(
+                CandidateSolutions::preliminary_solve(db, &env, &builder, &bounds),
+                PathBoundSolution::Solved(expected),
+                "{} with upper {} ({provenance:?})",
+                lower.display(db, &env),
+                upper.display(db, &env),
+            );
+        }
     }
 
     #[test]

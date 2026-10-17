@@ -4389,3 +4389,85 @@ def prebound_gradual(values: list[Any], mapping: dict[str, Any], unknown):
     reveal_type(mapped_bound(mapping))  # revealed: dict[str, Any]
     reveal_type(bounded([unknown]))  # revealed: list[Unknown]
 ```
+
+## Empty input with a union-bound callback
+
+A provisional empty collection must use compatible sibling evidence even when its type variable has
+a union bound. Bare calls below deliberately have no result context that could rescue inference.
+
+```py
+from typing import Any, Callable, Never, NotRequired, Protocol, Sequence, Unpack, overload
+from typing_extensions import TypedDict
+from ty_extensions._internal import Unknown
+
+class Selected[T]:
+    @property
+    def value(self) -> T:
+        raise NotImplementedError
+
+type Input = Sequence[str | int] | Selected[Sequence[str | int]]
+
+class Rule[D](Protocol):
+    def __call__(self, *args: Unknown, data: D, **kwargs: Unknown) -> object: ...
+
+class Forwarded(TypedDict, extra_items=Any):
+    marker: NotRequired[int]
+
+class DefaultForwarded(TypedDict, extra_items=Any):
+    marker: NotRequired[int]
+    inner_data: NotRequired[Never]
+
+@overload
+def invoke[D: Input](rule: Rule[D], *, inner_data: D, **kwargs: Unpack[Forwarded]) -> None: ...
+@overload
+def invoke(rule: Callable[..., object], **kwargs: Unpack[DefaultForwarded]) -> None: ...
+def invoke(rule: Callable[..., object], *, inner_data: Input = [], **kwargs: Any) -> None:
+    rule(data=inner_data, **kwargs)
+
+def listed(*, data: list[str], srcs: list[str]) -> None: ...
+def tupled(*, data: tuple[str]) -> None: ...
+def sequence(*, data: Sequence[str]) -> None: ...
+
+invoke(listed, inner_data=[], srcs=["ok"])  # no diagnostic
+invoke(inner_data=[], rule=listed, srcs=["ok"])  # no diagnostic
+invoke(listed, inner_data=["ok"], srcs=["ok"])  # no diagnostic
+invoke(tupled, inner_data=("ok",))  # no diagnostic
+invoke(sequence, inner_data=[])  # no diagnostic
+# error: [no-matching-overload]
+invoke(listed, inner_data=[42], srcs=["ok"])
+# error: [no-matching-overload]
+invoke(tupled, inner_data=[])
+# error: [no-matching-overload]
+invoke(tupled, **{"inner_data": ["ok"]})
+
+def identity[D: Input](rule: Rule[D], *, data: D) -> D:
+    return data
+
+# Keep result precision separate from the context-free invocation checks.
+listed_result = identity(listed, data=[])
+sequence_result = identity(sequence, data=[])
+reveal_type(listed_result)  # revealed: list[str]
+reveal_type(sequence_result)  # revealed: list[str]
+```
+
+Partial tuple information remains available, including real gradual values. The callback's broader
+component does not replace the argument's literal component.
+
+```py
+def pair[T](data: T, callback: Callable[[T], None]) -> T:
+    return data
+
+def known(value: tuple[list[str], object]) -> None: ...
+def incompatible(value: tuple[list[str], str]) -> None: ...
+
+value = pair(([], 42), known)
+reveal_type(value[1])  # revealed: Literal[42]
+# error: [invalid-argument-type]
+pair(([], 42), incompatible)
+
+def gradual(any_value: Any, unknown: Unknown):
+    a = pair(([], any_value), known)
+    u = pair(([], unknown), known)
+    reveal_type(a[1])  # revealed: Any
+    reveal_type(u[1])  # revealed: Unknown
+```
