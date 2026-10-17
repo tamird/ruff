@@ -3448,6 +3448,22 @@ impl<'db> CandidateTypeVarSolution<'db> {
         }
     }
 
+    /// Whether inference evidence still contains an unresolved contextual slot.
+    /// Lower bounds can discard that slot while an upper bound retains it, so a
+    /// preliminary solution alone cannot identify partially specialized context.
+    pub(crate) fn has_provisional_inference(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
+        self.evidence_lower
+            .into_iter()
+            .chain(self.mixed_lower)
+            .chain(self.upper.iter_evidence())
+            .chain(self.upper.iter_mixed())
+            .any(|ty| ty.has_provisional_marker(db, env))
+    }
+
     /// Returns one effective upper bound without expanding factored intersections.
     fn as_single_upper_bound(
         &self,

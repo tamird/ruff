@@ -1165,6 +1165,53 @@ def _():
     reveal_type(x8)  # revealed: X
 ```
 
+Only a fresh result can use the wider context. A prebound invariant container keeps its own type:
+
+```py
+def prebound(values: list[X], entries: dict[X, X]) -> None:
+    # error: [invalid-argument-type]
+    # error: [invalid-argument-type]
+    two_lists(values, values)
+    # error: [invalid-argument-type]
+    # error: [invalid-argument-type]
+    two_dicts(entries, entries)
+```
+
+Partial context does not erase gradual argument evidence or relax a declared bound. Completed
+context still rejects an incompatible result:
+
+```py
+from ty_extensions._internal import Unknown
+
+def gradual(value: Any, unknown: Unknown) -> None:
+    reveal_type(lst(value))  # revealed: list[Any]
+    reveal_type(two_lists(lst(value), lst(value)))  # revealed: Unknown
+    reveal_type(two_lists(lst(unknown), lst(unknown)))  # revealed: Unknown
+
+def bounded[T: int](value: T) -> list[T]:
+    return [value]
+
+def bounds() -> None:
+    two_lists(bounded(1), bounded(1))  # error: [invalid-argument-type]
+    bounded(X())  # error: [invalid-argument-type]
+    invalid: list[str] = lst(1)  # error: [invalid-assignment]
+```
+
+An unresolved slot does not weaken a separate, fully specialized slot:
+
+```py
+def pair[A, B](first: A, second: B) -> tuple[list[A], list[B]]:
+    return [first], [second]
+
+def two_slots[T](value: tuple[list[T | int], list[str]]) -> T:
+    raise NotImplementedError
+
+def independent_slots() -> None:
+    reveal_type(two_slots(pair(X(), "text")))  # revealed: X
+    # revealed: tuple[list[X], list[int]]
+    two_slots(reveal_type(pair(X(), 42)))  # error: [invalid-argument-type]
+```
+
 ## Prefer the declared type of generic classes and callables
 
 When inferring a generic call, we only use the declared type as type context if it is in

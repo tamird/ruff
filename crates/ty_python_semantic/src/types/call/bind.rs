@@ -6627,6 +6627,9 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     FxHashMap::default();
                 let solutions = path_bounds.solve_with(db, self.env, |variance, path_bound| {
                     let identity = path_bound.bound_typevar.identity(db);
+                    if path_bound.has_provisional_inference(db, self.env) {
+                        partially_specialized_declared_type.insert(identity);
+                    }
                     variance_map
                         .entry(identity)
                         .and_modify(|current| *current = current.join(variance))
@@ -6710,11 +6713,15 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                         }
 
                         if let Some(&ty) = preferred.get(&identity) {
-                            builder.add_type_mapping(
-                                binding.bound_typevar,
-                                ty,
-                                TypeVarVariance::Invariant,
-                            );
+                            // An incomplete context contributes its concrete remainder, but
+                            // argument evidence can still widen the unresolved part.
+                            let variance =
+                                if partially_specialized_declared_type.contains(&identity) {
+                                    TypeVarVariance::Covariant
+                                } else {
+                                    TypeVarVariance::Invariant
+                                };
+                            builder.add_type_mapping(binding.bound_typevar, ty, variance);
                         }
                     }
                 }
