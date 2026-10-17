@@ -288,9 +288,9 @@ pub(crate) fn check_overloaded_function<'db>(
 
 /// Check overload signatures against their implementation.
 ///
-/// Generic comparisons require a complete implementation specialization inferred from overload
-/// inputs. Overload variables remain rigid, and the same specialization must cover their parameter
-/// domains and return types. Incomplete inference leaves the comparison unsupported. Each callable
+/// Generic implementations require complete specialization inferred from overload inputs; nongeneric
+/// implementations require no specialization. Overload variables remain rigid for parameter and
+/// return checks. Incomplete inference leaves the comparison unsupported. Each callable
 /// alternative of the implementation must contain a signature consistent with each overload.
 fn check_overload_implementation_consistency<'db>(
     context: &InferContext<'db, '_>,
@@ -314,28 +314,11 @@ fn check_overload_implementation_consistency<'db>(
         return;
     }
 
-    // Generic methods, declared domains, and variadic signatures still require additional
-    // type-variable-domain handling. Pair preparation below also declines incomplete inference.
-    if implementation_callables
-        .iter()
-        .flat_map(|callable| &callable.signatures(db).overloads)
-        .any(|signature| !signature.supports_overload_implementation_consistency(db, env))
-    {
-        return;
-    }
-
     let overload_signatures = overloads.iter().flat_map(|overload| {
         overload
             .decorated_signatures(db)
             .map(move |signature| (overload, signature))
     });
-
-    if overload_signatures
-        .clone()
-        .any(|(_, signature)| !signature.supports_overload_implementation_consistency(db, env))
-    {
-        return;
-    }
 
     for (overload, overload_signature) in overload_signatures {
         let function_node = overload.node(db, context.file(), context.module());

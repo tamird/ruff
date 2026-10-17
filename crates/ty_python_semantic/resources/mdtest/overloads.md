@@ -2224,3 +2224,127 @@ def nullable[U](value: U | None = None) -> U | None:
 def caller[T](value: T):
     reveal_type(nullable(value))  # revealed: Unknown | None
 ```
+
+## Generic overloads with nongeneric implementations
+
+The implementation has no variables to infer. Compare its parameters and return against the rigid
+overload variables using ordinary assignability, including gradual and variadic parameters.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+### Typed keyword forwarding
+
+```py
+from typing import Any, Callable, Never, NotRequired, Protocol, Sequence, Unpack, overload
+from typing_extensions import TypedDict
+
+class Rule[D](Protocol):
+    def __call__(self, *args: Any, data: D, **kwargs: Any) -> object: ...
+
+class Forwarded(TypedDict, extra_items=Any):
+    marker: NotRequired[int]
+
+class DefaultForwarded(TypedDict, extra_items=Any):
+    marker: NotRequired[int]
+    inner_data: NotRequired[Never]
+
+@overload
+def invoke[D: Sequence[str]](rule: Rule[D], *, name: str, inner_data: D, **kwargs: Unpack[Forwarded]) -> None: ...
+@overload
+def invoke(rule: Callable[..., object], *, name: str, **kwargs: Unpack[DefaultForwarded]) -> None: ...
+def invoke(rule: Callable[..., object], *, name: str, inner_data: Sequence[str] = [], **kwargs: Any) -> None:
+    rule(name=name + "_", data=inner_data, tags=[], **kwargs)
+
+def listed(*, data: list[str], name: str, tags: list[str], srcs: list[str]) -> None: ...
+def tupled(*, data: tuple[str], name: str, tags: list[str]) -> None: ...
+
+invoke(listed, name="case", inner_data=["ok"], srcs=["ok"])
+invoke(listed, name="case", srcs=["ok"])
+invoke(tupled, name="case", inner_data=("ok",))
+invoke(tupled, name="case")
+# error: [no-matching-overload]
+invoke(listed, name="case", inner_data=("ok",), srcs=["ok"])
+# error: [no-matching-overload]
+invoke(tupled, name="case", inner_data=["ok"])
+# error: [no-matching-overload]
+invoke(listed, name="case", inner_data=[42], srcs=["ok"])
+# error: [invalid-argument-type]
+invoke(listed, name="case", marker="bad", srcs=["ok"])
+```
+
+### Rigid variables and gradual inputs
+
+```py
+from typing import Any, overload
+
+@overload
+def f[T](x: T, y: int) -> T: ...
+@overload
+def f(x: list[int | str], y: str) -> object: ...
+def f(x, y) -> object:
+    return x
+
+@overload
+# error: [invalid-overload]
+def bad_input[T](value: T) -> T: ...
+@overload
+def bad_input(value: int, other: int) -> int: ...
+def bad_input(value: int, other: int = 0) -> object:
+    return value
+
+@overload
+# error: [invalid-overload]
+def bounded[T: str | int](value: T) -> T: ...
+@overload
+def bounded(value: str, other: str) -> str: ...
+def bounded(value: str, other: str = "") -> str:
+    return value
+
+@overload
+# error: [invalid-overload]
+def bad_return[T](value: T) -> T: ...
+@overload
+def bad_return(value: int, other: int) -> int: ...
+def bad_return(value: Any, other: int = 0) -> int:
+    return 1
+```
+
+### Closed keyword arguments
+
+```py
+from typing import NotRequired, Unpack, overload
+from typing_extensions import TypedDict
+
+class Closed(TypedDict, closed=True):
+    marker: NotRequired[int]
+
+@overload
+def closed[T](value: T, **kwargs: Unpack[Closed]) -> None: ...
+@overload
+def closed(value: int, other: int, **kwargs: Unpack[Closed]) -> None: ...
+def closed(value: object, other: int = 0, **kwargs: Unpack[Closed]) -> None:
+    pass
+
+closed("ok", marker=1)
+# error: [no-matching-overload]
+closed("ok", extra=1)
+```
+
+### Supported pairs in mixed families
+
+An unsupported parameter pack does not prevent diagnostics for an independent concrete overload.
+
+```py
+from typing import overload
+
+@overload
+def mixed[**P](*args: P.args, **kwargs: P.kwargs) -> int: ...
+@overload
+# error: [invalid-overload]
+def mixed(value: str) -> int: ...
+def mixed(value: int) -> int:
+    return value
+```

@@ -2371,7 +2371,7 @@ impl<'db> Signature<'db> {
         self.generic_context.is_none()
     }
 
-    pub(crate) fn supports_overload_implementation_consistency(
+    fn supports_overload_implementation_consistency(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -2399,9 +2399,9 @@ impl<'db> Signature<'db> {
     /// Whether this implementation and overload have a complete consistency comparison.
     ///
     /// This does not establish that the signatures are consistent. A completed comparison can
-    /// reject parameter coverage or the return type. Generic signatures are supported only when
-    /// input-only call inference completely specializes the implementation; unresolved, gradual,
-    /// receiver-dependent, and variadic cases remain unsupported.
+    /// reject parameter coverage or the return type. Nongeneric implementations use ordinary
+    /// assignability against rigid overload variables. Generic implementations require complete,
+    /// static specialization from overload inputs; incomplete inference remains unsupported.
     pub fn supports_overload_implementation_consistency_with(
         &self,
         db: &'db dyn Db,
@@ -2412,27 +2412,42 @@ impl<'db> Signature<'db> {
             .is_some()
     }
 
-    /// Resolve implementation variables from overload inputs, without using its promised return.
-    /// Incomplete input inference cannot establish overload implementation consistency.
+    /// Prepare one implementation for comparison with the rigid overload domain.
+    ///
+    /// Nongeneric implementations need no inference. Otherwise, resolve implementation variables
+    /// from overload inputs without using the promised return; incomplete inference must decline.
     pub(crate) fn specialize_for_overload_implementation(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         overload: &Self,
     ) -> Option<Self> {
+        if self.is_non_generic() {
+            if overload.is_non_generic() {
+                return Some(self.clone());
+            }
+            let supports_type = |ty: Type<'db>| !ty.has_indeterminate_inference(db, env);
+            return (self.supports_specialization(db, supports_type)
+                && overload.supports_specialization(db, supports_type)
+                && overload.definition.is_some_and(|definition| {
+                    !definition.scope(db).node(db).scope_kind().is_class()
+                })
+                && overload.generic_context.is_none_or(|context| {
+                    context
+                        .variables(db)
+                        .all(|variable| !variable.typevar(db).is_self(db))
+                }))
+            .then(|| self.clone());
+        }
         if !self.supports_overload_implementation_consistency(db, env)
             || !overload.supports_overload_implementation_consistency(db, env)
         {
             return None;
         }
-        if (self.is_generic() || overload.is_generic())
-            && (!self.supports_specialization(db, |ty| ty.is_fully_static(db, env))
-                || !overload.supports_specialization(db, |ty| ty.is_fully_static(db, env)))
+        if !self.supports_specialization(db, |ty| ty.is_fully_static(db, env))
+            || !overload.supports_specialization(db, |ty| ty.is_fully_static(db, env))
         {
             return None;
-        }
-        if self.is_non_generic() {
-            return Some(self.clone());
         }
         let arguments: Option<CallArguments<'_, 'db>> = overload
             .parameters
@@ -2510,7 +2525,7 @@ impl<'db> Signature<'db> {
         let disjointness_visitor = IsDisjointVisitor::default(&constraints);
         let signature_relation_visitor = SignatureRelationVisitor::default();
         let materialization_visitor = ApplyTypeMappingVisitor::new(env);
-        let checker = TypeRelationChecker::constraint_set_assignability_with_context(
+        let checker = TypeRelationChecker::assignability_with_context(
             env,
             &constraints,
             &relation_visitor,
@@ -7211,6 +7226,9 @@ mod tests {
             def variadic[T](*values: T) -> T: ...
             def gradual(value: Any) -> Any: ...
             def unannotated(value) -> object: ...
+            def keyword_generic[T](value: T, **kwargs: object) -> T: ...
+            def broad(value: Any, **kwargs: Any) -> object: ...
+            def packed[**P](*args: P.args, **kwargs: P.kwargs) -> object: ...
             def limited[T](value: int, other: T) -> T: ...
             def wrong_inputs(value: str, other: str) -> str: ...
             def correlated[T](left: T, right: list[T]) -> T: ...
@@ -7281,13 +7299,21 @@ mod tests {
         );
         for name in ["gradual", "unannotated"] {
             assert!(
-                !signature(name).supports_overload_implementation_consistency_with(
+                signature(name).supports_overload_implementation_consistency_with(
                     &db,
                     &env,
                     signature("generic"),
                 ),
                 "{name}",
             );
+            assert!(matches!(
+                signature(name).implementation_parameters_consistency_with(
+                    &db,
+                    &env,
+                    signature("generic"),
+                ),
+                ParameterConsistency::Consistent
+            ));
             assert!(
                 signature(name).supports_overload_implementation_consistency_with(
                     &db,
@@ -7297,6 +7323,48 @@ mod tests {
                 "{name}",
             );
         }
+        for name in ["generic", "keyword_generic", "bounded"] {
+            assert!(
+                signature("broad").supports_overload_implementation_consistency_with(
+                    &db,
+                    &env,
+                    signature(name),
+                ),
+                "{name}"
+            );
+            assert!(matches!(
+                signature("broad").implementation_parameters_consistency_with(
+                    &db,
+                    &env,
+                    signature(name),
+                ),
+                ParameterConsistency::Consistent
+            ));
+        }
+        for name in ["packed", "method"] {
+            assert!(
+                !signature("broad").supports_overload_implementation_consistency_with(
+                    &db,
+                    &env,
+                    signature(name),
+                )
+            );
+        }
+        assert!(
+            signature("strings").supports_overload_implementation_consistency_with(
+                &db,
+                &env,
+                signature("generic"),
+            )
+        );
+        assert!(matches!(
+            signature("strings").implementation_parameters_consistency_with(
+                &db,
+                &env,
+                signature("generic"),
+            ),
+            ParameterConsistency::Inconsistent(_)
+        ));
         assert!(
             !signature("limited").supports_overload_implementation_consistency_with(
                 &db,
