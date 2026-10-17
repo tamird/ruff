@@ -3035,10 +3035,11 @@ impl<'db> Type<'db> {
         }
     }
 
-    /// Resolve outermost aliases and expand aliases that expose top-level union elements.
+    /// Resolves outermost aliases and expands aliases that expose top-level union elements.
     ///
-    /// Aliases nested inside non-union types remain unexpanded.
-    fn expand_top_level_aliases(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Self {
+    /// Aliases nested inside non-union types remain unexpanded. This allows consumers to
+    /// inspect the possible outer types without traversing container arguments.
+    pub fn expand_top_level_aliases(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Self {
         match self.resolve_type_alias(db) {
             Type::Union(union) if union.has_aliases(db) => union.expand_aliases(db, env),
             ty => ty,
