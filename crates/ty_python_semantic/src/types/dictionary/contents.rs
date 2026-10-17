@@ -684,11 +684,6 @@ fn initial_contents<'db>(
             contents => return contents,
         }
     }
-    // Ordinary dictionary bounds retain their per-alternative key domains. A union of
-    // invariant dictionaries is admitted only by the proved record seed above.
-    if !closed_typed_dict && bound_type.as_nominal_instance().is_none() {
-        return ContentsValue::Unavailable;
-    }
     let (owner, value, shared) = match definition.kind(db) {
         DefinitionKind::DictKeyAssignment(assignment) => (
             assignment.assignment(),
@@ -708,6 +703,18 @@ fn initial_contents<'db>(
     let owner_inference = infer_definition_types(db, owner);
     if StatementInference::Definition(owner, owner_inference).is_provisional() {
         return ContentsValue::Pending;
+    }
+    let observed = value
+        .filter(|_| !owner_inference.discards_dict_key_assignments())
+        .map_or(Err(DictionaryFallback::Unavailable), |value| {
+            DictionaryItems::expression(db, &env, scope, value, &mut |expression| {
+                owner_inference.try_expression_type(expression)
+            })
+        });
+    // A fresh allocation can prove its contents even when its inferred type is a union.
+    // Unobserved union bounds retain their per-alternative key domains.
+    if !closed_typed_dict && bound_type.as_nominal_instance().is_none() && observed.is_err() {
+        return ContentsValue::Unavailable;
     }
     let builtin_allocation = !owner_inference.discards_dict_key_assignments()
         && value.is_some_and(|value| is_builtin_allocation(db, value, owner_inference));
@@ -777,9 +784,6 @@ fn initial_contents<'db>(
                 ContentsValue::Unavailable => {}
             }
         }
-        let observed = DictionaryItems::expression(db, &env, scope, value, &mut |expression| {
-            owner_inference.try_expression_type(expression)
-        });
         match observed {
             Ok(dictionary) => {
                 mapping.dictionary = dictionary;
@@ -1836,14 +1840,6 @@ pub(super) fn snapshot_contents<'db>(
         {
             return None;
         }
-        // Only a proved For seed can observe an invariant dictionary union. Ordinary
-        // assignment and capture unions retain their existing argument-matching fallback.
-        if !closed_typed_dict
-            && argument_type.as_nominal_instance().is_none()
-            && super::records::for_binding(db, scope, expression).is_none()
-        {
-            return None;
-        }
         let file = scope.program_file(db);
         let index = semantic_index(db, file);
         let place = PlaceExpr::contents(expression)?;
@@ -1852,6 +1848,25 @@ pub(super) fn snapshot_contents<'db>(
             .place_id(&place)?;
         let use_id = index.try_expression_use_id(snapshot)?;
         let use_def = index.use_def_map(scope.file_scope_id(db));
+        // A nested scope can replace a captured binding with another dictionary. Its
+        // alternative type survives ordinary inference but has no local contents seed.
+        if !closed_typed_dict
+            && argument_type.as_nominal_instance().is_none()
+            && super::records::for_binding(db, scope, expression).is_none()
+        {
+            let receiver = PlaceExpr::try_from_expr(expression)?;
+            let receiver = index
+                .place_table(scope.file_scope_id(db))
+                .place_id(&receiver)?;
+            if use_def.reachable_bindings(receiver).any(|binding| {
+                let DefinitionState::Defined(definition) = binding.binding else {
+                    return false;
+                };
+                matches!(definition.kind(db), DefinitionKind::NestedBindings(_))
+            }) {
+                return None;
+            }
+        }
         let bindings = use_def.multi_bindings_at_use(use_id, contents_place)?;
         let Contents { value, captured: _ } = from_bindings(db, scope, bindings, reachability);
         Some(value)

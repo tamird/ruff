@@ -1149,6 +1149,73 @@ def guarded(values: dict[Literal["value"], int | str]):
         consume(**values)  # error: [invalid-argument-type]
 ```
 
+## Conditional dictionary allocations
+
+Each reaching allocation contributes its own contents, even when the branches have different
+dictionary value types. A required field in the right operand replaces every left-hand value.
+
+```py
+def consume(*, required: str, **extra: object) -> None: ...
+def conditional(flag: bool):
+    if flag:
+        partial = {"optional": 1}
+    else:
+        partial = {"optional": "other"}
+    consume(**(partial | {"required": "known"}))  # no diagnostic
+    merged = partial | {"required": "known"}
+    consume(**merged)  # no diagnostic
+
+def overwrite(flag: bool):
+    if flag:
+        partial = {"required": 1}
+    else:
+        partial = {"required": "other"}
+    consume(**(partial | {"required": "known"}))  # no diagnostic
+    consume(**({"required": "known"} | partial))  # error: [invalid-argument-type]
+```
+
+Unknown initial contents and later mutations retain their ordinary value domains.
+
+```py
+def external(partial: dict[str, int] | dict[str, str]):
+    consume(**partial)  # error: [invalid-argument-type]
+
+def mutation(flag: bool):
+    if flag:
+        partial = {"optional": 1}
+    else:
+        partial = {"optional": "other"}
+    merged: dict[str, object] = partial | {"required": "known"}
+    merged["required"] = 42
+    consume(**merged)  # error: [invalid-argument-type]
+
+def alias(flag: bool):
+    if flag:
+        partial = {"optional": 1}
+    else:
+        partial = {"optional": "other"}
+    merged: dict[str, object] = partial | {"required": "known"}
+    retained = merged
+    retained["required"] = 42
+    consume(**merged)  # error: [invalid-argument-type]
+
+def unavailable_branch(flag: bool, other: dict[str, int] | dict[str, str]):
+    if flag:
+        partial = {"required": "known"}
+    else:
+        partial = other
+    consume(**partial)  # error: [invalid-argument-type]
+
+def expose(value: object) -> None: ...
+def exposed_branch(flag: bool):
+    if flag:
+        partial: dict[str, object] = {"required": "known"}
+        expose(partial)
+    else:
+        partial = {"required": "other"}
+    consume(**partial)  # error: [invalid-argument-type]
+```
+
 ## First values of immediate snapshots
 
 An immediate list snapshot preserves the dictionary's observed first value. Overwriting a key
@@ -1171,8 +1238,8 @@ def first_value(flag: bool):
 
 ## Saved values and later snapshots
 
-A guard narrows the saved scalar. A later dictionary read retains its own value type; the guard
-does not establish a relation between the two reads.
+A guard narrows the saved scalar. A later dictionary read retains its own value type; the guard does
+not establish a relation between the two reads.
 
 ```py
 def saved_first(source: dict[str, int | None]):
@@ -1247,8 +1314,8 @@ def snapshots(source: dict[str, int | None]):
 
 ## First-value reads require builtin operations
 
-A dictionary annotation alone permits subclasses, and a similarly named method can return
-unrelated data. Both keep the ordinary value type.
+A dictionary annotation alone permits subclasses, and a similarly named method can return unrelated
+data. Both keep the ordinary value type.
 
 ```py
 from typing_extensions import reveal_type

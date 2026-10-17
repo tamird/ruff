@@ -713,6 +713,8 @@ def nonlocal_write():
     options = dict(tags=["example"], testonly=True)
     nested()
     consume(**options)  # error: [invalid-argument-type]
+    options["tags"] = ["again"]
+    consume(**options)  # error: [invalid-argument-type]
 
 def loop(flag: bool):
     options = dict(tags=["example"], testonly=True)
