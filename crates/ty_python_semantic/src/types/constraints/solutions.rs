@@ -2672,6 +2672,7 @@ mod tests {
     use super::*;
     use crate::db::tests::setup_db;
     use crate::types::TypeVarVariance;
+    use crate::types::constraints::tests::quantify_constraint;
     use crate::types::constraints::{SolutionPaths, Solutions};
     use ruff_python_ast::name::Name;
 
@@ -2689,14 +2690,15 @@ mod tests {
             )
         });
         let builder = ConstraintSetBuilder::new();
-        let scoped = ConstraintSet::constrain_typevar_equivalence_bound(
+        let body = ConstraintSet::constrain_typevar_equivalence_bound(
             db,
             &env,
             &builder,
             local,
             Type::TypeVar(free),
-        )
-        .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        );
+        // Truth normalization would settle this query before the walker's budget is used.
+        let scoped = quantify_constraint(db, body, TypeVarSet::from_typevars(db, [local]));
         let negative = scoped.negate(db, &builder);
         let mut storage = builder.storage.borrow_mut();
         let source_orders = storage.calculate_source_orders(negative.source_order);

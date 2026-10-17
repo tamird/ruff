@@ -5263,7 +5263,7 @@ mod tests {
     }
 
     /// Exercises scope representation without the truth normalization in `reduce_inferable`.
-    fn quantify_constraint<'db, 'c>(
+    pub(super) fn quantify_constraint<'db, 'c>(
         db: &'db TestDb,
         body: ConstraintSet<'db, 'c>,
         locals: TypeVarSet<'db>,
