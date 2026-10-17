@@ -1803,3 +1803,35 @@ def unconstrained[T: str](*, unused: T | None = None) -> None:
 # No source specialization is needed for an omitted optional parameter.
 static_assert(is_subtype_of(TypeOf[unconstrained], Callable[[], None]))
 ```
+
+## Empty operands in overloaded operators
+
+An operator's expected result supplies context to its empty operand, including when a later overload
+preserves an arbitrary compatible payload. The direct method call and operator spelling agree.
+
+```py
+from __future__ import annotations
+from collections.abc import Sequence
+from typing import overload
+from ty_extensions import Intersection
+
+class Selected[T]:
+    def payload(self) -> T:
+        raise NotImplementedError
+
+    @overload
+    def __add__[L, R](self: Selected[Sequence[L]], other: Sequence[R], /) -> Selected[list[L | R]]: ...
+    @overload
+    def __add__[R, P](self, other: Intersection[Sequence[R], P], /) -> Selected[T | P]: ...
+    def __add__(self, other):
+        raise NotImplementedError
+
+    __radd__ = __add__
+
+def probe(value: Selected[list[str] | list[int]]):
+    result: Selected[list[str | int]] = reveal_type(value + [])  # revealed: Selected[list[str | int]]
+    direct: Selected[list[str | int]] = reveal_type(value.__add__([]))  # revealed: Selected[list[str | int]]
+    reflected: Selected[list[str | int]] = reveal_type([] + value)  # revealed: Selected[list[str | int]]
+    wrong: Selected[list[bytes]] = value + []  # error: [invalid-assignment]
+    value + {}  # error: [unsupported-operator]
+```

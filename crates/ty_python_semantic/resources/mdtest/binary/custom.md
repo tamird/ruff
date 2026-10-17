@@ -535,3 +535,98 @@ def check(left: MappingValue[dict[str, int]], right: dict[str, str]) -> None:
     reveal_type(direct)  # revealed: MappingValue[dict[str, int | str]]
     wrong: MappingValue[dict[str, int]] = left | right  # error: [invalid-assignment]
 ```
+
+## Empty collection arguments
+
+Empty displays adopt an operator overload's element types as they do in an explicit method call.
+Preexisting gradual containers still leave the overload ambiguous.
+
+```py
+from typing import Any, overload
+from ty_extensions._internal import Unknown
+
+class Choice:
+    @overload
+    def __add__(self, other: list[str], /) -> str: ...
+    @overload
+    def __add__(self, other: list[int], /) -> int: ...
+    def __add__(self, other):
+        raise NotImplementedError
+
+    __radd__ = __add__
+
+    @overload
+    def __or__(self, other: dict[str, str], /) -> str: ...
+    @overload
+    def __or__(self, other: dict[str, int], /) -> int: ...
+    def __or__(self, other):
+        raise NotImplementedError
+
+    __ror__ = __or__
+
+def probe(choice: Choice, gradual: list[Any], unknown: list[Unknown]):
+    reveal_type(choice + [])  # revealed: str
+    reveal_type(choice.__add__([]))  # revealed: str
+    reveal_type([] + choice)  # revealed: str
+    reveal_type(choice | {})  # revealed: str
+    reveal_type(choice.__or__({}))  # revealed: str
+    reveal_type({} | choice)  # revealed: str
+    reveal_type(choice + [42])  # revealed: int
+    reveal_type(choice + ["x"])  # revealed: str
+    reveal_type(choice + gradual)  # revealed: (Unknown & str) | (Unknown & int)
+    reveal_type(choice + unknown)  # revealed: (Unknown & str) | (Unknown & int)
+    prebound: list[Any] = []
+    reveal_type(choice + prebound)  # revealed: (Unknown & str) | (Unknown & int)
+    wrong: int = choice + []  # error: [invalid-assignment]
+    choice + [b"x"]  # error: [unsupported-operator]
+    choice | {"x": b"x"}  # error: [unsupported-operator]
+```
+
+Possible reflected-method priority retains both successful dispatch results.
+
+```py
+class Reflected(list[int]):
+    @overload
+    def __radd__(self, other: list[str], /) -> str: ...
+    @overload
+    def __radd__(self, other: list[int], /) -> int: ...
+    def __radd__(self, other):
+        raise NotImplementedError
+
+def reflected(value: Reflected):
+    result = [] + value
+    reveal_type(result)  # revealed: str | list[Unknown]
+```
+
+Intersection receivers retain their existing constituent-by-constituent dunder dispatch.
+
+```py
+from typing import TypedDict
+from ty_extensions import Intersection
+
+class Other:
+    def __add__(self, other: list[str] | list[int], /) -> object:
+        raise NotImplementedError
+
+def intersections(value: Intersection[Choice, Other], gradual: Intersection[Choice, Unknown], argument: list[Unknown]):
+    empty = value + []
+    prebound = value + argument
+    gradual_empty = gradual + []
+    reveal_type(empty)  # revealed: (Unknown & str) | (Unknown & int)
+    reveal_type(prebound)  # revealed: (Unknown & str) | (Unknown & int)
+    reveal_type(gradual_empty)  # revealed: (Unknown & str) | (Unknown & int)
+```
+
+Contextual inference still rejects an empty dictionary when the operator requires fields.
+
+```py
+class Fields(TypedDict):
+    required: int
+
+class RequiresFields:
+    def __or__(self, other: Fields, /) -> str:
+        raise NotImplementedError
+
+def required_fields(value: RequiresFields):
+    value | {}  # error: [unsupported-operator]
+```

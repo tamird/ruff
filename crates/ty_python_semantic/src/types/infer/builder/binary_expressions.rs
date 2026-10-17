@@ -1,10 +1,10 @@
 use crate::Db;
 use crate::ProgramEnvironment;
 use compact_str::CompactString;
-use ruff_python_ast::{self as ast, AnyNodeRef};
+use ruff_python_ast::{self as ast, AnyNodeRef, ArgOrKeyword};
 
-use super::TypeInferenceBuilder;
-use crate::types::call::CallArguments;
+use super::{ArgumentsIter, TypeInferenceBuilder};
+use crate::types::call::{BinaryOperatorMethod, CallArguments};
 use crate::types::constraints::ConstraintSetBuilder;
 use crate::types::cyclic::CycleDetector;
 use crate::types::diagnostic::{
@@ -59,6 +59,14 @@ fn has_dict_literal_operand(expression: &ast::Expr) -> bool {
                 && (has_dict_literal_operand(&binary.left)
                     || has_dict_literal_operand(&binary.right))
         }
+        _ => false,
+    }
+}
+
+fn is_empty_collection_display(expression: &ast::Expr) -> bool {
+    match expression {
+        ast::Expr::List(list) => list.elts.is_empty(),
+        ast::Expr::Dict(dict) => dict.items.is_empty(),
         _ => false,
     }
 }
@@ -542,14 +550,73 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         })
     }
 
-    /// Collect deprecations from the selected operator methods while reusing cached resolution.
+    /// Resolve operator methods, retaining source context for empty collection arguments.
     fn infer_binary_dunder(
-        &self,
+        &mut self,
+        node: AnyNodeRef<'_>,
         state: &mut BinaryInferenceState<'db>,
         left_ty: Type<'db>,
         op: ast::Operator,
         right_ty: Type<'db>,
     ) -> Option<Type<'db>> {
+        if let AnyNodeRef::ExprBinOp(binary) = node
+            && (is_empty_collection_display(&binary.left)
+                || is_empty_collection_display(&binary.right))
+        {
+            let db = self.db();
+            let env = self.program_environment();
+            let bindings = Type::try_call_bin_op_with(db, env, left_ty, op, right_ty, |method| {
+                let (receiver, name, argument, expression) = match method {
+                    BinaryOperatorMethod::Normal => {
+                        (left_ty, op.dunder(), right_ty, binary.right.as_ref())
+                    }
+                    BinaryOperatorMethod::Reflected => (
+                        right_ty,
+                        op.reflected_dunder(),
+                        left_ty,
+                        binary.left.as_ref(),
+                    ),
+                };
+                // Intersection dunders dispatch on each constituent before combining results;
+                // aggregate member lookup in the contextual helper is not equivalent.
+                if !is_empty_collection_display(expression)
+                    || matches!(receiver.resolve_type_alias(db), Type::Intersection(_))
+                {
+                    return receiver.try_call_dunder(
+                        db,
+                        env,
+                        name,
+                        CallArguments::positional([argument]),
+                        state.result_context,
+                    );
+                }
+
+                // An empty allocation can adopt each overload's element context, just as
+                // in an explicit method call. Its previously inferred Unknown elements
+                // must not stand in for a preexisting gradual container.
+                let mut candidate = self.speculate();
+                let ast_arguments = [ArgOrKeyword::Arg(expression)];
+                let mut arguments = CallArguments::positional([Type::unknown()]);
+                // Keep the original operand observation: alternate dispatches can infer
+                // different valid contexts, and this empty display has no child effects.
+                candidate.infer_and_try_call_dunder(
+                    receiver,
+                    name,
+                    MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+                    ArgumentsIter::synthesized(&ast_arguments),
+                    &mut arguments,
+                    &mut |builder, (_, expression, tcx)| builder.infer_expression(expression, tcx),
+                    state.result_context,
+                )
+            })
+            .ok()?;
+            state.deprecated_functions.extend(
+                bindings
+                    .deprecated_functions(db)
+                    .map(|(_, function)| function),
+            );
+            return Some(bindings.return_type(db, env));
+        }
         let result = Type::try_call_bin_op_result(
             self.db(),
             self.program_environment(),
@@ -756,7 +823,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         )
                     }
                     // For bounded TypeVars or unconstrained TypeVars, fall through to the default handling.
-                    _ => self.infer_binary_dunder(state, left_ty, op, right_ty),
+                    _ => self.infer_binary_dunder(node, state, left_ty, op, right_ty),
                 }
             }
 
@@ -783,7 +850,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         )
                     }
                     // For bounded TypeVars or unconstrained TypeVars, fall through to the default handling.
-                    _ => self.infer_binary_dunder(state, left_ty, op, right_ty),
+                    _ => self.infer_binary_dunder(node, state, left_ty, op, right_ty),
                 }
             }
 
@@ -805,7 +872,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         )
                     }
                     // For bounded TypeVars or unconstrained TypeVars, fall through to the default handling.
-                    _ => self.infer_binary_dunder(state, left_ty, op, right_ty),
+                    _ => self.infer_binary_dunder(node, state, left_ty, op, right_ty),
                 }
             }
 
@@ -816,7 +883,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             // positional arguments get. In those cases we need to explicitly delegate to the base
             // type, so that it hits the `Type::Union` branches above.
             (Type::NewTypeInstance(newtype), rhs, _) => self
-                .infer_binary_dunder(state, left_ty, op, right_ty)
+                .infer_binary_dunder(node, state, left_ty, op, right_ty)
                 .or_else(|| {
                     self.infer_binary_expression_type_impl(
                         node,
@@ -828,7 +895,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     )
                 }),
             (lhs, Type::NewTypeInstance(newtype), _) => self
-                .infer_binary_dunder(state, left_ty, op, right_ty)
+                .infer_binary_dunder(node, state, left_ty, op, right_ty)
                 .or_else(|| {
                     self.infer_binary_expression_type_impl(
                         node,
@@ -883,7 +950,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 if (left.is_bool_literal() || right.is_bool_literal())
                     && !KnownClass::bool_is_subclass_of_int(db, env) =>
             {
-                self.infer_binary_dunder(state, left_ty, op, right_ty)
+                self.infer_binary_dunder(node, state, left_ty, op, right_ty)
             }
 
             (Type::LiteralValue(left), Type::LiteralValue(right), _) => {
@@ -1174,7 +1241,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         Some(result)
                     }
 
-                    _ => self.infer_binary_dunder(state, left_ty, op, right_ty),
+                    _ => self.infer_binary_dunder(node, state, left_ty, op, right_ty),
                 };
 
                 result.map(|result| match result {
@@ -1338,7 +1405,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 | Type::TypeForm(_)
                 | Type::TypedDict(_),
                 op,
-            ) => self.infer_binary_dunder(state, left_ty, op, right_ty),
+            ) => self.infer_binary_dunder(node, state, left_ty, op, right_ty),
         }
     }
 
