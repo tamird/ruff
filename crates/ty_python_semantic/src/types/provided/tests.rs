@@ -3225,57 +3225,58 @@ fn callable_metadata_survives_signature_transforms() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn schema_getattr_result<'db>(
+    db: &'db TestDb,
+    definition: Definition<'db>,
+    receiver: Type<'db>,
+    attribute: &str,
+) -> ProvidedGetattrResult<'db> {
+    let file = definition.program_file(db);
+    if file
+        .file(db)
+        .path(db)
+        .as_system_path()
+        .is_none_or(|path| path.as_str() != "/src/native.pyi")
+        || definition.name(db).as_deref() != Some("__getattr__")
+    {
+        return ProvidedGetattrResult::default();
+    }
+    let Type::ClassLiteral(ClassLiteral::Static(class)) =
+        crate::place::global_symbol(db, file, "Store")
+            .place
+            .expect_type()
+    else {
+        return ProvidedGetattrResult::default();
+    };
+    let env = ProgramEnvironment::from_file(file);
+    let Some(specialization) = receiver.base_class_specialization(db, &env, class) else {
+        return ProvidedGetattrResult::default();
+    };
+    let [Type::TypedDict(schema)] = specialization.types(db) else {
+        return ProvidedGetattrPresence::PossiblyMissing.into();
+    };
+    if let Some(field) = schema.items(db).get(attribute) {
+        ProvidedGetattrResult {
+            presence: if field.is_required() {
+                ProvidedGetattrPresence::Present
+            } else {
+                ProvidedGetattrPresence::PossiblyMissing
+            },
+            return_type: Some(field.declared_type()),
+            immutable_storage: field.is_required(),
+        }
+    } else if schema.openness(db) == TypedDictOpenness::Closed {
+        ProvidedGetattrPresence::Absent.into()
+    } else {
+        ProvidedGetattrPresence::PossiblyMissing.into()
+    }
+}
+
 #[test]
 fn supplied_getters_can_reject_attributes_on_specialized_receivers() -> anyhow::Result<()> {
-    fn result<'db>(
-        db: &'db TestDb,
-        definition: Definition<'db>,
-        receiver: Type<'db>,
-        attribute: &str,
-    ) -> ProvidedGetattrResult<'db> {
-        let file = definition.program_file(db);
-        if file
-            .file(db)
-            .path(db)
-            .as_system_path()
-            .is_none_or(|path| path.as_str() != "/src/native.pyi")
-            || definition.name(db).as_deref() != Some("__getattr__")
-        {
-            return ProvidedGetattrResult::default();
-        }
-        let Type::ClassLiteral(ClassLiteral::Static(class)) =
-            crate::place::global_symbol(db, file, "Store")
-                .place
-                .expect_type()
-        else {
-            return ProvidedGetattrResult::default();
-        };
-        let env = ProgramEnvironment::from_file(file);
-        let Some(specialization) = receiver.base_class_specialization(db, &env, class) else {
-            return ProvidedGetattrResult::default();
-        };
-        let [Type::TypedDict(schema)] = specialization.types(db) else {
-            return ProvidedGetattrPresence::PossiblyMissing.into();
-        };
-        if let Some(field) = schema.items(db).get(attribute) {
-            ProvidedGetattrResult {
-                presence: if field.is_required() {
-                    ProvidedGetattrPresence::Present
-                } else {
-                    ProvidedGetattrPresence::PossiblyMissing
-                },
-                return_type: Some(field.declared_type()),
-            }
-        } else if schema.openness(db) == TypedDictOpenness::Closed {
-            ProvidedGetattrPresence::Absent.into()
-        } else {
-            ProvidedGetattrPresence::PossiblyMissing.into()
-        }
-    }
-
     let db = TestDbBuilder::new()
         .with_python_version(ruff_python_ast::PythonVersion::PY313)
-        .with_getattr_result_provider(result)
+        .with_getattr_result_provider(schema_getattr_result)
         .with_file(
             "/src/native.pyi",
             "from typing_extensions import NotRequired, TypedDict
@@ -3370,6 +3371,227 @@ def mixed(value: Store[Closed] | Store[Open]):
         KnownClass::Str.to_instance(&db, &env)
     );
     assert!(!member.qualifiers.contains(TypeQualifiers::KNOWN_ABSENT));
+    Ok(())
+}
+
+#[test]
+fn supplied_getter_storage_supports_structural_schemas() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_getattr_result_provider(schema_getattr_result)
+        .with_file(
+            "/src/native.pyi",
+            r#"
+from typing import Protocol
+from typing_extensions import NotRequired, TypedDict
+from ty_extensions import Intersection
+
+class Store[S]:
+    def __getattr__(self, name: str) -> object: ...
+class Runtime(TypedDict, closed=True):
+    runtime_jre_version: str
+class Build(TypedDict, closed=True):
+    jre_version: str
+class Optional(TypedDict, closed=True):
+    runtime_jre_version: NotRequired[str]
+class Nullable(TypedDict, closed=True):
+    runtime_jre_version: str | None
+class RuntimeFields(Protocol):
+    @property
+    def runtime_jre_version(self) -> str: ...
+type RuntimeView = Intersection[Store[Runtime], RuntimeFields]
+class RuntimeContext(TypedDict, closed=True):
+    attr: object
+class BuildContext(TypedDict, closed=True):
+    attr: Store[Build]
+class ContextFields(Protocol):
+    @property
+    def attr(self) -> RuntimeView: ...
+type RuntimeContextView = Intersection[Store[RuntimeContext], ContextFields]
+
+class Property:
+    @property
+    def runtime_jre_version(self) -> str: ...
+class Intercepted:
+    def __getattribute__(self, name: str) -> str: ...
+class Mutable(Store[Runtime]):
+    runtime_jre_version: str | None
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from typing_extensions import assert_type
+from ty_extensions import Intersection
+from native import (
+    Store, Runtime, Build, Optional, Nullable, RuntimeFields, RuntimeView,
+    RuntimeContextView, BuildContext, Property, Intercepted, Mutable,
+)
+
+def fallback(value: RuntimeContextView | Store[BuildContext]) -> str:
+    version = getattr(value.attr, "runtime_jre_version", None)
+    if version is not None:
+        pass
+    else:
+        version = value.attr.jre_version
+    version = version or "default"
+    return version
+
+def optional(value: Store[Optional] | Store[Build]):
+    if getattr(value, "runtime_jre_version", None) is None:
+        assert_type(value, Store[Optional] | Store[Build])
+
+def nullable(value: Store[Nullable] | Store[Build]):
+    if getattr(value, "runtime_jre_version", None) is None:
+        assert_type(value, Store[Nullable] | Store[Build])
+
+required: RuntimeView
+optional_field: Store[Optional]
+protocol: RuntimeFields
+property_field: Intersection[Store[Runtime], Property]
+intercepted: Intersection[Store[Runtime], Intercepted]
+mutable_field: Mutable
+context: RuntimeContextView
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(file);
+    for (name, path, expected) in [
+        ("required", &["runtime_jre_version"][..], true),
+        ("optional_field", &["runtime_jre_version"], false),
+        ("protocol", &["runtime_jre_version"], false),
+        ("property_field", &["runtime_jre_version"], false),
+        ("intercepted", &["runtime_jre_version"], false),
+        ("mutable_field", &["runtime_jre_version"], false),
+        ("context", &["attr", "runtime_jre_version"], true),
+    ] {
+        let receiver = crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type();
+        let path = path.iter().map(Name::new).collect::<Vec<_>>();
+        assert_eq!(
+            receiver.has_immutable_field_path(&db, &env, &path),
+            expected,
+            "{name}: {}",
+            receiver.display(&db, &env)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_getter_storage_requires_matching_consensus() -> anyhow::Result<()> {
+    fn result<'db>(
+        db: &'db TestDb,
+        definition: Definition<'db>,
+        _receiver: Type<'db>,
+        _attribute: &str,
+    ) -> ProvidedGetattrResult<'db> {
+        let DefinitionKind::Function(function) = definition.kind(db) else {
+            return ProvidedGetattrResult::default();
+        };
+        let module = parsed_module(db, definition.python_file(db)).load(db);
+        let function = function.node(&module);
+        let Some(parameter) = function.parameters.find("name") else {
+            return ProvidedGetattrResult::default();
+        };
+        let guaranteed = parameter
+            .annotation()
+            .and_then(ast::Expr::as_name_expr)
+            .is_some_and(|annotation| annotation.id == "int");
+        let optional = function
+            .returns
+            .as_deref()
+            .and_then(ast::Expr::as_name_expr)
+            .is_some_and(|annotation| annotation.id == "bool");
+        ProvidedGetattrResult {
+            presence: if optional {
+                ProvidedGetattrPresence::PossiblyMissing
+            } else {
+                ProvidedGetattrPresence::Present
+            },
+            return_type: None,
+            immutable_storage: guaranteed,
+        }
+    }
+    let db = TestDbBuilder::new()
+        .with_getattr_result_provider(result)
+        .with_file(
+            "/src/native.pyi",
+            r#"
+from typing import overload
+class Mixed:
+    @overload
+    def __getattr__(self, name: int) -> int: ...
+    @overload
+    def __getattr__(self, name: str) -> str: ...
+class Equivalent:
+    @overload
+    def __getattr__(self, name: int) -> int: ...
+    @overload
+    def __getattr__(self, name: str) -> int: ...
+class Optional:
+    def __getattr__(self, name: int) -> bool: ...
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import Mixed, Equivalent, Optional\nmixed: Mixed\nequivalent: Equivalent\noptional: Optional\n",
+        )
+        .build()?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let env = ProgramEnvironment::from_file(file);
+    let int = KnownClass::Int.to_instance(&db, &env);
+    let str = KnownClass::Str.to_instance(&db, &env);
+    for (name, argument, valid, expected) in [
+        ("mixed", int, true, true),
+        ("mixed", str, true, false),
+        ("mixed", Type::any(), true, false),
+        ("equivalent", int, true, true),
+        ("equivalent", Type::any(), true, false),
+        ("optional", int, true, false),
+        (
+            "mixed",
+            KnownClass::Float.to_instance(&db, &env),
+            false,
+            false,
+        ),
+        (
+            "mixed",
+            crate::types::UnionType::from_two_elements(&db, &env, int, str),
+            true,
+            false,
+        ),
+    ] {
+        let receiver = crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type();
+        let mut arguments = crate::types::CallArguments::positional([argument]);
+        let result = receiver.try_call_dunder_with_policy(
+            &db,
+            &env,
+            "__getattr__",
+            &mut arguments,
+            crate::types::TypeContext::default(),
+            MemberLookupPolicy::default(),
+        );
+        assert_eq!(result.is_ok(), valid, "{name}: {result:?}");
+        let bindings = match result {
+            Ok(bindings) => bindings,
+            Err(crate::types::CallDunderError::CallError(_, bindings, _)) => *bindings,
+            Err(other) => panic!("unexpected getter result: {other:?}"),
+        };
+        assert_eq!(
+            bindings.getattr_result(&db, &env, receiver, "field").1,
+            expected,
+            "{name}: {}",
+            argument.display(&db, &env)
+        );
+    }
     Ok(())
 }
 
@@ -3943,6 +4165,7 @@ fn supplied_getters_preserve_attribute_presence() -> anyhow::Result<()> {
                     db,
                     &ProgramEnvironment::from_file(definition.program_file(db)),
                 )),
+                immutable_storage: false,
             }
         }
     }

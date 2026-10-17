@@ -3,6 +3,7 @@
 //! Applications resolve their own module names and native APIs. Source exports retain their
 //! program-file identity so type inference and navigation use the same ordinary definitions.
 
+use itertools::Either;
 use ruff_db::diagnostic::Diagnostic;
 use ruff_db::files::FileRange;
 use ruff_db::parsed::parsed_module;
@@ -317,13 +318,21 @@ pub enum ProvidedGetattrPresence {
     Absent,
 }
 
-/// Presence and optional value refinement for a supplied getter's attribute.
+/// Presence, value, and storage facts for a supplied getter's attribute.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProvidedGetattrResult<'db> {
     pub presence: ProvidedGetattrPresence,
     /// Replaces the checked getter result when the attribute can be present.
     /// `None` preserves ordinary return inference; absent attributes have no value.
     pub return_type: Option<Type<'db>>,
+    /// The attribute is always present in immutable instance storage. Reading it cannot
+    /// raise `AttributeError` or return a different value on a subsequent access.
+    ///
+    /// This is stronger than a readonly property or a getter's return annotation. It is
+    /// honored only when every viable binding of a valid call supplies a `Present` result
+    /// with this guarantee. Ordinary members shadowing the getter, and custom
+    /// `__getattribute__` methods intercepting the access, still take precedence.
+    pub immutable_storage: bool,
 }
 
 impl From<ProvidedGetattrPresence> for ProvidedGetattrResult<'_> {
@@ -331,6 +340,7 @@ impl From<ProvidedGetattrPresence> for ProvidedGetattrResult<'_> {
         Self {
             presence,
             return_type: None,
+            immutable_storage: false,
         }
     }
 }
@@ -530,42 +540,92 @@ impl<'db> Type<'db> {
         let mut receiver = self;
         for name in path {
             receiver = receiver.resolve_type_alias(db);
-            // Qualifiers on joined alternatives do not prove storage for every alternative.
-            if !receiver.is_nominal_instance() {
+            let constituents = match receiver {
+                Type::NominalInstance(_) => Either::Left(std::iter::once(&receiver)),
+                Type::Intersection(intersection) => Either::Right(intersection.positive(db).iter()),
+                _ => return false,
+            };
+            let mut immutable_storage = false;
+            for constituent in constituents {
+                // Structural properties constrain the field's type, but do not describe
+                // runtime descriptors or prove storage themselves.
+                match constituent {
+                    Type::ProtocolInstance(_) => continue,
+                    Type::NominalInstance(_) => {}
+                    _ => return false,
+                }
+                let PlaceAndQualifiers { place, qualifiers } =
+                    constituent.instance_member(db, env, name);
+                let stored = place.is_definitely_bound()
+                    && qualifiers.contains(
+                        TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE,
+                    );
+                if !stored && !place.is_undefined() {
+                    // A mutable instance declaration can shadow the supplied getter.
+                    return false;
+                }
+                if !constituent.permits_instance_storage(db, env, name, stored) {
+                    return false;
+                }
+                // An intersection's required protocol member can prevent ordinary lookup
+                // from reaching __getattr__. Ask the nominal carrier using the same checked
+                // getter resolution, preserving the full receiver for schema specialization.
+                immutable_storage |= stored
+                    || constituent
+                        .getattr_result_with_storage(
+                            db,
+                            env,
+                            name,
+                            MemberLookupPolicy::default(),
+                            Some(receiver),
+                        )
+                        .1;
+            }
+            if !immutable_storage {
                 return false;
             }
-            let PlaceAndQualifiers { place, qualifiers } = receiver.instance_member(db, env, name);
-            let Place::Defined(storage) = place else {
+            // Keep constraints contributed by every component for the next path segment.
+            let Ok(member) = receiver.member_lookup_with_policy_and_receiver(
+                db,
+                env,
+                name,
+                MemberLookupPolicy::RUNTIME_ATTRIBUTE,
+                None,
+            ) else {
                 return false;
             };
-            if !storage.is_definitely_defined()
-                || !qualifiers
-                    .contains(TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE)
-            {
+            let Place::Defined(member) = member.member(db).place else {
+                return false;
+            };
+            if !member.is_definitely_defined() {
                 return false;
             }
-            // The storage flag is consumed by descriptor lookup. Validate its precedence here,
-            // using the same class-side lookup and descriptor classifier as ordinary access.
-            if let Some(class_member) = receiver
-                .class_member(db, env, name)
-                .place
-                .ignore_possibly_undefined()
-                && !class_member.is_definitely_non_data_descriptor(db, env)
-            {
-                return false;
-            }
-            let policy = MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK
-                | MemberLookupPolicy::META_CLASS_NO_TYPE_FALLBACK;
-            if !receiver
-                .class_member_with_policy(db, env, "__getattribute__", policy)
-                .place
-                .is_undefined()
-            {
-                return false;
-            }
-            receiver = storage.ty;
+            receiver = member.ty;
         }
         true
+    }
+
+    /// Validates stored-field precedence before descriptor lookup consumes its qualifiers.
+    fn permits_instance_storage(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &Name,
+        stored: bool,
+    ) -> bool {
+        if let Some(class_member) = self
+            .class_member(db, env, name)
+            .place
+            .ignore_possibly_undefined()
+            && (!stored || !class_member.is_definitely_non_data_descriptor(db, env))
+        {
+            return false;
+        }
+        let policy = MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK
+            | MemberLookupPolicy::META_CLASS_NO_TYPE_FALLBACK;
+        self.class_member_with_policy(db, env, "__getattribute__", policy)
+            .place
+            .is_undefined()
     }
 
     /// Attaches immutable application data to a synthesized callable.

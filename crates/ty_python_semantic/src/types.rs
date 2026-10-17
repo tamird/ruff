@@ -8520,8 +8520,22 @@ impl<'db> Type<'db> {
         policy: MemberLookupPolicy,
         receiver: Option<Type<'db>>,
     ) -> MemberLookupResult<'db> {
+        self.getattr_result_with_storage(db, env, name, policy, receiver)
+            .0
+    }
+
+    /// Resolves the getter through ordinary call checking, retaining a supplied storage
+    /// guarantee separately from qualifiers on the resolved member.
+    fn getattr_result_with_storage(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &Name,
+        policy: MemberLookupPolicy,
+        receiver: Option<Type<'db>>,
+    ) -> (MemberLookupResult<'db>, bool) {
         if policy.no_getattr_lookup() {
-            return MemberLookupResult::from(Place::Undefined);
+            return (MemberLookupResult::from(Place::Undefined), false);
         }
 
         if receiver.is_some()
@@ -8532,7 +8546,10 @@ impl<'db> Type<'db> {
         {
             // Bounds and aliases can contain unions. Reuse their ordinary lookup so an arm
             // with a declared member does not call its fallback when another arm can miss.
-            return self.member_lookup_with_policy_and_receiver(db, env, name, policy, receiver);
+            return (
+                self.member_lookup_with_policy_and_receiver(db, env, name, policy, receiver),
+                false,
+            );
         }
 
         if matches!(
@@ -8541,13 +8558,16 @@ impl<'db> Type<'db> {
         ) {
             // `GenericAlias.__getattr__` delegates to `__origin__`. For `type[T]`, the
             // origin is always `type`, not `T`, even when `T` is `Any`.
-            return KnownClass::Type
-                .to_class_literal(db, env)
-                .member_lookup_with_policy_and_receiver(db, env, name, policy, None);
+            return (
+                KnownClass::Type
+                    .to_class_literal(db, env)
+                    .member_lookup_with_policy_and_receiver(db, env, name, policy, None),
+                false,
+            );
         }
 
         if let Type::ModuleLiteral(module) = self {
-            return module.try_module_getattr(db, env, name);
+            return (module.try_module_getattr(db, env, name), false);
         }
 
         let name_type = Type::string_literal(db, name);
@@ -8583,23 +8603,32 @@ impl<'db> Type<'db> {
                 unbound_on: _,
             }) => (*bindings, true),
             Err(CallDunderError::CallError(_, bindings, _)) => {
-                return member_lookup_result(
-                    db,
-                    bindings.getattr_result(db, env, receiver.unwrap_or(self), name),
-                    Some(MemberLookupErrorKind::GetAttr {
-                        receiver: self,
-                        name: name_type,
-                    }),
-                    None,
+                return (
+                    member_lookup_result(
+                        db,
+                        bindings
+                            .getattr_result(db, env, receiver.unwrap_or(self), name)
+                            .0,
+                        Some(MemberLookupErrorKind::GetAttr {
+                            receiver: self,
+                            name: name_type,
+                        }),
+                        None,
+                    ),
+                    false,
                 );
             }
-            Err(CallDunderError::MethodNotAvailable) => return Place::Undefined.into(),
+            Err(CallDunderError::MethodNotAvailable) => return (Place::Undefined.into(), false),
         };
-        let mut member = bindings.getattr_result(db, env, receiver.unwrap_or(self), name);
+        let (mut member, immutable_storage) =
+            bindings.getattr_result(db, env, receiver.unwrap_or(self), name);
         if possibly_unbound && let Place::Defined(defined) = member.place {
             member.place = Place::Defined(defined.with_definedness(Definedness::PossiblyUndefined));
         }
-        member_lookup_result(db, member, None, None)
+        (
+            member_lookup_result(db, member, None, None),
+            immutable_storage && !possibly_unbound,
+        )
     }
 
     /// Apply `__getattr__` / `__getattribute__` fallback to an attribute-lookup result.

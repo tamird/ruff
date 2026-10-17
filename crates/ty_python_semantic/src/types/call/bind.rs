@@ -1233,14 +1233,14 @@ impl<'db> Bindings<'db> {
         })
     }
 
-    /// The getter's ordinary result, retaining application-supplied presence information.
+    /// The getter's ordinary result and any agreed immutable-storage guarantee.
     pub(crate) fn getattr_result(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         receiver: Type<'db>,
         attribute: &str,
-    ) -> PlaceAndQualifiers<'db> {
+    ) -> (PlaceAndQualifiers<'db>, bool) {
         let combine = |left, right| {
             if left == right {
                 left
@@ -1250,35 +1250,30 @@ impl<'db> Bindings<'db> {
         };
         let item_result = |item: &CallableItem<'db>| {
             let binding = item.callable();
+            let provided_result = |overload: &Binding<'db>| {
+                overload
+                    .signature
+                    .definition()
+                    .map_or_else(ProvidedGetattrResult::default, |definition| {
+                        db.provided_getattr_result(definition, receiver, attribute)
+                    })
+            };
             let mut selected = binding.selected_overloads().peekable();
-            let overloads = if selected.peek().is_some() {
+            let has_selected = selected.peek().is_some();
+            let overloads = if has_selected {
                 Either::Left(selected)
             } else {
                 // Invalid calls retain the same recovery candidates as ordinary call inference.
                 Either::Right(binding.overloads().iter().enumerate())
             };
             let results: SmallVec<[_; 1]> = overloads
-                .map(|(index, overload)| {
-                    let result = overload
-                        .signature
-                        .definition()
-                        .map_or_else(ProvidedGetattrResult::default, |definition| {
-                            db.provided_getattr_result(definition, receiver, attribute)
-                        });
-                    (index, result)
-                })
+                .map(|(index, overload)| (index, provided_result(overload)))
                 .collect();
             let presence = results
                 .iter()
                 .map(|(_, result)| result.presence)
                 .reduce(combine)
                 .unwrap_or(ProvidedGetattrPresence::Present);
-            if !results
-                .iter()
-                .any(|(_, result)| result.return_type.is_some())
-            {
-                return (presence, None);
-            }
             let expanded = binding.overload_call_result.as_ref().is_some_and(|result| {
                 matches!(
                     result,
@@ -1286,6 +1281,26 @@ impl<'db> Bindings<'db> {
                         | OverloadCallResult::ArgumentTypeExpansionLimitReached(_)
                 )
             });
+            // Equal return types can select one overload even when a gradual argument
+            // leaves other domains viable. Storage must agree before that pruning.
+            // Recovery and expansion snapshots cannot prove every participating call.
+            let immutable_storage = has_selected
+                && !expanded
+                && binding.matching_overloads().all(|(index, overload)| {
+                    let result = results
+                        .iter()
+                        .find_map(|(selected, result)| (*selected == index).then_some(*result))
+                        .unwrap_or_else(|| provided_result(overload));
+                    overload.errors().is_empty()
+                        && result.presence == ProvidedGetattrPresence::Present
+                        && result.immutable_storage
+                });
+            if !results
+                .iter()
+                .any(|(_, result)| result.return_type.is_some())
+            {
+                return (presence, None, immutable_storage);
+            }
             if expanded {
                 // Expansion retains only the last per-overload argument snapshot. Preserve
                 // its combined result unless all present declarations supply the same value.
@@ -1296,13 +1311,14 @@ impl<'db> Bindings<'db> {
                 let replacement = replacement.filter(|replacement| {
                     present.all(|(_, result)| result.return_type == Some(*replacement))
                 });
-                return (presence, replacement);
+                return (presence, replacement, false);
             }
             let mut refined = binding.clone();
             for (index, result) in results {
                 let ProvidedGetattrResult {
                     presence,
                     return_type,
+                    immutable_storage: _,
                 } = result;
                 let replacement = if presence == ProvidedGetattrPresence::Absent {
                     Type::Never
@@ -1314,13 +1330,21 @@ impl<'db> Bindings<'db> {
                 };
                 refined.overloads[index].set_return_type(replacement);
             }
-            (presence, Some(refined.return_type(db, env)))
+            (
+                presence,
+                Some(refined.return_type(db, env)),
+                immutable_storage,
+            )
         };
         let mut changed_result = false;
+        let mut immutable_storage = true;
+        let mut has_items = false;
         let presence = self
             .iter_callable_items()
             .map(|item| {
-                let (presence, replacement) = item_result(item);
+                let (presence, replacement, storage) = item_result(item);
+                has_items = true;
+                immutable_storage &= storage;
                 changed_result |=
                     presence == ProvidedGetattrPresence::Absent || replacement.is_some();
                 presence
@@ -1328,7 +1352,10 @@ impl<'db> Bindings<'db> {
             .reduce(combine)
             .unwrap_or(ProvidedGetattrPresence::Present);
         if presence == ProvidedGetattrPresence::Absent {
-            return Place::Undefined.with_qualifiers(TypeQualifiers::KNOWN_ABSENT);
+            return (
+                Place::Undefined.with_qualifiers(TypeQualifiers::KNOWN_ABSENT),
+                false,
+            );
         }
         let definedness = if presence == ProvidedGetattrPresence::PossiblyMissing {
             Definedness::PossiblyUndefined
@@ -1337,14 +1364,17 @@ impl<'db> Bindings<'db> {
         };
         let result = if changed_result {
             self.map_item_types(db, env, |item| {
-                let (presence, replacement) = item_result(item);
+                let (presence, replacement, _) = item_result(item);
                 (presence != ProvidedGetattrPresence::Absent)
                     .then(|| replacement.unwrap_or_else(|| item.return_type(db, env)))
             })
         } else {
             self.return_type(db, env)
         };
-        Place::Defined(DefinedPlace::new(result).with_definedness(definedness)).into()
+        (
+            Place::Defined(DefinedPlace::new(result).with_definedness(definedness)).into(),
+            has_items && immutable_storage,
+        )
     }
 
     /// Maps each `CallableBinding` to a type and combines results while preserving
