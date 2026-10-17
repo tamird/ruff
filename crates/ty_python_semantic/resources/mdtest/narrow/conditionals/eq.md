@@ -3257,3 +3257,108 @@ def literal(value: str):
     if value == "a":
         reveal_type(value)  # revealed: str
 ```
+
+## Narrowing nested attribute tags
+
+A tag can identify the outer object even when it belongs to a nested attribute.
+
+```py
+from typing import Any, Literal
+
+class TextOptions:
+    kind: Literal["text"]
+    enabled: Literal[True]
+
+class BinaryOptions:
+    kind: Literal["binary"]
+    enabled: Literal[False]
+
+class Text:
+    options: TextOptions
+    text: str
+
+class Binary:
+    options: BinaryOptions
+    data: bytes
+
+def nested_tag(value: Text | Binary):
+    if value.options.kind == "text":
+        reveal_type(value)  # revealed: Text
+        reveal_type(value.text)  # revealed: str
+    else:
+        reveal_type(value)  # revealed: Binary
+        reveal_type(value.data)  # revealed: bytes
+
+    if "text" != value.options.kind:
+        reveal_type(value)  # revealed: Binary
+    else:
+        reveal_type(value)  # revealed: Text
+
+    if value.options.enabled is True:
+        reveal_type(value)  # revealed: Text
+    else:
+        reveal_type(value)  # revealed: Binary
+
+def nested_truthiness(value: Text | Binary):
+    if value.options.enabled:
+        reveal_type(value)  # revealed: Text
+    else:
+        reveal_type(value)  # revealed: Binary
+
+def nested_match(value: Text | Binary):
+    match value.options.kind:
+        case "text":
+            reveal_type(value)  # revealed: Text
+        case "binary":
+            reveal_type(value)  # revealed: Binary
+```
+
+An intermediate union stays possible if either alternative permits the tag. A gradual intermediate
+type also stays possible in both branches.
+
+```py
+class Mixed:
+    options: TextOptions | BinaryOptions
+
+class Dynamic:
+    options: Any
+
+def ambiguous_path(value: Text | Binary | Mixed | Dynamic):
+    if value.options.kind == "text":
+        reveal_type(value)  # revealed: Text | Mixed | Dynamic
+    else:
+        reveal_type(value)  # revealed: Binary | Mixed | Dynamic
+```
+
+An incomplete intermediate type reports its missing member and keeps the outer alternative.
+
+```py
+class EmptyOptions: ...
+
+class Incomplete:
+    options: TextOptions | EmptyOptions
+
+def missing_member(value: Binary | Incomplete):
+    # error: [unresolved-attribute]
+    if value.options.kind == "text":
+        reveal_type(value)  # revealed: Incomplete
+    else:
+        reveal_type(value)  # revealed: Binary | Incomplete
+```
+
+Rebinding an ancestor invalidates the relationship with its former tag.
+
+```py
+def rebind_in_comparison(value: Text | Binary | str):
+    if isinstance(value, (Text, Binary)):
+        if value.options.kind == (value := "text"):
+            reveal_type(value)  # revealed: Literal["text"]
+        else:
+            reveal_type(value)  # revealed: Literal["text"]
+
+def rebind_after_predicate(value: Text | Binary, other: Text | Binary):
+    is_text = value.options.kind == "text"
+    value = other
+    if is_text:
+        reveal_type(value)  # revealed: Text | Binary
+```

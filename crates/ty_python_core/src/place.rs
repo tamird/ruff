@@ -74,7 +74,13 @@ pub(crate) fn match_subject_place_expressions(subject: &ast::Expr) -> SmallVec<[
     expressions.push(subject);
     match subject {
         ast::Expr::Subscript(subscript) => expressions.push(&subscript.value),
-        ast::Expr::Attribute(attribute) => expressions.push(&attribute.value),
+        ast::Expr::Attribute(_) => {
+            let mut ancestor = subject;
+            while let ast::Expr::Attribute(attribute) = ancestor {
+                ancestor = &attribute.value;
+                expressions.push(ancestor);
+            }
+        }
         _ => {}
     }
     expressions
@@ -797,12 +803,12 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
             {
                 places.insert(place);
             }
-            if can_narrow_tagged_union_base
-                && let ast::Expr::Attribute(attribute) = expr
-                && let Some(place_expr) = PlaceExpr::try_from_expr(&attribute.value)
-                && let Some(place) = self.places.place_id((&place_expr).into())
-            {
-                places.insert(place);
+            if can_narrow_tagged_union_base {
+                let mut ancestor = expr;
+                while let ast::Expr::Attribute(attribute) = ancestor {
+                    ancestor = &attribute.value;
+                    places.extend(self.simple_expr(ancestor));
+                }
             }
         }
 
