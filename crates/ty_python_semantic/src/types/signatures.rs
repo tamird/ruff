@@ -22,6 +22,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec_inline};
 
 use super::{DynamicType, Type, TypeVarVariance, UnionType, any_over_type, semantic_index};
+use crate::types::call::{Argument, CallArguments};
 use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::resolution::{SolutionType, resolve_solution};
 use crate::types::constraints::{
@@ -2343,23 +2344,134 @@ impl<'db> Signature<'db> {
         self.generic_context.is_none()
     }
 
-    /// Return whether this non-generic implementation accepts the arguments of a non-generic
-    /// overload, and the relation error context if it does not.
+    pub(crate) fn supports_overload_implementation_consistency(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
+        let Some(context) = self.generic_context else {
+            return true;
+        };
+        self.definition
+            .is_some_and(|definition| !definition.scope(db).node(db).scope_kind().is_class())
+            && self.supports_static_inference(db, env)
+            && self.parameters.variadic().is_none()
+            && self.parameters.keyword_variadic().is_none()
+            && context.variables(db).all(|variable| {
+                !variable.typevar(db).is_self(db)
+                    && self.parameters.iter().any(|parameter| {
+                        parameter.annotated_type().references_typevar(
+                            db,
+                            env,
+                            variable.typevar(db).identity(db),
+                        )
+                    })
+            })
+    }
+
+    /// Whether this implementation and overload have a complete consistency comparison.
     ///
-    /// This is a deliberately narrow first pass for overload implementation consistency. Generic
-    /// signatures need additional type-variable-domain handling and should be left to the full
-    /// implementation.
-    pub(crate) fn non_generic_implementation_parameters_consistency_with(
+    /// This does not establish that the signatures are consistent. A completed comparison can
+    /// reject parameter coverage or the return type. Generic signatures are supported only when
+    /// input-only call inference completely specializes the implementation; unresolved, gradual,
+    /// receiver-dependent, and variadic cases remain unsupported.
+    pub fn supports_overload_implementation_consistency_with(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        overload: &Self,
+    ) -> bool {
+        self.specialize_for_overload_implementation(db, env, overload)
+            .is_some()
+    }
+
+    /// Resolve implementation variables from overload inputs, without using its promised return.
+    /// Incomplete input inference cannot establish overload implementation consistency.
+    pub(crate) fn specialize_for_overload_implementation(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        overload: &Self,
+    ) -> Option<Self> {
+        if !self.supports_overload_implementation_consistency(db, env)
+            || !overload.supports_overload_implementation_consistency(db, env)
+        {
+            return None;
+        }
+        if self.is_non_generic() {
+            return Some(self.clone());
+        }
+        let arguments: Option<CallArguments<'_, 'db>> = overload
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let argument = match parameter.kind() {
+                    ParameterKind::PositionalOnly {
+                        name: _,
+                        default_type: _,
+                    } => Argument::Positional,
+                    ParameterKind::PositionalOrKeyword {
+                        name: _,
+                        default_type: _,
+                    } => Argument::Positional,
+                    ParameterKind::KeywordOnly {
+                        name,
+                        default_type: _,
+                    } => Argument::Keyword(name.as_str()),
+                    ParameterKind::Variadic { name: _ } => return None,
+                    ParameterKind::KeywordVariadic { name: _ } => return None,
+                };
+                Some((argument, Some(parameter.annotated_type())))
+            })
+            .collect();
+        let arguments = arguments?;
+        let constraints = ConstraintSetBuilder::new();
+        let bindings = Type::single_callable(db, self.clone())
+            .bindings(db, env)
+            .match_parameters(db, env, &arguments)
+            .check_types(
+                db,
+                env,
+                &constraints,
+                &arguments,
+                TypeContext::default(),
+                &[],
+            )
+            .ok()?;
+        let callable = bindings.iter_flat().next()?;
+        let binding = callable.overloads().first()?;
+        // A declared default is not evidence that an input resolved a type variable.
+        let specialization = binding.partial_specialization(db, env)?;
+        if !specialization
+            .types(db)
+            .iter()
+            .all(|ty| ty.is_fully_static(db, env) && !ty.has_indeterminate_inference(db, env))
+        {
+            return None;
+        }
+        let mut specialized = binding.signature.apply_specialization(db, specialization);
+        if specialized
+            .generic_context
+            .is_some_and(|context| context.variables(db).next().is_some())
+        {
+            return None;
+        }
+        specialized.generic_context = None;
+        Some(specialized)
+    }
+
+    /// Check parameter coverage after specializing implementation variables from overload inputs.
+    pub(crate) fn implementation_parameters_consistency_with(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         overload: &Self,
     ) -> ParameterConsistency<'db> {
-        debug_assert!(self.is_non_generic());
-        debug_assert!(overload.is_non_generic());
-
         let implementation = self.clone().with_return_type(Type::unknown());
-        let overload = overload.clone().with_return_type(Type::unknown());
+        let mut overload = overload.clone().with_return_type(Type::unknown());
+        // Overload variables describe every accepted input. They remain rigid during coverage
+        // checking; the implementation's variables have already been specialized from inputs.
+        overload.generic_context = None;
         let constraints = ConstraintSetBuilder::new();
         let relation_visitor = HasRelationToVisitor::default(&constraints);
         let disjointness_visitor = IsDisjointVisitor::default(&constraints);
@@ -2385,17 +2497,13 @@ impl<'db> Signature<'db> {
         }
     }
 
-    /// Return whether a non-generic overload return type is assignable to a non-generic
-    /// implementation return type, and the relation error context if it is not.
-    pub(crate) fn non_generic_implementation_return_type_consistency_with(
+    /// Check the promised return against the same input-specialized implementation.
+    pub(crate) fn implementation_return_type_consistency_with(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         overload: &Self,
     ) -> ReturnTypeConsistency<'db> {
-        debug_assert!(self.is_non_generic());
-        debug_assert!(overload.is_non_generic());
-
         let constraints = ConstraintSetBuilder::new();
         let relation_visitor = HasRelationToVisitor::default(&constraints);
         let disjointness_visitor = IsDisjointVisitor::default(&constraints);
@@ -6985,6 +7093,115 @@ mod tests {
             .place
             .expect_type()
             .expect_function_literal()
+    }
+
+    #[test]
+    fn overload_implementation_admission_requires_complete_input_inference() {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/overload_admission.py",
+            "
+            from typing import Any
+            def f[T](value: T) -> T: ...
+            def strings(value: str) -> str: ...
+            def wrong_return(value: int) -> str: ...
+            def generic[U](value: U) -> U: ...
+            def nullable[T](value: T | None = None) -> T | None: ...
+            def nullable_none[T](value: T | None = None) -> None: ...
+            def nullable_default[T = int](value: T | None = None) -> None: ...
+            def return_only[T]() -> T: ...
+            def bounded[T: int](value: T) -> T: ...
+            def variadic[T](*values: T) -> T: ...
+            def gradual(value: Any) -> Any: ...
+            def limited[T](value: int, other: T) -> T: ...
+            def wrong_inputs(value: str, other: str) -> str: ...
+            def correlated[T](left: T, right: list[T]) -> T: ...
+            def impossible(left: str, right: list[int]) -> str: ...
+            def consistent(left: str, right: list[str]) -> str: ...
+            class Methods:
+                def generic[T](self, value: T) -> T: ...
+            method = Methods.generic
+            ",
+        )
+        .unwrap();
+        let function = get_function_f(&db, "/src/overload_admission.py");
+        let implementation = function.last_definition_signature(&db);
+        let env = db.program_environment();
+        let file = implementation.definition().unwrap().program_file(&db);
+        let signature = |name| {
+            global_symbol(&db, file, name)
+                .place
+                .expect_type()
+                .expect_function_literal()
+                .last_definition_signature(&db)
+        };
+        for name in ["strings", "generic", "wrong_return"] {
+            assert!(
+                implementation.supports_overload_implementation_consistency_with(
+                    &db,
+                    &env,
+                    signature(name),
+                )
+            );
+        }
+        let wrong_return = signature("wrong_return");
+        let prepared = implementation
+            .specialize_for_overload_implementation(&db, &env, wrong_return)
+            .unwrap();
+        match prepared.implementation_parameters_consistency_with(&db, &env, wrong_return) {
+            ParameterConsistency::Consistent => {}
+            ParameterConsistency::Inconsistent(_) => panic!("expected compatible parameters"),
+        }
+        match prepared.implementation_return_type_consistency_with(&db, &env, wrong_return) {
+            ReturnTypeConsistency::Consistent => panic!("expected incompatible return type"),
+            ReturnTypeConsistency::Inconsistent(_) => {}
+        }
+        for name in [
+            "nullable",
+            "nullable_none",
+            "nullable_default",
+            "return_only",
+            "bounded",
+            "variadic",
+            "method",
+        ] {
+            assert!(
+                !signature(name).supports_overload_implementation_consistency_with(
+                    &db,
+                    &env,
+                    signature("generic"),
+                ),
+                "{name}",
+            );
+        }
+        assert!(
+            !implementation.supports_overload_implementation_consistency_with(
+                &db,
+                &env,
+                signature("gradual"),
+            )
+        );
+        assert!(
+            !signature("limited").supports_overload_implementation_consistency_with(
+                &db,
+                &env,
+                signature("wrong_inputs"),
+            )
+        );
+        assert!(
+            !signature("correlated").supports_overload_implementation_consistency_with(
+                &db,
+                &env,
+                signature("impossible"),
+            )
+        );
+        assert!(
+            signature("correlated").supports_overload_implementation_consistency_with(
+                &db,
+                &env,
+                signature("consistent"),
+            )
+        );
     }
 
     #[test]

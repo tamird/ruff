@@ -106,7 +106,7 @@ pub(crate) fn check_overloaded_function<'db>(
         && context.is_lint_enabled(&INVALID_OVERLOAD)
     {
         let implementation_callables = function.implementation_callables(db);
-        check_non_generic_overload_implementation_consistency(
+        check_overload_implementation_consistency(
             context,
             overloads,
             implementation,
@@ -286,13 +286,13 @@ pub(crate) fn check_overloaded_function<'db>(
     }
 }
 
-/// Check non-generic overload signatures against their implementation.
+/// Check overload signatures against their implementation.
 ///
-/// This is the first, deliberately narrow pass at overload implementation consistency. Signature
-/// compatibility is checked only when the overloads and implementation are all non-generic;
-/// generic signatures require careful treatment of type-variable domains. Each callable
+/// Generic comparisons require a complete implementation specialization inferred from overload
+/// inputs. Overload variables remain rigid, and the same specialization must cover their parameter
+/// domains and return types. Incomplete inference leaves the comparison unsupported. Each callable
 /// alternative of the implementation must contain a signature consistent with each overload.
-fn check_non_generic_overload_implementation_consistency<'db>(
+fn check_overload_implementation_consistency<'db>(
     context: &InferContext<'db, '_>,
     overloads: &'db [OverloadLiteral<'db>],
     implementation: OverloadLiteral<'db>,
@@ -314,12 +314,12 @@ fn check_non_generic_overload_implementation_consistency<'db>(
         return;
     }
 
-    // TODO: Remove this temporary non-generic restriction once overload implementation consistency
-    // handles type-variable domains.
+    // Generic methods, declared domains, and variadic signatures still require additional
+    // type-variable-domain handling. Pair preparation below also declines incomplete inference.
     if implementation_callables
         .iter()
         .flat_map(|callable| &callable.signatures(db).overloads)
-        .any(|signature| !signature.is_non_generic())
+        .any(|signature| !signature.supports_overload_implementation_consistency(db, env))
     {
         return;
     }
@@ -332,7 +332,7 @@ fn check_non_generic_overload_implementation_consistency<'db>(
 
     if overload_signatures
         .clone()
-        .any(|(_, signature)| !signature.is_non_generic())
+        .any(|(_, signature)| !signature.supports_overload_implementation_consistency(db, env))
     {
         return;
     }
@@ -343,18 +343,12 @@ fn check_non_generic_overload_implementation_consistency<'db>(
             implementation_callables.iter().find_map(|callable| {
                 let mut inconsistency = None;
                 for implementation_signature in &callable.signatures(db).overloads {
+                    let implementation_signature = implementation_signature
+                        .specialize_for_overload_implementation(db, env, &overload_signature)?;
                     let parameter_consistency = implementation_signature
-                        .non_generic_implementation_parameters_consistency_with(
-                            db,
-                            env,
-                            &overload_signature,
-                        );
+                        .implementation_parameters_consistency_with(db, env, &overload_signature);
                     let return_type_consistency = implementation_signature
-                        .non_generic_implementation_return_type_consistency_with(
-                            db,
-                            env,
-                            &overload_signature,
-                        );
+                        .implementation_return_type_consistency_with(db, env, &overload_signature);
                     if matches!(
                         (&parameter_consistency, &return_type_consistency),
                         (

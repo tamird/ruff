@@ -1080,7 +1080,8 @@ class StaticMethod:
 reveal_type(StaticMethod().method(1))  # revealed: int
 ```
 
-Generic overloads are left to the full implementation-consistency check.
+Generic overload variables describe every accepted input, so a concrete implementation cannot
+restrict an unconstrained overload variable to `int`.
 
 ```py
 from typing import TypeVar, overload
@@ -1088,8 +1089,10 @@ from typing import TypeVar, overload
 T = TypeVar("T")
 
 @overload
+# error: [invalid-overload]
 def generic_parameter_type(x: T) -> T: ...
 @overload
+# error: [invalid-overload]
 def generic_parameter_type(x: str) -> str: ...
 def generic_parameter_type(x: int) -> int | str:
     return x
@@ -2109,4 +2112,115 @@ shaped: Normal[tuple[int], Scalar]
 assert_type(shaped.phantom(), list[Scalar])
 # TODO: The receiver constraint `Scalar <: T` should propagate through invariant `list[T]`.
 reveal_type(shaped.value)  # revealed: Unknown
+```
+
+## Generic implementation consistency with fixed parameters
+
+Implementation return types follow the argument types of each overload. The promised return type
+cannot influence that specialization.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Callable, overload
+
+@overload
+def rewrite(value: str, transform: Callable[[str], str]) -> str: ...
+@overload
+def rewrite(value: list[str], transform: Callable[[str], str]) -> list[str]: ...
+@overload
+def rewrite[T](value: T, transform: Callable[[str], str]) -> T | str | list[object]: ...
+def rewrite[U](value: U, transform: Callable[[str], str]) -> U | str | list[object]:
+    return value
+
+@overload
+# error: [invalid-overload]
+def identity(value: int) -> str: ...
+@overload
+def identity(value: str) -> str: ...
+def identity[T](value: T) -> T:
+    return value
+
+@overload
+# error: [invalid-overload]
+def accepts_all[T](value: list[T]) -> None: ...
+@overload
+def accepts_all(value: int) -> None: ...
+def accepts_all(value: list[int] | int) -> None:
+    pass
+
+@overload
+def rewrite_bad(value: str, transform: Callable[[str], str]) -> str: ...
+@overload
+# error: [invalid-overload]
+def rewrite_bad(value: list[str], transform: Callable[[str], str]) -> list[int]: ...
+@overload
+def rewrite_bad[T](value: T, transform: Callable[[str], str]) -> T | str | list[object]: ...
+def rewrite_bad[U](value: U, transform: Callable[[str], str]) -> U | str | list[object]:
+    return value
+```
+
+Legacy declarations may reuse the same type variable without merging the implementation's binding
+with an overload's binding.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+@overload
+def legacy(value: list[str]) -> list[str]: ...
+@overload
+def legacy(value: T) -> T: ...
+def legacy(value: T) -> T:
+    return value
+
+@overload
+# error: [invalid-overload]
+def legacy_bad(value: int) -> str: ...
+@overload
+def legacy_bad(value: T) -> T: ...
+def legacy_bad(value: T) -> T:
+    return value
+```
+
+Keyword-only inputs and defaults retain their ordinary call-shape requirements.
+
+```py
+@overload
+def keyword(*, value: int, enabled: bool = False) -> int: ...
+@overload
+def keyword[T](*, value: T, enabled: bool = False) -> T: ...
+def keyword[T](*, value: T, enabled: bool = False) -> T:
+    return value
+
+@overload
+# error: [invalid-overload]
+def required(value: int = 0) -> int: ...
+@overload
+def required[T](value: T) -> T: ...
+def required[T](value: T) -> T:
+    return value
+```
+
+## Incomplete implementation specialization
+
+Ordinary call inference currently loses the rigid caller variable in this nullable input. The
+implementation comparison remains unsupported until that specialization can be completed; it must
+not compare the overload against an unresolved implementation variable.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+def nullable[U](value: U | None = None) -> U | None:
+    return value
+
+def caller[T](value: T):
+    reveal_type(nullable(value))  # revealed: Unknown | None
 ```
