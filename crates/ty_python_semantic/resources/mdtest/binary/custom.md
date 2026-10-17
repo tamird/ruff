@@ -593,9 +593,14 @@ class Reflected(list[int]):
     def __radd__(self, other):
         raise NotImplementedError
 
-def reflected(value: Reflected):
+def reflected(value: Reflected, gradual: list[Any], unknown: list[Unknown]):
+    reveal_type([] + value)  # revealed: str | list[Unknown]
     result = [] + value
     reveal_type(result)  # revealed: str | list[Unknown]
+    reveal_type(([] + value, 42))  # revealed: tuple[str | list[Unknown], Literal[42]]
+    reveal_type(gradual + value)  # revealed: (Unknown & str) | (Unknown & int) | list[Any]
+    reveal_type(unknown + value)  # revealed: (Unknown & str) | (Unknown & int) | list[Unknown]
+    wrong: str = [] + value  # error: [invalid-assignment]
 ```
 
 Intersection receivers retain their existing constituent-by-constituent dunder dispatch.

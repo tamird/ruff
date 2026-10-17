@@ -325,14 +325,22 @@ impl<'db> CallArgumentTypes<'db> {
             .chain(self.fallback_type.map(|ty| (TypeContext::default(), ty)))
     }
 
+    /// Whether a nominal argument alternative still needs final contextual inference.
+    /// Callable alternatives retain their separate contextual inference behavior.
     pub(crate) fn has_unspecialized_nominal_type(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> bool {
         self.iter().any(|(_, ty)| {
-            matches!(ty.resolve_type_alias(db), Type::NominalInstance(_))
-                && ty.has_unspecialized_type_var(db, env)
+            let ty = ty.expand_top_level_aliases(db, env);
+            let alternatives = match &ty {
+                Type::Union(union) => union.elements(db),
+                ty => std::slice::from_ref(ty),
+            };
+            alternatives.iter().any(|ty| {
+                matches!(ty, Type::NominalInstance(_)) && ty.has_unspecialized_type_var(db, env)
+            })
         })
     }
 }
@@ -945,7 +953,54 @@ mod tests {
     use crate::db::tests::TestDbBuilder;
     use crate::types::call::{Bindings, CallableBinding};
     use crate::types::constraints::ConstraintSetBuilder;
-    use crate::types::{KnownClass, Parameter, Signature};
+    use crate::types::{DynamicType, KnownClass, Parameter, Signature};
+
+    #[test]
+    fn nominal_union_arguments_need_final_context() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new().with_file("/src/main.py", "").build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let env = ProgramEnvironment::from_file(db.program_file(file));
+        let string = KnownClass::Str.to_instance(&db, &env);
+        let list = |element| KnownClass::List.to_specialized_instance(&db, &env, &[element]);
+        let provisional = list(Type::Dynamic(DynamicType::UnspecializedTypeVar));
+        let callback = Type::single_callable(&db, Signature::new(Parameters::empty(), provisional));
+        let other_callback = Type::single_callable(
+            &db,
+            Signature::new(Parameters::empty(), Type::int_literal(42)),
+        );
+        for (ty, needs_final_context) in [
+            (provisional, true),
+            (
+                UnionType::from_two_elements(&db, &env, string, provisional),
+                true,
+            ),
+            (
+                UnionType::from_two_elements(&db, &env, string, list(Type::any())),
+                false,
+            ),
+            (
+                UnionType::from_two_elements(&db, &env, string, list(Type::unknown())),
+                false,
+            ),
+            (callback, false),
+            (
+                UnionType::from_two_elements(&db, &env, callback, other_callback),
+                false,
+            ),
+            (
+                UnionType::from_two_elements(&db, &env, string, callback),
+                false,
+            ),
+        ] {
+            let types = CallArgumentTypes::new(Some(ty));
+            assert_eq!(
+                types.has_unspecialized_nominal_type(&db, &env),
+                needs_final_context,
+                "{ty:?}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn literal_unpacking_preserves_operand_and_child_types() -> anyhow::Result<()> {
