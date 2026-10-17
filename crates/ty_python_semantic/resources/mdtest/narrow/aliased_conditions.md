@@ -1079,6 +1079,32 @@ def direct_tag(value: TextOptions | BinaryOptions):
         reveal_type(value)  # revealed: TextOptions
 ```
 
+Using a branch-local value must not invalidate the saved tag. Binding a function parameter can
+invalidate pre-registered member places before the tag is captured; that unchanged invalidation is
+distinct from a later deletion.
+
+```py
+class Context:
+    value: Text | Binary
+
+def consumed_branch_values(context: Context):
+    kind = context.value.options.kind
+    if kind == "text":
+        text: str = context.value.text
+        print(text)
+    else:
+        data: bytes = context.value.data
+        print(data)
+
+def fresh_deletion(context: Context):
+    kind = context.value.options.kind
+    del context.value.options.kind
+    if kind == "text":
+        value: Text | Binary = context.value
+        print(value)
+        reveal_type(context.value)  # revealed: Text | Binary
+```
+
 An independent assignment to the saved local does not establish the relationship, even when it
 produces a truthy value.
 

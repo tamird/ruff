@@ -2394,7 +2394,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             let use_id = index.try_expression_use_id(original.into())?;
             let captured: SmallVec<[_; 2]> = use_def
                 .bindings_at_use(use_id)
-                .map(|binding| binding.binding)
+                .map(|binding| binding.binding_order)
                 .collect();
             if use_def
                 .reachable_bindings(place)
@@ -2402,9 +2402,12 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 .chain(use_def.end_of_scope_bindings(place))
                 .any(|binding| match binding.binding {
                     DefinitionState::Undefined => false,
-                    DefinitionState::Deleted => true,
+                    // Binding an ancestor can invalidate a member before the capture. Only
+                    // a new deletion event invalidates that captured member afterward.
+                    DefinitionState::Deleted => !captured.contains(&binding.binding_order),
                     DefinitionState::Defined(definition) => {
-                        definition.kind(db).is_loop_header() || !captured.contains(&binding.binding)
+                        definition.kind(db).is_loop_header()
+                            || !captured.contains(&binding.binding_order)
                     }
                 })
             {
