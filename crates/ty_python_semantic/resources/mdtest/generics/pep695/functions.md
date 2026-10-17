@@ -4156,5 +4156,67 @@ def contra(values: Sink[str] | Sink[int]):
     reveal_type(contravariant(values))  # revealed: Never
 ```
 
+An unrelated parameter pack does not prevent ordinary nominal parameters from contributing
+constraints. Callback signatures and forwarded packs retain their own inference.
+
+```py
+from typing import Callable, Unpack
+
+def retained[**P, R, K: str, D: Attr[object] = Attr[Any]](
+    implementation: Callable[P, R],
+    attrs: Mapping[K, D],
+) -> tuple[D, Callable[P, R]]:
+    raise NotImplementedError
+
+def forwarded[**P, R, D: Attr[object] = Attr[Any]](
+    attrs: Mapping[str, D] | None,
+    implementation: Callable[P, R],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> tuple[D, R]:
+    raise NotImplementedError
+
+def packed[T, *Ts](attrs: Mapping[str, T], values: tuple[Unpack[Ts]]) -> tuple[T, tuple[Unpack[Ts]]]:
+    raise NotImplementedError
+
+def invariant_callback[**P, R, T](
+    implementation: Callable[P, R],
+    value: Cell[T],
+    expected: Cell[T],
+) -> T:
+    raise NotImplementedError
+
+def bounded_callback[**P, R, S: str](implementation: Callable[P, R], attrs: Mapping[str, S]) -> S:
+    raise NotImplementedError
+
+def string_impl(context: str, *, flag: bool = False) -> int:
+    return len(context)
+
+def with_packs(
+    attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]],
+    keys: Mapping[Literal["key"], Attr[bool]] | Mapping[Literal["key"], Attr[str]],
+    values: Mapping[str, bool] | Mapping[str, str],
+    mutable: Cell[str] | Cell[int],
+    integer: Cell[int],
+    pair: tuple[int, str],
+    nested_any: Mapping[str, Any] | Mapping[str, int],
+    direct_any: Any | Mapping[str, int],
+    nested_unknown: Mapping[str, Unknown] | Mapping[str, int],
+):
+    value, callback = retained(string_impl, keys)
+    assert_type(value, Attr[bool] | Attr[str])
+    assert_type(callback("value", flag=True), int)
+    callback(42)  # error: [invalid-argument-type]
+    callback("value", unexpected=True)  # error: [unknown-argument]
+    assert_type(forwarded(attrs, string_impl, "value", flag=True), tuple[Attr[bool] | Attr[str], int])
+    forwarded(attrs, string_impl, 42)  # error: [invalid-argument-type]
+    assert_type(packed(values, pair), tuple[bool | str, tuple[int, str]])
+    invariant_callback(string_impl, mutable, integer)  # error: [invalid-argument-type]
+    bounded_callback(string_impl, values)  # error: [invalid-argument-type]
+    reveal_type(packed(nested_any, pair))  # revealed: tuple[Any | int, tuple[int, str]]
+    reveal_type(packed(nested_unknown, pair))  # revealed: tuple[Unknown | int, tuple[int, str]]
+    reveal_type(packed(direct_any, pair))  # revealed: tuple[Unknown, tuple[int, str]]
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

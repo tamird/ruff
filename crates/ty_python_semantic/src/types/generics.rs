@@ -4680,18 +4680,24 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             (
                 formal @ Type::NominalInstance(formal_instance),
                 actual @ Type::Union(actual_union),
-            ) if (formal_instance.tuple_spec(db, self.env).is_some()
-                || (!contains_self_or_variadic(formal)
-                    && !contains_self_or_variadic(actual)
-                    && !actual.has_indeterminate_inference(db, self.env)
-                    && !actual_union.elements(db).iter().any(Type::is_dynamic)))
-                && !self
-                    .inferable
-                    .iter(db)
-                    .any(|typevar| typevar.is_paramspec(db) || typevar.is_typevartuple(db)) =>
-            {
-                let when = self.constraint_for_relation(formal, actual, relation_polarity);
-                return self.infer_from_constraint_set(when);
+            ) => {
+                let can_infer = if formal_instance.tuple_spec(db, self.env).is_some() {
+                    !self
+                        .inferable
+                        .iter(db)
+                        .any(|typevar| typevar.is_paramspec(db) || typevar.is_typevartuple(db))
+                } else {
+                    // Unrelated parameter packs still use legacy inference. Ordinary variables
+                    // in this comparison can contribute to its projected mapping independently.
+                    !contains_self_or_variadic(formal)
+                        && !contains_self_or_variadic(actual)
+                        && !actual.has_indeterminate_inference(db, self.env)
+                        && !actual_union.elements(db).iter().any(Type::is_dynamic)
+                };
+                if can_infer {
+                    let when = self.constraint_for_relation(formal, actual, relation_polarity);
+                    return self.infer_from_constraint_set(when);
+                }
             }
 
             // Special case: `formal` and `actual` are both tuples.

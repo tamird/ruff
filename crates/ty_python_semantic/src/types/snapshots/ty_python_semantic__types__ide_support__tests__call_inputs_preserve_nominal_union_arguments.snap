@@ -1,6 +1,6 @@
 ---
 source: crates/ty_python_semantic/src/types/ide_support.rs
-expression: "call_inputs(r#\"\nfrom typing import Any, Generic, Mapping, TypeVar\n\nV_co = TypeVar(\"V_co\", covariant=True)\nclass Attr(Generic[V_co]): ...\ndef defaulted[T: Attr[object] = Attr[Any]](attrs: Mapping[str, T]) -> T: ...\ndef required[T: Attr[object]](attrs: Mapping[str, T]) -> T: ...\n\ndef first(attrs: Mapping[str, Attr[bool]]):\n    return defaulted(attrs)\ndef second(attrs: Mapping[str, Attr[str]]):\n    return required(attrs)\ndef both_defaulted(attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]]):\n    return defaulted(attrs)\ndef both_required(attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]]):\n    return required(attrs)\ndef gradual(attrs: Mapping[str, Attr[Any]] | Mapping[str, Attr[str]]):\n    return required(attrs)\n\"#,)?"
+expression: "call_inputs(r#\"\nfrom typing import Any, Callable, Generic, Mapping, TypeVar\n\nV_co = TypeVar(\"V_co\", covariant=True)\nclass Attr(Generic[V_co]): ...\ndef defaulted[T: Attr[object] = Attr[Any]](attrs: Mapping[str, T]) -> T: ...\ndef required[T: Attr[object]](attrs: Mapping[str, T]) -> T: ...\ndef register[**P, R, K: str, T: Attr[object] = Attr[Any]](\n    implementation: Callable[P, R], attrs: Mapping[K, T],\n) -> T: ...\ndef implementation(context: object) -> list[object]: ...\n\ndef first(attrs: Mapping[str, Attr[bool]]):\n    return defaulted(attrs)\ndef second(attrs: Mapping[str, Attr[str]]):\n    return required(attrs)\ndef both_defaulted(attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]]):\n    return defaulted(attrs)\ndef both_required(attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]]):\n    return required(attrs)\ndef gradual(attrs: Mapping[str, Attr[Any]] | Mapping[str, Attr[str]]):\n    return required(attrs)\ndef with_callback(attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]]):\n    return register(implementation, attrs)\ndef gradual_callback(attrs: Mapping[str, Attr[Any]] | Mapping[str, Attr[str]]):\n    return register(implementation, attrs)\n\"#,)?"
 ---
 [
     Ok(
@@ -33,6 +33,26 @@ expression: "call_inputs(r#\"\nfrom typing import Any, Generic, Mapping, TypeVar
     ),
     Ok(
         [
+            [
+                "Mapping[str, Attr[Any]] | Mapping[str, Attr[str]] <: Mapping[str, Attr[Any] | Attr[str]]: false",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "def implementation(context: object) -> list[object] <: (context: object) -> list[object]: true",
+            ],
+            [
+                "Mapping[str, Attr[bool]] | Mapping[str, Attr[str]] <: Mapping[str, Attr[bool] | Attr[str]]: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "def implementation(context: object) -> list[object] <: (context: object) -> list[object]: true",
+            ],
             [
                 "Mapping[str, Attr[Any]] | Mapping[str, Attr[str]] <: Mapping[str, Attr[Any] | Attr[str]]: false",
             ],
