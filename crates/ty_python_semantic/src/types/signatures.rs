@@ -3137,10 +3137,9 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         target: &Signature<'db>,
     ) -> ConstraintSet<'db, 'c> {
         let env = self.env;
-        // If either signature is generic, freshen that signature's typevars before considering
-        // them inferable for this relation. The relation only needs to find one specialization of
-        // each generic callable that causes the check to succeed, but those callable-local
-        // specializations must not collide with any same-source typevars in the other signature.
+        // If either signature is generic, freshen its typevars before the comparison.
+        // Callable-local variables must not collide with same-source variables in the other
+        // signature, regardless of which signature's variables are inferable.
         let freshened_source;
         let source = if source.generic_context != target.generic_context
             && let Some(generic_context) = source.generic_context
@@ -3177,9 +3176,9 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             )
             && source.has_supported_declared_domain(db, env)
             && target.supports_specialization(db, |ty| ty.is_fully_static_except_any(db, env))
-            && self.proves_declared_domain_specialization(db, source, target)
+            && let Some(proved) = self.check_declared_domain_specialization(db, source, target)
         {
-            return self.always();
+            return ConstraintSet::from_bool(self.constraints, proved);
         }
 
         let signature_typevars = |signature: &Signature<'db>| {
@@ -3233,16 +3232,16 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         when.reduce_inferable(db, env, self.constraints, signature_inferable)
     }
 
-    fn proves_declared_domain_specialization(
+    /// Compare a complete source specialization while preserving rigid target variables.
+    /// An unsupported or incomplete search leaves the existing relation path responsible.
+    fn check_declared_domain_specialization(
         &self,
         db: &'db dyn Db,
         source: &Signature<'db>,
         target: &Signature<'db>,
-    ) -> bool {
+    ) -> Option<bool> {
         let env = self.env;
-        let Some(context) = source.generic_context else {
-            return false;
-        };
+        let context = source.generic_context?;
         // Target variables describe every accepted specialization. Keep them rigid throughout
         // the search and replay, including when the target itself is a generic callable.
         let mut target = target.clone();
@@ -3256,15 +3255,21 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 search.check_signature_pair_inner(db, source, target)
             })
         });
-        let Ok(solutions) = when.solutions(db, env, inferable) else {
-            return false;
-        };
-        let Solutions::Constrained(paths) = solutions else {
-            return false;
+        let solutions = when.solutions(db, env, inferable).ok()?;
+        let paths = match solutions {
+            Solutions::Unsatisfiable(paths) => {
+                return match paths {
+                    SolutionPaths::Complete(_) => Some(false),
+                    SolutionPaths::Incomplete(_) => None,
+                };
+            }
+            Solutions::Unconstrained => return None,
+            Solutions::Constrained(paths) => paths,
         };
         let SolutionPaths::Complete(paths) = paths else {
-            return false;
+            return None;
         };
+        let mut complete = true;
         for solution in paths {
             let Solution {
                 solved_typevars,
@@ -3291,8 +3296,16 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 })
                 .collect();
             let Some(types) = types else {
+                complete = false;
                 continue;
             };
+            if types
+                .iter()
+                .any(|ty| ty.has_indeterminate_inference(db, env))
+            {
+                complete = false;
+                continue;
+            }
             let specialization = context.specialize(db, types);
             let mut specialized = source.apply_specialization(db, specialization);
             specialized.generic_context = None;
@@ -3303,10 +3316,10 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     .is_always_satisfied(db, env)
             });
             if proved {
-                return true;
+                return Some(true);
             }
         }
-        false
+        complete.then_some(false)
     }
 
     fn with_signature_recursion_guard(

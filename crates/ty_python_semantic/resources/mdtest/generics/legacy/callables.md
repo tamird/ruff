@@ -1791,9 +1791,13 @@ def mismatched(value: T, *, unused: V | None = None) -> tuple[T, str]:
     return value, "extra"
 
 static_assert(is_subtype_of(TypeOf[correlated], Correlated))
-# TODO: The existing fallback infers both signatures' variables existentially.
 # The source's str bound cannot cover every specialization of the target.
-# error: [static-assert-error]
 static_assert(not is_subtype_of(TypeOf[correlated], Broader))
 static_assert(not is_subtype_of(TypeOf[mismatched], Correlated))
+
+def unconstrained(*, unused: T | None = None) -> None:
+    pass
+
+# No source specialization is needed for an omitted optional parameter.
+static_assert(is_subtype_of(TypeOf[unconstrained], Callable[[], None]))
 ```
