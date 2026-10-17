@@ -43,6 +43,7 @@ use ty_python_core::unpack::UnpackKind;
 use ty_python_core::{ExpressionNodeKey, NarrowingEvaluator, place_table, semantic_index};
 
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
+use ruff_python_ast::helpers::any_over_expr;
 use ruff_python_ast::name::Name;
 use ruff_python_stdlib::identifiers::is_identifier;
 
@@ -5169,13 +5170,61 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 }
             }
             Type::FunctionLiteral(function_type) if expr_call.arguments.keywords.is_empty() => {
-                let [first_arg_expr, second_arg] = &*expr_call.arguments.args else {
-                    return None;
+                let (first_arg_expr, second_arg, default) = match &*expr_call.arguments.args {
+                    [receiver, name] => (receiver, name, None),
+                    [receiver, name, default] => (receiver, name, Some(default)),
+                    _ => return None,
                 };
                 let first_arg = PlaceExpr::try_from_expr(first_arg_expr)?;
                 let function = function_type.known(db)?;
                 let place = self.expect_place(&first_arg);
 
+                if function == KnownFunction::GetAttr {
+                    // The fallback must be unable to produce this branch's truthiness.
+                    // Otherwise the attribute need not exist at all.
+                    if default.is_some_and(|default| {
+                        inference.expression_type(default).bool(db, &self.env)
+                            != Truthiness::from(!is_positive)
+                    }) {
+                        return None;
+                    }
+                    // Later arguments can replace the receiver after it was read.
+                    if std::iter::once(second_arg).chain(default).any(|argument| {
+                        any_over_expr(argument, |expr| matches!(expr, ast::Expr::Named(_)))
+                    }) {
+                        return None;
+                    }
+                    let attr = inference
+                        .expression_type(second_arg)
+                        .as_string_literal()?
+                        .value(db);
+                    if !is_identifier(attr) {
+                        return None;
+                    }
+                    let value_type = self
+                        .readable_attribute_type(inference.expression_type(first_arg_expr), attr);
+                    let truthiness = if is_positive {
+                        Type::AlwaysFalsy
+                    } else {
+                        Type::AlwaysTruthy
+                    };
+                    let value_type = IntersectionType::from_two_elements(
+                        db,
+                        &self.env,
+                        value_type,
+                        truthiness.negate(db, &self.env),
+                    );
+                    let constraint =
+                        Type::protocol_with_readonly_members(db, &self.env, [(attr, value_type)]);
+                    return Some(NarrowingConstraints::from_iter([(
+                        place,
+                        NarrowingConstraint::intersection(constraint),
+                    )]));
+                }
+
+                if default.is_some() {
+                    return None;
+                }
                 if function == KnownFunction::HasAttr {
                     let attr = inference
                         .expression_type(second_arg)
@@ -5188,23 +5237,14 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
 
                     // A successful readability check establishes presence without discarding
                     // the value domain of a possibly available attribute or getter.
-                    let mut value_type = Type::object();
-                    if is_positive
-                        && let Ok(member) = inference
-                            .expression_type(first_arg_expr)
-                            .member_lookup_with_policy_and_receiver(
-                                db,
-                                &self.env,
-                                attr,
-                                MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK
-                                    | MemberLookupPolicy::PRESERVE_MISSING_ALTERNATIVES,
-                                None,
-                            )
-                        && let Some(ty) = member.member(db).place.ignore_possibly_undefined()
-                        && !ty.has_indeterminate_inference(db, &self.env)
-                    {
-                        value_type = ty;
-                    }
+                    let value_type = if is_positive {
+                        self.readable_attribute_type(
+                            inference.expression_type(first_arg_expr),
+                            attr,
+                        )
+                    } else {
+                        Type::object()
+                    };
                     let constraint =
                         Type::protocol_with_readonly_members(db, &self.env, [(attr, value_type)]);
 
@@ -5264,6 +5304,23 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             }
             _ => None,
         }
+    }
+
+    fn readable_attribute_type(&self, receiver: Type<'db>, attribute: &str) -> Type<'db> {
+        let db = self.db;
+        receiver
+            .member_lookup_with_policy_and_receiver(
+                db,
+                &self.env,
+                attribute,
+                MemberLookupPolicy::RUNTIME_ATTRIBUTE
+                    | MemberLookupPolicy::PRESERVE_MISSING_ALTERNATIVES,
+                None,
+            )
+            .ok()
+            .and_then(|member| member.member(db).place.ignore_possibly_undefined())
+            .filter(|ty| !ty.has_indeterminate_inference(db, &self.env))
+            .unwrap_or(Type::object())
     }
 
     fn type_test_constraint(
