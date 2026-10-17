@@ -1236,6 +1236,127 @@ def first_value(flag: bool):
     reveal_type(list(values.values())[0])  # revealed: None | Literal[1]
 ```
 
+## Default insertion preserves existing entries
+
+`setdefault` inserts a value only when its key is absent. A new entry goes last, so an existing
+first value remains unchanged even when the inserted key is computed.
+
+```py
+def consume(value: int, note: str = ""): ...
+def known_keys():
+    values = {"value": 1, "note": ""}
+    values.setdefault("value", "ignored")
+    consume(**values)  # no diagnostic
+    values.setdefault("note", "ok")
+    consume(**values)  # no diagnostic
+    reveal_type(list(values.values())[0])  # revealed: Literal[1]
+
+def optional_key(flag: bool):
+    values: dict[str, int] = {}
+    if flag:
+        values["value"] = 1
+    values.setdefault("value", 2)
+    reveal_type(list(values.values())[0])  # revealed: int
+
+def omitted_default():
+    values: dict[str, int | None] = {}
+    values.setdefault("first")
+    reveal_type(list(values.values())[0])  # revealed: None
+
+def computed_keys(key: str, source: dict[str, int | None]):
+    values: dict[str, int | None] = {}
+    values[key] = 1
+    for other_key, default in source.items():
+        values.setdefault(other_key, default)
+    reveal_type(list(values.values())[0])  # revealed: Literal[1]
+```
+
+## Default insertion respects mutation and exposure
+
+Default insertion preserves existing values, including a saved subscript's narrowing. It still
+publishes a returned descendant, and evaluating the arguments can mutate or expose the receiver.
+
+```py
+from typing import Any
+
+def integers(value: int, **other: object): ...
+def absent_key():
+    values = {"value": 1}
+    values.setdefault("note", 2)
+    integers(**values)  # no diagnostic
+
+def saved_key(initial: int | str, key: str):
+    values = {"value": initial}
+    ready = isinstance(values["value"], int)
+    values.setdefault(key, "default")
+    if ready:
+        integers(value=values["value"])  # no diagnostic
+
+def overwritten(key: str, source: dict[str, int | None]):
+    values: dict[str, int | None] = {}
+    values[key] = 1
+    for other_key, default in source.items():
+        values[other_key] = default
+    reveal_type(list(values.values())[0])  # revealed: int | None
+
+def gradual(default: Any):
+    values = {"value": 1}
+    values.setdefault("value", default)
+    reveal_type(list(values.values())[0])  # revealed: Literal[1]
+    inserted: dict[str, Any] = {}
+    inserted.setdefault("value", default)
+    reveal_type(list(inserted.values())[0])  # revealed: Any
+
+def returned_descendant():
+    values = {"child": {"value": 1, "note": ""}}
+    child = values.setdefault("child", {})
+    child["value"] = "bad"
+    integers(**values["child"])  # error: [invalid-argument-type]
+
+def sibling_alias():
+    values = {"child": {"value": 1, "note": ""}}
+    values.setdefault("copy", values["child"])
+    values["copy"]["value"] = "bad"
+    integers(**values["child"])  # error: [invalid-argument-type]
+
+def self_default():
+    values: dict[str, object] = {"value": 1}
+    alias = values.setdefault("self", values)
+    if isinstance(alias, dict):
+        alias.clear()
+        alias["changed"] = "bad"
+    reveal_type(list(values.values())[0])  # revealed: object
+
+def nested_self_default():
+    values: dict[str, object] = {"value": 1}
+    alias = values.setdefault("self", [values])
+    if isinstance(alias, list):
+        alias[0].clear()
+    reveal_type(list(values.values())[0])  # revealed: object
+
+def mutate(values: dict[str, int | None]) -> None:
+    values.clear()
+    values["changed"] = None
+
+def argument_mutation():
+    values: dict[str, int | None] = {"value": 1}
+    values.setdefault("default", mutate(values))
+    reveal_type(list(values.values())[0])  # revealed: int | None
+
+def subclassable(values: dict[str, int | None]):
+    values["first"] = 1
+    values.setdefault("other", None)
+    reveal_type(list(values.values())[0])  # revealed: int | None
+
+def invalid_calls():
+    values: dict[str, int] = {"value": 1}
+    values.setdefault("value", "bad")  # error: [no-matching-overload]
+    values.setdefault(42, 2)  # error: [no-matching-overload]
+    values.setdefault()  # error: [no-matching-overload]
+    values.setdefault("value", 2, 3)  # error: [no-matching-overload]
+    values.setdefault(key="value", default=2)  # error: [no-matching-overload]
+```
+
 ## Saved values and later snapshots
 
 A guard narrows the saved scalar. A later dictionary read retains its own value type; the guard does

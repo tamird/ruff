@@ -190,6 +190,37 @@ impl<'db> MappingContents<'db> {
         }
     }
 
+    fn set_default(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        key: Type<'db>,
+        value: Type<'db>,
+        source: TextRange,
+    ) {
+        let previous = std::mem::replace(
+            &mut self.dictionary,
+            DictionaryItems {
+                items: Box::default(),
+                extra_items: DictionaryExtraItems::Closed,
+                first_entry: DictionaryFirstEntry::Empty,
+            },
+        );
+        self.set_item(db, env, key, value, source);
+        let first_entry = match &previous.first_entry {
+            DictionaryFirstEntry::Empty => self.dictionary.first_entry.clone(),
+            DictionaryFirstEntry::Entry { key: _, value: _ } => previous.first_entry.clone(),
+            DictionaryFirstEntry::Unknown => DictionaryFirstEntry::Unknown,
+        };
+        // Existing required entries replace the candidate default, while optional entries
+        // retain both possibilities. Runtime insertion order still starts with the old map.
+        let mut result = DictionaryItemsBuilder::default();
+        result.overlay(db, env, self.dictionary.clone());
+        result.overlay(db, env, previous);
+        self.dictionary = result.finish();
+        self.dictionary.first_entry = first_entry;
+    }
+
     fn delete_item(
         &mut self,
         db: &'db dyn Db,
@@ -894,6 +925,12 @@ enum MappingTransfer<'db> {
         value: Type<'db>,
         source: TextRange,
     },
+    SetDefault {
+        key: Type<'db>,
+        value: Type<'db>,
+        source: TextRange,
+        exposes_descendants: bool,
+    },
     Delete {
         key: Type<'db>,
         source: TextRange,
@@ -917,6 +954,12 @@ impl<'db> MappingTransfer<'db> {
                 value: _,
                 source: _,
             } => key.string_literal_value(db).is_some_and(|key| key != name),
+            Self::SetDefault {
+                key: _,
+                value: _,
+                source: _,
+                exposes_descendants: _,
+            } => true,
             Self::Delete { key, source: _ } => {
                 key.string_literal_value(db).is_some_and(|key| key != name)
             }
@@ -944,6 +987,12 @@ impl<'db> MappingTransfer<'db> {
                 key: _,
                 value: _,
                 source: _,
+            } => true,
+            Self::SetDefault {
+                key: _,
+                value: _,
+                source: _,
+                exposes_descendants: _,
             } => true,
             Self::Delete { key: _, source: _ } => true,
             Self::Clear => true,
@@ -981,6 +1030,20 @@ impl<'db> MappingTransfer<'db> {
                 value: _,
                 source: _,
             } => Self::Expose,
+            Self::SetDefault {
+                key: _,
+                value: _,
+                source: _,
+                exposes_descendants,
+            } => {
+                if exposes_descendants {
+                    Self::Expose
+                } else {
+                    Self::Keep {
+                        exposes_descendants: false,
+                    }
+                }
+            }
             Self::Delete { key: _, source: _ } => Self::Expose,
             Self::Clear => Self::Expose,
             Self::Update {
@@ -1014,6 +1077,15 @@ impl<'db> MappingTransfer<'db> {
             }
             Self::Set { key, value, source } => {
                 mapping.set_item(db, env, key, value, source);
+                previous
+            }
+            Self::SetDefault {
+                key,
+                value,
+                source,
+                exposes_descendants: _,
+            } => {
+                mapping.set_default(db, env, key, value, source);
                 previous
             }
             Self::Delete { key, source } => {
@@ -1390,6 +1462,43 @@ fn mapping_transfer<'db>(
                             exposes_descendants: !discarded
                                 && method.attr.as_str() != "__contains__",
                         }
+                    }
+                }
+                "setdefault" => {
+                    let (key, default) = match call.arguments.args.as_ref() {
+                        [key] => (key, None),
+                        [key, default] => (key, Some(default)),
+                        _ => return unavailable(),
+                    };
+                    if !call.arguments.keywords.is_empty()
+                        || call.arguments.args.iter().any(ast::Expr::is_starred_expr)
+                    {
+                        return unavailable();
+                    }
+                    if *retained
+                        || call.arguments.args.iter().any(|argument| {
+                            PlaceExpr::try_from_expr(argument) == PlaceExpr::try_from_expr(receiver)
+                        })
+                    {
+                        return MappingTransfer::Expose;
+                    }
+                    let Some(key_ty) = inference.try_expression_type(key) else {
+                        return unavailable();
+                    };
+                    let value = match default {
+                        Some(default) => {
+                            let Some(value) = inference.try_expression_type(default) else {
+                                return unavailable();
+                            };
+                            value
+                        }
+                        None => Type::none(db, &env),
+                    };
+                    MappingTransfer::SetDefault {
+                        key: key_ty,
+                        value,
+                        source: key.range(),
+                        exposes_descendants: !discarded,
                     }
                 }
                 "clear" => {
