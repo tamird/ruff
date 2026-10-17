@@ -125,7 +125,9 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
         })
     }
 
-    fn argument_at(&self, parameter: usize) -> CheckedArgument<'a, 'db> {
+    /// Inspects a matched parameter by its zero-based signature position.
+    /// An absent parameter is omitted.
+    pub fn argument_at(&self, parameter: usize) -> CheckedArgument<'a, 'db> {
         let mut arguments = self.matched_arguments(parameter);
         let Some(source) = arguments.next() else {
             return CheckedArgument::Omitted;
