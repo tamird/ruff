@@ -1751,6 +1751,26 @@ fn supplied_builtin_usage_selects_the_declaration() -> anyhow::Result<()> {
 
 #[test]
 fn supplied_builtin_calls_propagate_never_arguments() -> anyhow::Result<()> {
+    struct Calls<'a, 'db> {
+        model: &'a SemanticModel<'db>,
+        types: Vec<Type<'db>>,
+    }
+    impl<'ast> Visitor<'ast> for Calls<'_, '_> {
+        fn visit_expr(&mut self, expression: &'ast ast::Expr) {
+            if let ast::Expr::Call(call) = expression
+                && let ast::Expr::Name(name) = call.func.as_ref()
+                && matches!(
+                    name.id.as_str(),
+                    "Scalar" | "sentinel" | "identity" | "noargs"
+                )
+            {
+                self.types
+                    .push(expression.inferred_type(self.model).unwrap());
+            }
+            walk_expr(self, expression);
+        }
+    }
+
     let db = TestDbBuilder::new()
         .with_file(
             "/src/native.pyi",
@@ -1810,25 +1830,6 @@ Scalar(None)
     let file = db.program_file(file);
     let module = parsed_module(&db, file.python_file(&db)).load(&db);
     let model = SemanticModel::new(&db, file);
-    struct Calls<'a, 'db> {
-        model: &'a SemanticModel<'db>,
-        types: Vec<Type<'db>>,
-    }
-    impl<'ast> Visitor<'ast> for Calls<'_, '_> {
-        fn visit_expr(&mut self, expression: &'ast ast::Expr) {
-            if let ast::Expr::Call(call) = expression
-                && let ast::Expr::Name(name) = call.func.as_ref()
-                && matches!(
-                    name.id.as_str(),
-                    "Scalar" | "sentinel" | "identity" | "noargs"
-                )
-            {
-                self.types
-                    .push(expression.inferred_type(self.model).unwrap());
-            }
-            walk_expr(self, expression);
-        }
-    }
     let mut calls = Calls {
         model: &model,
         types: Vec::new(),

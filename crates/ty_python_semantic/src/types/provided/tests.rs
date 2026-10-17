@@ -264,6 +264,10 @@ fn intersections_preserve_unambiguous_provided_data() -> anyhow::Result<()> {
 
 #[test]
 fn supplied_readonly_fields_use_return_variance() -> anyhow::Result<()> {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the type application hook requires this signature"
+    )]
     fn application<'db>(
         db: &'db TestDb,
         application: ProvidedTypeApplication<'_, 'db>,
@@ -343,6 +347,10 @@ accepts("text")(scalar("other"))
 
 #[test]
 fn supplied_type_applications_use_annotation_inference() -> anyhow::Result<()> {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the type application hook requires this signature"
+    )]
     fn application<'db>(
         db: &'db TestDb,
         application: ProvidedTypeApplication<'_, 'db>,
@@ -471,6 +479,10 @@ fn supplied_type_applications_specialize_signature_results() -> anyhow::Result<(
         Some(signature)
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the type application hook requires this signature"
+    )]
     fn application<'db>(
         db: &'db TestDb,
         application: ProvidedTypeApplication<'_, 'db>,
