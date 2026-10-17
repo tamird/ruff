@@ -6817,7 +6817,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Type<'db> {
         let db = self.db();
         let env = self.program_environment();
-        let peer_tcx = if is_collection_literal(expression)
+        let peer_tcx = if can_use_collection_peer_context(expression)
             && let Some(peer_ty) = peer_ty
             && prefer_collection_literal_peer_context(db, env, tcx)
         {
@@ -9241,7 +9241,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
             _ => false,
         };
-        let (body_ty, orelse_ty) = if is_collection_literal(body)
+        let (body_ty, orelse_ty) = if can_use_collection_peer_context(body)
             && prefer_collection_literal_peer_context(db, env, tcx)
             && !nonempty_body_with_empty_peer
         {
@@ -9886,19 +9886,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Empty builtin constructors share literal inference for contextual element types and
         // indexed future uses. Semantic indexing only tracks bare constructor names, so confirm
         // that the name still resolves to the corresponding builtin.
-        let collection_initializer_class = if arguments.is_empty()
-            && let Some(name) = func.as_name_expr()
-            && let Some(known_class) = callable_type
-                .as_class_literal()
-                .and_then(|class| class.known(self.db()))
-            && matches!(
-                (name.id.as_str(), known_class),
-                ("list", KnownClass::List) | ("set", KnownClass::Set) | ("dict", KnownClass::Dict)
-            ) {
-            Some(known_class)
-        } else {
-            None
-        };
+        let collection_initializer_class =
+            empty_collection_constructor(call_expression).filter(|known_class| {
+                callable_type
+                    .as_class_literal()
+                    .is_some_and(|class| class.is_known(db, *known_class))
+            });
 
         if callable_type
             .as_class_literal()
@@ -12589,15 +12582,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             op,
             values,
         } = bool_op;
-        // The first operand has no peers. If no later operand is a collection literal,
+        // The first operand has no peers. If no later operand can use collection context,
         // accumulating prior types cannot affect inference.
-        let track_peer_types = values.iter().skip(1).any(is_collection_literal)
+        let track_peer_types = values.iter().skip(1).any(can_use_collection_peer_context)
             && prefer_collection_literal_peer_context(self.db(), self.program_environment(), tcx);
         self.infer_chained_boolean_types(
             *op,
             track_peer_types,
             values.iter().enumerate(),
-            |(_, value)| is_collection_literal(value),
+            |(_, value)| can_use_collection_peer_context(value),
             |builder, (index, value), peer_ty| {
                 let ty = if index == values.len() - 1 {
                     builder
@@ -13733,11 +13726,28 @@ fn supports_collection_literal_context<'db>(
     }
 }
 
-fn is_collection_literal(expression: &ast::Expr) -> bool {
-    matches!(
-        expression,
-        ast::Expr::List(_) | ast::Expr::Set(_) | ast::Expr::Dict(_)
-    )
+fn can_use_collection_peer_context(expression: &ast::Expr) -> bool {
+    match expression {
+        ast::Expr::List(_) | ast::Expr::Set(_) | ast::Expr::Dict(_) => true,
+        // This only supplies expected-type context. Normal call inference checks the
+        // callee's identity before using builtin collection allocation inference.
+        ast::Expr::Call(call) => empty_collection_constructor(call).is_some(),
+        _ => false,
+    }
+}
+
+/// A syntactic candidate for empty builtin allocation. Call inference must also confirm that
+/// the bare name resolves to the corresponding builtin class.
+fn empty_collection_constructor(call: &ast::ExprCall) -> Option<KnownClass> {
+    if !call.arguments.is_empty() {
+        return None;
+    }
+    match call.func.as_name_expr()?.id.as_str() {
+        "list" => Some(KnownClass::List),
+        "set" => Some(KnownClass::Set),
+        "dict" => Some(KnownClass::Dict),
+        _ => None,
+    }
 }
 
 /// Returns `true` if `tcx` cannot provide useful type context for a collection literal.

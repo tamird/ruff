@@ -4267,3 +4267,44 @@ def _(has_td: HasTD, flag: bool):
     # error: [possibly-unresolved-reference] "Name `y` used when possibly not defined"
     has_td.td = {"bar": y}
 ```
+
+## Empty constructor contexts from peers
+
+Empty bare builtin constructors can use the same peer context as collection displays. A shadowed
+name still uses ordinary call checking; the hint does not establish builtin identity.
+
+```py
+import builtins
+from typing import assert_type
+
+original_list = list
+
+def constructor_peer(values: list[int] | None, mappings: dict[str, int] | None, sets: set[int] | None):
+    assert_type(values or list(), list[int])
+    assert_type(mappings or dict(), dict[str, int])
+    assert_type(sets or set(), set[int])
+    assert_type(values or original_list(), list[int])
+
+def shadowed_constructor(values: list[int] | None):
+    def list() -> str:
+        return "shadow"
+
+    reveal_type(values or list())  # revealed: (list[int] & ~AlwaysFalsy) | str
+
+def generic_shadow(values: list[int] | None):
+    def list[T: str]() -> builtins.list[T]:
+        raise NotImplementedError
+
+    reveal_type(values or list())  # revealed: (list[int] & ~AlwaysFalsy) | list[Unknown]
+    # error: [too-many-positional-arguments]
+    list(42)
+
+def required_shadow(values: list[int] | None):
+    def list(value: str) -> builtins.list[str]:
+        return [value]
+
+    # error: [missing-argument]
+    values or list()
+    # error: [invalid-argument-type]
+    values or list(42)
+```
