@@ -58,6 +58,144 @@ x += "Hello"
 reveal_type(x)  # revealed: int
 ```
 
+## NotImplemented requests binary fallback
+
+An in-place method can decline an operation by returning `NotImplemented`. The ordinary binary
+operation then determines the value assigned to the target; an alias still refers to the original
+object. Reflected overloads are selected using the actual operand.
+
+```py
+from types import NotImplementedType
+from typing import overload
+
+Refusal = NotImplementedType
+
+class Left:
+    def __iadd__(self, other: object) -> Refusal:
+        return NotImplemented
+
+class Right:
+    @overload
+    def __radd__(self, other: Left) -> str: ...
+    @overload
+    def __radd__(self, other: object) -> str | bytes: ...
+    def __radd__(self, other: object) -> str | bytes:
+        return "result"
+
+value = Left()
+alias = value
+value += Right()
+reveal_type(value)  # revealed: str
+reveal_type(alias)  # revealed: Left
+wrong: bytes = value  # error: [invalid-assignment]
+
+class NormalLeft(Left):
+    def __add__(self, other: Right) -> int:
+        return 1
+
+normal = NormalLeft()
+normal += Right()
+reveal_type(normal)  # revealed: int
+```
+
+Other possible return values remain in the result alongside the binary fallback.
+
+```py
+from types import NotImplementedType
+
+class Choice:
+    def __iadd__(self, other: int) -> int | NotImplementedType:
+        return 0 if other else NotImplemented
+
+    def __add__(self, other: int) -> str:
+        return "fallback"
+
+value = Choice()
+value += 1
+reveal_type(value)  # revealed: int | str
+```
+
+A possibly absent in-place method uses the same fallback, without retaining `NotImplemented`.
+
+```py
+from types import NotImplementedType
+
+def optional_method(flag: bool):
+    class Choice:
+        if flag:
+            def __ior__(self, other: int) -> bytes | NotImplementedType:
+                return b"" if other else NotImplemented
+
+        def __or__(self, other: int) -> str:
+            return "fallback"
+
+    value = Choice()
+    value |= 1
+    reveal_type(value)  # revealed: bytes | str
+```
+
+A declined operation still fails when neither binary method accepts the operands. An incompatible
+in-place argument remains an error even if a reflected binary method could accept it.
+
+```py
+from types import NotImplementedType
+
+class Missing:
+    def __iadd__(self, other: object) -> int | NotImplementedType:
+        return NotImplemented
+
+value = Missing()
+value += 1  # error: [unsupported-operator]
+reveal_type(value)  # revealed: int | Unknown
+
+class Incompatible:
+    def __iadd__(self, other: int) -> bytes:
+        return b""
+
+class Right:
+    def __radd__(self, other: Incompatible) -> str:
+        return "result"
+
+value = Incompatible()
+value += Right()  # error: [unsupported-operator]
+reveal_type(value)  # revealed: bytes
+```
+
+Gradual return types do not prove that an in-place operation declined. A method that never returns
+also does not fall back.
+
+```py
+from typing import Any
+from typing_extensions import Never
+from ty_extensions._internal import Unknown
+
+class AnyResult:
+    def __iadd__(self, other: int) -> Any: ...
+    def __add__(self, other: int) -> str:
+        return "fallback"
+
+class UnknownResult:
+    def __iadd__(self, other: int) -> Unknown: ...
+    def __add__(self, other: int) -> str:
+        return "fallback"
+
+class NeverResult:
+    def __iadd__(self, other: int) -> Never:
+        raise RuntimeError
+    def __add__(self, other: int) -> str:
+        return "fallback"
+
+any_value = AnyResult()
+any_value += 1
+reveal_type(any_value)  # revealed: Any
+unknown_value = UnknownResult()
+unknown_value += 1
+reveal_type(unknown_value)  # revealed: Unknown
+never_value = NeverResult()
+never_value += 1
+reveal_type(never_value)  # revealed: Never
+```
+
 ## Unsupported types
 
 ```py
