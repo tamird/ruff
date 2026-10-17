@@ -10767,27 +10767,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut diagnostics = Vec::new();
         for callable in bindings.iter_flat_mut() {
             let bound_receiver = callable.bound_type.is_some();
-            let Some(binding) = callable.single_overload_mut() else {
-                continue;
-            };
-            let mut context = crate::types::CheckedCall {
-                binding,
-                arguments,
-                bound_receiver,
-                file: self.scope().program_file(self.db()),
-                call,
-                expression_type: &expression_type,
-                dictionary_items: &dictionary_items,
-                class_anchor: &class_anchor,
-                has_binding_errors,
-            };
-            let crate::provided::ProvidedCallResult {
-                return_type,
-                diagnostics: supplied_diagnostics,
-            } = self.db().provided_call_result(&context);
-            diagnostics.extend(supplied_diagnostics);
-            if let Some(result) = return_type {
-                context.set_return_type(result);
+            for binding in callable.result_refinement_overloads_mut() {
+                let mut context = crate::types::CheckedCall {
+                    binding,
+                    arguments,
+                    bound_receiver,
+                    file: self.scope().program_file(self.db()),
+                    call,
+                    expression_type: &expression_type,
+                    dictionary_items: &dictionary_items,
+                    class_anchor: &class_anchor,
+                    has_binding_errors,
+                };
+                let crate::provided::ProvidedCallResult {
+                    return_type,
+                    diagnostics: supplied_diagnostics,
+                } = self.db().provided_call_result(&context);
+                diagnostics.extend(supplied_diagnostics);
+                if let Some(result) = return_type {
+                    context.set_return_type(result);
+                }
             }
         }
         if !diagnostics.is_empty()

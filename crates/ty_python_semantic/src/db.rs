@@ -127,8 +127,10 @@ pub trait Db: PythonCoreDb {
     /// The declaration, bound arguments, and inferred child types come from this inference pass.
     /// Implementations must identify the resolved declaration, rather than the spelling of the
     /// call, and must not request completed inference of the scope currently being inferred.
-    /// Invalid calls retain their diagnostics and can supply a recovery result. Overloaded
-    /// callables retain ordinary inference; this hook only handles single-signature callables.
+    /// Selected overloads are refined separately and retain ordinary result aggregation.
+    /// Calls requiring argument expansion retain ordinary inference because their complete
+    /// checked bindings are not available. Invalid single-signature calls retain their
+    /// diagnostics and can supply a recovery result.
     /// Supplied diagnostics use the current lint rules and source suppressions and are omitted
     /// for unreachable calls and `@no_type_check` scopes. Reporting diagnostics does not require
     /// a return-type refinement.

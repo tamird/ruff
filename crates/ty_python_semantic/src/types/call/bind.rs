@@ -4791,6 +4791,34 @@ impl<'db> CallableBinding<'db> {
         }
     }
 
+    /// Selected bindings whose arguments are retained for result refinement.
+    /// A single signature also retains its recovery binding after argument errors.
+    pub(crate) fn result_refinement_overloads_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut Binding<'db>> {
+        // Expansion caches a combined result, but retains only the last argument
+        // snapshot for each overload. It cannot supply a complete checked view.
+        let complete = self
+            .overload_call_result
+            .as_ref()
+            .is_none_or(|result| match result {
+                OverloadCallResult::ArgumentTypeExpansion(_) => false,
+                OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => false,
+                OverloadCallResult::Ambiguous => true,
+            });
+        let selected: SmallVec<[usize; 2]> = if self.overloads.len() == 1 {
+            smallvec::smallvec![0]
+        } else if complete {
+            self.selected_overloads().map(|(index, _)| index).collect()
+        } else {
+            SmallVec::new()
+        };
+        self.overloads
+            .iter_mut()
+            .enumerate()
+            .filter_map(move |(index, binding)| selected.contains(&index).then_some(binding))
+    }
+
     /// Returns an iterator over all the overloads that matched for this call binding.
     pub(crate) fn matching_overloads(
         &self,

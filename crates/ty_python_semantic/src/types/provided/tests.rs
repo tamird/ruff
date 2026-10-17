@@ -973,6 +973,114 @@ fn supplied_call_diagnostics_follow_native_policy() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn supplied_call_results_follow_selected_overloads() -> anyhow::Result<()> {
+    fn result<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
+        let name = call
+            .declaration()
+            .and_then(|definition| definition.name(db));
+        match name.as_deref() {
+            Some("select" | "first" | "ambiguous") => {
+                assert!(!call.has_binding_errors());
+                assert!(!matches!(
+                    call.argument("rejected"),
+                    CheckedArgument::Value { .. }
+                ));
+                let value = if matches!(call.argument("one"), CheckedArgument::Value { .. }) {
+                    1
+                } else {
+                    assert!(matches!(
+                        call.argument("two"),
+                        CheckedArgument::Value { .. }
+                    ));
+                    2
+                };
+                Some(Type::int_literal(value)).into()
+            }
+            Some("expanded") => panic!("expanded arguments do not retain every checked binding"),
+            Some("recover") => {
+                assert!(call.has_binding_errors());
+                Some(Type::int_literal(-1)).into()
+            }
+            _ => ProvidedCallResult::default(),
+        }
+    }
+
+    let db = TestDbBuilder::new()
+        .with_call_result_provider(result)
+        .with_file(
+            "/src/native.pyi",
+            r#"
+from typing import Any, overload
+@overload
+def select(one: int) -> object: ...
+@overload
+def select(two: str, suffix: str) -> object: ...
+@overload
+def first(one: int) -> object: ...
+@overload
+def first(rejected: object) -> object: ...
+@overload
+def ambiguous(one: int) -> int: ...
+@overload
+def ambiguous(two: str) -> str: ...
+@overload
+def expanded(one: int) -> int: ...
+@overload
+def expanded(two: str) -> str: ...
+def recover(value: int) -> int: ...
+def gradual() -> Any: ...
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from native import select, first, ambiguous, expanded, recover, gradual
+from typing import Literal
+from typing_extensions import assert_type
+
+assert_type(select(1), Literal[1])
+assert_type(select("a", "b"), Literal[2])
+assert_type(first(1), Literal[1])
+value = gradual()
+ambiguous_result = ambiguous(value)
+def expand(value: int | str):
+    assert_type(expanded(value), int | str)
+invalid = select([])
+recovered = recover("bad")
+assert_type(recovered, Literal[-1])
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type", "invalid-argument-type"],
+        "{diagnostics:#?}"
+    );
+    let file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(file);
+    let actual = crate::place::global_symbol(&db, file, "ambiguous_result")
+        .place
+        .expect_type();
+    let expected = crate::types::IntersectionType::from_two_elements(
+        &db,
+        &env,
+        Type::Dynamic(crate::types::DynamicType::AmbiguousOverload),
+        crate::types::UnionType::from_elements(
+            &db,
+            &env,
+            [Type::int_literal(1), Type::int_literal(2)],
+        ),
+    );
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
 fn runtime_type_test<'db>(
     db: &'db TestDb,
     file: ProgramFile<'db>,
