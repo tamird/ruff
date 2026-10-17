@@ -124,7 +124,7 @@ use crate::types::{
     TypeContext, TypeMapping, TypePair, TypeVarBoundOrConstraints, TypeVarVariance, UnionType,
 };
 use crate::{Db, FxIndexMap, FxIndexSet, FxOrderSet, ProgramEnvironment};
-use resolution::{SolutionType, resolve_solution};
+use resolution::{SolutionType, resolve_merged_solution, resolve_solution};
 
 mod owned;
 pub(crate) mod paths;
@@ -3713,9 +3713,10 @@ impl<'db> CandidateResidual<'db> {
             .iter()
             .any(|ty| matches!(ty, SolutionType::Unresolved(_)))
         {
-            // Caller variables may parameterize a solution family. Close the local
-            // witnesses against those symbolic anchors, then certify the whole family.
-            resolved = resolve_solution(db, env, locals, selected);
+            // Caller variables may anchor positive-union cycles between local witnesses.
+            // Closing those equations only proposes a witness; replay below still certifies
+            // the complete relation and each local's declared domain.
+            resolved = resolve_merged_solution(db, env, locals, selected);
         }
         let bindings: Option<Vec<_>> = selected
             .iter()
@@ -6323,6 +6324,82 @@ mod tests {
                 "witness family admitted {} outside Local's domain",
                 instantiated.display(db, &env),
             );
+        }
+    }
+
+    #[test]
+    fn anchored_union_witnesses_preserve_domains() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let outer = create_typevar(db, "Outer");
+        let left = create_typevar(db, "Left");
+        let right = create_typevar(db, "Right");
+        let string = KnownClass::Str.to_instance(db, &env);
+        let bounded_left = left
+            .map_bound_or_constraints(db, |_| Some(TypeVarBoundOrConstraints::UpperBound(string)));
+        for (left, negative_atom, expected) in [
+            (left, false, true),
+            (bounded_left, false, false),
+            (left, true, false),
+        ] {
+            let builder = ConstraintSetBuilder::new();
+            let relation = ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                left,
+                Type::TypeVar(outer),
+            )
+            .and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db,
+                    &env,
+                    &builder,
+                    right,
+                    Type::TypeVar(left),
+                )
+            })
+            .and(db, &builder, || {
+                if negative_atom {
+                    ConstraintSet::constrain_typevar_equivalence_bound(
+                        db, &env, &builder, left, string,
+                    )
+                    .negate(db, &builder)
+                } else {
+                    ConstraintSet::from_bool(&builder, true)
+                }
+            });
+            let selected =
+                [(left, right), (right, left)].map(|(variable, dependency)| TypeVarSolution {
+                    bound_typevar: variable,
+                    solution: UnionType::from_two_elements(
+                        db,
+                        &env,
+                        Type::TypeVar(dependency),
+                        Type::TypeVar(outer),
+                    ),
+                });
+            let locals = TypeVarSet::from_typevars(db, [left, right]);
+            let (replay, bindings) = CandidateResidual::specialize_witness(
+                db,
+                &env,
+                relation,
+                locals,
+                locals,
+                &selected,
+                &mut ProjectionTypeBudget::new(SolutionBudget::default().type_terms),
+            )
+            .unwrap()
+            .expect("anchored cycle should produce a witness proposal");
+            assert!(
+                bindings
+                    .iter()
+                    .all(|binding| binding.solution == Type::TypeVar(outer))
+            );
+            let ControlFlow::Continue(holds) =
+                CandidateResidual::replay_holds(db, &env, replay, &mut UnboundedSolutionLimits);
+            assert_eq!(holds, expected);
         }
     }
 

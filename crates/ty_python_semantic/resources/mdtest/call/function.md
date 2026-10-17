@@ -165,6 +165,118 @@ cn = compose(fn, fn, fn, fn, fn, fn, fn)
 reveal_type(cn)  # revealed: (int, /) -> int
 ```
 
+## Generic callbacks with shared union inputs
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+The two callbacks must share the caller's rigid key and value types. Their local type variables can
+form positive-union cycles with those caller variables as anchors; closing a witness must still
+validate the complete callback relation.
+
+```py
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Literal
+
+class Selected[T]:
+    def value(self) -> T:
+        raise NotImplementedError
+
+type Piece[P, S] = tuple[Literal[True], S] | tuple[Literal[False], P]
+type Carrier[K, V] = dict[K, V] | Selected[dict[K, V]]
+
+def map_attr[R, S, O](
+    func: Callable[[object], R],
+    selected: Callable[[Callable[[object], R], Mapping[str, object]], S],
+    compose: Callable[[Sequence[Piece[R, S]]], O],
+) -> R | O:
+    raise NotImplementedError
+
+def map_selected[K, V](func: Callable[[object], dict[K, V]], branches: Mapping[str, object]) -> Selected[dict[K, V]]:
+    raise NotImplementedError
+
+def compose_dict[K, V](
+    items: Sequence[Piece[dict[K, V], Selected[dict[K, V]]]],
+) -> Carrier[K, V]:
+    raise NotImplementedError
+
+def generic[K, V](func: Callable[[object], dict[K, V]]) -> Carrier[K, V]:
+    result = map_attr(func, map_selected, compose_dict)
+    reveal_type(result)  # revealed: dict[K@generic, V@generic] | Selected[dict[K@generic, V@generic]]
+    return result
+
+def concrete(func: Callable[[object], dict[str, int]]) -> Carrier[str, int]:
+    result = map_attr(func, map_selected, compose_dict)
+    reveal_type(result)  # revealed: dict[str, int] | Selected[dict[str, int]]
+    return result
+
+def unknown(value):
+    return {"key": value}
+
+def gradual(func: Callable[[object], dict[str, Any]]) -> None:
+    reveal_type(map_attr(func, map_selected, compose_dict))  # revealed: Unknown
+    reveal_type(map_attr(unknown, map_selected, compose_dict))  # revealed: Unknown
+
+def wrong_selected[K, V](func: Callable[[object], dict[K, V]], branches: Mapping[str, object]) -> Selected[dict[K, bytes]]:
+    raise NotImplementedError
+
+def bad_adapter(func: Callable[[object], dict[str, int]]) -> None:
+    # error: [invalid-argument-type]
+    # error: [invalid-argument-type]
+    map_attr(func, wrong_selected, compose_dict)
+
+def string_selected[K: str, V](func: Callable[[object], dict[K, V]], branches: Mapping[str, object]) -> Selected[dict[K, V]]:
+    raise NotImplementedError
+
+def bad_bound[K, V](func: Callable[[object], dict[K, V]]) -> None:
+    reveal_type(map_attr(func, string_selected, compose_dict))  # revealed: Unknown
+
+def bad_result[K, V](func: Callable[[object], dict[K, V]]) -> list[V]:
+    # error: [invalid-return-type]
+    return map_attr(func, map_selected, compose_dict)
+```
+
+## Legacy generic callbacks with shared union inputs
+
+The same callback relation also preserves variables declared with legacy `TypeVar` syntax.
+
+```py
+from collections.abc import Callable, Mapping, Sequence
+from typing import Generic, Literal, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+K = TypeVar("K")
+V = TypeVar("V")
+R = TypeVar("R")
+S = TypeVar("S")
+O = TypeVar("O")
+
+class Selected(Generic[T_co]): ...
+
+Piece = tuple[Literal[False], R] | tuple[Literal[True], S]
+Carrier = dict[K, V] | Selected[dict[K, V]]
+
+def map_attr(
+    func: Callable[[object], R],
+    selected: Callable[[Callable[[object], R], Mapping[str, object]], S],
+    compose: Callable[[Sequence[Piece[R, S]]], O],
+) -> R | O:
+    raise NotImplementedError
+
+def map_selected(func: Callable[[object], dict[K, V]], branches: Mapping[str, object]) -> Selected[dict[K, V]]:
+    raise NotImplementedError
+
+def compose_dict(items: Sequence[Piece[dict[K, V], Selected[dict[K, V]]]]) -> Carrier[K, V]:
+    raise NotImplementedError
+
+def generic(func: Callable[[object], dict[K, V]]) -> Carrier[K, V]:
+    result = map_attr(func, map_selected, compose_dict)
+    reveal_type(result)  # revealed: dict[K@generic, V@generic] | Selected[dict[K@generic, V@generic]]
+    return result
+```
+
 ## Recursive callable constraints in constructors
 
 When inferring the generic constructor for `map`, an overloaded callable together with a gradual

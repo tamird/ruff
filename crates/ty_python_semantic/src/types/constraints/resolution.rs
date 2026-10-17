@@ -40,8 +40,10 @@ pub(crate) fn resolve_solution<'db>(
     Resolver::new(db, env, inferable, solution).resolve_all(db)
 }
 
-/// Closes a merged compatibility projection, including anchored positive-union cycles.
-/// Correlated solution paths use [`resolve_solution`] and preserve their original evidence.
+/// Closes a selected mapping, including anchored positive-union cycles.
+///
+/// A merged compatibility projection can use the closed mapping directly. A correlated witness
+/// proposal must still certify the complete original relation before exporting its bindings.
 pub(crate) fn resolve_merged_solution<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
