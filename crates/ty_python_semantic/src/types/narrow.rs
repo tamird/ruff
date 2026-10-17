@@ -2299,6 +2299,9 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         is_positive: bool,
     ) -> bool {
         let db = self.db;
+        if alias.node_ref(db).node(self.module).is_attribute_expr() {
+            return self.saved_attribute(name, expression).is_some();
+        }
         let scope = expression.scope(db);
         let index = semantic_index(db, expression.program_file(db));
         let use_def = index.use_def_map(scope.file_scope_id(db));
@@ -2340,6 +2343,83 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 // `Never` cannot produce either outcome, even though its truthiness is ambiguous.
                 ty.is_never() || ty.bool(db, &self.env) == Truthiness::from(!is_positive)
             })
+    }
+
+    /// Recover a saved attribute path only while its bindings remain unchanged.
+    /// As with unpacked locals, whole-scope histories deliberately reject later writes too.
+    fn saved_attribute(
+        &self,
+        name: &ast::ExprName,
+        expression: Expression<'db>,
+    ) -> Option<Expression<'db>> {
+        let db = self.db;
+        let scope = expression.scope(db);
+        if scope.node(db).scope_kind() != ScopeKind::Function {
+            return None;
+        }
+        let file = expression.program_file(db);
+        let index = semantic_index(db, file);
+        let alias = index
+            .narrowing_alias_predicate(ast::ExprRef::Name(name))?
+            .expression;
+        if alias.scope(db) != scope {
+            return None;
+        }
+        let mut original = alias.node_ref(db).node(self.module);
+        if !original.is_attribute_expr() {
+            return None;
+        }
+        let places = index.place_table(scope.file_scope_id(db));
+        if !places.symbol_by_name(name.id.as_str())?.is_local() {
+            return None;
+        }
+        let use_def = index.use_def_map(scope.file_scope_id(db));
+        let alias_key = ExpressionNodeKey::from(original);
+        if !use_def
+            .bindings_at_use(name.scoped_use_id(db, file))
+            .all(|binding| {
+                binding_reachability(db, use_def, &binding).is_always_false()
+                    || binding.binding.definition().is_some_and(|definition| {
+                        self.binding_assigns_alias(definition, alias_key, false)
+                    })
+            })
+        {
+            return None;
+        }
+
+        loop {
+            let place = PlaceExpr::try_from_expr(original)?;
+            let place = places.place_id(&place)?;
+            let use_id = index.try_expression_use_id(original.into())?;
+            let captured: SmallVec<[_; 2]> = use_def
+                .bindings_at_use(use_id)
+                .map(|binding| binding.binding)
+                .collect();
+            if use_def
+                .reachable_bindings(place)
+                // Deletions are retained in the final state, not the history of definitions.
+                .chain(use_def.end_of_scope_bindings(place))
+                .any(|binding| match binding.binding {
+                    DefinitionState::Undefined => false,
+                    DefinitionState::Deleted => true,
+                    DefinitionState::Defined(definition) => {
+                        definition.kind(db).is_loop_header() || !captured.contains(&binding.binding)
+                    }
+                })
+            {
+                return None;
+            }
+            match original {
+                ast::Expr::Attribute(attribute) => original = &attribute.value,
+                ast::Expr::Name(root) => {
+                    return places
+                        .symbol_by_name(root.id.as_str())?
+                        .is_local()
+                        .then_some(alias);
+                }
+                _ => return None,
+            }
+        }
     }
 
     fn binding_assigns_alias(
@@ -4777,12 +4857,14 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             right,
         )) = expr_compare.as_single()
         {
-            let mut narrow_attribute = |attribute: &ast::ExprAttribute, other: &ast::Expr| {
+            let mut narrow_attribute = |attribute_inference: &ExpressionInference<'db>,
+                                        attribute: &ast::ExprAttribute,
+                                        other: &ast::Expr| {
                 let rebound = other
                     .as_named_expr()
                     .and_then(|named| PlaceExpr::try_from_expr(&named.target));
                 if let Some(attribute_constraints) = self.narrow_nominal_attribute(
-                    inference,
+                    attribute_inference,
                     attribute,
                     inference.expression_type(other),
                     *operator,
@@ -4793,13 +4875,33 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 }
             };
 
-            if let ast::Expr::Attribute(attribute) = left {
-                narrow_attribute(attribute, right);
+            let mut provisional = false;
+            for (candidate, other) in [(left, right), (right, left)] {
+                match candidate {
+                    ast::Expr::Attribute(attribute) => {
+                        narrow_attribute(inference, attribute, other);
+                    }
+                    ast::Expr::Name(name) => {
+                        let Some(alias) = self.saved_attribute(name, expression) else {
+                            continue;
+                        };
+                        let Some(attribute) =
+                            alias.node_ref(db).node(self.module).as_attribute_expr()
+                        else {
+                            continue;
+                        };
+                        let alias_inference =
+                            infer_expression_types(db, alias, TypeContext::default());
+                        if alias_inference.is_provisional() {
+                            provisional = true;
+                            continue;
+                        }
+                        narrow_attribute(alias_inference, attribute, other);
+                    }
+                    _ => {}
+                }
             }
-
-            if let ast::Expr::Attribute(attribute) = right {
-                narrow_attribute(attribute, left);
-            }
+            self.is_provisional |= provisional;
         }
 
         // Narrow types when a key membership test proves that a key is present, and narrow unions

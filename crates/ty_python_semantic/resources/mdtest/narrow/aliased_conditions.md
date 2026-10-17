@@ -1026,3 +1026,166 @@ def _(x: int, y: bool):
         reveal_type(x)  # revealed: int & ~AlwaysFalsy
         reveal_type(y)  # revealed: Literal[True]
 ```
+
+## Saved attribute tags
+
+A local can retain an attribute tag used to distinguish alternatives, including a tag on a nested
+object.
+
+```py
+from typing import Any, Literal
+
+class TextOptions:
+    kind: Literal["text"]
+    enabled: Literal[True]
+
+class BinaryOptions:
+    kind: Literal["binary"]
+    enabled: Literal[False]
+
+class Text:
+    options: TextOptions
+    text: str
+
+class Binary:
+    options: BinaryOptions
+    data: bytes
+
+def saved_tag(value: Text | Binary):
+    kind = value.options.kind
+    if kind == "text":
+        reveal_type(value)  # revealed: Text
+        reveal_type(value.text)  # revealed: str
+    else:
+        reveal_type(value)  # revealed: Binary
+
+    if "text" != kind:
+        reveal_type(value)  # revealed: Binary
+    else:
+        reveal_type(value)  # revealed: Text
+
+def saved_boolean(value: Text | Binary):
+    enabled = value.options.enabled
+    if enabled is True:
+        reveal_type(value)  # revealed: Text
+    else:
+        reveal_type(value)  # revealed: Binary
+    if enabled:
+        reveal_type(value)  # revealed: Text
+
+def direct_tag(value: TextOptions | BinaryOptions):
+    kind = value.kind
+    if kind == "text":
+        reveal_type(value)  # revealed: TextOptions
+```
+
+An independent assignment to the saved local does not establish the relationship, even when it
+produces a truthy value.
+
+```py
+def independent_assignment(value: Text | Binary, choose: bool):
+    kind = "binary"
+    if choose:
+        kind = value.options.kind
+    if kind == "text":
+        reveal_type(value)  # revealed: Text | Binary
+    else:
+        reveal_type(value)  # revealed: Text | Binary
+
+def overwritten_alias(value: Text | Binary):
+    kind = value.options.kind
+    kind = "text"
+    if kind == "text":
+        reveal_type(value)  # revealed: Text | Binary
+
+def overwritten_boolean(value: Text | Binary):
+    enabled = value.options.enabled
+    enabled = True
+    if enabled:
+        reveal_type(value)  # revealed: Text | Binary
+
+def loop_alias(value: Text | Binary):
+    kind = value.options.kind
+    for _ in range(2):
+        if kind == "text":
+            reveal_type(value)  # revealed: Text | Binary
+        kind = "text"
+```
+
+Writes to the original object or any intermediate attribute prevent projection through the saved
+tag. This conservatively includes writes later in the scope and on a loop backedge.
+
+```py
+class Envelope:
+    value: Text | Binary
+
+def replaced_root(value: Text | Binary, other: Text | Binary):
+    kind = value.options.kind
+    value = other
+    if kind == "text":
+        reveal_type(value)  # revealed: Text | Binary
+
+def replaced_member(envelope: Envelope, other: Text | Binary):
+    kind = envelope.value.options.kind
+    envelope.value = other
+    if kind == "text":
+        reveal_type(envelope.value)  # revealed: Text | Binary
+
+def later_write(value: Text | Binary, other: Text | Binary):
+    kind = value.options.kind
+    if kind == "text":
+        reveal_type(value)  # revealed: Text | Binary
+    value = other
+
+def loop_write(value: Text | Binary, other: Text | Binary):
+    kind = value.options.kind
+    for _ in range(2):
+        if kind == "text":
+            reveal_type(value)  # revealed: Text | Binary
+        value = other
+
+def deleted_leaf(value: Text | Binary):
+    kind = value.options.kind
+    if kind == "text":
+        reveal_type(value)  # revealed: Text | Binary
+    del value.options.kind
+
+def deleted_ancestor(envelope: Envelope):
+    kind = envelope.value.options.kind
+    if kind == "text":
+        reveal_type(envelope.value)  # revealed: Text | Binary
+    del envelope.value
+```
+
+Ambiguous and gradual intermediate attributes remain possible in either branch.
+
+```py
+class Mixed:
+    options: TextOptions | BinaryOptions
+
+class Dynamic:
+    options: Any
+
+def ambiguous(value: Text | Binary | Mixed | Dynamic):
+    kind = value.options.kind
+    if kind == "text":
+        reveal_type(value)  # revealed: Text | Mixed | Dynamic
+    else:
+        reveal_type(value)  # revealed: Binary | Mixed | Dynamic
+```
+
+The relationship does not cross a deferred scope or another local alias.
+
+```py
+def deferred(value: Text | Binary):
+    kind = value.options.kind
+    def inner():
+        if kind == "text":
+            reveal_type(value)  # revealed: Text | Binary
+
+def chained(value: Text | Binary):
+    kind = value.options.kind
+    other = kind
+    if other == "text":
+        reveal_type(value)  # revealed: Text | Binary
+```

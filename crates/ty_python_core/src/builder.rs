@@ -89,8 +89,7 @@ struct Loop {
     continue_states: Vec<FlowSnapshot>,
 }
 
-/// A narrowing alias: a variable whose RHS is a narrowing expression
-/// (e.g., `is_none = x is None`).
+/// A local retaining a narrowing expression or an attribute tag.
 #[derive(Clone, Debug)]
 struct NarrowingAlias<'ast> {
     /// The RHS expression (e.g., `x is None`).
@@ -1242,7 +1241,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         let Some(value) = value else { return };
         let target_name = &target_name_expr.id;
 
-        if !Self::can_register_narrowing_alias(value) {
+        let attribute_path = value.is_attribute_expr() && PlaceExpr::try_from_expr(value).is_some();
+        if !attribute_path && !Self::can_register_narrowing_alias(value) {
             return;
         }
 
@@ -1340,6 +1340,17 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             ast::Expr::BoolOp(bool_op) => {
                 for value in &bool_op.values {
                     Self::walk_narrowing_alias_predicate(value, f);
+                }
+            }
+            ast::Expr::Compare(compare) => {
+                if let Some((
+                    left,
+                    ast::CmpOp::Eq | ast::CmpOp::NotEq | ast::CmpOp::Is | ast::CmpOp::IsNot,
+                    right,
+                )) = compare.as_single()
+                {
+                    Self::walk_narrowing_alias_predicate(left, f);
+                    Self::walk_narrowing_alias_predicate(right, f);
                 }
             }
             ast::Expr::Call(call) => {
