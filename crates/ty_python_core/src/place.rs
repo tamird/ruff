@@ -805,6 +805,19 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
             }
             if can_narrow_tagged_union_base {
                 let mut ancestor = expr;
+                if let ast::Expr::Call(call) = expr
+                    && call.arguments.keywords.is_empty()
+                {
+                    match call.arguments.args.as_ref() {
+                        [receiver, _] | [receiver, _, _] => {
+                            // A finite getattr comparison can narrow its receiver and
+                            // every attribute ancestor. Inference checks the callee.
+                            ancestor = receiver;
+                            places.extend(self.simple_expr(receiver));
+                        }
+                        _ => {}
+                    }
+                }
                 while let ast::Expr::Attribute(attribute) = ancestor {
                     ancestor = &attribute.value;
                     places.extend(self.simple_expr(ancestor));
@@ -837,8 +850,18 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
             places.extend(self.simple_expr(argument));
         }
 
-        // `bool(expr)` can delegate to narrowing `expr` itself, e.g. `bool(x is not None)`
         if let Some(first_arg) = expr_call.arguments.args.first() {
+            // A saved getattr result can constrain all ancestors of its receiver.
+            if matches!(expr_call.arguments.args.as_ref(), [_, _] | [_, _, _])
+                && expr_call.arguments.keywords.is_empty()
+            {
+                let mut ancestor = first_arg;
+                while let ast::Expr::Attribute(attribute) = ancestor {
+                    ancestor = &attribute.value;
+                    places.extend(self.simple_expr(ancestor));
+                }
+            }
+            // `bool(expr)` can delegate to narrowing `expr` itself, e.g. `bool(x is not None)`.
             if expr_call.arguments.args.len() == 1 && expr_call.arguments.keywords.is_empty() {
                 places.extend(self.expression_node(first_arg));
             }

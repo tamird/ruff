@@ -2301,7 +2301,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
     ) -> bool {
         let db = self.db;
         if alias.node_ref(db).node(self.module).is_attribute_expr() {
-            return self.saved_attribute(name, expression).is_some();
+            return self.saved_attribute_lookup(name, expression).is_some();
         }
         let scope = expression.scope(db);
         let index = semantic_index(db, expression.program_file(db));
@@ -2346,9 +2346,9 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             })
     }
 
-    /// Recover a saved attribute path only while its bindings remain unchanged.
+    /// Recover a saved attribute lookup only while its receiver bindings remain unchanged.
     /// As with unpacked locals, whole-scope histories deliberately reject later writes too.
-    fn saved_attribute(
+    fn saved_attribute_lookup(
         &self,
         name: &ast::ExprName,
         expression: Expression<'db>,
@@ -2366,10 +2366,12 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         if alias.scope(db) != scope {
             return None;
         }
-        let mut original = alias.node_ref(db).node(self.module);
-        if !original.is_attribute_expr() {
-            return None;
-        }
+        let original = alias.node_ref(db).node(self.module);
+        let mut receiver = match original {
+            ast::Expr::Attribute(_) => original,
+            ast::Expr::Call(call) => call.arguments.args.first()?,
+            _ => return None,
+        };
         let places = index.place_table(scope.file_scope_id(db));
         if !places.symbol_by_name(name.id.as_str())?.is_local() {
             return None;
@@ -2389,9 +2391,9 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         }
 
         loop {
-            let place = PlaceExpr::try_from_expr(original)?;
+            let place = PlaceExpr::try_from_expr(receiver)?;
             let place = places.place_id(&place)?;
-            let use_id = index.try_expression_use_id(original.into())?;
+            let use_id = index.try_expression_use_id(receiver.into())?;
             let captured: SmallVec<[_; 2]> = use_def
                 .bindings_at_use(use_id)
                 .map(|binding| binding.binding_order)
@@ -2413,8 +2415,8 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             {
                 return None;
             }
-            match original {
-                ast::Expr::Attribute(attribute) => original = &attribute.value,
+            match receiver {
+                ast::Expr::Attribute(attribute) => receiver = &attribute.value,
                 ast::Expr::Name(root) => {
                     return places
                         .symbol_by_name(root.id.as_str())?
@@ -4861,20 +4863,32 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             right,
         )) = expr_compare.as_single()
         {
-            let mut narrow_attribute = |attribute_inference: &ExpressionInference<'db>,
-                                        attribute: &ast::ExprAttribute,
-                                        other: &ast::Expr| {
+            let mut narrow_lookup = |lookup_inference: &ExpressionInference<'db>,
+                                     lookup: &ast::Expr,
+                                     other: &ast::Expr| {
                 let rebound = other
                     .as_named_expr()
                     .and_then(|named| PlaceExpr::try_from_expr(&named.target));
-                if let Some(attribute_constraints) = self.narrow_nominal_attribute(
-                    attribute_inference,
-                    attribute,
-                    inference.expression_type(other),
-                    *operator,
-                    is_positive,
-                    rebound.as_ref(),
-                ) {
+                let attribute_constraints = match lookup {
+                    ast::Expr::Attribute(attribute) => self.narrow_nominal_attribute(
+                        lookup_inference,
+                        attribute,
+                        inference.expression_type(other),
+                        *operator,
+                        is_positive,
+                        rebound.as_ref(),
+                    ),
+                    ast::Expr::Call(call) => self.narrow_getattr_comparison(
+                        lookup_inference,
+                        call,
+                        inference.expression_type(other),
+                        *operator,
+                        is_positive,
+                        rebound.as_ref(),
+                    ),
+                    _ => None,
+                };
+                if let Some(attribute_constraints) = attribute_constraints {
                     merge_constraints_and(&mut constraints, attribute_constraints);
                 }
             };
@@ -4882,25 +4896,20 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             let mut provisional = false;
             for (candidate, other) in [(left, right), (right, left)] {
                 match candidate {
-                    ast::Expr::Attribute(attribute) => {
-                        narrow_attribute(inference, attribute, other);
-                    }
+                    ast::Expr::Attribute(_) => narrow_lookup(inference, candidate, other),
+                    ast::Expr::Call(_) => narrow_lookup(inference, candidate, other),
                     ast::Expr::Name(name) => {
-                        let Some(alias) = self.saved_attribute(name, expression) else {
+                        let Some(alias) = self.saved_attribute_lookup(name, expression) else {
                             continue;
                         };
-                        let Some(attribute) =
-                            alias.node_ref(db).node(self.module).as_attribute_expr()
-                        else {
-                            continue;
-                        };
+                        let lookup = alias.node_ref(db).node(self.module);
                         let alias_inference =
                             infer_expression_types(db, alias, TypeContext::default());
                         if alias_inference.is_provisional() {
                             provisional = true;
                             continue;
                         }
-                        narrow_attribute(alias_inference, attribute, other);
+                        narrow_lookup(alias_inference, lookup, other);
                     }
                     _ => {}
                 }
@@ -5930,6 +5939,34 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         }
     }
 
+    fn attribute_comparison_may_match(
+        &self,
+        attribute_type: Type<'db>,
+        rhs_type: Type<'db>,
+        operator: ast::CmpOp,
+        is_positive: bool,
+    ) -> bool {
+        if operator.is_eq() || operator.is_not_eq() {
+            self.evaluate_expr_compare_op(
+                attribute_type,
+                rhs_type,
+                operator,
+                is_positive,
+                ComparisonSoundnessPolicy::CONSERVATIVE,
+            )
+            .is_none_or(|constraint| {
+                !attribute_type.is_disjoint_from(self.db, &self.env, constraint)
+            })
+        } else if operator.is_is() || operator.is_is_not() {
+            attribute_type
+                .identity_comparison_truthiness(self.db, &self.env, rhs_type)
+                .negate_if(is_positive != operator.is_is())
+                .may_be_true()
+        } else {
+            true
+        }
+    }
+
     fn narrow_nominal_attribute(
         &self,
         inference: &ExpressionInference<'db>,
@@ -5939,29 +5976,66 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         is_positive: bool,
         rebound: Option<&PlaceExpr>,
     ) -> Option<NarrowingConstraints<'db>> {
-        self.narrow_attribute_path(
-            inference,
-            attribute,
-            rebound,
-            |attribute_type| match operator {
-                ast::CmpOp::Eq | ast::CmpOp::NotEq => self
-                    .evaluate_expr_compare_op(
-                        attribute_type,
-                        rhs_type,
-                        operator,
-                        is_positive,
-                        ComparisonSoundnessPolicy::CONSERVATIVE,
-                    )
-                    .is_none_or(|constraint| {
-                        !attribute_type.is_disjoint_from(self.db, &self.env, constraint)
-                    }),
-                ast::CmpOp::Is | ast::CmpOp::IsNot => attribute_type
-                    .identity_comparison_truthiness(self.db, &self.env, rhs_type)
-                    .negate_if(is_positive != operator.is_is())
-                    .may_be_true(),
-                _ => true,
-            },
-        )
+        self.narrow_attribute_path(inference, attribute, rebound, |attribute_type| {
+            self.attribute_comparison_may_match(attribute_type, rhs_type, operator, is_positive)
+        })
+    }
+
+    fn narrow_getattr_comparison(
+        &self,
+        inference: &ExpressionInference<'db>,
+        call: &ast::ExprCall,
+        rhs_type: Type<'db>,
+        operator: ast::CmpOp,
+        is_positive: bool,
+        rebound: Option<&PlaceExpr>,
+    ) -> Option<NarrowingConstraints<'db>> {
+        let db = self.db;
+        let Type::FunctionLiteral(function) = inference.expression_type(&*call.func) else {
+            return None;
+        };
+        if function.known(db) != Some(KnownFunction::GetAttr) || !call.arguments.keywords.is_empty()
+        {
+            return None;
+        }
+        let (receiver, name, default) = match &*call.arguments.args {
+            [receiver, name] => (receiver, name, None),
+            [receiver, name, default] => (receiver, name, Some(default)),
+            _ => return None,
+        };
+        if std::iter::once(name)
+            .chain(default)
+            .any(|argument| any_over_expr(argument, ast::Expr::is_named_expr))
+        {
+            return None;
+        }
+        let name = inference.expression_type(name).string_literal_value(db)?;
+        if !is_identifier(name) {
+            return None;
+        }
+        let default = default.map(|default| inference.expression_type(default));
+        let policy = MemberLookupPolicy::RUNTIME_ATTRIBUTE
+            | MemberLookupPolicy::PRESERVE_MISSING_ALTERNATIVES;
+        self.narrow_receiver_path(inference, receiver, rebound, |receiver| {
+            let member = receiver
+                .member_lookup_with_policy_and_receiver(db, &self.env, name, policy, None)
+                .ok()?;
+            let member = policy.preserve_missing_alternative(db, receiver, member.member(db));
+            let Place::Defined(member) = member.place else {
+                return None;
+            };
+            if member.ty.has_indeterminate_inference(db, &self.env) {
+                return None;
+            }
+            // Even a declared property can raise AttributeError. Only guaranteed,
+            // immutable instance storage proves that the fallback cannot be used.
+            let value = if receiver.has_immutable_field_path(db, &self.env, &[Name::new(name)]) {
+                member.ty
+            } else {
+                UnionType::from_elements(db, &self.env, [member.ty, default.unwrap_or(Type::Never)])
+            };
+            Some(self.attribute_comparison_may_match(value, rhs_type, operator, is_positive))
+        })
     }
 
     fn narrow_attribute_path(
@@ -5971,10 +6045,29 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         rebound: Option<&PlaceExpr>,
         may_match: impl Fn(Type<'db>) -> bool,
     ) -> Option<NarrowingConstraints<'db>> {
+        self.narrow_receiver_path(inference, &attribute.value, rebound, |receiver| {
+            let Place::Defined(member) = receiver
+                .resolve_type_alias(self.db)
+                .member(self.db, &self.env, attribute.attr.as_str())
+                .place
+            else {
+                return None;
+            };
+            member.is_definitely_defined().then(|| may_match(member.ty))
+        })
+    }
+
+    fn narrow_receiver_path(
+        &self,
+        inference: &ExpressionInference<'db>,
+        receiver: &ast::Expr,
+        rebound: Option<&PlaceExpr>,
+        may_match: impl Fn(Type<'db>) -> Option<bool>,
+    ) -> Option<NarrowingConstraints<'db>> {
         // A comparison can rebind an ancestor after reading the tag. The tag then
         // describes the old object, not any of the continuing attribute places.
         if let Some(rebound) = rebound {
-            let mut ancestor = &*attribute.value;
+            let mut ancestor = receiver;
             loop {
                 if PlaceExpr::try_from_expr(ancestor).as_ref() == Some(rebound) {
                     return None;
@@ -5989,16 +6082,14 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         let db = self.db;
         let mut constraints = NarrowingConstraints::default();
         let mut reversed_path = SmallVec::<[&str; 4]>::new();
-        let mut attribute = attribute;
+        let mut receiver = receiver;
         loop {
-            reversed_path.push(attribute.attr.as_str());
-            let receiver = &*attribute.value;
             let Some(place) = PlaceExpr::try_from_expr(receiver) else {
                 break;
             };
             if let Type::Union(union) = inference.expression_type(receiver).resolve_type_alias(db) {
-                // Evaluate the entire tag path on each outer arm. A union within the
-                // path can still match if any of its alternatives permits the tag.
+                // Evaluate the entire receiver path on each outer arm. A missing
+                // intermediate cannot prove which value the lookup returned.
                 let narrowed = union.filter(db, |element| {
                     reversed_path
                         .iter()
@@ -6011,7 +6102,8 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                             };
                             member.is_definitely_defined().then_some(member.ty)
                         })
-                        .is_none_or(&may_match)
+                        .and_then(&may_match)
+                        .unwrap_or(true)
                 });
                 if narrowed != Type::Union(union) {
                     constraints.insert(
@@ -6023,7 +6115,8 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             let ast::Expr::Attribute(parent) = receiver else {
                 break;
             };
-            attribute = parent;
+            reversed_path.push(parent.attr.as_str());
+            receiver = &parent.value;
         }
         (!constraints.is_empty()).then_some(constraints)
     }

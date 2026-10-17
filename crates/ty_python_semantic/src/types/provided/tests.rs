@@ -1378,6 +1378,163 @@ other = record({'guard': guard, 'target': target})
 ";
 
 #[test]
+fn supplied_storage_getattr_comparisons_preserve_saved_receivers() -> anyhow::Result<()> {
+    let declarations = format!(
+        "{FIELD_IMPLICATION_DECLARATIONS}\
+from typing import final
+@final
+class Version(str): ...
+class Closed:
+    def __getattr__(self, name: str) -> object: ...
+number: int
+text: str
+maybe_version: str | None
+version: Version
+"
+    );
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", &declarations)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .with_getattr_result_provider(|db, definition, _, _| {
+            if definition.name(db).as_deref() == Some("__getattr__")
+                && definition
+                    .program_file(db)
+                    .file(db)
+                    .path(db)
+                    .as_system_path()
+                    .is_some_and(|path| path.as_str() == "/src/native.pyi")
+            {
+                ProvidedGetattrPresence::Absent.into()
+            } else {
+                ProvidedGetattrResult::default()
+            }
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (definition, right, before, condition, expected) in [
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "getattr(ctx.attr, 'runtime_jre_version', None) is not None",
+            vec![],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "runtime_version is not None",
+            vec![],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': version}, base=Closed)",
+            "",
+            "runtime_version != None",
+            vec![],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "runtime_version != None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': maybe_version}, base=Closed)",
+            "",
+            "runtime_version is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "class Property(Closed):\n    @property\n    def runtime_jre_version(self) -> str:\n        raise AttributeError()\n",
+            "Property()",
+            "",
+            "getattr(ctx.attr, 'runtime_jre_version', None) is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "class Intercepted(Closed):\n    def __getattribute__(self, name: str) -> str:\n        raise AttributeError()\n",
+            "Intercepted()",
+            "",
+            "runtime_version is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "    ctx = record({'attr': right, 'marker': text})\n",
+            "runtime_version is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "    runtime_version = None\n",
+            "runtime_version is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "getattr(ctx.attr, 'runtime_jre_version', default) == None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "getattr(ctx.attr, (name := 'runtime_jre_version'), None) is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "getattr(ctx.attr, 'runtime_jre_version', ((ctx := record({'attr': right, 'marker': text})), None)[1]) is not None",
+            vec!["invalid-assignment"],
+        ),
+    ] {
+        let fallback = if expected.is_empty() {
+            "ctx.attr.jre_version"
+        } else {
+            "'fallback'"
+        };
+        let source = format!(
+            "from native import record, Closed, flag, number, text, maybe_version, version\n{definition}\
+def run(default: object):
+    left = record({{'jre_version': text}}, base=Closed)
+    right = {right}
+    ctx = record({{'attr': left, 'marker': number}}) if flag else record({{'attr': right, 'marker': text}})
+    runtime_version = getattr(ctx.attr, 'runtime_jre_version', None)
+{before}    if {condition}:
+        pass
+    else:
+        marker: int = ctx.marker
+        print(marker)
+        runtime_version = {fallback}
+    runtime_version = runtime_version or 'default'
+    print(runtime_version)
+"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{source}: {diagnostics:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_storage_preserves_subscript_continuation() -> anyhow::Result<()> {
     let declarations = format!(
         "{FIELD_IMPLICATION_DECLARATIONS}\
