@@ -3671,3 +3671,35 @@ def with_packs(
     reveal_type(packed(nested_unknown, pair))  # revealed: tuple[Unknown | int, tuple[int, str]]
     reveal_type(packed(direct_any, pair))  # revealed: tuple[Unknown, tuple[int, str]]
 ```
+
+## Literal constraints from sibling callbacks
+
+Fresh collection elements retain literal evidence until sibling callback constraints have supplied
+their context. Ordinary mutable inference and prebound inputs retain their existing behavior.
+
+```py
+from typing import Callable, Literal, TypeVar
+
+T = TypeVar("T", bound=str)
+
+def apply(callback: Callable[[list[T]], object], values: list[T]) -> list[T]:
+    callback(values)
+    return values
+
+def exact(values: list[Literal["foo"]]) -> object:
+    return values
+
+def broad(values: list[str]) -> object:
+    return values
+
+apply(exact, ["foo"])  # no diagnostic
+apply(values=["foo"], callback=exact)  # no diagnostic
+result = apply(exact, ["foo"])
+reveal_type(result)  # revealed: list[Literal["foo"]]
+reveal_type(apply(broad, ["foo"]))  # revealed: list[str]
+apply(exact, ["wrong"])  # error: [invalid-argument-type]
+
+def supplied(narrow: list[Literal["foo"]], wide: list[str]):
+    apply(exact, narrow)  # no diagnostic
+    apply(exact, wide)  # error: [invalid-argument-type]
+```

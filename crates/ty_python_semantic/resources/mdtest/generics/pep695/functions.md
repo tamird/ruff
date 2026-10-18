@@ -4216,5 +4216,102 @@ def with_packs(
     reveal_type(packed(direct_any, pair))  # revealed: tuple[Unknown, tuple[int, str]]
 ```
 
+## Literal constraints from sibling callbacks
+
+A fresh collection can use a callback's literal constraint before its elements widen to their
+ordinary instance types. This works independently of keyword order and expected result context.
+
+```py
+from collections.abc import Callable, Sequence
+from typing import Any, Literal, Protocol
+from ty_extensions._internal import Unknown
+
+def apply[T: str](callback: Callable[[list[T]], object], values: list[T]) -> list[T]:
+    callback(values)
+    return values
+
+def exact(values: list[Literal["foo"]]) -> object:
+    return values
+
+def alternatives(values: list[Literal["foo", "bar"]]) -> object:
+    return values
+
+apply(exact, ["foo"])  # no diagnostic
+apply(values=["foo"], callback=exact)  # no diagnostic
+result = apply(exact, ["foo"])
+reveal_type(result)  # revealed: list[Literal["foo"]]
+reveal_type(apply(alternatives, ["foo", "bar"]))  # revealed: list[Literal["foo", "bar"]]
+apply(exact, ["wrong"])  # error: [invalid-argument-type]
+
+class Rule[T: str](Protocol):
+    def __call__(self, *, values: list[T]) -> object: ...
+
+def keyword[T: str](callback: Rule[T], values: list[T]) -> None:
+    callback(values=values)
+
+def exact_keyword(*, values: list[Literal["foo"]]) -> object:
+    return values
+
+keyword(exact_keyword, ["foo"])  # no diagnostic
+keyword(values=["foo"], callback=exact_keyword)  # no diagnostic
+keyword(exact_keyword, ["wrong"])  # error: [invalid-argument-type]
+```
+
+Without a literal constraint, mutable elements still widen. Previously inferred containers and real
+gradual elements keep their existing types.
+
+```py
+def broad(values: list[str]) -> object:
+    return values
+
+def sequence(values: Sequence[str]) -> object:
+    return values
+
+def collect[T](values: list[T]) -> list[T]:
+    return values
+
+reveal_type(apply(broad, ["foo"]))  # revealed: list[str]
+reveal_type(apply(sequence, ["foo"]))  # revealed: list[str]
+reveal_type(collect(["foo"]))  # revealed: list[str]
+
+def supplied(
+    narrow: list[Literal["foo"]],
+    wide: list[str],
+    gradual: list[Any],
+    unknown: list[Unknown],
+    gradual_element: Any,
+    unknown_element: Unknown,
+):
+    apply(exact, narrow)  # no diagnostic
+    apply(exact, wide)  # error: [invalid-argument-type]
+    reveal_type(collect(gradual))  # revealed: list[Any]
+    reveal_type(collect(unknown))  # revealed: list[Unknown]
+    reveal_type(collect([gradual_element]))  # revealed: list[Any]
+    reveal_type(collect([unknown_element]))  # revealed: list[Unknown]
+```
+
+In a dictionary, a missing key or value context does not defer the other slot's ordinary inference.
+
+```py
+def values[T](callback: Callable[[dict[str, T]], object], data: dict[str, T]) -> dict[str, T]:
+    callback(data)
+    return data
+
+def keys[T](callback: Callable[[dict[T, int]], object], data: dict[T, int]) -> dict[T, int]:
+    callback(data)
+    return data
+
+def exact_value(data: dict[str, Literal["foo"]]) -> object:
+    return data
+
+def exact_key(data: dict[Literal["foo"], int]) -> object:
+    return data
+
+reveal_type(values(exact_value, {"key": "foo"}))  # revealed: dict[str, Literal["foo"]]
+reveal_type(keys(exact_key, {"foo": 1}))  # revealed: dict[Literal["foo"], int]
+values(exact_value, {1: "foo"})  # error: [invalid-argument-type]
+keys(exact_key, {"foo": "wrong"})  # error: [invalid-argument-type]
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

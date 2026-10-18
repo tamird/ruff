@@ -8129,6 +8129,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .or_never()
         });
 
+        let has_unspecialized_context = tcx
+            .annotation
+            .is_some_and(|ty| ty.has_unspecialized_type_var(db, env));
+
         // Collect type constraints from the declared element types.
         //
         // We use a forward assignability check (`identity_instance ≤ tcx`) to infer what each
@@ -8572,10 +8576,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     continue;
                 }
 
+                // Keep promotable evidence until sibling arguments have supplied the missing
+                // element context. Eager widening here can make a literal-only callback
+                // incompatible before the next generic inference round can constrain the list.
+                let defer_promotion =
+                    has_unspecialized_context && elt_tcx.is_none_or(|ty| ty.is_never());
+                let promoted_elt_ty = if defer_promotion {
+                    inferred_elt_ty
+                } else {
+                    inferred_elt_ty.promote(db, env)
+                };
                 // A covariant context is an upper bound, so promotion must not widen an otherwise
                 // compatible element beyond that bound. In particular, promoting an exact float
                 // introduces `int`, which is not assignable to an exact-float context.
-                let promoted_elt_ty = inferred_elt_ty.promote(db, env);
                 let inferred_elt_ty = if let Some(elt_tcx) = elt_tcx
                     && elt_tcx_variance[&elt_ty_identity].is_covariant()
                     && promoted_elt_ty != inferred_elt_ty
