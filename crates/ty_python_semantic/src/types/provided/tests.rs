@@ -263,7 +263,7 @@ fn intersections_preserve_unambiguous_provided_data() -> anyhow::Result<()> {
 }
 
 #[test]
-fn supplied_readonly_fields_use_return_variance() -> anyhow::Result<()> {
+fn supplied_readonly_fields_preserve_type_variables() -> anyhow::Result<()> {
     #[expect(
         clippy::needless_pass_by_value,
         reason = "the type application hook requires this signature"
@@ -306,7 +306,7 @@ fn supplied_readonly_fields_use_return_variance() -> anyhow::Result<()> {
             "/src/main.py",
             r#"
 from schema import Field
-from typing import Callable, Literal
+from typing import Callable, Literal, TypeVar, assert_type
 
 def scalar[T](value: T) -> Field[T]:
     raise NotImplementedError
@@ -322,12 +322,34 @@ values = mutable("text").value
 values.append("other")
 context: Field[list[str]] = mutable("text")
 accepts("text")(scalar("other"))
+
+# Recursive properties share the enclosing legacy type-variable traversal.
+type Recursive = Field[dict[str, Recursive]]
+T = TypeVar("T")
+
+def recursive_member(value: Field[tuple[Recursive, T]]) -> None: ...
+
+def identity_after_recursive(value: Recursive, item: T) -> T:
+    return item
+
+def check_recursive(value: Recursive, integer: int, text: str) -> None:
+    assert_type(identity_after_recursive(value, integer), int)
+    assert_type(identity_after_recursive(value, text), str)
 "#,
         )
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     let diagnostics = db.check_file(file);
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let member = crate::place::global_symbol(&db, db.program_file(file), "recursive_member")
+        .place
+        .expect_type();
+    let Type::FunctionLiteral(member) = member else {
+        anyhow::bail!("Expected a function, got {member:?}");
+    };
+    let signature = member.last_definition_signature(&db);
+    let context = signature.generic_context.context("missing legacy binder")?;
+    assert_eq!(context.variables(&db).len(), 1);
     let source = source_text(&db, file).to_string();
     db.write_file(
         "/src/main.py",

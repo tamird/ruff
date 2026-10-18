@@ -1840,10 +1840,10 @@ impl<'db> ProtocolMemberData<'db> {
         env: &ProgramEnvironment<'db>,
         binding_context: Option<Definition<'db>>,
         typevars: &mut FxOrderSet<BoundTypeVarInstance<'db>>,
-        _visitor: &FindLegacyTypeVarsVisitor<'db>,
+        visitor: &FindLegacyTypeVarsVisitor<'db>,
     ) {
         for member_type in self.kind.member_types() {
-            member_type.find_legacy_typevars(db, env, binding_context, typevars);
+            member_type.find_legacy_typevars_impl(db, env, binding_context, typevars, visitor);
         }
     }
 
