@@ -23,10 +23,10 @@ use crate::types::{
     IntersectionBuilder, IntersectionType, KnownClass, KnownInstanceType, LiteralValueTypeKind,
     MemberLookupPolicy, Parameter, Parameters, Signature, SpecialFormType, SubclassOfInner,
     SubclassOfType, Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnfoldResult,
-    UnionBuilder, binding_type, class_pattern_positional_sources,
-    definite_match_pattern_type_for_subject, exact_sequence_pattern_type, infer_expression_types,
-    mapping_pattern_type, pattern_binding_fallthrough_type, sequence_pattern_type_builder,
-    singleton_pattern_type, starred_sequence_pattern_type, typed_dict_matches_class_pattern,
+    UnionBuilder, class_pattern_positional_sources, definite_match_pattern_type_for_subject,
+    exact_sequence_pattern_type, infer_expression_types, mapping_pattern_type,
+    pattern_binding_fallthrough_type, sequence_pattern_type_builder, singleton_pattern_type,
+    starred_sequence_pattern_type, typed_dict_matches_class_pattern,
 };
 use crate::{Db, ProgramEnvironment};
 use ty_python_core::ast_ids::HasScopedUseId;
@@ -48,7 +48,6 @@ use ruff_python_ast::helpers::any_over_expr;
 use ruff_python_ast::name::Name;
 use ruff_python_stdlib::identifiers::is_identifier;
 
-use super::UnionType;
 use super::call::CallArguments;
 use super::constraints::{ConstraintSetBuilder, Solutions};
 use super::equality::{
@@ -56,6 +55,7 @@ use super::equality::{
     evaluate_type_equality, evaluate_type_inequality,
 };
 use super::match_pattern::is_typed_dict_runtime_domain;
+use super::{FunctionBodyDomain, UnionType};
 use itertools::{Either, Itertools};
 use ruff_python_ast as ast;
 use ruff_python_ast::{BoolOp, ExprBoolOp};
@@ -86,6 +86,7 @@ pub(crate) fn infer_narrowing_constraints<'db>(
     db: &'db dyn Db,
     predicate: Predicate<'db>,
     place: ScopedPlaceId,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> (
     Option<NarrowingConstraint<'db>>,
     Option<NarrowingConstraint<'db>>,
@@ -94,7 +95,12 @@ pub(crate) fn infer_narrowing_constraints<'db>(
         PredicateNode::Expression(expression)
         | PredicateNode::Condition(expression)
         | PredicateNode::ChainedComparisonCondition(expression) => {
-            let constraints = all_narrowing_constraints_for_expression(db, expression);
+            let constraints = domain
+                .filter(|domain| domain.scope(db) == expression.scope(db))
+                .map_or_else(
+                    || all_narrowing_constraints_for_expression(db, expression),
+                    |domain| all_body_narrowing_constraints_for_expression(db, expression, domain),
+                );
             (constraints.get(place, true), constraints.get(place, false))
         }
         PredicateNode::Pattern(pattern) => {
@@ -498,8 +504,15 @@ fn all_narrowing_constraints_for_pattern<'db>(
     let python_file = program_file.python_file(db);
     let env = ProgramEnvironment::from_file(program_file);
     let module = parsed_module(db, python_file).load(db);
-    NarrowingConstraintsBuilder::new(db, &env, &module, PredicateNode::Pattern(pattern), true)
-        .finish()
+    NarrowingConstraintsBuilder::new(
+        db,
+        &env,
+        &module,
+        PredicateNode::Pattern(pattern),
+        true,
+        None,
+    )
+    .finish()
 }
 
 #[salsa::tracked(
@@ -511,14 +524,37 @@ fn all_narrowing_constraints_for_expression<'db>(
     db: &'db dyn Db,
     expression: Expression<'db>,
 ) -> ExpressionNarrowingConstraints<'db> {
+    infer_expression_narrowing_constraints(db, expression, None)
+}
+
+#[salsa::tracked(
+    returns(ref),
+    cycle_initial=|_, _, _, _| ExpressionNarrowingConstraints::Inferred { positive: None, negative: None },
+    heap_size=ruff_memory_usage::heap_size,
+)]
+fn all_body_narrowing_constraints_for_expression<'db>(
+    db: &'db dyn Db,
+    expression: Expression<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> ExpressionNarrowingConstraints<'db> {
+    debug_assert_eq!(expression.scope(db), domain.scope(db));
+    infer_expression_narrowing_constraints(db, expression, Some(domain))
+}
+
+fn infer_expression_narrowing_constraints<'db>(
+    db: &'db dyn Db,
+    expression: Expression<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> ExpressionNarrowingConstraints<'db> {
     let program_file = expression.program_file(db);
     let python_file = program_file.python_file(db);
     let env = ProgramEnvironment::from_file(program_file);
     let module = parsed_module(db, python_file).load(db);
     let predicate = PredicateNode::Expression(expression);
-    let mut positive = NarrowingConstraintsBuilder::new(db, &env, &module, predicate, true);
+    let mut positive = NarrowingConstraintsBuilder::new(db, &env, &module, predicate, true, domain);
     let positive_constraints = positive.finish();
-    let mut negative = NarrowingConstraintsBuilder::new(db, &env, &module, predicate, false);
+    let mut negative =
+        NarrowingConstraintsBuilder::new(db, &env, &module, predicate, false, domain);
     let negative_constraints = negative.finish();
 
     if positive.is_provisional || negative.is_provisional {
@@ -544,8 +580,15 @@ fn all_negative_narrowing_constraints_for_pattern<'db>(
     let python_file = program_file.python_file(db);
     let env = ProgramEnvironment::from_file(program_file);
     let module = parsed_module(db, python_file).load(db);
-    NarrowingConstraintsBuilder::new(db, &env, &module, PredicateNode::Pattern(pattern), false)
-        .finish()
+    NarrowingConstraintsBuilder::new(
+        db,
+        &env,
+        &module,
+        PredicateNode::Pattern(pattern),
+        false,
+        None,
+    )
+    .finish()
 }
 
 #[salsa::tracked(
@@ -568,6 +611,7 @@ fn all_narrowing_constraints_for_subject_element_pattern<'db>(
         &module,
         PredicateNode::SubjectElementPattern(SubjectElementPatternPredicate { pattern, target }),
         true,
+        None,
     )
     .finish()
 }
@@ -2086,6 +2130,7 @@ struct NarrowingConstraintsBuilder<'db, 'ast> {
     predicate: PredicateNode<'db>,
     is_positive: bool,
     is_provisional: bool,
+    body_domain: Option<FunctionBodyDomain<'db>>,
 }
 
 impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
@@ -2095,6 +2140,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         module: &'ast ParsedModuleRef,
         predicate: PredicateNode<'db>,
         is_positive: bool,
+        body_domain: Option<FunctionBodyDomain<'db>>,
     ) -> Self {
         Self {
             db,
@@ -2103,6 +2149,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             predicate,
             is_positive,
             is_provisional: false,
+            body_domain,
         }
     }
 
@@ -2216,7 +2263,12 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             }
             ast::Expr::Attribute(attribute) => {
                 let constraints = self.evaluate_simple_expr(expression_node, is_positive);
-                let inference = infer_expression_types(db, expression, TypeContext::default());
+                let inference = infer_expression_with_body_domain(
+                    db,
+                    expression,
+                    TypeContext::default(),
+                    self.body_domain,
+                );
                 if inference.is_provisional() {
                     self.is_provisional = true;
                     return None;
@@ -2261,7 +2313,12 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             }
             ast::Expr::Subscript(subscript) => {
                 let constraints = self.evaluate_simple_expr(expression_node, is_positive);
-                let inference = infer_expression_types(db, expression, TypeContext::default());
+                let inference = infer_expression_with_body_domain(
+                    db,
+                    expression,
+                    TypeContext::default(),
+                    self.body_domain,
+                );
                 let typeddict_constraints = self
                     .narrow_typeddict_subscript_by_truthiness(
                         inference.expression_type(&*subscript.value),
@@ -2319,15 +2376,29 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 .symbol_by_name(name.id.as_str())
                 .is_some_and(Symbol::is_local);
 
+        let unreachable = |binding: &ty_python_core::BindingWithConstraints<'_, 'db>| {
+            self.body_domain
+                .map_or_else(
+                    || binding_reachability(db, use_def, binding),
+                    |domain| {
+                        crate::reachability::evaluate_reachability_in_domain(
+                            db,
+                            scope,
+                            binding.reachability_constraint,
+                            Some(domain),
+                        )
+                    },
+                )
+                .is_always_false()
+        };
         use_def
             .bindings_at_use(name.scoped_use_id(db, expression.program_file(db)))
             .all(|binding| {
                 let Some(definition) = binding.binding.definition() else {
-                    return unbound_is_terminal
-                        || binding_reachability(db, use_def, &binding).is_always_false();
+                    return unbound_is_terminal || unreachable(&binding);
                 };
                 if self.binding_assigns_alias(definition, alias_key, unbound_is_terminal)
-                    || binding_reachability(db, use_def, &binding).is_always_false()
+                    || unreachable(&binding)
                 {
                     return true;
                 }
@@ -2338,11 +2409,13 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
 
                 // A different binding need not prevent narrowing if it cannot produce this
                 // outcome: `if not check: check = x is None` still narrows `x` when `check` is false.
-                let ty = binding.narrowing_constraint.narrow(
+                let ty = binding.narrowing_constraint.narrow_in_domain(
                     db,
                     &self.env,
-                    binding_type(db, definition),
+                    infer_definition_with_body_domain(db, definition, self.body_domain)
+                        .binding_type(definition),
                     definition.place(db),
+                    self.body_domain,
                 );
                 // `Never` cannot produce either outcome, even though its truthiness is ambiguous.
                 ty.is_never() || ty.bool(db, &self.env) == Truthiness::from(!is_positive)
@@ -2487,9 +2560,14 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         is_positive: bool,
     ) -> Option<NarrowingConstraints<'db>> {
         let db = self.db;
-        let test_truthiness = infer_expression_types(db, expression, TypeContext::default())
-            .expression_type(&expr_if.test)
-            .bool(db, &self.env);
+        let test_truthiness = infer_expression_with_body_domain(
+            db,
+            expression,
+            TypeContext::default(),
+            self.body_domain,
+        )
+        .expression_type(&expr_if.test)
+        .bool(db, &self.env);
 
         match test_truthiness {
             Truthiness::AlwaysTrue => {
@@ -4716,7 +4794,12 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             return None;
         }
 
-        let inference = infer_expression_types(db, expression, TypeContext::default());
+        let inference = infer_expression_with_body_domain(
+            db,
+            expression,
+            TypeContext::default(),
+            self.body_domain,
+        );
 
         let mut constraints = NarrowingConstraints::default();
 
@@ -5138,7 +5221,12 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         is_positive: bool,
     ) -> Option<NarrowingConstraints<'db>> {
         let db = self.db;
-        let inference = infer_expression_types(db, expression, TypeContext::default());
+        let inference = infer_expression_with_body_domain(
+            db,
+            expression,
+            TypeContext::default(),
+            self.body_domain,
+        );
 
         // During loop inference, even the callee can temporarily be `Divergent`. Treating that
         // as a call with no narrowing would expose unguarded alternatives to the loop body. For
@@ -5695,7 +5783,12 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         is_positive: bool,
     ) -> Option<NarrowingConstraints<'db>> {
         let db = self.db;
-        let inference = infer_expression_types(db, expression, TypeContext::default());
+        let inference = infer_expression_with_body_domain(
+            db,
+            expression,
+            TypeContext::default(),
+            self.body_domain,
+        );
         let env = self.env.clone();
         let sub_constraints = expr_bool_op
             .values
@@ -6327,17 +6420,29 @@ pub(crate) trait NarrowingEvaluatorExtension<'db> {
         env: &ProgramEnvironment<'db>,
         base_type: Type<'db>,
         place: ScopedPlaceId,
-    ) -> Type<'db>;
-}
+    ) -> Type<'db> {
+        self.narrow_in_domain(db, env, base_type, place, None)
+    }
 
-impl<'db> NarrowingEvaluatorExtension<'db> for NarrowingEvaluator<'_, 'db> {
-    fn narrow(
+    fn narrow_in_domain(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         base_type: Type<'db>,
         place: ScopedPlaceId,
+        domain: Option<FunctionBodyDomain<'db>>,
+    ) -> Type<'db>;
+}
+
+impl<'db> NarrowingEvaluatorExtension<'db> for NarrowingEvaluator<'_, 'db> {
+    fn narrow_in_domain(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        base_type: Type<'db>,
+        place: ScopedPlaceId,
+        domain: Option<FunctionBodyDomain<'db>>,
     ) -> Type<'db> {
-        narrow_type_by_constraint(db, env, self, base_type, place)
+        narrow_type_by_constraint(db, env, self, base_type, place, domain)
     }
 }

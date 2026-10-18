@@ -349,8 +349,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             {
                 continue;
             }
-            let (positive, negative) =
-                crate::types::infer_narrowing_constraints(db, predicate, place);
+            let (positive, negative) = crate::types::infer_narrowing_constraints(
+                db,
+                predicate,
+                place,
+                self.context.body_domain,
+            );
             let impossible = |narrowing: Option<NarrowingConstraint<'db>>| {
                 narrowing.is_some_and(|narrowing| {
                     NarrowingConstraint::intersection(constraint)

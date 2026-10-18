@@ -2138,11 +2138,10 @@ fn place_from_bindings_impl<'db>(
                         NarrowingProjector::new(
                             db,
                             env,
-                            narrowing_constraint.narrowing_constraints(),
-                            predicates,
-                            narrowing_constraint.predicate_narrowing_targets(),
+                            &narrowing_constraint,
                             binding.place(db),
                             binding_ty,
+                            body_domain,
                         )
                     })
                     .narrow(constraint, binding_ty),

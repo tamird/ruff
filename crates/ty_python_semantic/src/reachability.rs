@@ -205,9 +205,9 @@ use crate::{
         CallableType, ComparisonSoundnessPolicy, EnumClassLiteral, KnownInstanceType,
         NarrowingConstraint, SpecialFormType, Type, TypeContext, UnionType,
         definite_match_pattern_type, definite_match_pattern_type_for_subject, equality_truthiness,
-        expand_type, infer_expression_types, infer_expression_with_body_domain,
-        infer_narrowing_constraints, infer_same_file_expression_type, mapping_pattern_type,
-        pattern_binding_fallthrough_type, sequence_pattern_type_builder, singleton_pattern_type,
+        expand_type, infer_expression_with_body_domain, infer_narrowing_constraints,
+        infer_same_file_expression_type, mapping_pattern_type, pattern_binding_fallthrough_type,
+        sequence_pattern_type_builder, singleton_pattern_type,
     },
 };
 use ruff_db::parsed::parsed_module;
@@ -1005,6 +1005,7 @@ pub(crate) fn narrow_type_by_constraint<'db>(
     evaluator: &NarrowingEvaluator<'_, 'db>,
     base_ty: Type<'db>,
     place: ScopedPlaceId,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> Type<'db> {
     let id = evaluator.constraint();
     match id {
@@ -1013,16 +1014,7 @@ pub(crate) fn narrow_type_by_constraint<'db>(
         _ => {}
     }
 
-    NarrowingProjector::new(
-        db,
-        env,
-        evaluator.narrowing_constraints(),
-        evaluator.predicates(),
-        evaluator.predicate_narrowing_targets(),
-        place,
-        base_ty,
-    )
-    .narrow(id, base_ty)
+    NarrowingProjector::new(db, env, evaluator, place, base_ty, domain).narrow(id, base_ty)
 }
 
 fn apply_accumulated_narrowing<'db>(
@@ -1125,6 +1117,26 @@ impl<'db> ProjectedNarrowingCheckpoint<'db> {
             Self::Narrowed(ty) => ty,
         }
     }
+
+    fn cycle_normalized(
+        self,
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        previous: Self,
+        base_ty: Type<'db>,
+        cycle: &salsa::Cycle,
+    ) -> Self {
+        match self {
+            Self::Narrowed(ty) => Self::Narrowed(ty.cycle_normalized(
+                db,
+                &ProgramEnvironment::from_scope(scope),
+                previous.ty(base_ty),
+                cycle,
+            )),
+            Self::Unreachable => self,
+            Self::Unconstrained => self,
+        }
+    }
 }
 
 /// Evaluates a stable suffix with the canonical projected-graph evaluator.
@@ -1136,12 +1148,7 @@ impl<'db> ProjectedNarrowingCheckpoint<'db> {
     returns(copy),
     cycle_initial = |_, id, _, _, _, _| ProjectedNarrowingCheckpoint::Narrowed(Type::divergent(id)),
     cycle_fn = |db: &'db dyn Db, cycle, previous: &ProjectedNarrowingCheckpoint<'db>, result: ProjectedNarrowingCheckpoint<'db>, scope: ScopeId<'db>, _, _, base_ty| {
-        match result {
-            ProjectedNarrowingCheckpoint::Narrowed(ty) => ProjectedNarrowingCheckpoint::Narrowed(
-                ty.cycle_normalized(db, &ProgramEnvironment::from_scope(scope), previous.ty(base_ty), cycle)
-            ),
-            _ => result,
-        }
+        result.cycle_normalized(db, scope, *previous, base_ty, cycle)
     },
     heap_size = get_size2::GetSize::get_heap_size
 )]
@@ -1152,18 +1159,48 @@ fn evaluate_projected_narrowing_checkpoint<'db>(
     constraint: ScopedNarrowingConstraint,
     base_ty: Type<'db>,
 ) -> ProjectedNarrowingCheckpoint<'db> {
+    evaluate_projected_narrowing_checkpoint_impl(db, scope, place, constraint, base_ty, None)
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, id, _, _, _, _, _| ProjectedNarrowingCheckpoint::Narrowed(Type::divergent(id)),
+    cycle_fn = |db: &'db dyn Db, cycle, previous: &ProjectedNarrowingCheckpoint<'db>, result: ProjectedNarrowingCheckpoint<'db>, scope: ScopeId<'db>, _, _, base_ty, _| {
+        result.cycle_normalized(db, scope, *previous, base_ty, cycle)
+    },
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn evaluate_body_projected_narrowing_checkpoint<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    place: ScopedPlaceId,
+    constraint: ScopedNarrowingConstraint,
+    base_ty: Type<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> ProjectedNarrowingCheckpoint<'db> {
+    debug_assert_eq!(scope, domain.scope(db));
+    evaluate_projected_narrowing_checkpoint_impl(
+        db,
+        scope,
+        place,
+        constraint,
+        base_ty,
+        Some(domain),
+    )
+}
+
+fn evaluate_projected_narrowing_checkpoint_impl<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    place: ScopedPlaceId,
+    constraint: ScopedNarrowingConstraint,
+    base_ty: Type<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> ProjectedNarrowingCheckpoint<'db> {
     let env = ProgramEnvironment::from_scope(scope);
     let use_def = use_def_map(db, scope);
     let evaluator = use_def.narrowing_evaluator(constraint);
-    let mut projector = NarrowingProjector::new(
-        db,
-        &env,
-        evaluator.narrowing_constraints(),
-        use_def.predicates(),
-        evaluator.predicate_narrowing_targets(),
-        place,
-        base_ty,
-    );
+    let mut projector = NarrowingProjector::new(db, &env, &evaluator, place, base_ty, domain);
     let root = projector.project(constraint, false);
     match root {
         ProjectedNarrowingNodeId::ALWAYS_FALSE => ProjectedNarrowingCheckpoint::Unreachable,
@@ -1181,6 +1218,8 @@ pub(crate) struct NarrowingProjector<'a, 'db> {
     predicate_narrowing_targets: &'a PredicateNarrowingTargets,
     place: ScopedPlaceId,
     base_ty: Type<'db>,
+    /// All local caches belong to this immutable domain as well as the selected place/type.
+    body_domain: Option<FunctionBodyDomain<'db>>,
     /// Checkpoint entries retain narrowed types, so projections are specific to the binding type.
     project_cache: FxHashMap<(ScopedNarrowingConstraint, Type<'db>), ProjectedNarrowingNodeId>,
     graph: ProjectedNarrowingGraph<'db>,
@@ -1192,20 +1231,20 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
     pub(crate) fn new(
         db: &'db dyn Db,
         env: &'a ProgramEnvironment<'db>,
-        constraints: &'a NarrowingConstraints,
-        predicates: &'a IndexSlice<ScopedPredicateId, Predicate<'db>>,
-        predicate_narrowing_targets: &'a PredicateNarrowingTargets,
+        evaluator: &NarrowingEvaluator<'a, 'db>,
         place: ScopedPlaceId,
         base_ty: Type<'db>,
+        body_domain: Option<FunctionBodyDomain<'db>>,
     ) -> Self {
         Self {
             db,
             env,
-            constraints,
-            predicates,
-            predicate_narrowing_targets,
+            constraints: evaluator.narrowing_constraints(),
+            predicates: evaluator.predicates(),
+            predicate_narrowing_targets: evaluator.predicate_narrowing_targets(),
             place,
             base_ty,
+            body_domain,
             project_cache: FxHashMap::default(),
             graph: ProjectedNarrowingGraph::default(),
             narrowed_cache: FxHashMap::default(),
@@ -1288,8 +1327,12 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
             return cached.clone();
         }
 
-        let constraints =
-            infer_narrowing_constraints(db, self.predicates[predicate_id], self.place);
+        let constraints = infer_narrowing_constraints(
+            db,
+            self.predicates[predicate_id],
+            self.place,
+            self.body_domain,
+        );
         self.graph
             .predicate_constraints_cache
             .insert(predicate_id, constraints.clone());
@@ -1496,13 +1539,31 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                                     | PredicateNode::FinallyNormalPathImpossible { .. }
                             ))
                     {
-                        let checkpoint = evaluate_projected_narrowing_checkpoint(
-                            db,
-                            predicate_scope(db, &predicate),
-                            self.place,
-                            id,
-                            self.base_ty,
-                        );
+                        let scope = predicate_scope(db, &predicate);
+                        let checkpoint = self
+                            .body_domain
+                            .filter(|domain| domain.scope(db) == scope)
+                            .map_or_else(
+                                || {
+                                    evaluate_projected_narrowing_checkpoint(
+                                        db,
+                                        scope,
+                                        self.place,
+                                        id,
+                                        self.base_ty,
+                                    )
+                                },
+                                |domain| {
+                                    evaluate_body_projected_narrowing_checkpoint(
+                                        db,
+                                        scope,
+                                        self.place,
+                                        id,
+                                        self.base_ty,
+                                        domain,
+                                    )
+                                },
+                            );
                         let projected = match checkpoint {
                             ProjectedNarrowingCheckpoint::Unreachable => {
                                 ProjectedNarrowingNodeId::ALWAYS_FALSE
@@ -1544,7 +1605,12 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                 Action::AnalyzeNonTerminal(id) => {
                     let node = self.constraints.get_interior_node(id);
                     let predicate = self.predicates[node.atom];
-                    let branch = match analyze_single(db, self.env, &predicate) {
+                    let branch = match analyze_single_in_domain(
+                        db,
+                        self.env,
+                        &predicate,
+                        self.body_domain,
+                    ) {
                         Truthiness::AlwaysTrue => node.if_true,
                         Truthiness::AlwaysFalse => node.if_false,
                         Truthiness::Ambiguous => {
@@ -1575,7 +1641,12 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                         // This node represents `if_uncertain || (P && if_true) || (!P && if_false)`.
                         // Since the predicate `P` cannot narrow this place, remove it while retaining only branches that `P` can take.
                         // Including a statically unreachable branch could erase narrowing from the reachable branch.
-                        match analyze_single(self.db, self.env, &self.predicates[node.atom]) {
+                        match analyze_single_in_domain(
+                            self.db,
+                            self.env,
+                            &self.predicates[node.atom],
+                            self.body_domain,
+                        ) {
                             Truthiness::AlwaysTrue => self.or(if_true, if_uncertain),
                             Truthiness::AlwaysFalse => self.or(if_false, if_uncertain),
                             Truthiness::Ambiguous => {
@@ -2215,10 +2286,6 @@ fn analyze_reachability_atom<'db>(
     ReachabilityAtom::Known(analyze_single_in_domain(db, env, predicate, domain))
 }
 
-fn analyze_single(db: &dyn Db, env: &ProgramEnvironment<'_>, predicate: &Predicate) -> Truthiness {
-    analyze_single_in_domain(db, env, predicate, None)
-}
-
 fn analyze_single_in_domain<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -2226,6 +2293,7 @@ fn analyze_single_in_domain<'db>(
     domain: Option<FunctionBodyDomain<'db>>,
 ) -> Truthiness {
     let _span = tracing::trace_span!("analyze_single", ?predicate).entered();
+    let domain = domain.filter(|domain| domain.scope(db) == predicate_scope(db, predicate));
 
     match predicate.node {
         PredicateNode::Expression(test_expr) => {
@@ -2241,7 +2309,8 @@ fn analyze_single_in_domain<'db>(
             )
             .negate_if(!predicate.is_positive),
         PredicateNode::ChainedComparisonCondition(test_expr) => {
-            let inference = infer_expression_types(db, test_expr, TypeContext::default());
+            let inference =
+                infer_expression_with_body_domain(db, test_expr, TypeContext::default(), domain);
             let expression = test_expr.node_ref(db);
             inference
                 .comparison_truthiness(expression)
@@ -3109,12 +3178,13 @@ class TargetB:
                 let mut projector = NarrowingProjector::new(
                     &db,
                     &env,
-                    &constraints,
-                    &predicates,
-                    evaluator.predicate_narrowing_targets(),
+                    &evaluator,
                     ScopedPlaceId::Symbol(x),
                     Type::unknown(),
+                    None,
                 );
+                projector.constraints = &constraints;
+                projector.predicates = &predicates;
 
                 assert_eq!(
                     projector.project(ScopedNarrowingConstraint::new(DEPTH - 1), false),

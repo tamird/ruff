@@ -1525,7 +1525,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 return None;
             }
             let place = places.symbol_id(&name.id)?;
-            let (constraint, _) = infer_narrowing_constraints(db, predicate, place.into());
+            let (constraint, _) =
+                infer_narrowing_constraints(db, predicate, place.into(), self.context.body_domain);
             NarrowingConstraint::intersection(ty)
                 .merge_constraint_and(constraint?)
                 .evaluate_constraint_type(db, env)
