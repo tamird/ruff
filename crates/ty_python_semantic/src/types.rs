@@ -162,6 +162,8 @@ mod function;
 mod generics;
 pub mod ide_support;
 mod infer;
+pub(crate) use infer::FunctionBodyDomain;
+pub use infer::{BodyDomainError, check_overload_body};
 mod instance;
 mod iteration;
 mod known_instance;

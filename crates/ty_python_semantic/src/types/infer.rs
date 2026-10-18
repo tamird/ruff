@@ -73,7 +73,10 @@ use ty_python_core::statement::StatementInner;
 use ty_python_core::unpack::Unpack;
 use ty_python_core::{ExpressionNodeKey, SemanticIndex, Statement, Truthiness, semantic_index};
 
+mod body_domain;
 mod builder;
+pub(crate) use body_domain::FunctionBodyDomain;
+pub use body_domain::{BodyDomainError, check_overload_body};
 mod implicit_alias;
 pub(super) use implicit_alias::implicit_alias_parameters;
 mod comparisons;
@@ -269,6 +272,14 @@ pub(crate) fn infer_definition_types<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
 ) -> DefinitionInference<'db> {
+    infer_definition_region(db, definition, None)
+}
+
+fn infer_definition_region<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> DefinitionInference<'db> {
     let program_file = definition.program_file(db);
     let python_file = program_file.python_file(db);
     let module = parsed_module(db, python_file).load(db);
@@ -292,6 +303,7 @@ pub(crate) fn infer_definition_types<'db>(
         index,
         &module,
     )
+    .with_body_domain(domain)
     .finish_definition(definition)
 }
 
@@ -567,6 +579,14 @@ pub(crate) fn infer_scope_types_impl<'db>(
     db: &'db dyn Db,
     input: InferScope<'db>,
 ) -> ScopeInference<'db> {
+    infer_scope_region(db, input, None)
+}
+
+fn infer_scope_region<'db>(
+    db: &'db dyn Db,
+    input: InferScope<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> ScopeInference<'db> {
     let (scope, tcx) = input.into_inner(db);
     let program_file = scope.program_file(db);
     let python_file = program_file.python_file(db);
@@ -590,6 +610,7 @@ pub(crate) fn infer_scope_types_impl<'db>(
         index,
         &module,
     )
+    .with_body_domain(domain)
     .finish_scope()
 }
 
@@ -619,6 +640,14 @@ pub(super) fn infer_expression_types_impl<'db>(
     db: &'db dyn Db,
     input: InferExpression<'db>,
 ) -> ExpressionInference<'db> {
+    infer_expression_region(db, input, None)
+}
+
+fn infer_expression_region<'db>(
+    db: &'db dyn Db,
+    input: InferExpression<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> ExpressionInference<'db> {
     let (expression, tcx) = input.into_inner(db);
 
     let program_file = expression.program_file(db);
@@ -645,6 +674,7 @@ pub(super) fn infer_expression_types_impl<'db>(
         index,
         &module,
     )
+    .with_body_domain(domain)
     .finish_expression()
 }
 
@@ -714,16 +744,30 @@ pub(super) fn infer_statement_types<'db>(
     db: &'db dyn Db,
     statement: Statement<'db>,
 ) -> StatementInference<'db> {
+    infer_statement_with_body_domain(db, statement, None)
+}
+
+fn infer_statement_with_body_domain<'db>(
+    db: &'db dyn Db,
+    statement: Statement<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> StatementInference<'db> {
     match statement {
-        Statement::Expression(expression) => StatementInference::Expression(
-            infer_expression_types(db, expression, TypeContext::default()),
+        Statement::Expression(expression) => StatementInference::Expression(domain.map_or_else(
+            || infer_expression_types(db, expression, TypeContext::default()),
+            |domain| domain.infer_expression(db, expression, TypeContext::default()),
+        )),
+        Statement::Definition(definition) => StatementInference::Definition(
+            definition,
+            domain.map_or_else(
+                || infer_definition_types(db, definition),
+                |domain| domain.infer_definition(db, definition),
+            ),
         ),
-        Statement::Definition(definition) => {
-            StatementInference::Definition(definition, infer_definition_types(db, definition))
-        }
-        Statement::Other(statement) => {
-            StatementInference::Other(infer_statement_types_impl(db, statement))
-        }
+        Statement::Other(statement) => StatementInference::Other(domain.map_or_else(
+            || infer_statement_types_impl(db, statement),
+            |domain| domain.infer_statement_region(db, statement),
+        )),
     }
 }
 
@@ -741,6 +785,14 @@ pub(super) fn infer_statement_types<'db>(
 fn infer_statement_types_impl<'db>(
     db: &'db dyn Db,
     statement: StatementInner<'db>,
+) -> StatementInferenceInner<'db> {
+    infer_statement_region(db, statement, None)
+}
+
+fn infer_statement_region<'db>(
+    db: &'db dyn Db,
+    statement: StatementInner<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> StatementInferenceInner<'db> {
     let program_file = statement.program_file(db);
     let python_file = program_file.python_file(db);
@@ -766,6 +818,7 @@ fn infer_statement_types_impl<'db>(
         index,
         &module,
     )
+    .with_body_domain(domain)
     .finish_statement()
 }
 
@@ -773,7 +826,7 @@ fn infer_statement_types_impl<'db>(
 ///
 /// This is a Salsa supertype used as the input to `infer_expression_types` to avoid
 /// interning an `ExpressionWithContext` unnecessarily when no type context is provided.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, salsa::Supertype)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, salsa::Supertype, salsa::SalsaValue)]
 pub(super) enum InferExpression<'db> {
     Bare(Expression<'db>),
     WithContext(ExpressionWithContext<'db>),

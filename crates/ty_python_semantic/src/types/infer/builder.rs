@@ -543,6 +543,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
+    pub(super) fn with_body_domain(
+        mut self,
+        domain: Option<super::FunctionBodyDomain<'db>>,
+    ) -> Self {
+        self.context.body_domain = domain;
+        self
+    }
+
+    fn infer_body_definition(
+        &self,
+        definition: Definition<'db>,
+    ) -> &'db super::DefinitionInference<'db> {
+        self.context.body_domain.map_or_else(
+            || infer_definition_types(self.db(), definition),
+            |domain| domain.infer_definition(self.db(), definition),
+        )
+    }
+
     fn reachability_cache(&self) -> &ReachabilityEvaluationCache<'db> {
         self.reachability_cache
             .get_or_init(|| {
@@ -1791,6 +1809,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             env,
             prior_bindings,
             self.reachability_cache(),
+            self.context.body_domain,
         )
         .place
         .with_qualifiers(TypeQualifiers::empty())
@@ -2252,7 +2271,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn infer_definition(&mut self, node: impl Into<DefinitionNodeKey> + std::fmt::Debug + Copy) {
         let definition = self.index.expect_single_definition(node);
-        let result = infer_definition_types(self.db(), definition);
+        let result = self.infer_body_definition(definition);
         self.extend_definition(definition, result);
     }
 
@@ -2741,6 +2760,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 env,
                 bindings,
                 self.reachability_cache(),
+                self.context.body_domain,
             )
             .place
             .raw_type() else {
@@ -5489,7 +5509,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn infer_return_statement(&mut self, ret: &ast::StmtReturn) {
         let db = self.db();
         let env = self.program_environment();
-        let tcx = if ret.value.is_some() {
+        let tcx = if let Some(domain) = self.context.body_domain {
+            TypeContext::new(Some(domain.return_type(db)))
+        } else if ret.value.is_some() {
             nearest_enclosing_function(db, self.index, self.scope())
                 .map(|func| {
                     // When inferring expressions within a function body,
@@ -6731,7 +6753,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn infer_standalone_statement_impl(&mut self, standalone_statement: Statement<'db>) {
-        let types = infer_statement_types(self.db(), standalone_statement);
+        let types = self.context.body_domain.map_or_else(
+            || infer_statement_types(self.db(), standalone_statement),
+            |domain| domain.infer_statement(self.db(), standalone_statement),
+        );
         self.extend_statement(&types);
     }
 
@@ -6909,7 +6934,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         tcx: TypeContext<'db>,
         bindings_owner: BindingsOwner,
     ) -> Type<'db> {
-        let types = infer_expression_types(self.db(), standalone_expression, tcx);
+        let types = self.context.body_domain.map_or_else(
+            || infer_expression_types(self.db(), standalone_expression, tcx),
+            |domain| domain.infer_expression(self.db(), standalone_expression, tcx),
+        );
         match bindings_owner {
             BindingsOwner::Definition => self.extend_expression(types),
             BindingsOwner::Statement => self.extend_expression_without_bindings(types),
@@ -11565,6 +11593,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     env,
                     bindings,
                     self.reachability_cache(),
+                    self.context.body_domain,
                 )
                 .place;
 
@@ -11667,6 +11696,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         env,
                         use_def.bindings_at_use(use_id),
                         self.reachability_cache(),
+                        self.context.body_domain,
                     )
                     .place
                 }
@@ -11676,6 +11706,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         env,
                         use_def.reachable_bindings(place_id),
                         self.reachability_cache(),
+                        self.context.body_domain,
                     )
                     .place
                 }
@@ -13367,6 +13398,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         builder.deferred_state = deferred_state;
         builder.typevar_binding_context = typevar_binding_context;
         builder.context.inference_flags = self.inference_flags();
+        builder.context.body_domain = self.context.body_domain;
         builder.expression_cache.clone_from(expression_cache);
         builder.reachability_cache.clone_from(reachability_cache);
         builder

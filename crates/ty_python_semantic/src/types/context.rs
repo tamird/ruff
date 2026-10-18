@@ -19,7 +19,7 @@ use crate::importer::Importer;
 use crate::lint::LintSource;
 use crate::reachability::is_range_reachable;
 use crate::types::function::FunctionDecorators;
-use crate::types::infer::InferenceFlags;
+use crate::types::infer::{FunctionBodyDomain, InferenceFlags};
 use crate::{
     Db, Program,
     lint::{LintId, LintMetadata},
@@ -163,6 +163,7 @@ pub(crate) struct InferContext<'db, 'ast> {
     module: &'ast ParsedModuleRef,
     diagnostics: std::cell::RefCell<TypeCheckDiagnostics>,
     diagnostics_suppressed: bool,
+    pub(crate) body_domain: Option<FunctionBodyDomain<'db>>,
     /// This field tracks various flags that control how type inference should behave in the current context.
     pub(crate) inference_flags: InferenceFlags,
     bomb: DebugDropBomb,
@@ -190,6 +191,7 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
             program_file,
             diagnostics: std::cell::RefCell::new(TypeCheckDiagnostics::default()),
             diagnostics_suppressed: false,
+            body_domain: None,
             inference_flags: InferenceFlags::empty(),
             bomb: DebugDropBomb::new(
                 "`InferContext` needs to be explicitly consumed by calling `::finish` to prevent accidental loss of diagnostics.",

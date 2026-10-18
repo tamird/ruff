@@ -5,7 +5,7 @@ use crate::{
     types::{
         CallableType, CheckedCall, ClassBase, ClassLiteral, ClassType, DynamicType,
         IntersectionBuilder, KnownClass, KnownInstanceType, NarrowingConstraint, ParamSpecAttrKind,
-        SpecialFormType, SubclassOfInner, SubclassOfType, Type, TypeContext,
+        SpecialFormType, SubclassOfInner, SubclassOfType, Type, TypeAndQualifiers, TypeContext,
         TypeVarBoundOrConstraints, TypeVarKind, UnionBuilder, UnionType,
         callable::CallableTypeKind,
         constraints::ConstraintSetBuilder,
@@ -409,7 +409,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         self.infer_scope_body(&function.body);
 
-        let returns = SourceAnnotation::function_return(db, self.program_file(), function);
+        let return_declaration = self.context.body_domain.map_or(function, |domain| {
+            domain
+                .overload(db)
+                .body_scope(db)
+                .node(db)
+                .expect_function()
+                .node(self.module())
+        });
+        let returns =
+            SourceAnnotation::function_return(db, self.program_file(), return_declaration);
         let supplied_return = if returns.is_none() {
             db.provided_function_return_type(self.index.expect_single_definition(function))
         } else {
@@ -458,11 +467,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 },
                 |returns| returns.ty,
             );
-            let expected_return = supplied_return.map_or_else(
-                || ExpectedReturnType::from_function(db, enclosing_function),
-                |returns| ExpectedReturnType {
-                    public: returns.ty,
-                    lexical: returns.ty,
+            let declared_ty = self
+                .context
+                .body_domain
+                .map_or(declared_ty, |domain| domain.return_type(db));
+            let expected_return = self.context.body_domain.map_or_else(
+                || {
+                    supplied_return.map_or_else(
+                        || ExpectedReturnType::from_function(db, enclosing_function),
+                        |returns| ExpectedReturnType {
+                            public: returns.ty,
+                            lexical: returns.ty,
+                        },
+                    )
+                },
+                |domain| ExpectedReturnType {
+                    public: domain.return_type(db),
+                    lexical: domain.return_type(db),
                 },
             );
             let expected_ty = expected_return.public();
@@ -1562,6 +1583,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         definition: Definition<'db>,
         ty: Type<'db>,
     ) {
+        let entry_ty = self
+            .context
+            .body_domain
+            .and_then(|domain| domain.parameter_type(self.db(), definition))
+            .unwrap_or(ty);
         if definition
             .category(self.db(), self.module())
             .is_declaration()
@@ -1569,11 +1595,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.add_declaration_with_binding(
                 parameter.into(),
                 definition,
-                &DeclaredAndInferredType::are_the_same_type(ty),
+                &if self.context.body_domain.is_some() {
+                    DeclaredAndInferredType::MightBeDifferent {
+                        declared_ty: TypeAndQualifiers::declared(ty),
+                        inferred_ty: entry_ty,
+                    }
+                } else {
+                    DeclaredAndInferredType::are_the_same_type(ty)
+                },
             );
         } else {
             self.add_binding(parameter.into(), definition)
-                .insert(self, ty);
+                .insert(self, entry_ty);
         }
     }
 

@@ -18,9 +18,9 @@ use crate::reachability::{
     refine_initial_binding_reachability,
 };
 use crate::types::{
-    DynamicType, KnownClass, MemberLookupPolicy, Type, TypeAndQualifiers, TypeQualifiers,
-    UnionBuilder, UnionType, binding_type, inferred_declaration, is_discarded_dict_key_assignment,
-    may_exist_at_runtime,
+    DynamicType, FunctionBodyDomain, KnownClass, MemberLookupPolicy, Type, TypeAndQualifiers,
+    TypeQualifiers, UnionBuilder, UnionType, binding_type, inferred_declaration,
+    is_discarded_dict_key_assignment, may_exist_at_runtime,
 };
 use crate::{Db, FxIndexSet, FxOrderSet};
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
@@ -862,6 +862,7 @@ pub(super) fn place_from_bindings<'db>(
         RequiresExplicitReExport::No,
         None,
         None,
+        None,
     )
 }
 
@@ -870,6 +871,7 @@ pub(super) fn place_from_bindings_with_reachability_cache<'db>(
     env: &ProgramEnvironment<'db>,
     bindings_with_constraints: BindingWithConstraintsIterator<'_, 'db>,
     reachability_cache: &ReachabilityEvaluationCache<'db>,
+    body_domain: Option<FunctionBodyDomain<'db>>,
 ) -> PlaceWithDefinition<'db> {
     place_from_bindings_impl(
         db,
@@ -878,6 +880,7 @@ pub(super) fn place_from_bindings_with_reachability_cache<'db>(
         RequiresExplicitReExport::No,
         Some(reachability_cache),
         None,
+        body_domain,
     )
 }
 
@@ -896,6 +899,7 @@ pub(super) fn place_from_bindings_assuming_boolean<'db>(
         RequiresExplicitReExport::No,
         None,
         Some((identity, value)),
+        None,
     )
 }
 
@@ -1414,6 +1418,7 @@ pub(crate) fn place_by_id<'db>(
             requires_explicit_reexport,
             None,
             None,
+            None,
         )
         .place
         .with_qualifiers(qualifiers);
@@ -1439,6 +1444,7 @@ pub(crate) fn place_by_id<'db>(
                 &env,
                 bindings,
                 requires_explicit_reexport,
+                None,
                 None,
                 None,
             )
@@ -1498,6 +1504,7 @@ pub(crate) fn place_by_id<'db>(
                 requires_explicit_reexport,
                 None,
                 None,
+                None,
             );
 
             let place = match inferred.place {
@@ -1548,6 +1555,7 @@ pub(crate) fn place_by_id<'db>(
                 &env,
                 bindings,
                 requires_explicit_reexport,
+                None,
                 None,
                 None,
             )
@@ -1949,6 +1957,7 @@ fn place_from_bindings_impl<'db>(
     requires_explicit_reexport: RequiresExplicitReExport,
     reachability_cache: Option<&ReachabilityEvaluationCache<'db>>,
     boolean_assumption: Option<(BooleanIdentity<'_, 'db>, bool)>,
+    body_domain: Option<FunctionBodyDomain<'db>>,
 ) -> PlaceWithDefinition<'db> {
     let predicates = bindings_with_constraints.predicates();
     let reachability_constraints = bindings_with_constraints.reachability_constraints();
@@ -2119,7 +2128,10 @@ fn place_from_bindings_impl<'db>(
 
             first_definition.get_or_insert(binding);
             provenance = provenance.or(Provenance::SingleDefinition(binding));
-            let binding_ty = binding_type(db, binding);
+            let binding_ty = body_domain.map_or_else(
+                || binding_type(db, binding),
+                |domain| domain.infer_definition(db, binding).binding_type(binding),
+            );
             let narrowed = match narrowing_constraint.constraint() {
                 ScopedNarrowingConstraint::ALWAYS_TRUE => binding_ty,
                 ScopedNarrowingConstraint::ALWAYS_FALSE => Type::Never,
