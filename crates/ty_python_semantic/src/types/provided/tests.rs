@@ -2233,7 +2233,7 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
         ),
         (
             "values: dict[str, tuple[int, ...]] = {'first': ()}\nwhile flag:\n    values['first'] += (1,)\nresult = observe(values)",
-            "first: tuple[()] | tuple[*tuple[Literal[1], ...], Literal[1]]",
+            "first: tuple[Literal[1], ...]",
         ),
         (
             "values = {'first': 1 for _ in range(2)}\nresult = observe(values)",
