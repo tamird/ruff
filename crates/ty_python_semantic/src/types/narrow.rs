@@ -9,7 +9,8 @@ use crate::reachability::{
 use crate::subscript::PyIndex;
 use crate::types::function::KnownFunction;
 use crate::types::infer::{
-    ExpressionInference, infer_definition_types, infer_same_file_expression_type,
+    ExpressionInference, infer_definition_with_body_domain, infer_expression_with_body_domain,
+    infer_same_file_expression_type,
 };
 use crate::types::iteration::extract_literal_container_element_types;
 use crate::types::match_pattern::PatternCacheKey;
@@ -358,10 +359,7 @@ pub(crate) fn is_stable_boolean_guard<'db>(
     {
         return false;
     }
-    let original = domain.map_or_else(
-        || infer_definition_types(db, definition),
-        |domain| domain.infer_definition(db, definition),
-    );
+    let original = infer_definition_with_body_domain(db, definition, domain);
     if original.is_provisional()
         || !original
             .binding_type(definition)
@@ -370,10 +368,8 @@ pub(crate) fn is_stable_boolean_guard<'db>(
     {
         return false;
     }
-    let occurrence = domain.map_or_else(
-        || infer_expression_types(db, expression, TypeContext::default()),
-        |domain| domain.infer_expression(db, expression, TypeContext::default()),
-    );
+    let occurrence =
+        infer_expression_with_body_domain(db, expression, TypeContext::default(), domain);
     if occurrence.is_provisional() {
         return false;
     }

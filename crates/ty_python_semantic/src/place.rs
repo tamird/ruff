@@ -19,8 +19,8 @@ use crate::reachability::{
 };
 use crate::types::{
     DynamicType, FunctionBodyDomain, KnownClass, MemberLookupPolicy, Type, TypeAndQualifiers,
-    TypeQualifiers, UnionBuilder, UnionType, binding_type, inferred_declaration,
-    is_discarded_dict_key_assignment, may_exist_at_runtime,
+    TypeQualifiers, UnionBuilder, UnionType, infer_definition_with_body_domain,
+    inferred_declaration, is_discarded_dict_key_assignment, may_exist_at_runtime,
 };
 use crate::{Db, FxIndexSet, FxOrderSet};
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
@@ -2128,10 +2128,8 @@ fn place_from_bindings_impl<'db>(
 
             first_definition.get_or_insert(binding);
             provenance = provenance.or(Provenance::SingleDefinition(binding));
-            let binding_ty = body_domain.map_or_else(
-                || binding_type(db, binding),
-                |domain| domain.infer_definition(db, binding).binding_type(binding),
-            );
+            let binding_ty =
+                infer_definition_with_body_domain(db, binding, body_domain).binding_type(binding);
             let narrowed = match narrowing_constraint.constraint() {
                 ScopedNarrowingConstraint::ALWAYS_TRUE => binding_ty,
                 ScopedNarrowingConstraint::ALWAYS_FALSE => Type::Never,

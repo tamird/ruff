@@ -748,27 +748,55 @@ pub(super) fn infer_statement_types<'db>(
     infer_statement_with_body_domain(db, statement, None)
 }
 
-fn infer_statement_with_body_domain<'db>(
+/// Keep module declarations and other scopes on their ordinary query identity.
+pub(crate) fn infer_definition_with_body_domain<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> &'db DefinitionInference<'db> {
+    if let Some(domain) = domain.filter(|domain| domain.scope(db) == definition.scope(db)) {
+        body_domain::infer_body_definition(db, definition, domain)
+    } else {
+        infer_definition_types(db, definition)
+    }
+}
+
+pub(crate) fn infer_expression_with_body_domain<'db>(
+    db: &'db dyn Db,
+    expression: Expression<'db>,
+    tcx: TypeContext<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> &'db ExpressionInference<'db> {
+    if let Some(domain) = domain.filter(|domain| domain.scope(db) == expression.scope(db)) {
+        body_domain::infer_body_expression(db, InferExpression::new(db, expression, tcx), domain)
+    } else {
+        infer_expression_types(db, expression, tcx)
+    }
+}
+
+pub(crate) fn infer_statement_with_body_domain<'db>(
     db: &'db dyn Db,
     statement: Statement<'db>,
     domain: Option<FunctionBodyDomain<'db>>,
 ) -> StatementInference<'db> {
     match statement {
-        Statement::Expression(expression) => StatementInference::Expression(domain.map_or_else(
-            || infer_expression_types(db, expression, TypeContext::default()),
-            |domain| domain.infer_expression(db, expression, TypeContext::default()),
-        )),
+        Statement::Expression(expression) => StatementInference::Expression(
+            infer_expression_with_body_domain(db, expression, TypeContext::default(), domain),
+        ),
         Statement::Definition(definition) => StatementInference::Definition(
             definition,
-            domain.map_or_else(
-                || infer_definition_types(db, definition),
-                |domain| domain.infer_definition(db, definition),
-            ),
+            infer_definition_with_body_domain(db, definition, domain),
         ),
-        Statement::Other(statement) => StatementInference::Other(domain.map_or_else(
-            || infer_statement_types_impl(db, statement),
-            |domain| domain.infer_statement_region(db, statement),
-        )),
+        Statement::Other(statement) => {
+            let inference = if let Some(domain) =
+                domain.filter(|domain| domain.scope(db) == statement.scope(db))
+            {
+                body_domain::infer_body_statement(db, statement, domain)
+            } else {
+                infer_statement_types_impl(db, statement)
+            };
+            StatementInference::Other(inference)
+        }
     }
 }
 

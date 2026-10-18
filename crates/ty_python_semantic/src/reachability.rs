@@ -205,9 +205,9 @@ use crate::{
         CallableType, ComparisonSoundnessPolicy, EnumClassLiteral, KnownInstanceType,
         NarrowingConstraint, SpecialFormType, Type, TypeContext, UnionType,
         definite_match_pattern_type, definite_match_pattern_type_for_subject, equality_truthiness,
-        expand_type, infer_expression_types, infer_narrowing_constraints,
-        infer_same_file_expression_type, mapping_pattern_type, pattern_binding_fallthrough_type,
-        sequence_pattern_type_builder, singleton_pattern_type,
+        expand_type, infer_expression_types, infer_expression_with_body_domain,
+        infer_narrowing_constraints, infer_same_file_expression_type, mapping_pattern_type,
+        pattern_binding_fallthrough_type, sequence_pattern_type_builder, singleton_pattern_type,
     },
 };
 use ruff_db::parsed::parsed_module;
@@ -2051,10 +2051,8 @@ fn condition_truthiness<'db>(
 ) -> Truthiness {
     let env = ProgramEnvironment::from_scope(expression.scope(db));
     let module = parsed_module(db, expression.python_file(db)).load(db);
-    let inference = domain.map_or_else(
-        || infer_expression_types(db, expression, TypeContext::default()),
-        |domain| domain.infer_expression(db, expression, TypeContext::default()),
-    );
+    let inference =
+        infer_expression_with_body_domain(db, expression, TypeContext::default(), domain);
     analyze_condition_expression(expression.node_ref(db).node(&module), &|node| {
         inference
             .comparison_truthiness(node)
@@ -2147,17 +2145,12 @@ fn analyze_single_in_domain<'db>(
     let _span = tracing::trace_span!("analyze_single", ?predicate).entered();
 
     match predicate.node {
-        PredicateNode::Expression(test_expr) => domain
-            .map_or_else(
-                || infer_same_file_expression_type(db, test_expr, TypeContext::default()),
-                |domain| {
-                    domain
-                        .infer_expression(db, test_expr, TypeContext::default())
-                        .expression_type(test_expr.node_ref(db))
-                },
-            )
-            .bool(db, env)
-            .negate_if(!predicate.is_positive),
+        PredicateNode::Expression(test_expr) => {
+            infer_expression_with_body_domain(db, test_expr, TypeContext::default(), domain)
+                .expression_type(test_expr.node_ref(db))
+                .bool(db, env)
+                .negate_if(!predicate.is_positive)
+        }
         PredicateNode::Condition(test_expr) => domain
             .map_or_else(
                 || analyze_condition(db, test_expr),

@@ -33,7 +33,8 @@ use super::{
     ExpressionInferenceExtra, FrozenMap, FrozenSet, FrozenValueMap, FunctionDecoratorInference,
     InferenceRegion, OtherDefinitionInferenceExtra, ScopeInference, ScopeInferenceExtra,
     extend_collection_use_constraints, infer_deferred_types, infer_definition_types,
-    infer_expression_types, infer_same_file_expression_type, infer_unpack_types,
+    infer_definition_with_body_domain, infer_expression_types, infer_expression_with_body_domain,
+    infer_same_file_expression_type, infer_statement_with_body_domain, infer_unpack_types,
 };
 use crate::diagnostic::format_enumeration;
 use crate::place::{
@@ -555,10 +556,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         &self,
         definition: Definition<'db>,
     ) -> &'db super::DefinitionInference<'db> {
-        self.context.body_domain.map_or_else(
-            || infer_definition_types(self.db(), definition),
-            |domain| domain.infer_definition(self.db(), definition),
-        )
+        infer_definition_with_body_domain(self.db(), definition, self.context.body_domain)
     }
 
     fn reachability_cache(&self) -> &ReachabilityEvaluationCache<'db> {
@@ -6753,9 +6751,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn infer_standalone_statement_impl(&mut self, standalone_statement: Statement<'db>) {
-        let types = self.context.body_domain.map_or_else(
-            || infer_statement_types(self.db(), standalone_statement),
-            |domain| domain.infer_statement(self.db(), standalone_statement),
+        let types = infer_statement_with_body_domain(
+            self.db(),
+            standalone_statement,
+            self.context.body_domain,
         );
         self.extend_statement(&types);
     }
@@ -6934,9 +6933,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         tcx: TypeContext<'db>,
         bindings_owner: BindingsOwner,
     ) -> Type<'db> {
-        let types = self.context.body_domain.map_or_else(
-            || infer_expression_types(self.db(), standalone_expression, tcx),
-            |domain| domain.infer_expression(self.db(), standalone_expression, tcx),
+        let types = infer_expression_with_body_domain(
+            self.db(),
+            standalone_expression,
+            tcx,
+            self.context.body_domain,
         );
         match bindings_owner {
             BindingsOwner::Definition => self.extend_expression(types),

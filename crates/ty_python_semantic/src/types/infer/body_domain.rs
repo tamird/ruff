@@ -7,18 +7,14 @@
 use itertools::Itertools;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
-use ty_python_core::Statement;
 use ty_python_core::definition::Definition;
-use ty_python_core::expression::Expression;
 use ty_python_core::scope::ScopeId;
 use ty_python_core::statement::StatementInner;
 
 use super::{
     DefinitionInference, ExpressionInference, FunctionType, InferExpression, InferScope,
-    ScopeInference, StatementInference, StatementInferenceInner, TypeContext,
-    infer_definition_region, infer_definition_types, infer_expression_region,
-    infer_expression_types, infer_scope_region, infer_statement_region,
-    infer_statement_with_body_domain,
+    ScopeInference, StatementInferenceInner, TypeContext, infer_definition_region,
+    infer_definition_types, infer_expression_region, infer_scope_region, infer_statement_region,
 };
 use crate::types::call::Argument;
 use crate::types::constraints::ConstraintSetBuilder;
@@ -99,50 +95,6 @@ impl<'db> FunctionBodyDomain<'db> {
         self.parameters(db)
             .iter()
             .find_map(|(parameter, ty)| (*parameter == definition).then_some(*ty))
-    }
-
-    pub(crate) fn infer_definition(
-        self,
-        db: &'db dyn Db,
-        definition: Definition<'db>,
-    ) -> &'db DefinitionInference<'db> {
-        if definition.scope(db) == self.scope(db) {
-            infer_body_definition(db, definition, self)
-        } else {
-            // Module functions, annotations, and all public callable declarations keep their
-            // ordinary query identity. A domain only changes bindings inside its own body.
-            infer_definition_types(db, definition)
-        }
-    }
-
-    pub(super) fn infer_statement(
-        self,
-        db: &'db dyn Db,
-        statement: Statement<'db>,
-    ) -> StatementInference<'db> {
-        infer_statement_with_body_domain(db, statement, Some(self))
-    }
-
-    pub(super) fn infer_statement_region(
-        self,
-        db: &'db dyn Db,
-        statement: StatementInner<'db>,
-    ) -> &'db StatementInferenceInner<'db> {
-        debug_assert_eq!(statement.scope(db), self.scope(db));
-        infer_body_statement(db, statement, self)
-    }
-
-    pub(crate) fn infer_expression(
-        self,
-        db: &'db dyn Db,
-        expression: Expression<'db>,
-        tcx: TypeContext<'db>,
-    ) -> &'db ExpressionInference<'db> {
-        if expression.scope(db) == self.scope(db) {
-            infer_body_expression(db, InferExpression::new(db, expression, tcx), self)
-        } else {
-            infer_expression_types(db, expression, tcx)
-        }
     }
 }
 
@@ -566,7 +518,7 @@ fn infer_body_scope<'db>(db: &'db dyn Db, domain: FunctionBodyDomain<'db>) -> Sc
     cycle_fn=|db, cycle, previous: &DefinitionInference<'db>, inference: DefinitionInference<'db>, definition: Definition<'db>, _| inference.cycle_normalized(db, previous, cycle, definition),
     heap_size=ruff_memory_usage::heap_size
 )]
-fn infer_body_definition<'db>(
+pub(super) fn infer_body_definition<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
     domain: FunctionBodyDomain<'db>,
@@ -583,7 +535,7 @@ fn infer_body_definition<'db>(
     },
     heap_size=ruff_memory_usage::heap_size
 )]
-fn infer_body_expression<'db>(
+pub(super) fn infer_body_expression<'db>(
     db: &'db dyn Db,
     input: InferExpression<'db>,
     domain: FunctionBodyDomain<'db>,
@@ -599,7 +551,7 @@ fn infer_body_expression<'db>(
     },
     heap_size=ruff_memory_usage::heap_size
 )]
-fn infer_body_statement<'db>(
+pub(super) fn infer_body_statement<'db>(
     db: &'db dyn Db,
     statement: StatementInner<'db>,
     domain: FunctionBodyDomain<'db>,
