@@ -7,6 +7,7 @@ use ruff_python_parser::{ParseError, ParseErrorType, Parsed};
 use ruff_text_size::{Ranged, TextRange};
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::node_key::NodeKey;
+use ty_python_core::scope::{NodeWithScopeKind, ScopeId};
 use ty_python_core::{
     ExpressionNodeKey, ProgramFile, ProvidedAnnotation, global_scope, semantic_index,
 };
@@ -292,6 +293,47 @@ impl Ranged for SourceAnnotation<'_, '_> {
             } => *range,
         }
     }
+}
+
+/// The donor definition of a type parameter adopted by this source function.
+/// Source bindings retain lexical ownership; the adopted parameter occupies the otherwise
+/// implicit annotation scope between the function body and its enclosing scopes.
+pub(crate) fn external_function_type_parameter<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    name: &str,
+) -> Option<Definition<'db>> {
+    let file = scope.program_file(db);
+    let index = semantic_index(db, file);
+    let table = index.place_table(scope.file_scope_id(db));
+    if let Some(symbol) = table.symbol_id(name).map(|id| table.symbol(id))
+        && (symbol.is_bound() || symbol.is_declared() || symbol.is_global() || symbol.is_nonlocal())
+    {
+        return None;
+    }
+    let context = adopted_function_generic_context(db, scope)?;
+    let variable = context
+        .variables(db)
+        .find(|variable| variable.name(db) == name)?;
+    variable.typevar(db).definition(db)
+}
+
+#[salsa::tracked(returns(copy))]
+fn adopted_function_generic_context<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+) -> Option<GenericContext<'db>> {
+    let NodeWithScopeKind::Function(function) = scope.node(db) else {
+        return None;
+    };
+    let file = scope.program_file(db);
+    let module = parsed_module(db, file.python_file(db)).load(db);
+    let function = function.node(&module);
+    if function.type_params.is_some() {
+        return None;
+    }
+    let (_, context) = SourceAnnotation::external_function_generic_context(db, file, function)?;
+    Some(context)
 }
 
 #[salsa::tracked(returns(copy))]

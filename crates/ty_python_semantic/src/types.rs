@@ -186,6 +186,7 @@ mod set_theoretic;
 mod signatures;
 mod special_form;
 mod string_annotation;
+pub(crate) use string_annotation::external_function_type_parameter;
 mod subclass_of;
 #[cfg(test)]
 pub(crate) mod tests;

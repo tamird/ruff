@@ -77,8 +77,13 @@ pub fn definitions_for_name<'db>(
         return vec![];
     };
     let scope = scope.to_scope_id(db, model.program_file());
-    let definitions =
-        definition_resolution::scoped_definitions_for_name(db, scope, name_str, alias_resolution);
+    let definitions = definition_resolution::scoped_definitions_for_name(
+        db,
+        scope,
+        name_str,
+        alias_resolution,
+        model.builtin_usage(node) == crate::provided::BuiltinUsage::Annotation,
+    );
     if !definitions.is_empty() {
         return definitions;
     }

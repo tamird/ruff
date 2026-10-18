@@ -95,6 +95,7 @@ use ty_python_core::{
 };
 
 use crate::Db;
+use crate::types::external_function_type_parameter;
 
 /// Returns an iterator over the steps that resolve a value for a place load.
 pub(crate) fn resolve_place_load<'db, 'ast>(
@@ -111,6 +112,7 @@ pub(crate) fn resolve_place_load<'db, 'ast>(
             scope,
             file: scope.program_file(db),
             mode,
+            external_type_parameters: false,
         },
         place_expr,
     )
@@ -216,6 +218,15 @@ impl<'db> Iterator for PlaceLoadResolution<'db, '_> {
                             PlaceLoadSourceRole::Ordinary,
                         ),
                     ));
+                }
+                PlaceLoadResolutionNode::ExternalTypeParameterSource(scopes) => {
+                    if let Some(source) = self.external_type_parameter_source(self.context.scope) {
+                        self.next_node = Some(PlaceLoadResolutionNode::Failure(
+                            PlaceLoadFailure::UnboundFree,
+                        ));
+                        return Some(PlaceLoadResolutionStep::Source(source));
+                    }
+                    self.next_node = Some(PlaceLoadResolutionNode::EnclosingScopeSource(scopes));
                 }
                 PlaceLoadResolutionNode::EnclosingScopeSource(mut scopes) => {
                     let (next_node, source) = self.resolve_enclosing_scopes(&mut scopes);
@@ -342,6 +353,27 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
         }
     }
 
+    /// Include adopted function type parameters while resolving an annotation name.
+    pub(crate) fn with_external_type_parameters(mut self) -> Self {
+        self.context.external_type_parameters = true;
+        self
+    }
+
+    fn external_type_parameter_source(&self, scope: ScopeId<'db>) -> Option<PlaceLoadSource<'db>> {
+        if !self.context.external_type_parameters {
+            return None;
+        }
+        let name = self.loaded_symbol_name()?;
+        let definition = external_function_type_parameter(self.context.db, scope, name.as_str())?;
+        Some(PlaceLoadConstraints::unnarrowed_source(
+            PlaceLoadSourceKind::DefinitionsFromOwningScope {
+                scope: definition.scope(self.context.db),
+                id: definition.place(self.context.db),
+            },
+            PlaceLoadSourceRole::Ordinary,
+        ))
+    }
+
     fn decide_resolution_path(&mut self) -> PlaceLoadResolutionNode<'db> {
         let db = self.context.db;
         let scope = self.context.scope;
@@ -355,6 +387,10 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
         {
             let indexed_symbol = place_table.symbol(symbol_id);
             symbol_is_local = indexed_symbol.is_local();
+            if indexed_symbol.is_nonlocal() {
+                // A nonlocal declaration refers to a source binding, not an adopted annotation.
+                self.context.external_type_parameters = false;
+            }
 
             let class_body_global_fallback = self.context.is_class_body_scope() && symbol_is_local;
             if self.context.skips_non_global_scopes(symbol_id) || class_body_global_fallback {
@@ -388,6 +424,8 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
                 definition,
                 enclosing_scopes: scopes,
             }
+        } else if self.context.external_type_parameters {
+            PlaceLoadResolutionNode::ExternalTypeParameterSource(scopes)
         } else {
             PlaceLoadResolutionNode::EnclosingScopeSource(scopes)
         }
@@ -404,6 +442,15 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
         for (enclosing_file_scope, _) in scopes {
             if enclosing_file_scope.is_global() {
                 break;
+            }
+
+            if let Some(source) = self.external_type_parameter_source(
+                enclosing_file_scope.to_scope_id(db, self.context.file),
+            ) {
+                return (
+                    PlaceLoadResolutionNode::Failure(PlaceLoadFailure::UnboundFree),
+                    Some(source),
+                );
             }
 
             let enclosing_scope = self.context.index.scope(enclosing_file_scope);
@@ -505,6 +552,7 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
             // Keep walking across `nonlocal` declarations until reaching the owning scope.
             if enclosing_place.as_symbol().is_some_and(Symbol::is_nonlocal) {
                 self.crosses_scope_declaration = true;
+                self.context.external_type_parameters = false;
                 continue;
             }
             if !(enclosing_place.is_bound() || enclosing_place.is_declared()) {
@@ -879,6 +927,7 @@ struct PlaceLoadResolutionContext<'db, 'ast> {
     scope: ScopeId<'db>,
     file: ProgramFile<'db>,
     mode: PlaceLoadMode<'ast>,
+    external_type_parameters: bool,
 }
 
 impl<'db> PlaceLoadResolutionContext<'db, '_> {
@@ -1051,6 +1100,8 @@ enum PlaceLoadResolutionNode<'db> {
         definition: Definition<'db>,
         enclosing_scopes: AncestorsIter<'db>,
     },
+    /// An adopted type parameter after local ownership checks, followed by enclosing scopes.
+    ExternalTypeParameterSource(AncestorsIter<'db>),
     /// A source from the remaining enclosing scopes, if one exists.
     EnclosingScopeSource(AncestorsIter<'db>),
     /// The implicit class-body source, followed by the applicable global source.

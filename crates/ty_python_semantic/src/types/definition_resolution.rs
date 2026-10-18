@@ -173,7 +173,7 @@ pub(crate) fn definitions_for_name<'db>(
     name: &str,
     alias_resolution: ImportAliasResolution,
 ) -> Vec<ResolvedDefinition<'db>> {
-    let definitions = scoped_definitions_for_name(db, scope, name, alias_resolution);
+    let definitions = scoped_definitions_for_name(db, scope, name, alias_resolution, false);
     if !definitions.is_empty() {
         return definitions;
     }
@@ -191,6 +191,7 @@ pub(crate) fn scoped_definitions_for_name<'db>(
     scope: ScopeId<'db>,
     name_str: &str,
     alias_resolution: ImportAliasResolution,
+    mut external_type_parameters: bool,
 ) -> Vec<ResolvedDefinition<'db>> {
     let env = ProgramEnvironment::from_scope(scope);
     let file = scope.program_file(db);
@@ -202,6 +203,16 @@ pub(crate) fn scoped_definitions_for_name<'db>(
     // Search through the scope hierarchy: start from the current scope and
     // traverse up through parent scopes to find definitions
     for (scope_id, _scope) in index.visible_ancestor_scopes(file_scope) {
+        if external_type_parameters
+            && let Some(definition) = super::external_function_type_parameter(
+                db,
+                scope_id.to_scope_id(db, file),
+                name_str,
+            )
+        {
+            all_definitions.insert(definition);
+            break;
+        }
         let place_table = index.place_table(scope_id);
 
         let Some(symbol_id) = place_table.symbol_id(name_str) else {
@@ -263,6 +274,7 @@ pub(crate) fn scoped_definitions_for_name<'db>(
 
         // If marked as nonlocal, skip current scope and search in ancestor scopes
         if is_nonlocal {
+            external_type_parameters = false;
             // Continue searching in parent scopes, but skip the current scope
             continue;
         }

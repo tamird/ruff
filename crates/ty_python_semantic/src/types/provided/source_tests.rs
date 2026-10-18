@@ -27,6 +27,7 @@ use crate::{HasType, ProgramEnvironment, SemanticModel};
 enum ExternalSource {
     Annotation,
     MixedFunctionAnnotations,
+    LocalAnnotations,
 }
 
 impl SourceProvider for ExternalSource {
@@ -46,6 +47,20 @@ impl SourceProvider for ExternalSource {
         let target = db.program_file(system_path_to_file(db, "/src/contracts.pyi").ok()?);
         let module = parsed_module(db, file.python_file(db)).load(db);
         let declarations = parsed_module(db, target.python_file(db)).load(db);
+        if matches!(self, Self::LocalAnnotations)
+            && let ast::AnyRootNodeRef::Expr(expression) = module.get_by_index(owner)
+            && let Some(name) = expression.as_name_expr()
+        {
+            let source = source_text(db, file.file(db));
+            let tail = source[usize::from(name.end())..].lines().next()?;
+            if let Some(marker) = tail.find("# type: ") {
+                let offset = marker + "# type: ".len();
+                return Some(ProvidedAnnotation::Range(TextRange::at(
+                    name.end() + TextSize::try_from(offset).unwrap(),
+                    TextSize::of(&tail[offset..]),
+                )));
+            }
+        }
         for statement in module.suite() {
             let target_name = match statement {
                 ast::Stmt::Assign(assignment) => match assignment.targets.as_slice() {
@@ -213,6 +228,171 @@ fn external_generic_function_annotations() -> anyhow::Result<()> {
             .collect();
         assert_eq!(observed, expected);
     }
+    Ok(())
+}
+
+#[test]
+fn external_generic_function_local_annotations() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY312)
+        .with_file(
+            "/src/main.py",
+            "
+T = str
+
+def identity(value):
+    copied: T = value
+    def inner():
+        nested: T = value
+        return nested
+    def own[T](argument: T) -> T:
+        local: T = argument
+        return local
+    return copied
+
+def wrong(value):
+    copied: T = 42
+    return value
+",
+        )
+        .with_file(
+            "/src/contracts.pyi",
+            "
+def identity[T](value: T) -> T: ...
+def wrong[T](value: T) -> T: ...
+",
+        )
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["shadowed-type-variable", "invalid-assignment"],
+        "{diagnostics:#?}",
+    );
+    let program = db.program_file(file);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let function = module.suite()[1].as_function_def_stmt().unwrap();
+    let annotation = function.body[0]
+        .as_ann_assign_stmt()
+        .unwrap()
+        .annotation
+        .as_name_expr()
+        .unwrap();
+    let model = SemanticModel::new(&db, program);
+    let definitions = crate::types::ide_support::definitions_for_name(
+        &model,
+        "T",
+        annotation.into(),
+        crate::types::ide_support::ImportAliasResolution::ResolveAliases,
+    );
+    let donor_file = system_path_to_file(&db, "/src/contracts.pyi")?;
+    let donor = db.program_file(donor_file);
+    let donor_module = parsed_module(&db, donor.python_file(&db)).load(&db);
+    let donor_function = donor_module.suite()[0].as_function_def_stmt().unwrap();
+    assert_matches!(
+        donor_function.type_params.as_ref().unwrap().type_params.as_slice(),
+        [ast::TypeParam::TypeVar(parameter)]
+            if definitions.len() == 1 && definitions[0].definition()
+                == Some(semantic_index(&db, donor).expect_single_definition(parameter))
+    );
+    Ok(())
+}
+
+#[test]
+fn external_generic_annotation_names_keep_source_precedence() -> anyhow::Result<()> {
+    for (source, expected) in [
+        (
+            "def identity(value):\n    T = int\n    copied: T = value\n    return value\n",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "def identity(value):\n    copied: T = value\n    T = 42\n    return value\n",
+            vec!["unresolved-reference"],
+        ),
+        (
+            "def identity(value):\n    return T\n",
+            vec!["unresolved-reference"],
+        ),
+        (
+            "T = int\ndef identity(value):\n    global T\n    copied: T = value\n    return value\n",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "def identity(value):\n    T = int\n    def nested():\n        copied: T = value\n    return value\n",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "def identity(value):\n    def nested():\n        nonlocal T\n        copied: T = value\n    return value\n",
+            vec!["invalid-syntax", "unresolved-reference"],
+        ),
+        (
+            "def identity(value):\n    def middle():\n        nonlocal T\n        def nested():\n            copied: T = value\n    return value\n",
+            vec!["invalid-syntax", "unresolved-reference"],
+        ),
+    ] {
+        let db = TestDbBuilder::new()
+            .with_python_version(ruff_python_ast::PythonVersion::PY312)
+            .with_file("/src/main.py", source)
+            .with_file(
+                "/src/contracts.pyi",
+                "def identity[T](value: T) -> T: ...\n",
+            )
+            .with_source_provider(ExternalSource::Annotation)
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{source}\n{diagnostics:#?}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn external_generic_detached_annotations_follow_donor_edits() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY312)
+        .with_file(
+            "/src/main.py",
+            "def identity(value):\n    copied = value  # type: T\n    return copied\n",
+        )
+        .with_file(
+            "/src/contracts.pyi",
+            "def identity[T](value: T) -> T: ...\n",
+        )
+        .with_source_provider(ExternalSource::LocalAnnotations)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    assert!(db.check_file(file).is_empty());
+    db.write_file(
+        "/src/main.py",
+        "def identity(value):\n    copied = 42  # type: T\n    return copied\n",
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-assignment");
+    db.write_file(
+        "/src/main.py",
+        "def identity(value):\n    copied = value  # type: T\n    return copied\n",
+    )?;
+    assert!(db.check_file(file).is_empty());
+    db.write_file(
+        "/src/contracts.pyi",
+        "def identity[U](value: U) -> U: ...\n",
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "unresolved-reference");
     Ok(())
 }
 

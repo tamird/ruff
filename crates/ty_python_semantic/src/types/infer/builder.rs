@@ -11473,6 +11473,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
         let mut resolution =
             resolve_place_load(self.db(), self.index, self.scope(), place_expr, mode);
+        if self.is_annotation_reference(expr_ref) {
+            resolution = resolution.with_external_type_parameters();
+        }
         let mut place = PlaceAndQualifiers::from(Place::Undefined);
         let mut failure = None;
         let mut checked_deprecated = false;
@@ -11532,6 +11535,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let constraint_keys = resolution.into_constraints();
 
         (place, constraint_keys)
+    }
+
+    fn is_annotation_reference(&self, expr_ref: ast::ExprRef) -> bool {
+        self.inference_flags()
+            .contains(InferenceFlags::IN_TYPE_EXPRESSION)
+            || self.in_detached_annotation()
+            || self
+                .index
+                .annotation_parent_scope_id(self.module(), &expr_ref)
+                .is_some()
     }
 
     fn infer_place_load_source(
@@ -11599,15 +11612,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             db,
                             env,
                             &name,
-                            if self
-                                .inference_flags()
-                                .contains(InferenceFlags::IN_TYPE_EXPRESSION)
-                                || self.in_detached_annotation()
-                                || self
-                                    .index
-                                    .annotation_parent_scope_id(self.module(), &expr_ref)
-                                    .is_some()
-                            {
+                            if self.is_annotation_reference(expr_ref) {
                                 crate::provided::BuiltinUsage::Annotation
                             } else {
                                 crate::provided::BuiltinUsage::Runtime
