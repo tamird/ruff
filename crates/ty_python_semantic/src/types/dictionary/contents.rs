@@ -54,7 +54,7 @@ pub(super) struct MappingContents<'db> {
     /// Exposure changes contents while preserving this class identity.
     pub(super) builtin: bool,
     /// Opaque exposure leaves only value restrictions, rather than evidence of key presence.
-    /// A closed `TypedDict` retains its schema and can track subsequent mutations.
+    /// An explicitly described `TypedDict` retains its schema and can track subsequent mutations.
     pub(super) uses_residual_presence: bool,
     /// The original mapping bound and its local source survive exposure.
     pub(super) bound: Option<MappingBound<'db>>,
@@ -97,7 +97,7 @@ impl<'db> MappingContents<'db> {
     /// Retain observed values without treating ordinary dictionary entries as supplied keys.
     fn generalize_presence(&mut self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) {
         if let Some(MappingBound { ty, source }) = self.bound
-            && is_closed_typed_dict(db, ty)
+            && has_explicit_typed_dict_items(db, ty)
             && let Some(dictionary) = DictionaryItems::unpacked(db, env, ty, source)
         {
             self.dictionary = dictionary;
@@ -701,8 +701,8 @@ fn initial_contents<'db>(
     if StatementInference::Definition(definition, inference).is_provisional() {
         return ContentsValue::Pending;
     }
-    let closed_typed_dict = is_closed_typed_dict(db, bound_type);
-    if !closed_typed_dict && !super::has_dict_type(db, &env, bound_type) {
+    let explicit_typed_dict = has_explicit_typed_dict_items(db, bound_type);
+    if !explicit_typed_dict && !super::has_dict_type(db, &env, bound_type) {
         return ContentsValue::Unavailable;
     }
     let index = semantic_index(db, file);
@@ -744,7 +744,7 @@ fn initial_contents<'db>(
         });
     // A fresh allocation can prove its contents even when its inferred type is a union.
     // Unobserved union bounds retain their per-alternative key domains.
-    if !closed_typed_dict && bound_type.as_nominal_instance().is_none() && observed.is_err() {
+    if !explicit_typed_dict && bound_type.as_nominal_instance().is_none() && observed.is_err() {
         return ContentsValue::Unavailable;
     }
     let builtin_allocation = !owner_inference.discards_dict_key_assignments()
@@ -760,7 +760,7 @@ fn initial_contents<'db>(
     };
     let bounded = !place.is_symbol() || place.is_declared() || value.is_none();
     let source = definition.kind(db).target_range(&module);
-    let bound = (bounded || closed_typed_dict).then_some(MappingBound {
+    let bound = (bounded || explicit_typed_dict).then_some(MappingBound {
         ty: bound_type,
         source,
     });
@@ -796,7 +796,7 @@ fn initial_contents<'db>(
     let mut mapping = MappingContents {
         file,
         dictionary,
-        builtin: closed_typed_dict || provided_allocation || kwargs_parameters.is_some(),
+        builtin: explicit_typed_dict || provided_allocation || kwargs_parameters.is_some(),
         uses_residual_presence: false,
         bound,
     };
@@ -850,7 +850,7 @@ fn initial_contents<'db>(
             mapping.expose(db, &env);
         }
     }
-    if !closed_typed_dict && let Some(parameters) = kwargs_parameters {
+    if !explicit_typed_dict && let Some(parameters) = kwargs_parameters {
         // Binding consumes keyword-capable named parameters before allocating **kwargs.
         // These exclusions are local contents facts; mutation and exposure can remove them.
         mapping.dictionary.items = parameters
@@ -1439,7 +1439,7 @@ fn mapping_transfer<'db>(
             let method = call.func.as_attribute_expr().filter(|attribute| {
                 PlaceExpr::try_from_expr(&*attribute.value) == PlaceExpr::try_from_expr(receiver)
                     && inference.try_expression_type(receiver).is_some_and(|ty| {
-                        is_closed_typed_dict(db, ty)
+                        has_explicit_typed_dict_items(db, ty)
                             || (ty.as_nominal_instance().is_some()
                                 && super::has_dict_type(db, &env, ty))
                     })
@@ -1918,7 +1918,7 @@ pub(super) fn at_use<'db>(
     )
 }
 
-pub(super) fn at_snapshot<'db>(
+pub(crate) fn at_snapshot<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
     expression: &ast::Expr,
@@ -1943,8 +1943,8 @@ pub(super) fn snapshot_contents<'db>(
     reachability: &ReachabilityEvaluationCache<'db>,
 ) -> ContentsValue<'db> {
     let observed = (|| {
-        let closed_typed_dict = is_closed_typed_dict(db, argument_type);
-        if !closed_typed_dict
+        let explicit_typed_dict = has_explicit_typed_dict_items(db, argument_type);
+        if !explicit_typed_dict
             && !super::has_dict_type(db, &ProgramEnvironment::from_scope(scope), argument_type)
         {
             return None;
@@ -1959,7 +1959,7 @@ pub(super) fn snapshot_contents<'db>(
         let use_def = index.use_def_map(scope.file_scope_id(db));
         // A nested scope can replace a captured binding with another dictionary. Its
         // alternative type survives ordinary inference but has no local contents seed.
-        if !closed_typed_dict
+        if !explicit_typed_dict
             && argument_type.as_nominal_instance().is_none()
             && super::records::for_binding(db, scope, expression).is_none()
         {
@@ -1990,8 +1990,8 @@ pub(super) fn snapshot_contents<'db>(
     }
 }
 
-fn is_closed_typed_dict(db: &dyn Db, ty: Type<'_>) -> bool {
+pub(crate) fn has_explicit_typed_dict_items(db: &dyn Db, ty: Type<'_>) -> bool {
     ty.resolve_type_alias(db)
         .as_typed_dict()
-        .is_some_and(|typed_dict| typed_dict.openness(db).is_closed())
+        .is_some_and(|typed_dict| !typed_dict.openness(db).is_implicitly_open())
 }

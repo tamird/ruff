@@ -1601,3 +1601,79 @@ def saved_boolean(source: dict[str, int | None]):
     if flag_alias:
         reveal_type(list(values.values())[0])  # revealed: Literal[2]
 ```
+
+## Typed dictionary reads preserve write contracts
+
+Known contents refine reads and fresh copies without changing the writable dictionary type. An
+opaque call or alias can change those contents, so later reads use the declared field type.
+
+```py
+from typing_extensions import Literal, NotRequired, TypedDict, reveal_type
+
+class Row(TypedDict, closed=True):
+    value: NotRequired[int | str]
+
+class Integers(TypedDict, closed=True):
+    value: int
+
+def mutate(row: Row) -> None:
+    row["value"] = "changed"
+
+def reads(row: Row) -> None:
+    row["value"] = 1
+    key = "value"
+    reveal_type(row[key])  # revealed: Literal[1]
+    reveal_type(row.get(key))  # revealed: Literal[1]
+    reveal_type("value" in row)  # revealed: Literal[True]
+    copied: Integers = dict(row)  # no diagnostic
+    mutate(row)  # no diagnostic
+    reveal_type(row.get(key))  # revealed: int | str | None
+    reveal_type("value" in row)  # revealed: bool
+    reveal_type(copied["value"])  # revealed: int
+    # error: [invalid-argument-type]
+    # error: [missing-typed-dict-key]
+    wrong: Integers = dict(row)
+
+def alias(row: Row) -> None:
+    row["value"] = 1
+    shared = row
+    mutate(shared)
+    reveal_type(row.get("value"))  # revealed: int | str | None
+    row["value"] = None  # error: [invalid-assignment]
+
+def default_effect(row: Row) -> None:
+    row["value"] = 1
+    reveal_type(row.get("value", mutate(row)))  # revealed: int | str | None
+
+def changing_key(row: Row) -> Literal["value"]:
+    row["value"] = "changed"
+    return "value"
+
+def key_effect(row: Row) -> None:
+    row["value"] = 1
+    reveal_type(row[changing_key(row)])  # revealed: int | str
+```
+
+## Explicit extra fields remain open after a read
+
+The default of a missing key is evaluated normally. An explicit extra-item type remains part of the
+result even when the key has no declared field.
+
+```py
+from typing_extensions import Never, NotRequired, TypedDict, reveal_type
+
+class OpenRow(TypedDict, extra_items=int):
+    value: NotRequired[str]
+
+def abort() -> Never:
+    raise ValueError
+
+def extra(row: OpenRow) -> None:
+    reveal_type(row.get("missing", "fallback"))  # revealed: int | Literal["fallback"]
+    row["value"] = "known"
+    reveal_type(row.get("value"))  # revealed: Literal["known"]
+    reveal_type("value" in row != {})  # revealed: bool
+
+def stopped(row: OpenRow) -> None:
+    reveal_type(row.get("missing", abort()))  # revealed: Never
+```

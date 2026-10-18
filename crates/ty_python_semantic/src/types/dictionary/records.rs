@@ -449,23 +449,6 @@ fn literal<'db>(
     }
 }
 
-/// Publish only proved For-row observations; scalar stores and other mappings keep their
-/// existing inference. Both subscript return paths still perform ordinary checked dispatch.
-pub(crate) fn item_type<'db>(
-    db: &'db dyn Db,
-    scope: ty_python_core::scope::ScopeId<'db>,
-    subscript: &ast::ExprSubscript,
-    receiver_type: Type<'db>,
-    reachability: &crate::reachability::ReachabilityEvaluationCache<'db>,
-) -> Option<Type<'db>> {
-    if !super::has_dict_type(db, &ProgramEnvironment::from_scope(scope), receiver_type) {
-        return None;
-    }
-    subscript.slice.as_string_literal_expr()?;
-    for_binding(db, scope, &subscript.value)?;
-    super::required_item_type(db, scope, subscript, receiver_type, reachability)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

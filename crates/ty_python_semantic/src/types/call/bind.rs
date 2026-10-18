@@ -70,7 +70,8 @@ use crate::types::signatures::{
 };
 use crate::types::tuple::{TupleLength, TupleSpec, TupleSpecBuilder, TupleType, VariableSegment};
 use crate::types::typed_dict::{
-    TypedDictOpenness, UnpackedTypedDict, extract_unpacked_typed_dict_from_value_type,
+    TypedDictOpenness, UnpackedTypedDict, UnpackedTypedDictKey,
+    extract_unpacked_typed_dict_from_value_type,
 };
 use crate::types::typevar::{BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVarSet};
 use crate::types::variance::VarianceInferable;
@@ -5863,6 +5864,46 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         if let Some(KnownUnpacking::Keywords(keywords)) =
             self.arguments.known_unpacking(argument_index)
         {
+            if let Some(mut unpacked) = argument_type
+                .and_then(|ty| extract_unpacked_typed_dict_from_value_type(db, env, ty))
+                && unpacked.openness.explicit_extra_items().is_some()
+            {
+                // Contents refine fields, but explicit TypedDict extras retain their stricter
+                // call policy: unknown names require **kwargs and cannot fill required slots.
+                unpacked.keys = keywords
+                    .items
+                    .iter()
+                    .map(|item| {
+                        let definition =
+                            unpacked.keys.get(&item.name).and_then(|key| key.definition);
+                        (
+                            item.name.clone(),
+                            UnpackedTypedDictKey {
+                                value_ty: item.ty,
+                                kind: item.kind,
+                                definition,
+                            },
+                        )
+                    })
+                    .collect();
+                for name in &keywords.excluded_names {
+                    unpacked.keys.insert(
+                        name.clone(),
+                        UnpackedTypedDictKey {
+                            value_ty: Type::Never,
+                            kind: DictionaryItemKind::Residual,
+                            definition: None,
+                        },
+                    );
+                }
+                unpacked.openness = keywords
+                    .extra_items
+                    .map_or(TypedDictOpenness::Closed, |ty| {
+                        TypedDictOpenness::extra(db, ty, true)
+                    });
+                self.match_typed_dict_keywords(argument_index, unpacked);
+                return;
+            }
             for item in &keywords.items {
                 if item.kind == DictionaryItemKind::Residual {
                     continue;

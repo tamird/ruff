@@ -376,6 +376,12 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         if let [source] = call.arguments.args.as_ref() {
             self.record_contents_snapshot(expression, &[source]);
         }
+        if let ast::Expr::Attribute(attribute) = call.func.as_ref()
+            && attribute.attr.as_str() == "get"
+        {
+            // The default expression can mutate the receiver before get reads its key.
+            self.record_contents_snapshot(expression, &[&attribute.value]);
+        }
 
         let occurrences = call_receivers(call);
         let sources: Vec<_> = occurrences
@@ -567,8 +573,6 @@ struct Candidate<'ast> {
     receiver: &'ast ast::Expr,
     dependencies: Vec<usize>,
     observed: bool,
-    iteration_target: bool,
-    list_literal: bool,
 }
 
 /// The graph carries only place identity, and is discarded before normal indexing. A demand
@@ -592,8 +596,6 @@ impl<'ast> Candidates<'ast, '_> {
                 receiver,
                 dependencies: Vec::new(),
                 observed: false,
-                iteration_target: false,
-                list_literal: false,
             });
             next
         });
@@ -703,8 +705,6 @@ impl<'ast> Candidates<'ast, '_> {
                     receiver,
                     dependencies: _,
                     observed,
-                    iteration_target: _,
-                    list_literal: _,
                 } = candidate;
                 observed.then_some(receiver)
             })
@@ -718,24 +718,7 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
             return;
         }
         match statement {
-            ast::Stmt::For(for_stmt) => {
-                if for_stmt.iter.is_name_expr()
-                    && let Some(iterable) = self.place(&for_stmt.iter)
-                    && self.nodes[iterable].list_literal
-                    && for_stmt.target.is_name_expr()
-                    && let Some(index) = self.place(&for_stmt.target)
-                {
-                    self.nodes[index].iteration_target = true;
-                }
-            }
             ast::Stmt::Assign(assign) => {
-                if let [target] = assign.targets.as_slice()
-                    && target.is_name_expr()
-                    && assign.value.is_list_expr()
-                    && let Some(index) = self.place(target)
-                {
-                    self.nodes[index].list_literal = true;
-                }
                 for target in &assign.targets {
                     self.assignment(target, &assign.value);
                 }
@@ -793,14 +776,17 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
                 if matches!(
                     subscript.ctx,
                     ast::ExprContext::Store | ast::ExprContext::Del
-                ) {
-                    self.demand(&subscript.value);
-                } else if subscript.slice.is_string_literal_expr()
-                    && subscript.value.is_name_expr()
-                    && let Some(index) = self.place(&subscript.value)
-                    && self.nodes[index].iteration_target
+                ) || (subscript.ctx == ast::ExprContext::Load
+                    && (subscript.slice.is_string_literal_expr() || subscript.slice.is_name_expr()))
                 {
-                    self.nodes[index].observed = true;
+                    self.demand(&subscript.value);
+                }
+            }
+            ast::Expr::Compare(compare) => {
+                for (_, operator, right) in compare.iter() {
+                    if matches!(operator, ast::CmpOp::In | ast::CmpOp::NotIn) {
+                        self.demand(right);
+                    }
                 }
             }
             ast::Expr::Call(call) => {
@@ -810,7 +796,7 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
                 if let ast::Expr::Attribute(attribute) = call.func.as_ref()
                     && matches!(
                         attribute.attr.as_str(),
-                        "update" | "clear" | "pop" | "popitem" | "setdefault" | "copy"
+                        "update" | "clear" | "pop" | "popitem" | "setdefault" | "copy" | "get"
                     )
                 {
                     self.demand(&attribute.value);

@@ -53,7 +53,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             let source_ty = speculative_builder
                                 .infer_expression(argument, TypeContext::default());
                             copy_positional = arguments.keywords.is_empty()
-                                && has_dict_type(db, env, source_ty)
+                                && (has_dict_type(db, env, source_ty)
+                                    || crate::types::dictionary::contents::has_explicit_typed_dict_items(db, source_ty))
                                 && source_ty.unpack_keys_and_items(db, env).is_some()
                                 && speculative_builder
                                     .dictionary_items(argument, source_ty)

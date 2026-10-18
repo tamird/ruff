@@ -21,7 +21,7 @@ use crate::types::typed_dict::{
 use crate::types::visitor::any_over_type_expanding_aliases;
 use crate::types::{
     ClassType, IntersectionType, KnownClass, Type, TypeAndQualifiers, TypeContext, TypedDictType,
-    TypingModule, any_over_type,
+    TypingModule, UnionType, any_over_type,
 };
 use ty_python_core::definition::Definition;
 
@@ -325,6 +325,58 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         Type::ClassLiteral(ClassLiteral::DynamicTypedDict(typeddict))
     }
 
+    /// Refine a validated `TypedDict.get` result from its current read facts without changing
+    /// the writable receiver or the ordinary argument/default inference.
+    pub(super) fn observed_typed_dict_get_result(&self, call: &ast::ExprCall) -> Option<Type<'db>> {
+        let attribute = call.func.as_attribute_expr()?;
+        if attribute.attr.as_str() != "get" || !call.arguments.keywords.is_empty() {
+            return None;
+        }
+        let (key, default) = match call.arguments.args.as_ref() {
+            [key] => (key, None),
+            [key, default] => (key, Some(default)),
+            _ => return None,
+        };
+        let receiver_type = self.expression_type(&attribute.value);
+        receiver_type.as_typed_dict()?;
+        let key = key
+            .as_string_literal_expr()
+            .map(|literal| literal.value.to_str())
+            .or_else(|| {
+                self.try_expression_type(key)
+                    .and_then(|ty| ty.string_literal_value(self.db()))
+            })?;
+        let dictionary = crate::types::dictionary::contents::at_snapshot(
+            self.db(),
+            self.scope(),
+            &attribute.value,
+            call.into(),
+            receiver_type,
+            self.reachability_cache(),
+        )
+        .ok()?;
+        let item = dictionary.items.iter().find(|item| item.name == key);
+        let default = || {
+            default.map_or_else(
+                || Type::none(self.db(), self.program_environment()),
+                |default| self.expression_type(default),
+            )
+        };
+        match item {
+            Some(item) => Some(if item.is_required() {
+                item.ty
+            } else {
+                UnionType::from_two_elements(
+                    self.db(),
+                    self.program_environment(),
+                    item.ty,
+                    default(),
+                )
+            }),
+            None => dictionary.is_complete().then(default),
+        }
+    }
+
     /// A contents snapshot can establish a schema only at a fresh copy boundary.
     pub(super) fn infer_typed_dict_copy(
         &mut self,
@@ -332,7 +384,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         source: &ast::Expr,
         source_ty: Type<'db>,
     ) -> Option<Type<'db>> {
-        if !has_dict_type(self.db(), self.program_environment(), source_ty) {
+        if !has_dict_type(self.db(), self.program_environment(), source_ty)
+            && !crate::types::dictionary::contents::has_explicit_typed_dict_items(
+                self.db(),
+                source_ty,
+            )
+        {
             return None;
         }
         let (key_ty, _) = source_ty.unpack_keys_and_items(self.db(), self.program_environment())?;

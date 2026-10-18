@@ -4064,6 +4064,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         *unpack_position = UnpackPosition::Other;
                     }
                 }
+                if let ast::Expr::Subscript(subscript) = expr
+                    && subscript.ctx == ast::ExprContext::Load
+                {
+                    self.record_contents_snapshot(expr, &[&subscript.value]);
+                }
             }
             ast::Expr::Named(node) => {
                 self.visit_expr(&node.value);

@@ -11,7 +11,9 @@ use crate::types::set_theoretic::UnionBuilder;
 use crate::types::typed_dict::{
     UnpackedTypedDict, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
 };
-use crate::types::{KnownClass, MemberLookupPolicy, ProgramEnvironment, Type, UnionType};
+use crate::types::{
+    KnownClass, MemberLookupPolicy, ProgramEnvironment, Truthiness, Type, UnionType,
+};
 use crate::{Db, FxIndexMap};
 
 pub(crate) mod contents;
@@ -96,45 +98,87 @@ pub(crate) fn has_dict_type<'db>(
     }
 }
 
-/// Observe a nominal-dictionary item through the existing contents history.
-/// Closed `TypedDict` schemas are excluded: exposure can preserve their required entries.
-fn observed_item_type<'db>(
+/// Observe one key through builtin dictionary history. Writable receiver types remain
+/// unchanged; only the result of a successful read is refined by these contents facts.
+pub(crate) fn item_type_at_use<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
     subscript: &ast::ExprSubscript,
     receiver_type: Type<'db>,
+    key_type: Type<'db>,
     reachability: &ReachabilityEvaluationCache<'db>,
-) -> Option<(Type<'db>, DictionaryItemKind)> {
-    if !has_dict_type(db, &ProgramEnvironment::from_scope(scope), receiver_type) {
+) -> Option<Type<'db>> {
+    let key = key_type.string_literal_value(db)?;
+    let contents = contents::snapshot_contents(
+        db,
+        scope,
+        &subscript.value,
+        subscript.into(),
+        receiver_type,
+        reachability,
+    );
+    let mapping = match contents {
+        contents::ContentsValue::Mapping(mapping) => mapping,
+        contents::ContentsValue::Unreachable => return Some(Type::Never),
+        contents::ContentsValue::Pending | contents::ContentsValue::Unavailable => return None,
+    };
+    if !mapping.builtin {
         return None;
     }
-    let key = subscript.slice.as_string_literal_expr()?.value.to_str();
-    let dictionary =
-        match DictionaryItems::observed(db, scope, &subscript.value, receiver_type, reachability) {
-            Ok(dictionary) => dictionary,
-            Err(fallback) => match fallback {
-                DictionaryFallback::Unavailable => return None,
-                DictionaryFallback::Unreachable => {
-                    return Some((Type::Never, DictionaryItemKind::Required));
-                }
-            },
-        };
-    dictionary
+    mapping
+        .dictionary
         .items
         .iter()
         .find(|item| item.name == key)
-        .map(|item| (item.ty, item.kind))
+        .map(|item| item.ty)
 }
 
-pub(crate) fn required_item_type<'db>(
+pub(crate) fn key_membership_at_use<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
-    subscript: &ast::ExprSubscript,
+    receiver: &ast::Expr,
     receiver_type: Type<'db>,
+    key: &str,
     reachability: &ReachabilityEvaluationCache<'db>,
-) -> Option<Type<'db>> {
-    let (ty, kind) = observed_item_type(db, scope, subscript, receiver_type, reachability)?;
-    kind.is_required().then_some(ty)
+) -> Option<Truthiness> {
+    let contents::ContentsValue::Mapping(mapping) = contents::snapshot_contents(
+        db,
+        scope,
+        receiver,
+        receiver.into(),
+        receiver_type,
+        reachability,
+    ) else {
+        return None;
+    };
+    if !mapping.builtin {
+        return None;
+    }
+    Some(
+        match mapping
+            .dictionary
+            .items
+            .iter()
+            .find(|item| item.name == key)
+        {
+            Some(item) => {
+                if item.is_required() {
+                    Truthiness::AlwaysTrue
+                } else if item.ty.resolve_type_alias(db).is_never() {
+                    Truthiness::AlwaysFalse
+                } else {
+                    Truthiness::Ambiguous
+                }
+            }
+            None => {
+                if mapping.dictionary.is_complete() {
+                    Truthiness::AlwaysFalse
+                } else {
+                    Truthiness::Ambiguous
+                }
+            }
+        },
+    )
 }
 
 /// Publication of contents evidence. An impossible mapping is not an empty mapping, and

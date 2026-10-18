@@ -10102,12 +10102,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         } else {
                             Type::none(db, env)
                         };
-                        return UnionType::from_two_elements(
-                            db,
-                            env,
-                            field.declared_ty,
-                            default_ty,
-                        );
+                        if default_ty.is_never() {
+                            return Type::Never;
+                        }
+                        return self
+                            .observed_typed_dict_get_result(call_expression)
+                            .unwrap_or_else(|| {
+                                UnionType::from_two_elements(db, env, field.declared_ty, default_ty)
+                            });
                     }
 
                     if !is_declared && field.is_read_only() {
@@ -10722,7 +10724,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if never_argument {
             return Type::Never;
         }
-        let return_ty = bindings.return_type(db, env);
+        let return_ty = self
+            .observed_typed_dict_get_result(call_expression)
+            .unwrap_or_else(|| bindings.return_type(db, env));
         let return_ty = match collection_initializer_class {
             Some(collection_class @ (KnownClass::List | KnownClass::Set))
                 if return_ty
@@ -12804,13 +12808,36 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 let range = TextRange::new(left.start(), right.end());
 
-                let literal_membership = comparisons::infer_literal_membership_comparison(
-                    &builder.context,
-                    left_ty,
-                    *op,
-                    right,
-                    |element| builder.expression_type(element),
-                );
+                let observed_membership = if matches!(op, ast::CmpOp::In | ast::CmpOp::NotIn) {
+                    left_ty.string_literal_value(db).and_then(|key| {
+                        crate::types::dictionary::key_membership_at_use(
+                            db,
+                            builder.scope(),
+                            right,
+                            right_ty,
+                            key,
+                            builder.reachability_cache(),
+                        )
+                        .map(|truthiness| {
+                            Type::from_truthiness(
+                                db,
+                                builder.program_environment(),
+                                truthiness.negate_if(*op == ast::CmpOp::NotIn),
+                            )
+                        })
+                    })
+                } else {
+                    None
+                };
+                let literal_membership = observed_membership.or_else(|| {
+                    comparisons::infer_literal_membership_comparison(
+                        &builder.context,
+                        left_ty,
+                        *op,
+                        right,
+                        |element| builder.expression_type(element),
+                    )
+                });
 
                 let comparison = match literal_membership {
                     Some(ty) => Ok(ty),

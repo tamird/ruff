@@ -200,11 +200,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // (to store the expression type and to report errors).
                     let slice_ty =
                         self.infer_maybe_standalone_expression(slice, TypeContext::default());
-                    let observed = crate::types::dictionary::records::item_type(
+                    let observed = crate::types::dictionary::item_type_at_use(
                         db,
                         self.scope(),
                         subscript,
                         value_ty,
+                        slice_ty,
                         self.reachability_cache(),
                     );
                     let ty = observed.map_or(ty, |observed| {
@@ -476,11 +477,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let slice_ty = self.infer_maybe_standalone_expression(slice, TypeContext::default());
         let checked =
             self.infer_subscript_expression_types(subscript, value_ty, slice_ty, ExprContext::Load);
-        let observed = crate::types::dictionary::records::item_type(
+        let observed = crate::types::dictionary::item_type_at_use(
             db,
             self.scope(),
             subscript,
             value_ty,
+            slice_ty,
             self.reachability_cache(),
         )
         .or_else(|| {
