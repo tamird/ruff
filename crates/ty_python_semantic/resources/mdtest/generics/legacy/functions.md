@@ -3751,3 +3751,47 @@ result = append_one([1], only_one)
 reveal_type(result)  # revealed: list[Literal[1]]
 append_one([2], only_one)  # error: [invalid-argument-type]
 ```
+
+## Bounded overload implementations with keyword tails
+
+The same fixed-input specialization works with legacy type variables and unpacked keyword fields.
+
+```py
+from typing import Any, Protocol, TypeVar, TypedDict, overload
+from typing_extensions import Never, NotRequired, Unpack
+
+T = TypeVar("T", bound=str)
+
+class Rule(Protocol[T]):
+    def __call__(self, *args: Any, values: list[T], **kwargs: Any) -> object: ...
+
+class Options(TypedDict):
+    flags: NotRequired[list[str]]
+
+class DefaultOptions(Options):
+    values: NotRequired[Never]
+
+@overload
+def invoke(rule: Rule[T], *, values: list[T], **kwargs: Unpack[Options]) -> None: ...
+@overload
+def invoke(rule: Rule[str], **kwargs: Unpack[DefaultOptions]) -> None: ...
+def invoke(rule: Rule[T], *, values: list[T] = [], **kwargs: Unpack[Options]) -> None:
+    rule(values=values, **kwargs)
+
+def broad(*, values: list[str]) -> None:
+    pass
+
+invoke(broad)  # no diagnostic
+invoke(broad, values=[], flags=["option"])  # no diagnostic
+invoke(broad, values=[42])  # error: [no-matching-overload]
+invoke(broad, values=[], flags=42)  # error: [no-matching-overload]
+
+R = TypeVar("R", bound=str | bytes)
+
+@overload
+def wrong_keywords(value: T, **kwargs: str) -> T: ...  # error: [invalid-overload]
+@overload
+def wrong_keywords(value: bytes, **kwargs: str) -> bytes: ...  # error: [invalid-overload]
+def wrong_keywords(value: R, **kwargs: int) -> R:
+    return value
+```

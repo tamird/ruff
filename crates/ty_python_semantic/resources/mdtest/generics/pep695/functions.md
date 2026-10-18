@@ -4406,5 +4406,69 @@ def supplied(narrow: list[Literal[1]], wide: list[int]):
     append_one(wide, only_one)  # error: [invalid-argument-type]
 ```
 
+## Bounded overload implementations with keyword tails
+
+Fixed parameters can specialize a bounded implementation even when a callback has a gradual
+remainder and the function accepts an unpacked keyword dictionary. The remaining keywords still
+participate in implementation consistency checking.
+
+```py
+from typing import Any, Literal, Never, NotRequired, Protocol, TypedDict, Unpack, overload
+
+class Rule[T: str](Protocol):
+    def __call__(self, *args: Any, values: list[T], **kwargs: Any) -> object: ...
+
+class Options(TypedDict):
+    flags: NotRequired[list[str]]
+
+class DefaultOptions(Options):
+    values: NotRequired[Never]
+
+@overload
+def invoke[T: str](rule: Rule[T], *, values: list[T], **kwargs: Unpack[Options]) -> None: ...
+@overload
+def invoke(rule: Rule[str], **kwargs: Unpack[DefaultOptions]) -> None: ...
+def invoke[T: str](rule: Rule[T], *, values: list[T] = [], **kwargs: Unpack[Options]) -> None:
+    rule(values=values, **kwargs)
+
+def exact(*, values: list[Literal["foo"]], source: str) -> None:
+    pass
+
+def broad(*, values: list[str]) -> None:
+    pass
+
+invoke(exact, values=["foo"], source="input")  # no diagnostic
+invoke(broad)  # no diagnostic
+invoke(broad, values=[], flags=["option"])  # no diagnostic
+invoke(exact, values=[42])  # error: [no-matching-overload]
+invoke(broad, values=[], flags=42)  # error: [no-matching-overload]
+```
+
+A successful fixed-parameter specialization does not excuse incompatible keyword values, required
+parameters, or return types.
+
+```py
+@overload
+def wrong_keywords[T: str](value: T, **kwargs: str) -> T: ...  # error: [invalid-overload]
+@overload
+def wrong_keywords(value: bytes, **kwargs: str) -> bytes: ...  # error: [invalid-overload]
+def wrong_keywords[T: str | bytes](value: T, **kwargs: int) -> T:
+    return value
+
+@overload
+def wrong_required[T: str](value: T, *, option: str = "", **kwargs: object) -> T: ...  # error: [invalid-overload]
+@overload
+def wrong_required(value: bytes, *, option: str = "", **kwargs: object) -> bytes: ...  # error: [invalid-overload]
+def wrong_required[T: str | bytes](value: T, *, option: str, **kwargs: object) -> T:
+    return value
+
+@overload
+def wrong_return(value: str, **kwargs: object) -> int: ...  # error: [invalid-overload]
+@overload
+def wrong_return(value: bytes, **kwargs: object) -> int: ...  # error: [invalid-overload]
+def wrong_return[T: str | bytes](value: T, **kwargs: object) -> T:
+    return value
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

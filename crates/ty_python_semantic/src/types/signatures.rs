@@ -2381,9 +2381,8 @@ impl<'db> Signature<'db> {
         };
         self.definition
             .is_some_and(|definition| !definition.scope(db).node(db).scope_kind().is_class())
-            && self.supports_static_inference(db, env)
+            && self.supports_specialization(db, |ty| !ty.has_indeterminate_inference(db, env))
             && self.parameters.variadic().is_none()
-            && self.parameters.keyword_variadic().is_none()
             && context.variables(db).all(|variable| {
                 !variable.typevar(db).is_self(db)
                     && self.parameters.iter().any(|parameter| {
@@ -2401,7 +2400,8 @@ impl<'db> Signature<'db> {
     /// This does not establish that the signatures are consistent. A completed comparison can
     /// reject parameter coverage or the return type. Nongeneric implementations use ordinary
     /// assignability against rigid overload variables. Generic implementations require complete,
-    /// static specialization from overload inputs; incomplete inference remains unsupported.
+    /// static specialization from fixed overload inputs; incomplete inference remains unsupported.
+    /// Gradual declarations can participate without supplying a gradual inferred replacement.
     pub fn supports_overload_implementation_consistency_with(
         &self,
         db: &'db dyn Db,
@@ -2444,14 +2444,43 @@ impl<'db> Signature<'db> {
         {
             return None;
         }
-        if !self.supports_specialization(db, |ty| ty.is_fully_static(db, env))
-            || !overload.supports_specialization(db, |ty| ty.is_fully_static(db, env))
+        let supports_type = |ty: Type<'db>| !ty.has_indeterminate_inference(db, env);
+        if !self.supports_specialization(db, supports_type)
+            || !overload.supports_specialization(db, supports_type)
+        {
+            return None;
+        }
+        let context = self.generic_context?;
+        let references_implementation_variable = |parameter: &Parameter<'db>| {
+            context.variables(db).any(|variable| {
+                parameter.annotated_type().references_typevar(
+                    db,
+                    env,
+                    variable.typevar(db).identity(db),
+                )
+            })
+        };
+        // Infer from the normalized fixed slots. A skipped keyword tail must not contribute
+        // additional evidence for an implementation variable, either through **kwargs itself
+        // or through a named parameter not present in the overload's fixed slots.
+        if self
+            .parameters
+            .keyword_variadic()
+            .is_some_and(|(_, parameter)| references_implementation_variable(parameter))
+            || (overload.parameters.keyword_variadic().is_some()
+                && self.parameters.iter().any(|parameter| {
+                    references_implementation_variable(parameter)
+                        && parameter.keyword_name().is_some_and(|name| {
+                            overload.parameters.keyword_by_name(name.as_str()).is_none()
+                        })
+                }))
         {
             return None;
         }
         let arguments: Option<CallArguments<'_, 'db>> = overload
             .parameters
             .iter()
+            .filter(|parameter| !parameter.is_keyword_variadic())
             .map(|parameter| {
                 let argument = match parameter.kind() {
                     ParameterKind::PositionalOnly {
@@ -7386,6 +7415,166 @@ mod tests {
                 signature("consistent"),
             )
         );
+    }
+
+    #[test]
+    fn overload_implementation_uses_fixed_inputs_with_open_keywords() {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/overload_keywords.py",
+            "
+            from collections.abc import Sequence
+            from typing import Literal, Never, NotRequired, Protocol, TypedDict, Unpack
+            from ty_extensions import Unknown
+
+            class Selected[T]: ...
+            type Input = Sequence[str] | Selected[Sequence[str]]
+            type Tags[T] = list[T | Literal['manual']]
+            class DataRule[D, T: str](Protocol):
+                def __call__(self, *args: Unknown, data: D, tags: Tags[T], **kwargs: Unknown) -> object: ...
+            class TagsRule[T: str](Protocol):
+                def __call__(self, *args: Unknown, tags: Tags[T], **kwargs: Unknown) -> object: ...
+            class Forwarded(TypedDict):
+                target_compatible_with: NotRequired[list[str]]
+            class DefaultForwarded(Forwarded):
+                inner_data: NotRequired[Never]
+
+            def f[T: str](rule: TagsRule[T], *, name: str, tags: list[T] = [], inner_data: Input = [], **kwargs: Unpack[Forwarded]) -> None: ...
+            def explicit[D: Input, T: str](rule: DataRule[D, T], *, name: str, tags: list[T] = [], inner_data: D, **kwargs: Unpack[Forwarded]) -> None: ...
+            def omitted[D, T: str](rule: DataRule[list[D], T], *, name: str, tags: list[T] = [], **kwargs: Unpack[DefaultForwarded]) -> None: ...
+            def uncertain(rule: TagsRule[Unknown], *, name: str, tags: list[Unknown] = [], inner_data: Input = [], **kwargs: Unpack[Forwarded]) -> None: ...
+            ",
+        )
+        .unwrap();
+        let function = get_function_f(&db, "/src/overload_keywords.py");
+        let implementation = function.last_definition_signature(&db);
+        let env = db.program_environment();
+        let file = implementation.definition().unwrap().program_file(&db);
+        let uncertain = global_symbol(&db, file, "uncertain")
+            .place
+            .expect_type()
+            .expect_function_literal()
+            .last_definition_signature(&db);
+        assert!(
+            !implementation.supports_overload_implementation_consistency_with(&db, &env, uncertain)
+        );
+        for name in ["explicit", "omitted"] {
+            let overload = global_symbol(&db, file, name)
+                .place
+                .expect_type()
+                .expect_function_literal()
+                .last_definition_signature(&db);
+            assert!(
+                implementation
+                    .supports_overload_implementation_consistency_with(&db, &env, overload),
+                "{name}",
+            );
+            let prepared = implementation
+                .specialize_for_overload_implementation(&db, &env, overload)
+                .unwrap();
+            assert!(
+                matches!(
+                    prepared.implementation_parameters_consistency_with(&db, &env, overload),
+                    ParameterConsistency::Consistent
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    prepared.implementation_return_type_consistency_with(&db, &env, overload),
+                    ReturnTypeConsistency::Consistent
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn overload_keyword_tails_do_not_supply_inference() {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/overload_keyword_inference.py",
+            "
+            from ty_extensions import Unknown
+            def f[T](x: T, **kwargs: object) -> T: ...
+            def coupled[T](x: T, **kwargs: T) -> T: ...
+            def optional[T](x: T, *, y: T = ..., **kwargs: object) -> T: ...
+            def residual(x: int, **kwargs: str) -> int: ...
+            def ordinary(x: int, **kwargs: object) -> int: ...
+            def partial[T, U = object](x: T, *, y: U | None = None, **kwargs: object) -> T: ...
+            def gradual(x: Unknown, **kwargs: object) -> object: ...
+            def return_only[T = object](x: int, **kwargs: object) -> T: ...
+            def bounded[T: str](x: T, **kwargs: object) -> T: ...
+            def wider[T: str | int](x: T, **kwargs: object) -> T: ...
+            def fixed_optional(x: int, *, required: str = '', **kwargs: object) -> int: ...
+            def required[T](x: T, *, required: str, **kwargs: object) -> T: ...
+            def restricted[T](x: T, **kwargs: int) -> T: ...
+            def wrong_return(x: int, **kwargs: object) -> str: ...
+            ",
+        )
+        .unwrap();
+        let function = get_function_f(&db, "/src/overload_keyword_inference.py");
+        let implementation = function.last_definition_signature(&db);
+        let env = db.program_environment();
+        let file = implementation.definition().unwrap().program_file(&db);
+        let signature = |name| {
+            global_symbol(&db, file, name)
+                .place
+                .expect_type()
+                .expect_function_literal()
+                .last_definition_signature(&db)
+        };
+        for (implementation, overload) in [
+            ("coupled", "residual"),
+            ("optional", "residual"),
+            ("partial", "ordinary"),
+            ("return_only", "ordinary"),
+            ("f", "gradual"),
+            ("bounded", "wider"),
+        ] {
+            assert!(
+                !signature(implementation).supports_overload_implementation_consistency_with(
+                    &db,
+                    &env,
+                    signature(overload),
+                ),
+                "{implementation} against {overload}",
+            );
+        }
+        for (implementation, overload, parameters_consistent, return_consistent) in [
+            ("f", "ordinary", true, true),
+            ("required", "fixed_optional", false, true),
+            ("restricted", "residual", false, true),
+            ("f", "wrong_return", true, false),
+        ] {
+            let prepared = signature(implementation)
+                .specialize_for_overload_implementation(&db, &env, signature(overload))
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    prepared.implementation_parameters_consistency_with(
+                        &db,
+                        &env,
+                        signature(overload)
+                    ),
+                    ParameterConsistency::Consistent
+                ),
+                parameters_consistent,
+                "{implementation} against {overload}",
+            );
+            assert_eq!(
+                matches!(
+                    prepared.implementation_return_type_consistency_with(
+                        &db,
+                        &env,
+                        signature(overload)
+                    ),
+                    ReturnTypeConsistency::Consistent
+                ),
+                return_consistent,
+                "{implementation} against {overload}",
+            );
+        }
     }
 
     #[test]
