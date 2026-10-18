@@ -582,6 +582,10 @@ fn supported_body(
             ast::Expr::BytesLiteral(_) => true,
             ast::Expr::BooleanLiteral(_) => true,
             ast::Expr::NoneLiteral(_) => true,
+            ast::Expr::Attribute(attribute) => {
+                attribute.ctx == ast::ExprContext::Load
+                    && expression(db, function, locals, callees, &attribute.value)
+            }
             ast::Expr::Compare(compare) => compare
                 .operands
                 .iter()
@@ -643,17 +647,10 @@ fn supported_body(
                                     }
                                 }
                                 Some(Type::FunctionLiteral(callee)) => {
-                                    let signature = callee
-                                        .literal(db)
-                                        .last_definition
-                                        .raw_signature(db, ReturnCallableTypeVarScope::Lexical);
                                     if matches!(
                                         callee.known(db),
                                         Some(KnownFunction::NewClass | KnownFunction::NamedTuple)
-                                    ) || !callee.overloads_and_implementation(db).0.is_empty()
-                                        || !signature.is_non_generic()
-                                        || signature.return_ty.is_never()
-                                    {
+                                    ) {
                                         return false;
                                     }
                                 }
@@ -3014,6 +3011,217 @@ mod tests {
     }
 
     #[test]
+    fn body_domains_read_generic_members() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for declaration in [
+            "class Record[T](Protocol):",
+            "T = TypeVar('T', covariant=True)\nclass Record(Protocol[T]):",
+        ] {
+            let source = indoc::formatdoc! {"
+            from typing import Protocol, TypeVar, overload
+            {declaration}
+                @property
+                def value(self) -> T: ...
+                @property
+                def marker(self) -> str: ...
+            @overload
+            def f(record: Record[int]) -> int: ...
+            @overload
+            def f(record: Record[str]) -> str: ...
+            def f(record: Record[int] | Record[str]) -> object:
+                return record.value
+        "};
+            for member in ["value", "marker", "missing", "value"] {
+                db.write_file(
+                    "/src/body.py",
+                    source.replace("return record.value", &format!("return record.{member}")),
+                )?;
+                let f = function(&db);
+                let ordinary = crate::types::check_types(&db, f.program_file(&db));
+                if member != "missing" {
+                    assert!(ordinary.is_empty(), "{member}: {ordinary:#?}");
+                }
+                for index in [0, 1, 0] {
+                    let diagnostics = check_overload_body(&db, f, index).unwrap();
+                    let expected = match member {
+                        "marker" => (index == 0).then_some("invalid-return-type"),
+                        "missing" => Some("unresolved-attribute"),
+                        _ => None,
+                    };
+                    assert_eq!(
+                        diagnostics
+                            .diagnostics()
+                            .iter()
+                            .map(|diagnostic| diagnostic.id().as_str())
+                            .collect::<Vec<_>>(),
+                        expected.into_iter().collect::<Vec<_>>(),
+                        "{member} domain {index}: {diagnostics:#?}"
+                    );
+                    assert_eq!(
+                        crate::types::check_types(&db, f.program_file(&db)),
+                        ordinary
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_infer_generic_and_overloaded_calls() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for helper in [
+            "def identity[T](value: T) -> T:\n    return value",
+            "T = TypeVar('T')\ndef identity(value: T) -> T:\n    return value",
+            "@overload\ndef identity(value: int) -> int: ...\n@overload\ndef identity(value: str) -> str: ...\ndef identity(value: int | str) -> int | str:\n    return value",
+        ] {
+            let source = indoc::formatdoc! {"
+                from typing import TypeVar, overload
+                {helper}
+                @overload
+                def f(value: int) -> int: ...
+                @overload
+                def f(value: str) -> str: ...
+                def f(value: int | str) -> object:
+                    return identity(value)
+            "};
+            for argument in ["value", "42", "value"] {
+                db.write_file(
+                    "/src/body.py",
+                    source.replace(
+                        "return identity(value)",
+                        &format!("return identity({argument})"),
+                    ),
+                )?;
+                let f = function(&db);
+                let ordinary = crate::types::check_types(&db, f.program_file(&db));
+                assert!(ordinary.is_empty(), "{helper}; {argument}: {ordinary:#?}");
+                for index in [0, 1, 0] {
+                    let diagnostics = check_overload_body(&db, f, index).unwrap();
+                    let expected = usize::from(argument == "42" && index == 1);
+                    assert_eq!(
+                        diagnostics.diagnostics().len(),
+                        expected,
+                        "{helper}; {argument}; domain {index}: {diagnostics:#?}"
+                    );
+                    assert!(
+                        diagnostics
+                            .diagnostics()
+                            .iter()
+                            .all(|diagnostic| diagnostic.id().as_str() == "invalid-return-type")
+                    );
+                    assert_eq!(
+                        crate::types::check_types(&db, f.program_file(&db)),
+                        ordinary
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_specialize_type_form_arguments() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for (declaration, parameters) in [("", "[T]"), ("T = TypeVar('T')", "")] {
+            for callee in ["cast", "typed"] {
+                db.write_file(
+                    "/src/body.py",
+                    indoc::formatdoc! {"
+                        from typing import cast, TypeVar, overload
+                        from typing_extensions import TypeForm
+                        {declaration}
+                        def erase(value: object) -> object:
+                            return value
+                        def typed[U](annotation: TypeForm[U], value: object) -> U:
+                            return cast(annotation, value)
+                        @overload
+                        def f(value: int) -> int: ...
+                        @overload
+                        def f(value: str) -> str: ...
+                        def f{parameters}(value: T) -> T:
+                            return {callee}(T, erase(value))
+                    "},
+                )?;
+                let f = function(&db);
+                let signature = f.last_definition_signature(&db).clone();
+                let ordinary = crate::types::check_types(&db, f.program_file(&db));
+                assert!(ordinary.is_empty(), "{ordinary:#?}");
+                for index in [0, 1, 0] {
+                    let domain = prepare_body_domain(&db, f, index).unwrap();
+                    let diagnostics = check_overload_body(&db, f, index).unwrap();
+                    assert!(
+                        diagnostics.is_empty(),
+                        "{callee}; {parameters}; domain {index}: {diagnostics:#?}"
+                    );
+                    assert_eq!(returned_type(&db, f, Some(domain)), domain.return_type(&db));
+                    assert_eq!(f.last_definition_signature(&db), &signature);
+                    assert_eq!(
+                        crate::types::check_types(&db, f.program_file(&db)),
+                        ordinary
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_follow_module_call_terminality() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for declarations in [
+            "@overload\ndef stop(value: Literal[True]) -> Never: ...\n@overload\ndef stop(value: Literal[False]) -> None: ...",
+            "@overload\ndef stop(value: Literal[False]) -> None: ...\n@overload\ndef stop(value: Literal[True]) -> Never: ...",
+        ] {
+            db.write_file(
+                "/src/calls.pyi",
+                format!("from typing import Literal, overload\nfrom typing_extensions import Never\n{declarations}\ndef finish() -> Never: ...\n"),
+            )?;
+            let calls = system_path_to_file(&db, "/src/calls.pyi")?;
+            let calls = ProgramFile::new(&db, calls, db.program_environment().program(&db));
+            let diagnostics = crate::types::check_types(&db, calls);
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+            let source = indoc::indoc! {"
+                from typing import Literal, overload
+                from calls import finish, stop
+                @overload
+                def f(value: Literal[True]) -> int: ...
+                @overload
+                def f(value: Literal[False]) -> str: ...
+                def f(value: bool) -> object:
+                    stop(value)
+                    return 'finished'
+            "};
+            for replacement in ["'finished'", "42", "finish()", "'finished'"] {
+                db.write_file(
+                    "/src/body.py",
+                    source.replace("return 'finished'", &format!("return {replacement}")),
+                )?;
+                let f = function(&db);
+                let ordinary = crate::types::check_types(&db, f.program_file(&db));
+                assert!(ordinary.is_empty(), "{replacement}: {ordinary:#?}");
+                for index in [0, 1, 0] {
+                    let diagnostics = check_overload_body(&db, f, index).unwrap();
+                    assert_eq!(
+                        diagnostics
+                            .diagnostics()
+                            .iter()
+                            .filter(|diagnostic| diagnostic.id().as_str() == "invalid-return-type")
+                            .count(),
+                        usize::from(index == 1 && replacement == "42"),
+                        "{replacement}; domain {index}: {diagnostics:#?}"
+                    );
+                    assert_eq!(
+                        crate::types::check_types(&db, f.program_file(&db)),
+                        ordinary
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn body_domain_checks_arguments_to_module_callee() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(
@@ -3059,7 +3267,7 @@ mod tests {
             ),
             (
                 "value: int | str",
-                "check = value.real\n    return value",
+                "check = value.upper()\n    return value",
                 BodyDomainError::Unsupported,
             ),
             (
