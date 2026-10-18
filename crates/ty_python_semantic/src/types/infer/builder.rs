@@ -1939,6 +1939,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         self.declarations.insert(definition, declared_ty);
+        // A validated body domain supplies parameter entry evidence, not an assignment
+        // initializer. Retain it even when gradual assignability lets the ordinary assignment
+        // simplification select the broader source declaration. Later assignments still use
+        // that declaration and do not have a projected parameter entry.
+        let inferred_ty = self
+            .context
+            .body_domain
+            .and_then(|domain| domain.parameter_type(db, definition))
+            .unwrap_or(inferred_ty);
         self.bindings.insert(definition, inferred_ty);
     }
 

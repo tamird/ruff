@@ -589,6 +589,7 @@ fn analyze_non_terminal_call_prefix<'db>(
     db: &'db dyn Db,
     predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
     root_predicate: ScopedPredicateId,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> bool {
     let scope = predicate_scope(db, &predicates[root_predicate]);
     let has_many_calls = predicates
@@ -610,7 +611,7 @@ fn analyze_non_terminal_call_prefix<'db>(
     while remaining > 0 {
         let level = remaining.ilog2();
         let length = 1 << level;
-        analyze_non_terminal_call_range(db, scope, level, start >> level);
+        analyze_non_terminal_call_range_in_domain(db, scope, level, start >> level, domain);
         start += length;
         remaining -= length;
     }
@@ -641,9 +642,10 @@ fn analyze_non_terminal_calls<'db>(
     env: &ProgramEnvironment<'db>,
     predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
     call_predicates: &[ScopedPredicateId],
+    domain: Option<FunctionBodyDomain<'db>>,
 ) {
     for id in call_predicates {
-        analyze_single(db, env, &predicates[*id]);
+        analyze_single_in_domain(db, env, &predicates[*id], domain);
     }
 }
 
@@ -668,19 +670,64 @@ fn analyze_non_terminal_call_range<'db>(
     level: u32,
     index: usize,
 ) {
+    analyze_non_terminal_call_range_impl(db, scope, level, index, None);
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _, _, _| (),
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn analyze_body_non_terminal_call_range<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    level: u32,
+    index: usize,
+    domain: FunctionBodyDomain<'db>,
+) {
+    debug_assert_eq!(scope, domain.scope(db));
+    analyze_non_terminal_call_range_impl(db, scope, level, index, Some(domain));
+}
+
+fn analyze_non_terminal_call_range_in_domain<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    level: u32,
+    index: usize,
+    domain: Option<FunctionBodyDomain<'db>>,
+) {
+    match domain {
+        Some(domain) => analyze_body_non_terminal_call_range(db, scope, level, index, domain),
+        None => analyze_non_terminal_call_range(db, scope, level, index),
+    }
+}
+
+fn analyze_non_terminal_call_range_impl<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    level: u32,
+    index: usize,
+    domain: Option<FunctionBodyDomain<'db>>,
+) {
     if level == 0 {
         let env = ProgramEnvironment::from_scope(scope);
         let use_def = use_def_map(db, scope);
         let call_predicates = non_terminal_call_predicates(db, scope);
         let start = index * NON_TERMINAL_CALL_CHUNK_SIZE;
         let end = start + NON_TERMINAL_CALL_CHUNK_SIZE;
-        analyze_non_terminal_calls(db, &env, use_def.predicates(), &call_predicates[start..end]);
+        analyze_non_terminal_calls(
+            db,
+            &env,
+            use_def.predicates(),
+            &call_predicates[start..end],
+            domain,
+        );
         return;
     }
 
     let child_index = index * 2;
-    analyze_non_terminal_call_range(db, scope, level - 1, child_index);
-    analyze_non_terminal_call_range(db, scope, level - 1, child_index + 1);
+    analyze_non_terminal_call_range_in_domain(db, scope, level - 1, child_index, domain);
+    analyze_non_terminal_call_range_in_domain(db, scope, level - 1, child_index + 1, domain);
 }
 
 /// Evaluates a reachability constraint after warming its statement-call prefix.
@@ -709,7 +756,8 @@ pub(crate) fn evaluate_reachability_in_domain<'db>(
     let constraints = use_def.reachability_constraints();
     let predicates = use_def.predicates();
     let root_predicate = constraints.get_interior_node(id).atom();
-    let has_many_calls = analyze_non_terminal_call_prefix(db, predicates, root_predicate);
+    let domain = domain.filter(|domain| domain.scope(db) == scope);
+    let has_many_calls = analyze_non_terminal_call_prefix(db, predicates, root_predicate, domain);
     let call_predicates = has_many_calls.then(|| non_terminal_call_predicates(db, scope));
 
     evaluate_reachability_path(
@@ -721,7 +769,7 @@ pub(crate) fn evaluate_reachability_in_domain<'db>(
         id,
         true,
         None,
-        domain.filter(|domain| domain.scope(db) == scope),
+        domain,
     )
 }
 
@@ -936,7 +984,7 @@ impl<'db> ReachabilityConstraintsExtension<'db> for ReachabilityConstraints {
         }
 
         let root_predicate = self.get_interior_node(id).atom();
-        analyze_non_terminal_call_prefix(db, predicates, root_predicate);
+        analyze_non_terminal_call_prefix(db, predicates, root_predicate, None);
         evaluate_reachability_path(
             db,
             predicate_scope(db, &predicates[root_predicate]),
@@ -1810,19 +1858,52 @@ fn analyze_single_pattern_predicate_kind<'db>(
     returns(copy),
     cycle_initial = |_, _, _| Truthiness::AlwaysTrue,
     cycle_fn = |_, cycle: &salsa::Cycle, previous: &Truthiness, result: Truthiness, _| {
-        // A call can determine whether its own target is reachable, as with `sys.exit()` before
-        // `import sys` in a loop. Expression inference can lose its previous result when it stops
-        // being a cycle head, so widen the predicate itself to ensure convergence. Delay widening
-        // to allow the optimistic initial value to resolve to a terminal call.
-        if cycle.iteration() > crate::TAINTED_CYCLES {
-            previous.or(result)
-        } else {
-            result
-        }
+        normalize_non_terminal_call_cycle(cycle, *previous, result)
     },
     heap_size = get_size2::GetSize::get_heap_size
 )]
 fn analyze_non_terminal_call<'db>(db: &'db dyn Db, call_expr: Expression<'db>) -> Truthiness {
+    analyze_non_terminal_call_impl(db, call_expr, None)
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _| Truthiness::AlwaysTrue,
+    cycle_fn = |_, cycle: &salsa::Cycle, previous: &Truthiness, result: Truthiness, _, _| {
+        normalize_non_terminal_call_cycle(cycle, *previous, result)
+    },
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn analyze_body_non_terminal_call<'db>(
+    db: &'db dyn Db,
+    call_expr: Expression<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> Truthiness {
+    debug_assert_eq!(call_expr.scope(db), domain.scope(db));
+    analyze_non_terminal_call_impl(db, call_expr, Some(domain))
+}
+
+fn normalize_non_terminal_call_cycle(
+    cycle: &salsa::Cycle,
+    previous: Truthiness,
+    result: Truthiness,
+) -> Truthiness {
+    // A call can determine whether its own target is reachable, as with `sys.exit()` before
+    // `import sys` in a loop. Expression inference can lose its previous result when it stops
+    // being a cycle head, so widen the predicate itself to ensure convergence. Delay widening
+    // to allow the optimistic initial value to resolve to a terminal call.
+    if cycle.iteration() > crate::TAINTED_CYCLES {
+        previous.or(result)
+    } else {
+        result
+    }
+}
+
+fn analyze_non_terminal_call_impl<'db>(
+    db: &'db dyn Db,
+    call_expr: Expression<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Truthiness {
     let file = call_expr.program_file(db);
     let module = parsed_module(db, file.python_file(db)).load(db);
     let Some(StatementCall { call, is_await }) =
@@ -1846,10 +1927,12 @@ fn analyze_non_terminal_call<'db>(db: &'db dyn Db, call_expr: Expression<'db>) -
     // inferring argument types to possibly run the overload selection algorithm). Avoiding this on
     // the happy path is important because these constraints can be very large in number, since we
     // add them on all statement-level function calls.
-    let ty = infer_same_file_expression_type(db, callable, TypeContext::default());
+    let ty = infer_expression_with_body_domain(db, callable, TypeContext::default(), domain)
+        .expression_type(callable.node_ref(db));
 
     is_non_terminal_call(db, &env, ty, is_await, || {
-        infer_same_file_expression_type(db, call_expr, TypeContext::default())
+        infer_expression_with_body_domain(db, call_expr, TypeContext::default(), domain)
+            .expression_type(call_expr.node_ref(db))
     })
 }
 
@@ -2181,9 +2264,12 @@ fn analyze_single_in_domain<'db>(
             evaluate_finally_continuation(db, scope, continuation).is_always_false(),
         )
         .negate_if(!predicate.is_positive),
-        PredicateNode::IsNonTerminalCall(call) => {
-            analyze_non_terminal_call(db, call).negate_if(!predicate.is_positive)
-        }
+        PredicateNode::IsNonTerminalCall(call) => domain
+            .map_or_else(
+                || analyze_non_terminal_call(db, call),
+                |domain| analyze_body_non_terminal_call(db, call, domain),
+            )
+            .negate_if(!predicate.is_positive),
         PredicateNode::SuccessfulSubscript {
             receiver: _,
             key: _,

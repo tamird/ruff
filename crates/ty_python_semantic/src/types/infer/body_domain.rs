@@ -19,7 +19,7 @@ use super::{
 };
 use crate::types::call::Argument;
 use crate::types::constraints::ConstraintSetBuilder;
-use crate::types::function::OverloadLiteral;
+use crate::types::function::{KnownFunction, OverloadLiteral};
 use crate::types::generics::Specialization;
 use crate::types::signatures::{
     ParameterConsistency, PreparedOverloadImplementation, ReturnCallableTypeVarScope,
@@ -52,6 +52,8 @@ pub enum BodyDomainError {
 /// inhabited input evidence for every source slot. Nongeneric omitted slots retain their ordinary
 /// source default types. Optional positional-only domains remain unsupported because their omitted
 /// inputs can be correlated. An unsupported domain never means success.
+/// Supported domains can retain authored gradual input types: completing these additional
+/// checks does not establish that every operation in the body has a fully static contract.
 pub fn check_overload_body<'db>(
     db: &'db dyn Db,
     function: FunctionType<'db>,
@@ -187,7 +189,7 @@ fn prepare_body_domain<'db>(
         !matches!(
             signature.return_ty.resolve_type_alias(db),
             Type::TypeIs(_) | Type::TypeGuard(_)
-        ) && Type::single_callable(db, signature.clone()).is_fully_static(db, &env)
+        ) && signature.return_ty.is_fully_static(db, &env)
             && !signature.return_ty.has_indeterminate_inference(db, &env)
             && signature.parameters().iter().all(|parameter| {
                 !parameter
@@ -217,9 +219,6 @@ fn prepare_body_domain<'db>(
         .iter()
         .any(|parameter| parameter.is_positional_only() && parameter.has_default())
     {
-        return Err(BodyDomainError::Unsupported);
-    }
-    if !supported_body(db, function, node, &implementation_signature) {
         return Err(BodyDomainError::Unsupported);
     }
     let PreparedOverloadImplementation {
@@ -253,6 +252,9 @@ fn prepare_body_domain<'db>(
         &overload_signature,
         specialization,
     )?;
+    if !supported_body(db, function, node, &implementation_signature, &parameters) {
+        return Err(BodyDomainError::Unsupported);
+    }
     Ok(FunctionBodyDomain::new(
         db,
         implementation,
@@ -373,13 +375,17 @@ fn project_body_parameters<'db>(
                 // Substitute only the already inferred type view. The ordinary default query
                 // and its shared runtime value retain their original identity and evidence.
                 let default = default.apply_optional_specialization(db, specialization);
+                if !default.is_fully_static(db, env) || default.has_indeterminate_inference(db, env)
+                {
+                    return Err(BodyDomainError::Unsupported);
+                }
                 supplied.map_or(default, |supplied| {
                     UnionType::from_two_elements(db, env, supplied, default)
                 })
             } else {
                 supplied.ok_or(BodyDomainError::Unsupported)?
             };
-            if !entry.is_fully_static(db, env) || entry.has_indeterminate_inference(db, env) {
+            if entry.has_indeterminate_inference(db, env) {
                 return Err(BodyDomainError::Unsupported);
             }
             Ok((definition, entry))
@@ -392,11 +398,13 @@ fn supported_body(
     function: FunctionType<'_>,
     node: &ast::StmtFunctionDef,
     signature: &crate::types::Signature<'_>,
+    entries: &[(Definition<'_>, Type<'_>)],
 ) -> bool {
     fn expression(
         db: &dyn Db,
         function: FunctionType<'_>,
         locals: &[&str],
+        callees: &[&str],
         value: &ast::Expr,
     ) -> bool {
         match value {
@@ -410,30 +418,46 @@ fn supported_body(
                 let ast::Expr::Name(name) = call.func.as_ref() else {
                     return false;
                 };
-                if locals.contains(&name.id.as_str()) || name.id == *function.name(db) {
+                if name.id == *function.name(db) {
                     return false;
                 }
-                let Some(Type::FunctionLiteral(callee)) =
-                    crate::place::global_symbol(db, function.program_file(db), name.id.as_str())
-                        .place
-                        .ignore_possibly_undefined()
-                else {
-                    return false;
-                };
-                let signature = callee
-                    .literal(db)
-                    .last_definition
-                    .raw_signature(db, ReturnCallableTypeVarScope::Lexical);
-                callee.overloads_and_implementation(db).0.is_empty()
-                    && signature.is_non_generic()
-                    && !signature.return_ty.is_never()
-                    && call
-                        .arguments
-                        .args
-                        .iter()
-                        .all(|argument| expression(db, function, locals, argument))
+                if locals.contains(&name.id.as_str()) {
+                    if !callees.contains(&name.id.as_str()) {
+                        return false;
+                    }
+                } else {
+                    let Some(Type::FunctionLiteral(callee)) = crate::place::global_symbol(
+                        db,
+                        function.program_file(db),
+                        name.id.as_str(),
+                    )
+                    .place
+                    .ignore_possibly_undefined() else {
+                        return false;
+                    };
+                    let signature = callee
+                        .literal(db)
+                        .last_definition
+                        .raw_signature(db, ReturnCallableTypeVarScope::Lexical);
+                    if matches!(
+                        callee.known(db),
+                        Some(KnownFunction::NewClass | KnownFunction::NamedTuple)
+                    ) || !callee.overloads_and_implementation(db).0.is_empty()
+                        || !signature.is_non_generic()
+                        || signature.return_ty.is_never()
+                    {
+                        return false;
+                    }
+                }
+                // Calls are admitted only in straight-line bodies. General narrowing queries
+                // still need domain propagation before calls can coexist with conditional flow.
+                call.arguments
+                    .args
+                    .iter()
+                    .all(|argument| expression(db, function, locals, callees, argument))
                     && call.arguments.keywords.iter().all(|argument| {
-                        argument.arg.is_some() && expression(db, function, locals, &argument.value)
+                        argument.arg.is_some()
+                            && expression(db, function, locals, callees, &argument.value)
                     })
             }
             _ => false,
@@ -443,6 +467,7 @@ fn supported_body(
         db: &dyn Db,
         function: FunctionType<'_>,
         locals: &[&str],
+        callees: &[&str],
         parameters: &[&str],
         body: &[ast::Stmt],
         return_tree: bool,
@@ -462,7 +487,7 @@ fn supported_body(
                             | ast::Expr::NoneLiteral(_)
                     )
                 } else {
-                    expression(db, function, locals, value)
+                    expression(db, function, locals, callees, value)
                 }
             }),
             ast::Stmt::If(statement) => {
@@ -473,29 +498,68 @@ fn supported_body(
                 };
                 return_tree
                     && condition(&statement.test)
-                    && statements(db, function, locals, parameters, &statement.body, true)
+                    && statements(
+                        db,
+                        function,
+                        locals,
+                        callees,
+                        parameters,
+                        &statement.body,
+                        true,
+                    )
                     && statement.elif_else_clauses.iter().all(|clause| {
                         clause.test.as_ref().is_none_or(condition)
-                            && statements(db, function, locals, parameters, &clause.body, true)
+                            && statements(
+                                db,
+                                function,
+                                locals,
+                                callees,
+                                parameters,
+                                &clause.body,
+                                true,
+                            )
                     })
             }
             ast::Stmt::Assign(assignment) => {
-                !return_tree && expression(db, function, locals, &assignment.value)
+                !return_tree && expression(db, function, locals, callees, &assignment.value)
             }
             ast::Stmt::AnnAssign(assignment) => {
                 !return_tree
                     && assignment
                         .value
                         .as_deref()
-                        .is_some_and(|value| expression(db, function, locals, value))
+                        .is_some_and(|value| expression(db, function, locals, callees, value))
             }
             ast::Stmt::Expr(statement) => {
-                !return_tree && expression(db, function, locals, &statement.value)
+                !return_tree && expression(db, function, locals, callees, &statement.value)
             }
             ast::Stmt::Pass(_) => true,
             _ => false,
         })
     }
+    fn callable_entry(db: &dyn Db, ty: Type<'_>) -> bool {
+        match ty.resolve_type_alias(db) {
+            Type::Callable(_) | Type::ProtocolInstance(_) | Type::Dynamic(_) => true,
+            Type::Union(union) => union.elements(db).iter().all(|ty| callable_entry(db, *ty)),
+            _ => false,
+        }
+    }
+    // Direct parameter calls cannot invoke local declaration factories or aliases. Only ordinary
+    // callable/protocol/gradual entry types participate, and any source reassignment removes the
+    // parameter from this set. Broader local-callee support needs its own declaration admission.
+    let mut callees: Vec<&str> = signature
+        .parameters()
+        .iter()
+        .filter_map(|parameter| {
+            let definition = parameter.definition()?;
+            let (_, ty) = entries.iter().find(|(entry, _)| *entry == definition)?;
+            if callable_entry(db, *ty) {
+                parameter.name().map(ast::name::Name::as_str)
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut local_names: Vec<&str> = node
         .parameters
         .iter()
@@ -530,6 +594,7 @@ fn supported_body(
                         return false;
                     }
                 }
+                callees.retain(|callee| *callee != name.id.as_str());
                 local_names.push(name.id.as_str());
             }
             ast::Stmt::AnnAssign(assignment) => {
@@ -541,6 +606,7 @@ fn supported_body(
                 {
                     return false;
                 }
+                callees.retain(|callee| *callee != name.id.as_str());
                 local_names.push(name.id.as_str());
             }
             _ => {}
@@ -566,6 +632,7 @@ fn supported_body(
         db,
         function,
         &local_names,
+        &callees,
         &parameters,
         &node.body,
         return_tree,
@@ -673,6 +740,228 @@ mod tests {
     }
 
     #[test]
+    fn body_domain_checks_generic_callback_keywords() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import Protocol, overload
+            class TagsRule[T: str](Protocol):
+                def __call__(self, *args, tags: list[T], **kwargs) -> object: ...
+            class DataRule[D, T: str](Protocol):
+                def __call__(self, *args, data: D, tags: list[T], **kwargs) -> object: ...
+            @overload
+            def f[D: list[str] | tuple[str, ...], Over: str](rule: DataRule[D, Over], data: D, tags: list[Over]) -> None: ...
+            @overload
+            def f(rule: DataRule[int, str], data: int, tags: list[str]) -> None: ...
+            def f[Impl: str](rule: TagsRule[Impl], data: list[str] | tuple[str, ...] | int, tags: list[Impl]) -> None:
+                copied: list[Impl] = tags
+                rule(data=data, tags=copied)
+        "#};
+        for value in ["data", "tags", "42", "data"] {
+            db.write_file(
+                "/src/body.py",
+                source.replace("rule(data=data", &format!("rule(data={value}")),
+            )?;
+            let f = function(&db);
+            let signature = f.last_definition_signature(&db).clone();
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            assert!(ordinary.is_empty(), "{ordinary:#?}");
+            for index in [0, 1, 0] {
+                let diagnostics = check_overload_body(&db, f, index).unwrap();
+                let wrong = value == "tags" || value == "42" && index == 0;
+                assert_eq!(
+                    diagnostics.diagnostics().len(),
+                    usize::from(wrong),
+                    "{value} domain {index}: {diagnostics:#?}"
+                );
+                if wrong {
+                    assert_eq!(
+                        diagnostics.diagnostics()[0].id().as_str(),
+                        "invalid-argument-type"
+                    );
+                }
+                assert_eq!(f.last_definition_signature(&db), &signature);
+                assert_eq!(
+                    crate::types::check_types(&db, f.program_file(&db)),
+                    ordinary
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domain_checks_legacy_callback_correlation() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for argument in ["value", "wrong"] {
+            db.write_file(
+                "/src/body.py",
+                indoc::formatdoc! {"
+                from typing import Callable, TypeVar, overload
+                D = TypeVar('D')
+                @overload
+                def f(rule: Callable[[D], None], value: D, wrong: str) -> None: ...
+                @overload
+                def f(rule: Callable[[int], None], value: int, wrong: int) -> None: ...
+                def f(rule: Callable[..., None], value: object, wrong: object) -> None:
+                    rule({argument})
+            "},
+            )?;
+            let f = function(&db);
+            let domain = prepare_body_domain(&db, f, 0).unwrap();
+            let definition = domain.parameters(&db)[0].0;
+            assert_eq!(
+                infer_body_definition(&db, definition, domain)
+                    .inferred_declaration(definition)
+                    .declared()
+                    .unwrap()
+                    .inner_type(),
+                f.last_definition_signature(&db).parameters()[0].annotated_type(),
+            );
+            let diagnostics = check_overload_body(&db, f, 0).unwrap();
+            assert_eq!(
+                diagnostics.diagnostics().len(),
+                usize::from(argument == "wrong"),
+                "{diagnostics:#?}"
+            );
+            if argument == "wrong" {
+                assert_eq!(
+                    diagnostics.diagnostics()[0].id().as_str(),
+                    "invalid-argument-type"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domain_call_ranges_isolate_terminal_callbacks() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let calls = "    callback()\n".repeat(64);
+        db.write_file("/src/body.py", format!("from typing import Callable, NoReturn as Never, overload\n@overload\ndef f(callback: Callable[[], Never], value: int) -> int: ...\n@overload\ndef f(callback: Callable[[], None], value: str) -> str: ...\ndef f(callback: Callable[[], None], value: int | str) -> int | str:\n{calls}    return 42\n"))?;
+        let f = function(&db);
+        let ordinary = crate::types::check_types(&db, f.program_file(&db));
+        assert!(ordinary.is_empty(), "{ordinary:#?}");
+        for index in [0, 1, 0] {
+            let diagnostics = check_overload_body(&db, f, index).unwrap();
+            assert_eq!(diagnostics.diagnostics().len(), index, "{diagnostics:#?}");
+            if index == 1 {
+                assert_eq!(
+                    diagnostics.diagnostics()[0].id().as_str(),
+                    "invalid-return-type"
+                );
+            }
+            assert_eq!(
+                crate::types::check_types(&db, f.program_file(&db)),
+                ordinary
+            );
+        }
+        let events = db.take_salsa_events();
+        for query in [
+            "analyze_body_non_terminal_call",
+            "analyze_body_non_terminal_call_range",
+        ] {
+            assert!(
+                ruff_db::testing::find_will_execute_event_by_name(&db, query, None, &events)
+                    .is_some(),
+                "{query}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domain_preserves_gradual_inputs_and_declines_gradual_defaults() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for annotation in ["Any", "Unknown"] {
+            db.write_file(
+                "/src/body.py",
+                indoc::formatdoc! {"
+                from typing import Any, overload
+                from ty_extensions._internal import Unknown
+                @overload
+                def f(value: {annotation}) -> object: ...
+                @overload
+                def f(value: int) -> int: ...
+                def f(value: object) -> object:
+                    return value
+            "},
+            )?;
+            let f = function(&db);
+            let domain = prepare_body_domain(&db, f, 0).unwrap();
+            assert_eq!(
+                returned_type(&db, f, Some(domain))
+                    .display(&db, &db.program_environment())
+                    .to_string(),
+                annotation
+            );
+            assert!(check_overload_body(&db, f, 0).unwrap().is_empty());
+            db.write_file(
+                "/src/body.py",
+                indoc::formatdoc! {"
+                from typing import Any, overload
+                from ty_extensions._internal import Unknown
+                default: {annotation}
+                @overload
+                def f(value: {annotation} = ...) -> object: ...
+                @overload
+                def f(value: int) -> int: ...
+                def f(value: object = default) -> object:
+                    return value
+            "},
+            )?;
+            assert_eq!(
+                check_overload_body(&db, function(&db), 0).unwrap_err(),
+                BodyDomainError::Unsupported
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domain_declines_call_narrowing_combinations() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for body in [
+            "    callback()\n    if flag:\n        return 1\n    return 0",
+            "    return callback() == 1",
+        ] {
+            db.write_file("/src/body.py", format!("from typing import Callable, Literal, overload\n@overload\ndef f(callback: Callable[[], int], flag: Literal[True]) -> int: ...\n@overload\ndef f(callback: Callable[[], int], flag: Literal[False]) -> int: ...\ndef f(callback: Callable[[], int], flag: bool) -> int:\n{body}\n"))?;
+            assert_eq!(
+                check_overload_body(&db, function(&db), 0).unwrap_err(),
+                BodyDomainError::Unsupported
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domain_declines_local_factories_and_reassigned_callees() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for (annotation, body) in [
+            (
+                "Callable[..., object]",
+                "factory = NewType\n    Alias = factory('Alias', str)",
+            ),
+            (
+                "Callable[..., object]",
+                "callback = NewType\n    Alias = callback('Alias', str)",
+            ),
+            ("type[NewType]", "Alias = callback('Alias', str)"),
+            ("Callable[..., object]", "Alias = new_class('Alias')"),
+            (
+                "Callable[..., object]",
+                "Alias = namedtuple('Alias', 'field')",
+            ),
+        ] {
+            db.write_file("/src/body.py", format!("from typing import Callable, Literal, NewType, overload\nfrom types import new_class\nfrom collections import namedtuple\n@overload\ndef f(callback: {annotation}, flag: Literal[True]) -> None: ...\n@overload\ndef f(callback: {annotation}, flag: Literal[False]) -> None: ...\ndef f(callback: {annotation}, flag: bool) -> None:\n    {body}\n"))?;
+            assert_eq!(
+                check_overload_body(&db, function(&db), 0).unwrap_err(),
+                BodyDomainError::Unsupported
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn generic_body_domains_specialize_declarations() -> anyhow::Result<()> {
         let mut db = setup_db();
         for legacy in [false, true] {
@@ -758,7 +1047,8 @@ mod tests {
             db.write_file(
                 "/src/body.py",
                 indoc::formatdoc! {"
-                from typing import Never, overload
+                from typing import overload
+                from typing_extensions import Never
                 @overload
                 def f[Over: str](value: Over{extra}) -> Over: ...
                 @overload
@@ -1647,7 +1937,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn body_domain_declines_local_callable_and_captures() -> anyhow::Result<()> {
+    fn body_domain_checks_local_callable_and_declines_captures() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented(
             "/src/body.py",
@@ -1661,9 +1951,16 @@ mod tests {
                 return value(1)
         ",
         )?;
+        assert!(
+            check_overload_body(&db, function(&db), 0)
+                .unwrap()
+                .is_empty()
+        );
+        let diagnostics = check_overload_body(&db, function(&db), 1).unwrap();
+        assert_eq!(diagnostics.diagnostics().len(), 1, "{diagnostics:#?}");
         assert_eq!(
-            check_overload_body(&db, function(&db), 0).unwrap_err(),
-            BodyDomainError::Unsupported
+            diagnostics.diagnostics()[0].id().as_str(),
+            "invalid-argument-type"
         );
         db.write_dedented(
             "/src/body.py",
