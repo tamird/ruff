@@ -465,23 +465,16 @@ fn supported_body(
     signature: &crate::types::Signature<'_>,
     entries: &[(Definition<'_>, Type<'_>)],
 ) -> bool {
-    // A projected parameter is an entry fact, not a narrower write declaration. Mutating
-    // methods are admitted only on direct allocations, so aliases of captured kwargs cannot
-    // accidentally turn their projected fields into source assignment restrictions.
-    fn fresh_receiver(
+    fn all_reaching_assignments(
         db: &dyn Db,
         function: FunctionType<'_>,
-        receiver: &ast::Expr,
-        class: KnownClass,
+        name: &ast::ExprName,
+        mut accepts: impl FnMut(&ast::Expr) -> bool,
     ) -> bool {
-        let ast::Expr::Name(name) = receiver else {
-            return false;
-        };
         let file = function.program_file(db);
         let index = semantic_index(db, file);
         let scope = function.literal(db).last_definition.body_scope(db);
         let module = parsed_module(db, file.python_file(db)).load(db);
-        let model = SemanticModel::new(db, file);
         let mut bindings = index
             .use_def_map(scope.file_scope_id(db))
             .bindings_at_use(name.scoped_use_id(db, file))
@@ -509,16 +502,68 @@ fn supported_body(
                     }
                     _ => return false,
                 };
-                match value {
-                    ast::Expr::List(_) => class == KnownClass::List,
-                    ast::Expr::Dict(_) => class == KnownClass::Dict,
-                    ast::Expr::Call(call) => match call.func.inferred_type(&model) {
-                        Some(Type::ClassLiteral(callee)) => callee.is_known(db, class),
-                        _ => false,
-                    },
-                    _ => false,
-                }
+                accepts(value)
             })
+    }
+
+    // A projected parameter is an entry fact, not a narrower write declaration. Mutating
+    // methods are admitted only on direct allocations, so aliases of captured kwargs cannot
+    // accidentally turn their projected fields into source assignment restrictions.
+    fn fresh_receiver(
+        db: &dyn Db,
+        function: FunctionType<'_>,
+        receiver: &ast::Expr,
+        class: KnownClass,
+    ) -> bool {
+        let ast::Expr::Name(name) = receiver else {
+            return false;
+        };
+        let model = SemanticModel::new(db, function.program_file(db));
+        all_reaching_assignments(db, function, name, |value| match value {
+            ast::Expr::List(_) => class == KnownClass::List,
+            ast::Expr::Dict(_) => class == KnownClass::Dict,
+            ast::Expr::Call(call) => match call.func.inferred_type(&model) {
+                Some(Type::ClassLiteral(callee)) => callee.is_known(db, class),
+                _ => false,
+            },
+            _ => false,
+        })
+    }
+
+    fn nonlocal_callee(db: &dyn Db, function: FunctionType<'_>, value: &ast::Expr) -> bool {
+        let model = SemanticModel::new(db, function.program_file(db));
+        match value.inferred_type(&model) {
+            Some(Type::ClassLiteral(class)) => [KnownClass::List, KnownClass::Dict]
+                .into_iter()
+                .any(|known| class.is_known(db, known)),
+            Some(Type::FunctionLiteral(callee)) => {
+                callee != function
+                    && !matches!(
+                        callee.known(db),
+                        Some(KnownFunction::NewClass | KnownFunction::NamedTuple)
+                    )
+            }
+            Some(ty) => callable_entry(db, &model.program_environment(), ty),
+            None => false,
+        }
+    }
+
+    fn assigned_callee(
+        db: &dyn Db,
+        function: FunctionType<'_>,
+        locals: &[&str],
+        value: &ast::Expr,
+    ) -> bool {
+        match value {
+            ast::Expr::Name(name) => {
+                !locals.contains(&name.id.as_str()) && nonlocal_callee(db, function, value)
+            }
+            ast::Expr::If(conditional) => {
+                assigned_callee(db, function, locals, &conditional.body)
+                    && assigned_callee(db, function, locals, &conditional.orelse)
+            }
+            _ => false,
+        }
     }
 
     fn collection_method(
@@ -632,35 +677,15 @@ fn supported_body(
                             return false;
                         }
                         if locals.contains(&name.id.as_str()) {
-                            if !callees.contains(&name.id.as_str()) {
+                            if !callees.contains(&name.id.as_str())
+                                && !all_reaching_assignments(db, function, name, |value| {
+                                    assigned_callee(db, function, locals, value)
+                                })
+                            {
                                 return false;
                             }
-                        } else {
-                            let model = SemanticModel::new(db, function.program_file(db));
-                            match call.func.inferred_type(&model) {
-                                Some(Type::ClassLiteral(class)) => {
-                                    if ![KnownClass::List, KnownClass::Dict]
-                                        .into_iter()
-                                        .any(|known| class.is_known(db, known))
-                                    {
-                                        return false;
-                                    }
-                                }
-                                Some(Type::FunctionLiteral(callee)) => {
-                                    if matches!(
-                                        callee.known(db),
-                                        Some(KnownFunction::NewClass | KnownFunction::NamedTuple)
-                                    ) {
-                                        return false;
-                                    }
-                                }
-                                Some(ty) => {
-                                    if !callable_entry(db, &model.program_environment(), ty) {
-                                        return false;
-                                    }
-                                }
-                                None => return false,
-                            }
+                        } else if !nonlocal_callee(db, function, &call.func) {
+                            return false;
                         }
                     }
                     ast::Expr::Attribute(attribute) => {
@@ -3169,6 +3194,65 @@ mod tests {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_follow_local_callees() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {"
+            from collections import namedtuple
+            from typing import Literal, overload
+
+            def accept_int(value: int) -> None: ...
+            def accept_str(value: str) -> None: ...
+
+            @overload
+            def f(flag: Literal[True], value: int) -> None: ...
+            @overload
+            def f(flag: Literal[False], value: str) -> None: ...
+            def f(flag: bool, value: int | str) -> None:
+                callee = accept_int if flag else accept_str
+                callee(value)
+        "};
+        for (argument, bad_domain) in [("value", None), ("42", Some(1))] {
+            db.write_file(
+                "/src/body.py",
+                source.replace("callee(value)", &format!("callee({argument})")),
+            )?;
+            let f = function(&db);
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            for index in [0, 1, 0] {
+                let diagnostics = check_overload_body(&db, f, index).unwrap();
+                let ids: Vec<_> = diagnostics
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| diagnostic.id().as_str())
+                    .collect();
+                let expected = (bad_domain == Some(index)).then_some("invalid-argument-type");
+                assert_eq!(ids, expected.into_iter().collect::<Vec<_>>());
+            }
+            assert_eq!(
+                crate::types::check_types(&db, f.program_file(&db)),
+                ordinary
+            );
+        }
+
+        for assignment in [
+            "accept_int if flag else namedtuple",
+            "accept_int\n    if flag:\n        callee = namedtuple",
+            "f",
+        ] {
+            db.write_file(
+                "/src/body.py",
+                source.replace("accept_int if flag else accept_str", assignment),
+            )?;
+            assert_eq!(
+                check_overload_body(&db, function(&db), 0),
+                Err(BodyDomainError::Unsupported),
+                "{assignment}"
+            );
         }
         Ok(())
     }
