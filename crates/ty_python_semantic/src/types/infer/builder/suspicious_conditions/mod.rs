@@ -401,7 +401,10 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             &TRUTHINESS_TEST_OF_NONE_UNION,
         ];
 
-        !self.in_detached_annotation()
+        // Specializing an overload can make a necessary source test constant or suspicious.
+        // Ordinary inference checks these condition lints against the shared implementation.
+        self.context.body_domain.is_none()
+            && !self.in_detached_annotation()
             && self.db().should_check_file(self.file())
             && !self.program_file().is_stub(self.db())
             && RELEVANT_RULES

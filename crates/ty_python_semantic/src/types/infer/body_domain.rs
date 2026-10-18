@@ -1422,6 +1422,51 @@ mod tests {
     }
 
     #[test]
+    fn body_domains_do_not_report_specialized_redundancy() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {"
+            from typing import overload
+            @overload
+            def f(always: None, value: None) -> None: ...
+            @overload
+            def f(always: None, value: str) -> str: ...
+            def f(always: None, value: None | str) -> None | str:
+                if not value:
+                    return value
+                return value
+        "};
+        for (body, expected) in [
+            ("return value", &[][..]),
+            ("return 'bad'", &["invalid-return-type"][..]),
+        ] {
+            db.write_file("/src/body.py", source.replacen("return value", body, 1))?;
+            let f = function(&db);
+            let diagnostics = check_overload_body(&db, f, 0).unwrap();
+            let ids: Vec<_> = diagnostics
+                .diagnostics()
+                .iter()
+                .map(|d| d.id().as_str())
+                .collect();
+            assert_eq!(ids, expected, "{diagnostics:#?}");
+        }
+        // Ordinary conditions still warn, and specializing inputs cannot consume an ignore.
+        for (condition, expected) in [
+            ("if always:", "redundant-condition"),
+            (
+                "if not value:  # ty: ignore[redundant-condition]",
+                "unused-ignore-comment",
+            ),
+        ] {
+            db.write_file("/src/body.py", source.replace("if not value:", condition))?;
+            let f = function(&db);
+            let diagnostics = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
+            let ids: Vec<_> = diagnostics.iter().map(|d| d.id().as_str()).collect();
+            assert_eq!(ids, [expected], "{diagnostics:#?}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn body_domain_projects_keyword_rows() -> anyhow::Result<()> {
         let mut db = setup_db();
         let source = indoc::indoc! {"
