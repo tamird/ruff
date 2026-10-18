@@ -4709,6 +4709,30 @@ impl<'db> CandidateSolutions<'db> {
                 return PathBoundSolution::Solved(upper);
             }
 
+            // Equivalent inferred bounds can carry an explicit literal annotation that
+            // prevents later promotion. Preserve that evidence when projecting the range
+            // into a type, without widening the chosen lower bound or using validity alone.
+            if path_bound.has_upper_inference()
+                && lower != lower.promote(db, env)
+                && lower.is_fully_static(db, env)
+                && !lower.has_indeterminate_inference(db, env)
+            {
+                let equivalent_uppers = path_bound
+                    .upper
+                    .iter_evidence()
+                    .chain(path_bound.upper.iter_mixed())
+                    .filter(|upper| {
+                        upper.is_fully_static(db, env)
+                            && !upper.has_indeterminate_inference(db, env)
+                            && lower.is_equivalent_to(db, env, *upper)
+                    });
+                return PathBoundSolution::Solved(UnionType::from_elements(
+                    db,
+                    env,
+                    std::iter::once(lower).chain(equivalent_uppers),
+                ));
+            }
+
             return PathBoundSolution::Solved(lower);
         }
 
@@ -5259,6 +5283,7 @@ mod tests {
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::global_symbol;
     use crate::types::generics::ApplySpecialization;
+    use crate::types::literal::LiteralValueType;
     use crate::types::typevar::{
         BindingContext, TypeVarBoundOrConstraintsEvaluation, TypeVarConstraints,
         TypeVarDefaultEvaluation, TypeVarIdentity,
@@ -7705,6 +7730,93 @@ mod tests {
                 upper.display(db, &env),
             );
         }
+    }
+
+    #[test]
+    fn equivalent_bounds_preserve_literal_annotations() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let builder = ConstraintSetBuilder::new();
+        let one = Type::int_literal(1);
+        let annotated_one = Type::LiteralValue(LiteralValueType::unpromotable(1));
+        let annotated_two = Type::LiteralValue(LiteralValueType::unpromotable(2));
+        let either = UnionType::from_two_elements(db, &env, annotated_one, annotated_two);
+        let int = known_instance(db, KnownClass::Int);
+        let divergent = Type::divergent(salsa::plumbing::Id::from_bits(1));
+        let solve = |lower, upper| {
+            let bounds = CandidateTypeVarSolution {
+                bound_typevar: t,
+                evidence_lower: Some(lower),
+                mixed_lower: None,
+                validity_lower: Type::Never,
+                upper,
+                has_only_non_concrete_evidence: None,
+                selected_declared_constraint: None,
+            };
+            CandidateSolutions::preliminary_solve(db, &env, &builder, &bounds)
+        };
+
+        for (lower, upper, provenance, expected) in [
+            (
+                one,
+                annotated_one,
+                ConstraintProvenance::Evidence,
+                annotated_one,
+            ),
+            (
+                one,
+                annotated_one,
+                ConstraintProvenance::Mixed,
+                annotated_one,
+            ),
+            (one, annotated_one, ConstraintProvenance::Validity, one),
+            (one, either, ConstraintProvenance::Evidence, one),
+            (one, int, ConstraintProvenance::Evidence, one),
+            (one, Type::any(), ConstraintProvenance::Evidence, one),
+            (one, Type::unknown(), ConstraintProvenance::Evidence, one),
+            (one, divergent, ConstraintProvenance::Evidence, one),
+            (
+                Type::any(),
+                annotated_one,
+                ConstraintProvenance::Evidence,
+                Type::any(),
+            ),
+            (
+                Type::unknown(),
+                annotated_one,
+                ConstraintProvenance::Evidence,
+                Type::unknown(),
+            ),
+            (
+                divergent,
+                annotated_one,
+                ConstraintProvenance::Evidence,
+                divergent,
+            ),
+        ] {
+            let mut upper_bound = UpperBound::unconstrained();
+            upper_bound.add_clause(provenance, upper);
+            assert_eq!(
+                solve(lower, upper_bound),
+                PathBoundSolution::Solved(expected)
+            );
+        }
+
+        // Equivalent clauses can differ in promotion eligibility. Their order must not
+        // decide whether the explicit annotation survives projection.
+        for clauses in [[one, annotated_one], [annotated_one, one]] {
+            let mut upper = UpperBound::unconstrained();
+            for clause in clauses {
+                upper.add_clause(ConstraintProvenance::Evidence, clause);
+            }
+            assert_eq!(solve(one, upper), PathBoundSolution::Solved(annotated_one));
+        }
+        assert_eq!(
+            solve(Type::int_literal(2), UpperBound::from_clause(annotated_one)),
+            PathBoundSolution::Unsatisfiable,
+        );
     }
 
     #[test]

@@ -4368,5 +4368,43 @@ def gradual(value: Any, unknown: Unknown):
     reveal_type(make_list(unknown, accepts_unknown))  # revealed: list[Unknown]
 ```
 
+## Equivalent literal bounds keep annotation context
+
+A literal supplied as an argument can have the same value as an inferred annotated upper bound.
+Preserving that annotation lets subsequent collection inference retain the required literal type.
+
+```py
+from collections.abc import Callable
+from typing import Literal
+
+def append_one[T](values: list[T], consume: Callable[[list[T | Literal[1]]], None]) -> list[T]:
+    combined: list[T | Literal[1]] = list(values)
+    combined.append(1)
+    consume(combined)
+    return values
+
+def only_one(values: list[Literal[1]]) -> None:
+    pass
+
+def either(values: list[Literal[1, 2]]) -> None:
+    pass
+
+def broad(values: list[int]) -> None:
+    pass
+
+append_one([1], only_one)  # no diagnostic
+append_one(consume=only_one, values=[1])  # no diagnostic
+append_one([], only_one)  # no diagnostic
+result = append_one([1], only_one)
+reveal_type(result)  # revealed: list[Literal[1]]
+reveal_type(append_one([2], either))  # revealed: list[Literal[2]]
+reveal_type(append_one([1], broad))  # revealed: list[int]
+append_one([2], only_one)  # error: [invalid-argument-type]
+
+def supplied(narrow: list[Literal[1]], wide: list[int]):
+    append_one(narrow, only_one)  # no diagnostic
+    append_one(wide, only_one)  # error: [invalid-argument-type]
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

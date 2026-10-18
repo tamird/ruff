@@ -3728,3 +3728,26 @@ reveal_type(make_list(1, accepts_one))  # revealed: list[Literal[1]]
 reveal_type(make_list(1, accepts_int))  # revealed: list[int]
 make_list(2, accepts_one)  # error: [invalid-argument-type]
 ```
+
+## Equivalent literal bounds keep annotation context
+
+```py
+from typing import Callable, Literal, TypeVar
+
+T = TypeVar("T")
+
+def append_one(values: list[T], consume: Callable[[list[T | Literal[1]]], None]) -> list[T]:
+    combined: list[T | Literal[1]] = list(values)
+    combined.append(1)
+    consume(combined)
+    return values
+
+def only_one(values: list[Literal[1]]) -> None:
+    pass
+
+append_one([1], only_one)  # no diagnostic
+append_one(consume=only_one, values=[1])  # no diagnostic
+result = append_one([1], only_one)
+reveal_type(result)  # revealed: list[Literal[1]]
+append_one([2], only_one)  # error: [invalid-argument-type]
+```
