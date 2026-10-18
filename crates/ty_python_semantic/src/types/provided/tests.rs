@@ -553,6 +553,75 @@ ordinary: list[int] = ["bad"]
 }
 
 #[test]
+fn supplied_type_applications_infer_callable_values() -> anyhow::Result<()> {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the type application hook requires this signature"
+    )]
+    fn application<'db>(
+        db: &'db TestDb,
+        application: ProvidedTypeApplication<'_, 'db>,
+        context: &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<Type<'db>> {
+        let Type::ClassLiteral(ClassLiteral::Static(class)) = application.value_type else {
+            return None;
+        };
+        if class.name(db) != "Arguments" {
+            return None;
+        }
+        let callable = context.infer_value_expression(&application.expression.slice);
+        let env = ProgramEnvironment::from_file(context.program_file());
+        let signature = callable.single_callable_signature(db, &env)?;
+        crate::types::keyword_arguments_type(db, &env, signature.parameters())
+    }
+
+    let db = TestDbBuilder::new()
+        .with_type_application_provider(application)
+        .with_file(
+            "/src/contracts.pyi",
+            "from typing import Callable, overload\n\
+             class Arguments: ...\n\
+             def target(*, required: str, optional: int = ...) -> None: ...\n\
+             @overload\n\
+             def overloaded(value: int) -> int: ...\n\
+             @overload\n\
+             def overloaded(value: str) -> str: ...\n\
+             alternatives: Callable[[int], int] | Callable[[str], str]\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"from contracts import Arguments, target
+valid: Arguments[target] = {"required": "value"}
+wrong: Arguments[target] = {"required": 42}
+missing: Arguments[target] = {}
+def scoped() -> None:
+    def target(*, required: int) -> None: pass
+    local: Arguments[target] = {"required": 42}
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type", "missing-typed-dict-key"],
+        "{diagnostics:#?}",
+    );
+    let contracts = db.program_file(system_path_to_file(&db, "/src/contracts.pyi")?);
+    let env = ProgramEnvironment::from_file(contracts);
+    for name in ["overloaded", "alternatives"] {
+        let callable = crate::place::global_symbol(&db, contracts, name)
+            .place
+            .expect_type();
+        assert!(callable.single_callable_signature(&db, &env).is_none());
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_type_applications_specialize_signature_results() -> anyhow::Result<()> {
     fn signature<'db>(db: &'db TestDb, value: Type<'db>) -> Option<&'db Signature<'db>> {
         let Type::FunctionLiteral(function) = value else {

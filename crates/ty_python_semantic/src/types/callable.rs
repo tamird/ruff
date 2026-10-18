@@ -106,6 +106,19 @@ impl<'db> Type<'db> {
         Type::Callable(CallableType::single(db, signature))
     }
 
+    /// Returns the signature when this type has exactly one callable alternative and overload.
+    pub fn single_callable_signature(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<&'db Signature<'db>> {
+        let callable = self.try_upcast_to_callable(db, env)?.exactly_one()?;
+        let [signature] = callable.signatures(db).overloads.as_slice() else {
+            return None;
+        };
+        Some(signature)
+    }
+
     /// Builds a wrapper callable by transforming each signature while retaining unions and
     /// overloads. Source parameter definitions and generic contexts remain in the signature.
     pub fn map_callable_signatures(

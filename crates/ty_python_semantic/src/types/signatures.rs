@@ -5517,11 +5517,11 @@ struct ParametersData<'db> {
     kind: ParametersKind<'db>,
 }
 
-/// Reconstruct a local `**kwargs` value from the normalized parameters it receives.
+/// Construct the dictionary type for a group of normalized keyword parameters.
 ///
 /// Defaults describe optional keys here, not values inserted into the dictionary. An empty
 /// complete group is a closed, empty dictionary; unavailable input context is handled by callers.
-pub(crate) fn keyword_arguments_type<'a, 'db>(
+pub fn keyword_arguments_type<'a, 'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     parameters: impl IntoIterator<Item = &'a Parameter<'db>>,

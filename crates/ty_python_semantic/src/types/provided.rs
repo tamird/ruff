@@ -352,6 +352,9 @@ impl From<ProvidedGetattrPresence> for ProvidedGetattrResult<'_> {
 pub trait TypeExpressionContext<'db> {
     fn program_file(&self) -> ProgramFile<'db>;
 
+    /// Infers a child as a runtime value rather than a type expression.
+    fn infer_value_expression(&mut self, expression: &ast::Expr) -> Type<'db>;
+
     /// Infers a type expression, rejecting declaration qualifiers such as `Final`.
     fn infer_type_expression(&mut self, expression: &ast::Expr) -> Type<'db>;
 

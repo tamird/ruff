@@ -101,7 +101,7 @@ use crate::types::mro::{MroIterator, StaticMroError};
 pub(crate) use crate::types::narrow::{NarrowingConstraint, infer_narrowing_constraints};
 use crate::types::newtype::NewType;
 use crate::types::signatures::{ConcatenateTail, walk_signature};
-pub use crate::types::signatures::{Parameter, Parameters};
+pub use crate::types::signatures::{Parameter, Parameters, keyword_arguments_type};
 pub(crate) use crate::types::signatures::{
     function_signature_annotation_info, function_signature_annotation_scope,
 };

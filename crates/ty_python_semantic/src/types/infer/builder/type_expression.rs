@@ -47,6 +47,10 @@ impl<'db> TypeExpressionContext<'db> for TypeInferenceBuilder<'db, '_> {
         self.program_file()
     }
 
+    fn infer_value_expression(&mut self, expression: &ast::Expr) -> Type<'db> {
+        self.infer_maybe_standalone_expression(expression, TypeContext::default())
+    }
+
     fn infer_type_expression(&mut self, expression: &ast::Expr) -> Type<'db> {
         self.infer_type_expression(expression)
     }
