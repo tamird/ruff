@@ -1499,6 +1499,44 @@ impl TypeCheckDiagnostics {
         self.used_suppressions.extend(&other.used_suppressions);
     }
 
+    /// Group failures at the same operation while retaining every distinct overload explanation.
+    pub(super) fn extend_overload_domains(&mut self, other: &TypeCheckDiagnostics) {
+        for diagnostic in other {
+            let existing = self.diagnostics.iter_mut().find(|existing| {
+                existing.id() == diagnostic.id()
+                    && existing.primary_span().is_some()
+                    && existing.primary_span() == diagnostic.primary_span()
+            });
+            if let Some(existing) = existing {
+                if existing.headline_message() == diagnostic.headline_message()
+                    && existing.annotations() == diagnostic.annotations()
+                    && diagnostic
+                        .sub_diagnostics()
+                        .iter()
+                        .all(|detail| existing.sub_diagnostics().contains(detail))
+                {
+                    continue;
+                }
+                let mut explanation =
+                    SubDiagnostic::new(SubDiagnosticSeverity::Info, diagnostic.headline_message());
+                for annotation in diagnostic.annotations() {
+                    explanation.annotate(annotation.clone());
+                }
+                if !existing.sub_diagnostics().contains(&explanation) {
+                    existing.sub(explanation);
+                }
+                for detail in diagnostic.sub_diagnostics() {
+                    if !existing.sub_diagnostics().contains(detail) {
+                        existing.sub(detail.clone());
+                    }
+                }
+            } else {
+                self.diagnostics.push(diagnostic.clone());
+            }
+        }
+        self.used_suppressions.extend(&other.used_suppressions);
+    }
+
     pub(super) fn extend_diagnostics(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
         self.diagnostics.extend(diagnostics);
     }
@@ -1582,7 +1620,8 @@ impl TypeCheckDiagnostics {
         self.diagnostics().iter()
     }
 
-    fn diagnostics(&self) -> &[Diagnostic] {
+    /// Reported diagnostics; suppression usage is retained separately in this bundle.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
         self.diagnostics.as_slice()
     }
 }

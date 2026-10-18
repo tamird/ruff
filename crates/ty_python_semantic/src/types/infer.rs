@@ -76,6 +76,7 @@ use ty_python_core::{ExpressionNodeKey, SemanticIndex, Statement, Truthiness, se
 mod body_domain;
 mod builder;
 pub(crate) use body_domain::FunctionBodyDomain;
+pub(super) use body_domain::overload_body_diagnostics;
 pub use body_domain::{BodyDomainError, check_overload_body};
 mod implicit_alias;
 pub(super) use implicit_alias::implicit_alias_parameters;

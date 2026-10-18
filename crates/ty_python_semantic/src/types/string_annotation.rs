@@ -83,6 +83,18 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         file: ProgramFile<'db>,
         function: &'a ast::StmtFunctionDef,
     ) -> Option<(Definition<'db>, GenericContext<'db>)> {
+        let donor = Self::external_function_definition(db, file, function)?;
+        let context = external_function_generic_context(db, donor)?;
+        Some((donor, context))
+    }
+
+    /// Identify a declaration supplying the entire signature, including nongeneric signatures.
+    /// Native or separately supplied annotations do not establish this correspondence.
+    pub(super) fn external_function_definition(
+        db: &'db dyn Db,
+        file: ProgramFile<'db>,
+        function: &'a ast::StmtFunctionDef,
+    ) -> Option<Definition<'db>> {
         let Self::External {
             annotation,
             range: _,
@@ -91,7 +103,6 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
             return None;
         };
         let donor = annotation.definition;
-        let context = external_function_generic_context(db, donor)?;
         for parameter in &function.parameters {
             let parameter = parameter.as_parameter();
             let Self::External {
@@ -105,7 +116,7 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
                 return None;
             }
         }
-        Some((donor, context))
+        Some(donor)
     }
 
     pub(crate) fn function_return(

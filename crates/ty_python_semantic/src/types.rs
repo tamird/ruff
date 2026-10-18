@@ -221,10 +221,27 @@ pub fn check_types(db: &dyn Db, file: ProgramFile<'_>) -> Vec<Diagnostic> {
 ///
 /// Supplemental diagnostics are not filtered by reachability: they may describe unreachable code.
 /// Suppression usage is validated once, after both inferred and supplemental diagnostics are added.
-pub fn check_types_with_diagnostics(
-    db: &dyn Db,
-    file: ProgramFile<'_>,
+pub fn check_types_with_diagnostics<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
     supplemental: impl IntoIterator<Item = Diagnostic>,
+) -> Vec<Diagnostic> {
+    check_types_with_overload_bodies(db, file, supplemental, [])
+}
+
+/// Checks a file, including supported overload bodies selected by an embedding application.
+///
+/// The selected source functions must belong to `file`; foreign functions and duplicate selections
+/// are ignored. Ty derives declared overloads from inline definitions or whole-signature external
+/// annotation provenance and validates each domain independently. Unsupported domains add no proof
+/// or diagnostic; [`check_overload_body`] reports that status explicitly when coverage is needed.
+/// Ordinary diagnostics take precedence at the same rule and source location. All suppression
+/// usage is merged before unused suppressions are checked.
+pub fn check_types_with_overload_bodies<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    supplemental: impl IntoIterator<Item = Diagnostic>,
+    functions: impl IntoIterator<Item = FunctionType<'db>>,
 ) -> Vec<Diagnostic> {
     let source_file = file.file(db);
     let _span = tracing::trace_span!("check_types", ?source_file).entered();
@@ -285,6 +302,23 @@ pub fn check_types_with_diagnostics(
                 .filter_map(diagnostic_key),
         );
         implicit_aliases.extend_from_slice(&inference.implicit_aliases);
+    }
+
+    let mut checked_functions = FxHashSet::default();
+    let mut body_diagnostics = TypeCheckDiagnostics::default();
+    for function in functions {
+        if function.program_file(db) != file || !checked_functions.insert(function) {
+            continue;
+        }
+        for domain in infer::overload_body_diagnostics(db, function) {
+            body_diagnostics.extend_overload_domains(&domain);
+        }
+    }
+    if body_diagnostics.has_diagnostics_or_used_suppressions() {
+        reported.extend((&diagnostics).into_iter().filter_map(diagnostic_key));
+        diagnostics.extend_filtered(&body_diagnostics, |diagnostic| {
+            diagnostic_key(diagnostic).is_none_or(|key| !reported.contains(&key))
+        });
     }
 
     diagnostics.extend_diagnostics(

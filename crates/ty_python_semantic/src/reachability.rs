@@ -196,6 +196,7 @@
 use crate::ProgramEnvironment;
 use std::cell::RefCell;
 
+use crate::types::FunctionBodyDomain;
 use crate::{
     Db,
     dunder_all::dunder_all_names,
@@ -691,6 +692,15 @@ fn evaluate_reachability_constraint<'db>(
     scope: ScopeId<'db>,
     id: ScopedReachabilityConstraintId,
 ) -> Truthiness {
+    evaluate_reachability_in_domain(db, scope, id, None)
+}
+
+pub(crate) fn evaluate_reachability_in_domain<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    id: ScopedReachabilityConstraintId,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Truthiness {
     if let Some(reachability) = terminal_reachability(id) {
         return reachability;
     }
@@ -711,6 +721,7 @@ fn evaluate_reachability_constraint<'db>(
         id,
         true,
         None,
+        domain.filter(|domain| domain.scope(db) == scope),
     )
 }
 
@@ -791,6 +802,7 @@ fn evaluate_reachability_path<'db>(
     mut id: ScopedReachabilityConstraintId,
     mut use_checkpoint: bool,
     initial_binding: Option<Definition<'db>>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> Truthiness {
     let env = ProgramEnvironment::from_scope(scope);
     let use_def = use_def_map(db, scope);
@@ -802,7 +814,7 @@ fn evaluate_reachability_path<'db>(
                 return ReachabilityAtom::Known(Truthiness::from(predicate.is_positive));
             }
         }
-        analyze_reachability_atom(db, &env, use_def, predicates, atom)
+        analyze_reachability_atom(db, &env, use_def, predicates, atom, domain)
     };
 
     loop {
@@ -815,7 +827,10 @@ fn evaluate_reachability_path<'db>(
             && use_checkpoint
             && is_reachability_checkpoint(call_predicates, node.atom(), visited)
         {
-            return evaluate_reachability_checkpoint(db, scope, id);
+            return domain.map_or_else(
+                || evaluate_reachability_checkpoint(db, scope, id),
+                |domain| evaluate_body_reachability_checkpoint(db, scope, id, domain),
+            );
         }
 
         id = match evaluate_atom(node.atom()) {
@@ -854,6 +869,29 @@ fn evaluate_reachability_checkpoint<'db>(
     scope: ScopeId<'db>,
     id: ScopedReachabilityConstraintId,
 ) -> Truthiness {
+    reachability_checkpoint(db, scope, id, None)
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _, _| Truthiness::Ambiguous,
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn evaluate_body_reachability_checkpoint<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    id: ScopedReachabilityConstraintId,
+    domain: FunctionBodyDomain<'db>,
+) -> Truthiness {
+    reachability_checkpoint(db, scope, id, Some(domain))
+}
+
+fn reachability_checkpoint<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    id: ScopedReachabilityConstraintId,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Truthiness {
     let use_def = use_def_map(db, scope);
     let predicates = use_def.predicates();
     let has_many_calls = predicates
@@ -871,6 +909,7 @@ fn evaluate_reachability_checkpoint<'db>(
         id,
         false,
         None,
+        domain,
     )
 }
 
@@ -906,6 +945,7 @@ impl<'db> ReachabilityConstraintsExtension<'db> for ReachabilityConstraints {
             None,
             id,
             true,
+            None,
             None,
         )
     }
@@ -1981,9 +2021,40 @@ pub(crate) fn analyze_condition_expression(
     heap_size = get_size2::GetSize::get_heap_size
 )]
 fn analyze_condition<'db>(db: &'db dyn Db, expression: Expression<'db>) -> Truthiness {
+    condition_truthiness(db, expression, None)
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _| Truthiness::Ambiguous,
+    cycle_fn = |_, cycle: &salsa::Cycle, previous: &Truthiness, result: Truthiness, _, _| {
+        if cycle.iteration() > crate::TAINTED_CYCLES && *previous != result {
+            Truthiness::Ambiguous
+        } else {
+            result
+        }
+    },
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn analyze_body_condition<'db>(
+    db: &'db dyn Db,
+    expression: Expression<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> Truthiness {
+    condition_truthiness(db, expression, Some(domain))
+}
+
+fn condition_truthiness<'db>(
+    db: &'db dyn Db,
+    expression: Expression<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Truthiness {
     let env = ProgramEnvironment::from_scope(expression.scope(db));
     let module = parsed_module(db, expression.python_file(db)).load(db);
-    let inference = infer_expression_types(db, expression, TypeContext::default());
+    let inference = domain.map_or_else(
+        || infer_expression_types(db, expression, TypeContext::default()),
+        |domain| domain.infer_expression(db, expression, TypeContext::default()),
+    );
     analyze_condition_expression(expression.node_ref(db).node(&module), &|node| {
         inference
             .comparison_truthiness(node)
@@ -2011,7 +2082,28 @@ fn analyze_stable_boolean_guard<'db>(
     definition: Definition<'db>,
     expression: Expression<'db>,
 ) -> bool {
-    crate::types::narrow::is_stable_boolean_guard(db, definition, expression)
+    crate::types::narrow::is_stable_boolean_guard(db, definition, expression, None)
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _, _| false,
+    cycle_fn = |_, cycle: &salsa::Cycle, previous: &bool, result: bool, _, _, _| {
+        if cycle.iteration() > crate::TAINTED_CYCLES {
+            *previous && result
+        } else {
+            result
+        }
+    },
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn analyze_body_boolean_guard<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    expression: Expression<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> bool {
+    crate::types::narrow::is_stable_boolean_guard(db, definition, expression, Some(domain))
 }
 
 fn analyze_reachability_atom<'db>(
@@ -2020,6 +2112,7 @@ fn analyze_reachability_atom<'db>(
     use_def: &UseDefMap<'db>,
     predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
     id: ScopedPredicateId,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> ReachabilityAtom<Definition<'db>> {
     let predicate = &predicates[id];
     if let Some(guard) = use_def.boolean_guard(id) {
@@ -2028,28 +2121,49 @@ fn analyze_reachability_atom<'db>(
             expression,
             is_positive,
         } = guard;
-        if analyze_stable_boolean_guard(db, definition, expression) {
+        if domain.map_or_else(
+            || analyze_stable_boolean_guard(db, definition, expression),
+            |domain| analyze_body_boolean_guard(db, definition, expression, domain),
+        ) {
             return ReachabilityAtom::Symbolic {
                 key: definition,
                 is_positive: is_positive == predicate.is_positive,
             };
         }
     }
-    ReachabilityAtom::Known(analyze_single(db, env, predicate))
+    ReachabilityAtom::Known(analyze_single_in_domain(db, env, predicate, domain))
 }
 
 fn analyze_single(db: &dyn Db, env: &ProgramEnvironment<'_>, predicate: &Predicate) -> Truthiness {
+    analyze_single_in_domain(db, env, predicate, None)
+}
+
+fn analyze_single_in_domain<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    predicate: &Predicate<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Truthiness {
     let _span = tracing::trace_span!("analyze_single", ?predicate).entered();
 
     match predicate.node {
-        PredicateNode::Expression(test_expr) => {
-            infer_same_file_expression_type(db, test_expr, TypeContext::default())
-                .bool(db, env)
-                .negate_if(!predicate.is_positive)
-        }
-        PredicateNode::Condition(test_expr) => {
-            analyze_condition(db, test_expr).negate_if(!predicate.is_positive)
-        }
+        PredicateNode::Expression(test_expr) => domain
+            .map_or_else(
+                || infer_same_file_expression_type(db, test_expr, TypeContext::default()),
+                |domain| {
+                    domain
+                        .infer_expression(db, test_expr, TypeContext::default())
+                        .expression_type(test_expr.node_ref(db))
+                },
+            )
+            .bool(db, env)
+            .negate_if(!predicate.is_positive),
+        PredicateNode::Condition(test_expr) => domain
+            .map_or_else(
+                || analyze_condition(db, test_expr),
+                |domain| analyze_body_condition(db, test_expr, domain),
+            )
+            .negate_if(!predicate.is_positive),
         PredicateNode::ChainedComparisonCondition(test_expr) => {
             let inference = infer_expression_types(db, test_expr, TypeContext::default());
             let expression = test_expr.node_ref(db);
@@ -2140,12 +2254,39 @@ pub(crate) fn is_range_reachable<'db>(
     scope_id: FileScopeId,
     range: TextRange,
 ) -> bool {
+    is_range_reachable_in_domain(db, index, scope_id, range, None)
+}
+
+pub(crate) fn is_range_reachable_in_domain<'db>(
+    db: &'db dyn Db,
+    index: &SemanticIndex<'db>,
+    scope_id: FileScopeId,
+    range: TextRange,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> bool {
     index.ancestor_scopes(scope_id).all(|(scope_id, _)| {
         let use_def = index.use_def_map(scope_id);
         !use_def
             .range_reachability()
             .any(|(entry_range, constraint)| {
-                entry_range.contains_range(range) && !is_reachable(db, use_def, constraint)
+                entry_range.contains_range(range)
+                    && !domain
+                        .map_or_else(
+                            || evaluate_reachability(db, use_def, constraint),
+                            |domain| {
+                                if domain.scope(db).file_scope_id(db) == scope_id {
+                                    evaluate_reachability_in_domain(
+                                        db,
+                                        domain.scope(db),
+                                        constraint,
+                                        Some(domain),
+                                    )
+                                } else {
+                                    evaluate_reachability(db, use_def, constraint)
+                                }
+                            },
+                        )
+                        .may_be_true()
             })
     })
 }
@@ -2304,7 +2445,7 @@ pub(crate) fn evaluate_reachability_assuming_boolean<'db>(
                 return ReachabilityAtom::Known(truthiness.negate_if(!predicate.is_positive));
             }
         }
-        match analyze_reachability_atom(db, &env, use_def, predicates, atom) {
+        match analyze_reachability_atom(db, &env, use_def, predicates, atom, None) {
             ReachabilityAtom::Symbolic { key, is_positive } => {
                 if stable_definition == Some(key) {
                     ReachabilityAtom::Known(Truthiness::from(value == is_positive))
@@ -2378,6 +2519,7 @@ pub(crate) fn refine_initial_binding_reachability<'db>(
         id,
         false,
         Some(binding),
+        None,
     );
     if result.is_always_false() {
         result
@@ -2403,6 +2545,7 @@ pub(crate) struct ReachabilityEvaluationCache<'db> {
     primary_constraints: usize,
     primary_entries: RefCell<Vec<Option<Truthiness>>>,
     other_entries: RefCell<FxHashMap<(usize, ScopedReachabilityConstraintId), Truthiness>>,
+    body_domain: Option<FunctionBodyDomain<'db>>,
 }
 
 impl<'db> ReachabilityEvaluationCache<'db> {
@@ -2420,7 +2563,17 @@ impl<'db> ReachabilityEvaluationCache<'db> {
             primary_constraints: std::ptr::from_ref(primary_constraints).addr(),
             primary_entries: RefCell::new(Vec::new()),
             other_entries: RefCell::new(FxHashMap::default()),
+            body_domain: None,
         }
+    }
+
+    /// Set the immutable inference context before populating this cache. Each entry is specific
+    /// to this domain as well as its scope and constraint identity.
+    pub(crate) fn with_body_domain(mut self, domain: Option<FunctionBodyDomain<'db>>) -> Self {
+        debug_assert!(self.primary_entries.borrow().is_empty());
+        debug_assert!(self.other_entries.borrow().is_empty());
+        self.body_domain = domain;
+        self
     }
 
     /// Evaluates `id`, reusing a cached result when possible.
@@ -2453,7 +2606,7 @@ impl<'db> ReachabilityEvaluationCache<'db> {
                 return result;
             }
 
-            let result = evaluate_reachability_constraint(db, scope, id);
+            let result = evaluate_reachability_in_domain(db, scope, id, self.body_domain);
             self.other_entries.borrow_mut().insert(key, result);
             return result;
         }
@@ -2463,7 +2616,7 @@ impl<'db> ReachabilityEvaluationCache<'db> {
             return result;
         }
 
-        let result = evaluate_reachability_constraint(db, self.primary_scope, id);
+        let result = evaluate_reachability_in_domain(db, self.primary_scope, id, self.body_domain);
         let mut entries = self.primary_entries.borrow_mut();
         if entries.len() <= index {
             entries.resize(index + 1, None);

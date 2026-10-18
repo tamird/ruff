@@ -17,7 +17,7 @@ use super::{Type, TypeCheckDiagnostics, infer_definition_types};
 use crate::diagnostic::DiagnosticGuard;
 use crate::importer::Importer;
 use crate::lint::LintSource;
-use crate::reachability::is_range_reachable;
+use crate::reachability::is_range_reachable_in_domain;
 use crate::types::function::FunctionDecorators;
 use crate::types::infer::{FunctionBodyDomain, InferenceFlags};
 use crate::{
@@ -389,7 +389,7 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
         let db = self.db;
         let index = semantic_index(self.db(), self.program_file);
         let scope_id = self.scope.file_scope_id(self.db());
-        is_range_reachable(db, index, scope_id, range)
+        is_range_reachable_in_domain(db, index, scope_id, range, self.body_domain)
     }
 
     /// Are we currently inferring types in a stub file?
@@ -665,6 +665,12 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
 
         let (severity, source) = Self::severity_and_source(ctx, lint_id)?;
 
+        // A branch excluded by this overload cannot justify an ignore in the source body.
+        // Ordinary inference retains its suppression accounting for unreachable code.
+        if ctx.body_domain.is_some() && !ctx.is_range_reachable(range) {
+            return None;
+        }
+
         let suppressed =
             ctx.diagnostics
                 .borrow_mut()
@@ -673,7 +679,7 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
         // Suppress diagnostics in unreachable code. This checks both whether
         // the scope itself is unreachable and whether the specific statement or
         // expression containing this diagnostic is unreachable.
-        if !ctx.is_range_reachable(range) {
+        if ctx.body_domain.is_none() && !ctx.is_range_reachable(range) {
             return None;
         }
 

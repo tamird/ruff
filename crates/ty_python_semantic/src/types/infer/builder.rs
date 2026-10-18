@@ -569,10 +569,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .index
                     .use_def_map(scope.file_scope_id(self.db()))
                     .reachability_constraints();
-                Rc::new(ReachabilityEvaluationCache::new(
-                    scope,
-                    reachability_constraints,
-                ))
+                Rc::new(
+                    ReachabilityEvaluationCache::new(scope, reachability_constraints)
+                        .with_body_domain(self.context.body_domain),
+                )
             })
             .as_ref()
     }

@@ -331,6 +331,7 @@ pub(crate) fn is_stable_boolean_guard<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
     expression: Expression<'db>,
+    domain: Option<super::infer::FunctionBodyDomain<'db>>,
 ) -> bool {
     let scope = definition.scope(db);
     let ScopedPlaceId::Symbol(symbol) = definition.place(db) else {
@@ -357,7 +358,10 @@ pub(crate) fn is_stable_boolean_guard<'db>(
     {
         return false;
     }
-    let original = infer_definition_types(db, definition);
+    let original = domain.map_or_else(
+        || infer_definition_types(db, definition),
+        |domain| domain.infer_definition(db, definition),
+    );
     if original.is_provisional()
         || !original
             .binding_type(definition)
@@ -366,7 +370,10 @@ pub(crate) fn is_stable_boolean_guard<'db>(
     {
         return false;
     }
-    let occurrence = infer_expression_types(db, expression, TypeContext::default());
+    let occurrence = domain.map_or_else(
+        || infer_expression_types(db, expression, TypeContext::default()),
+        |domain| domain.infer_expression(db, expression, TypeContext::default()),
+    );
     if occurrence.is_provisional() {
         return false;
     }

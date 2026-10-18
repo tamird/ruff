@@ -18,7 +18,7 @@ use ty_python_core::{ProgramFileKind, ProvidedAnnotation, semantic_index};
 
 use super::*;
 use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
-use crate::types::KnownClass;
+use crate::types::{BodyDomainError, KnownClass, check_overload_body};
 use crate::{HasType, ProgramEnvironment, SemanticModel};
 
 /// Pairs top-level functions by name and their ordinary parameters by position.
@@ -111,7 +111,7 @@ impl SourceProvider for ExternalSource {
                     owner: foreign.node_index().load(),
                 });
             }
-            let Some(foreign) = declarations.suite().iter().find_map(|statement| {
+            let Some(foreign) = declarations.suite().iter().rev().find_map(|statement| {
                 let ast::Stmt::FunctionDef(declaration) = statement else {
                     return None;
                 };
@@ -165,6 +165,231 @@ impl SourceProvider for ExternalSource {
     ) -> Option<ProvidedBindingValue<'db>> {
         None
     }
+}
+
+#[test]
+fn external_overload_body_domains() -> anyhow::Result<()> {
+    fn function(db: &TestDb) -> crate::types::FunctionType<'_> {
+        let file = db.program_file(system_path_to_file(db, "/src/main.py").unwrap());
+        crate::place::global_symbol(db, file, "pick")
+            .place
+            .expect_type()
+            .expect_function_literal()
+    }
+
+    let source = indoc::indoc! {r#"
+            from contracts import pick as public_pick
+
+            def pick(*, executable, test):
+                if test:
+                    return 'test'
+                elif executable:
+                    return 1
+                else:
+                    return b'alias'
+
+            ordinary = pick(executable=True, test=False)
+            public_test = public_pick(executable=False, test=True)
+            public_executable = public_pick(executable=True, test=False)
+            public_alias = public_pick(executable=False, test=False)
+        "#};
+    let donor = indoc::indoc! {r#"
+            from typing import Literal, overload
+
+            # Keep donor and source offsets deliberately different.
+
+            @overload
+            def pick(*, executable: bool, test: Literal[True]) -> str: ...
+            @overload
+            def pick(*, executable: Literal[True], test: Literal[False]) -> int: ...
+            @overload
+            def pick(*, executable: Literal[False], test: Literal[False]) -> bytes: ...
+            @overload
+            def pick(*, executable: bool, test: bool) -> str | int | bytes: ...
+            def pick(*, executable: bool, test: bool) -> str | int | bytes: ...
+        "#};
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", source)
+        .with_file("/src/contracts.pyi", donor)
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    let source_file = system_path_to_file(&db, "/src/main.py")?;
+    let file = db.program_file(source_file);
+    for index in [0, 3, 1, 2, 1, 0] {
+        let diagnostics = check_overload_body(&db, function(&db), index)
+            .unwrap()
+            .into_diagnostics();
+        assert!(diagnostics.is_empty(), "domain {index}: {diagnostics:#?}");
+        assert!(db.check_file(source_file).is_empty());
+        for (name, expected) in [
+            ("ordinary", "str | int | bytes"),
+            ("public_test", "str"),
+            ("public_executable", "int"),
+            ("public_alias", "bytes"),
+        ] {
+            let ty = crate::place::global_symbol(&db, file, name)
+                .place
+                .expect_type();
+            assert_eq!(
+                ty.display(&db, &ProgramEnvironment::from_file(file))
+                    .to_string(),
+                expected
+            );
+        }
+    }
+    db.write_file(
+        "/src/main.py",
+        source.replace("return 'test'", "return b'alias'"),
+    )?;
+    assert!(db.check_file(source_file).is_empty());
+    let diagnostics = check_overload_body(&db, function(&db), 0)
+        .unwrap()
+        .into_diagnostics();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+    assert_eq!(
+        diagnostics[0]
+            .primary_annotation()
+            .unwrap()
+            .get_span()
+            .file(),
+        &ruff_db::diagnostic::UnifiedFile::Ty(source_file)
+    );
+    assert!(
+        check_overload_body(&db, function(&db), 1)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Editing only the donor changes the selected promise and invalidates its body check.
+    db.write_file(
+        "/src/contracts.pyi",
+        donor.replace(
+            "test: Literal[True]) -> str",
+            "test: Literal[True]) -> bytes",
+        ),
+    )?;
+    assert!(
+        check_overload_body(&db, function(&db), 0)
+            .unwrap()
+            .is_empty()
+    );
+    db.write_file("/src/contracts.pyi", donor)?;
+    assert_eq!(
+        check_overload_body(&db, function(&db), 0)
+            .unwrap()
+            .diagnostics()
+            .len(),
+        1
+    );
+
+    // An unsupported sibling must not conceal a completed inconsistent return check.
+    db.write_file(
+        "/src/contracts.pyi",
+        donor.replace(
+            "executable: bool, test: bool) -> str | int | bytes: ...\ndef pick",
+            "executable: bool = False, test: bool) -> str | int | bytes: ...\ndef pick",
+        ),
+    )?;
+    assert_eq!(
+        check_overload_body(&db, function(&db), 3).unwrap_err(),
+        BodyDomainError::Unsupported
+    );
+    assert_eq!(
+        check_overload_body(&db, function(&db), 0)
+            .unwrap()
+            .diagnostics()
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn external_overload_body_domains_require_whole_signature_provenance() -> anyhow::Result<()> {
+    for (provider, source) in [
+        (
+            ExternalSource::MixedFunctionAnnotations,
+            "def pick(flag):\n    return flag\n",
+        ),
+        (
+            ExternalSource::Annotation,
+            "def pick(flag: bool):\n    return flag\n",
+        ),
+    ] {
+        let db = TestDbBuilder::new()
+            .with_file("/src/main.py", source)
+            .with_file(
+                "/src/contracts.pyi",
+                indoc::indoc! {r#"
+            from typing import Literal, overload
+            @overload
+            def pick(flag: Literal[True]) -> Literal[True]: ...
+            @overload
+            def pick(flag: Literal[False]) -> Literal[False]: ...
+            def pick(flag: bool) -> bool: ...
+            def other(flag: bool) -> bool: ...
+        "#},
+            )
+            .with_source_provider(provider)
+            .build()?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let function = crate::place::global_symbol(&db, file, "pick")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        assert_eq!(
+            check_overload_body(&db, function, 0).unwrap_err(),
+            BodyDomainError::Unsupported
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn external_overload_body_domain_fallthrough_location() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            "def pick(flag):\n    if flag:\n        return 1\n",
+        )
+        .with_file(
+            "/src/contracts.pyi",
+            indoc::indoc! {r#"
+            from typing import Literal, overload
+
+
+
+
+
+            @overload
+            def pick(flag: Literal[True]) -> int: ...
+            @overload
+            def pick(flag: Literal[False]) -> str: ...
+            def pick(flag: bool) -> int | str: ...
+        "#},
+        )
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let program_file = db.program_file(file);
+    let function = crate::place::global_symbol(&db, program_file, "pick")
+        .place
+        .expect_type()
+        .expect_function_literal();
+    assert!(check_overload_body(&db, function, 0).unwrap().is_empty());
+    let diagnostics = check_overload_body(&db, function, 1)
+        .unwrap()
+        .into_diagnostics();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+    let span = diagnostics[0].primary_annotation().unwrap().get_span();
+    assert_eq!(span.file(), &ruff_db::diagnostic::UnifiedFile::Ty(file));
+    assert_eq!(
+        span.range(),
+        Some(TextRange::new(TextSize::new(4), TextSize::new(8)))
+    );
+    Ok(())
 }
 
 #[test]

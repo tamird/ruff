@@ -375,13 +375,28 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     pub(super) fn infer_function_body(&mut self, function: &ast::StmtFunctionDef) {
-        fn can_implicitly_return_none<'db>(db: &'db dyn Db, use_def: &UseDefMap<'db>) -> bool {
-            !use_def
-                .reachability_constraints()
-                .evaluate(
-                    db,
-                    use_def.predicates(),
-                    use_def.end_of_scope_reachability(),
+        fn can_implicitly_return_none<'db>(
+            db: &'db dyn Db,
+            use_def: &UseDefMap<'db>,
+            domain: Option<crate::types::infer::FunctionBodyDomain<'db>>,
+        ) -> bool {
+            !domain
+                .map_or_else(
+                    || {
+                        use_def.reachability_constraints().evaluate(
+                            db,
+                            use_def.predicates(),
+                            use_def.end_of_scope_reachability(),
+                        )
+                    },
+                    |domain| {
+                        crate::reachability::evaluate_reachability_in_domain(
+                            db,
+                            domain.scope(db),
+                            use_def.end_of_scope_reachability(),
+                            Some(domain),
+                        )
+                    },
                 )
                 .is_always_false()
         }
@@ -409,25 +424,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         self.infer_scope_body(&function.body);
 
-        let return_declaration = self.context.body_domain.map_or(function, |domain| {
-            domain
-                .overload(db)
-                .body_scope(db)
-                .node(db)
-                .expect_function()
-                .node(self.module())
-        });
-        let returns =
-            SourceAnnotation::function_return(db, self.program_file(), return_declaration);
+        let returns = SourceAnnotation::function_return(db, self.program_file(), function);
         let supplied_return = if returns.is_none() {
             db.provided_function_return_type(self.index.expect_single_definition(function))
         } else {
             None
         };
-        let return_location = returns
-            .as_ref()
-            .map(|returns| (returns.source(self.context.file()), returns.range()))
-            .or_else(|| supplied_return.map(|returns| (returns.source, function.name.range())));
+        let return_location = if let Some(domain) = self.context.body_domain {
+            let overload = domain.overload(db);
+            let file = overload.definition(db).program_file(db);
+            let module = parsed_module(db, file.python_file(db)).load(db);
+            let declaration = overload
+                .body_scope(db)
+                .node(db)
+                .expect_function()
+                .node(&module);
+            SourceAnnotation::function_return(db, file, declaration).map(|returns| {
+                // The expected annotation belongs to the donor, but an implicit-return error
+                // and its reachability are located at the actual source implementation.
+                (returns.source(file.file(db)), function.name.range())
+            })
+        } else {
+            returns
+                .as_ref()
+                .map(|returns| (returns.source(self.context.file()), returns.range()))
+                .or_else(|| supplied_return.map(|returns| (returns.source, function.name.range())))
+        };
         if let Some((return_source, return_range)) = return_location {
             let has_empty_body = self.return_types_and_ranges.is_empty()
                 && function_body_kind(db, env, self.index, function, |expr| {
@@ -556,7 +578,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     let use_def = self.index.use_def_map(scope_id);
 
-                    let implicit_none = can_implicitly_return_none(db, use_def);
+                    let implicit_none =
+                        can_implicitly_return_none(db, use_def, self.context.body_domain);
 
                     if implicit_none
                         && !Type::none(db, env).is_assignable_to(db, env, expected_return_ty)
@@ -637,7 +660,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
 
             let use_def = self.index.use_def_map(scope_id);
-            let implicit_none = can_implicitly_return_none(db, use_def);
+            let implicit_none = can_implicitly_return_none(db, use_def, self.context.body_domain);
 
             if implicit_none && !Type::none(db, env).is_assignable_to(db, env, expected_ty) {
                 let no_return = self.return_types_and_ranges.is_empty();
