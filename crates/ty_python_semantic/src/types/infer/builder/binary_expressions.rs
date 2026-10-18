@@ -226,6 +226,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         env,
                         candidate.scope(),
                         binary,
+                        candidate.context.body_domain,
                         &mut |expression| candidate.try_expression_type(expression),
                     )
                 {
@@ -403,6 +404,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     self.scope(),
                     binary.into(),
                     empty,
+                    self.context.body_domain,
                     &mut |expression| self.try_expression_type(expression),
                 )
                 && dictionary.is_complete()

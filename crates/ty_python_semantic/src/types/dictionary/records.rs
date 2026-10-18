@@ -420,7 +420,7 @@ fn literal<'db>(
         return ContentsValue::Unavailable;
     }
     let mut pending = false;
-    let observed = DictionaryItems::expression(db, env, scope, value, &mut |expression| {
+    let observed = DictionaryItems::expression(db, env, scope, value, None, &mut |expression| {
         let ty = inference.try_expression_type(expression)?;
         if crate::types::visitor::any_over_type_expanding_aliases(db, env, ty, |ty| {
             matches!(ty, Type::Divergent(_))

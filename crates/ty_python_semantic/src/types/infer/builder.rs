@@ -110,8 +110,7 @@ use crate::types::infer::builder::named_tuple::NamedTupleKind;
 use crate::types::infer::builder::paramspec_validation::validate_paramspec_components;
 use crate::types::infer::{
     StatementInference, StatementInferenceInner, StatementInferenceInnerExtra, TypeAndRange,
-    TypeExpressionFlags, infer_statement_types, nearest_enclosing_class,
-    nearest_enclosing_function, original_class_type,
+    TypeExpressionFlags, nearest_enclosing_class, nearest_enclosing_function, original_class_type,
 };
 use crate::types::iteration::refine_dict_snapshot_element_type;
 use crate::types::match_pattern::{ClassPatternPositionalResult, class_pattern_positional_result};
@@ -1946,7 +1945,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let inferred_ty = self
             .context
             .body_domain
-            .and_then(|domain| domain.parameter_type(db, definition))
+            .and_then(|domain| domain.parameter_binding_type(db, definition))
             .unwrap_or(inferred_ty);
         self.bindings.insert(definition, inferred_ty);
     }
@@ -5291,7 +5290,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         assignment: Definition<'db>,
         definition: Definition<'db>,
     ) {
-        let value_ty = infer_definition_types(self.db(), assignment).expression_type(value);
+        let value_ty =
+            infer_definition_with_body_domain(self.db(), assignment, self.context.body_domain)
+                .expression_type(value);
         self.add_binding(key, definition).insert(self, value_ty);
     }
 
@@ -7728,7 +7729,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             for binding in bindings {
                 let definition = binding.binding.definition()?;
                 has_current_header |= matches!(definition.kind(db), DefinitionKind::LoopHeader(_));
-                if infer_definition_types(db, definition).is_provisional() {
+                if infer_definition_with_body_domain(db, definition, self.context.body_domain)
+                    .is_provisional()
+                {
                     return None;
                 }
                 if sole_definition.is_some_and(|previous| previous != definition) {
@@ -8450,7 +8453,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             for (statement, use_expression) in
                 self.index.constraining_collection_uses(collection_def)
             {
-                let statement_use_types = infer_statement_types(self.db(), statement);
+                let statement_use_types = infer_statement_with_body_domain(
+                    self.db(),
+                    statement,
+                    self.context.body_domain,
+                );
 
                 if let Some(divergent) = statement_use_types
                     .expression_type(use_expression)
@@ -9621,6 +9628,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.program_environment(),
             self.scope(),
             expression,
+            self.context.body_domain,
             &mut |expression| self.try_expression_type(expression),
         ) {
             Err(crate::types::dictionary::DictionaryFallback::Unavailable) => {
@@ -11160,7 +11168,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             DefinitionState::Defined(definition)
                                 if !is_discarded_dict_key_assignment(db, definition) =>
                             {
-                                let mut binding_ty = binding_type(db, definition);
+                                let mut binding_ty = infer_definition_with_body_domain(
+                                    db,
+                                    definition,
+                                    self.context.body_domain,
+                                )
+                                .binding_type(definition);
                                 if definition.kind(db).is_loop_header() {
                                     let fallback_ty = self.loop_header_fallback_type(
                                         definition,
@@ -11173,11 +11186,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                         [binding_ty, fallback_ty],
                                     );
                                 }
-                                union.add_in_place(
-                                    binding
-                                        .narrowing_constraint
-                                        .narrow(db, env, binding_ty, place),
-                                );
+                                union.add_in_place(binding.narrowing_constraint.narrow_in_domain(
+                                    db,
+                                    env,
+                                    binding_ty,
+                                    place,
+                                    self.context.body_domain,
+                                ));
                             }
                             DefinitionState::Defined(_)
                             | DefinitionState::Undefined

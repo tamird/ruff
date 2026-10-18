@@ -24,7 +24,8 @@ use crate::place::loop_header_reachability;
 use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
 use crate::types::call::CallArguments;
 use crate::types::infer::{
-    DefinitionInference, StatementInference, infer_definition_types, infer_statement_types,
+    DefinitionInference, FunctionBodyDomain, StatementInference, infer_definition_with_body_domain,
+    infer_statement_with_body_domain,
 };
 use crate::types::narrow::NarrowingEvaluatorExtension;
 use crate::types::{KnownClass, KnownFunction, ProgramEnvironment, Type, UnionBuilder, UnionType};
@@ -440,6 +441,28 @@ struct Contents<'db> {
 }
 
 impl<'db> Contents<'db> {
+    fn cycle_normalized(
+        self,
+        db: &'db dyn Db,
+        previous: &Self,
+        cycle: &salsa::Cycle,
+        definition: Definition<'db>,
+    ) -> Self {
+        let env = ProgramEnvironment::from_definition(definition);
+        let Self { value, captured } = self;
+        let Self {
+            value: previous_value,
+            captured: previous_captured,
+        } = previous;
+        let value = value.cycle_normalized(db, &env, previous_value, cycle);
+        let captured = if cycle.iteration() <= crate::TAINTED_CYCLES {
+            captured
+        } else {
+            *previous_captured || captured
+        };
+        Self { value, captured }
+    }
+
     fn new(value: ContentsValue<'db>) -> Self {
         Self {
             value,
@@ -467,6 +490,7 @@ impl<'db> Contents<'db> {
         scope: ScopeId<'db>,
         definition: Definition<'db>,
         constraint: &NarrowingEvaluator<'_, 'db>,
+        domain: Option<FunctionBodyDomain<'db>>,
     ) -> Self {
         if matches!(self.value, ContentsValue::Pending) {
             return self;
@@ -480,13 +504,13 @@ impl<'db> Contents<'db> {
                 range: _,
             } = contents.as_ref()
         {
-            let inference = infer_definition_types(db, *receiver);
+            let inference = infer_definition_with_body_domain(db, *receiver, domain);
             let bound = inference.binding_type(*receiver);
-            let narrowed = constraint.narrow(db, &env, bound, receiver.place(db));
+            let narrowed = constraint.narrow_in_domain(db, &env, bound, receiver.place(db), domain);
             if narrowed.resolve_type_alias(db).is_never() {
                 self.value = ContentsValue::Unreachable;
             } else if matches!(self.value, ContentsValue::Unavailable) && narrowed != bound {
-                self.value = initial_contents(db, *receiver, narrowed);
+                self.value = initial_contents(db, *receiver, narrowed, domain);
             }
         }
         let ContentsValue::Mapping(mapping) = &mut self.value else {
@@ -499,7 +523,7 @@ impl<'db> Contents<'db> {
             let Some(key) = table.contents_key(place, &item.name) else {
                 continue;
             };
-            item.ty = constraint.narrow(db, &env, item.ty, key);
+            item.ty = constraint.narrow_in_domain(db, &env, item.ty, key, domain);
             if item.is_required() && item.ty.resolve_type_alias(db).is_never() {
                 self.value = ContentsValue::Unreachable;
                 return self;
@@ -511,7 +535,7 @@ impl<'db> Contents<'db> {
         } = &mut mapping.dictionary.first_entry
             && let Some(key) = table.contents_key(place, name)
         {
-            *value = constraint.narrow(db, &env, *value, key);
+            *value = constraint.narrow_in_domain(db, &env, *value, key, domain);
             if value.resolve_type_alias(db).is_never() {
                 self.value = ContentsValue::Unreachable;
                 return self;
@@ -525,23 +549,54 @@ impl<'db> Contents<'db> {
     returns(clone),
     cycle_initial=|_, _, _| Contents::new(ContentsValue::Pending),
     cycle_fn=|db, cycle, previous: &Contents<'db>, result: Contents<'db>, definition: Definition<'db>| {
-        let env = ProgramEnvironment::from_definition(definition);
-        let Contents { value, captured } = result;
-        let Contents { value: previous_value, captured: previous_captured } = previous;
-        let value = value.cycle_normalized(db, &env, previous_value, cycle);
-        let captured = if cycle.iteration() <= crate::TAINTED_CYCLES {
-            captured
-        } else { *previous_captured || captured };
-        Contents { value, captured }
+        result.cycle_normalized(db, previous, cycle, definition)
     },
     heap_size=get_size2::GetSize::get_heap_size,
 )]
 fn definition_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Contents<'db> {
+    infer_definition_contents(db, definition, None)
+}
+
+#[salsa::tracked(
+    returns(clone),
+    cycle_initial=|_, _, _, _| Contents::new(ContentsValue::Pending),
+    cycle_fn=|db, cycle, previous: &Contents<'db>, result: Contents<'db>, definition: Definition<'db>, _| {
+        result.cycle_normalized(db, previous, cycle, definition)
+    },
+    heap_size=get_size2::GetSize::get_heap_size,
+)]
+fn body_definition_contents<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> Contents<'db> {
+    infer_definition_contents(db, definition, Some(domain))
+}
+
+fn definition_contents_in_domain<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Contents<'db> {
+    domain
+        .filter(|domain| domain.scope(db) == definition.scope(db))
+        .map_or_else(
+            || definition_contents(db, definition),
+            |domain| body_definition_contents(db, definition, domain),
+        )
+}
+
+fn infer_definition_contents<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Contents<'db> {
     let scope = definition.scope(db);
     let env = ProgramEnvironment::from_scope(scope);
     let index = semantic_index(db, scope.program_file(db));
     let use_def = index.use_def_map(scope.file_scope_id(db));
-    let reachability = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
+    let reachability = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints())
+        .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
 
     match definition.kind(db) {
         DefinitionKind::LoopHeader(_) => {
@@ -560,12 +615,14 @@ fn definition_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Con
                 ContentsValue::Unavailable
             });
             for binding in &loop_header.reachable_bindings {
-                let incoming = definition_contents(db, binding.definition).narrow(
-                    db,
-                    scope,
-                    binding.definition,
-                    &use_def.narrowing_evaluator(binding.narrowing_constraint),
-                );
+                let incoming = definition_contents_in_domain(db, binding.definition, domain)
+                    .narrow(
+                        db,
+                        scope,
+                        binding.definition,
+                        &use_def.narrowing_evaluator(binding.narrowing_constraint),
+                        domain,
+                    );
                 result = result.join(db, &env, incoming);
             }
             result
@@ -575,15 +632,17 @@ fn definition_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Con
                 definition,
                 range: _,
             } => {
-                let inference = infer_definition_types(db, *definition);
+                let inference = infer_definition_with_body_domain(db, *definition, domain);
                 Contents::new(initial_contents(
                     db,
                     *definition,
                     inference.binding_type(*definition),
+                    domain,
                 ))
             }
             DictionaryContentsDefinitionKind::LoopCapture { header, range: _ } => {
-                let Contents { value, captured } = definition_contents(db, *header);
+                let Contents { value, captured } =
+                    definition_contents_in_domain(db, *header, domain);
                 match value {
                     ContentsValue::Pending => Contents::new(ContentsValue::Pending),
                     ContentsValue::Unavailable => Contents {
@@ -601,7 +660,7 @@ fn definition_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Con
                 }
             }
             DictionaryContentsDefinitionKind::Operation { receiver, effect } => {
-                Contents::new(operation_contents(db, definition, receiver, effect))
+                Contents::new(operation_contents(db, definition, receiver, effect, domain))
             }
             DictionaryContentsDefinitionKind::Capture {
                 nested_scope,
@@ -684,11 +743,12 @@ fn capture_has_no_reachable_effects<'db>(
 
 /// Seed the contents graph from the same binding that owns ordinary value inference.
 /// Nominal dictionary parameters and members carry value refinements without a closed key set.
-/// A closed `TypedDict` retains its fields until a recorded mutation changes them.
+/// An explicitly described `TypedDict` retains its fields until a recorded mutation changes them.
 fn initial_contents<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
     bound_type: Type<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> ContentsValue<'db> {
     if crate::types::infer::is_discarded_dict_key_assignment(db, definition) {
         return ContentsValue::Unavailable;
@@ -697,7 +757,7 @@ fn initial_contents<'db>(
     let env = ProgramEnvironment::from_scope(scope);
     let file = scope.program_file(db);
     let module = parsed_module(db, file.python_file(db)).load(db);
-    let inference = infer_definition_types(db, definition);
+    let inference = infer_definition_with_body_domain(db, definition, domain);
     if StatementInference::Definition(definition, inference).is_provisional() {
         return ContentsValue::Pending;
     }
@@ -731,14 +791,14 @@ fn initial_contents<'db>(
         ),
         kind => (definition, kind.value(&module), false),
     };
-    let owner_inference = infer_definition_types(db, owner);
+    let owner_inference = infer_definition_with_body_domain(db, owner, domain);
     if StatementInference::Definition(owner, owner_inference).is_provisional() {
         return ContentsValue::Pending;
     }
     let observed = value
         .filter(|_| !owner_inference.discards_dict_key_assignments())
         .map_or(Err(DictionaryFallback::Unavailable), |value| {
-            DictionaryItems::expression(db, &env, scope, value, &mut |expression| {
+            DictionaryItems::expression(db, &env, scope, value, domain, &mut |expression| {
                 owner_inference.try_expression_type(expression)
             })
         });
@@ -750,7 +810,7 @@ fn initial_contents<'db>(
     let builtin_allocation = !owner_inference.discards_dict_key_assignments()
         && value.is_some_and(|value| is_builtin_allocation(db, value, owner_inference));
     let parent_preserved = if builtin_allocation && !shared && !place.is_symbol() {
-        match parent_allows_seed(db, owner) {
+        match parent_allows_seed(db, owner, domain) {
             KeyPreservation::Preserved => true,
             KeyPreservation::Changed => false,
             KeyPreservation::Pending => return ContentsValue::Pending,
@@ -807,7 +867,8 @@ fn initial_contents<'db>(
         mapping.builtin |= builtin_allocation;
         if PlaceExpr::try_from_expr(value).is_some() {
             let use_def = index.use_def_map(scope.file_scope_id(db));
-            let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
+            let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints())
+                .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
             match snapshot_contents(db, scope, value, value.into(), bound_type, &cache) {
                 ContentsValue::Mapping(source) => mapping.builtin |= source.builtin,
                 ContentsValue::Pending => return ContentsValue::Pending,
@@ -828,6 +889,7 @@ fn initial_contents<'db>(
                         &env,
                         scope,
                         value,
+                        domain,
                         &mut |expression| owner_inference.try_expression_type(expression),
                     ) {
                         Ok(dictionary) => mapping.dictionary = dictionary,
@@ -865,6 +927,17 @@ fn initial_contents<'db>(
             })
             .collect();
     }
+    if matches!(
+        definition.kind(db),
+        DefinitionKind::Parameter(ParameterDefinitionNodeKind::VariadicKeywordParameter(_))
+    ) && let Some(entry) = domain.and_then(|domain| domain.parameter_type(db, definition))
+        && let Some(dictionary) = DictionaryItems::unpacked(db, &env, entry, source)
+    {
+        // Parameter coverage proves these initial fields. Keep the source writable bound so
+        // an escape restores its field types instead of perpetuating the narrowed entry row.
+        mapping.dictionary = dictionary;
+        mapping.uses_residual_presence = false;
+    }
     ContentsValue::Mapping(mapping)
 }
 
@@ -884,7 +957,11 @@ fn is_builtin_allocation<'db>(
     }
 }
 
-fn fresh_allocation<'db>(db: &'db dyn Db, definition: Definition<'db>) -> KeyPreservation {
+fn fresh_allocation<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> KeyPreservation {
     let scope = definition.scope(db);
     let module = parsed_module(db, scope.program_file(db).python_file(db)).load(db);
     let (owner, value) = match definition.kind(db) {
@@ -901,7 +978,7 @@ fn fresh_allocation<'db>(db: &'db dyn Db, definition: Definition<'db>) -> KeyPre
     let Some(value) = value else {
         return KeyPreservation::Changed;
     };
-    let inference = infer_definition_types(db, owner);
+    let inference = infer_definition_with_body_domain(db, owner, domain);
     if StatementInference::Definition(owner, inference).is_provisional() {
         return KeyPreservation::Pending;
     }
@@ -1128,13 +1205,15 @@ fn operation_contents<'db>(
     definition: Definition<'db>,
     receiver: &ty_python_core::ast_node_ref::AstNodeRef<ast::Expr>,
     effect: &DictionaryContentsEffect<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> ContentsValue<'db> {
     let scope = definition.scope(db);
     let env = ProgramEnvironment::from_scope(scope);
-    mapping_transfer(db, definition, receiver, effect).apply(db, &env, || {
+    mapping_transfer(db, definition, receiver, effect, domain).apply(db, &env, || {
         let index = semantic_index(db, scope.program_file(db));
         let use_def = index.use_def_map(scope.file_scope_id(db));
-        let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
+        let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints())
+            .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
         from_bindings(
             db,
             scope,
@@ -1239,11 +1318,55 @@ fn call_preserves_contents<'db>(
     found
 }
 
+/// Aliases, stored values, and raw returns transfer the whole value, rather than observing
+/// its current fields. Body domains do not yet project these whole-row read contracts.
+pub(crate) fn has_value_exposure(db: &dyn Db, parameter: Definition<'_>) -> bool {
+    let scope = parameter.scope(db);
+    let index = semantic_index(db, scope.program_file(db));
+    let use_def = index.use_def_map(scope.file_scope_id(db));
+    let place = use_def
+        .definitions_with_usage()
+        .find_map(|(_, definition, _)| {
+            let DefinitionKind::DictionaryContents(kind) = definition.kind(db) else {
+                return None;
+            };
+            if let DictionaryContentsDefinitionKind::Initialize {
+                definition: source,
+                range: _,
+            } = kind.as_ref()
+                && *source == parameter
+            {
+                Some(definition.place(db))
+            } else {
+                None
+            }
+        });
+    place.is_some_and(|place| {
+        use_def.definitions_with_usage().any(|(_, definition, _)| {
+            if definition.place(db) != place {
+                return false;
+            }
+            let DefinitionKind::DictionaryContents(kind) = definition.kind(db) else {
+                return false;
+            };
+            let DictionaryContentsDefinitionKind::Operation {
+                receiver: _,
+                effect,
+            } = kind.as_ref()
+            else {
+                return false;
+            };
+            matches!(effect, DictionaryContentsEffect::Expose)
+        })
+    })
+}
+
 fn mapping_transfer<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
     receiver: &ty_python_core::ast_node_ref::AstNodeRef<ast::Expr>,
     effect: &DictionaryContentsEffect<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> MappingTransfer<'db> {
     let scope = definition.scope(db);
     let env = ProgramEnvironment::from_scope(scope);
@@ -1261,7 +1384,8 @@ fn mapping_transfer<'db>(
     ) {
         let index = semantic_index(db, file);
         let use_def = index.use_def_map(scope.file_scope_id(db));
-        let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
+        let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints())
+            .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
         match from_bindings(
             db,
             scope,
@@ -1299,7 +1423,7 @@ fn mapping_transfer<'db>(
             ) {
                 return unavailable();
             }
-            let transfer = mapping_transfer(db, *original, receiver, effect);
+            let transfer = mapping_transfer(db, *original, receiver, effect, domain);
             let index = semantic_index(db, file);
             let table = index.place_table(scope.file_scope_id(db));
             let Some(source) = PlaceExpr::try_from_expr(receiver.node(&module))
@@ -1331,7 +1455,7 @@ fn mapping_transfer<'db>(
             let Some(subscript) = node.node(&module).target.as_subscript_expr() else {
                 return unavailable();
             };
-            let inference = infer_definition_types(db, *assignment);
+            let inference = infer_definition_with_body_domain(db, *assignment, domain);
             if StatementInference::Definition(*assignment, inference).is_provisional() {
                 return pending();
             }
@@ -1346,7 +1470,7 @@ fn mapping_transfer<'db>(
             }
         }
         DictionaryContentsEffect::SetItem { subscript, owner } => {
-            let Some(inference) = operand_types(db, scope, owner.as_ref()) else {
+            let Some(inference) = operand_types(db, scope, owner.as_ref(), domain) else {
                 return unavailable();
             };
             if inference.is_provisional() {
@@ -1366,7 +1490,7 @@ fn mapping_transfer<'db>(
             }
         }
         DictionaryContentsEffect::DeleteItem { subscript, owner } => {
-            let Some(inference) = operand_types(db, scope, owner.as_ref()) else {
+            let Some(inference) = operand_types(db, scope, owner.as_ref(), domain) else {
                 return unavailable();
             };
             if inference.is_provisional() {
@@ -1386,7 +1510,7 @@ fn mapping_transfer<'db>(
             owner,
             retained,
         } => {
-            let Some(inference) = operand_types(db, scope, owner.as_ref()) else {
+            let Some(inference) = operand_types(db, scope, owner.as_ref(), domain) else {
                 return unavailable();
             };
             if inference.is_provisional() {
@@ -1539,6 +1663,7 @@ fn mapping_transfer<'db>(
                                 scope,
                                 call.into(),
                                 source,
+                                domain,
                                 &mut |expression| inference.try_expression_type(expression),
                             ) {
                                 Ok(source) => source,
@@ -1556,6 +1681,7 @@ fn mapping_transfer<'db>(
                         &env,
                         scope,
                         &call.arguments.keywords,
+                        domain,
                         &mut |expression| inference.try_expression_type(expression),
                     ) {
                         Ok(keywords) => keywords,
@@ -1580,6 +1706,7 @@ fn operand_types<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
     owner: Option<&DictionaryContentsInferenceOwner>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> Option<StatementInference<'db>> {
     let file = scope.program_file(db);
     let module = parsed_module(db, file.python_file(db)).load(db);
@@ -1592,7 +1719,7 @@ fn operand_types<'db>(
             index.try_statement(statement.node(&module))?
         }
     };
-    Some(infer_statement_types(db, statement))
+    Some(infer_statement_with_body_domain(db, statement, domain))
 }
 
 pub(crate) enum KeyPreservation {
@@ -1611,6 +1738,7 @@ pub(crate) fn alias_preserves_key<'db>(
     current: &ast::Expr,
     key_place: ScopedPlaceId,
     loop_carried: bool,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> Option<KeyPreservation> {
     struct KeyRead<'a, 'ast> {
         table: &'a PlaceTable,
@@ -1650,6 +1778,7 @@ pub(crate) fn alias_preserves_key<'db>(
         read.into(),
         current,
         name,
+        domain,
     ))
 }
 
@@ -1660,6 +1789,7 @@ fn saved_read_preserved<'db>(
     original: ast::ExprRef<'_>,
     current: &ast::Expr,
     name: &str,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> KeyPreservation {
     let index = semantic_index(db, scope.program_file(db));
     let table = index.place_table(scope.file_scope_id(db));
@@ -1688,6 +1818,7 @@ fn saved_read_preserved<'db>(
             anchors: &anchors,
             name,
         },
+        domain,
     )
 }
 
@@ -1703,7 +1834,11 @@ enum KeyHistoryOrigin<'a, 'db> {
 
 /// A member store does not create a new containing object. Read the receiver's snapshot before
 /// the store, so a new child cannot hide an earlier escape of its parent.
-fn parent_allows_seed<'db>(db: &'db dyn Db, owner: Definition<'db>) -> KeyPreservation {
+fn parent_allows_seed<'db>(
+    db: &'db dyn Db,
+    owner: Definition<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> KeyPreservation {
     let owner = match owner.kind(db) {
         DefinitionKind::DictKeyAssignment(assignment) => assignment.assignment(),
         _ => owner,
@@ -1738,6 +1873,7 @@ fn parent_allows_seed<'db>(db: &'db dyn Db, owner: Definition<'db>) -> KeyPreser
         scope,
         bindings.map(|binding| binding.binding).collect(),
         KeyHistoryOrigin::UnexposedParent,
+        domain,
     )
 }
 
@@ -1746,6 +1882,7 @@ fn check_contents_history<'db>(
     scope: ScopeId<'db>,
     mut pending: Vec<DefinitionState<'db>>,
     origin: KeyHistoryOrigin<'_, 'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> KeyPreservation {
     let index = semantic_index(db, scope.program_file(db));
     let use_def = index.use_def_map(scope.file_scope_id(db));
@@ -1784,8 +1921,10 @@ fn check_contents_history<'db>(
                         if definition.kind(db).is_parameter_def() {
                             continue;
                         }
-                        match fresh_allocation(db, *definition) {
-                            KeyPreservation::Preserved => parent_allows_seed(db, *definition),
+                        match fresh_allocation(db, *definition, domain) {
+                            KeyPreservation::Preserved => {
+                                parent_allows_seed(db, *definition, domain)
+                            }
                             result => result,
                         }
                     }
@@ -1798,7 +1937,7 @@ fn check_contents_history<'db>(
                 continue;
             }
             DictionaryContentsDefinitionKind::Operation { receiver, effect } => {
-                let transfer = mapping_transfer(db, definition, receiver, effect);
+                let transfer = mapping_transfer(db, definition, receiver, effect, domain);
                 if matches!(transfer, MappingTransfer::Result(ContentsValue::Pending)) {
                     provisional = true;
                     continue;
@@ -1887,12 +2026,15 @@ fn from_bindings<'db>(
             continue;
         }
         let incoming = match binding.binding {
-            DefinitionState::Defined(definition) => definition_contents(db, definition).narrow(
-                db,
-                scope,
-                definition,
-                &binding.narrowing_constraint,
-            ),
+            DefinitionState::Defined(definition) => {
+                definition_contents_in_domain(db, definition, reachability.body_domain()).narrow(
+                    db,
+                    scope,
+                    definition,
+                    &binding.narrowing_constraint,
+                    reachability.body_domain(),
+                )
+            }
             DefinitionState::Undefined => Contents::new(ContentsValue::Unavailable),
             DefinitionState::Deleted => Contents::new(ContentsValue::Unavailable),
         };

@@ -316,7 +316,7 @@ pub(super) fn refine_dict_snapshot_element_type<'db>(
         return None;
     };
     let dictionary =
-        match DictionaryItems::expression(db, env, scope, receiver, &mut expression_type) {
+        match DictionaryItems::expression(db, env, scope, receiver, None, &mut expression_type) {
             Ok(dictionary) => dictionary,
             Err(fallback) => match fallback {
                 DictionaryFallback::Unavailable => {

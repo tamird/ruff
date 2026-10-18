@@ -1,13 +1,14 @@
 //! Opt-in checking of a named function body under one declared overload.
 //!
 //! Domains support fixed parameters and normalized keyword rows in simple function bodies.
-//! Unsupported syntax must be rejected before inference: capture and collection queries do not
-//! yet carry a body domain.
+//! Unsupported syntax must be rejected before inference: capture, loop, and comprehension
+//! queries do not yet carry a body domain.
 
 use itertools::Itertools;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
-use ty_python_core::definition::Definition;
+use ty_python_core::ast_ids::HasScopedUseId;
+use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
 use ty_python_core::scope::ScopeId;
 use ty_python_core::semantic_index;
 use ty_python_core::statement::StatementInner;
@@ -17,6 +18,7 @@ use super::{
     ScopeInference, StatementInferenceInner, TypeContext, infer_definition_region,
     infer_definition_types, infer_expression_region, infer_scope_region, infer_statement_region,
 };
+use crate::semantic_model::HasType;
 use crate::types::call::Argument;
 use crate::types::constraints::ConstraintSetBuilder;
 use crate::types::function::{KnownFunction, OverloadLiteral};
@@ -27,7 +29,8 @@ use crate::types::signatures::{
 };
 use crate::types::string_annotation::SourceAnnotation;
 use crate::types::{
-    CallArguments, KnownClass, ParameterKind, Signature, Type, TypeCheckDiagnostics, UnionType,
+    CallArguments, KnownClass, MemberLookupPolicy, ParameterKind, Signature, Type,
+    TypeCheckDiagnostics, UnionType,
 };
 use crate::{Db, ProgramEnvironment, SemanticModel};
 
@@ -45,7 +48,10 @@ pub enum BodyDomainError {
 /// This is additional checking, not a replacement for ordinary function or overload checking.
 /// It preserves the public callable type. A source function may adopt an entire signature from
 /// an external declaration; in that case the overload index refers to that declaration's family.
-/// Fixed parameters and normalized keyword rows support simple assignments, calls, and conditionals.
+/// Fixed parameters and normalized keyword rows support assignments, calls, conditionals, and
+/// builtin collection copies. Mutating methods require a directly allocated local receiver.
+/// Keyword captures retain source write types and projected read facts; transferring the raw
+/// capture through aliases, storage, or returns remains unsupported. Fresh copies are supported.
 /// Generic implementations require complete specialization from fixed overload inputs.
 /// The same substitution applies to source declarations and already inferred default types;
 /// their ordinary inference and shared runtime identity are unchanged. Generic domains require
@@ -97,7 +103,7 @@ impl<'db> FunctionBodyDomain<'db> {
         self.implementation(db).body_scope(db)
     }
 
-    pub(super) fn parameter_type(
+    pub(crate) fn parameter_type(
         self,
         db: &'db dyn Db,
         definition: Definition<'db>,
@@ -105,6 +111,22 @@ impl<'db> FunctionBodyDomain<'db> {
         self.parameters(db)
             .iter()
             .find_map(|(parameter, ty)| (*parameter == definition).then_some(*ty))
+    }
+
+    pub(super) fn parameter_binding_type(
+        self,
+        db: &'db dyn Db,
+        definition: Definition<'db>,
+    ) -> Option<Type<'db>> {
+        // Keyword capture entries describe current contents. The dictionary itself retains
+        // its source writable type; Contents owns the projected fields and their invalidation.
+        if matches!(
+            definition.kind(db),
+            DefinitionKind::Parameter(ParameterDefinitionNodeKind::VariadicKeywordParameter(_))
+        ) {
+            return None;
+        }
+        self.parameter_type(db, definition)
     }
 
     pub(super) fn specialize_type(self, db: &'db dyn Db, ty: Type<'db>) -> Type<'db> {
@@ -443,6 +465,109 @@ fn supported_body(
     signature: &crate::types::Signature<'_>,
     entries: &[(Definition<'_>, Type<'_>)],
 ) -> bool {
+    // A projected parameter is an entry fact, not a narrower write declaration. Mutating
+    // methods are admitted only on direct allocations, so aliases of captured kwargs cannot
+    // accidentally turn their projected fields into source assignment restrictions.
+    fn fresh_receiver(
+        db: &dyn Db,
+        function: FunctionType<'_>,
+        receiver: &ast::Expr,
+        class: KnownClass,
+    ) -> bool {
+        let ast::Expr::Name(name) = receiver else {
+            return false;
+        };
+        let file = function.program_file(db);
+        let index = semantic_index(db, file);
+        let scope = function.literal(db).last_definition.body_scope(db);
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let model = SemanticModel::new(db, file);
+        let mut bindings = index
+            .use_def_map(scope.file_scope_id(db))
+            .bindings_at_use(name.scoped_use_id(db, file))
+            .peekable();
+        bindings.peek().is_some()
+            && bindings.all(|binding| {
+                let Some(definition) = binding.binding.definition() else {
+                    return false;
+                };
+                if definition.scope(db) != scope {
+                    return false;
+                }
+                let value = match definition.kind(db) {
+                    DefinitionKind::Assignment(assignment) => {
+                        if !assignment.is_single_target(&module) {
+                            return false;
+                        }
+                        assignment.value(&module)
+                    }
+                    DefinitionKind::AnnotatedAssignment(assignment) => {
+                        let Some(value) = assignment.value(&module) else {
+                            return false;
+                        };
+                        value
+                    }
+                    _ => return false,
+                };
+                match value {
+                    ast::Expr::List(_) => class == KnownClass::List,
+                    ast::Expr::Dict(_) => class == KnownClass::Dict,
+                    ast::Expr::Call(call) => match call.func.inferred_type(&model) {
+                        Some(Type::ClassLiteral(callee)) => callee.is_known(db, class),
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            })
+    }
+
+    fn collection_method(
+        db: &dyn Db,
+        function: FunctionType<'_>,
+        attribute: &ast::ExprAttribute,
+    ) -> bool {
+        let model = SemanticModel::new(db, function.program_file(db));
+        let (class, mutates) = match attribute.attr.id.as_str() {
+            "get" => (KnownClass::Dict, false),
+            "pop" => (KnownClass::Dict, true),
+            "append" => (KnownClass::List, true),
+            _ => return false,
+        };
+        if mutates && !fresh_receiver(db, function, &attribute.value, class) {
+            return false;
+        }
+        if !mutates
+            && attribute
+                .value
+                .inferred_type(&model)
+                .is_some_and(|ty| matches!(ty.resolve_type_alias(db), Type::TypedDict(_)))
+        {
+            // TypedDict get is checked by the ordinary specialized call owner.
+            return true;
+        }
+        let Some(Type::BoundMethod(method)) = attribute.inferred_type(&model) else {
+            return false;
+        };
+        let env = ProgramEnvironment::from_file(function.program_file(db));
+        let Some(Type::BoundMethod(declared)) = class
+            .to_instance(db, &env)
+            .member_lookup_with_policy(
+                db,
+                &env,
+                attribute.attr.id.as_str(),
+                MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+            )
+            .place
+            .ignore_possibly_undefined()
+        else {
+            return false;
+        };
+        match (method.function(db), declared.function(db)) {
+            (Some(method), Some(declared)) => method.definition(db) == declared.definition(db),
+            _ => false,
+        }
+    }
+
     fn expression(
         db: &dyn Db,
         function: FunctionType<'_>,
@@ -474,49 +599,91 @@ fn supported_body(
                     .into_iter()
                     .all(|value| expression(db, function, locals, callees, value))
             }
+            ast::Expr::List(list) => list
+                .elts
+                .iter()
+                .all(|value| expression(db, function, locals, callees, value)),
+            ast::Expr::Tuple(tuple) => tuple
+                .elts
+                .iter()
+                .all(|value| expression(db, function, locals, callees, value)),
+            ast::Expr::Dict(dictionary) => dictionary.items.iter().all(|item| {
+                item.key
+                    .as_ref()
+                    .is_none_or(|key| expression(db, function, locals, callees, key))
+                    && expression(db, function, locals, callees, &item.value)
+            }),
+            ast::Expr::Subscript(subscript) => {
+                expression(db, function, locals, callees, &subscript.value)
+                    && expression(db, function, locals, callees, &subscript.slice)
+            }
+            ast::Expr::BinOp(binary) => {
+                expression(db, function, locals, callees, &binary.left)
+                    && expression(db, function, locals, callees, &binary.right)
+            }
             ast::Expr::Call(call) => {
-                let ast::Expr::Name(name) = call.func.as_ref() else {
-                    return false;
-                };
-                if name.id == *function.name(db) {
-                    return false;
-                }
-                if locals.contains(&name.id.as_str()) {
-                    if !callees.contains(&name.id.as_str()) {
-                        return false;
+                match call.func.as_ref() {
+                    ast::Expr::Name(name) => {
+                        if name.id == *function.name(db) {
+                            return false;
+                        }
+                        if locals.contains(&name.id.as_str()) {
+                            if !callees.contains(&name.id.as_str()) {
+                                return false;
+                            }
+                        } else {
+                            let model = SemanticModel::new(db, function.program_file(db));
+                            match call.func.inferred_type(&model) {
+                                Some(Type::ClassLiteral(class)) => {
+                                    if ![KnownClass::List, KnownClass::Dict]
+                                        .into_iter()
+                                        .any(|known| class.is_known(db, known))
+                                    {
+                                        return false;
+                                    }
+                                }
+                                Some(Type::FunctionLiteral(callee)) => {
+                                    let signature = callee
+                                        .literal(db)
+                                        .last_definition
+                                        .raw_signature(db, ReturnCallableTypeVarScope::Lexical);
+                                    if matches!(
+                                        callee.known(db),
+                                        Some(KnownFunction::NewClass | KnownFunction::NamedTuple)
+                                    ) || !callee.overloads_and_implementation(db).0.is_empty()
+                                        || !signature.is_non_generic()
+                                        || signature.return_ty.is_never()
+                                    {
+                                        return false;
+                                    }
+                                }
+                                Some(ty) => {
+                                    if !callable_entry(db, ty) {
+                                        return false;
+                                    }
+                                }
+                                None => return false,
+                            }
+                        }
                     }
-                } else {
-                    let Some(Type::FunctionLiteral(callee)) = crate::place::global_symbol(
-                        db,
-                        function.program_file(db),
-                        name.id.as_str(),
-                    )
-                    .place
-                    .ignore_possibly_undefined() else {
-                        return false;
-                    };
-                    let signature = callee
-                        .literal(db)
-                        .last_definition
-                        .raw_signature(db, ReturnCallableTypeVarScope::Lexical);
-                    if matches!(
-                        callee.known(db),
-                        Some(KnownFunction::NewClass | KnownFunction::NamedTuple)
-                    ) || !callee.overloads_and_implementation(db).0.is_empty()
-                        || !signature.is_non_generic()
-                        || signature.return_ty.is_never()
-                    {
-                        return false;
+                    ast::Expr::Attribute(attribute) => {
+                        if !expression(db, function, locals, callees, &attribute.value)
+                            || !collection_method(db, function, attribute)
+                        {
+                            return false;
+                        }
                     }
+                    _ => return false,
                 }
                 call.arguments
                     .args
                     .iter()
                     .all(|argument| expression(db, function, locals, callees, argument))
-                    && call.arguments.keywords.iter().all(|argument| {
-                        argument.arg.is_some()
-                            && expression(db, function, locals, callees, &argument.value)
-                    })
+                    && call
+                        .arguments
+                        .keywords
+                        .iter()
+                        .all(|argument| expression(db, function, locals, callees, &argument.value))
             }
             _ => false,
         }
@@ -618,6 +785,12 @@ fn supported_body(
         })
         .collect();
     statements(db, function, &locals, &callees, &node.body)
+        && node.parameters.kwarg.as_deref().is_none_or(|kwargs| {
+            !crate::types::dictionary::contents::has_value_exposure(
+                db,
+                index.expect_single_definition(kwargs),
+            )
+        })
 }
 
 #[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
@@ -721,6 +894,529 @@ mod tests {
     }
 
     #[test]
+    fn body_domains_preserve_copied_keyword_contents() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import Callable, Protocol, overload
+            from typing_extensions import TypedDict, Unpack
+            class Integers(TypedDict, closed=True):
+                value: int
+                marker: str
+            class Strings(TypedDict, closed=True):
+                value: str
+                marker: str
+            class Rule[T](Protocol):
+                def __call__(self, *, data: T, marker: str) -> None: ...
+            @overload
+            def f(rule: Rule[int], **kwargs: Unpack[Integers]) -> None: ...
+            @overload
+            def f(rule: Rule[str], **kwargs: Unpack[Strings]) -> None: ...
+            def f(rule: Callable[..., None], **kwargs: object) -> None:
+                forwarded = dict(kwargs)
+                forwarded.pop('value', None)
+                rule(data=kwargs['value'], **forwarded)
+        "#};
+        for (before, after, wrong) in [
+            ("dict(kwargs)", "dict(kwargs)", false),
+            ("dict(kwargs)", "dict(kwargs, marker=42)", true),
+            ("pop('value', None)", "pop('marker', None)", true),
+            ("kwargs['value']", "kwargs['marker']", true),
+            ("dict(kwargs)", "dict(kwargs)", false),
+        ] {
+            db.write_file("/src/body.py", source.replace(before, after))?;
+            let f = function(&db);
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            let signature = f.last_definition_signature(&db).clone();
+            for index in [0, 1, 0] {
+                let diagnostics = check_overload_body(&db, f, index).unwrap();
+                let fails = wrong && (after != "kwargs['marker']" || index == 0);
+                assert_eq!(
+                    !diagnostics.is_empty(),
+                    fails,
+                    "{after} domain {index}: {diagnostics:#?}"
+                );
+                assert_eq!(f.last_definition_signature(&db), &signature);
+                assert_eq!(
+                    crate::types::check_types(&db, f.program_file(&db)),
+                    ordinary
+                );
+            }
+        }
+        let events = db.take_salsa_events();
+        assert!(
+            ruff_db::testing::find_will_execute_event_by_name(
+                &db,
+                "body_definition_contents",
+                None,
+                &events
+            )
+            .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_keep_conditional_dictionary_removal() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/body.py",
+            r#"
+            from typing import Literal, overload
+            from typing_extensions import TypedDict, Unpack
+            class Row(TypedDict, closed=True):
+                marker: str
+            def consume(*, marker: str) -> None: ...
+            @overload
+            def f(remove: Literal[False], **kwargs: Unpack[Row]) -> None: ...
+            @overload
+            def f(remove: Literal[True], **kwargs: Unpack[Row]) -> None: ...
+            def f(remove: bool, **kwargs: object) -> None:
+                forwarded = dict(kwargs)
+                if remove:
+                    forwarded.pop('marker', None)
+                consume(**forwarded)
+        "#,
+        )?;
+        let f = function(&db);
+        for index in [0, 1, 0] {
+            let diagnostics = check_overload_body(&db, f, index).unwrap();
+            assert_eq!(
+                diagnostics.diagnostics().len(),
+                index,
+                "{index}: {diagnostics:#?}"
+            );
+            if index == 1 {
+                assert_eq!(
+                    diagnostics.diagnostics()[0].id().as_str(),
+                    "missing-argument"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_check_generic_collection_forwarding() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import Callable, Literal, Protocol, overload
+            type Input = list[str] | tuple[str, ...]
+            type Tags[T: str] = list[T | Literal['manual']]
+            class TagsRule[T: str](Protocol):
+                def __call__(self, *args, tags: Tags[T], **kwargs) -> object: ...
+            class DataRule[D, T: str](Protocol):
+                def __call__(self, *args, data: D, tags: Tags[T], **kwargs) -> object: ...
+            finish: Callable[..., None]
+            @overload
+            def f[D: Input, Over: str](rule: DataRule[D, Over], *, name: str, inner_data: D, tags: list[Over] = ...) -> None: ...
+            @overload
+            def f[Over: str](rule: DataRule[list[Over], Over], *, name: str, tags: list[Over] = ...) -> None: ...
+            def f[Impl: str](rule: TagsRule[Impl], *, name: str, inner_data: Input = [], tags: list[Impl] = []) -> None:
+                inner_tags: Tags[Impl] = list(tags)
+                if 'manual' not in tags:
+                    inner_tags.append('manual')
+                rule(name=name + '_', data=inner_data, tags=inner_tags)
+                finish(name=name)
+        "#};
+        for (before, after, wrong) in [
+            ("data=inner_data", "data=inner_data", false),
+            ("data=inner_data", "data=tags", true),
+            ("data=inner_data", "data=[]", true),
+            ("data=inner_data", "data=42", true),
+            ("append('manual')", "append(42)", true),
+            ("data=inner_data", "data=inner_data", false),
+        ] {
+            db.write_file("/src/body.py", source.replace(before, after))?;
+            let f = function(&db);
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            let signature = f.last_definition_signature(&db).clone();
+            let diagnostics = check_overload_body(&db, f, 0).unwrap();
+            assert_eq!(!diagnostics.is_empty(), wrong, "{after}: {diagnostics:#?}");
+            assert_eq!(
+                check_overload_body(&db, f, 1),
+                Err(BodyDomainError::Unsupported)
+            );
+            assert_eq!(
+                crate::types::check_types(&db, f.program_file(&db)),
+                ordinary
+            );
+            assert_eq!(f.last_definition_signature(&db), &signature);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_decline_mutating_captured_rows() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for body in [
+            "kwargs.pop('value', None)",
+            "alias = kwargs\n    alias.pop('value', None)",
+            "copy = dict(kwargs)\n    copy = kwargs\n    copy.pop('value', None)",
+            "kwargs['value'] = 'replacement'",
+        ] {
+            db.write_file(
+                "/src/body.py",
+                indoc::formatdoc! {"
+                from typing import overload
+                @overload
+                def f(*, value: int) -> None: ...
+                @overload
+                def f(*, value: str) -> None: ...
+                def f(**kwargs: object) -> None:
+                    {body}
+            "},
+            )?;
+            assert_eq!(
+                check_overload_body(&db, function(&db), 0),
+                Err(BodyDomainError::Unsupported),
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_project_optional_data_into_copied_kwargs() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import Literal, Protocol, overload
+            from typing_extensions import Never, NotRequired, TypedDict, Unpack
+            type Input = list[str] | tuple[str, ...]
+            class Forwarded(TypedDict, closed=True):
+                marker: str
+            class OptionalData(TypedDict, closed=True):
+                marker: str
+                inner_data: NotRequired[Input]
+            class NoData(TypedDict, closed=True):
+                marker: str
+                inner_data: NotRequired[Never]
+            class TagsRule[T: str](Protocol):
+                def __call__(self, *args, tags: list[T], **kwargs) -> object: ...
+            class DataRule[D, T: str](Protocol):
+                def __call__(self, *, data: D, tags: list[T], marker: str) -> object: ...
+            @overload
+            def f[D: Input, T: str](rule: DataRule[D, T], *, inner_data: D, tags: list[T], **kwargs: Unpack[Forwarded]) -> None: ...
+            @overload
+            def f[T: str](rule: DataRule[list[T], T], *, tags: list[T], **kwargs: Unpack[NoData]) -> None: ...
+            def f[T: str](rule: TagsRule[T], *, tags: list[T], **kwargs: Unpack[OptionalData]) -> None:
+                forwarded = dict(kwargs)
+                forwarded.pop('inner_data', None)
+                rule(data=(kwargs['inner_data'] if 'inner_data' in kwargs else []), tags=tags, **forwarded)
+        "#};
+        for (before, after, failing_domains) in [
+            ("else []", "else []", [false, false]),
+            ("else []", "else [42]", [false, true]),
+            ("kwargs['inner_data']", "tags", [true, false]),
+            ("dict(kwargs)", "dict(kwargs, marker=42)", [true, true]),
+            ("else []", "else []", [false, false]),
+        ] {
+            db.write_file("/src/body.py", source.replace(before, after))?;
+            let f = function(&db);
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            if before == after {
+                assert!(ordinary.is_empty(), "{ordinary:#?}");
+            }
+            for index in [0, 1, 0] {
+                let diagnostics = check_overload_body(&db, f, index).unwrap();
+                assert_eq!(
+                    !diagnostics.is_empty(),
+                    failing_domains[index],
+                    "{after} domain {index}: {diagnostics:#?}"
+                );
+                assert_eq!(
+                    crate::types::check_types(&db, f.program_file(&db)),
+                    ordinary
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_check_legacy_collection_forwarding() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/body.py",
+            "
+            from typing import Protocol, TypeVar, overload
+            T = TypeVar('T')
+            class Rule(Protocol[T]):
+                def __call__(self, *, data: list[T]) -> None: ...
+            @overload
+            def f(rule: Rule[int], values: list[int]) -> None: ...
+            @overload
+            def f(rule: Rule[str], values: list[str]) -> None: ...
+            def f(rule: Rule[T], values: list[T]) -> None:
+                copied: list[T] = list(values)
+                rule(data=copied)
+        ",
+        )?;
+        let f = function(&db);
+        for index in [0, 1, 0] {
+            let diagnostics = check_overload_body(&db, f, index).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_decline_overridden_collection_operations() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for (setup, body) in [
+            (
+                "class Custom(dict):\n    def pop(self, *args): ...\ndict = Custom",
+                "copied = dict()\n    copied.pop('value')",
+            ),
+            (
+                "class Custom(list):\n    def append(self, value): ...\nlist = Custom",
+                "copied = list()\n    copied.append(1)",
+            ),
+            (
+                "from collections import namedtuple\nfactory = namedtuple",
+                "Alias = factory('Alias', ['value'])",
+            ),
+        ] {
+            db.write_file("/src/body.py", format!("from typing import overload\n{setup}\n@overload\ndef f(value: int) -> None: ...\n@overload\ndef f(value: str) -> None: ...\ndef f(value: int | str) -> None:\n    {body}\n"))?;
+            assert_eq!(
+                check_overload_body(&db, function(&db), 0),
+                Err(BodyDomainError::Unsupported),
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_preserve_literal_dictionary_bindings() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {"
+            from typing import overload
+            @overload
+            def f(value: int) -> int: ...
+            @overload
+            def f(value: str) -> str: ...
+            def f(value: int | str) -> int | str:
+                copied = {'value': value}
+                return copied['value']
+        "};
+        for value in ["value", "42", "value"] {
+            db.write_file(
+                "/src/body.py",
+                source.replace("{'value': value}", &format!("{{'value': {value}}}")),
+            )?;
+            let f = function(&db);
+            for index in [0, 1, 0] {
+                let diagnostics = check_overload_body(&db, f, index).unwrap();
+                assert_eq!(
+                    diagnostics.diagnostics().len(),
+                    usize::from(value == "42" && index == 1),
+                    "{value} domain {index}: {diagnostics:#?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_isolate_successful_subscript_constraints() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {"
+            from typing import overload
+            @overload
+            def f(value: dict[str, int] | None) -> dict[str, int]: ...
+            @overload
+            def f(value: dict[str, str] | None) -> dict[str, str]: ...
+            def f(value: dict[str, int] | dict[str, str] | None) -> object:
+                value['key']
+                return value
+        "};
+        for wrong in [false, true, false] {
+            db.write_file(
+                "/src/body.py",
+                if wrong {
+                    source.replace("-> dict[str, str]: ...", "-> dict[str, int]: ...")
+                } else {
+                    source.to_owned()
+                },
+            )?;
+            let f = function(&db);
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            for index in [0, 1, 0] {
+                let diagnostics = check_overload_body(&db, f, index).unwrap();
+                // The possible None receiver retains its normal indexing diagnostic; a
+                // successful read excludes it from the subsequent return in each domain.
+                assert_eq!(
+                    diagnostics
+                        .diagnostics()
+                        .iter()
+                        .filter(|diagnostic| diagnostic.id().as_str() == "invalid-return-type")
+                        .count(),
+                    usize::from(wrong && index == 1),
+                    "domain {index}: {diagnostics:#?}"
+                );
+                assert_eq!(
+                    crate::types::check_types(&db, f.program_file(&db)),
+                    ordinary
+                );
+            }
+        }
+        let events = db.take_salsa_events();
+        assert!(
+            ruff_db::testing::find_will_execute_event_by_name(
+                &db,
+                "successful_body_subscript_constraints",
+                None,
+                &events
+            )
+            .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_preserve_keyword_write_contracts_through_calls() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for (body, supported) in [
+            ("consume(kwargs)", true),
+            ("copied: Source = dict(kwargs)\n    consume(copied)", true),
+            ("copied = dict(kwargs)\n    consume_dict(copied)", true),
+            ("alias = kwargs\n    consume(alias)", false),
+            ("consume_nested((kwargs,))", false),
+        ] {
+            db.write_file(
+                "/src/body.py",
+                indoc::formatdoc! {"
+                from typing import overload
+                from typing_extensions import TypedDict, NotRequired, Unpack
+                class Source(TypedDict, closed=True):
+                    value: NotRequired[object]
+                def consume(row: Source) -> None:
+                    row['value'] = 'text'
+                def consume_dict(row: dict[str, object]) -> None:
+                    row['value'] = 'text'
+                def consume_nested(rows: tuple[Source]) -> None:
+                    rows[0]['value'] = 'text'
+                @overload
+                def f(*, value: int) -> None: ...
+                @overload
+                def f() -> None: ...
+                def f(**kwargs: Unpack[Source]) -> None:
+                    {body}
+            "},
+            )?;
+            let f = function(&db);
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            assert!(ordinary.is_empty(), "{ordinary:#?}");
+            for index in [0, 1, 0] {
+                let result = check_overload_body(&db, f, index);
+                if supported {
+                    let diagnostics = result.unwrap();
+                    assert!(diagnostics.is_empty(), "{body}: {diagnostics:#?}");
+                } else {
+                    assert_eq!(result, Err(BodyDomainError::Unsupported), "{body}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_invalidate_keyword_read_facts_after_escape() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {"
+            from typing import overload
+            from typing_extensions import TypedDict, NotRequired, Unpack
+            class Source(TypedDict, extra_items=object):
+                value: NotRequired[object]
+            def consume(row: Source) -> None:
+                row['value'] = 'text'
+            @overload
+            def f(*, value: int) -> int: ...
+            @overload
+            def f(*, value: str) -> str: ...
+            def f(**kwargs: Unpack[Source]) -> object:
+                pass
+                key = 'value'
+                return kwargs[key]
+        "};
+        for (mutation, wrong) in [
+            ("pass", false),
+            ("consume(kwargs)", true),
+            ("copied: Source = dict(kwargs)\n    consume(copied)", false),
+            ("pass", false),
+        ] {
+            for read in ["kwargs[key]", "kwargs.get(key)"] {
+                db.write_file(
+                    "/src/body.py",
+                    source
+                        .replace("    pass", &format!("    {mutation}"))
+                        .replace("kwargs[key]", read),
+                )?;
+                let f = function(&db);
+                let ordinary = crate::types::check_types(&db, f.program_file(&db));
+                assert!(ordinary.is_empty(), "{ordinary:#?}");
+                for index in [0, 1, 0] {
+                    let diagnostics = check_overload_body(&db, f, index).unwrap();
+                    assert_eq!(
+                        !diagnostics.is_empty(),
+                        wrong,
+                        "{mutation}; {read}, {index}: {diagnostics:#?}"
+                    );
+                    assert!(
+                        diagnostics
+                            .diagnostics()
+                            .iter()
+                            .all(|diagnostic| diagnostic.id().as_str() == "invalid-return-type")
+                    );
+                    assert_eq!(
+                        crate::types::check_types(&db, f.program_file(&db)),
+                        ordinary
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_decline_raw_keyword_returns() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for body in [
+            "return kwargs",
+            "alias = kwargs\n    return alias",
+            "return (kwargs,)",
+        ] {
+            db.write_file(
+                "/src/body.py",
+                indoc::formatdoc! {"
+                from typing import overload
+                from typing_extensions import TypedDict, NotRequired, Unpack
+                class Source(TypedDict, closed=True):
+                    value: NotRequired[object]
+                class Narrow(TypedDict, closed=True):
+                    value: int
+                @overload
+                def f(*, value: int) -> Narrow: ...
+                @overload
+                def f() -> Source: ...
+                def f(**kwargs: Unpack[Source]) -> object:
+                    {body}
+            "},
+            )?;
+            let f = function(&db);
+            assert!(crate::types::check_types(&db, f.program_file(&db)).is_empty());
+            for index in [0, 1] {
+                assert_eq!(
+                    check_overload_body(&db, f, index),
+                    Err(BodyDomainError::Unsupported),
+                    "{body}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn body_domain_projects_keyword_rows() -> anyhow::Result<()> {
         let mut db = setup_db();
         let source = indoc::indoc! {"
@@ -736,12 +1432,12 @@ mod tests {
             @overload
             def f(**kwargs: Unpack[Second]) -> Second: ...
             def f(**kwargs: object) -> object:
-                return kwargs
+                return dict(kwargs)
         "};
-        for result in ["kwargs", "42", "kwargs"] {
+        for result in ["dict(kwargs)", "42", "dict(kwargs)"] {
             db.write_file(
                 "/src/body.py",
-                source.replace("return kwargs", &format!("return {result}")),
+                source.replace("return dict(kwargs)", &format!("return {result}")),
             )?;
             let f = function(&db);
             let signature = f.last_definition_signature(&db).clone();
@@ -770,7 +1466,11 @@ mod tests {
                         "invalid-return-type"
                     );
                 } else {
-                    assert_eq!(returned_type(&db, f, Some(domain)), *entry);
+                    assert!(returned_type(&db, f, Some(domain)).is_equivalent_to(
+                        &db,
+                        &ProgramEnvironment::from_scope(domain.scope(&db)),
+                        *entry
+                    ));
                 }
                 assert_eq!(f.last_definition_signature(&db), &signature);
                 assert_eq!(
@@ -806,7 +1506,7 @@ mod tests {
                 @overload
                 def f(owner: str, /) -> Empty: ...
                 def f(owner: object, /, **kwargs{annotation}) -> object:
-                    return kwargs
+                    return dict(kwargs)
             "},
                 )?;
                 let f = function(&db);
@@ -822,7 +1522,11 @@ mod tests {
                         "{}",
                         entry.display(&db, &env)
                     );
-                    assert_eq!(returned_type(&db, f, Some(domain)), *entry);
+                    assert!(returned_type(&db, f, Some(domain)).is_equivalent_to(
+                        &db,
+                        &ProgramEnvironment::from_scope(domain.scope(&db)),
+                        *entry
+                    ));
                     let diagnostics = check_overload_body(&db, f, index).unwrap();
                     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
                 }
@@ -850,7 +1554,7 @@ mod tests {
             @overload
             def f() -> Empty: ...
             def f(**kwargs: Unpack[Source]) -> object:
-                return kwargs
+                return dict(kwargs)
         "},
         )?;
         let f = function(&db);
@@ -865,7 +1569,11 @@ mod tests {
                 infer_body_definition(&db, *definition, domain).inferred_declaration(*definition),
                 ordinary_declaration
             );
-            assert_eq!(returned_type(&db, f, Some(domain)), *entry);
+            assert!(returned_type(&db, f, Some(domain)).is_equivalent_to(
+                &db,
+                &ProgramEnvironment::from_scope(domain.scope(&db)),
+                *entry
+            ));
             let diagnostics = check_overload_body(&db, f, index).unwrap();
             assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         }
@@ -922,7 +1630,7 @@ mod tests {
         let f = function(&db);
         assert!(crate::types::check_types(&db, f.program_file(&db)).is_empty());
         // The fresh entry can have a narrower field than the original mutable declaration.
-        // Dictionary history must carry both before writes are admitted in a body domain.
+        // Direct writes remain outside admission; copied dictionaries use ordinary write checks.
         for index in [0, 1] {
             assert_eq!(
                 check_overload_body(&db, f, index).unwrap_err(),
@@ -1000,8 +1708,10 @@ mod tests {
                         .return_ty
                 );
                 if residual == "int" || index == 1 {
-                    let diagnostics = check_overload_body(&db, f, index).unwrap();
-                    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+                    assert_eq!(
+                        check_overload_body(&db, f, index),
+                        Err(BodyDomainError::Unsupported)
+                    );
                 }
             }
         }
@@ -2339,12 +3049,12 @@ mod tests {
             ("value: int", "return value", BodyDomainError::Inconsistent),
             (
                 "value: int | str",
-                "return [value]",
+                "return [item for item in value]",
                 BodyDomainError::Unsupported,
             ),
             (
                 "value: int | str",
-                "check = value[0]\n    if check:\n        return value\n    return value",
+                "check, other = value\n    return value",
                 BodyDomainError::Unsupported,
             ),
             (
@@ -2437,8 +3147,10 @@ mod tests {
         ",
         )?;
         for index in [0, 1] {
-            let diagnostics = check_overload_body(&db, function(&db), index).unwrap();
-            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+            assert_eq!(
+                check_overload_body(&db, function(&db), index),
+                Err(BodyDomainError::Unsupported)
+            );
         }
         Ok(())
     }

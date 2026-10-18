@@ -583,6 +583,7 @@ struct Candidate<'ast> {
 /// and the ordinary source-ordered visit owns all effects.
 struct Candidates<'ast, 'a> {
     exclusions: &'a SourceExclusions,
+    keyword_capture: Option<&'ast str>,
     by_place: FxHashMap<MemberExprBuilder, usize>,
     nodes: Vec<Candidate<'ast>>,
 }
@@ -682,6 +683,7 @@ impl<'ast> Candidates<'ast, '_> {
     fn finish(self) -> Vec<&'ast ast::Expr> {
         let Self {
             exclusions: _,
+            keyword_capture: _,
             by_place: _,
             nodes: mut candidates,
         } = self;
@@ -766,6 +768,11 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
             return;
         }
         match expression {
+            ast::Expr::Name(name) => {
+                if self.keyword_capture == Some(name.id.as_str()) {
+                    self.demand(expression);
+                }
+            }
             ast::Expr::Named(named) => self.assignment(&named.target, &named.value),
             ast::Expr::Subscript(subscript) => {
                 if let Some(read) = DictionaryFirstValueRead::from_subscript(subscript)
@@ -863,14 +870,29 @@ pub(super) fn candidates<'ast>(
 ) -> Vec<&'ast ast::Expr> {
     let mut visitor = Candidates {
         exclusions,
+        keyword_capture: None,
         by_place: FxHashMap::default(),
         nodes: Vec::new(),
     };
     match node {
         NodeWithScopeRef::Module => visitor.visit_body(module),
         NodeWithScopeRef::Class(class) => visitor.visit_body(&class.body),
-        NodeWithScopeRef::Function(function) => visitor.visit_body(&function.body),
-        NodeWithScopeRef::Lambda(lambda) => visitor.visit_expr(&lambda.body),
+        NodeWithScopeRef::Function(function) => {
+            visitor.keyword_capture = function
+                .parameters
+                .kwarg
+                .as_ref()
+                .map(|parameter| parameter.name.as_str());
+            visitor.visit_body(&function.body);
+        }
+        NodeWithScopeRef::Lambda(lambda) => {
+            visitor.keyword_capture = lambda
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.kwarg.as_ref())
+                .map(|parameter| parameter.name.as_str());
+            visitor.visit_expr(&lambda.body);
+        }
         NodeWithScopeRef::ListComprehension(comp) => {
             visitor.comprehension(&comp.generators);
             visitor.visit_expr(&comp.elt);

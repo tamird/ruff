@@ -250,9 +250,14 @@ impl<'db> SemanticModel<'db> {
             return Err(crate::types::dictionary::DictionaryFallback::Unavailable);
         };
         let scope = file_scope.to_scope_id(self.db, self.file);
-        match DictionaryItems::expression(self.db, &env, scope, expression, &mut |expression| {
-            expression.inferred_type(self)
-        }) {
+        match DictionaryItems::expression(
+            self.db,
+            &env,
+            scope,
+            expression,
+            None,
+            &mut |expression| expression.inferred_type(self),
+        ) {
             Err(crate::types::dictionary::DictionaryFallback::Unavailable) => {
                 let cache = ReachabilityEvaluationCache::new(
                     scope,

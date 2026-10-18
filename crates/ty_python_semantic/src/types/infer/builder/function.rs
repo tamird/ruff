@@ -58,7 +58,7 @@ use ruff_python_edits::unwrapped_call_argument;
 use ty_module_resolver::{ImportingFile, ModuleName, resolve_module};
 use ty_python_core::{
     Truthiness, UseDefMap,
-    definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind},
+    definition::{Definition, DefinitionKind},
     place::PlaceExpr,
     place_table,
     predicate::{Predicate, PredicateNode},
@@ -1611,11 +1611,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .context
             .body_domain
             .map_or(ty, |domain| domain.specialize_type(self.db(), ty));
-        let entry_ty = self
+        let projected_entry = self
             .context
             .body_domain
-            .and_then(|domain| domain.parameter_type(self.db(), definition))
-            .unwrap_or(ty);
+            .and_then(|domain| domain.parameter_binding_type(self.db(), definition));
         if definition
             .category(self.db(), self.module())
             .is_declaration()
@@ -1623,14 +1622,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.add_declaration_with_binding(
                 parameter.into(),
                 definition,
-                &if self.context.body_domain.is_some()
-                    && !matches!(
-                        definition.kind(self.db()),
-                        DefinitionKind::Parameter(
-                            ParameterDefinitionNodeKind::VariadicKeywordParameter(_)
-                        )
-                    )
-                {
+                &if let Some(entry_ty) = projected_entry {
                     DeclaredAndInferredType::MightBeDifferent {
                         declared_ty: TypeAndQualifiers::declared(ty),
                         inferred_ty: entry_ty,
@@ -1638,13 +1630,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 } else {
                     // A fresh kwargs dictionary is validated through parameter coverage, not
                     // invariant assignment between aliased dictionaries. Retain its source
-                    // declaration; the domain supplies its initial binding at insertion.
+                    // declaration; the domain supplies its initial Contents facts.
                     DeclaredAndInferredType::are_the_same_type(ty)
                 },
             );
         } else {
             self.add_binding(parameter.into(), definition)
-                .insert(self, entry_ty);
+                .insert(self, projected_entry.unwrap_or(ty));
         }
     }
 

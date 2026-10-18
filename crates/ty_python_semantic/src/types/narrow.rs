@@ -120,7 +120,12 @@ pub(crate) fn infer_narrowing_constraints<'db>(
             (positive, None)
         }
         PredicateNode::SuccessfulSubscript { receiver, key } => {
-            let constraints = successful_subscript_constraints(db, receiver, key);
+            let constraints = domain
+                .filter(|domain| domain.scope(db) == receiver.scope(db))
+                .map_or_else(
+                    || successful_subscript_constraints(db, receiver, key),
+                    |domain| successful_body_subscript_constraints(db, receiver, key, domain),
+                );
             (constraints.get(place, true), None)
         }
         PredicateNode::ContextManagerSuppresses { .. }
@@ -396,11 +401,34 @@ fn successful_subscript_constraints<'db>(
     receiver: Expression<'db>,
     key: Expression<'db>,
 ) -> ExpressionNarrowingConstraints<'db> {
+    infer_successful_subscript_constraints(db, receiver, key, None)
+}
+
+#[salsa::tracked(
+    returns(ref),
+    cycle_initial=|_, _, _, _, _| ExpressionNarrowingConstraints::Provisional,
+    heap_size=ruff_memory_usage::heap_size,
+)]
+fn successful_body_subscript_constraints<'db>(
+    db: &'db dyn Db,
+    receiver: Expression<'db>,
+    key: Expression<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> ExpressionNarrowingConstraints<'db> {
+    infer_successful_subscript_constraints(db, receiver, key, Some(domain))
+}
+
+fn infer_successful_subscript_constraints<'db>(
+    db: &'db dyn Db,
+    receiver: Expression<'db>,
+    key: Expression<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> ExpressionNarrowingConstraints<'db> {
     let unchanged = ExpressionNarrowingConstraints::Inferred {
         positive: None,
         negative: None,
     };
-    let inference = infer_expression_types(db, receiver, TypeContext::default());
+    let inference = infer_expression_with_body_domain(db, receiver, TypeContext::default(), domain);
     if inference.is_provisional() {
         return ExpressionNarrowingConstraints::Provisional;
     }
@@ -461,7 +489,7 @@ fn successful_subscript_constraints<'db>(
     else {
         return unchanged;
     };
-    let key_inference = infer_expression_types(db, key, TypeContext::default());
+    let key_inference = infer_expression_with_body_domain(db, key, TypeContext::default(), domain);
     if key_inference.is_provisional() {
         return ExpressionNarrowingConstraints::Provisional;
     }
@@ -2235,6 +2263,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                                 expression_node,
                                 *place,
                                 loop_carried,
+                                self.body_domain,
                             ) {
                                 Some(
                                     crate::types::dictionary::contents::KeyPreservation::Changed,
@@ -2457,7 +2486,13 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         if !use_def
             .bindings_at_use(name.scoped_use_id(db, file))
             .all(|binding| {
-                binding_reachability(db, use_def, &binding).is_always_false()
+                crate::reachability::evaluate_reachability_in_domain(
+                    db,
+                    scope,
+                    binding.reachability_constraint,
+                    self.body_domain,
+                )
+                .is_always_false()
                     || binding.binding.definition().is_some_and(|definition| {
                         self.binding_assigns_alias(definition, alias_key, false)
                     })
@@ -4989,8 +5024,12 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                             continue;
                         };
                         let lookup = alias.node_ref(db).node(self.module);
-                        let alias_inference =
-                            infer_expression_types(db, alias, TypeContext::default());
+                        let alias_inference = infer_expression_with_body_domain(
+                            db,
+                            alias,
+                            TypeContext::default(),
+                            self.body_domain,
+                        );
                         if alias_inference.is_provisional() {
                             provisional = true;
                             continue;

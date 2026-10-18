@@ -7,6 +7,7 @@ use ty_python_core::semantic_index;
 
 use crate::reachability::ReachabilityEvaluationCache;
 use crate::types::call::collect_keyword_items;
+use crate::types::infer::FunctionBodyDomain;
 use crate::types::set_theoretic::UnionBuilder;
 use crate::types::typed_dict::{
     UnpackedTypedDict, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
@@ -342,11 +343,16 @@ impl<'db> DictionaryItems<'db> {
         env: &ProgramEnvironment<'db>,
         scope: ScopeId<'db>,
         expression: &ast::Expr,
+        domain: Option<FunctionBodyDomain<'db>>,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
         match expression {
-            ast::Expr::BinOp(binary) => Self::union(db, env, scope, binary, expression_type),
-            ast::Expr::Dict(_) => Self::literal(db, env, scope, expression, expression_type),
+            ast::Expr::BinOp(binary) => {
+                Self::union(db, env, scope, binary, domain, expression_type)
+            }
+            ast::Expr::Dict(_) => {
+                Self::literal(db, env, scope, expression, domain, expression_type)
+            }
             ast::Expr::DictComp(comprehension) => {
                 let ast::ExprDictComp {
                     node_index: _,
@@ -418,6 +424,7 @@ impl<'db> DictionaryItems<'db> {
                             scope,
                             expression.into(),
                             source,
+                            domain,
                             expression_type,
                         )?;
                         dictionary.overlay(db, env, source);
@@ -425,7 +432,7 @@ impl<'db> DictionaryItems<'db> {
                     _ => return Err(DictionaryFallback::Unavailable),
                 }
                 let keywords =
-                    Self::keywords(db, env, scope, &arguments.keywords, expression_type)?;
+                    Self::keywords(db, env, scope, &arguments.keywords, domain, expression_type)?;
                 dictionary.overlay(db, env, keywords);
                 Ok(dictionary.finish())
             }
@@ -438,6 +445,7 @@ impl<'db> DictionaryItems<'db> {
         env: &ProgramEnvironment<'db>,
         scope: ScopeId<'db>,
         keywords: &[ast::Keyword],
+        domain: Option<FunctionBodyDomain<'db>>,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
         collect_keyword_items(
@@ -466,7 +474,7 @@ impl<'db> DictionaryItems<'db> {
                         },
                     })
                 } else {
-                    Self::unpacked_expression(db, env, scope, value, expression_type)
+                    Self::unpacked_expression(db, env, scope, value, domain, expression_type)
                 }
             }),
         )
@@ -477,14 +485,15 @@ impl<'db> DictionaryItems<'db> {
         env: &ProgramEnvironment<'db>,
         scope: ScopeId<'db>,
         expression: &ast::Expr,
+        domain: Option<FunctionBodyDomain<'db>>,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
-        let observed = Self::expression(db, env, scope, expression, expression_type);
+        let observed = Self::expression(db, env, scope, expression, domain, expression_type);
         if expression.is_dict_expr() || !matches!(observed, Err(DictionaryFallback::Unavailable)) {
             // Unsupported literals decline atomically; unreachable operands stay unreachable.
             return observed;
         }
-        Self::unpacked_value(db, env, scope, expression, expression_type)
+        Self::unpacked_value(db, env, scope, expression, domain, expression_type)
     }
 
     fn unpacked_value(
@@ -492,6 +501,7 @@ impl<'db> DictionaryItems<'db> {
         env: &ProgramEnvironment<'db>,
         scope: ScopeId<'db>,
         expression: &ast::Expr,
+        domain: Option<FunctionBodyDomain<'db>>,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
         let ty = expression_type(expression).ok_or(DictionaryFallback::Unavailable)?;
@@ -501,7 +511,8 @@ impl<'db> DictionaryItems<'db> {
             index
                 .use_def_map(scope.file_scope_id(db))
                 .reachability_constraints(),
-        );
+        )
+        .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
         match contents::at_use(db, scope, expression, ty, &cache) {
             Err(DictionaryFallback::Unavailable) => Self::unpacked(db, env, ty, expression.range())
                 .ok_or(DictionaryFallback::Unavailable),
@@ -515,10 +526,11 @@ impl<'db> DictionaryItems<'db> {
         scope: ScopeId<'db>,
         snapshot: ast::ExprRef<'_>,
         source: &ast::Expr,
+        domain: Option<FunctionBodyDomain<'db>>,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
         if ty_python_core::place::PlaceExpr::try_from_expr(source).is_none() {
-            return Self::unpacked_expression(db, env, scope, source, expression_type);
+            return Self::unpacked_expression(db, env, scope, source, domain, expression_type);
         }
         let ty = expression_type(source).ok_or(DictionaryFallback::Unavailable)?;
         let index = semantic_index(db, scope.program_file(db));
@@ -527,7 +539,8 @@ impl<'db> DictionaryItems<'db> {
             index
                 .use_def_map(scope.file_scope_id(db))
                 .reachability_constraints(),
-        );
+        )
+        .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
         match contents::at_snapshot(db, scope, source, snapshot, ty, &cache) {
             Err(DictionaryFallback::Unavailable) => {
                 Self::unpacked(db, env, ty, source.range()).ok_or(DictionaryFallback::Unavailable)
@@ -541,6 +554,7 @@ impl<'db> DictionaryItems<'db> {
         env: &ProgramEnvironment<'db>,
         scope: ScopeId<'db>,
         binary: &ast::ExprBinOp,
+        domain: Option<FunctionBodyDomain<'db>>,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
         let ast::ExprBinOp {
@@ -555,23 +569,30 @@ impl<'db> DictionaryItems<'db> {
         }
         let mut dictionary = DictionaryItemsBuilder::default();
         for operand in [left.as_ref(), right.as_ref()] {
-            let source =
-                Self::builtin_source(db, env, scope, binary.into(), operand, expression_type)
-                    .or_else(|fallback| match fallback {
-                        DictionaryFallback::Unavailable => {
-                            let ty = expression_type(operand).ok_or(fallback)?;
-                            let unpacked = extract_unpacked_typed_dict_from_value_type(db, env, ty)
-                                .ok_or(fallback)?;
-                            let has_implicit_extra_items = unpacked.has_implicit_extra_items;
-                            let mut source = Self::from_typed_dict(unpacked, operand.range());
-                            if has_implicit_extra_items {
-                                // A hidden RHS field can overwrite any known LHS field.
-                                source.extra_items = DictionaryExtraItems::Value(Type::object());
-                            }
-                            Ok(source)
-                        }
-                        DictionaryFallback::Unreachable => Err(fallback),
-                    })?;
+            let source = Self::builtin_source(
+                db,
+                env,
+                scope,
+                binary.into(),
+                operand,
+                domain,
+                expression_type,
+            )
+            .or_else(|fallback| match fallback {
+                DictionaryFallback::Unavailable => {
+                    let ty = expression_type(operand).ok_or(fallback)?;
+                    let unpacked =
+                        extract_unpacked_typed_dict_from_value_type(db, env, ty).ok_or(fallback)?;
+                    let has_implicit_extra_items = unpacked.has_implicit_extra_items;
+                    let mut source = Self::from_typed_dict(unpacked, operand.range());
+                    if has_implicit_extra_items {
+                        // A hidden RHS field can overwrite any known LHS field.
+                        source.extra_items = DictionaryExtraItems::Value(Type::object());
+                    }
+                    Ok(source)
+                }
+                DictionaryFallback::Unreachable => Err(fallback),
+            })?;
             dictionary.overlay(db, env, source);
         }
         Ok(dictionary.finish())
@@ -584,10 +605,11 @@ impl<'db> DictionaryItems<'db> {
         scope: ScopeId<'db>,
         snapshot: ast::ExprRef<'_>,
         source: &ast::Expr,
+        domain: Option<FunctionBodyDomain<'db>>,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
         if ty_python_core::place::PlaceExpr::try_from_expr(source).is_none() {
-            return Self::expression(db, env, scope, source, expression_type);
+            return Self::expression(db, env, scope, source, domain, expression_type);
         }
         let ty = expression_type(source).ok_or(DictionaryFallback::Unavailable)?;
         let index = semantic_index(db, scope.program_file(db));
@@ -596,7 +618,8 @@ impl<'db> DictionaryItems<'db> {
             index
                 .use_def_map(scope.file_scope_id(db))
                 .reachability_constraints(),
-        );
+        )
+        .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
         match contents::snapshot_contents(db, scope, source, snapshot, ty, &cache) {
             contents::ContentsValue::Mapping(mapping) => {
                 if mapping.builtin {
@@ -616,6 +639,7 @@ impl<'db> DictionaryItems<'db> {
         env: &ProgramEnvironment<'db>,
         scope: ScopeId<'db>,
         expression: &ast::Expr,
+        domain: Option<FunctionBodyDomain<'db>>,
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
         let ast::Expr::Dict(ast::ExprDict {
@@ -629,7 +653,8 @@ impl<'db> DictionaryItems<'db> {
         let mut dictionary = DictionaryItemsBuilder::default();
         for ast::DictItem { key, value } in items {
             let Some(key) = key else {
-                let unpacked = Self::unpacked_expression(db, env, scope, value, expression_type)?;
+                let unpacked =
+                    Self::unpacked_expression(db, env, scope, value, domain, expression_type)?;
                 dictionary.overlay(db, env, unpacked);
                 continue;
             };

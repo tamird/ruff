@@ -388,7 +388,7 @@ fn external_generic_body_domains_preserve_default_evidence() -> anyhow::Result<(
 
 #[test]
 fn external_overload_body_domains_project_keyword_rows() -> anyhow::Result<()> {
-    let source = "def pick(**kwargs):\n    return kwargs\n";
+    let source = "def pick(**kwargs):\n    return dict(kwargs)\n";
     let donor = indoc::indoc! {"
         from typing import overload
         from typing_extensions import NotRequired, TypedDict, Unpack
@@ -412,10 +412,10 @@ fn external_overload_body_domains_project_keyword_rows() -> anyhow::Result<()> {
         .with_source_provider(ExternalSource::Annotation)
         .build()?;
     let source_file = system_path_to_file(&db, "/src/main.py")?;
-    for result in ["kwargs", "42", "kwargs"] {
+    for result in ["dict(kwargs)", "42", "dict(kwargs)"] {
         db.write_file(
             "/src/main.py",
-            source.replace("return kwargs", &format!("return {result}")),
+            source.replace("return dict(kwargs)", &format!("return {result}")),
         )?;
         let file = db.program_file(source_file);
         let function = crate::place::global_symbol(&db, file, "pick")
