@@ -4647,6 +4647,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) {
         let db = self.db();
         let env = self.program_environment();
+        if let Some(domain) = self.context.body_domain {
+            declared = declared.map_type(|ty| domain.specialize_type(db, ty));
+        }
 
         // P.args and P.kwargs are only valid as annotations on *args and **kwargs,
         // not as variable annotations. Check both resolved type and AST form.

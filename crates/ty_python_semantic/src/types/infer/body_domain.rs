@@ -1,6 +1,6 @@
 //! Opt-in checking of a named function body under one declared overload.
 //!
-//! Domains are limited to fixed nongeneric parameters, straight-line bodies, and return trees
+//! Domains are limited to fixed parameters, straight-line bodies, and return trees
 //! guarded by Boolean parameters. Unsupported syntax must be rejected before inference: general
 //! narrowing, capture, and collection queries do not yet carry a body domain.
 
@@ -9,6 +9,7 @@ use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
 use ty_python_core::definition::Definition;
 use ty_python_core::scope::ScopeId;
+use ty_python_core::semantic_index;
 use ty_python_core::statement::StatementInner;
 
 use super::{
@@ -19,14 +20,16 @@ use super::{
 use crate::types::call::Argument;
 use crate::types::constraints::ConstraintSetBuilder;
 use crate::types::function::OverloadLiteral;
+use crate::types::generics::Specialization;
 use crate::types::signatures::{
-    ParameterConsistency, ReturnCallableTypeVarScope, ReturnTypeConsistency,
+    ParameterConsistency, PreparedOverloadImplementation, ReturnCallableTypeVarScope,
+    ReturnTypeConsistency,
 };
 use crate::types::string_annotation::SourceAnnotation;
 use crate::types::{
     CallArguments, ParameterKind, Signature, Type, TypeCheckDiagnostics, UnionType,
 };
-use crate::{Db, ProgramEnvironment};
+use crate::{Db, ProgramEnvironment, SemanticModel};
 
 /// Why a declared overload cannot be used to check its implementation body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,10 +45,13 @@ pub enum BodyDomainError {
 /// This is additional checking, not a replacement for ordinary function or overload checking.
 /// It preserves the public callable type. A source function may adopt an entire signature from
 /// an external declaration; in that case the overload index refers to that declaration's family.
-/// Only fixed nongeneric parameters, simple straight-line bodies, and Boolean-parameter return
-/// trees are supported. Supplied required inputs exclude source defaults; omitted inputs retain
-/// their ordinary source default types. Optional positional-only domains remain unsupported because
-/// their omitted inputs can be correlated. An unsupported domain never means success.
+/// Only fixed parameters, simple straight-line bodies, and Boolean-parameter return trees are
+/// supported. Generic implementations require complete specialization from fixed overload inputs.
+/// The same substitution applies to source declarations and already inferred default types;
+/// their ordinary inference and shared runtime identity are unchanged. Generic domains require
+/// inhabited input evidence for every source slot. Nongeneric omitted slots retain their ordinary
+/// source default types. Optional positional-only domains remain unsupported because their omitted
+/// inputs can be correlated. An unsupported domain never means success.
 pub fn check_overload_body<'db>(
     db: &'db dyn Db,
     function: FunctionType<'db>,
@@ -80,6 +86,8 @@ pub(crate) struct FunctionBodyDomain<'db> {
     parameters: Box<[(Definition<'db>, Type<'db>)]>,
     #[returns(copy)]
     pub(crate) return_type: Type<'db>,
+    #[returns(copy)]
+    specialization: Option<Specialization<'db>>,
 }
 
 impl<'db> FunctionBodyDomain<'db> {
@@ -95,6 +103,10 @@ impl<'db> FunctionBodyDomain<'db> {
         self.parameters(db)
             .iter()
             .find_map(|(parameter, ty)| (*parameter == definition).then_some(*ty))
+    }
+
+    pub(super) fn specialize_type(self, db: &'db dyn Db, ty: Type<'db>) -> Type<'db> {
+        ty.apply_optional_specialization(db, self.specialization(db))
     }
 }
 
@@ -147,7 +159,6 @@ fn prepare_body_domain<'db>(
         .node(&module);
     if node.is_async
         || !node.decorator_list.is_empty()
-        || node.type_params.is_some()
         || node.parameters.vararg.is_some()
         || node.parameters.kwarg.is_some()
     {
@@ -173,12 +184,10 @@ fn prepare_body_domain<'db>(
     let overload_signature = overload.raw_signature(db, ReturnCallableTypeVarScope::Lexical);
     let env = ProgramEnvironment::from_file(file);
     let supported_signature = |signature: &crate::types::Signature<'db>| {
-        signature.is_non_generic()
-            && !matches!(
-                signature.return_ty.resolve_type_alias(db),
-                Type::TypeIs(_) | Type::TypeGuard(_)
-            )
-            && Type::single_callable(db, signature.clone()).is_fully_static(db, &env)
+        !matches!(
+            signature.return_ty.resolve_type_alias(db),
+            Type::TypeIs(_) | Type::TypeGuard(_)
+        ) && Type::single_callable(db, signature.clone()).is_fully_static(db, &env)
             && !signature.return_ty.has_indeterminate_inference(db, &env)
             && signature.parameters().iter().all(|parameter| {
                 !parameter
@@ -213,8 +222,11 @@ fn prepare_body_domain<'db>(
     if !supported_body(db, function, node, &implementation_signature) {
         return Err(BodyDomainError::Unsupported);
     }
-    let implementation_signature = implementation_signature
-        .specialize_for_overload_implementation(db, &env, &overload_signature)
+    let PreparedOverloadImplementation {
+        signature: implementation_signature,
+        specialization,
+    } = implementation_signature
+        .prepare_overload_implementation(db, &env, &overload_signature)
         .ok_or(BodyDomainError::Unsupported)?;
     if !matches!(
         implementation_signature.implementation_parameters_consistency_with(
@@ -239,6 +251,7 @@ fn prepare_body_domain<'db>(
         implementation.body_scope(db),
         &implementation_signature,
         &overload_signature,
+        specialization,
     )?;
     Ok(FunctionBodyDomain::new(
         db,
@@ -246,6 +259,7 @@ fn prepare_body_domain<'db>(
         overload,
         parameters,
         overload_signature.return_ty,
+        specialization,
     ))
 }
 
@@ -256,6 +270,7 @@ fn project_body_parameters<'db>(
     scope: ScopeId<'db>,
     implementation: &Signature<'db>,
     overload: &Signature<'db>,
+    specialization: Option<Specialization<'db>>,
 ) -> Result<Box<[(Definition<'db>, Type<'db>)]>, BodyDomainError> {
     let bind = |keywords: bool| {
         let arguments: Option<CallArguments<'_, 'db>> = overload
@@ -338,6 +353,13 @@ fn project_body_parameters<'db>(
         .zip_eq(supplied)
         .zip_eq(may_be_omitted)
         .map(|((parameter, supplied), omitted)| {
+            // Generic omitted inputs need a projection distinct from the fixed input evidence
+            // used to specialize the implementation. Do not use a default to invent that evidence.
+            if (specialization.is_some() || !overload.is_non_generic())
+                && supplied.is_none_or(|ty| ty.is_never())
+            {
+                return Err(BodyDomainError::Unsupported);
+            }
             let definition = parameter.definition().ok_or(BodyDomainError::Unsupported)?;
             if definition.scope(db) != scope {
                 return Err(BodyDomainError::Unsupported);
@@ -348,6 +370,9 @@ fn project_body_parameters<'db>(
                 let default = parameter
                     .default_type(db)
                     .ok_or(BodyDomainError::Unsupported)?;
+                // Substitute only the already inferred type view. The ordinary default query
+                // and its shared runtime value retain their original identity and evidence.
+                let default = default.apply_optional_specialization(db, specialization);
                 supplied.map_or(default, |supplied| {
                     UnionType::from_two_elements(db, env, supplied, default)
                 })
@@ -457,6 +482,13 @@ fn supported_body(
             ast::Stmt::Assign(assignment) => {
                 !return_tree && expression(db, function, locals, &assignment.value)
             }
+            ast::Stmt::AnnAssign(assignment) => {
+                !return_tree
+                    && assignment
+                        .value
+                        .as_deref()
+                        .is_some_and(|value| expression(db, function, locals, value))
+            }
             ast::Stmt::Expr(statement) => {
                 !return_tree && expression(db, function, locals, &statement.value)
             }
@@ -470,11 +502,48 @@ fn supported_body(
         .map(|parameter| parameter.name().as_str())
         .collect();
     for statement in &node.body {
-        if let ast::Stmt::Assign(assignment) = statement {
-            let [ast::Expr::Name(name)] = assignment.targets.as_slice() else {
-                return false;
-            };
-            local_names.push(name.id.as_str());
+        match statement {
+            ast::Stmt::Assign(assignment) => {
+                let [ast::Expr::Name(name)] = assignment.targets.as_slice() else {
+                    return false;
+                };
+                if let Some(annotation) =
+                    SourceAnnotation::new(db, function.program_file(db), name, None)
+                {
+                    if let Some(expression) = annotation.expression() {
+                        let definition = semantic_index(db, function.program_file(db))
+                            .expect_single_definition(name);
+                        if infer_definition_types(db, definition)
+                            .try_expression_type(expression)
+                            .is_some_and(|ty| ty.is_typealias_special_form())
+                        {
+                            return false;
+                        }
+                    } else if matches!(
+                        annotation,
+                        SourceAnnotation::External {
+                            annotation: _,
+                            range: _
+                        }
+                    ) && annotation.external_declaration(db).is_none()
+                    {
+                        return false;
+                    }
+                }
+                local_names.push(name.id.as_str());
+            }
+            ast::Stmt::AnnAssign(assignment) => {
+                let ast::Expr::Name(name) = assignment.target.as_ref() else {
+                    return false;
+                };
+                if SemanticModel::new(db, function.program_file(db))
+                    .is_type_alias_annotation(&assignment.annotation)
+                {
+                    return false;
+                }
+                local_names.push(name.id.as_str());
+            }
+            _ => {}
         }
     }
     let parameters: Vec<_> = signature
@@ -601,6 +670,179 @@ mod tests {
             |domain| infer_body_scope(db, domain),
         );
         inference.expression_type(value)
+    }
+
+    #[test]
+    fn generic_body_domains_specialize_declarations() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for legacy in [false, true] {
+            let (variables, overload_binder, implementation_binder) = if legacy {
+                (
+                    "Over = TypeVar('Over', bound=str)\nImpl = TypeVar('Impl')",
+                    "",
+                    "",
+                )
+            } else {
+                ("", "[Over: str]", "[Impl]")
+            };
+            for (future, annotation) in [
+                ("", "Impl"),
+                ("", "'Impl'"),
+                ("from __future__ import annotations", "Impl"),
+            ] {
+                let source = indoc::formatdoc! {"
+                    {future}
+                    from typing import TypeVar, overload
+                    {variables}
+                    @overload
+                    def f{overload_binder}(value: Over) -> Over: ...
+                    @overload
+                    def f(value: int) -> int: ...
+                    def f{implementation_binder}(value: Impl) -> Impl:
+                        copied: {annotation} = value
+                        return copied
+                    integer = f(1)
+                    text = f('ok')
+                "};
+                db.write_file("/src/body.py", &source)?;
+                let f = function(&db);
+                let signature = f.last_definition_signature(&db).clone();
+                let ordinary_return = returned_type(&db, f, None);
+                let ordinary = crate::types::check_types(&db, f.program_file(&db));
+                assert!(ordinary.is_empty(), "{ordinary:#?}");
+                for index in [0, 1, 0] {
+                    let domain = prepare_body_domain(&db, f, index).unwrap();
+                    assert!(domain.specialization(&db).is_some());
+                    assert_eq!(returned_type(&db, f, Some(domain)), domain.return_type(&db));
+                    let diagnostics = check_overload_body(&db, f, index).unwrap();
+                    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+                    assert_eq!(returned_type(&db, f, None), ordinary_return);
+                    assert_eq!(f.last_definition_signature(&db), &signature);
+                    assert_eq!(
+                        crate::types::check_types(&db, f.program_file(&db)),
+                        ordinary
+                    );
+                }
+                for (name, expected) in [("integer", "int"), ("text", "Literal[\"ok\"]")] {
+                    let ty = crate::place::global_symbol(&db, f.program_file(&db), name)
+                        .place
+                        .expect_type();
+                    assert_eq!(
+                        ty.display(&db, &db.program_environment()).to_string(),
+                        expected
+                    );
+                }
+                for target in ["copied", "value"] {
+                    db.write_file(
+                        "/src/body.py",
+                        source.replace(
+                            "return copied",
+                            &format!("{target} = 42\n    return copied"),
+                        ),
+                    )?;
+                    let f = function(&db);
+                    assert!(check_overload_body(&db, f, 1).unwrap().is_empty());
+                    let diagnostics = check_overload_body(&db, f, 0).unwrap().into_diagnostics();
+                    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+                    assert_eq!(diagnostics[0].id().as_str(), "invalid-assignment");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generic_body_domains_decline_unrepresented_inputs_and_aliases() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for extra in ["", ", *, extra: Never = ..."] {
+            db.write_file(
+                "/src/body.py",
+                indoc::formatdoc! {"
+                from typing import Never, overload
+                @overload
+                def f[Over: str](value: Over{extra}) -> Over: ...
+                @overload
+                def f(value: int, *, extra: int = ...) -> int: ...
+                def f[Impl](value: Impl, *, extra: int = 1) -> Impl:
+                    return value
+            "},
+            )?;
+            assert_eq!(
+                check_overload_body(&db, function(&db), 0).unwrap_err(),
+                BodyDomainError::Unsupported
+            );
+            assert!(
+                check_overload_body(&db, function(&db), 1)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        for statement in [
+            "Alias: TA = str",
+            "type Alias = str",
+            "Alias = NewType('Alias', str)",
+            "Alias = TypeAliasType('Alias', str)",
+        ] {
+            db.write_file(
+                "/src/body.py",
+                indoc::formatdoc! {"
+                from typing import overload, TypeAlias as TA, NewType
+                from typing_extensions import TypeAliasType
+                @overload
+                def f(value: str) -> str: ...
+                @overload
+                def f(value: int) -> int: ...
+                def f[Impl](value: Impl) -> Impl:
+                    {statement}
+                    return value
+            "},
+            )?;
+            assert_eq!(
+                check_overload_body(&db, function(&db), 0).unwrap_err(),
+                BodyDomainError::Unsupported,
+                "{statement}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generic_body_domains_map_source_default_views() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/body.py",
+            "
+            from typing import overload
+            @overload
+            def f[Over: str](value: Over, data: list[Over] = ...) -> list[Over]: ...
+            @overload
+            def f(value: int, data: list[int] = ...) -> list[int]: ...
+            def f[Impl](value: Impl, data: list[Impl] = []) -> list[Impl]:
+                copied: list[Impl] = data
+                return copied
+        ",
+        )?;
+        let f = function(&db);
+        let signature = f.last_definition_signature(&db).clone();
+        let raw_default = signature.parameters()[1].default_type(&db).unwrap();
+        assert_eq!(
+            raw_default
+                .display(&db, &db.program_environment())
+                .to_string(),
+            "list[Impl@f]"
+        );
+        for index in [0, 1, 0] {
+            let domain = prepare_body_domain(&db, f, index).unwrap();
+            assert_eq!(returned_type(&db, f, Some(domain)), domain.return_type(&db));
+            let diagnostics = check_overload_body(&db, f, index).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+            assert_eq!(
+                signature.parameters()[1].default_type(&db),
+                Some(raw_default)
+            );
+            assert_eq!(f.last_definition_signature(&db), &signature);
+        }
+        Ok(())
     }
 
     #[test]
@@ -788,6 +1030,7 @@ mod tests {
                 implementation.body_scope(&db),
                 &implementation.raw_signature(&db, ReturnCallableTypeVarScope::Lexical),
                 &overloads[0].raw_signature(&db, ReturnCallableTypeVarScope::Lexical),
+                None,
             )
             .unwrap_err(),
             BodyDomainError::Unsupported,

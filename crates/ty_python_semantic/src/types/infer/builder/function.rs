@@ -1606,6 +1606,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         definition: Definition<'db>,
         ty: Type<'db>,
     ) {
+        let ty = self
+            .context
+            .body_domain
+            .map_or(ty, |domain| domain.specialize_type(self.db(), ty));
         let entry_ty = self
             .context
             .body_domain

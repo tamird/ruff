@@ -2428,7 +2428,10 @@ fn place_from_declarations_impl<'db>(
         if static_reachability.is_always_false() {
             None
         } else {
-            let declared_type = inferred_declaration(db, declaration).declared()?;
+            let domain = reachability_cache.and_then(ReachabilityEvaluationCache::body_domain);
+            let declared_type = infer_definition_with_body_domain(db, declaration, domain)
+                .inferred_declaration(declaration)
+                .declared()?;
             first_declaration.get_or_insert(declaration);
             provenance = provenance.or(Provenance::SingleDefinition(declaration));
             all_declarations_definitely_reachable =

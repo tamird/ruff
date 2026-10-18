@@ -61,32 +61,24 @@ impl SourceProvider for ExternalSource {
                 )));
             }
         }
+        if let ast::AnyRootNodeRef::Expr(expression) = module.get_by_index(owner)
+            && let Some(name) = expression.as_name_expr()
+            && let Some(foreign) = declarations.suite().iter().find_map(|statement| {
+                let ast::Stmt::AnnAssign(declaration) = statement else {
+                    return None;
+                };
+                let ast::Expr::Name(target) = declaration.target.as_ref() else {
+                    return None;
+                };
+                (target.id == name.id).then_some(declaration)
+            })
+        {
+            return Some(ProvidedAnnotation::External {
+                file: target,
+                owner: foreign.node_index().load(),
+            });
+        }
         for statement in module.suite() {
-            let target_name = match statement {
-                ast::Stmt::Assign(assignment) => match assignment.targets.as_slice() {
-                    [target] => Some(target),
-                    _ => None,
-                },
-                ast::Stmt::AnnAssign(assignment) => Some(assignment.target.as_ref()),
-                _ => None,
-            };
-            if let Some(ast::Expr::Name(name)) = target_name
-                && name.node_index().load() == owner
-            {
-                let foreign = declarations.suite().iter().find_map(|statement| {
-                    let ast::Stmt::AnnAssign(declaration) = statement else {
-                        return None;
-                    };
-                    let ast::Expr::Name(target) = declaration.target.as_ref() else {
-                        return None;
-                    };
-                    (target.id == name.id).then_some(declaration)
-                })?;
-                return Some(ProvidedAnnotation::External {
-                    file: target,
-                    owner: foreign.node_index().load(),
-                });
-            }
             let ast::Stmt::FunctionDef(function) = statement else {
                 continue;
             };
@@ -307,6 +299,153 @@ fn external_overload_body_domains() -> anyhow::Result<()> {
             .len(),
         1
     );
+    Ok(())
+}
+
+#[test]
+fn external_generic_body_domains_preserve_default_evidence() -> anyhow::Result<()> {
+    let donor = indoc::indoc! {r#"
+        from typing import overload
+        type Items[Element] = list[Element]
+        @overload
+        def pick[Over: str](value: Over, data: list[Over] = ...) -> list[Over]: ...
+        @overload
+        def pick(value: int, data: list[int] = ...) -> list[int]: ...
+        def pick[Impl](value: Impl, data: list[Impl] = ...) -> list[Impl]: ...
+    "#};
+    for (declaration, default, expected_default, errors) in [
+        ("", "[]", "list[Impl@pick]", Some([0, 0])),
+        ("", "['known-extra']", "list[Impl@pick | str]", Some([1, 1])),
+        (
+            "shared: list[int] = [1]",
+            "shared",
+            "list[int]",
+            Some([1, 0]),
+        ),
+        ("shared: Any = None", "shared", "Any", None),
+        ("shared = []", "shared", "list[Unknown]", None),
+        (
+            "def get_shared(): ...\nshared = get_shared()",
+            "shared",
+            "Unknown",
+            None,
+        ),
+    ] {
+        let source = indoc::formatdoc! {"
+            from typing import Any
+            from contracts import Items, pick as public_pick
+            {declaration}
+            def pick(value, data={default}):
+                copied = data  # type: Items[Impl]
+                return copied
+            public_result = public_pick(1)
+        "};
+        let db = TestDbBuilder::new()
+            .with_file("/src/main.py", &source)
+            .with_file("/src/contracts.pyi", donor)
+            .with_source_provider(ExternalSource::LocalAnnotations)
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let program_file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program_file);
+        let function = crate::place::global_symbol(&db, program_file, "pick")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        let signature = function.last_definition_signature(&db).clone();
+        let raw_default = signature.parameters()[1].default_type(&db).unwrap();
+        assert_eq!(raw_default.display(&db, &env).to_string(), expected_default);
+        let ordinary = db.check_file(file);
+        for index in [0, 1, 0] {
+            let result = check_overload_body(&db, function, index);
+            if let Some(counts) = errors {
+                let diagnostics = result.unwrap().into_diagnostics();
+                assert_eq!(
+                    diagnostics.len(),
+                    counts[index],
+                    "{default}, domain {index}: {diagnostics:#?}"
+                );
+                for diagnostic in diagnostics {
+                    assert_eq!(diagnostic.id().as_str(), "invalid-assignment");
+                }
+            } else {
+                assert_eq!(result.unwrap_err(), BodyDomainError::Unsupported);
+            }
+            assert_eq!(
+                signature.parameters()[1].default_type(&db),
+                Some(raw_default)
+            );
+            assert_eq!(function.last_definition_signature(&db), &signature);
+            assert_eq!(db.check_file(file), ordinary);
+            let public = crate::place::global_symbol(&db, program_file, "public_result")
+                .place
+                .expect_type();
+            assert_eq!(public.display(&db, &env).to_string(), "list[int]");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn external_generic_body_domains_decline_detached_aliases() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/main.py", "from typing import TypeAlias as TA\ndef pick(value):\n    Alias = str  # type: TA\n    return value\n")
+        .with_file("/src/contracts.pyi", indoc::indoc! {r#"
+            from typing import overload
+            @overload
+            def pick(value: str) -> str: ...
+            @overload
+            def pick(value: int) -> int: ...
+            def pick[Impl](value: Impl) -> Impl: ...
+        "#})
+        .with_source_provider(ExternalSource::LocalAnnotations)
+        .build()?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let function = crate::place::global_symbol(&db, file, "pick")
+        .place
+        .expect_type()
+        .expect_function_literal();
+    assert_eq!(
+        check_overload_body(&db, function, 0).unwrap_err(),
+        BodyDomainError::Unsupported
+    );
+    Ok(())
+}
+
+#[test]
+fn external_generic_body_domains_decline_foreign_aliases() -> anyhow::Result<()> {
+    for (declaration, unsupported) in [("Alias: TypeAlias = str", true), ("Alias: object", false)] {
+        let db = TestDbBuilder::new()
+            .with_file(
+                "/src/main.py",
+                "def pick(value):\n    Alias = str\n    return value\n",
+            )
+            .with_file(
+                "/src/contracts.pyi",
+                &indoc::formatdoc! {"
+                from typing import overload, TypeAlias
+                {declaration}
+                @overload
+                def pick(value: str) -> str: ...
+                @overload
+                def pick(value: int) -> int: ...
+                def pick[Impl](value: Impl) -> Impl: ...
+            "},
+            )
+            .with_source_provider(ExternalSource::Annotation)
+            .build()?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let function = crate::place::global_symbol(&db, file, "pick")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        let result = check_overload_body(&db, function, 0);
+        if unsupported {
+            assert_eq!(result.unwrap_err(), BodyDomainError::Unsupported);
+        } else {
+            assert!(result.unwrap().is_empty());
+        }
+    }
     Ok(())
 }
 

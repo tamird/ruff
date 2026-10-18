@@ -2569,6 +2569,10 @@ impl<'db> ReachabilityEvaluationCache<'db> {
         self
     }
 
+    pub(crate) fn body_domain(&self) -> Option<FunctionBodyDomain<'db>> {
+        self.body_domain
+    }
+
     /// Evaluates `id`, reusing a cached result when possible.
     ///
     /// Trivial constraint ids return immediately and are not stored. For interior nodes, the

@@ -786,6 +786,12 @@ pub struct Signature<'db> {
     pub(crate) return_ty: Type<'db>,
 }
 
+/// An implementation viewed under a rigid overload, with its input-inferred substitution.
+pub(crate) struct PreparedOverloadImplementation<'db> {
+    pub(crate) signature: Signature<'db>,
+    pub(crate) specialization: Option<Specialization<'db>>,
+}
+
 /// Signature data needed only for overload diagnostics, receiver binding, or `ParamSpec` values.
 #[derive(Clone, Debug, get_size2::GetSize, PartialEq, Eq, Hash, salsa::SalsaValue)]
 struct SignatureExtras<'db> {
@@ -2422,9 +2428,22 @@ impl<'db> Signature<'db> {
         env: &ProgramEnvironment<'db>,
         overload: &Self,
     ) -> Option<Self> {
+        self.prepare_overload_implementation(db, env, overload)
+            .map(|prepared| prepared.signature)
+    }
+
+    pub(crate) fn prepare_overload_implementation(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        overload: &Self,
+    ) -> Option<PreparedOverloadImplementation<'db>> {
         if self.is_non_generic() {
             if overload.is_non_generic() {
-                return Some(self.clone());
+                return Some(PreparedOverloadImplementation {
+                    signature: self.clone(),
+                    specialization: None,
+                });
             }
             let supports_type = |ty: Type<'db>| !ty.has_indeterminate_inference(db, env);
             return (self.supports_specialization(db, supports_type)
@@ -2437,7 +2456,10 @@ impl<'db> Signature<'db> {
                         .variables(db)
                         .all(|variable| !variable.typevar(db).is_self(db))
                 }))
-            .then(|| self.clone());
+            .then(|| PreparedOverloadImplementation {
+                signature: self.clone(),
+                specialization: None,
+            });
         }
         if !self.supports_overload_implementation_consistency(db, env)
             || !overload.supports_overload_implementation_consistency(db, env)
@@ -2534,7 +2556,10 @@ impl<'db> Signature<'db> {
             return None;
         }
         specialized.generic_context = None;
-        Some(specialized)
+        Some(PreparedOverloadImplementation {
+            signature: specialized,
+            specialization: Some(specialization),
+        })
     }
 
     /// Check parameter coverage after specializing implementation variables from overload inputs.
