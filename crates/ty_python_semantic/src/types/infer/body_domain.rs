@@ -655,7 +655,7 @@ fn supported_body(
                                     }
                                 }
                                 Some(ty) => {
-                                    if !callable_entry(db, ty) {
+                                    if !callable_entry(db, &model.program_environment(), ty) {
                                         return false;
                                     }
                                 }
@@ -743,13 +743,18 @@ fn supported_body(
             _ => false,
         })
     }
-    fn callable_entry(db: &dyn Db, ty: Type<'_>) -> bool {
+    fn callable_entry<'db>(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
         match ty.resolve_type_alias(db) {
             Type::Callable(_) | Type::ProtocolInstance(_) | Type::Dynamic(_) => true,
-            Type::Union(union) => union.elements(db).iter().all(|ty| callable_entry(db, *ty)),
+            Type::NominalInstance(_) => ty.try_upcast_to_callable(db, env).is_some(),
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .all(|ty| callable_entry(db, env, *ty)),
             _ => false,
         }
     }
+    let env = ProgramEnvironment::from_file(function.program_file(db));
     let index = semantic_index(db, function.program_file(db));
     let scope = function
         .literal(db)
@@ -771,7 +776,7 @@ fn supported_body(
         .filter_map(|parameter| {
             let definition = parameter.definition()?;
             let (_, ty) = entries.iter().find(|(entry, _)| *entry == definition)?;
-            if !callable_entry(db, *ty)
+            if !callable_entry(db, &env, *ty)
                 || use_def.definitions_with_usage().any(|(_, other, _)| {
                     other != definition && other.place(db) == definition.place(db)
                 })
@@ -996,14 +1001,16 @@ mod tests {
     fn body_domains_check_generic_collection_forwarding() -> anyhow::Result<()> {
         let mut db = setup_db();
         let source = indoc::indoc! {r#"
-            from typing import Callable, Literal, Protocol, overload
+            from typing import Literal, Protocol, overload
             type Input = list[str] | tuple[str, ...]
             type Tags[T: str] = list[T | Literal['manual']]
             class TagsRule[T: str](Protocol):
                 def __call__(self, *args, tags: Tags[T], **kwargs) -> object: ...
             class DataRule[D, T: str](Protocol):
                 def __call__(self, *args, data: D, tags: Tags[T], **kwargs) -> object: ...
-            finish: Callable[..., None]
+            class Finish:
+                def __call__(self, *, name: str) -> None: ...
+            finish: Finish
             @overload
             def f[D: Input, Over: str](rule: DataRule[D, Over], *, name: str, inner_data: D, tags: list[Over] = ...) -> None: ...
             @overload
@@ -1021,6 +1028,7 @@ mod tests {
             ("data=inner_data", "data=[]", true),
             ("data=inner_data", "data=42", true),
             ("append('manual')", "append(42)", true),
+            ("finish(name=name)", "finish(name=42)", true),
             ("data=inner_data", "data=inner_data", false),
         ] {
             db.write_file("/src/body.py", source.replace(before, after))?;
@@ -3362,6 +3370,57 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn body_domains_check_nominal_callable_parameters() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {"
+            from typing import overload
+            class Integer:
+                def __call__(self, value: int) -> int:
+                    return value
+            class String:
+                def __call__(self, value: int) -> str:
+                    return 'converted'
+            @overload
+            def f(callback: Integer) -> int: ...
+            @overload
+            def f(callback: String) -> str: ...
+            def f(callback: Integer | String) -> int | str:
+                return callback(1)
+        "};
+        for argument in ["1", "'wrong'", "1"] {
+            db.write_file(
+                "/src/body.py",
+                source.replace("callback(1)", &format!("callback({argument})")),
+            )?;
+            let f = function(&db);
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            if argument == "1" {
+                assert!(ordinary.is_empty(), "{ordinary:#?}");
+            }
+            for index in [0, 1, 0] {
+                let diagnostics = check_overload_body(&db, f, index).unwrap();
+                assert_eq!(
+                    diagnostics
+                        .diagnostics()
+                        .iter()
+                        .map(|diagnostic| diagnostic.id().as_str())
+                        .collect::<Vec<_>>(),
+                    (argument != "1")
+                        .then_some("invalid-argument-type")
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    "{argument}, domain {index}: {diagnostics:#?}"
+                );
+                assert_eq!(
+                    crate::types::check_types(&db, f.program_file(&db)),
+                    ordinary
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn body_domain_checks_local_callable_and_declines_captures() -> anyhow::Result<()> {
         let mut db = setup_db();
