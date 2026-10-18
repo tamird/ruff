@@ -286,10 +286,15 @@ fn external_overload_body_domains() -> anyhow::Result<()> {
     // An unsupported sibling must not conceal a completed inconsistent return check.
     db.write_file(
         "/src/contracts.pyi",
-        donor.replace(
-            "executable: bool, test: bool) -> str | int | bytes: ...\ndef pick",
-            "executable: bool = False, test: bool) -> str | int | bytes: ...\ndef pick",
-        ),
+        donor
+            .replace(
+                "from typing import Literal, overload",
+                "from typing import Any, Literal, overload",
+            )
+            .replace(
+                "executable: bool, test: bool) -> str | int | bytes: ...\ndef pick",
+                "executable: bool, test: bool) -> Any: ...\ndef pick",
+            ),
     )?;
     assert_eq!(
         check_overload_body(&db, function(&db), 3).unwrap_err(),
@@ -301,6 +306,94 @@ fn external_overload_body_domains() -> anyhow::Result<()> {
             .diagnostics()
             .len(),
         1
+    );
+    Ok(())
+}
+
+#[test]
+fn external_overload_body_domains_use_source_defaults() -> anyhow::Result<()> {
+    fn function(db: &TestDb) -> crate::types::FunctionType<'_> {
+        let file = db.program_file(system_path_to_file(db, "/src/main.py").unwrap());
+        crate::place::global_symbol(db, file, "pick")
+            .place
+            .expect_type()
+            .expect_function_literal()
+    }
+
+    let source = indoc::indoc! {r#"
+        from contracts import pick as public_pick
+        shared = 1
+        def pick(value=shared):
+            return value
+        ordinary = pick()
+        public_omitted = public_pick()
+        public_supplied = public_pick('ok')
+    "#};
+    let donor = indoc::indoc! {r#"
+        from typing import overload
+        @overload
+        def pick() -> int: ...
+        @overload
+        def pick(value: str) -> str: ...
+        def pick(value: int | str = ...) -> int | str: ...
+    "#};
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", source)
+        .with_file("/src/contracts.pyi", donor)
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    let source_file = system_path_to_file(&db, "/src/main.py")?;
+    // The donor can spell its optional default differently without changing the source value.
+    for default in ["...", "'other'", "..."] {
+        db.write_file(
+            "/src/contracts.pyi",
+            donor.replace("= ...)", &format!("= {default})")),
+        )?;
+        for index in [1, 0, 1] {
+            assert!(
+                check_overload_body(&db, function(&db), index)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(db.check_file(source_file).is_empty());
+        }
+        let file = db.program_file(source_file);
+        for (name, expected) in [
+            ("ordinary", "int | str"),
+            ("public_omitted", "int"),
+            ("public_supplied", "str"),
+        ] {
+            let ty = crate::place::global_symbol(&db, file, name)
+                .place
+                .expect_type();
+            assert_eq!(
+                ty.display(&db, &ProgramEnvironment::from_file(file))
+                    .to_string(),
+                expected
+            );
+        }
+    }
+    // Only the omitted domain observes a change to the original shared default.
+    db.write_file(
+        "/src/main.py",
+        source.replace("shared = 1", "shared = 'wrong'"),
+    )?;
+    assert!(db.check_file(source_file).is_empty());
+    assert!(
+        check_overload_body(&db, function(&db), 1)
+            .unwrap()
+            .is_empty()
+    );
+    let diagnostics = check_overload_body(&db, function(&db), 0)
+        .unwrap()
+        .into_diagnostics();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+    db.write_file("/src/main.py", source)?;
+    assert!(
+        check_overload_body(&db, function(&db), 0)
+            .unwrap()
+            .is_empty()
     );
     Ok(())
 }

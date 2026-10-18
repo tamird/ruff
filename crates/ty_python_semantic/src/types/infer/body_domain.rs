@@ -1,9 +1,10 @@
 //! Opt-in checking of a named function body under one declared overload.
 //!
-//! Domains are limited to required nongeneric parameters, straight-line bodies, and return trees
+//! Domains are limited to fixed nongeneric parameters, straight-line bodies, and return trees
 //! guarded by Boolean parameters. Unsupported syntax must be rejected before inference: general
 //! narrowing, capture, and collection queries do not yet carry a body domain.
 
+use itertools::Itertools;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
 use ty_python_core::Statement;
@@ -19,12 +20,16 @@ use super::{
     infer_expression_types, infer_scope_region, infer_statement_region,
     infer_statement_with_body_domain,
 };
+use crate::types::call::Argument;
+use crate::types::constraints::ConstraintSetBuilder;
 use crate::types::function::OverloadLiteral;
 use crate::types::signatures::{
     ParameterConsistency, ReturnCallableTypeVarScope, ReturnTypeConsistency,
 };
 use crate::types::string_annotation::SourceAnnotation;
-use crate::types::{ParameterKind, Type, TypeCheckDiagnostics};
+use crate::types::{
+    CallArguments, ParameterKind, Signature, Type, TypeCheckDiagnostics, UnionType,
+};
 use crate::{Db, ProgramEnvironment};
 
 /// Why a declared overload cannot be used to check its implementation body.
@@ -41,8 +46,10 @@ pub enum BodyDomainError {
 /// This is additional checking, not a replacement for ordinary function or overload checking.
 /// It preserves the public callable type. A source function may adopt an entire signature from
 /// an external declaration; in that case the overload index refers to that declaration's family.
-/// Only fixed required nongeneric parameters, simple straight-line bodies, and Boolean-parameter
-/// return trees are supported. An unsupported domain never means success.
+/// Only fixed nongeneric parameters, simple straight-line bodies, and Boolean-parameter return
+/// trees are supported. Supplied required inputs exclude source defaults; omitted inputs retain
+/// their ordinary source default types. Optional positional-only domains remain unsupported because
+/// their omitted inputs can be correlated. An unsupported domain never means success.
 pub fn check_overload_body<'db>(
     db: &'db dyn Db,
     function: FunctionType<'db>,
@@ -222,10 +229,9 @@ fn prepare_body_domain<'db>(
             && Type::single_callable(db, signature.clone()).is_fully_static(db, &env)
             && !signature.return_ty.has_indeterminate_inference(db, &env)
             && signature.parameters().iter().all(|parameter| {
-                !parameter.has_default()
-                    && !parameter
-                        .annotated_type()
-                        .has_indeterminate_inference(db, &env)
+                !parameter
+                    .annotated_type()
+                    .has_indeterminate_inference(db, &env)
                     && matches!(
                         parameter.kind(),
                         ParameterKind::PositionalOnly {
@@ -242,6 +248,13 @@ fn prepare_body_domain<'db>(
             })
     };
     if !supported_signature(&implementation_signature) || !supported_signature(&overload_signature)
+    {
+        return Err(BodyDomainError::Unsupported);
+    }
+    if overload_signature
+        .parameters()
+        .iter()
+        .any(|parameter| parameter.is_positional_only() && parameter.has_default())
     {
         return Err(BodyDomainError::Unsupported);
     }
@@ -268,27 +281,13 @@ fn prepare_body_domain<'db>(
     ) {
         return Err(BodyDomainError::Inconsistent);
     }
-    // With identical required slot shapes, the canonical coverage comparison establishes an
-    // unambiguous one-to-one entry projection. Other call shapes need binder-owned projection.
-    let source_parameters = implementation_signature.parameters();
-    let domain_parameters = overload_signature.parameters();
-    if source_parameters.len() != domain_parameters.len() {
-        return Err(BodyDomainError::Unsupported);
-    }
-    let parameters = source_parameters
-        .iter()
-        .zip(domain_parameters.iter())
-        .map(|(source, domain)| {
-            if source.kind() != domain.kind() {
-                return Err(BodyDomainError::Unsupported);
-            }
-            let definition = source.definition().ok_or(BodyDomainError::Unsupported)?;
-            if definition.scope(db) != implementation.body_scope(db) {
-                return Err(BodyDomainError::Unsupported);
-            }
-            Ok((definition, domain.annotated_type()))
-        })
-        .collect::<Result<Box<[_]>, _>>()?;
+    let parameters = project_body_parameters(
+        db,
+        &env,
+        implementation.body_scope(db),
+        &implementation_signature,
+        &overload_signature,
+    )?;
     Ok(FunctionBodyDomain::new(
         db,
         implementation,
@@ -296,6 +295,119 @@ fn prepare_body_domain<'db>(
         parameters,
         overload_signature.return_ty,
     ))
+}
+
+/// Project a fixed call domain into source bindings using the ordinary argument matcher.
+fn project_body_parameters<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    scope: ScopeId<'db>,
+    implementation: &Signature<'db>,
+    overload: &Signature<'db>,
+) -> Result<Box<[(Definition<'db>, Type<'db>)]>, BodyDomainError> {
+    let bind = |keywords: bool| {
+        let arguments: Option<CallArguments<'_, 'db>> = overload
+            .parameters()
+            .iter()
+            .map(|parameter| {
+                let argument = match parameter.kind() {
+                    ParameterKind::PositionalOnly {
+                        name: _,
+                        default_type: _,
+                    } => Argument::Positional,
+                    ParameterKind::PositionalOrKeyword {
+                        name,
+                        default_type: _,
+                    } => {
+                        if keywords {
+                            Argument::Keyword(name.as_str())
+                        } else {
+                            Argument::Positional
+                        }
+                    }
+                    ParameterKind::KeywordOnly {
+                        name,
+                        default_type: _,
+                    } => Argument::Keyword(name.as_str()),
+                    ParameterKind::Variadic { name: _ } => return None,
+                    ParameterKind::KeywordVariadic { name: _ } => return None,
+                };
+                Some((argument, Some(parameter.annotated_type())))
+            })
+            .collect();
+        let arguments = arguments.ok_or(BodyDomainError::Unsupported)?;
+        let constraints = ConstraintSetBuilder::new();
+        let bindings = Type::single_callable(db, implementation.clone())
+            .bindings(db, env)
+            .match_parameters(db, env, &arguments)
+            .check_types(
+                db,
+                env,
+                &constraints,
+                &arguments,
+                TypeContext::default(),
+                &[],
+            )
+            .map_err(|_| BodyDomainError::Unsupported)?;
+        let callable = bindings
+            .iter_flat()
+            .exactly_one()
+            .map_err(|_| BodyDomainError::Unsupported)?;
+        let [binding] = callable.overloads() else {
+            return Err(BodyDomainError::Unsupported);
+        };
+        let mapping = (0..overload.parameters().len())
+            .map(|index| {
+                let matched = binding.matched_argument_for_call_argument(false, index)?;
+                let [parameter] = matched.parameters.as_slice() else {
+                    return None;
+                };
+                Some(parameter.index)
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(BodyDomainError::Unsupported)?;
+        Ok((mapping, binding.parameter_types().to_vec()))
+    };
+    let (positional, supplied) = bind(false)?;
+    let (keywords, _) = bind(true)?;
+    // A positional prefix and a named argument bind independently. Agreement at both endpoints
+    // establishes the same source ownership for every mixed call mode. Keep this projection
+    // invariant explicit even after the full signature coverage check.
+    if positional != keywords {
+        return Err(BodyDomainError::Unsupported);
+    }
+    let mut may_be_omitted = vec![true; implementation.parameters().len()];
+    for (parameter, index) in overload.parameters().iter().zip(positional) {
+        may_be_omitted[index] = parameter.has_default();
+    }
+    implementation
+        .parameters()
+        .iter()
+        .zip_eq(supplied)
+        .zip_eq(may_be_omitted)
+        .map(|((parameter, supplied), omitted)| {
+            let definition = parameter.definition().ok_or(BodyDomainError::Unsupported)?;
+            if definition.scope(db) != scope {
+                return Err(BodyDomainError::Unsupported);
+            }
+            let entry = if omitted {
+                // This is the original source default, inferred once in its ordinary definition
+                // context. Donor defaults only describe optionality; they are not runtime values.
+                let default = parameter
+                    .default_type(db)
+                    .ok_or(BodyDomainError::Unsupported)?;
+                supplied.map_or(default, |supplied| {
+                    UnionType::from_two_elements(db, env, supplied, default)
+                })
+            } else {
+                supplied.ok_or(BodyDomainError::Unsupported)?
+            };
+            if !entry.is_fully_static(db, env) || entry.has_indeterminate_inference(db, env) {
+                return Err(BodyDomainError::Unsupported);
+            }
+            Ok((definition, entry))
+        })
+        .collect()
 }
 
 fn supported_body(
@@ -537,6 +649,254 @@ mod tests {
             |domain| infer_body_scope(db, domain),
         );
         inference.expression_type(value)
+    }
+
+    #[test]
+    fn body_domains_project_required_and_omitted_arguments() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for positional_only in [false, true] {
+            let separator = if positional_only { ", /" } else { "" };
+            db.write_file(
+                "/src/body.py",
+                indoc::formatdoc! {"
+                from typing import overload
+                @overload
+                def f() -> int: ...
+                @overload
+                def f(value: str{separator}) -> str: ...
+                def f(value: int | str = 1{separator}) -> int | str:
+                    copied = value
+                    return copied
+                omitted = f()
+                supplied = f('ok')
+            "},
+            )?;
+            let f = function(&db);
+            let file = f.program_file(&db);
+            let signature = f.last_definition_signature(&db).clone();
+            let default = signature.parameters()[0].default_type(&db).unwrap();
+            for index in [0, 1, 0] {
+                let domain = prepare_body_domain(&db, f, index).unwrap();
+                let expected = if index == 0 {
+                    default
+                } else {
+                    crate::types::KnownClass::Str.to_instance(&db, &db.program_environment())
+                };
+                assert_eq!(returned_type(&db, f, Some(domain)), expected);
+                assert!(check_overload_body(&db, f, index).unwrap().is_empty());
+                assert!(crate::types::check_types(&db, file).is_empty());
+                assert_eq!(f.last_definition_signature(&db), &signature);
+                for (name, expected) in [("omitted", "int"), ("supplied", "str")] {
+                    let ty = crate::place::global_symbol(&db, file, name)
+                        .place
+                        .expect_type();
+                    assert_eq!(
+                        ty.display(&db, &db.program_environment()).to_string(),
+                        expected
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_include_source_default_for_optional_slots() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/body.py",
+            "
+            from typing import Literal, overload
+            @overload
+            def f(flag: Literal[False] = ...) -> str: ...
+            @overload
+            def f(flag: Literal[True]) -> int: ...
+            def f(flag: bool = True) -> int | str:
+                if flag:
+                    return 1
+                return 'no'
+        ",
+        )?;
+        let f = function(&db);
+        assert!(crate::types::check_types(&db, f.program_file(&db)).is_empty());
+        assert!(check_overload_body(&db, f, 1).unwrap().is_empty());
+        let diagnostics = check_overload_body(&db, f, 0).unwrap().into_diagnostics();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_project_reordered_keyword_slots() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/body.py",
+            "
+            from typing import Literal, overload
+            @overload
+            def f() -> int: ...
+            @overload
+            def f(*, value: str, flag: Literal[False] = ...) -> str: ...
+            def f(*, flag: bool = False, value: int | str = 1) -> int | str:
+                if flag:
+                    return 1
+                return value
+        ",
+        )?;
+        let f = function(&db);
+        for index in [1, 0, 1] {
+            let diagnostics = check_overload_body(&db, f, index).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        }
+        assert!(crate::types::check_types(&db, f.program_file(&db)).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_keep_shared_default_types() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import overload
+            shared: list[int] = [1]
+            @overload
+            def f() -> list[str]: ...
+            @overload
+            def f(value: list[str]) -> list[str]: ...
+            def f(value: list[int] | list[str] = shared) -> list[int] | list[str]:
+                return value
+        "#};
+        db.write_file("/src/body.py", source)?;
+        let f = function(&db);
+        let domain = prepare_body_domain(&db, f, 0).unwrap();
+        let shared = crate::place::global_symbol(&db, f.program_file(&db), "shared")
+            .place
+            .expect_type();
+        assert_eq!(returned_type(&db, f, Some(domain)), shared);
+        assert!(check_overload_body(&db, f, 1).unwrap().is_empty());
+        let diagnostics = check_overload_body(&db, f, 0).unwrap().into_diagnostics();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+        db.write_file(
+            "/src/body.py",
+            source.replace("shared: list[int] = [1]", "shared: list[str] = ['ok']"),
+        )?;
+        assert!(
+            check_overload_body(&db, function(&db), 0)
+                .unwrap()
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_decline_correlated_omission_and_call_modes() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for (source, error) in [
+            (
+                indoc::indoc! {r#"
+            from typing import Literal, overload
+            @overload
+            def f(a: Literal[True] = ..., b: str = ..., /) -> int: ...
+            @overload
+            def f(a: Literal[False], b: int, /) -> int: ...
+            def f(a: bool = False, b: int | str = 0, /) -> int | str:
+                if a:
+                    return 1
+                return b
+        "#},
+                BodyDomainError::Unsupported,
+            ),
+            (
+                indoc::indoc! {r#"
+            from typing import overload
+            @overload
+            def f(a: int) -> int: ...
+            @overload
+            def f(a: str) -> str: ...
+            def f(b: int | str = 0, a: int | str = 0) -> int | str:
+                return a
+        "#},
+                BodyDomainError::Inconsistent,
+            ),
+        ] {
+            db.write_file("/src/body.py", source)?;
+            assert_eq!(
+                check_overload_body(&db, function(&db), 0).unwrap_err(),
+                error
+            );
+        }
+        // Signature coverage already declines this family. Projection must also avoid selecting
+        // just the positional call's bindings if coverage later admits both calling conventions.
+        let f = function(&db);
+        let (overloads, implementation) = overload_family(&db, f).unwrap();
+        assert_eq!(
+            project_body_parameters(
+                &db,
+                &db.program_environment(),
+                implementation.body_scope(&db),
+                &implementation.raw_signature(&db, ReturnCallableTypeVarScope::Lexical),
+                &overloads[0].raw_signature(&db, ReturnCallableTypeVarScope::Lexical),
+            )
+            .unwrap_err(),
+            BodyDomainError::Unsupported,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn body_domains_do_not_prove_gradual_defaults() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for definition in [
+            "shared: Any = None",
+            "def shared_value(): ...\nshared = shared_value()",
+            "shared = []",
+        ] {
+            db.write_file(
+                "/src/body.py",
+                indoc::formatdoc! {"
+                from typing import Any, overload
+                {definition}
+                @overload
+                def f() -> str: ...
+                @overload
+                def f(value: str) -> str: ...
+                def f(value: object = shared) -> object:
+                    return value
+            "},
+            )?;
+            assert!(
+                check_overload_body(&db, function(&db), 1)
+                    .unwrap()
+                    .is_empty()
+            );
+            // The body domain never turns an unresolved default into its promised return type.
+            assert_eq!(
+                check_overload_body(&db, function(&db), 0).unwrap_err(),
+                BodyDomainError::Unsupported
+            );
+        }
+        db.write_dedented(
+            "/src/body.py",
+            "
+            from typing import overload
+            @overload
+            def f(value: int) -> int: ...
+            @overload
+            def f(value: str) -> str: ...
+            def f(value: int | str = None) -> int | str:
+                return value
+        ",
+        )?;
+        let f = function(&db);
+        let diagnostics = crate::types::check_types(&db, f.program_file(&db));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-parameter-default");
+        let _ = check_overload_body(&db, f, 0).unwrap();
+        assert_eq!(
+            crate::types::check_types(&db, f.program_file(&db)),
+            diagnostics
+        );
+        Ok(())
     }
 
     #[test]
@@ -994,11 +1354,6 @@ mod tests {
         let mut db = setup_db();
         for (parameter, body, expected) in [
             ("value: int", "return value", BodyDomainError::Inconsistent),
-            (
-                "value: int | str = 0",
-                "return value",
-                BodyDomainError::Unsupported,
-            ),
             (
                 "value: int | str",
                 "return [value]",
