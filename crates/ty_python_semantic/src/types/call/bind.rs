@@ -57,7 +57,7 @@ use crate::types::function::{
 };
 use crate::types::generics::{
     GenericContext, Specialization, SpecializationBuilder, SpecializationError, TypeVarInference,
-    TypeVarProjection,
+    TypeVarProjection, walk_specialization_types,
 };
 use crate::types::infer::original_class_type;
 use crate::types::known_instance::{
@@ -8162,7 +8162,21 @@ fn inferable_typevar_occurrences<'db>(
             }
 
             self.stack.borrow_mut().push(ty);
-            walk_non_atomic_type(db, non_atomic_type, self);
+            // Stored alias arguments participate in call inference even when their lazy
+            // definitions are not visited. Skipping them can bypass contextual replay.
+            match ty {
+                Type::TypeAlias(alias) => {
+                    if let Some(arguments) = alias.specialization(db) {
+                        walk_specialization_types(db, arguments, self);
+                    }
+                }
+                Type::Recursive(recursive) => {
+                    if let Some(arguments) = recursive.arguments(db) {
+                        walk_specialization_types(db, arguments, self);
+                    }
+                }
+                _ => walk_non_atomic_type(db, non_atomic_type, self),
+            }
             self.stack.borrow_mut().pop();
         }
     }

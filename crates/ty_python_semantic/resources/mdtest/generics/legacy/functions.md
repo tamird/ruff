@@ -3704,6 +3704,37 @@ def supplied(narrow: list[Literal["foo"]], wide: list[str]):
     apply(exact, wide)  # error: [invalid-argument-type]
 ```
 
+## Contextual inference through alias arguments
+
+An alias parameter participates in contextual inference like its underlying collection type. The
+call widens unconstrained elements and preserves literals required by a callback.
+
+```py
+from typing import Callable, Literal, TypeVar
+from typing_extensions import TypeAliasType
+
+T = TypeVar("T")
+Values = TypeAliasType("Values", list[T], type_params=(T,))
+
+def direct(values: list[T]) -> list[T]:
+    return values
+
+def aliased(values: Values[T]) -> list[T]:
+    return values
+
+def apply(values: Values[T], callback: Callable[[T], None]) -> list[T]:
+    callback(values[0])
+    return values
+
+def accepts_one(value: Literal[1]) -> None:
+    pass
+
+reveal_type(direct([1]))  # revealed: list[int]
+reveal_type(aliased([1]))  # revealed: list[int]
+reveal_type(apply([1], accepts_one))  # revealed: list[Literal[1]]
+apply([2], accepts_one)  # error: [invalid-argument-type]
+```
+
 ## Promotion respects inferred upper bounds
 
 An inferred callback restriction also limits promotion for legacy type variables.
