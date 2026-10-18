@@ -306,7 +306,7 @@ fn supplied_readonly_fields_preserve_type_variables() -> anyhow::Result<()> {
             "/src/main.py",
             r#"
 from schema import Field
-from typing import Callable, Literal, TypeVar, assert_type
+from typing import Any, Callable, Literal, Protocol, TypeVar, assert_type
 
 def scalar[T](value: T) -> Field[T]:
     raise NotImplementedError
@@ -332,9 +332,57 @@ def recursive_member(value: Field[tuple[Recursive, T]]) -> None: ...
 def identity_after_recursive(value: Recursive, item: T) -> T:
     return item
 
-def check_recursive(value: Recursive, integer: int, text: str) -> None:
+def read(value: Field[T]) -> T:
+    return value.value
+
+def read_modern[T](value: Field[T]) -> T:
+    return value.value
+
+def read_nested(value: Field[tuple[Recursive, T]]) -> T:
+    return value.value[1]
+
+def read_nested_modern[T](value: Field[tuple[Recursive, T]]) -> T:
+    return value.value[1]
+
+class NamedField[T](Protocol):
+    @property
+    def value(self) -> T: ...
+
+def read_named[T](value: NamedField[T]) -> T:
+    return value.value
+
+def read_integer[T: int](value: Field[T]) -> T:
+    return value.value
+
+def check_recursive(
+    value: Recursive,
+    integer: int,
+    text: str,
+    integer_field: Field[int],
+    text_field: Field[str],
+    nested_integer: Field[tuple[Recursive, int]],
+    nested_text: Field[tuple[Recursive, str]],
+    gradual_field: Field[Any],
+) -> None:
     assert_type(identity_after_recursive(value, integer), int)
     assert_type(identity_after_recursive(value, text), str)
+    assert_type(read(integer_field), int)
+    assert_type(read(text_field), str)
+    assert_type(read_modern(integer_field), int)
+    assert_type(read_modern(text_field), str)
+    assert_type(read_nested(nested_integer), int)
+    assert_type(read_nested(nested_text), str)
+    assert_type(read_nested_modern(nested_integer), int)
+    assert_type(read_nested_modern(nested_text), str)
+    assert_type(read_named(integer_field), int)
+    assert_type(read_named(text_field), str)
+    assert_type(read_integer(integer_field), int)
+    assert_type(read(gradual_field), Any)
+    assert_type(read_modern(gradual_field), Any)
+
+def unknown(): ...
+
+unknown_result = read(scalar(unknown()))
 "#,
         )
         .build()?;
@@ -350,10 +398,24 @@ def check_recursive(value: Recursive, integer: int, text: str) -> None:
     let signature = member.last_definition_signature(&db);
     let context = signature.generic_context.context("missing legacy binder")?;
     assert_eq!(context.variables(&db).len(), 1);
+    let unknown = crate::place::global_symbol(&db, db.program_file(file), "unknown_result")
+        .place
+        .expect_type();
+    assert_eq!(unknown, Type::unknown());
     let source = source_text(&db, file).to_string();
     db.write_file(
         "/src/main.py",
-        format!("{source}\nvalues.append(42)\naccepts(\"text\")(scalar(42))\n"),
+        format!(
+            r#"{source}
+values.append(42)
+accepts("text")(scalar(42))
+
+def reject(integer: Field[int], text: Field[str], nested: Field[tuple[Recursive, int]]) -> None:
+    bad: str = read(integer)
+    nested_bad: str = read_nested(nested)
+    read_integer(text)
+"#,
+        ),
     )?;
     let diagnostics = db.check_file(file);
     assert_eq!(
@@ -361,7 +423,13 @@ def check_recursive(value: Recursive, integer: int, text: str) -> None:
             .iter()
             .map(|diagnostic| diagnostic.id().as_str())
             .collect::<Vec<_>>(),
-        ["invalid-argument-type", "invalid-argument-type"],
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-assignment",
+            "invalid-assignment",
+            "invalid-argument-type",
+        ],
         "{diagnostics:#?}",
     );
     Ok(())

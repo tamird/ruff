@@ -4652,7 +4652,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
 
                 // Converting the actual protocol to its nominal origin makes the reversed
                 // comparison impossible: a protocol cannot be assignable to a nominal class.
-                if matches!(formal, Type::ProtocolInstance(_)) && !relation_polarity.is_covariant()
+                // Synthesized protocols have no nominal origin, so their members must also
+                // contribute structural constraints in covariant positions.
+                if matches!(formal, Type::ProtocolInstance(_))
+                    && (!relation_polarity.is_covariant()
+                        || actual_protocol.class_origin(db).is_none())
                 {
                     let when = self.constraint_for_relation(formal, actual, relation_polarity);
                     return self.infer_from_constraint_set(when);
