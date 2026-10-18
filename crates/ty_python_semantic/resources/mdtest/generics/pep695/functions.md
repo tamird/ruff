@@ -4313,5 +4313,60 @@ values(exact_value, {1: "foo"})  # error: [invalid-argument-type]
 keys(exact_key, {"foo": "wrong"})  # error: [invalid-argument-type]
 ```
 
+## Promotion respects inferred upper bounds
+
+A solution that satisfies the arguments can become invalid when widened for a mutable return value.
+Callback parameters and contravariant generic arguments can require a literal even when the type
+variable has no declared literal bound.
+
+```py
+from collections.abc import Callable
+from typing import Any, Literal
+from ty_extensions._internal import Unknown
+
+def make_list[T](value: T, accept: Callable[[T], None]) -> list[T]:
+    return [value]
+
+def accepts_one(value: Literal[1]) -> None:
+    pass
+
+def accepts_int(value: int) -> None:
+    pass
+
+result = make_list(1, accepts_one)
+reveal_type(result)  # revealed: list[Literal[1]]
+reveal_type(make_list(1, accepts_one))  # revealed: list[Literal[1]]
+reveal_type(make_list(1, accepts_int))  # revealed: list[int]
+make_list(2, accepts_one)  # error: [invalid-argument-type]
+
+def accepts_either(value: Literal[1, 2]) -> None:
+    pass
+
+reveal_type(make_list(1, accepts_either))  # revealed: list[Literal[1]]
+make_list(3, accepts_either)  # error: [invalid-argument-type]
+
+class Consumer[T]:
+    def accept(self, value: T) -> None:
+        pass
+
+def with_consumer[T](value: T, accept: Consumer[T]) -> list[T]:
+    return [value]
+
+def consumers(exact: Consumer[Literal[1]], broad: Consumer[int]):
+    reveal_type(with_consumer(1, exact))  # revealed: list[Literal[1]]
+    reveal_type(with_consumer(1, broad))  # revealed: list[int]
+    with_consumer(2, exact)  # error: [invalid-argument-type]
+
+def accepts_any(value: Any) -> None:
+    pass
+
+def accepts_unknown(value: Unknown) -> None:
+    pass
+
+def gradual(value: Any, unknown: Unknown):
+    reveal_type(make_list(value, accepts_any))  # revealed: list[Any]
+    reveal_type(make_list(unknown, accepts_unknown))  # revealed: list[Unknown]
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

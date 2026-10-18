@@ -3464,6 +3464,16 @@ impl<'db> CandidateTypeVarSolution<'db> {
             .any(|ty| ty.has_provisional_marker(db, env))
     }
 
+    /// Whether a proposed solution satisfies every accumulated upper-bound clause.
+    pub(crate) fn satisfies_upper_bound(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+    ) -> bool {
+        self.upper.is_satisfied_by(db, env, ty)
+    }
+
     /// Returns one effective upper bound without expanding factored intersections.
     fn as_single_upper_bound(
         &self,

@@ -3703,3 +3703,28 @@ def supplied(narrow: list[Literal["foo"]], wide: list[str]):
     apply(exact, narrow)  # no diagnostic
     apply(exact, wide)  # error: [invalid-argument-type]
 ```
+
+## Promotion respects inferred upper bounds
+
+An inferred callback restriction also limits promotion for legacy type variables.
+
+```py
+from typing import Callable, Literal, TypeVar
+
+T = TypeVar("T")
+
+def make_list(value: T, accept: Callable[[T], None]) -> list[T]:
+    return [value]
+
+def accepts_one(value: Literal[1]) -> None:
+    pass
+
+def accepts_int(value: int) -> None:
+    pass
+
+result = make_list(1, accepts_one)
+reveal_type(result)  # revealed: list[Literal[1]]
+reveal_type(make_list(1, accepts_one))  # revealed: list[Literal[1]]
+reveal_type(make_list(1, accepts_int))  # revealed: list[int]
+make_list(2, accepts_one)  # error: [invalid-argument-type]
+```

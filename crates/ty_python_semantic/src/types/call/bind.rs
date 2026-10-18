@@ -6811,6 +6811,11 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             Some(
                 CandidateSolutions::default_solve(db, env, constraints, bounds).map(|solution| {
                     let promoted = solution.promote(db, env);
+                    // Promotion must also respect restrictions inferred from arguments,
+                    // such as a callback accepting only a particular literal value.
+                    if promoted != solution && !bounds.satisfies_upper_bound(db, env, promoted) {
+                        return solution;
+                    }
 
                     // If the TypeVar has an upper bound, only use the promoted type if it
                     // still satisfies the bound.
