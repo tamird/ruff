@@ -41,12 +41,9 @@ use crate::{
         infer_definition_types,
         list_members::all_members,
         relation::TypeRelation,
-        signatures::{Parameter, Parameters, ReturnCallableTypeVarScope},
+        signatures::{Parameter, Parameters, ReturnCallableTypeVarScope, keyword_arguments_type},
         tuple::{TupleSpec, TupleSpecBuilder, TupleType},
-        typed_dict::{
-            TypedDictFieldBuilder, TypedDictOpenness, TypedDictSchema, TypedDictType,
-            extract_unpacked_typed_dict_keys_from_kwargs_annotation,
-        },
+        typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation,
         typevar::TypeVarSet,
         visitor::non_any_dynamic_content,
     },
@@ -61,7 +58,7 @@ use ruff_python_edits::unwrapped_call_argument;
 use ty_module_resolver::{ImportingFile, ModuleName, resolve_module};
 use ty_python_core::{
     Truthiness, UseDefMap,
-    definition::{Definition, DefinitionKind},
+    definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind},
     place::PlaceExpr,
     place_table,
     predicate::{Predicate, PredicateNode},
@@ -1626,12 +1623,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.add_declaration_with_binding(
                 parameter.into(),
                 definition,
-                &if self.context.body_domain.is_some() {
+                &if self.context.body_domain.is_some()
+                    && !matches!(
+                        definition.kind(self.db()),
+                        DefinitionKind::Parameter(
+                            ParameterDefinitionNodeKind::VariadicKeywordParameter(_)
+                        )
+                    )
+                {
                     DeclaredAndInferredType::MightBeDifferent {
                         declared_ty: TypeAndQualifiers::declared(ty),
                         inferred_ty: entry_ty,
                     }
                 } else {
+                    // A fresh kwargs dictionary is validated through parameter coverage, not
+                    // invariant assignment between aliased dictionaries. Retain its source
+                    // declaration; the domain supplies its initial binding at insertion.
                     DeclaredAndInferredType::are_the_same_type(ty)
                 },
             );
@@ -1779,8 +1786,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 )
             });
 
-            self.add_binding(parameter.into(), definition)
-                .insert(self, inferred_ty);
+            self.add_parameter_binding(parameter, definition, inferred_ty);
         }
     }
 
@@ -1877,47 +1883,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Option<Type<'db>> {
         let db = self.db();
         let parameters = self.contextual_lambda_parameters(lambda)?;
-        let env = self.program_environment();
-        let mut fields = TypedDictSchema::default();
-        let mut extra_items = None;
-        for parameter in parameters
-            .iter()
-            .filter(|parameter| parameter.source_parameter_index() == Some(index as usize))
-        {
-            let ty = parameter.annotated_type();
-            if ty.has_provisional_marker(db, env) {
-                return None;
-            }
-            if let Some(name) = parameter.keyword_name() {
-                fields.insert(
-                    name.clone(),
-                    TypedDictFieldBuilder::new(ty)
-                        .required(!parameter.has_default())
-                        .build(),
-                );
-            } else if parameter.is_keyword_variadic() {
-                extra_items = Some(ty);
-            } else {
-                return None;
-            }
-        }
-        if fields.is_empty()
-            && let Some(element_type) = extra_items
-        {
-            return Some(KnownClass::Dict.to_specialized_instance(
-                db,
-                env,
-                &[KnownClass::Str.to_instance(db, env), element_type],
-            ));
-        }
-        // An empty group in a complete signature represents closed, empty kwargs.
-        // An unavailable context retains its Unknown kwargs slot instead.
-        let openness = extra_items.map_or(TypedDictOpenness::Closed, |ty| {
-            TypedDictOpenness::extra(db, ty, false)
-        });
-        Some(Type::TypedDict(
-            TypedDictType::from_schema_items_with_openness(db, fields, openness),
-        ))
+        keyword_arguments_type(
+            db,
+            self.program_environment(),
+            parameters
+                .iter()
+                .filter(|parameter| parameter.source_parameter_index() == Some(index as usize)),
+        )
     }
 
     /// Returns the contextual parameter from the lambda's inferred callable, if available.

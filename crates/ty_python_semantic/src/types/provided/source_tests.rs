@@ -387,6 +387,67 @@ fn external_generic_body_domains_preserve_default_evidence() -> anyhow::Result<(
 }
 
 #[test]
+fn external_overload_body_domains_project_keyword_rows() -> anyhow::Result<()> {
+    let source = "def pick(**kwargs):\n    return kwargs\n";
+    let donor = indoc::indoc! {"
+        from typing import overload
+        from typing_extensions import NotRequired, TypedDict, Unpack
+        class First(TypedDict, closed=True):
+            value: int
+            note: NotRequired[str]
+        class Second(TypedDict, closed=True):
+            value: str
+        class Source(TypedDict, closed=True):
+            value: int | str
+            note: NotRequired[str]
+        @overload
+        def pick(**kwargs: Unpack[First]) -> First: ...
+        @overload
+        def pick(**kwargs: Unpack[Second]) -> Second: ...
+        def pick(**kwargs: Unpack[Source]) -> object: ...
+    "};
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", source)
+        .with_file("/src/contracts.pyi", donor)
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    let source_file = system_path_to_file(&db, "/src/main.py")?;
+    for result in ["kwargs", "42", "kwargs"] {
+        db.write_file(
+            "/src/main.py",
+            source.replace("return kwargs", &format!("return {result}")),
+        )?;
+        let file = db.program_file(source_file);
+        let function = crate::place::global_symbol(&db, file, "pick")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        let signature = function.last_definition_signature(&db).clone();
+        let ordinary = db.check_file(source_file);
+        for index in [0, 1, 0] {
+            let diagnostics = check_overload_body(&db, function, index)
+                .unwrap()
+                .into_diagnostics();
+            assert_eq!(
+                diagnostics.len(),
+                usize::from(result == "42"),
+                "{diagnostics:#?}"
+            );
+            for diagnostic in diagnostics {
+                assert_eq!(diagnostic.id().as_str(), "invalid-return-type");
+                assert_eq!(
+                    diagnostic.primary_annotation().unwrap().get_span().file(),
+                    &ruff_db::diagnostic::UnifiedFile::Ty(source_file)
+                );
+            }
+            assert_eq!(function.last_definition_signature(&db), &signature);
+            assert_eq!(db.check_file(source_file), ordinary);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn external_generic_body_domains_decline_detached_aliases() -> anyhow::Result<()> {
     let db = TestDbBuilder::new()
         .with_file("/src/main.py", "from typing import TypeAlias as TA\ndef pick(value):\n    Alias = str  # type: TA\n    return value\n")

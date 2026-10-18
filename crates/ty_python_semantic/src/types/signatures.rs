@@ -41,7 +41,10 @@ use crate::types::relation::{
     HasRelationToVisitor, IsDisjointVisitor, TypeRelation, TypeRelationChecker, TypeVarEvaluation,
 };
 use crate::types::tuple::{Tuple, TupleType, VariableSegment};
-use crate::types::typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation;
+use crate::types::typed_dict::{
+    TypedDictFieldBuilder, TypedDictOpenness, TypedDictSchema,
+    extract_unpacked_typed_dict_keys_from_kwargs_annotation,
+};
 use crate::types::typevar::{
     TypeVarDomain, TypeVarInstance, TypeVarSet, max_typevar_freshness_matching_generic_context,
 };
@@ -5512,6 +5515,55 @@ struct ParametersData<'db> {
     // TODO: use SmallVec here once invariance bug is fixed
     value: Box<[Parameter<'db>]>,
     kind: ParametersKind<'db>,
+}
+
+/// Reconstruct a local `**kwargs` value from the normalized parameters it receives.
+///
+/// Defaults describe optional keys here, not values inserted into the dictionary. An empty
+/// complete group is a closed, empty dictionary; unavailable input context is handled by callers.
+pub(crate) fn keyword_arguments_type<'a, 'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    parameters: impl IntoIterator<Item = &'a Parameter<'db>>,
+) -> Option<Type<'db>>
+where
+    'db: 'a,
+{
+    let mut fields = TypedDictSchema::default();
+    let mut extra_items = None;
+    for parameter in parameters {
+        let ty = parameter.annotated_type();
+        if ty.has_provisional_marker(db, env) {
+            return None;
+        }
+        if let Some(name) = parameter.keyword_name() {
+            fields.insert(
+                name.clone(),
+                TypedDictFieldBuilder::new(ty)
+                    .required(!parameter.has_default())
+                    .build(),
+            );
+        } else if parameter.is_keyword_variadic() {
+            extra_items = Some(ty);
+        } else {
+            return None;
+        }
+    }
+    if fields.is_empty()
+        && let Some(element_type) = extra_items
+    {
+        return Some(super::KnownClass::Dict.to_specialized_instance(
+            db,
+            env,
+            &[super::KnownClass::Str.to_instance(db, env), element_type],
+        ));
+    }
+    let openness = extra_items.map_or(TypedDictOpenness::Closed, |ty| {
+        TypedDictOpenness::extra(db, ty, false)
+    });
+    Some(Type::TypedDict(
+        TypedDictType::from_schema_items_with_openness(db, fields, openness),
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
