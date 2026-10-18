@@ -7658,7 +7658,7 @@ impl<'db> Type<'db> {
                             Parameters::standard([Parameter::positional_only(Some(
                                 Name::new_static("o"),
                             ))
-                            .with_annotated_type(Type::any())
+                            .with_annotated_type(Type::object())
                             .with_default_type(Type::bool_literal(false))]),
                             KnownClass::Bool.to_instance(db, env),
                         ),

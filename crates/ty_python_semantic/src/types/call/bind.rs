@@ -11185,6 +11185,27 @@ mod tests {
     use crate::types::generics::TypeVarInferenceSolutions;
 
     #[test]
+    fn bool_constructor_accepts_object() -> anyhow::Result<()> {
+        let db = setup_db();
+        let env = db.program_environment();
+        let bindings = KnownClass::Bool
+            .to_class_literal(&db, &env)
+            .bindings(&db, &env);
+        let callable = bindings
+            .single_element()
+            .ok_or_else(|| anyhow::anyhow!("expected one callable"))?;
+        let [binding] = callable.overloads.as_slice() else {
+            anyhow::bail!("expected one overload");
+        };
+        let parameters = binding.signature.parameters();
+        let [parameter] = parameters.iter().as_slice() else {
+            anyhow::bail!("expected one constructor parameter");
+        };
+        assert_eq!(parameter.annotated_type(), Type::object());
+        Ok(())
+    }
+
+    #[test]
     fn argument_context_keeps_concrete_union_arms() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented("/src/a.py", "def identity[T](value: T) -> T: ...")?;
