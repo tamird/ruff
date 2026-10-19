@@ -4692,6 +4692,58 @@ factory_object: FactoryObject = factory
 factory_module: FactoryModule = factory
 ```
 
+## Generic protocol inference from bounded type variables
+
+An outer type variable's members determine the type arguments of a protocol accepted by a generic
+function. Methods returning `Self` preserve the original type variable as their receiver.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from collections.abc import Callable, Iterable
+from typing import Protocol, Self
+
+class Keyed[K, V](Protocol):
+    def keys(self) -> Iterable[K]: ...
+    def __getitem__(self, key: K, /) -> V: ...
+
+def capture[K, V](value: Keyed[K, V]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def require_same_values[K, V](value: Keyed[K, V], values: list[V]) -> None: ...
+
+def bounded[T: dict[str, int]](value: T) -> None:
+    reveal_type(capture(value))  # revealed: tuple[str, int]
+    require_same_values(value, ["wrong"])  # error: [invalid-argument-type]
+
+def arguments[**P](callback: Callable[P, None], *args: P.args, **kwargs: P.kwargs) -> None:
+    reveal_type(dict(kwargs))  # revealed: dict[str, object]
+    reveal_type(capture(kwargs))  # revealed: tuple[str, object]
+
+class Clonable[T](Protocol):
+    def clone(self) -> T: ...
+
+class Parent:
+    def clone(self) -> Self:
+        return self
+
+def capture_clone[T](value: Clonable[T]) -> T:
+    return value.clone()
+
+def clone[S: Parent](value: S) -> S:
+    return capture_clone(value)  # no diagnostic
+
+class Widens:
+    def clone(self) -> "Widens":
+        return self
+
+def clone_widens[S: Widens](value: S) -> S:
+    return capture_clone(value)  # error: [invalid-return-type]
+```
+
 ## Generic protocol inference from module objects
 
 A module attribute can determine a protocol's type argument when the module itself is passed to a

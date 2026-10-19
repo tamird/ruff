@@ -4455,6 +4455,22 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 return self.infer_from_constraint_set(when);
             }
 
+            (Type::ProtocolInstance(protocol), Type::TypeVar(actual_typevar))
+                if polarity.is_covariant()
+                    && actual_typevar
+                        .typevar(db)
+                        .upper_bound(db, self.env)
+                        .is_some() =>
+            {
+                let when = protocol.when_constraint_set_satisfied_by_typevar(
+                    db,
+                    self.env,
+                    actual_typevar,
+                    self.constraints,
+                );
+                return self.infer_from_constraint_set(when);
+            }
+
             (Type::Intersection(formal_intersection), _) => {
                 // The actual type must be assignable to every (positive) element of the
                 // formal intersection, so we must infer type mappings for each of them. (The

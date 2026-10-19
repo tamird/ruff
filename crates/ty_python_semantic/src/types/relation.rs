@@ -2381,6 +2381,31 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                     self.with_recursion_guard(db, source, target, || {
                         self.check_callables_vs_callable(db, &callables, target_callable)
                     })
+                } else if self.relation.is_assignability()
+                    && matches!(
+                        bound_or_constraints,
+                        TypeVarBoundOrConstraints::UpperBound(_)
+                    )
+                    && let Type::ProtocolInstance(protocol) = target
+                    && target.references_typevar_through_aliases(
+                        db,
+                        env,
+                        bound_typevar.typevar(db).identity(db),
+                    )
+                {
+                    // The bound can satisfy the protocol on its own. If it cannot, matching the
+                    // original receiver may still bind `Self` to this type variable. Suppress
+                    // the failed bound's error context when trying that second proof.
+                    let through_bound = self.without_context_collection(|| {
+                        self.check_source_typevar_bounds(db, bound_or_constraints, target)
+                    });
+                    if through_bound.is_never_satisfied(db, env) {
+                        self.with_recursion_guard(db, source, target, || {
+                            self.check_type_satisfies_protocol(db, source, protocol)
+                        })
+                    } else {
+                        through_bound
+                    }
                 } else {
                     self.check_source_typevar_bounds(db, bound_or_constraints, target)
                 }
