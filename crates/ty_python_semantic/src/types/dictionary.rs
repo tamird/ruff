@@ -12,8 +12,10 @@ use crate::types::set_theoretic::UnionBuilder;
 use crate::types::typed_dict::{
     UnpackedTypedDict, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
 };
+use crate::types::typevar::ParamSpecAttrKind;
 use crate::types::{
-    KnownClass, MemberLookupPolicy, ProgramEnvironment, Truthiness, Type, UnionType,
+    BoundTypeVarInstance, KnownClass, MemberLookupPolicy, ProgramEnvironment, Truthiness, Type,
+    UnionType,
 };
 use crate::{Db, FxIndexMap};
 
@@ -320,6 +322,73 @@ pub enum DictionaryExtraItems<'db> {
     /// Values for additional keys. Every represented name is excluded; its entry records the
     /// applicable value restriction and whether a named value can supply it.
     Value(Type<'db>),
+    /// The dictionary contains exactly the keyword arguments of this `ParamSpec` component.
+    /// Named entries describe facts about those arguments. Operations that change the contents
+    /// discard the component identity.
+    ParamSpec(ParamSpecKeywords<'db>),
+}
+
+/// The keyword arguments captured by a `ParamSpec`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
+pub struct ParamSpecKeywords<'db>(BoundTypeVarInstance<'db>);
+
+impl<'db> ParamSpecKeywords<'db> {
+    fn from_type(db: &'db dyn Db, ty: Type<'db>) -> Option<Self> {
+        let Type::TypeVar(component) = ty else {
+            return None;
+        };
+        (component.paramspec_attr(db) == Some(ParamSpecAttrKind::Kwargs)).then_some(Self(component))
+    }
+}
+
+impl<'db> DictionaryExtraItems<'db> {
+    /// The type of one additional mapping value.
+    pub fn value_type(self) -> Option<Type<'db>> {
+        match self {
+            Self::Closed => None,
+            Self::Value(ty) => Some(ty),
+            Self::ParamSpec(_) => Some(Type::object()),
+        }
+    }
+
+    /// The type supplied while matching a keyword argument to a parameter. A `ParamSpec`
+    /// component must retain its identity here, just as it does for a direct `**kwargs` argument.
+    pub(super) fn argument_type(self) -> Option<Type<'db>> {
+        match self {
+            Self::ParamSpec(ParamSpecKeywords(component)) => Some(Type::TypeVar(component)),
+            _ => self.value_type(),
+        }
+    }
+
+    fn forget_paramspec(self) -> Self {
+        match self {
+            Self::ParamSpec(_) => Self::Value(Type::object()),
+            _ => self,
+        }
+    }
+
+    pub(super) fn combine(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        incoming: Self,
+        previous_empty: bool,
+        incoming_empty: bool,
+    ) -> Self {
+        if previous_empty {
+            return incoming;
+        }
+        if incoming_empty {
+            return self;
+        }
+        match (self.value_type(), incoming.value_type()) {
+            (None, None) => Self::Closed,
+            (Some(ty), None) | (None, Some(ty)) => Self::Value(ty),
+            (Some(left), Some(right)) => {
+                Self::Value(UnionType::from_two_elements(db, env, left, right))
+            }
+        }
+    }
 }
 
 impl<'db> DictionaryItems<'db> {
@@ -693,6 +762,7 @@ impl<'db> DictionaryItems<'db> {
             };
             // Repeated keys replace their values without changing insertion order.
             dictionary.first_entry.set(db, env, Some(&name), ty);
+            dictionary.extra_items = dictionary.extra_items.forget_paramspec();
             dictionary.items.insert(name, entry);
         }
         Ok(dictionary.finish())
@@ -791,7 +861,7 @@ impl<'db> DictionaryItems<'db> {
 /// An ordered overlay of mapping sources. The residual excludes every represented name.
 struct DictionaryItemsBuilder<'db> {
     items: FxIndexMap<Name, DictionaryItem<'db>>,
-    extra_items: Option<Type<'db>>,
+    extra_items: DictionaryExtraItems<'db>,
     first_entry: DictionaryFirstEntry<'db>,
 }
 
@@ -799,7 +869,7 @@ impl Default for DictionaryItemsBuilder<'_> {
     fn default() -> Self {
         Self {
             items: FxIndexMap::default(),
-            extra_items: None,
+            extra_items: DictionaryExtraItems::Closed,
             first_entry: DictionaryFirstEntry::Empty,
         }
     }
@@ -812,6 +882,9 @@ impl<'db> DictionaryItemsBuilder<'db> {
         env: &ProgramEnvironment<'db>,
         dictionary: DictionaryItems<'db>,
     ) {
+        let previous_empty =
+            self.items.is_empty() && matches!(self.extra_items, DictionaryExtraItems::Closed);
+        let incoming_empty = dictionary.items.is_empty() && dictionary.is_complete();
         match &mut self.first_entry {
             DictionaryFirstEntry::Empty => self.first_entry = dictionary.first_entry.clone(),
             DictionaryFirstEntry::Unknown => {}
@@ -823,14 +896,14 @@ impl<'db> DictionaryItemsBuilder<'db> {
                         } else {
                             UnionType::from_two_elements(db, env, *value, item.ty)
                         };
-                    } else if let DictionaryExtraItems::Value(ty) = dictionary.extra_items {
+                    } else if let Some(ty) = dictionary.extra_items.value_type() {
                         *value = UnionType::from_two_elements(db, env, *value, ty);
                     }
                 } else {
                     for item in &dictionary.items {
                         *value = UnionType::from_two_elements(db, env, *value, item.ty);
                     }
-                    if let DictionaryExtraItems::Value(ty) = dictionary.extra_items {
+                    if let Some(ty) = dictionary.extra_items.value_type() {
                         *value = UnionType::from_two_elements(db, env, *value, ty);
                     }
                 }
@@ -841,10 +914,7 @@ impl<'db> DictionaryItemsBuilder<'db> {
             extra_items,
             first_entry: _,
         } = dictionary;
-        let incoming_extra = match extra_items {
-            DictionaryExtraItems::Closed => None,
-            DictionaryExtraItems::Value(ty) => Some(ty),
-        };
+        let incoming_extra = extra_items.value_type();
         if let Some(ty) = incoming_extra {
             let names: FxHashSet<_> = items.iter().map(|item| item.name.clone()).collect();
             for item in self.items.values_mut() {
@@ -872,7 +942,7 @@ impl<'db> DictionaryItemsBuilder<'db> {
                 }
                 Entry::Vacant(entry) => {
                     if !item.is_required()
-                        && let Some(ty) = self.extra_items
+                        && let Some(ty) = self.extra_items.value_type()
                     {
                         item.ty = UnionType::from_two_elements(db, env, ty, item.ty);
                     }
@@ -880,11 +950,9 @@ impl<'db> DictionaryItemsBuilder<'db> {
                 }
             }
         }
-        if let Some(ty) = incoming_extra {
-            self.extra_items = Some(self.extra_items.map_or(ty, |previous| {
-                UnionType::from_two_elements(db, env, previous, ty)
-            }));
-        }
+        self.extra_items =
+            self.extra_items
+                .combine(db, env, extra_items, previous_empty, incoming_empty);
     }
 
     fn finish(self) -> DictionaryItems<'db> {
@@ -896,8 +964,7 @@ impl<'db> DictionaryItemsBuilder<'db> {
         DictionaryItems {
             first_entry,
             items: items.into_values().collect(),
-            extra_items: extra_items
-                .map_or(DictionaryExtraItems::Closed, DictionaryExtraItems::Value),
+            extra_items,
         }
     }
 }

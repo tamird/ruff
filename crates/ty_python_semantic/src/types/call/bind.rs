@@ -5894,6 +5894,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 }
                 unpacked.openness = keywords
                     .extra_items
+                    .value_type()
                     .map_or(TypedDictOpenness::Closed, |ty| {
                         TypedDictOpenness::extra(db, ty, true)
                     });

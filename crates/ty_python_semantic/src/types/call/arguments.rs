@@ -35,7 +35,7 @@ pub(crate) fn collect_keyword_items<'db>(
     sources: impl IntoIterator<Item = DictionaryObservation<'db>>,
 ) -> DictionaryObservation<'db> {
     let mut items: FxIndexMap<Name, DictionaryItem<'db>> = FxIndexMap::default();
-    let mut extra_items = None;
+    let mut extra_items = DictionaryExtraItems::Closed;
     let mut first_entry = DictionaryFirstEntry::Empty;
     for source in sources {
         let DictionaryItems {
@@ -47,11 +47,11 @@ pub(crate) fn collect_keyword_items<'db>(
             // This combines argument evidence, rather than observing a runtime mapping.
             first_entry = DictionaryFirstEntry::Unknown;
         }
-        let incoming_extra = match incoming_extra {
-            DictionaryExtraItems::Closed => None,
-            DictionaryExtraItems::Value(ty) => Some(ty),
-        };
-        if let Some(ty) = incoming_extra {
+        let previous_empty =
+            items.is_empty() && matches!(extra_items, DictionaryExtraItems::Closed);
+        let incoming_empty =
+            incoming.is_empty() && matches!(incoming_extra, DictionaryExtraItems::Closed);
+        if let Some(ty) = incoming_extra.value_type() {
             let names: FxHashSet<_> = incoming.iter().map(|item| item.name.clone()).collect();
             for item in items.values_mut() {
                 if !item.is_required() && !names.contains(&item.name) {
@@ -84,7 +84,7 @@ pub(crate) fn collect_keyword_items<'db>(
                 }
                 Entry::Vacant(entry) => {
                     if !item.is_required()
-                        && let Some(ty) = extra_items
+                        && let Some(ty) = extra_items.value_type()
                     {
                         item.ty = UnionType::from_two_elements(db, env, ty, item.ty);
                     }
@@ -92,16 +92,12 @@ pub(crate) fn collect_keyword_items<'db>(
                 }
             }
         }
-        if let Some(ty) = incoming_extra {
-            extra_items = Some(extra_items.map_or(ty, |previous| {
-                UnionType::from_two_elements(db, env, previous, ty)
-            }));
-        }
+        extra_items = extra_items.combine(db, env, incoming_extra, previous_empty, incoming_empty);
     }
     Ok(DictionaryItems {
         first_entry,
         items: items.into_values().collect(),
-        extra_items: extra_items.map_or(DictionaryExtraItems::Closed, DictionaryExtraItems::Value),
+        extra_items,
     })
 }
 
@@ -146,7 +142,7 @@ pub(super) enum KnownUnpacking<'db> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct KnownKeywords<'db> {
     pub(super) items: Box<[DictionaryItem<'db>]>,
-    pub(super) extra_items: Option<Type<'db>>,
+    pub(super) extra_items: DictionaryExtraItems<'db>,
     /// Prefix parameters removed while forwarding to a `ParamSpec` remain excluded from the tail.
     pub(super) excluded_names: Vec<Name>,
 }
@@ -166,7 +162,7 @@ impl<'db> KnownKeywords<'db> {
         UnionType::from_elements(
             db,
             env,
-            extra_items.iter().copied().chain(
+            extra_items.argument_type().into_iter().chain(
                 items.iter().filter_map(|item| {
                     (item.kind == DictionaryItemKind::Residual).then_some(item.ty)
                 }),
@@ -196,7 +192,7 @@ impl<'db> KnownKeywords<'db> {
                     DictionaryItemKind::Residual => item.ty,
                 }
             } else {
-                (*extra_items)?
+                extra_items.argument_type()?
             }
         } else {
             all_values
@@ -245,10 +241,6 @@ impl<'db> KnownUnpacking<'db> {
             extra_items,
             first_entry: _,
         } = dictionary;
-        let extra_items = match extra_items {
-            DictionaryExtraItems::Closed => None,
-            DictionaryExtraItems::Value(ty) => Some(ty),
-        };
         Self::Keywords(KnownKeywords {
             items,
             extra_items,
@@ -1086,7 +1078,7 @@ mod tests {
                         },
                     ]
                     .into(),
-                    extra_items: None,
+                    extra_items: DictionaryExtraItems::Closed,
                     excluded_names: Vec::new(),
                 })),
             }],

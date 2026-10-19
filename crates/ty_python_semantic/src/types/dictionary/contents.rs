@@ -36,6 +36,7 @@ use crate::{Db, FxIndexMap};
 use super::{
     DictionaryExtraItems, DictionaryFallback, DictionaryFirstEntry, DictionaryItem,
     DictionaryItemKind, DictionaryItems, DictionaryItemsBuilder, DictionaryObservation,
+    ParamSpecKeywords,
 };
 
 /// A cycle seed, unreachable control flow, missing history, and an inhabited mapping are
@@ -79,10 +80,10 @@ impl<'db> MappingContents<'db> {
     }
 
     fn extra_value(&self) -> Type<'db> {
-        match self.dictionary.extra_items {
-            DictionaryExtraItems::Closed => Type::Never,
-            DictionaryExtraItems::Value(ty) => ty,
-        }
+        self.dictionary
+            .extra_items
+            .value_type()
+            .unwrap_or(Type::Never)
     }
 
     fn bound_value(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
@@ -250,9 +251,7 @@ impl<'db> MappingContents<'db> {
             items.retain(|item| item.name != name);
             // A closed inventory already excludes missing names. An open remainder needs an
             // explicit exclusion so it cannot supply the deleted key.
-            if !self.uses_residual_presence
-                && matches!(self.dictionary.extra_items, DictionaryExtraItems::Value(_))
-            {
+            if !self.uses_residual_presence && !self.dictionary.is_complete() {
                 items.push(DictionaryItem {
                     name,
                     ty: Type::Never,
@@ -358,10 +357,13 @@ impl<'db> MappingContents<'db> {
                     .first_entry
                     .join(db, env, &other_dictionary.first_entry),
                 items: items.into_values().collect(),
-                extra_items: if extra_value.is_never() {
-                    DictionaryExtraItems::Closed
-                } else {
-                    DictionaryExtraItems::Value(extra_value)
+                extra_items: match (dictionary.extra_items, other_dictionary.extra_items) {
+                    (
+                        DictionaryExtraItems::ParamSpec(left),
+                        DictionaryExtraItems::ParamSpec(right),
+                    ) if left == right => DictionaryExtraItems::ParamSpec(left),
+                    _ if extra_value.is_never() => DictionaryExtraItems::Closed,
+                    _ => DictionaryExtraItems::Value(extra_value),
                 },
             },
             uses_residual_presence,
@@ -764,7 +766,13 @@ fn initial_contents<'db>(
         return ContentsValue::Pending;
     }
     let explicit_typed_dict = has_explicit_typed_dict_items(db, bound_type);
-    if !explicit_typed_dict && !super::has_dict_type(db, &env, bound_type) {
+    let paramspec = matches!(
+        definition.kind(db),
+        DefinitionKind::Parameter(ParameterDefinitionNodeKind::VariadicKeywordParameter(_))
+    )
+    .then(|| ParamSpecKeywords::from_type(db, bound_type))
+    .flatten();
+    if !explicit_typed_dict && paramspec.is_none() && !super::has_dict_type(db, &env, bound_type) {
         return ContentsValue::Unavailable;
     }
     if matches!(definition.kind(db), DefinitionKind::ProvidedBinding(_))
@@ -823,7 +831,11 @@ fn initial_contents<'db>(
         });
     // A fresh allocation can prove its contents even when its inferred type is a union.
     // Unobserved union bounds retain their per-alternative key domains.
-    if !explicit_typed_dict && bound_type.as_nominal_instance().is_none() && observed.is_err() {
+    if !explicit_typed_dict
+        && paramspec.is_none()
+        && bound_type.as_nominal_instance().is_none()
+        && observed.is_err()
+    {
         return ContentsValue::Unavailable;
     }
     let builtin_allocation = !owner_inference.discards_dict_key_assignments()
@@ -843,9 +855,12 @@ fn initial_contents<'db>(
         ty: bound_type,
         source,
     });
-    let Some(dictionary) = DictionaryItems::unpacked(db, &env, bound_type, source) else {
+    let Some(mut dictionary) = DictionaryItems::unpacked(db, &env, bound_type, source) else {
         return ContentsValue::Unavailable;
     };
+    if let Some(component) = paramspec {
+        dictionary.extra_items = DictionaryExtraItems::ParamSpec(component);
+    }
     let kwargs_parameters = match definition.kind(db) {
         DefinitionKind::Parameter(parameter) => match parameter {
             ParameterDefinitionNodeKind::VariadicKeywordParameter(_) => match scope.node(db) {
@@ -919,7 +934,22 @@ fn initial_contents<'db>(
             }
         }
     }
-    if bounded || shared || value.is_some_and(|value| PlaceExpr::try_from_expr(value).is_some()) {
+    if matches!(
+        mapping.dictionary.extra_items,
+        DictionaryExtraItems::ParamSpec(_)
+    ) {
+        // A copied parameter bundle loses its identity when exposed, but its ordinary value
+        // type still constrains what can be forwarded afterward.
+        mapping.bound.get_or_insert(MappingBound {
+            ty: bound_type,
+            source,
+        });
+    }
+    if paramspec.is_none()
+        && (bounded
+            || shared
+            || value.is_some_and(|value| PlaceExpr::try_from_expr(value).is_some()))
+    {
         if builtin_allocation
             && !shared
             && parent_preserved
@@ -1035,6 +1065,7 @@ fn fresh_allocation<'db>(
 /// The index records syntax only; exact builtin identity is resolved with the operand's owner.
 enum MappingTransfer<'db> {
     Result(ContentsValue<'db>),
+    UnknownMutation,
     Keep {
         exposes_descendants: bool,
     },
@@ -1067,7 +1098,7 @@ impl<'db> MappingTransfer<'db> {
             Self::Keep {
                 exposes_descendants: _,
             } => true,
-            Self::Expose => false,
+            Self::Expose | Self::UnknownMutation => false,
             Self::Set {
                 key,
                 value: _,
@@ -1119,7 +1150,7 @@ impl<'db> MappingTransfer<'db> {
                 dictionary: _,
                 retained,
             } => !retained,
-            Self::Expose => false,
+            Self::Expose | Self::UnknownMutation => false,
             Self::Result(_) => false,
         }
     }
@@ -1143,7 +1174,7 @@ impl<'db> MappingTransfer<'db> {
                 ContentsValue::Unavailable => Self::Expose,
                 ContentsValue::Mapping(_) => Self::Expose,
             },
-            Self::Expose => Self::Expose,
+            Self::Expose | Self::UnknownMutation => Self::Expose,
             Self::Set {
                 key: _,
                 value: _,
@@ -1183,10 +1214,35 @@ impl<'db> MappingTransfer<'db> {
             _ => previous(),
         };
         let ContentsValue::Mapping(mapping) = &mut previous else {
-            return previous;
+            return if matches!(self, Self::UnknownMutation) {
+                ContentsValue::Unavailable
+            } else {
+                previous
+            };
         };
+        if !matches!(
+            self,
+            Self::Keep {
+                exposes_descendants: _
+            }
+        ) {
+            mapping.dictionary.extra_items = mapping.dictionary.extra_items.forget_paramspec();
+        }
         match self {
             Self::Result(result) => result,
+            Self::UnknownMutation => {
+                if mapping
+                    .bound
+                    .is_some_and(|bound| ParamSpecKeywords::from_type(db, bound.ty).is_some())
+                {
+                    // Falling back to the receiver's declared type would restore the
+                    // original keyword arguments after an unmodeled mutation.
+                    mapping.expose(db, env);
+                    previous
+                } else {
+                    ContentsValue::Unavailable
+                }
+            }
             Self::Keep {
                 exposes_descendants: _,
             } => previous,
@@ -1446,7 +1502,7 @@ fn mapping_transfer<'db>(
     }
     match effect {
         DictionaryContentsEffect::Expose => MappingTransfer::Expose,
-        DictionaryContentsEffect::UnknownMutation => unavailable(),
+        DictionaryContentsEffect::UnknownMutation => MappingTransfer::UnknownMutation,
         DictionaryContentsEffect::ProjectedCall(original) => {
             let DefinitionKind::DictionaryContents(kind) = original.kind(db) else {
                 return unavailable();
@@ -1585,8 +1641,27 @@ fn mapping_transfer<'db>(
                 };
             }
             let receiver = receiver.node(&module);
+            // Positional unpacking of captured keywords passes their string keys, not the
+            // dictionary. Reject calls that also mention the dictionary elsewhere.
+            if let [ast::Expr::Starred(starred)] = call.arguments.args.as_ref()
+                && call.arguments.keywords.is_empty()
+                && let Some(place) = PlaceExpr::try_from_expr(receiver)
+                && PlaceExpr::try_from_expr(&starred.value).as_ref() == Some(&place)
+                && !any_over_expr(&call.func, |expression| {
+                    PlaceExpr::try_from_expr(expression).as_ref() == Some(&place)
+                })
+                && inference
+                    .try_expression_type(receiver)
+                    .is_some_and(|ty| ParamSpecKeywords::from_type(db, ty).is_some())
+            {
+                return MappingTransfer::Keep {
+                    exposes_descendants: false,
+                };
+            }
+            // `reveal_type` returns its argument, so a retained result may expose the mapping.
             if let Some(Type::FunctionLiteral(function)) = inference.try_expression_type(&call.func)
-                && function.known(db) == Some(KnownFunction::Len)
+                && (function.known(db) == Some(KnownFunction::Len)
+                    || discarded && function.known(db) == Some(KnownFunction::RevealType))
                 && let [argument] = call.arguments.args.as_ref()
                 && call.arguments.keywords.is_empty()
                 && PlaceExpr::try_from_expr(argument) == PlaceExpr::try_from_expr(receiver)
@@ -1606,6 +1681,7 @@ fn mapping_transfer<'db>(
                 PlaceExpr::try_from_expr(&*attribute.value) == PlaceExpr::try_from_expr(receiver)
                     && inference.try_expression_type(receiver).is_some_and(|ty| {
                         has_explicit_typed_dict_items(db, ty)
+                            || ParamSpecKeywords::from_type(db, ty).is_some()
                             || (ty.as_nominal_instance().is_some()
                                 && super::has_dict_type(db, &env, ty))
                     })
@@ -2322,6 +2398,7 @@ pub(super) fn snapshot_contents<'db>(
     let observed = (|| {
         let explicit_typed_dict = has_explicit_typed_dict_items(db, argument_type);
         if !explicit_typed_dict
+            && ParamSpecKeywords::from_type(db, argument_type).is_none()
             && !super::has_dict_type(db, &ProgramEnvironment::from_scope(scope), argument_type)
         {
             return None;

@@ -17,7 +17,7 @@ use super::diagnostic::{
     self, INVALID_ARGUMENT_TYPE, INVALID_ASSIGNMENT, INVALID_KEY, PARAMETER_ALREADY_ASSIGNED,
     TOO_MANY_POSITIONAL_ARGUMENTS, report_invalid_key_on_typed_dict, report_missing_typed_dict_key,
 };
-use super::dictionary::{DictionaryExtraItems, DictionaryItem, DictionaryItems};
+use super::dictionary::{DictionaryItem, DictionaryItems};
 use super::infer::{TypeExpressionFlags, infer_deferred_types};
 use super::{
     ApplyTypeMappingVisitor, BoundTypeVarIdentity, ErrorContext, IntersectionType, Type,
@@ -2595,10 +2595,11 @@ pub(super) fn validate_typed_dict_copy<'db, 'ast>(
             )
         })
         .collect();
-    let openness = match extra_items {
-        DictionaryExtraItems::Closed => TypedDictOpenness::Closed,
-        DictionaryExtraItems::Value(ty) => TypedDictOpenness::extra(db, ty, true),
-    };
+    let openness = extra_items
+        .value_type()
+        .map_or(TypedDictOpenness::Closed, |ty| {
+            TypedDictOpenness::extra(db, ty, true)
+        });
     let nodes = TypedDictAssignmentNodes {
         typed_dict: source,
         key: source,

@@ -16,9 +16,9 @@ use crate::types::ide_support::{
     definitions_for_keyword_argument, inlay_hint_call_argument_details,
 };
 use crate::types::{
-    CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryFirstEntry, DictionaryItem,
-    DictionaryItemKind, DictionaryItems, KnownClass, Parameter, Parameters, Signature,
-    TypedDictFieldBuilder, TypedDictOpenness, TypedDictSchema, TypedDictType,
+    CheckedArgument, CheckedCall, DictionaryFirstEntry, DictionaryItem, DictionaryItemKind,
+    DictionaryItems, KnownClass, Parameter, Parameters, Signature, TypedDictFieldBuilder,
+    TypedDictOpenness, TypedDictSchema, TypedDictType,
 };
 use crate::{HasType, SemanticModel};
 
@@ -2749,10 +2749,10 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         } = entries;
         let source = source_text(db, file.file(db));
         let env = ProgramEnvironment::from_file(file);
-        let mut description = match extra_items {
-            DictionaryExtraItems::Closed => "complete".to_owned(),
-            DictionaryExtraItems::Value(ty) => format!("extra: {}", ty.display(db, &env)),
-        };
+        let mut description = extra_items.value_type().map_or_else(
+            || "complete".to_owned(),
+            |ty| format!("extra: {}", ty.display(db, &env)),
+        );
         // Preserve key order, values, and their source spelling through the public call view.
         for DictionaryItem {
             name,

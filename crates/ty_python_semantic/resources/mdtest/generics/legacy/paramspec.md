@@ -1554,6 +1554,26 @@ def calls(values: dict[str, str]):
     forward(needs_prefix, **{**values, "prefix": 0})  # error: [missing-argument]
 ```
 
+## Forwarding copied keyword arguments
+
+```py
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def copy_arguments(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    copied = dict(kwargs)
+    kwargs.pop("required", None)
+    return callback(*args, **copied)  # no diagnostic
+
+def remove_argument(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    copied = dict(kwargs)
+    copied.pop("required", None)
+    return callback(*args, **copied)  # error: [invalid-argument-type]
+```
+
 ## Calling methods on a union of `ParamSpec` specializations
 
 A caller's parameter list can be shared by the receivers while the return type preserves the

@@ -281,14 +281,6 @@ def f[**P](func: Callable[P, int]) -> Callable[P, None]:
         reveal_type(kwargs)  # revealed: P@f.kwargs
         reveal_type(func(*args, **kwargs))  # revealed: int
 
-        # error: [invalid-argument-type] "Argument is incorrect: Expected `P@f.args`, found `P@f.kwargs`"
-        # error: [invalid-argument-type] "Argument is incorrect: Expected `P@f.kwargs`, found `P@f.args`"
-        reveal_type(func(*kwargs, **args))  # revealed: int
-
-        # error: [invalid-argument-type] "Argument is incorrect: Expected `P@f.args`, found `P@f.kwargs`"
-        # error: [missing-argument]
-        reveal_type(func(args, kwargs))  # revealed: int
-
         # Both parameters are required
         # error: [missing-argument]
         reveal_type(func())  # revealed: int
@@ -296,6 +288,14 @@ def f[**P](func: Callable[P, int]) -> Callable[P, None]:
         reveal_type(func(*args))  # revealed: int
         # error: [missing-argument]
         reveal_type(func(**kwargs))  # revealed: int
+
+        # error: [invalid-argument-type] "Argument is incorrect: Expected `P@f.args`, found `P@f.kwargs`"
+        # error: [invalid-argument-type] "Argument is incorrect: Expected `P@f.kwargs`, found `P@f.args`"
+        reveal_type(func(*kwargs, **args))  # revealed: int
+
+        # error: [invalid-argument-type] "Argument is incorrect: Expected `P@f.args`, found `P@f.kwargs`"
+        # error: [missing-argument]
+        reveal_type(func(args, kwargs))  # revealed: int
     return wrapper
 ```
 
@@ -2553,6 +2553,69 @@ def calls(values: dict[str, str]):
     forward(target, **{**values, "prefix": 0, "value": 1})  # error: [invalid-argument-type]
     forward(target, **{**values, "prefix": "bad"})  # error: [invalid-argument-type]
     forward(needs_prefix, **{**values, "prefix": 0})  # error: [missing-argument]
+```
+
+## Forwarding copied keyword arguments
+
+```py
+from collections.abc import Callable
+
+def copy_arguments[**P, R](callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    copied = dict(kwargs)
+    kwargs.pop("required", None)
+    return callback(*args, **copied)  # no diagnostic
+
+def inspect_arguments[**P, R](callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    kwargs.get("required")
+    kwargs.keys()
+    return callback(*args, **kwargs)  # no diagnostic
+
+def inspect_keys(*keys: object) -> None: ...
+
+def pass_keys[**P, R](callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    inspect_keys(*kwargs)
+    return callback(*args, **kwargs)  # no diagnostic
+
+def remove_argument[**P, R](callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    copied = dict(kwargs)
+    copied.pop("required", None)
+    return callback(*args, **copied)  # error: [invalid-argument-type]
+
+def maybe_remove_argument[**P, R](
+    callback: Callable[P, R], remove: bool, *args: P.args, **kwargs: P.kwargs
+) -> R:
+    copied = dict(kwargs)
+    if remove:
+        copied.pop("required", None)
+    return callback(*args, **copied)  # error: [invalid-argument-type]
+
+def copy_modified_arguments[**P, R](callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    kwargs.pop("required", None)
+    copied = dict(kwargs)
+    return callback(*args, **copied)  # error: [invalid-argument-type]
+
+def overwrite_argument[**P, R](callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    copied = {**kwargs, "required": 42}
+    # error: [invalid-argument-type]
+    return callback(*args, **copied)  # error: [invalid-argument-type]
+
+def mutate(arguments: object) -> None:
+    if isinstance(arguments, dict):
+        arguments.clear()
+
+def expose_arguments[**P, R](callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    copied = dict(kwargs)
+    mutate(copied)
+    return callback(*args, **copied)  # error: [invalid-argument-type]
+
+def expose_original[**P, R](callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    mutate(kwargs)
+    return callback(*args, **kwargs)  # error: [invalid-argument-type]
+
+def assign_in_loop[**P, R](callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    for kwargs["required"] in (None,):  # error: [invalid-assignment]
+        pass
+    return callback(*args, **kwargs)  # error: [invalid-argument-type]
 ```
 
 ## Calling methods on a union of `ParamSpec` specializations
