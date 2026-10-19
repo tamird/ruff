@@ -9623,19 +9623,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expression: &ast::Expr,
         ty: Type<'db>,
     ) -> crate::types::dictionary::DictionaryObservation<'db> {
-        match DictionaryItems::expression(
+        DictionaryItems::expression_or_observed(
             self.db(),
             self.program_environment(),
             self.scope(),
             expression,
             self.context.body_domain,
             &mut |expression| self.try_expression_type(expression),
-        ) {
-            Err(crate::types::dictionary::DictionaryFallback::Unavailable) => {
-                self.observed_dictionary_items(expression, ty)
-            }
-            observed => observed,
-        }
+            || self.observed_dictionary_items(expression, ty),
+        )
     }
 
     /// Infer the variadic argument types needed for call binding and emit the shared diagnostics

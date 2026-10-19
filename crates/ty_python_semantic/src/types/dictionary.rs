@@ -328,6 +328,22 @@ impl<'db> DictionaryItems<'db> {
         matches!(self.extra_items, DictionaryExtraItems::Closed)
     }
 
+    /// Observe the expression's contents only when its syntax does not determine its items.
+    pub(crate) fn expression_or_observed(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
+        expression: &ast::Expr,
+        body_domain: Option<FunctionBodyDomain<'db>>,
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+        observe: impl FnOnce() -> DictionaryObservation<'db>,
+    ) -> DictionaryObservation<'db> {
+        match Self::expression(db, env, scope, expression, body_domain, expression_type) {
+            Err(DictionaryFallback::Unavailable) => observe(),
+            result => result,
+        }
+    }
+
     pub(crate) fn observed(
         db: &'db dyn Db,
         scope: ScopeId<'db>,
