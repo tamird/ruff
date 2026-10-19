@@ -640,8 +640,8 @@ impl RuleSelection {
         self.lints.remove(&lint);
     }
 
-    /// Requires ignore comments to name specific rules and makes diagnostics about them
-    /// unsuppressible errors, regardless of their configured severity.
+    /// Requires ignore comments to name specific rules and apply to a limited range of code.
+    /// Makes diagnostics about them unsuppressible errors, regardless of their configured severity.
     pub fn set_require_valid_suppressions(&mut self, require: bool) {
         self.require_valid_suppressions = require;
     }

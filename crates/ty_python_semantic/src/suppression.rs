@@ -158,11 +158,39 @@ fn check_blanket_suppressions(context: &mut CheckSuppressionsContext) {
         return;
     }
 
+    if context.require_valid_suppressions {
+        for group in context
+            .suppressions
+            .file
+            .chunk_by(|left, right| left.comment_range == right.comment_range)
+        {
+            let suppression = &group[0];
+            if group
+                .iter()
+                .any(|suppression| context.is_suppression_used(suppression.id()))
+                && let Some(diag) =
+                    context.report_unchecked(&BLANKET_IGNORE_COMMENT, suppression.comment_range)
+            {
+                diag.into_diagnostic(format_args!(
+                    "Use a rule-specific `{}` comment on the line it suppresses",
+                    suppression.kind
+                ));
+            }
+        }
+    }
+
     let candidates = context.suppression_diagnostic_candidates();
-    for suppression in context.suppressions.iter().filter(|suppression| {
-        suppression.target == SuppressionTarget::All
-            && (suppression.kind == SuppressionKind::Ty || context.require_valid_suppressions)
-    }) {
+    for suppression in context
+        .suppressions
+        .file
+        .iter()
+        .filter(|_| !context.require_valid_suppressions)
+        .chain(context.suppressions.inline.iter())
+        .filter(|suppression| {
+            suppression.target == SuppressionTarget::All
+                && (suppression.kind == SuppressionKind::Ty || context.require_valid_suppressions)
+        })
+    {
         // A blanket suppression cannot suppress its own diagnostic, but a lint-specific
         // suppression can.
         if let Some(lint_suppression) = candidates.and_then(|candidates| {
@@ -1006,6 +1034,14 @@ mod tests {
                 "# type: ignore\nvalue = missing\n",
                 "blanket-ignore-comment",
             ),
+            (
+                "# ty: ignore[unresolved-reference, division-by-zero]\nvalue = missing\nquotient = 1 / 0\n",
+                "blanket-ignore-comment",
+            ),
+            (
+                "# type: ignore[ty:unresolved-reference]\nvalue = missing\n",
+                "blanket-ignore-comment",
+            ),
         ] {
             for require in [false, true] {
                 let registry = crate::default_lint_registry();
@@ -1020,17 +1056,28 @@ mod tests {
                 assert_eq!(
                     diagnostics
                         .iter()
-                        .find(|diagnostic| diagnostic.id().as_str() == required_diagnostic)
-                        .map(Diagnostic::severity),
-                    require.then_some(Severity::Error),
+                        .filter(|diagnostic| diagnostic.id().as_str() == required_diagnostic)
+                        .map(Diagnostic::severity)
+                        .collect::<Vec<_>>(),
+                    require
+                        .then_some(Severity::Error)
+                        .into_iter()
+                        .collect::<Vec<_>>(),
                     "{source}: {diagnostics:?}",
                 );
             }
         }
 
-        for source in [
-            "value = missing # ty: ignore[unresolved-reference]\n",
-            "value = missing # type: ignore[ty:unresolved-reference]\n",
+        for (source, expected) in [
+            ("value = missing # ty: ignore[unresolved-reference]\n", None),
+            (
+                "value = missing # type: ignore[ty:unresolved-reference]\n",
+                None,
+            ),
+            (
+                "# ty: ignore[division-by-zero]\nvalue = 1\n",
+                Some(("unused-ignore-comment", Severity::Error)),
+            ),
         ] {
             let mut selection = RuleSelection::from_registry(crate::default_lint_registry());
             selection.set_require_valid_suppressions(true);
@@ -1040,7 +1087,14 @@ mod tests {
                 .build()?;
             let file = system_path_to_file(&db, "/src/main.py")?;
             let diagnostics = check_types(&db, db.program_file(file));
-            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| (diagnostic.id().as_str(), diagnostic.severity()))
+                    .collect::<Vec<_>>(),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{source}: {diagnostics:?}",
+            );
         }
         Ok(())
     }
