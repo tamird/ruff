@@ -8342,21 +8342,27 @@ impl<'db> Binding<'db> {
             if dynamic {
                 return None;
             }
-            Some(ty)
+            let Some(default) = default else {
+                return Some(ty);
+            };
+            let path = [Name::new(name.value(db))];
+            let stored = |receiver: &Type<'db>| receiver.has_immutable_field_path(db, env, &path);
+            let immutable_storage = match instance.expand_top_level_aliases(db, env) {
+                Type::Union(union) => union.elements(db).iter().all(stored),
+                receiver => stored(&receiver),
+            };
+            // A descriptor can raise AttributeError even when it is definitely present.
+            // Only proven immutable storage makes this default unreachable.
+            Some(if immutable_storage {
+                ty
+            } else {
+                UnionType::from_two_elements(db, env, ty, default)
+            })
         };
-        let result = match names {
+        match names {
             Type::Union(union) => union.try_map(db, env, lookup),
             name => lookup(&name),
-        };
-        let result = result?;
-        // A present descriptor can raise AttributeError, causing getattr to return
-        // the supplied default. Static boundness does not establish getter totality.
-        Some(UnionType::from_two_elements(
-            db,
-            env,
-            result,
-            default.unwrap_or(Type::Never),
-        ))
+        }
     }
 
     /// Checks the getter invoked by `property.__get__`, retaining its error and recovery type.

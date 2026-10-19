@@ -3912,6 +3912,84 @@ context: RuntimeContextView
 }
 
 #[test]
+fn supplied_getter_storage_excludes_unreachable_defaults() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_getattr_result_provider(schema_getattr_result)
+        .with_file(
+            "/src/native.pyi",
+            r#"
+from typing import Protocol
+from typing_extensions import NotRequired, TypedDict
+
+class Required(TypedDict, closed=True):
+    items: list[str]
+    count: int
+    nullable: int | None
+class Other(TypedDict, closed=True):
+    items: list[int]
+class Optional(TypedDict, closed=True):
+    items: NotRequired[list[str]]
+class Store[S]:
+    def __getattr__(self, name: str) -> object: ...
+class Fields(Protocol):
+    @property
+    def items(self) -> list[str]: ...
+class Property(Store[Required]):
+    @property
+    def items(self) -> str: ...
+class Intercepted(Store[Required]):
+    def __getattribute__(self, name: str) -> float: ...
+class Mutable(Store[Required]):
+    items: list[str]
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from typing import Literal
+from typing_extensions import assert_type
+from ty_extensions import Intersection
+from native import Store, Required, Other, Optional, Fields, Property, Intercepted, Mutable
+
+type View = Intersection[Store[Required], Fields]
+
+def stored(value: View, default: bytes, name: Literal["items", "count"]):
+    assert_type(getattr(value, "items", default), list[str])
+    assert_type(getattr(value, "items", []), list[str])
+    assert_type(getattr(value, "nullable", default), int | None)
+    assert_type(getattr(value, name, default), list[str] | int)
+    assert_type(getattr(value, "missing", default), bytes)
+    # Even an unused default expression is evaluated.
+    getattr(value, "items", len(42))
+
+def unions(value: Store[Required] | Store[Other], default: bytes):
+    assert_type(getattr(value, "items", default), list[str] | list[int])
+
+def optional(value: Store[Required] | Store[Optional], default: bytes):
+    assert_type(getattr(value, "items", default), list[str] | bytes)
+
+def ordinary(property: Property, intercepted: Intercepted, mutable: Mutable, default: bytes):
+    assert_type(getattr(property, "items", default), str | bytes)
+    assert_type(getattr(intercepted, "items", default), float | bytes)
+    assert_type(getattr(mutable, "items", default), list[str] | bytes)
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type"],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn supplied_getter_storage_requires_matching_consensus() -> anyhow::Result<()> {
     fn result<'db>(
         db: &'db TestDb,
