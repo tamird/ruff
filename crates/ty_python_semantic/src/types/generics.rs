@@ -4944,6 +4944,10 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             }
 
             (Type::NominalInstance(formal_nominal), Type::NominalInstance(actual_nominal)) => {
+                if formal_nominal.provided_instance().is_some() {
+                    let when = self.constraint_for_relation(formal, actual, relation_polarity);
+                    return self.infer_from_constraint_set(when);
+                }
                 if let Some(formal_alias) = formal_nominal.class(db, self.env).into_generic_alias()
                 {
                     let formal_origin = formal_alias.origin(db);

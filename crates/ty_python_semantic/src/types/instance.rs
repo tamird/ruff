@@ -413,6 +413,12 @@ impl<'db> NominalInstanceType<'db> {
         }
     }
 
+    /// Supplied fields may contain type variables or gradual types even when the class is
+    /// nongeneric.
+    pub(super) fn may_have_nested_types(self, db: &'db dyn Db) -> bool {
+        self.provided_instance().is_some() || self.is_definition_generic(db)
+    }
+
     /// If this type is an *exact* tuple type (*not* a subclass of `tuple`), returns the
     /// tuple spec.
     ///

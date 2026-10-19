@@ -2570,7 +2570,7 @@ impl<'db> Type<'db> {
     /// Returns `true` if this type contains a `Self` type variable.
     fn contains_self(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
         if let Type::NominalInstance(instance) = self
-            && !instance.is_definition_generic(db)
+            && !instance.may_have_nested_types(db)
         {
             return false;
         }
@@ -2979,7 +2979,7 @@ impl<'db> Type<'db> {
             | Type::DataclassTransformer(_)
             | Type::BoundSuper(_)
             | Type::SpecialForm(_) => self,
-            Type::NominalInstance(instance) if !instance.is_definition_generic(db) => self,
+            Type::NominalInstance(instance) if !instance.may_have_nested_types(db) => self,
             _ => self.cached_materialization(db, env.program(db), materialization_kind),
         }
     }
@@ -4123,6 +4123,15 @@ impl<'db> Type<'db> {
         f(self, polarity);
 
         visitor.visit(db, (self, polarity), || {
+            if let Type::NominalInstance(instance) = self
+                && let Some(provided) = instance.provided_instance()
+            {
+                for field in provided.fields(db) {
+                    field
+                        .ty
+                        .visit_specialization_impl(db, env, polarity, f, visitor);
+                }
+            }
             let Some((_, specialization)) = self.class_specialization(db, env) else {
                 match self {
                     Type::Union(union) => {
@@ -9747,7 +9756,7 @@ impl<'db> Type<'db> {
         specialize_typevar_domains: bool,
     ) -> Type<'db> {
         if let Type::NominalInstance(instance) = self
-            && !instance.is_definition_generic(db)
+            && !instance.may_have_nested_types(db)
         {
             return self;
         }

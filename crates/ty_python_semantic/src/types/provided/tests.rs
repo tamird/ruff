@@ -11,7 +11,9 @@ use ruff_text_size::{Ranged, TextLen, TextRange};
 
 use super::*;
 use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
+use crate::types::constraints::ConstraintSetBuilder;
 use crate::types::definition_resolution::definitions_for_attribute;
+use crate::types::generics::SpecializationBuilder;
 use crate::types::ide_support::{
     call_signature_details, definitions_for_keyword_argument, inlay_hint_call_argument_details,
 };
@@ -101,7 +103,7 @@ fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyh
     let db = TestDbBuilder::new()
         .with_file(
             "/src/main.pyi",
-            "from typing import type_check_only\nclass Box[T]:\n    @type_check_only\n    def value(self) -> str: ...\nclass Child(Box[int]):\n    @property\n    def value(self) -> object: ...\nbox: Box[int]\nchild: Child\n",
+            "from collections.abc import Callable\nfrom typing import type_check_only\nclass Box[T]:\n    @type_check_only\n    def value(self) -> str: ...\nclass Child(Box[int]):\n    @property\n    def value(self) -> object: ...\nclass Handler[**P]:\n    callback: Callable[P, int]\nbox: Box[int]\nchild: Child\nhandler: Handler[[int]]\n",
         )
         .build()?;
     let file = system_path_to_file(&db, "/src/main.pyi")?;
@@ -195,6 +197,99 @@ fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyh
     assert!(!Type::string_literal(&db, "x").is_assignable_to(&db, &env, string_with_storage));
     assert!(Type::unknown().is_assignable_to(&db, &env, boxed));
     assert!(Type::Never.is_subtype_of(&db, &env, boxed));
+
+    let Type::ClassLiteral(box_class) = symbol("Box") else {
+        anyhow::bail!("Expected the Box class");
+    };
+    let context = box_class.generic_context(&db).expect("generic Box");
+    let variable = Type::TypeVar(context.variables(&db).next().expect("Box type parameter"));
+    let generic_storage = refine(&db, str, variable, None, ProvidedInstanceDisplay::Full);
+    let specialized = generic_storage.apply_specialization(&db, context.specialize(&db, &[int]));
+    assert_eq!(
+        specialized.member(&db, &env, "value").place.expect_type(),
+        int
+    );
+    let gradual_storage = refine(
+        &db,
+        str,
+        Type::unknown(),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    assert_eq!(
+        gradual_storage
+            .top_materialization(&db, &env)
+            .member(&db, &env, "value")
+            .place
+            .expect_type(),
+        Type::object()
+    );
+    let invariant_storage = refine(
+        &db,
+        str,
+        KnownClass::List.to_specialized_instance(&db, &env, &[variable]),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    let mut occurrence = None;
+    invariant_storage.visit_specialization(&db, &env, |ty, variance| {
+        if ty == variable {
+            occurrence = Some(variance);
+        }
+    });
+    assert_eq!(
+        occurrence,
+        Some(crate::types::variance::TypeVarVariance::Invariant)
+    );
+    let constraints = ConstraintSetBuilder::new();
+    let mut inference = SpecializationBuilder::new(&db, &env, &constraints, context);
+    inference
+        .infer(generic_storage, string_with_storage)
+        .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
+    let inferred = inference
+        .build_inference_with(|_, _| None)
+        .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?
+        .merged_specialization(&db);
+    assert_eq!(inferred.types(&db), [int]);
+
+    let Type::ClassLiteral(handler_class) = symbol("Handler") else {
+        anyhow::bail!("Expected the Handler class");
+    };
+    let handler_context = handler_class.generic_context(&db).expect("generic Handler");
+    let handler = Type::instance(&db, &env, handler_class.identity_specialization(&db));
+    let formal = refine(
+        &db,
+        handler,
+        handler.member(&db, &env, "callback").place.expect_type(),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    let actual_handler = symbol("handler");
+    let actual = refine(
+        &db,
+        actual_handler,
+        actual_handler
+            .member(&db, &env, "callback")
+            .place
+            .expect_type(),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    let expected = actual
+        .class_specialization(&db, &env)
+        .expect("generic Handler")
+        .1;
+    assert!(matches!(expected.types(&db), [Type::Callable(_)]));
+    let constraints = ConstraintSetBuilder::new();
+    let mut inference = SpecializationBuilder::new(&db, &env, &constraints, handler_context);
+    inference
+        .infer(formal, actual)
+        .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
+    let inferred = inference
+        .build_inference_with(|_, _| None)
+        .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?
+        .merged_specialization(&db);
+    assert_eq!(inferred.types(&db), expected.types(&db));
     Ok(())
 }
 
