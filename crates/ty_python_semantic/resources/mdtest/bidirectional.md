@@ -3256,6 +3256,42 @@ x19["b"] = "2"
 reveal_type(x19)  # revealed: dict[str, int | str]
 ```
 
+Unpacked assignments contribute each written value to an unannotated collection's inferred type:
+
+```py
+def unpack(values: tuple[str, bytes]) -> None:
+    entries = {}
+    entries["existing"] = 1
+    entries["text"], entries["data"] = values
+    reveal_type(entries)  # revealed: dict[str, int | str | bytes]
+
+    declared: dict[str, int] = {}
+    declared["text"], _ = values  # error: [invalid-assignment]
+```
+
+The right-hand side may read the same collection:
+
+```py
+def unpack_self_reference() -> None:
+    entries = {}
+    entries["seed"] = 1
+    entries["first"], entries["second"] = entries["seed"], "text"
+    reveal_type(entries)  # revealed: dict[str, int | str]
+```
+
+Only the collections receiving the writes contribute constraints from the assignment:
+
+```py
+def produce(values: list[int]) -> tuple[str, bytes]:
+    return "text", b"data"
+
+def unpack_unrelated_read() -> None:
+    values = []
+    entries = {}
+    entries["text"], entries["data"] = produce(values)
+    reveal_type(values)  # revealed: list[Unknown]
+```
+
 ```py
 x20 = {}
 x20["a"] = len(x20)

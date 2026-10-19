@@ -1245,6 +1245,17 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .ok()
     }
 
+    fn record_collection_use(&mut self, expression: &ast::Expr) {
+        if let Some(definition) = self.unannotated_collection_initializer_binding(expression)
+            && let Some(statement) = self.current_statements.last_mut()
+        {
+            statement.collection_uses.push(CollectionUse::Resolved {
+                definition,
+                expression: expression.into(),
+            });
+        }
+    }
+
     fn unannotated_collection_display_binding(
         &self,
         collection_use: &ast::Expr,
@@ -4045,7 +4056,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                             node: _,
                             unpack: _,
                             owner: _,
-                        }) => self.record_contents_store(subscript),
+                        }) => {
+                            self.record_contents_store(subscript);
+                            self.record_collection_use(&subscript.value);
+                        }
                         Some(CurrentAssignment::AnnAssign { node, pending: _ }) => {
                             if node.value.is_some() {
                                 self.record_contents_store(subscript);
@@ -4067,17 +4081,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     if is_use {
                         self.record_place_use(place_id, expr);
 
-                        // Keep track of any uses of unannotated collection initializers.
-                        if let Some(collection_def) =
-                            self.unannotated_collection_initializer_binding(expr)
-                            && let Some(current_statement) = self.current_statements.last_mut()
-                        {
-                            current_statement
-                                .collection_uses
-                                .push(CollectionUse::Resolved {
-                                    definition: collection_def,
-                                    expression: expr.into(),
-                                });
+                        // Assignment statements record only the receivers of subscript stores.
+                        if self.current_statements.last().is_some_and(|statement| {
+                            !matches!(statement.node, ast::Stmt::Assign(_))
+                        }) {
+                            self.record_collection_use(expr);
                         }
                     }
 
@@ -6334,15 +6342,8 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                 // A return involving the collection object.
                 ruff_python_ast::Stmt::Return(_) => true,
 
-                // A subscript assignment on the collection object.
-                ruff_python_ast::Stmt::Assign(ast::StmtAssign { targets, .. }) => {
-                    match targets.as_slice() {
-                        [ast::Expr::Subscript(ast::ExprSubscript { value, .. })] => {
-                            ExpressionNodeKey::from(value) == *use_expression
-                        }
-                        _ => false,
-                    }
-                }
+                // Subscript store receivers were recorded while visiting their targets.
+                ruff_python_ast::Stmt::Assign(_) => true,
 
                 // An annotated assignment assigning the collection object to a new binding.
                 ruff_python_ast::Stmt::AnnAssign(_) => true,
