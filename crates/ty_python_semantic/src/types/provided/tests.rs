@@ -983,6 +983,36 @@ fn assert_keyword_diagnostics(db: &TestDb, file: File, expected: &[(&str, &str)]
 }
 
 #[test]
+fn captured_keywords_contextualize_individual_arguments() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol, TypedDict
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+class Options(TypedDict):
+    symbol: str
+def invoke[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **kwargs)
+def target(*, generated: str, x_defs: Options) -> None: ...
+target(generated="made", x_defs={"symbol": False})
+invoke(target, x_defs={"symbol": "ok"})
+invoke(target, x_defs={"symbol": 42})
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[
+            ("invalid-argument-type", "x_defs={\"symbol\": False}"),
+            ("invalid-argument-type", "False"),
+            ("invalid-argument-type", "x_defs={\"symbol\": 42}"),
+            ("invalid-argument-type", "42"),
+        ],
+    );
+    Ok(())
+}
+
+#[test]
 fn supplied_keyword_parameters_preserve_callback_contracts() -> anyhow::Result<()> {
     let db = keyword_capture_db(
         r#"from typing import Protocol

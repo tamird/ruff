@@ -8892,23 +8892,24 @@ impl<'db> Binding<'db> {
         if self.signature.generic_context.is_some() {
             let paramspec = if let Type::TypeVar(typevar) = original_parameter_type
                 && typevar.is_paramspec(db)
-                && typevar.paramspec_attr(db).is_some()
+                && (typevar.paramspec_attr(db).is_some()
+                    || typevar.is_captured_keyword_arguments(db))
             {
                 Some(typevar.paramspec_base(db))
             } else {
                 None
             };
 
-            // A `P.args`/`P.kwargs` parameter receives context from the `ParamSpec` specialization
-            // checked during the previous fixpoint round.
+            // A forwarded argument receives context from the `ParamSpec` specialization checked
+            // during the previous fixpoint round.
             if let Some(paramspec) = paramspec {
                 // Forwarded parameter context can depend on the wrapped callable and other
                 // arguments. Decline it when those prior argument constraints are excluded.
                 if source == ArgumentTypeContextSource::WithoutArguments {
                     return None;
                 }
-                // Specializing `P.args` or `P.kwargs` directly yields the entire parameter list,
-                // which is not a valid type context for an individual argument.
+                // Specializing a variadic parameter directly yields the entire parameter list
+                // or keyword mapping, neither of which is a valid context for one argument.
                 let callable = paramspec_callable(paramspec)?;
                 let specialized_parameter_type =
                     self.paramspec_argument_context(&ParamSpecArgumentContext {
