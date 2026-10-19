@@ -5774,7 +5774,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // computing the signature requires evaluating those defaults which may trigger
         // deferred inference.
         let propagatable_kind = match decorated_ty {
-            Type::FunctionLiteral(func) => Some(func.callable_type_kind(db)),
+            Type::FunctionLiteral(_) => decorated_ty.function_like_kind(db),
             _ => decorated_ty
                 .try_upcast_to_callable(db, env)
                 .and_then(|callables| {

@@ -23,6 +23,60 @@ use crate::types::{
 use crate::{HasType, SemanticModel};
 
 #[test]
+fn supplied_builtin_function_retains_signature_and_runtime_class() -> anyhow::Result<()> {
+    let source = "\
+from native import native, native2
+from types import BuiltinFunctionType, FunctionType
+
+def source(value: int) -> str:
+    return str(value)
+
+native_ok: BuiltinFunctionType = native
+source_ok: FunctionType = source
+bad_direct: FunctionType = native
+items = [native]
+promoted_ok: BuiltinFunctionType = items[0]
+bad_promoted: FunctionType = items[0]
+
+class Container:
+    operation = native
+
+result: str = Container().operation(1)
+Container.operation = native2
+bad_call = native('bad')
+wrapped: BuiltinFunctionType = staticmethod(native).__func__
+";
+    let db = TestDbBuilder::new()
+        .with_builtin_function(|db, definition| {
+            matches!(definition.name(db).as_deref(), Some("native" | "native2"))
+        })
+        .with_file(
+            "/src/native.pyi",
+            "def native(value: int) -> str: ...\ndef native2(value: int) -> str: ...\n",
+        )
+        .with_file("/src/main.py", source)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let range = diagnostic.range().unwrap();
+                (diagnostic.id().as_str(), &source[range])
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("invalid-assignment", "native"),
+            ("invalid-assignment", "items[0]"),
+            ("invalid-argument-type", "'bad'")
+        ],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyhow::Result<()> {
     fn refine<'db>(
         db: &'db TestDb,

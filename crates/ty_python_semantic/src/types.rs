@@ -6542,7 +6542,12 @@ impl<'db> Type<'db> {
 
                 Type::Callable(callable)
                     if name_str == "__call__"
-                        && (callable.is_function_like(db) || callable.is_staticmethod_like(db))
+                        && matches!(
+                            callable.kind(db),
+                            CallableTypeKind::FunctionLike
+                                | CallableTypeKind::BuiltinFunctionLike
+                                | CallableTypeKind::StaticMethodLike
+                        )
                         && runtime_call_is_declared(
                             callable
                                 .runtime_class(db)

@@ -115,7 +115,7 @@ impl<'db> MethodWrapper<'db> {
                         MethodWrapperKind::Staticmethod => FunctionDecorators::STATICMETHOD,
                     },
                 ) && match function.callable_type_kind(db) {
-                    CallableTypeKind::FunctionLike => true,
+                    CallableTypeKind::FunctionLike | CallableTypeKind::BuiltinFunctionLike => true,
                     CallableTypeKind::ClassMethodLike => kind == MethodWrapperKind::Classmethod,
                     CallableTypeKind::StaticMethodLike => kind == MethodWrapperKind::Staticmethod,
                     CallableTypeKind::Regular

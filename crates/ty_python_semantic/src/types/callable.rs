@@ -24,7 +24,10 @@ use ty_python_core::definition::Definition;
 impl<'db> Type<'db> {
     pub(super) fn function_like_kind(self, db: &'db dyn Db) -> Option<CallableTypeKind> {
         match self {
-            Type::FunctionLiteral(function) => Some(function.callable_type_kind(db)),
+            Type::FunctionLiteral(function) => {
+                let kind = function.callable_type_kind(db);
+                kind.is_method_like().then_some(kind)
+            }
             Type::Callable(callable) if callable.is_method_like(db) => Some(callable.kind(db)),
             Type::KnownInstance(KnownInstanceType::MethodWrapper(wrapper)) => {
                 Some(match wrapper.kind(db) {
@@ -651,6 +654,10 @@ pub enum CallableTypeKind {
     /// [descriptor-protocol]: https://docs.python.org/3/howto/descriptor.html#descriptor-protocol
     FunctionLike,
 
+    /// A native builtin function. It has the runtime class `types.BuiltinFunctionType`
+    /// and does not bind a receiver when accessed through an instance.
+    BuiltinFunctionLike,
+
     /// A `Callable[P, R]`-typed dunder attribute whose parameters come from a `ParamSpec`.
     ///
     /// This has the runtime assumptions of [`Self::Regular`]: truthiness is ambiguous,
@@ -703,6 +710,25 @@ pub enum CallableTypeKind {
     /// materializations from ordinary callable types in type-relation checks. It does not
     /// carry the runtime `typing.ParamSpec` instance behavior of a `ParamSpec` declaration.
     ParamSpecValue,
+}
+
+impl CallableTypeKind {
+    pub(super) const fn runtime_class(self) -> Option<KnownClass> {
+        match self {
+            Self::FunctionLike => Some(KnownClass::FunctionType),
+            Self::BuiltinFunctionLike => Some(KnownClass::BuiltinFunctionType),
+            Self::StaticMethodLike => Some(KnownClass::Staticmethod),
+            Self::ClassMethodLike => Some(KnownClass::Classmethod),
+            Self::Regular | Self::DunderParamSpec | Self::ParamSpecValue => None,
+        }
+    }
+
+    const fn is_method_like(self) -> bool {
+        matches!(
+            self,
+            Self::FunctionLike | Self::StaticMethodLike | Self::ClassMethodLike
+        )
+    }
 }
 
 /// A "policy" enum that describes how `type[]` types should be upcast
@@ -916,12 +942,7 @@ impl<'db> CallableType<'db> {
     }
 
     pub(super) fn runtime_class(self, db: &'db dyn Db) -> Option<KnownClass> {
-        match self.kind(db) {
-            CallableTypeKind::FunctionLike => Some(KnownClass::FunctionType),
-            CallableTypeKind::StaticMethodLike => Some(KnownClass::Staticmethod),
-            CallableTypeKind::ClassMethodLike => Some(KnownClass::Classmethod),
-            _ => None,
-        }
+        self.kind(db).runtime_class()
     }
 
     pub(super) fn is_dunder_paramspec(self, db: &'db dyn Db) -> bool {
@@ -942,12 +963,7 @@ impl<'db> CallableType<'db> {
 
     /// Returns `true` if this callable represents a function used as a class member.
     pub fn is_method_like(self, db: &'db dyn Db) -> bool {
-        matches!(
-            self.kind(db),
-            CallableTypeKind::FunctionLike
-                | CallableTypeKind::StaticMethodLike
-                | CallableTypeKind::ClassMethodLike
-        )
+        self.kind(db).is_method_like()
     }
 
     pub(crate) fn into_regular(self, db: &'db dyn Db) -> CallableType<'db> {

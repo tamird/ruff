@@ -833,7 +833,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             dataclass_transformer_params,
             SourceAnnotation::function_return(db, self.program_file(), function).is_some(),
         );
-        let function_literal = FunctionLiteral::new(db, overload_literal);
+        let function_literal = FunctionLiteral::new(
+            db,
+            overload_literal,
+            db.provided_function_is_builtin(definition),
+        );
         let function_type = FunctionType::new(db, function_literal, None);
         let is_decorated_overload_implementation =
             has_transforming_decorators && function_literal.has_separate_implementation(db);
@@ -897,8 +901,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             if let Some(kind) = descriptor_kind {
                 let wrap = |ty: Type<'db>| match ty.resolve_type_alias(db) {
                     Type::FunctionLiteral(function)
-                        if function.callable_type_kind(db) == CallableTypeKind::FunctionLike
-                            || function.callable_type_kind(db) == kind =>
+                        if matches!(
+                            function.callable_type_kind(db),
+                            CallableTypeKind::FunctionLike | CallableTypeKind::BuiltinFunctionLike
+                        ) || function.callable_type_kind(db) == kind =>
                     {
                         Some(Type::FunctionLiteral(
                             function.with_descriptor_kind(db, kind),

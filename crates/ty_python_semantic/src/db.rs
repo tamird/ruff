@@ -89,6 +89,16 @@ pub trait Db: PythonCoreDb {
         None
     }
 
+    /// Whether a supplied declaration describes a native builtin function.
+    ///
+    /// The declaration retains its signature and identity, but its runtime class is
+    /// `types.BuiltinFunctionType`. Every declaration in an overload family must agree.
+    /// Implementations must read tracked declaration inputs and must not infer the function's
+    /// signature or body.
+    fn provided_function_is_builtin(&self, _definition: Definition<'_>) -> bool {
+        false
+    }
+
     /// Interprets an application-defined type subscription after resolving its constructor.
     ///
     /// Implementations must identify the resolved declaration and infer child annotations
@@ -419,6 +429,7 @@ pub(crate) mod tests {
         instance_fields_provider: Option<InstanceFieldsProvider>,
         type_test_provider: Option<TypeTestProvider>,
         getattr_result_provider: Option<GetattrResultProvider>,
+        builtin_function: Option<DeclarationPredicate>,
         keyword_field_factory: Option<DeclarationPredicate>,
         parameter_contents_preserver: Option<ParameterPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
@@ -454,6 +465,7 @@ pub(crate) mod tests {
                 instance_fields_provider: None,
                 type_test_provider: None,
                 getattr_result_provider: None,
+                builtin_function: None,
                 keyword_field_factory: None,
                 parameter_contents_preserver: None,
                 source_provider: None,
@@ -558,6 +570,11 @@ pub(crate) mod tests {
 
     #[salsa::db]
     impl Db for TestDb {
+        fn provided_function_is_builtin(&self, definition: Definition<'_>) -> bool {
+            self.builtin_function
+                .is_some_and(|predicate| predicate(self, definition))
+        }
+
         fn provided_function_return_type<'db>(
             &'db self,
             definition: Definition<'db>,
@@ -776,6 +793,7 @@ pub(crate) mod tests {
         instance_fields_provider: Option<InstanceFieldsProvider>,
         type_test_provider: Option<TypeTestProvider>,
         getattr_result_provider: Option<GetattrResultProvider>,
+        builtin_function: Option<DeclarationPredicate>,
         keyword_field_factory: Option<DeclarationPredicate>,
         parameter_contents_preserver: Option<ParameterPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
@@ -800,6 +818,7 @@ pub(crate) mod tests {
                 instance_fields_provider: None,
                 type_test_provider: None,
                 getattr_result_provider: None,
+                builtin_function: None,
                 keyword_field_factory: None,
                 parameter_contents_preserver: None,
                 source_provider: None,
@@ -888,6 +907,11 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_builtin_function(mut self, predicate: DeclarationPredicate) -> Self {
+            self.builtin_function = Some(predicate);
+            self
+        }
+
         pub(crate) fn with_parameter_contents_preserver(
             mut self,
             provider: ParameterPredicate,
@@ -937,6 +961,7 @@ pub(crate) mod tests {
             db.instance_fields_provider = self.instance_fields_provider;
             db.type_test_provider = self.type_test_provider;
             db.getattr_result_provider = self.getattr_result_provider;
+            db.builtin_function = self.builtin_function;
             db.keyword_field_factory = self.keyword_field_factory;
             db.parameter_contents_preserver = self.parameter_contents_preserver;
             db.source_provider = self.source_provider;

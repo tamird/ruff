@@ -793,14 +793,28 @@ impl<'db> OverloadLiteral<'db> {
 pub struct FunctionLiteral<'db> {
     pub(crate) last_definition: OverloadLiteral<'db>,
     overloaded: bool,
+    is_builtin: bool,
 }
 
 impl<'db> FunctionLiteral<'db> {
-    pub(super) fn new(db: &'db dyn Db, last_definition: OverloadLiteral<'db>) -> Self {
+    pub(super) fn new(
+        db: &'db dyn Db,
+        last_definition: OverloadLiteral<'db>,
+        is_builtin: bool,
+    ) -> Self {
         Self {
             last_definition,
             overloaded: last_definition.is_overload(db)
                 || last_definition.previous_overload(db).is_some(),
+            is_builtin,
+        }
+    }
+
+    const fn unwrapped_callable_kind(self) -> CallableTypeKind {
+        if self.is_builtin {
+            CallableTypeKind::BuiltinFunctionLike
+        } else {
+            CallableTypeKind::FunctionLike
         }
     }
 
@@ -1196,7 +1210,7 @@ impl<'db> FunctionType<'db> {
 
     pub(super) fn underlying_function(self, db: &'db dyn Db) -> Self {
         if self.is_classmethod(db) || self.is_staticmethod(db) {
-            self.with_descriptor_kind(db, CallableTypeKind::FunctionLike)
+            self.with_descriptor_kind(db, self.literal(db).unwrapped_callable_kind())
         } else {
             self
         }
@@ -1737,18 +1751,14 @@ impl<'db> FunctionType<'db> {
         } else if self.is_staticmethod(db) {
             CallableTypeKind::StaticMethodLike
         } else {
-            CallableTypeKind::FunctionLike
+            self.literal(db).unwrapped_callable_kind()
         }
     }
 
     pub(super) fn runtime_class(self, db: &'db dyn Db) -> KnownClass {
-        if self.is_classmethod(db) {
-            KnownClass::Classmethod
-        } else if self.is_staticmethod(db) {
-            KnownClass::Staticmethod
-        } else {
-            KnownClass::FunctionType
-        }
+        self.callable_type_kind(db)
+            .runtime_class()
+            .expect("function literal has a runtime class")
     }
 
     /// Convert the `FunctionType` into a [`CallableType`].

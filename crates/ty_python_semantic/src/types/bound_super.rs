@@ -836,7 +836,10 @@ impl<'db> BoundSuperType<'db> {
             Type::KnownInstance(instance) => {
                 return delegate_to(instance.instance_fallback(db, env));
             }
-            Type::FunctionLiteral(_) | Type::DataclassDecorator(_) => {
+            Type::FunctionLiteral(function) => {
+                return delegate_to(function.runtime_class(db).to_instance(db, env));
+            }
+            Type::DataclassDecorator(_) => {
                 return delegate_to(KnownClass::FunctionType.to_instance(db, env));
             }
             Type::WrapperDescriptor(_) => {
