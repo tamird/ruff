@@ -25,6 +25,15 @@ pub trait Db: PythonCoreDb {
         ProvidedBindingValue::Unresolved.into()
     }
 
+    /// Whether values exported by this module are frozen before a supplied binding can read them.
+    ///
+    /// The application must guarantee completed evaluation and prevent later mutation through
+    /// every alias. This permits observing the existing end-of-module contents; it does not
+    /// erase mutations or escapes during evaluation. Ordinary Python modules do not qualify.
+    fn provided_exports_are_frozen(&self, _file: ProgramFile<'_>) -> bool {
+        false
+    }
+
     /// Overrides a name in the builtin namespace of an embedded program.
     /// `None` selects ordinary Python lookup; `Some(Unresolved)` hides that name.
     fn provided_builtin<'db>(
@@ -308,6 +317,10 @@ pub(crate) mod tests {
             None
         }
 
+        fn exports_are_frozen(&self, _db: &TestDb, _file: ProgramFile<'_>) -> bool {
+            false
+        }
+
         fn exclusions(
             &self,
             _db: &TestDb,
@@ -572,6 +585,12 @@ pub(crate) mod tests {
                 || ProvidedBindingValue::Unresolved.into(),
                 |provider| provider.binding(self, definition),
             )
+        }
+
+        fn provided_exports_are_frozen(&self, file: ProgramFile<'_>) -> bool {
+            self.source_provider
+                .as_ref()
+                .is_some_and(|provider| provider.exports_are_frozen(self, file))
         }
 
         fn provided_builtin<'db>(

@@ -6292,6 +6292,7 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                 let (definition, count) = self.create_definition_with_kind(place, key, kind);
                 assert_eq!(count, 1, "provided binding targets must be unique");
                 self.record_definition(place, definition, None);
+                self.record_contents_initializer(definition);
                 definitions.push(definition);
             }
             self.definitions_by_node

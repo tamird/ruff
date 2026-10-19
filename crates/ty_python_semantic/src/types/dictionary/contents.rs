@@ -22,6 +22,7 @@ use ty_python_core::{
 };
 
 use crate::place::loop_header_reachability;
+use crate::provided::ProvidedBindingValue;
 use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
 use crate::types::call::CallArguments;
 use crate::types::infer::{
@@ -766,6 +767,23 @@ fn initial_contents<'db>(
     if !explicit_typed_dict && !super::has_dict_type(db, &env, bound_type) {
         return ContentsValue::Unavailable;
     }
+    if matches!(definition.kind(db), DefinitionKind::ProvidedBinding(_))
+        && let ProvidedBindingValue::Export {
+            file,
+            name,
+            value: None,
+        } = db.provided_binding(definition).value
+        && db.provided_exports_are_frozen(file)
+        && let Some(mut contents) = frozen_export_contents(db, file, &name)
+    {
+        if let ContentsValue::Mapping(mapping) = &mut contents {
+            mapping.localize(
+                definition.program_file(db),
+                definition.kind(db).target_range(&module),
+            );
+        }
+        return contents;
+    }
     let index = semantic_index(db, file);
     let place = index
         .place_table(scope.file_scope_id(db))
@@ -940,6 +958,29 @@ fn initial_contents<'db>(
         mapping.uses_residual_presence = false;
     }
     ContentsValue::Mapping(mapping)
+}
+
+/// Observe completion through the same reaching definitions as local dictionary reads.
+/// Missing indexed history declines; no initializer snapshot can stand in for later effects.
+fn frozen_export_contents<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    name: &str,
+) -> Option<ContentsValue<'db>> {
+    let scope = ty_python_core::global_scope(db, file);
+    let index = semantic_index(db, file);
+    let table = index.place_table(scope.file_scope_id(db));
+    let symbol = table.symbol_id(name)?;
+    let contents = table.contents_place(symbol.into())?;
+    let use_def = index.use_def_map(scope.file_scope_id(db));
+    let reachability = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
+    let Contents { value, captured: _ } = from_bindings(
+        db,
+        scope,
+        use_def.end_of_scope_bindings(contents),
+        &reachability,
+    );
+    Some(value)
 }
 
 fn is_builtin_allocation<'db>(

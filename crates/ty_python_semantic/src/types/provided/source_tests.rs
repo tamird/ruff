@@ -2155,6 +2155,171 @@ fn supplied_class_identity_can_use_empty_declarations() -> anyhow::Result<()> {
     Ok(())
 }
 
+struct FrozenExports(bool);
+
+impl SourceProvider for FrozenExports {
+    fn statements(&self, db: &TestDb, file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
+        CommentedSource.statements(db, file)
+    }
+
+    fn annotation<'db>(
+        &self,
+        _db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        _owner: NodeIndex,
+    ) -> Option<ProvidedAnnotation<'db>> {
+        None
+    }
+
+    fn binding<'db>(
+        &self,
+        db: &'db TestDb,
+        definition: Definition<'db>,
+    ) -> ProvidedBindingResolution<'db> {
+        let DefinitionKind::ProvidedBinding(binding) = definition.kind(db) else {
+            return ProvidedBindingValue::Unresolved.into();
+        };
+        ProvidedBindingValue::Export {
+            file: db.program_file(system_path_to_file(db, "/src/exporter.py").unwrap()),
+            name: binding.binding.name.clone(),
+            value: None,
+        }
+        .into()
+    }
+
+    fn exports_are_frozen(&self, db: &TestDb, file: ProgramFile<'_>) -> bool {
+        self.0
+            && file
+                .file(db)
+                .path(db)
+                .as_system_path()
+                .map(SystemPath::as_str)
+                == Some("/src/exporter.py")
+    }
+
+    fn builtin<'db>(
+        &self,
+        _db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        _name: &str,
+        _usage: BuiltinUsage,
+    ) -> Option<ProvidedBindingValue<'db>> {
+        None
+    }
+}
+
+#[test]
+fn frozen_exports_observe_completed_mapping_contents() -> anyhow::Result<()> {
+    let source = "include(\"attrs\")\ndef observe(value: object) -> None: pass\nobserve(attrs)\n";
+    for frozen in [false, true] {
+        let mut db = TestDbBuilder::new()
+            .with_source_provider(FrozenExports(frozen))
+            .with_file("/src/main.py", source)
+            .with_file("/src/exporter.py", "attrs = {'name': 1}\n")
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        for (exporter, expected) in [
+            ("attrs = {'name': 1}\n", Some("Literal[1]")),
+            (
+                "attrs = {'name': 1}\nattrs['name'] = 2\n",
+                Some("Literal[2]"),
+            ),
+            (
+                "attrs = {'name': 1}\nattrs = {'name': 2}\n",
+                Some("Literal[2]"),
+            ),
+            ("attrs = {'name': 1}\nattrs.pop('name')\n", None),
+            (
+                "attrs = {'name': 1}\nalias = attrs\nalias['name'] = 2\n",
+                None,
+            ),
+            (
+                "original = {'name': 1}\nattrs = original\noriginal['name'] = 2\n",
+                None,
+            ),
+            (
+                "attrs = {'name': 1}\ndef mutate(value: dict[str, int]) -> None: value['name'] = 2\nmutate(attrs)\n",
+                None,
+            ),
+            ("include(\"attrs\")\nattrs = dict(attrs)\n", None),
+            ("attrs = {'name': 1}\n", Some("Literal[1]")),
+        ] {
+            db.write_file("/src/exporter.py", exporter)?;
+            let diagnostics = db.check_file(file);
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+            let program = db.program_file(file);
+            let module = parsed_module(&db, program.python_file(&db)).load(&db);
+            let Some(ast::Stmt::Expr(statement)) = module.suite().last() else {
+                panic!("expected observation");
+            };
+            let ast::Expr::Call(call) = statement.value.as_ref() else {
+                panic!("expected observation call");
+            };
+            let model = SemanticModel::new(&db, program);
+            let items = model.dictionary_items(&call.arguments.args[0]);
+            let name = items.as_ref().and_then(|items| {
+                items
+                    .items
+                    .iter()
+                    .find(|item| item.name == "name" && item.is_required())
+            });
+            assert_eq!(
+                name.map(|item| item
+                    .ty
+                    .display(&db, &model.program_environment())
+                    .to_string())
+                    .as_deref(),
+                expected.filter(|_| frozen),
+                "frozen={frozen}, {exporter}: {items:?}",
+            );
+        }
+    }
+
+    // Imported entries must carry local ranges before joining with a local allocation.
+    let mut db = TestDbBuilder::new()
+        .with_source_provider(FrozenExports(true))
+        .with_file("/src/main.py", "")
+        .with_file(
+            "/src/exporter.py",
+            &format!("{}attrs = {{'name': 1}}\n", "# padding\n".repeat(40)),
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for statements in [
+        "include(\"attrs\")\nif flag(): attrs = {'name': 2}\n",
+        "attrs = {'name': 2}\ninclude(\"attrs\")\n",
+    ] {
+        let source = format!(
+            "def flag() -> bool: return True\ndef observe(value: object) -> None: pass\n{statements}observe(attrs)\n"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let program = db.program_file(file);
+        let module = parsed_module(&db, program.python_file(&db)).load(&db);
+        let Some(ast::Stmt::Expr(statement)) = module.suite().last() else {
+            panic!("expected observation");
+        };
+        let ast::Expr::Call(call) = statement.value.as_ref() else {
+            panic!("expected observation call");
+        };
+        let model = SemanticModel::new(&db, program);
+        let items = model.dictionary_items(&call.arguments.args[0]).unwrap();
+        assert!(
+            items
+                .items
+                .iter()
+                .any(|item| item.name == "name" && item.is_required())
+        );
+        for item in &items.items {
+            assert!(item.source.end() <= TextSize::of(&source), "{item:?}");
+            assert!(
+                matches!(&source[item.source], "\"attrs\"" | "'name'"),
+                "{item:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn supplied_export_refinements_keep_source_resolution() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
