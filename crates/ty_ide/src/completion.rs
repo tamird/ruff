@@ -2558,6 +2558,7 @@ fn add_function_arg_completions<'db>(
             if p.is_positional_only
                 || p.is_variadic
                 || p.is_keyword_variadic
+                || !ruff_python_stdlib::identifiers::is_identifier(&p.name)
                 || !set_function_args.insert(p.name.as_str())
             {
                 continue;
@@ -6073,6 +6074,26 @@ foo(bar=1, b<CURSOR>
             builder.skip_keywords().skip_builtins().skip_auto_import().build().snapshot(),
             @"baz="
         );
+    }
+
+    #[test]
+    fn unpacked_typed_dict_completions_require_identifiers() {
+        completion_test_builder(
+            "\
+from typing import TypedDict, Unpack
+
+Args = TypedDict('Args', {'valid': int, 'bad-key': int, 'class': int})
+def take(**kwargs: Unpack[Args]) -> None: ...
+take(<CURSOR>)
+",
+        )
+        .skip_keywords()
+        .skip_builtins()
+        .skip_auto_import()
+        .build()
+        .contains("valid")
+        .not_contains("bad-key")
+        .not_contains("class");
     }
 
     #[test]

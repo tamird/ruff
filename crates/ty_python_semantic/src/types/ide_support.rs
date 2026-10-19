@@ -988,6 +988,19 @@ pub struct CallSignatureParameter<'db> {
     pub is_keyword_variadic: bool,
 }
 
+impl CallSignatureParameter<'_> {
+    /// Whether this parameter can be suggested as a direct keyword argument.
+    ///
+    /// A callable can accept names that cannot appear directly in an argument list, such as a
+    /// key from an unpacked `TypedDict` containing a hyphen.
+    pub fn can_complete_as_keyword(&self) -> bool {
+        !self.is_positional_only
+            && !self.is_variadic
+            && !self.is_keyword_variadic
+            && ruff_python_stdlib::identifiers::is_identifier(&self.name)
+    }
+}
+
 impl<'db> CallSignatureDetails<'db> {
     /// Selects the displayed parameter for an argument, including an unfinished argument.
     pub fn active_parameter(&self, argument_index: usize) -> Option<usize> {
