@@ -11,9 +11,8 @@ use ruff_python_ast::{self as ast, AnyNodeRef};
 use ruff_text_size::Ranged;
 
 use crate::Db;
-use crate::types::dict::dict_literal_key_value_types;
 use crate::types::infer::{ExpressionInference, FrozenMap};
-use crate::types::iteration::refine_dict_snapshot_element_type;
+use crate::types::iteration::{precise_iterable_element_type, refine_dict_snapshot_element_type};
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
 use crate::types::tuple::{
     ResizeTupleError, Tuple, TupleBuilder, TupleElement, TupleLength, TupleSpec,
@@ -140,12 +139,13 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             UnpackKind::Iterable { mode } => {
                 let env = self.context.program_environment();
                 if !mode.is_async()
-                    && let ast::Expr::Dict(dict) = value_expr
-                    && let Some((keys, _)) = dict_literal_key_value_types(db, env, dict, |expr| {
-                        value_inference.expression_type(expr)
-                    })
+                    && matches!(value_expr, ast::Expr::Dict(_) | ast::Expr::List(_))
+                    && let Some(element) =
+                        precise_iterable_element_type(db, env, value_expr, |expr| {
+                            value_inference.expression_type(expr)
+                        })
                 {
-                    keys
+                    element
                 } else {
                     match value_type.try_iterate_with_mode(db, env, mode) {
                         Ok(tuple) => {

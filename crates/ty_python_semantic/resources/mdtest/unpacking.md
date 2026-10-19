@@ -1393,7 +1393,7 @@ def _(arg: tuple[tuple[int, int, int], tuple[int, str, bytes], tuple[int, int, s
 ### Same literal values
 
 ```py
-for a, b in ((1, 2), (3, 4)):
+for a, b in [(1, 2), (3, 4)]:
     reveal_type(a)  # revealed: Literal[1, 3]
     reveal_type(b)  # revealed: Literal[2, 4]
 ```

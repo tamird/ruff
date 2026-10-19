@@ -1,6 +1,7 @@
 use crate::Db;
 use crate::ProgramEnvironment;
 use crate::reachability::ReachabilityEvaluationCache;
+use crate::types::dict::dict_literal_key_value_types;
 use crate::types::dictionary::{DictionaryFallback, DictionaryItem, DictionaryItems};
 use crate::types::{
     AwaitError, Bindings, CallArguments, CallDunderError, KnownClass, LintDiagnosticGuard,
@@ -216,6 +217,23 @@ pub(crate) fn extract_fixed_length_iterable_element_types<'db>(
     let mut element_types = Vec::new();
     extend_fixed_length_iterable(db, env, iterable, &mut expression_type, &mut element_types)?;
     Some(element_types.into_boxed_slice())
+}
+
+/// Infer an immediately consumed iterable's element type from its already-inferred expressions.
+pub(super) fn precise_iterable_element_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    iterable: &ast::Expr,
+    expression_type: impl FnMut(&ast::Expr) -> Type<'db>,
+) -> Option<Type<'db>> {
+    if let ast::Expr::Dict(dict) = iterable {
+        return dict_literal_key_value_types(db, env, dict, expression_type).map(|(keys, _)| keys);
+    }
+
+    let element_types =
+        extract_fixed_length_iterable_element_types(db, env, iterable, expression_type)?;
+    (!element_types.is_empty())
+        .then(|| UnionType::from_elements(db, env, element_types.iter().copied()))
 }
 
 /// Refine elements of an immediately consumed dictionary items snapshot without changing its
