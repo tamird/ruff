@@ -6168,6 +6168,20 @@ impl<'db> Parameters<'db> {
         if self.is_top() {
             return Some(self.clone());
         }
+        if self.is_gradual() {
+            // A gradual tail can hide required keywords. Retain that uncertainty after dropping
+            // positional parameters, while preserving the known keyword inputs for call checking.
+            return Some(
+                Self::standard(
+                    self.iter()
+                        .filter(|parameter| {
+                            parameter.keyword_name().is_some() || parameter.is_keyword_variadic()
+                        })
+                        .map(Parameter::positional_or_keyword_to_keyword_only),
+                )
+                .with_incomplete_shape(),
+            );
+        }
         if let Some(tail) = self.keyword_projection_tail() {
             return Some(Self::standard([capture.clone().with_annotated_type(
                 Type::TypeVar(tail.captured_keyword_arguments(db)),

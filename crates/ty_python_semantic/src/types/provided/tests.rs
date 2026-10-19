@@ -1078,6 +1078,60 @@ fn assert_keyword_diagnostics(db: &TestDb, file: File, expected: &[(&str, &str)]
 }
 
 #[test]
+fn captured_keywords_specialize_gradual_parameters() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Any, Protocol
+class Keywords: ...
+class Wrapped[**P](Protocol):
+    def __call__(self, *, name: str, **kwargs: Keywords[P]) -> None: ...
+def identity[**P](callback: Wrapped[P]) -> Wrapped[P]:
+    return callback
+def target(*, name: str, srcs: list[str]) -> None: ...
+def check(dynamic: Any, explicit: Wrapped[...]) -> None:
+    inferred = identity(dynamic)
+    inferred(name="x", extra=1)
+    explicit(name="x", extra=1)
+    inferred(name=42)
+    inferred(extra=1)
+    inferred(0, name="x")
+    precise = identity(target)
+    precise(name="x", srcs=["file"])
+    precise(name="x", srcs=42)
+    precise(name="x")
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[
+            ("invalid-argument-type", "name=42"),
+            ("missing-argument", "inferred(extra=1)"),
+            ("too-many-positional-arguments", "0"),
+            ("invalid-argument-type", "srcs=42"),
+            ("missing-argument", "precise(name=\"x\")"),
+        ],
+    );
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let function = crate::place::global_symbol(&db, file, "check")
+        .place
+        .expect_type()
+        .expect_function_literal();
+    let projected = function.last_definition_signature(&db).parameters()[1].annotated_type();
+    let env = db.program_environment();
+    let known = Type::single_callable(
+        &db,
+        Signature::new(
+            Parameters::standard([Parameter::keyword_only(Name::new_static("name"))
+                .with_annotated_type(KnownClass::Str.to_instance(&db, &env))]),
+            Type::none(&db, &env),
+        ),
+    );
+    assert!(projected.is_assignable_to(&db, &env, known));
+    assert!(!projected.is_subtype_of(&db, &env, known));
+    Ok(())
+}
+
+#[test]
 fn captured_keywords_contextualize_individual_arguments() -> anyhow::Result<()> {
     let db = keyword_capture_db(
         r#"from typing import Protocol, TypedDict
