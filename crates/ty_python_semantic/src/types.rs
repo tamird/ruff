@@ -4973,7 +4973,14 @@ impl<'db> Type<'db> {
             Type::Dynamic(_) | Type::Divergent(_) | Type::Never => Place::bound(self).into(),
 
             Type::NominalInstance(instance) => {
-                instance.class(db, env).instance_member(db, env, name)
+                if let Some(field) = instance
+                    .provided_instance()
+                    .and_then(|provided| provided.field(db, name))
+                {
+                    field.instance_member()
+                } else {
+                    instance.class(db, env).instance_member(db, env, name)
+                }
             }
             Type::NewTypeInstance(newtype) => newtype
                 .concrete_base_type(db)

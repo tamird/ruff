@@ -238,6 +238,14 @@ impl<'db> AllMembers<'db> {
 
             Type::NominalInstance(instance) => {
                 let class = instance.class(db, env).class_literal(db);
+                if let Some(provided) = instance.provided_instance() {
+                    self.extend_with_member_names(
+                        db,
+                        env,
+                        ty,
+                        provided.fields(db).iter().map(|field| &field.name),
+                    );
+                }
                 self.extend_with_instance_members(db, env, ty, class);
                 self.extend_with_synthetic_members(db, env, ty, class);
             }
@@ -689,12 +697,22 @@ impl<'db> AllMembers<'db> {
         } else {
             &[]
         };
-        for name in class
+        let names = class
             .members(db)
             .iter()
             .map(|(name, _)| name)
-            .chain(instance_fields.iter().map(|field| &field.name))
-        {
+            .chain(instance_fields.iter().map(|field| &field.name));
+        self.extend_with_member_names(db, env, ty, names);
+    }
+
+    fn extend_with_member_names<'a>(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        names: impl IntoIterator<Item = &'a Name>,
+    ) {
+        for name in names {
             let Some(member_type) = ty.member(db, env, name).place.ignore_possibly_undefined()
             else {
                 continue;

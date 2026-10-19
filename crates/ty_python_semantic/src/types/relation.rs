@@ -1988,12 +1988,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                     self.check_type_pair(db, source_argument, target_typeform.type_argument(db))
                 }),
 
-            (Type::GenericAlias(_), Type::NominalInstance(target_instance))
-                if target_instance.has_known_class(db, KnownClass::GenericAlias) =>
-            {
-                self.always()
-            }
-
             (Type::EnumComplement(complement), Type::LiteralValue(_) | Type::Union(_)) => {
                 self.check_type_pair(db, complement.remaining_literal_union(db, env), target)
             }
@@ -2109,46 +2103,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 self.constraints,
                 source_sentinel.is_same_sentinel(db, target_sentinel),
             ),
-
-            // A nominal descriptor annotation specifies the wrapped callable through `__func__`.
-            // Comparing that contract directly preserves overloads and avoids replacing the
-            // wrapped callable's parameter and return types with the default specialization.
-            (
-                Type::KnownInstance(KnownInstanceType::MethodWrapper(wrapper)),
-                Type::NominalInstance(target_instance),
-            ) if target_instance
-                .class(db, env)
-                .is_known(db, wrapper.class(db)) =>
-            {
-                self.with_recursion_guard(db, source, target, || {
-                    let Some(target_function) = target
-                        .member_lookup_with_policy(
-                            db,
-                            env,
-                            "__func__",
-                            MemberLookupPolicy::NO_INSTANCE_FALLBACK,
-                        )
-                        .place
-                        .ignore_possibly_undefined()
-                    else {
-                        return self.never();
-                    };
-                    self.check_type_pair(db, wrapper.wrapped(db), target_function)
-                })
-            }
-
-            // When checking `FunctoolsPartial <: functools.partial[T]`, we need to specialize
-            // the nominal instance with the partial's return type so the check is precise.
-            (
-                Type::KnownInstance(KnownInstanceType::FunctoolsPartial(partial)),
-                Type::NominalInstance(target_instance),
-            ) if target_instance
-                .class(db, env)
-                .is_known(db, KnownClass::FunctoolsPartial) =>
-            {
-                let specialized = partial.partial(db).into_functools_partial_instance(db, env);
-                self.check_type_pair(db, specialized, target)
-            }
 
             // Dynamic is only a subtype of `object` and only a supertype of `Never`; both were
             // handled above. It's always assignable, though.
@@ -2388,6 +2342,21 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 )
             }
 
+            // Check the whole receiver before splitting an intersection: one constituent may
+            // supply immutable storage while another narrows its value. Leave type variables to
+            // their bound and constraint handling below.
+            (_, Type::NominalInstance(target_instance))
+                if let Some(provided) = target_instance.provided_instance()
+                    && !matches!(source, Type::TypeVar(_)) =>
+            {
+                self.with_recursion_guard(db, source, target, || {
+                    self.check_type_pair(db, source, provided.base_instance(db))
+                        .and(db, self.constraints, || {
+                            self.check_provided_instance_fields(db, source, target, provided)
+                        })
+                })
+            }
+
             (Type::Intersection(intersection), _) => {
                 self.check_source_intersection(db, intersection, target)
             }
@@ -2437,6 +2406,52 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 // All inferable cases should have been handled above
                 assert!(!bound_typevar.is_inferable(db, self.inferable));
                 self.never()
+            }
+
+            (Type::GenericAlias(_), Type::NominalInstance(target_instance))
+                if target_instance.has_known_class(db, KnownClass::GenericAlias) =>
+            {
+                self.always()
+            }
+
+            // A nominal descriptor annotation specifies the wrapped callable through `__func__`.
+            // Comparing that contract directly preserves overloads and avoids replacing the
+            // wrapped callable's parameter and return types with the default specialization.
+            (
+                Type::KnownInstance(KnownInstanceType::MethodWrapper(wrapper)),
+                Type::NominalInstance(target_instance),
+            ) if target_instance
+                .class(db, env)
+                .is_known(db, wrapper.class(db)) =>
+            {
+                self.with_recursion_guard(db, source, target, || {
+                    let Some(target_function) = target
+                        .member_lookup_with_policy(
+                            db,
+                            env,
+                            "__func__",
+                            MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+                        )
+                        .place
+                        .ignore_possibly_undefined()
+                    else {
+                        return self.never();
+                    };
+                    self.check_type_pair(db, wrapper.wrapped(db), target_function)
+                })
+            }
+
+            // When checking `FunctoolsPartial <: functools.partial[T]`, we need to specialize
+            // the nominal instance with the partial's return type so the check is precise.
+            (
+                Type::KnownInstance(KnownInstanceType::FunctoolsPartial(partial)),
+                Type::NominalInstance(target_instance),
+            ) if target_instance
+                .class(db, env)
+                .is_known(db, KnownClass::FunctoolsPartial) =>
+            {
+                let specialized = partial.partial(db).into_functools_partial_instance(db, env);
+                self.check_type_pair(db, specialized, target)
             }
 
             // All other `NewType` assignments fall back to the concrete base type.

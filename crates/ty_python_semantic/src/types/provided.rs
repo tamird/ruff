@@ -187,6 +187,25 @@ pub struct ProvidedField<'db> {
     pub source: Option<FileRange>,
 }
 
+/// Presentation of a nominal instance with application-supplied fields.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, get_size2::GetSize, salsa::SalsaValue,
+)]
+pub enum ProvidedInstanceDisplay {
+    /// Use the ordinary instance display, including any type arguments.
+    #[default]
+    Full,
+    /// Show only the class name when the type arguments are internal to the embedding.
+    ClassName,
+}
+
+impl<'db> ProvidedField<'db> {
+    pub(super) fn instance_member(&self) -> PlaceAndQualifiers<'db> {
+        Place::declared(self.ty)
+            .with_qualifiers(TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE)
+    }
+}
+
 /// A source-created nominal class using Ty's ordinary member lookup and constructor analysis.
 pub struct ProvidedClass<'db> {
     pub name: Name,

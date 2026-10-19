@@ -25,7 +25,7 @@ use ty_python_core::{
 };
 
 use crate::place::implicit_builtins_symbol_source;
-use crate::provided::ProvidedBindingValue;
+use crate::provided::{ProvidedBindingValue, ProvidedField};
 use crate::types::{
     ClassBase, ClassLiteral, MemberLookupKey, MemberLookupPolicy, SubclassOfInner, Type,
     TypeQualifiers, binding_type,
@@ -407,6 +407,16 @@ pub(crate) fn definitions_for_attribute<'db>(
             continue;
         }
 
+        if let Type::NominalInstance(instance) = ty
+            && let Some(field) = instance
+                .provided_instance()
+                .and_then(|provided| provided.field(db, name_str))
+            && let Some(definitions) = provided_field_definition(db, env, ty, field)
+        {
+            resolved.extend(definitions);
+            continue;
+        }
+
         let meta_type = ty.to_meta_type(db, env);
 
         // Look up the attribute first on the meta-type, unless it's already a class-like type.
@@ -476,6 +486,36 @@ pub(crate) fn definitions_for_attribute<'db>(
     resolved
 }
 
+fn provided_field_definition<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    receiver: Type<'db>,
+    field: &ProvidedField<'db>,
+) -> Option<Vec<ResolvedDefinition<'db>>> {
+    let key = MemberLookupKey::new(
+        db,
+        env.program(db),
+        receiver,
+        field.name.as_str(),
+        MemberLookupPolicy::default(),
+    );
+    let class_member = Type::instance_lookup_class_member_with_policy(db, env, key, receiver);
+    // Data descriptors precede instance storage. A slot represents that same storage.
+    let descriptor_precedes = class_member
+        .place
+        .ignore_possibly_undefined()
+        .is_some_and(|ty| {
+            !matches!(ty, Type::SlotDescriptor(_)) && ty.attribute_kind_for_read(db, env).is_data()
+        });
+    (!descriptor_precedes).then(|| {
+        field
+            .source
+            .into_iter()
+            .map(ResolvedDefinition::FileWithRange)
+            .collect()
+    })
+}
+
 fn definitions_for_attribute_in_class_hierarchy<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -504,34 +544,9 @@ fn definitions_for_attribute_in_class_hierarchy<'db>(
                     {
                         return resolved;
                     }
-                    let key = MemberLookupKey::new(
-                        db,
-                        env.program(db),
-                        receiver,
-                        attribute_name,
-                        MemberLookupPolicy::default(),
-                    );
-                    let class_member =
-                        Type::instance_lookup_class_member_with_policy(db, env, key, receiver);
-                    // Properties and other data descriptors precede instance storage. A slot
-                    // represents that same storage, so its inherited declaration does not hide
-                    // the supplied field (matching `invoke_descriptor_protocol`).
-                    let descriptor_precedes = class_member
-                        .place
-                        .ignore_possibly_undefined()
-                        .is_some_and(|ty| {
-                            !matches!(ty, Type::SlotDescriptor(_))
-                                && ty.attribute_kind_for_read(db, env).is_data()
-                        });
-                    if !descriptor_precedes {
+                    if let Some(definitions) = provided_field_definition(db, env, receiver, field) {
                         // An explicit field without source still shadows a base declaration.
-                        return Some(
-                            field
-                                .source
-                                .into_iter()
-                                .map(ResolvedDefinition::FileWithRange)
-                                .collect(),
-                        );
+                        return Some(definitions);
                     }
                 }
                 continue;

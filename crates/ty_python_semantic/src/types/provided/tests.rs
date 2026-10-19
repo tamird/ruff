@@ -23,6 +23,128 @@ use crate::types::{
 use crate::{HasType, SemanticModel};
 
 #[test]
+fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyhow::Result<()> {
+    fn refine<'db>(
+        db: &'db TestDb,
+        receiver: Type<'db>,
+        ty: Type<'db>,
+        source: Option<FileRange>,
+        display: ProvidedInstanceDisplay,
+    ) -> Type<'db> {
+        receiver
+            .with_provided_instance_fields(
+                db,
+                Box::from([ProvidedField {
+                    name: Name::new_static("value"),
+                    ty,
+                    source,
+                }]),
+                display,
+            )
+            .expect("nominal instance")
+    }
+
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.pyi",
+            "from typing import type_check_only\nclass Box[T]:\n    @type_check_only\n    def value(self) -> str: ...\nclass Child(Box[int]):\n    @property\n    def value(self) -> object: ...\nbox: Box[int]\nchild: Child\n",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.pyi")?;
+    let program_file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program_file);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, program_file, name)
+            .place
+            .expect_type()
+    };
+    let int = KnownClass::Int.to_instance(&db, &env);
+    let str = KnownClass::Str.to_instance(&db, &env);
+    let origin = FileRange::new(file, TextRange::new(0.into(), 4.into()));
+    let boxed = refine(
+        &db,
+        symbol("box"),
+        int,
+        Some(origin),
+        ProvidedInstanceDisplay::Full,
+    );
+    let equivalent = refine(
+        &db,
+        symbol("box"),
+        int,
+        None,
+        ProvidedInstanceDisplay::ClassName,
+    );
+    let incompatible = refine(&db, symbol("box"), str, None, ProvidedInstanceDisplay::Full);
+    let descriptor = refine(
+        &db,
+        symbol("child"),
+        int,
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+
+    assert!(boxed.is_assignable_to(&db, &env, equivalent));
+    assert!(!symbol("box").is_assignable_to(&db, &env, boxed));
+    assert!(!incompatible.is_assignable_to(&db, &env, boxed));
+    assert!(!descriptor.is_assignable_to(&db, &env, boxed));
+    assert_eq!(boxed.member(&db, &env, "value").place.expect_type(), int);
+    assert_eq!(
+        descriptor.member(&db, &env, "value").place.expect_type(),
+        Type::object()
+    );
+    assert_eq!(boxed.display(&db, &env).to_string(), "Box[int]");
+    assert_eq!(equivalent.display(&db, &env).to_string(), "Box");
+    assert_eq!(
+        definitions_for_attribute(&db, &env, boxed, "value"),
+        [crate::types::ide_support::ResolvedDefinition::FileWithRange(origin)]
+    );
+    let members = crate::types::list_members::all_members(&db, &env, boxed);
+    let value = members
+        .iter()
+        .find(|member| member.name == "value")
+        .unwrap();
+    assert_eq!(value.ty, int);
+    assert!(!value.is_type_check_only);
+
+    let readable_int = Type::protocol_with_readonly_members(&db, &env, [("value", int)]);
+    let narrowed = |receiver| {
+        IntersectionBuilder::new(&db, &env)
+            .positive_elements([receiver, readable_int])
+            .build()
+    };
+    let boxed_object = refine(
+        &db,
+        symbol("box"),
+        Type::object(),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    let masked_object = refine(
+        &db,
+        symbol("child"),
+        Type::object(),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    assert!(narrowed(boxed_object).is_assignable_to(&db, &env, boxed));
+    assert_eq!(
+        narrowed(masked_object)
+            .member(&db, &env, "value")
+            .place
+            .expect_type(),
+        int
+    );
+    assert!(!narrowed(masked_object).is_assignable_to(&db, &env, boxed));
+
+    let string_with_storage = refine(&db, str, int, None, ProvidedInstanceDisplay::Full);
+    assert!(!Type::string_literal(&db, "x").is_assignable_to(&db, &env, string_with_storage));
+    assert!(Type::unknown().is_assignable_to(&db, &env, boxed));
+    assert!(Type::Never.is_subtype_of(&db, &env, boxed));
+    Ok(())
+}
+
+#[test]
 fn deferred_nominal_fields_preserve_identity_and_follow_edits() -> anyhow::Result<()> {
     fn annotation<'db>(
         db: &'db TestDb,

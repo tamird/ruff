@@ -514,20 +514,18 @@ impl<'db> DynamicClassLiteral<'db> {
         else {
             return Member::unbound();
         };
-        let field = fields
-            .iter()
-            .find_map(|field| (field.name == name).then_some(field.ty));
-        let qualifiers = if field.is_some() {
-            TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE
+        if let Some(field) = fields.iter().find(|field| field.name == name) {
+            return Member {
+                inner: field.instance_member(),
+            };
+        }
+        if *has_dynamic_fields {
+            Member {
+                inner: Place::declared(Type::unknown()).with_qualifiers(TypeQualifiers::FINAL),
+            }
         } else {
-            TypeQualifiers::FINAL
-        };
-        field
-            .or_else(|| has_dynamic_fields.then(Type::unknown))
-            .map(|ty| Member {
-                inner: Place::declared(ty).with_qualifiers(qualifiers),
-            })
-            .unwrap_or_default()
+            Member::unbound()
+        }
     }
 
     /// Try to compute the MRO for this dynamic class.

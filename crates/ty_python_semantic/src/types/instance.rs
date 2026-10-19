@@ -6,12 +6,15 @@ use std::cell::Cell;
 use std::debug_assert_matches;
 use std::marker::PhantomData;
 
+use itertools::Either;
+
 use super::protocol_class::{ProtocolInterface, ProtocolInterfaceView, StructuralMemberPriority};
 use super::{
     BoundTypeVarIdentity, BoundTypeVarInstance, ClassType, DivergentType, KnownClass,
     MaterializationKind, SubclassOfType, Type, TypeAliasType,
 };
-use crate::place::PlaceAndQualifiers;
+use crate::place::{Place, PlaceAndQualifiers};
+use crate::provided::{ProvidedField, ProvidedInstanceDisplay};
 use crate::types::constraints::{
     ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, OwnedConstraintSet,
 };
@@ -35,13 +38,47 @@ use crate::types::visitor::{
 };
 use crate::types::{
     ApplyTypeMappingVisitor, CallableType, ClassBase, ClassLiteral, ErrorContext,
-    FindLegacyTypeVarsVisitor, TypeContext, TypeMapping, VarianceInferable, VarianceTerm,
+    FindLegacyTypeVarsVisitor, IntersectionBuilder, TypeContext, TypeMapping, TypeQualifiers,
+    VarianceInferable, VarianceTerm,
 };
 use crate::{Db, FxOrderSet};
 pub(super) use synthesized_protocol::SynthesizedProtocolType;
 use ty_python_core::definition::Definition;
 
 impl<'db> Type<'db> {
+    /// Refines an instance with immutable storage supplied by an embedding application.
+    ///
+    /// The runtime class is unchanged. Each field is guaranteed to exist in instance storage,
+    /// and callable field values do not bind as methods. Field names must be unique. Returns
+    /// `None` for instances whose class has special semantics, including tuple and `Any` bases.
+    /// Field source locations and display style affect presentation only; relations ignore them.
+    /// Simplifying a union may discard presentation metadata from an equivalent type.
+    pub fn with_provided_instance_fields(
+        self,
+        db: &'db dyn Db,
+        mut fields: Box<[ProvidedField<'db>]>,
+        display: ProvidedInstanceDisplay,
+    ) -> Option<Self> {
+        let Self::NominalInstance(NominalInstanceType(NominalInstanceInner::NonTuple(
+            NominalInstanceClass::Plain(class),
+        ))) = self
+        else {
+            return None;
+        };
+        fields.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        if fields
+            .windows(2)
+            .any(|pair| matches!(pair, [left, right] if left.name == right.name))
+        {
+            return None;
+        }
+        Some(Self::NominalInstance(NominalInstanceType(
+            NominalInstanceInner::NonTuple(NominalInstanceClass::WithFields(
+                ProvidedNominalInstance::new(db, class, fields, display),
+            )),
+        )))
+    }
+
     pub(crate) const fn object() -> Self {
         Type::NominalInstance(NominalInstanceType(NominalInstanceInner::Object))
     }
@@ -224,12 +261,26 @@ pub(super) fn walk_nominal_instance_type<'db, V: super::visitor::TypeVisitor<'db
         NominalInstanceInner::Object => {}
         NominalInstanceInner::NonTuple(class) => {
             visitor.visit_type(db, class.class(db).into());
+            if let NominalInstanceClass::WithFields(provided) = class {
+                for field in provided.fields(db) {
+                    visitor.visit_type(db, field.ty);
+                }
+            }
         }
         NominalInstanceInner::SysVersionInfo => {}
     }
 }
 
 impl<'db> NominalInstanceType<'db> {
+    pub(super) fn provided_instance(self) -> Option<ProvidedNominalInstance<'db>> {
+        match self.0 {
+            NominalInstanceInner::NonTuple(NominalInstanceClass::WithFields(provided)) => {
+                Some(provided)
+            }
+            _ => None,
+        }
+    }
+
     fn from_class(db: &'db dyn Db, class: ClassType<'db>) -> Self {
         Self(NominalInstanceInner::NonTuple(
             NominalInstanceClass::from_class(db, class),
@@ -426,7 +477,16 @@ impl<'db> NominalInstanceType<'db> {
                     .class(db)
                     .recursive_type_normalized_impl(db, env, div, nested)?;
                 Some(Self(NominalInstanceInner::NonTuple(
-                    class.with_class(db, transformed),
+                    class
+                        .try_with_class_and_mapped_fields(db, transformed, |ty| {
+                            let ty = ty.recursive_type_normalized_impl(db, env, div, true);
+                            if nested {
+                                ty.ok_or(())
+                            } else {
+                                Ok(ty.unwrap_or(div))
+                            }
+                        })
+                        .ok()?,
                 )))
             }
         }
@@ -472,7 +532,11 @@ impl<'db> NominalInstanceType<'db> {
                         .class(db)
                         .apply_type_mapping_impl(db, type_mapping, tcx, visitor);
                 Type::NominalInstance(Self(NominalInstanceInner::NonTuple(
-                    class.with_class(db, transformed),
+                    class
+                        .try_with_class_and_mapped_fields(db, transformed, |ty| {
+                            Ok(ty.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
+                        })
+                        .unwrap_or_else(|never: std::convert::Infallible| match never {}),
                 )))
             }
         }
@@ -499,6 +563,17 @@ impl<'db> NominalInstanceType<'db> {
                     typevars,
                     visitor,
                 );
+                if let NominalInstanceClass::WithFields(provided) = class {
+                    for field in provided.fields(db) {
+                        field.ty.find_legacy_typevars_impl(
+                            db,
+                            env,
+                            binding_context,
+                            typevars,
+                            visitor,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1039,12 +1114,90 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 NominalInstanceInner::ExactTuple(source_tuple),
                 NominalInstanceInner::ExactTuple(target_tuple),
             ) => self.check_tuple_type_pair(db, source_tuple, target_tuple),
-            _ => {
-                let env = self.env;
-                self.check_class_pair(db, source.class(db, env), target.class(db, env))
-            }
+            _ => self.check_class_pair(db, source.class(db, self.env), target.class(db, self.env)),
         }
     }
+
+    pub(super) fn check_provided_instance_fields(
+        &self,
+        db: &'db dyn Db,
+        source: Type<'db>,
+        target: Type<'db>,
+        provided: ProvidedNominalInstance<'db>,
+    ) -> ConstraintSet<'db, 'c> {
+        let env = self.env;
+        provided
+            .fields(db)
+            .iter()
+            .when_all(db, self.constraints, |field| {
+                let Some(storage) = provided_field_storage_type(db, env, source, field) else {
+                    return self.never();
+                };
+                self.check_type_pair(db, storage, field.ty)
+                    .and(db, self.constraints, || {
+                        let visible = |receiver: Type<'db>| {
+                            let Place::Defined(member) =
+                                receiver.member(db, env, field.name.as_str()).place
+                            else {
+                                return None;
+                            };
+                            member.is_definitely_defined().then_some(member.ty)
+                        };
+                        match (visible(source), visible(target)) {
+                            (Some(source), Some(target)) => {
+                                self.check_type_pair(db, source, target)
+                            }
+                            _ => self.never(),
+                        }
+                    })
+            })
+    }
+}
+
+/// Returns the guaranteed physical storage type for one field on the receiver.
+fn provided_field_storage_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    receiver: Type<'db>,
+    field: &ProvidedField<'db>,
+) -> Option<Type<'db>> {
+    if receiver.has_immutable_field_path(db, env, std::slice::from_ref(&field.name)) {
+        let Place::Defined(member) = receiver.member(db, env, field.name.as_str()).place else {
+            return None;
+        };
+        return member.is_definitely_defined().then_some(member.ty);
+    }
+
+    // When a data descriptor masks instance storage, a protocol can narrow what is read without
+    // narrowing the stored value. Combine only physical storage from nominal constituents.
+    let constituents = match receiver {
+        Type::NominalInstance(_) => Either::Left(std::iter::once(receiver)),
+        Type::Intersection(intersection) => {
+            Either::Right(intersection.positive(db).iter().copied())
+        }
+        _ => return None,
+    };
+    let mut storage = constituents.filter_map(|constituent| {
+        if !matches!(constituent, Type::NominalInstance(_)) {
+            return None;
+        }
+        let member = constituent.instance_member(db, env, field.name.as_str());
+        let Place::Defined(place) = member.place else {
+            return None;
+        };
+        (place.is_definitely_defined()
+            && member
+                .qualifiers
+                .contains(TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE))
+        .then_some(place.ty)
+    });
+    let first = storage.next()?;
+    Some(match storage.next() {
+        None => first,
+        Some(second) => IntersectionBuilder::new(db, env)
+            .positive_elements([first, second].into_iter().chain(storage))
+            .build(),
+    })
 }
 
 /// Returns the finite members of a protocol interface, omitting members that refer back to its
@@ -1225,6 +1378,35 @@ struct ExplicitAnyInstanceClass<'db> {
 // The Salsa heap is tracked separately.
 impl get_size2::GetSize for ExplicitAnyInstanceClass<'_> {}
 
+/// A nominal instance refined with immutable, application-supplied storage.
+#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
+pub(super) struct ProvidedNominalInstance<'db> {
+    #[returns(copy)]
+    class: ClassType<'db>,
+    #[returns(deref)]
+    pub(super) fields: Box<[ProvidedField<'db>]>,
+    #[returns(copy)]
+    pub(super) display: ProvidedInstanceDisplay,
+}
+
+impl get_size2::GetSize for ProvidedNominalInstance<'_> {}
+
+impl<'db> ProvidedNominalInstance<'db> {
+    pub(super) fn base_instance(self, db: &'db dyn Db) -> Type<'db> {
+        Type::NominalInstance(NominalInstanceType(NominalInstanceInner::NonTuple(
+            NominalInstanceClass::Plain(self.class(db)),
+        )))
+    }
+
+    pub(super) fn field(self, db: &'db dyn Db, name: &str) -> Option<&'db ProvidedField<'db>> {
+        let fields = self.fields(db);
+        let index = fields
+            .binary_search_by(|field| field.name.as_str().cmp(name))
+            .ok()?;
+        Some(&fields[index])
+    }
+}
+
 /// The class stored by a non-tuple nominal instance.
 ///
 /// Interning the uncommon explicit-`Any` case lets this type store the additional semantic bit
@@ -1233,6 +1415,7 @@ impl get_size2::GetSize for ExplicitAnyInstanceClass<'_> {}
 enum NominalInstanceClass<'db> {
     Plain(ClassType<'db>),
     InheritsFromExplicitAny(ExplicitAnyInstanceClass<'db>),
+    WithFields(ProvidedNominalInstance<'db>),
 }
 
 impl<'db> NominalInstanceClass<'db> {
@@ -1252,16 +1435,41 @@ impl<'db> NominalInstanceClass<'db> {
         match self {
             Self::Plain(class) => class,
             Self::InheritsFromExplicitAny(class) => class.class(db),
+            Self::WithFields(provided) => provided.class(db),
         }
     }
 
-    fn with_class(self, db: &'db dyn Db, class: ClassType<'db>) -> Self {
-        match self {
+    fn try_with_class_and_mapped_fields<E>(
+        self,
+        db: &'db dyn Db,
+        class: ClassType<'db>,
+        mut map: impl FnMut(Type<'db>) -> Result<Type<'db>, E>,
+    ) -> Result<Self, E> {
+        Ok(match self {
             Self::Plain(_) => Self::Plain(class),
             Self::InheritsFromExplicitAny(_) => {
                 Self::InheritsFromExplicitAny(ExplicitAnyInstanceClass::new(db, class))
             }
-        }
+            Self::WithFields(provided) => {
+                let fields = provided
+                    .fields(db)
+                    .iter()
+                    .map(|ProvidedField { name, ty, source }| {
+                        Ok(ProvidedField {
+                            name: name.clone(),
+                            ty: map(*ty)?,
+                            source: *source,
+                        })
+                    })
+                    .collect::<Result<Box<_>, E>>()?;
+                Self::WithFields(ProvidedNominalInstance::new(
+                    db,
+                    class,
+                    fields,
+                    provided.display(db),
+                ))
+            }
+        })
     }
 }
 
@@ -1313,7 +1521,19 @@ impl<'db> VarianceInferable<'db> for NominalInstanceType<'db> {
         env: &ProgramEnvironment<'db>,
         typevar: BoundTypeVarIdentity<'db>,
     ) -> VarianceTerm<'db> {
-        self.class(db, env).variance_of(db, env, typevar)
+        let class = self.class(db, env).variance_of(db, env, typevar);
+        let Some(provided) = self.provided_instance() else {
+            return class;
+        };
+        VarianceTerm::join(
+            db,
+            std::iter::once(class).chain(
+                provided
+                    .fields(db)
+                    .iter()
+                    .map(|field| field.ty.variance_of(db, env, typevar)),
+            ),
+        )
     }
 }
 

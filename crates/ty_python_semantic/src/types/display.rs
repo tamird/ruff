@@ -692,6 +692,20 @@ impl<'db> TypeVisitor<'db> for AmbiguousNameCollector<'_, 'db> {
             Type::ProtocolInstance(protocol) if let Some(class) = protocol.class_origin(db) => {
                 return self.visit_type(db, Type::from(class));
             }
+            Type::NominalInstance(instance)
+                if let Some(provided) = instance.provided_instance() =>
+            {
+                let class = instance.class(db, self.env);
+                match provided.display(db) {
+                    crate::provided::ProvidedInstanceDisplay::Full => {
+                        self.visit_type(db, Type::from(class));
+                    }
+                    crate::provided::ProvidedInstanceDisplay::ClassName => {
+                        self.record_class(db, class.class_literal(db));
+                    }
+                }
+                return;
+            }
             // no need to recurse into TypeVar bounds/constraints
             Type::TypeVar(_) => return,
             _ => {}
@@ -1174,6 +1188,15 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'_, 'db> {
             Type::RecursiveVar(_) => unreachable!("display of an unbound recursive variable"),
             Type::Never => f.with_type(self.ty).write_str("Never"),
             Type::NominalInstance(instance) => {
+                if instance.provided_instance().is_some_and(|provided| {
+                    provided.display(db) == crate::provided::ProvidedInstanceDisplay::ClassName
+                }) {
+                    return instance
+                        .class(db, self.env)
+                        .class_literal(db)
+                        .display_with(db, self.settings.clone())
+                        .fmt_detailed(f);
+                }
                 let class = instance.class(db, self.env);
 
                 match (class, class.known(db)) {
