@@ -542,12 +542,25 @@ impl<'db> DictionaryItems<'db> {
                     return Err(DictionaryFallback::Unavailable);
                 }
                 let key_ty = UnionBuilder::new(db, env).add(key_ty).build();
+                let source = comprehension_field_source(db, key, value, expression_type);
+                if let Some(source) = source
+                    && key_ty == KnownClass::Str.to_instance(db, env)
+                {
+                    // A successful lookup preserves each source field's value type even when
+                    // the iterator yields arbitrary strings. No particular key must be present.
+                    let mut copied = Self::unpacked(db, env, Type::TypedDict(source), key.range())
+                        .ok_or(DictionaryFallback::Unavailable)?;
+                    for item in &mut copied.items {
+                        item.ty = IntersectionType::from_two_elements(db, env, value_ty, item.ty);
+                        item.kind = DictionaryItemKind::Residual;
+                    }
+                    return Ok(copied);
+                }
                 let keys = match &key_ty {
                     Type::Union(union) => union.elements(db),
                     ty => std::slice::from_ref(ty),
                 };
-                let source_fields = comprehension_field_source(db, key, value, expression_type)
-                    .map(|source| source.items(db));
+                let source_fields = source.map(|source| source.items(db));
                 let items = keys
                     .iter()
                     .map(|ty| {

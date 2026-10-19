@@ -112,13 +112,30 @@ def require_tags(*, tags: list[str]) -> None: ...
 def incomplete(options: Options) -> None:
     selected = {key: options[key] for key in ("enabled",) if key in options}
     require_tags(**selected)  # error: [missing-argument]
+```
 
+Even an unknown set of keys preserves the types of copied fields. The result may also contain
+additional keys allowed by the source.
+
+```py
 class OpenOptions(TypedDict, extra_items=object):
     enabled: NotRequired[bool]
 
 def consume_enabled(*, enabled: bool = False) -> None: ...
 def unknown_keys(options: OpenOptions, keys: list[str]) -> None:
     selected = {key: options[key] for key in keys if key in options}
+    consume_enabled(**selected)  # no diagnostic
+
+    selected["enabled"] = ["wrong"]
+    consume_enabled(**selected)  # error: [invalid-argument-type]
+
+def consume_count(*, count: int) -> None: ...
+def extra_keys(options: OpenOptions, keys: list[str]) -> None:
+    selected = {key: options.pop(key) for key in keys if key in options}
+    consume_count(**selected)  # error: [invalid-argument-type]
+
+def get_with_default(options: OpenOptions, keys: list[str]) -> None:
+    selected = {key: options.get(key, "wrong") for key in keys}
     consume_enabled(**selected)  # error: [invalid-argument-type]
 ```
 
