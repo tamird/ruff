@@ -368,6 +368,15 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         expression: &'ast ast::Expr,
         sources: &[&'ast ast::Expr],
     ) {
+        self.record_contents_snapshot_for_sources(expression, sources, false);
+    }
+
+    fn record_contents_snapshot_for_sources(
+        &mut self,
+        expression: &'ast ast::Expr,
+        sources: &[&'ast ast::Expr],
+        include_values: bool,
+    ) {
         let mut places: SmallVec<[_; 2]> = SmallVec::new();
         for &source in sources {
             let Some(contents) = self.contents_place(source) else {
@@ -394,7 +403,22 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 .current_bindings(receiver)
                 .map(|binding| binding.binding())
                 .collect();
-            if original == current && !places.contains(&(receiver, contents)) {
+            if original != current || places.iter().any(|(recorded, _)| *recorded == receiver) {
+                continue;
+            }
+            if include_values {
+                let table = self.current_place_table();
+                places.extend(
+                    table
+                        .associated_place_ids(receiver)
+                        .iter()
+                        .filter_map(|id| {
+                            let member = table.member(*id);
+                            (member.is_contents() && member.expression().num_segments() == 2)
+                                .then_some((receiver, (*id).into()))
+                        }),
+                );
+            } else {
                 places.push((receiver, contents));
             }
         }
@@ -426,6 +450,16 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         expression: &'ast ast::Expr,
         call: &'ast ast::ExprCall,
     ) {
+        let unpacked: SmallVec<[_; 2]> = call
+            .arguments
+            .keywords
+            .iter()
+            .filter(|keyword| keyword.arg.is_none() && keyword.value.is_name_expr())
+            .map(|keyword| &keyword.value)
+            .collect();
+        if !unpacked.is_empty() {
+            self.record_contents_snapshot_for_sources(expression, &unpacked, true);
+        }
         // A positional mapping is copied after every argument has evaluated.
         if let [source] = call.arguments.args.as_ref() {
             self.record_contents_snapshot(expression, &[source]);
@@ -644,8 +678,16 @@ struct Candidate<'ast> {
     receiver: &'ast ast::Expr,
     dependencies: Vec<usize>,
     observed: bool,
-    assigned: bool,
-    retaining_call: Option<&'ast ast::ExprCall>,
+    unpacked: bool,
+    assignment: CandidateAssignment<'ast>,
+}
+
+#[derive(Clone, Copy)]
+enum CandidateAssignment<'ast> {
+    Unassigned,
+    RetainingCall(&'ast ast::ExprCall),
+    Dictionary(&'ast ast::ExprDict),
+    Other,
 }
 
 /// The graph carries only place identity, and is discarded before normal indexing. A demand
@@ -670,8 +712,8 @@ impl<'ast> Candidates<'ast, '_> {
                 receiver,
                 dependencies: Vec::new(),
                 observed: false,
-                assigned: false,
-                retaining_call: None,
+                unpacked: false,
+                assignment: CandidateAssignment::Unassigned,
             });
             next
         });
@@ -695,22 +737,27 @@ impl<'ast> Candidates<'ast, '_> {
             return;
         };
         let candidate = &mut self.nodes[index];
-        candidate.retaining_call = if !candidate.assigned
+        candidate.assignment = if matches!(candidate.assignment, CandidateAssignment::Unassigned)
             && target.is_name_expr()
-            && let ast::Expr::Call(call) = value
-            && call.arguments.args.is_empty()
-            && !call.arguments.keywords.is_empty()
-            && call
-                .arguments
-                .keywords
-                .iter()
-                .all(|keyword| keyword.arg.is_some())
         {
-            Some(call)
+            match value {
+                ast::Expr::Call(call)
+                    if call.arguments.args.is_empty()
+                        && !call.arguments.keywords.is_empty()
+                        && call
+                            .arguments
+                            .keywords
+                            .iter()
+                            .all(|keyword| keyword.arg.is_some()) =>
+                {
+                    CandidateAssignment::RetainingCall(call)
+                }
+                ast::Expr::Dict(dictionary) => CandidateAssignment::Dictionary(dictionary),
+                _ => CandidateAssignment::Other,
+            }
         } else {
-            None
+            CandidateAssignment::Other
         };
-        candidate.assigned = true;
         let mapping_syntax = match value {
             ast::Expr::Dict(_) => true,
             ast::Expr::DictComp(_) => true,
@@ -772,18 +819,65 @@ impl<'ast> Candidates<'ast, '_> {
         }
     }
 
-    fn finish(self) -> ContentsCandidates<'ast> {
+    fn finish(mut self) -> ContentsCandidates<'ast> {
+        let mut pending = Vec::new();
+        // An unpacked value has no separate argument expression. Register its place before
+        // indexing the assignment so the ordinary contents graph records later effects.
+        let mut unpacked_values = Vec::new();
+        for index in 0..self.nodes.len() {
+            let candidate = &self.nodes[index];
+            if candidate.observed {
+                pending.push(index);
+            }
+            let (true, CandidateAssignment::Dictionary(dictionary)) =
+                (candidate.unpacked, candidate.assignment)
+            else {
+                continue;
+            };
+            let Some(root) = MemberExprBuilder::visit_expr(candidate.receiver.into()) else {
+                continue;
+            };
+            for item in &dictionary.items {
+                let Some(key) = &item.key else {
+                    continue;
+                };
+                if !key.is_string_literal_expr() {
+                    continue;
+                }
+                let dependency = match &item.value {
+                    ast::Expr::Dict(_) => None,
+                    ast::Expr::BinOp(binary) => {
+                        if binary.op != ast::Operator::BitOr {
+                            continue;
+                        }
+                        Some(&item.value)
+                    }
+                    _ => continue,
+                };
+                let Some(value) = MemberExprBuilder::visit_subscript_expr(&root, key) else {
+                    continue;
+                };
+                let Some(contents) = value
+                    .with_contents()
+                    .and_then(PlaceExpr::try_from_member_expr)
+                else {
+                    continue;
+                };
+                let Some(value) = PlaceExpr::try_from_member_expr(value) else {
+                    continue;
+                };
+                if let Some(dependency) = dependency {
+                    self.source_dependencies(index, dependency);
+                }
+                unpacked_values.push((value, contents));
+            }
+        }
         let Self {
             exclusions: _,
             keyword_capture: _,
             by_place,
             nodes: mut candidates,
         } = self;
-        let mut pending: Vec<_> = candidates
-            .iter()
-            .enumerate()
-            .filter_map(|(index, candidate)| candidate.observed.then_some(index))
-            .collect();
         while let Some(index) = pending.pop() {
             for dependency in std::mem::take(&mut candidates[index].dependencies) {
                 if !candidates[dependency].observed {
@@ -799,7 +893,7 @@ impl<'ast> Candidates<'ast, '_> {
                 && attribute.value.is_name_expr()
                 && let Some(holder) = MemberExprBuilder::visit_expr(attribute.value.as_ref().into())
                 && let Some(index) = by_place.get(&holder)
-                && let Some(call) = candidates[*index].retaining_call
+                && let CandidateAssignment::RetainingCall(call) = candidates[*index].assignment
             {
                 for keyword in &call.arguments.keywords {
                     if keyword
@@ -819,8 +913,8 @@ impl<'ast> Candidates<'ast, '_> {
                     receiver,
                     dependencies: _,
                     observed,
-                    assigned: _,
-                    retaining_call: _,
+                    unpacked: _,
+                    assignment: _,
                 } = candidate;
                 observed.then_some(receiver)
             })
@@ -828,6 +922,7 @@ impl<'ast> Candidates<'ast, '_> {
         ContentsCandidates {
             receivers,
             field_sources,
+            unpacked_values,
         }
     }
 }
@@ -877,6 +972,12 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
     fn visit_annotation(&mut self, _expression: &'ast ast::Expr) {}
 
     fn visit_keyword(&mut self, keyword: &'ast ast::Keyword) {
+        if keyword.arg.is_none()
+            && keyword.value.is_name_expr()
+            && let Some(index) = self.place(&keyword.value)
+        {
+            self.nodes[index].unpacked = true;
+        }
         self.demand(&keyword.value);
         self.visit_expr(&keyword.value);
     }
@@ -984,6 +1085,7 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
 pub(super) struct ContentsCandidates<'ast> {
     pub(super) receivers: Vec<&'ast ast::Expr>,
     pub(super) field_sources: Vec<(&'ast ast::Expr, &'ast ast::Expr, &'ast ast::ExprCall)>,
+    pub(super) unpacked_values: Vec<(PlaceExpr, PlaceExpr)>,
 }
 
 pub(super) fn candidates<'ast>(

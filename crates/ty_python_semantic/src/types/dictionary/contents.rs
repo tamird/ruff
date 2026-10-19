@@ -830,6 +830,14 @@ fn initial_contents<'db>(
                 owner_inference.try_expression_type(expression)
             })
         });
+    let fresh_nested_allocation =
+        matches!(definition.kind(db), DefinitionKind::DictKeyAssignment(_))
+            && matches!(owner.kind(db), DefinitionKind::Assignment(assignment)
+            if assignment.is_single_target(&module)
+                && assignment.target(&module).is_name_expr()
+                && assignment.value(&module).is_dict_expr())
+            && matches!(value, Some(ast::Expr::Dict(_) | ast::Expr::BinOp(_)))
+            && observed.is_ok();
     // A fresh allocation can prove its contents even when its inferred type is a union.
     // Unobserved union bounds retain their per-alternative key domains.
     if !explicit_typed_dict
@@ -947,6 +955,7 @@ fn initial_contents<'db>(
         });
     }
     if paramspec.is_none()
+        && !fresh_nested_allocation
         && (bounded
             || shared
             || value.is_some_and(|value| PlaceExpr::try_from_expr(value).is_some()))
@@ -2240,6 +2249,37 @@ pub(crate) fn at_snapshot<'db>(
         ContentsValue::Pending => Err(DictionaryFallback::Unavailable),
         ContentsValue::Unavailable => Err(DictionaryFallback::Unavailable),
     }
+}
+
+/// Observe the dictionary stored under a key of an unpacked call argument after all arguments
+/// have been evaluated. The index records the child at this call only while the receiver still
+/// identifies the value read for unpacking.
+pub(super) fn unpacked_keyword<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    expression: &ast::Expr,
+    call: &ast::ExprCall,
+    name: &str,
+    reachability: &ReachabilityEvaluationCache<'db>,
+) -> Option<DictionaryItems<'db>> {
+    let index = semantic_index(db, scope.program_file(db));
+    let table = index.place_table(scope.file_scope_id(db));
+    let root = table.place_id(&PlaceExpr::contents(expression)?)?;
+    let key = table.contents_key(root, name)?;
+    let child = table.contents_place(key)?;
+    let use_id = index.try_expression_use_id(call.into())?;
+    let bindings = index
+        .use_def_map(scope.file_scope_id(db))
+        .multi_bindings_at_use(use_id, child)?;
+    let Contents {
+        value: ContentsValue::Mapping(mut mapping),
+        captured: false,
+    } = from_bindings(db, scope, bindings, reachability)
+    else {
+        return None;
+    };
+    mapping.localize(scope.program_file(db), expression.range());
+    Some(mapping.dictionary)
 }
 
 /// Recover a first field observation from a factory's pre-retention snapshot. No alias is

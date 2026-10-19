@@ -23,6 +23,17 @@ pub enum CheckedArgument<'a, 'db> {
     Indeterminate,
 }
 
+enum ArgumentSource<'a> {
+    Expression(&'a ast::Expr),
+    KeywordUnpacking(&'a ast::Expr),
+    Receiver,
+}
+
+enum ArgumentAbsence {
+    Omitted,
+    Indeterminate,
+}
+
 /// A call after ordinary argument matching and type checking.
 ///
 /// Argument-context providers receive a provisional check during sibling inference; its child
@@ -39,7 +50,8 @@ pub struct CheckedCall<'a, 'db> {
     pub(crate) file: ProgramFile<'db>,
     pub(crate) call: &'a ast::ExprCall,
     pub(crate) expression_type: &'a dyn Fn(&ast::Expr) -> Option<Type<'db>>,
-    pub(crate) dictionary_items: &'a dyn Fn(&ast::Expr, Type<'db>) -> Option<DictionaryItems<'db>>,
+    pub(crate) dictionary_items:
+        &'a dyn Fn(&ast::Expr, Type<'db>, Option<&str>) -> Option<DictionaryItems<'db>>,
     pub(crate) class_anchor: &'a dyn Fn(Box<[Type<'db>]>) -> DynamicClassAnchor<'db>,
     pub(crate) has_binding_errors: bool,
 }
@@ -82,13 +94,7 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
     }
 
     pub fn argument(&self, name: &str) -> CheckedArgument<'a, 'db> {
-        let Some(parameter) = self
-            .binding
-            .signature
-            .parameters()
-            .iter()
-            .position(|parameter| parameter.name().map(Name::as_str) == Some(name))
-        else {
+        let Some(parameter) = self.parameter_index(name) else {
             return CheckedArgument::Indeterminate;
         };
         self.argument_at(parameter)
@@ -96,11 +102,20 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
 
     /// Known entries of a definitely supplied dictionary argument.
     pub fn dictionary_argument(&self, db: &'db dyn Db, name: &str) -> Option<DictionaryItems<'db>> {
-        let CheckedArgument::Value { ty, expression } = self.argument(name) else {
-            return None;
+        let parameter = self.parameter_index(name)?;
+        let (ty, source) = self.matched_value(parameter).ok()?;
+        let (expression, keyword) = match source {
+            ArgumentSource::Expression(expression) => (expression, None),
+            ArgumentSource::KeywordUnpacking(expression) => {
+                // A variadic parameter's name does not identify the caller's keyword.
+                if self.binding.signature.parameters()[parameter].is_variadic() {
+                    return None;
+                }
+                (expression, Some(name))
+            }
+            ArgumentSource::Receiver => return None,
         };
-        let expression = expression?;
-        self.observed_dictionary_items(db, expression, ty)
+        self.observed_dictionary_items(db, expression, ty, keyword)
     }
 
     /// Dictionary entries observed for an already inferred child expression of this call.
@@ -111,7 +126,7 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
         expression: &ast::Expr,
     ) -> Option<DictionaryItems<'db>> {
         let ty = self.expression_type(expression)?;
-        self.observed_dictionary_items(db, expression, ty)
+        self.observed_dictionary_items(db, expression, ty, None)
     }
 
     fn observed_dictionary_items(
@@ -119,8 +134,9 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
         db: &'db dyn Db,
         expression: &ast::Expr,
         ty: Type<'db>,
+        keyword: Option<&str>,
     ) -> Option<DictionaryItems<'db>> {
-        (self.dictionary_items)(expression, ty).or_else(|| {
+        (self.dictionary_items)(expression, ty, keyword).or_else(|| {
             let env = ProgramEnvironment::from_file(self.file);
             DictionaryItems::from_typed_dict_type(db, &env, ty, expression.range())
         })
@@ -129,47 +145,73 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
     /// Inspects a matched parameter by its zero-based signature position.
     /// An absent parameter is omitted.
     pub fn argument_at(&self, parameter: usize) -> CheckedArgument<'a, 'db> {
+        match self.matched_value(parameter) {
+            Ok((ty, source)) => CheckedArgument::Value {
+                ty,
+                expression: match source {
+                    ArgumentSource::Expression(expression) => Some(expression),
+                    ArgumentSource::KeywordUnpacking(_) => None,
+                    ArgumentSource::Receiver => None,
+                },
+            },
+            Err(ArgumentAbsence::Omitted) => CheckedArgument::Omitted,
+            Err(ArgumentAbsence::Indeterminate) => CheckedArgument::Indeterminate,
+        }
+    }
+
+    fn parameter_index(&self, name: &str) -> Option<usize> {
+        self.binding
+            .signature
+            .parameters()
+            .iter()
+            .position(|parameter| parameter.name().map(Name::as_str) == Some(name))
+    }
+
+    fn matched_value(
+        &self,
+        parameter: usize,
+    ) -> Result<(Type<'db>, ArgumentSource<'a>), ArgumentAbsence> {
         let mut arguments = self.matched_arguments(parameter);
         let Some(source) = arguments.next() else {
-            return CheckedArgument::Omitted;
+            return Err(ArgumentAbsence::Omitted);
         };
         if arguments.next().is_some() {
-            return CheckedArgument::Indeterminate;
+            return Err(ArgumentAbsence::Indeterminate);
         }
         let Some(ty) = self.parameter_types()[parameter] else {
-            return CheckedArgument::Indeterminate;
+            return Err(ArgumentAbsence::Indeterminate);
         };
-        let expression = match source {
+        let source = match source {
             Some((source, _, argument)) => {
                 let mut matches = argument
                     .parameters
                     .iter()
                     .filter(|matched| matched.index == parameter);
                 let (Some(matched), None) = (matches.next(), matches.next()) else {
-                    return CheckedArgument::Indeterminate;
+                    return Err(ArgumentAbsence::Indeterminate);
                 };
                 match source {
                     ast::ArgOrKeyword::Arg(expression) => {
                         if expression.is_starred_expr() {
-                            return CheckedArgument::Indeterminate;
+                            return Err(ArgumentAbsence::Indeterminate);
                         }
-                        Some(expression)
+                        ArgumentSource::Expression(expression)
                     }
                     ast::ArgOrKeyword::Keyword(keyword) => {
                         if keyword.arg.is_some() {
-                            Some(&keyword.value)
+                            ArgumentSource::Expression(&keyword.value)
                         } else {
                             if !matched.is_definite_keyword() {
-                                return CheckedArgument::Indeterminate;
+                                return Err(ArgumentAbsence::Indeterminate);
                             }
-                            None
+                            ArgumentSource::KeywordUnpacking(&keyword.value)
                         }
                     }
                 }
             }
-            None => None,
+            None => ArgumentSource::Receiver,
         };
-        CheckedArgument::Value { ty, expression }
+        Ok((ty, source))
     }
 
     /// Associates the matcher's receiver-prefixed arguments with original source arguments.

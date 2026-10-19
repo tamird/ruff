@@ -3370,10 +3370,9 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
         let CheckedArgument::Value { ty: _, expression } = call.argument("value") else {
             panic!("one dictionary argument");
         };
-        assert_eq!(
-            Some(entries.clone()),
-            call.dictionary_items(db, expression.unwrap())
-        );
+        if let Some(expression) = expression {
+            assert_eq!(Some(entries.clone()), call.dictionary_items(db, expression));
+        }
         Some(describe(db, call.file(), entries))
     }
 
@@ -3420,7 +3419,7 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file(
             "/src/native.pyi",
-            "def observe(value: object) -> str: ...\n",
+            "def observe(value: object, *, other: object = ...) -> str: ...\n",
         )
         .with_file("/src/main.py", "")
         .with_call_result_provider(|db, call| observe(db, call).into())
@@ -3429,6 +3428,42 @@ fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
     for (source, expected) in [
         ("result = observe({})", "complete"),
         ("result = observe(dict())", "complete"),
+        (
+            "arguments = {'value': {'x': 1}}\nresult = observe(**arguments)",
+            "complete; x: Literal[1] at 'x'",
+        ),
+        (
+            "arguments = {'value': {'x': 1} | {'y': 2}}\nresult = observe(**arguments)",
+            "complete; x: Literal[1] at 'x'; y: Literal[2] at 'y'",
+        ),
+        (
+            "copy = dict\noperand = copy(x=1)\narguments = {'value': {'y': 2} | operand}\nresult = observe(**arguments)",
+            "complete; y: Literal[2] at 'y'; x: Literal[1] at x",
+        ),
+        (
+            "from typing import TypedDict\nclass Value(TypedDict):\n    x: int\nclass Arguments(TypedDict):\n    value: Value\ndef get_arguments() -> Arguments: return {'value': {'x': 1}}\narguments = get_arguments()\nresult = observe(**arguments)",
+            "extra: Unknown; x: int at arguments",
+        ),
+        (
+            "arguments = {'value': {'x': 1}}\narguments['value']['x'] = 2\nresult = observe(**arguments)",
+            "complete; x: Literal[2] at 'x'",
+        ),
+        (
+            "arguments = {'value': {'x': 1}}\nresult = observe(**arguments, other=arguments['value'].clear())",
+            "complete",
+        ),
+        (
+            "arguments = {'value': {'x': 1}}\nresult = observe(**arguments, other=arguments.update({'value': {'y': 2}}))",
+            "extra: int",
+        ),
+        (
+            "arguments = {'value': {'x': 1}}\nalias = arguments['value']\nalias.clear()\nresult = observe(**arguments)",
+            "extra: int",
+        ),
+        (
+            "arguments = {'value': {'x': 1}}\nresult = observe(**arguments, other=(arguments := {'value': {'y': 2}}))",
+            "unavailable",
+        ),
         (
             "result = observe(dict({'x': 'old'}, x=1, y=2))",
             "complete; x: Literal[1] at x; y: Literal[2] at y",

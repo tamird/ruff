@@ -9663,6 +9663,27 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.dictionary_observation(expression, ty).ok()
     }
 
+    fn call_dictionary_items(
+        &self,
+        call: &ast::ExprCall,
+        expression: &ast::Expr,
+        ty: Type<'db>,
+        keyword: Option<&str>,
+    ) -> Option<DictionaryItems<'db>> {
+        match keyword {
+            Some(_) if self.in_detached_annotation() => None,
+            Some(name) => DictionaryItems::unpacked_keyword(
+                self.db(),
+                self.scope(),
+                expression,
+                call,
+                name,
+                self.reachability_cache(),
+            ),
+            None => self.dictionary_items(expression, ty),
+        }
+    }
+
     fn dictionary_observation(
         &self,
         expression: &ast::Expr,
@@ -9725,7 +9746,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         {
             let mapping_type = self.expression_type(&keyword.value);
 
-            if mapping_type.as_paramspec_keyword_component(self.db()).is_some()
+            if mapping_type
+                .as_paramspec_keyword_component(self.db())
+                .is_some()
                 || mapping_type.unpack_keys_and_items(db, env).is_some()
             {
                 continue;
@@ -10560,7 +10583,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
-        let dictionary_items = |expression: &ast::Expr, ty| self.dictionary_items(expression, ty);
+        let dictionary_items = |expression: &ast::Expr, ty, keyword: Option<&str>| {
+            self.call_dictionary_items(call_expression, expression, ty, keyword)
+        };
         let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
             scope: self.scope(),
             offset: self.dynamic_class_scope_offset(call_expression),
@@ -10825,7 +10850,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return;
         };
         let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
-        let dictionary_items = |expression: &ast::Expr, ty| self.dictionary_items(expression, ty);
+        let dictionary_items = |expression: &ast::Expr, ty, keyword: Option<&str>| {
+            self.call_dictionary_items(call, expression, ty, keyword)
+        };
         let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
             scope: self.scope(),
             offset: self.dynamic_class_scope_offset(call),
@@ -10866,7 +10893,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         has_binding_errors: bool,
     ) {
         let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
-        let dictionary_items = |expression: &ast::Expr, ty| self.dictionary_items(expression, ty);
+        let dictionary_items = |expression: &ast::Expr, ty, keyword: Option<&str>| {
+            self.call_dictionary_items(call, expression, ty, keyword)
+        };
         let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
             scope: self.scope(),
             offset: self.dynamic_class_scope_offset(call),

@@ -466,6 +466,17 @@ impl<'db> DictionaryItems<'db> {
         contents::at_use(db, scope, expression, argument_type, reachability)
     }
 
+    pub(crate) fn unpacked_keyword(
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        expression: &ast::Expr,
+        call: &ast::ExprCall,
+        name: &str,
+        reachability: &ReachabilityEvaluationCache<'db>,
+    ) -> Option<Self> {
+        contents::unpacked_keyword(db, scope, expression, call, name, reachability)
+    }
+
     pub(crate) fn expression(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,

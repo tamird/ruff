@@ -590,9 +590,14 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         let dictionary_contents::ContentsCandidates {
             receivers,
             field_sources,
+            unpacked_values,
         } = dictionary_contents::candidates(node, self.module.suite(), &self.source_exclusions);
         for receiver in receivers {
             self.register_contents_place(receiver);
+        }
+        for (value, contents) in unpacked_values {
+            self.add_place(value);
+            self.add_place(contents);
         }
         for (field, source, call) in field_sources {
             if let Some(receiver) = PlaceExpr::try_from_expr(field)
