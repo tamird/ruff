@@ -6198,6 +6198,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let commit_mode = CallArgumentInferenceMode::Commit;
         let requires_overload_evaluation = requires_overload_evaluation(candidates);
         let arguments_tcx = self.collect_call_arguments_type_context(
+            ast_arguments.clone(),
             collection_arguments,
             baseline_argument_types,
             bindings,
@@ -6258,6 +6259,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // And re-infer argument types after overload evaluation, ensuring that only
         // inferred types and diagnostics from matching overloads are preserved.
         let arguments_tcx = self.collect_call_arguments_type_context(
+            ast_arguments.clone(),
             collection_arguments,
             &checked_argument_types,
             bindings,
@@ -6300,6 +6302,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let requires_overload_evaluation = requires_overload_evaluation(candidates);
 
         let mut arguments_tcx = self.collect_call_arguments_type_context(
+            ast_arguments.clone(),
             collection_arguments,
             argument_types,
             bindings,
@@ -6364,6 +6367,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // Collect the argument constraints based on the newly inferred types.
             let mut next_arguments_tcx = self.collect_call_arguments_type_context(
+                ast_arguments.clone(),
                 collection_arguments,
                 &next_argument_types,
                 &next_bindings,
@@ -6409,6 +6413,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .collect();
         let (converged_builder, converged_argument_types) = if !final_arguments.is_empty() {
             let mut arguments_tcx = self.collect_call_arguments_type_context(
+                ast_arguments.clone(),
                 collection_arguments,
                 &converged_argument_types,
                 &next_bindings,
@@ -6465,6 +6470,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // and inferred types are preserved.
         if requires_overload_evaluation {
             let arguments_tcx = self.collect_call_arguments_type_context(
+                ast_arguments.clone(),
                 collection_arguments,
                 &converged_argument_types,
                 &next_bindings,
@@ -6497,6 +6503,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     #[expect(clippy::too_many_arguments)]
     fn collect_call_arguments_type_context<'bindings>(
         &self,
+        ast_arguments: ArgumentsIter<'_>,
         collection_arguments: &[usize],
         argument_types: &CallArguments<'_, 'db>,
         bindings: &'bindings Bindings<'db>,
@@ -6555,8 +6562,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         // Collect the type context of each argument from each matching overload.
-        (0..argument_types.len())
-            .map(|argument_index| {
+        ast_arguments
+            .enumerate()
+            .map(|(argument_index, argument)| {
                 if argument_types.is_variadic(argument_index) {
                     return None;
                 }
@@ -6571,10 +6579,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 } else {
                     CheckTypesMode::Provisional
                 };
+                let empty_collection = match argument.value() {
+                    ast::Expr::List(list) => list.elts.is_empty().then_some(KnownClass::List),
+                    ast::Expr::Dict(dict) => dict.items.is_empty().then_some(KnownClass::Dict),
+                    _ => None,
+                };
                 let parameter_tcx = |overload: &Binding<'db>,
                                      binding: &CallableBinding<'db>,
                                      specializations: &[OnceCell<Option<Specialization<'db>>>;
                                           3]| {
+                    if let Some(collection) = empty_collection
+                        && let Some(context) = overload.empty_getattr_default_context(
+                            db,
+                            env,
+                            binding,
+                            argument_index,
+                            collection,
+                        )
+                    {
+                        return Some(context);
+                    }
                     let [all_provisional, all_final, without_arguments] = specializations;
                     let specialization = match source {
                         ArgumentTypeContextSource::All => match mode {

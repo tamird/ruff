@@ -3990,6 +3990,130 @@ def ordinary(property: Property, intercepted: Intercepted, mutable: Mutable, def
 }
 
 #[test]
+fn supplied_getter_storage_contextualizes_empty_defaults() -> anyhow::Result<()> {
+    let registry = crate::default_lint_registry();
+    let mut rules = crate::lint::RuleSelection::from_registry(registry);
+    rules.enable(
+        registry.get("division-by-zero")?,
+        Severity::Error,
+        crate::lint::LintSource::Default,
+    );
+    let db = TestDbBuilder::new()
+        .with_rule_selection(rules)
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_getattr_result_provider(schema_getattr_result)
+        .with_file(
+            "/src/native.pyi",
+            r#"
+from typing_extensions import NotRequired, TypedDict
+
+class Row(TypedDict):
+    key: int
+class Required(TypedDict, closed=True):
+    items: list[str]
+    mapping: dict[str, int]
+    row: Row
+class Other(TypedDict, closed=True):
+    items: list[int]
+class Optional(TypedDict, closed=True):
+    items: NotRequired[list[str]]
+class Store[S]:
+    def __getattr__(self, name: str) -> object: ...
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from builtins import getattr as lookup
+from typing import Literal
+from native import Store, Required, Other, Optional
+
+def required_list(value: Store[Required]):
+    return lookup(value, "items", [])
+def required_dict(value: Store[Required]):
+    return lookup(value, "mapping", {})
+def union_list(value: Store[Required] | Store[Other]):
+    return lookup(value, "items", [])
+def optional_list(value: Store[Optional]):
+    return lookup(value, "items", [])
+
+# Every fallback value is legal, even when it differs from the stored field.
+def required_row(value: Store[Required]):
+    return lookup(value, "row", {})
+def mismatched_list(value: Store[Required]):
+    return lookup(value, "items", {})
+def mismatched_dict(value: Store[Required]):
+    return lookup(value, "mapping", [])
+def nonempty_list(value: Store[Required]):
+    return lookup(value, "items", [b"other"])
+def nonempty_dict(value: Store[Required]):
+    return lookup(value, "mapping", {1: b"other"})
+def mixed_name(value: Store[Required], name: Literal["items", "mapping"]):
+    return lookup(value, name, [])
+def generic_default[T](value: Store[Required], default: T):
+    return lookup(value, "items", default)
+def evaluated_default(value: Store[Required]):
+    return lookup(value, "items", [len(42)])
+def division_default(value: Store[Required]):
+    return lookup(value, "items", [1 / 0])
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type", "division-by-zero"],
+        "{diagnostics:#?}"
+    );
+    let file = db.program_file(file);
+    let model = SemanticModel::new(&db, file);
+    let env = ProgramEnvironment::from_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let defaults = module
+        .suite()
+        .iter()
+        .filter_map(ast::Stmt::as_function_def_stmt)
+        .map(|function| {
+            let returned = function.body.last().unwrap().as_return_stmt().unwrap();
+            let call = returned.value.as_ref().unwrap().as_call_expr().unwrap();
+            let default = &call.arguments.args[2];
+            (
+                function.name.as_str(),
+                default
+                    .inferred_type(&model)
+                    .unwrap()
+                    .display(&db, &env)
+                    .to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        defaults,
+        [
+            ("required_list", "list[str]".into()),
+            ("required_dict", "dict[str, int]".into()),
+            // Existing collection inference selects one compatible arm for the empty literal.
+            ("union_list", "list[str]".into()),
+            ("optional_list", "list[Any]".into()),
+            ("required_row", "dict[Any, Any]".into()),
+            ("mismatched_list", "dict[Any, Any]".into()),
+            ("mismatched_dict", "list[Any]".into()),
+            ("nonempty_list", "list[Any]".into()),
+            ("nonempty_dict", "dict[Any, Any]".into()),
+            ("mixed_name", "list[Any]".into()),
+            ("generic_default", "T@generic_default".into()),
+            ("evaluated_default", "list[Any]".into()),
+            ("division_default", "list[Any]".into()),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn supplied_getter_storage_requires_matching_consensus() -> anyhow::Result<()> {
     fn result<'db>(
         db: &'db TestDb,

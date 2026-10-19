@@ -8365,6 +8365,52 @@ impl<'db> Binding<'db> {
         }
     }
 
+    /// Supplies context for a fresh empty default whose kind matches a finite lookup result.
+    pub(crate) fn empty_getattr_default_context(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        binding: &CallableBinding<'db>,
+        argument_index: usize,
+        collection: KnownClass,
+    ) -> Option<ArgumentTypeContext<'db>> {
+        let Type::FunctionLiteral(function) = binding.callable_type else {
+            return None;
+        };
+        if function.known(db) != Some(KnownFunction::GetAttr) || binding.bound_type.is_some() {
+            return None;
+        }
+        let argument = self.matched_argument_for_call_argument(false, argument_index)?;
+        let [parameter] = argument.parameters.as_slice() else {
+            return None;
+        };
+        if parameter.index != 2 {
+            return None;
+        }
+        let context = self.getattr_call_result(db, env)?;
+        if !context.is_fully_static(db, env) {
+            return None;
+        }
+        let matching_kind = |ty: &Type<'db>| match ty {
+            Type::NominalInstance(instance) => {
+                instance.class(db, env).known(db) == Some(collection)
+            }
+            _ => false,
+        };
+        let matches = match context.expand_top_level_aliases(db, env) {
+            Type::Union(union) => union.elements(db).iter().all(matching_kind),
+            context => matching_kind(&context),
+        };
+        // A TypedDict or a different container kind can impose obligations on an empty default.
+        // An empty builtin list or dict has no such obligations on its elements.
+        matches.then(|| {
+            ArgumentTypeContext::standard(
+                self.signature.parameters()[parameter.index].annotated_type(),
+                context,
+            )
+        })
+    }
+
     /// Checks the getter invoked by `property.__get__`, retaining its error and recovery type.
     fn check_property_getter(
         &mut self,
