@@ -692,18 +692,32 @@ impl<'db> Type<'db> {
                 |element| value_ty.subscript(db, env, element, expr_context),
             )),
 
-            (Type::TypeVar(typevar), _)
-                if let Some(TypeVarBoundOrConstraints::Constraints(constraints)) =
-                    typevar.typevar(db).bound_or_constraints(db, env) =>
-            {
-                Some(map_subscript_alternatives(
-                    db,
-                    env,
-                    value_ty,
-                    constraints.elements(db).iter().copied(),
-                    |constraint| constraint.subscript(db, env, slice_ty, expr_context),
-                ))
-            }
+            (Type::TypeVar(typevar), _) => typevar
+                .typevar(db)
+                .bound_or_constraints(db, env)
+                .and_then(|bound_or_constraints| match bound_or_constraints {
+                    TypeVarBoundOrConstraints::Constraints(constraints) => {
+                        Some(map_subscript_alternatives(
+                            db,
+                            env,
+                            value_ty,
+                            constraints.elements(db).iter().copied(),
+                            |constraint| constraint.subscript(db, env, slice_ty, expr_context),
+                        ))
+                    }
+                    TypeVarBoundOrConstraints::UpperBound(bound) => {
+                        if expr_context == ast::ExprContext::Store {
+                            None
+                        } else {
+                            bound
+                                .resolve_type_alias(db)
+                                .as_typed_dict()
+                                .map(|typed_dict| {
+                                    typed_dict_subscript(db, env, typed_dict, slice_ty)
+                                })
+                        }
+                    }
+                }),
 
             // Ex) Given `person["name"]`, return `str`
             (Type::TypedDict(typed_dict), _) if expr_context != ast::ExprContext::Store => {
@@ -941,7 +955,6 @@ impl<'db> Type<'db> {
                 Some(Ok(todo_type!("Inference of subscript on special form")))
             }
 
-            // Upper-bounded and unconstrained type variables use ordinary method lookup.
             (
                 Type::FunctionLiteral(_)
                 | Type::WrapperDescriptor(_)
@@ -968,7 +981,6 @@ impl<'db> Type<'db> {
                 | Type::SpecialForm(_)
                 | Type::KnownInstance(_)
                 | Type::LiteralValue(_)
-                | Type::TypeVar(_)
                 | Type::KnownBoundMethod(_),
                 _,
             ) => None,

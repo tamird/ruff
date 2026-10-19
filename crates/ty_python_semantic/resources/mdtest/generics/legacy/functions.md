@@ -1878,6 +1878,24 @@ reveal_type(result)  # revealed: int
 invalid: str = result  # error: [invalid-assignment]
 ```
 
+## Subscripting a TypedDict-bounded type variable
+
+```py
+from typing import TypeAlias, TypeVar, TypedDict
+
+class Package(TypedDict):
+    metadata: dict[str, object]
+    name: str
+
+PackageAlias: TypeAlias = Package
+T = TypeVar("T", bound=PackageAlias)
+
+def update_package(value: T) -> T:
+    reveal_type(value["metadata"])  # revealed: dict[str, object]
+    value["unknown"]  # error: [invalid-key]
+    return value
+```
+
 ## Opaque decorators don't affect typevar binding
 
 Inside the body of a generic function, we should be able to see that the typevars bound by that
