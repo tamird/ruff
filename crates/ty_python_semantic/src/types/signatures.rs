@@ -1384,16 +1384,25 @@ impl<'db> Signature<'db> {
     fn supports_specialization(
         &self,
         db: &'db dyn Db,
+        supports_type: impl FnMut(Type<'db>) -> bool,
+    ) -> bool {
+        self.supports_specialization_with(db, supports_type, |variable| {
+            variable.domain(db) == TypeVarDomain::Type
+        })
+    }
+
+    fn supports_specialization_with(
+        &self,
+        db: &'db dyn Db,
         mut supports_type: impl FnMut(Type<'db>) -> bool,
+        supports_variable: impl FnMut(BoundTypeVarInstance<'db>) -> bool,
     ) -> bool {
         !self.is_paramspec_value()
             && self.receiver_constraints().is_none()
             && self.parameters().is_standard()
-            && self.generic_context.is_none_or(|context| {
-                context
-                    .variables(db)
-                    .all(|variable| variable.domain(db) == TypeVarDomain::Type)
-            })
+            && self
+                .generic_context
+                .is_none_or(|context| context.variables(db).all(supports_variable))
             && supports_type(self.return_type())
             && self
                 .parameters()
@@ -2408,17 +2417,40 @@ impl<'db> Signature<'db> {
         self.generic_context.is_none()
     }
 
+    fn supports_overload_specialization(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
+        let captured = self
+            .parameters
+            .as_keyword_paramspec_with_prefix(db)
+            .map(|(_, captured)| captured);
+        self.supports_specialization_with(
+            db,
+            |ty| !ty.has_indeterminate_inference(db, env),
+            |variable| {
+                variable.domain(db) == TypeVarDomain::Type
+                    || (variable.domain(db) == TypeVarDomain::ParameterSignature
+                        && captured
+                            .is_some_and(|captured| captured.is_same_typevar_as(db, variable)))
+            },
+        )
+    }
+
     fn supports_overload_implementation_consistency(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> bool {
+        if !self.supports_overload_specialization(db, env) {
+            return false;
+        }
         let Some(context) = self.generic_context else {
             return true;
         };
         self.definition
             .is_some_and(|definition| !definition.scope(db).node(db).scope_kind().is_class())
-            && self.supports_specialization(db, |ty| !ty.has_indeterminate_inference(db, env))
             && self.parameters.variadic().is_none()
             && context.variables(db).all(|variable| {
                 !variable.typevar(db).is_self(db)
@@ -2437,7 +2469,7 @@ impl<'db> Signature<'db> {
     /// This does not establish that the signatures are consistent. A completed comparison can
     /// reject parameter coverage or the return type. Nongeneric implementations use ordinary
     /// assignability against rigid overload variables. Generic implementations require complete,
-    /// static specialization from fixed overload inputs; incomplete inference remains unsupported.
+    /// static specialization from overload inputs; incomplete inference remains unsupported.
     /// Gradual declarations can participate without supplying a gradual inferred replacement.
     pub fn supports_overload_implementation_consistency_with(
         &self,
@@ -2478,7 +2510,7 @@ impl<'db> Signature<'db> {
             }
             let supports_type = |ty: Type<'db>| !ty.has_indeterminate_inference(db, env);
             return (self.supports_specialization(db, supports_type)
-                && overload.supports_specialization(db, supports_type)
+                && overload.supports_overload_specialization(db, env)
                 && overload.definition.is_some_and(|definition| {
                     !definition.scope(db).node(db).scope_kind().is_class()
                 })
@@ -2497,12 +2529,6 @@ impl<'db> Signature<'db> {
         {
             return None;
         }
-        let supports_type = |ty: Type<'db>| !ty.has_indeterminate_inference(db, env);
-        if !self.supports_specialization(db, supports_type)
-            || !overload.supports_specialization(db, supports_type)
-        {
-            return None;
-        }
         let context = self.generic_context?;
         let references_implementation_variable = |parameter: &Parameter<'db>| {
             context.variables(db).any(|variable| {
@@ -2513,13 +2539,21 @@ impl<'db> Signature<'db> {
                 )
             })
         };
-        // Infer from the normalized fixed slots. A skipped keyword tail must not contribute
-        // additional evidence for an implementation variable, either through **kwargs itself
-        // or through a named parameter not present in the overload's fixed slots.
-        if self
+        let infer_keyword_tail = self
             .parameters
-            .keyword_variadic()
-            .is_some_and(|(_, parameter)| references_implementation_variable(parameter))
+            .as_keyword_paramspec_with_prefix(db)
+            .is_some()
+            && overload
+                .parameters
+                .as_keyword_paramspec_with_prefix(db)
+                .is_some();
+        // A skipped keyword tail must not contribute additional evidence for an implementation
+        // variable, either through **kwargs itself or a named parameter absent from fixed slots.
+        if (!infer_keyword_tail
+            && self
+                .parameters
+                .keyword_variadic()
+                .is_some_and(|(_, parameter)| references_implementation_variable(parameter)))
             || (overload.parameters.keyword_variadic().is_some()
                 && self.parameters.iter().any(|parameter| {
                     references_implementation_variable(parameter)
@@ -2533,7 +2567,7 @@ impl<'db> Signature<'db> {
         let arguments: Option<CallArguments<'_, 'db>> = overload
             .parameters
             .iter()
-            .filter(|parameter| !parameter.is_keyword_variadic())
+            .filter(|parameter| infer_keyword_tail || !parameter.is_keyword_variadic())
             .map(|parameter| {
                 let argument = match parameter.kind() {
                     ParameterKind::PositionalOnly {
@@ -2549,7 +2583,7 @@ impl<'db> Signature<'db> {
                         default_type: _,
                     } => Argument::Keyword(name.as_str()),
                     ParameterKind::Variadic { name: _ } => return None,
-                    ParameterKind::KeywordVariadic { name: _ } => return None,
+                    ParameterKind::KeywordVariadic { name: _ } => Argument::Keywords,
                 };
                 Some((argument, Some(parameter.annotated_type())))
             })

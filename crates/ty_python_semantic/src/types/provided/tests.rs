@@ -824,6 +824,148 @@ fn keyword_capture_db(source: &str) -> anyhow::Result<TestDb> {
         .build()
 }
 
+#[test]
+fn overload_bodies_preserve_captured_keyword_parameters() -> anyhow::Result<()> {
+    let source = r#"from typing import Literal, Protocol, overload
+class Keywords: ...
+class Callback[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+@overload
+def invoke[**P](callback: Callback[P], *, flag: Literal[True], **kwargs: Keywords[P]) -> None: ...
+@overload
+def invoke[**P](callback: Callback[P], *, flag: Literal[False], **kwargs: Keywords[P]) -> None: ...
+def invoke[**P](callback: Callback[P], *, flag: bool, **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **kwargs)
+"#;
+    for (generated, expected) in [("\"made\"", 0), ("42", 1)] {
+        let db = keyword_capture_db(&source.replace("\"made\"", generated))?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let function = crate::place::global_symbol(&db, file, "invoke")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        let mut family = function.iter_overloads_and_implementation(&db);
+        let implementation = family.next_back().unwrap().signature(&db);
+        let environment = ProgramEnvironment::from_file(file);
+        for overload in family {
+            assert!(
+                implementation.supports_overload_implementation_consistency_with(
+                    &db,
+                    &environment,
+                    &overload.signature(&db)
+                ),
+                "implementation {implementation:?}, overload {:?}",
+                overload.signature(&db)
+            );
+        }
+        for index in [0, 1] {
+            let diagnostics = crate::types::check_overload_body(&db, function, index)
+                .unwrap()
+                .into_diagnostics();
+            assert_eq!(diagnostics.len(), expected, "{diagnostics:#?}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn overload_body_forwards_a_captured_tail_after_deleting_a_fixed_keyword() -> anyhow::Result<()> {
+    let source = r#"from typing import Never, Protocol, overload
+class Keywords: ...
+class Callback[T, **P](Protocol):
+    def __call__(self, *, generated: T, retained: bool, **kwargs: Keywords[P]) -> None: ...
+@overload
+def invoke[**P](callback: Callback[int, P], *, input: int, retained: bool, **kwargs: Keywords[P]) -> None: ...
+@overload
+def invoke[**P](callback: Callback[str, P], *, input: str, retained: bool, **kwargs: Keywords[P]) -> None: ...
+def invoke(callback: object, **kwargs: object) -> None:
+    forwarded = dict(kwargs)
+    forwarded.pop("input", None)
+    callback(generated=kwargs["input"], **forwarded)
+"#;
+    for (source, expected) in [
+        (source.to_owned(), [0, 0]),
+        (
+            source.replace(
+                "forwarded.pop(\"input\", None)",
+                "forwarded.pop(\"input\", None)\n    forwarded.pop(\"required\", None)",
+            ),
+            [1, 1],
+        ),
+        (
+            source.replace(
+                "forwarded.pop(\"input\", None)",
+                "forwarded.pop(\"input\", None)\n    forwarded.pop(\"retained\", None)",
+            ),
+            [1, 1],
+        ),
+        (
+            source.replace("generated=kwargs[\"input\"]", "generated=42"),
+            [0, 1],
+        ),
+        (
+            source
+                .replace("input: int,", "input: Never = ...,")
+                .replace("generated=kwargs[\"input\"]", "generated=42"),
+            [0, 1],
+        ),
+    ] {
+        let db = keyword_capture_db(&source)?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let function = crate::place::global_symbol(&db, file, "invoke")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        for (index, count) in expected.into_iter().enumerate() {
+            let diagnostics = crate::types::check_overload_body(&db, function, index)
+                .unwrap()
+                .into_diagnostics();
+            assert_eq!(
+                diagnostics.len(),
+                count,
+                "{index}: {source}\n{diagnostics:#?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn observed_fixed_keywords_do_not_close_the_whole_mapping() -> anyhow::Result<()> {
+    let source = r#"from typing import Protocol, overload
+from typing_extensions import TypedDict
+class Keywords: ...
+class Fixed(TypedDict, closed=True):
+    input: int
+class Callback[**P](Protocol):
+    def __call__(self, **kwargs: Keywords[P]) -> None: ...
+def accept_closed(value: Fixed) -> None: ...
+@overload
+def invoke[**P](callback: Callback[P], *, input: int, **kwargs: Keywords[P]) -> None: ...
+@overload
+def invoke[**P](callback: Callback[P], *, input: str, **kwargs: Keywords[P]) -> None: ...
+def invoke(callback: object, **kwargs: object) -> None:
+    accept_closed(kwargs)
+"#;
+    let db = keyword_capture_db(source)?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let function = crate::place::global_symbol(&db, file, "invoke")
+        .place
+        .expect_type()
+        .expect_function_literal();
+    let diagnostics = crate::types::check_overload_body(&db, function, 0).unwrap();
+    let diagnostics = diagnostics.into_diagnostics();
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("expected a closed-mapping rejection: {diagnostics:#?}");
+    };
+    assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+    assert_eq!(
+        &source[diagnostic.primary_span().unwrap().range().unwrap()],
+        "kwargs"
+    );
+    Ok(())
+}
+
 fn assert_keyword_diagnostics(db: &TestDb, file: File, expected: &[(&str, &str)]) {
     let diagnostics = db.check_file(file);
     let source = source_text(db, file);

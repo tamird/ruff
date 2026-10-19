@@ -23,7 +23,7 @@ use crate::reachability::{ReachabilityEvaluationCache, is_range_reachable_in_dom
 use crate::semantic_model::HasType;
 use crate::types::call::Argument;
 use crate::types::constraints::ConstraintSetBuilder;
-use crate::types::dictionary::DictionaryItems;
+use crate::types::dictionary::{CapturedKeywordTail, DictionaryItems};
 use crate::types::function::{KnownFunction, OverloadLiteral};
 use crate::types::generics::Specialization;
 use crate::types::ide_support::{CallInput, CallInputError, bound_call_input_types};
@@ -256,6 +256,8 @@ pub(crate) struct FunctionBodyDomain<'db> {
     #[returns(ref)]
     parameters: Box<[(Definition<'db>, Type<'db>)]>,
     #[returns(copy)]
+    pub(crate) keyword_tail: Option<CapturedKeywordTail<'db>>,
+    #[returns(copy)]
     pub(crate) return_type: Type<'db>,
     #[returns(copy)]
     specialization: Option<Specialization<'db>>,
@@ -423,7 +425,7 @@ fn prepare_body_domain<'db>(
     ) {
         return Err(BodyDomainError::Inconsistent);
     }
-    let parameters = project_body_parameters(
+    let (parameters, keyword_tail) = project_body_parameters(
         db,
         &env,
         implementation.body_scope(db),
@@ -440,6 +442,7 @@ fn prepare_body_domain<'db>(
         implementation,
         overload,
         parameters,
+        keyword_tail,
         overload_signature.return_ty,
         specialization,
     ))
@@ -454,7 +457,13 @@ fn project_body_parameters<'db>(
     implementation: &Signature<'db>,
     overload: &Signature<'db>,
     specialization: Option<Specialization<'db>>,
-) -> Result<Box<[(Definition<'db>, Type<'db>)]>, BodyDomainError> {
+) -> Result<
+    (
+        Box<[(Definition<'db>, Type<'db>)]>,
+        Option<CapturedKeywordTail<'db>>,
+    ),
+    BodyDomainError,
+> {
     let bind = |keywords: bool| {
         let arguments: Option<CallArguments<'_, 'db>> = overload
             .parameters()
@@ -482,14 +491,7 @@ fn project_body_parameters<'db>(
                     ParameterKind::Variadic { name: _ } => return None,
                     ParameterKind::KeywordVariadic { name: _ } => (
                         Argument::Keywords,
-                        KnownClass::Dict.to_specialized_instance(
-                            db,
-                            env,
-                            &[
-                                KnownClass::Str.to_instance(db, env),
-                                parameter.annotated_type(),
-                            ],
-                        ),
+                        keyword_arguments_type(db, env, std::iter::once(parameter))?,
                     ),
                 };
                 Some((argument, Some(ty)))
@@ -546,21 +548,48 @@ fn project_body_parameters<'db>(
     for (parameter, index) in overload.parameters().iter().zip(&positional) {
         may_be_omitted[*index] = parameter.has_default();
     }
-    source_parameters
+    let mut keyword_tail = None;
+    let parameters = source_parameters
         .iter()
         .enumerate()
         .zip_eq(may_be_omitted)
         .map(|((source_index, source_parameter), omitted)| {
             let definition = index.expect_single_definition(source_parameter.as_parameter());
             if Some(definition) == kwargs_definition {
-                let entry = keyword_arguments_type(
+                let mut captured = None;
+                let mut entry = keyword_arguments_type(
                     db,
                     env,
                     overload.parameters().iter().zip(&positional).filter_map(
-                        |(parameter, owner)| (*owner == source_index).then_some(parameter),
+                        |(parameter, owner)| {
+                            if *owner != source_index {
+                                return None;
+                            }
+                            if parameter.is_keyword_variadic()
+                                && let Type::TypeVar(component) = parameter.annotated_type()
+                                && component.is_captured_keyword_arguments(db)
+                            {
+                                captured = Some(component);
+                                return None;
+                            }
+                            Some(parameter)
+                        },
                     ),
                 )
                 .ok_or(BodyDomainError::Unsupported)?;
+                if let Some(captured) = captured {
+                    let Type::TypedDict(fixed) = entry else {
+                        return Err(BodyDomainError::Unsupported);
+                    };
+                    if fixed.items(db).is_empty() {
+                        entry = Type::TypeVar(captured);
+                    } else {
+                        keyword_tail = Some(
+                            CapturedKeywordTail::from_overload(db, captured, fixed)
+                                .ok_or(BodyDomainError::Unsupported)?,
+                        );
+                    }
+                }
                 if entry.has_indeterminate_inference(db, env) {
                     return Err(BodyDomainError::Unsupported);
                 }
@@ -618,7 +647,8 @@ fn project_body_parameters<'db>(
             }
             Ok((definition, entry))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok((parameters, keyword_tail))
 }
 
 fn supported_body(
@@ -2240,7 +2270,7 @@ mod tests {
                 let module = parsed_module(&db, scope.program_file(&db).python_file(&db)).load(&db);
                 let node = scope.node(&db).expect_function().node(&module);
                 let env = ProgramEnvironment::from_scope(scope);
-                let projected = project_body_parameters(
+                let (projected, keyword_tail) = project_body_parameters(
                     &db,
                     &env,
                     scope,
@@ -2250,6 +2280,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
+                assert!(keyword_tail.is_none());
                 let [(_, _), (_, entry)] = projected.as_ref() else {
                     panic!("expected mode and kwargs source bindings");
                 };

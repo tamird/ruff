@@ -14,7 +14,7 @@ use crate::types::typed_dict::{
 };
 use crate::types::{
     BoundTypeVarInstance, KnownClass, MemberLookupPolicy, ProgramEnvironment, Truthiness, Type,
-    UnionType,
+    TypedDictOpenness, TypedDictType, UnionType,
 };
 use crate::{Db, FxIndexMap};
 
@@ -325,18 +325,47 @@ pub enum DictionaryExtraItems<'db> {
     /// Named entries describe facts about those arguments. Operations that change the contents
     /// discard the component identity.
     ParamSpec(ParamSpecKeywords<'db>),
+    /// An untouched captured keyword component plus disjoint named fields.
+    KeywordTail(CapturedKeywordTail<'db>),
 }
 
 /// The keyword arguments captured by a `ParamSpec`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
 pub struct ParamSpecKeywords<'db>(BoundTypeVarInstance<'db>);
+
+/// Proof that the named fields of a keyword dictionary are disjoint from its captured tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub struct CapturedKeywordTail<'db> {
+    component: ParamSpecKeywords<'db>,
+    fixed: TypedDictType<'db>,
+}
+
+impl<'db> CapturedKeywordTail<'db> {
+    /// Construct only from normalized overload parameters whose source ownership was proved by
+    /// the argument binder. Named parameters of that overload are disjoint from its keyword tail.
+    pub(super) fn from_overload(
+        db: &'db dyn Db,
+        component: BoundTypeVarInstance<'db>,
+        fixed: TypedDictType<'db>,
+    ) -> Option<Self> {
+        (component.is_captured_keyword_arguments(db)
+            && matches!(fixed.openness(db), TypedDictOpenness::Closed)
+            && !fixed.items(db).is_empty())
+        .then_some(Self {
+            component: ParamSpecKeywords(component),
+            fixed,
+        })
+    }
+}
 
 impl<'db> ParamSpecKeywords<'db> {
     fn from_type(db: &'db dyn Db, ty: Type<'db>) -> Option<Self> {
         let Type::TypeVar(component) = ty else {
             return None;
         };
-        component.is_keyword_argument_component(db).then_some(Self(component))
+        component
+            .is_keyword_argument_component(db)
+            .then_some(Self(component))
     }
 }
 
@@ -344,10 +373,10 @@ impl<'db> DictionaryExtraItems<'db> {
     pub(super) fn keyword_paramspec(self, db: &'db dyn Db) -> Option<BoundTypeVarInstance<'db>> {
         match self {
             Self::ParamSpec(ParamSpecKeywords(component))
-                if component.is_captured_keyword_arguments(db) =>
-            {
-                Some(component.paramspec_base(db))
-            }
+            | Self::KeywordTail(CapturedKeywordTail {
+                component: ParamSpecKeywords(component),
+                fixed: _,
+            }) if component.is_captured_keyword_arguments(db) => Some(component.paramspec_base(db)),
             _ => None,
         }
     }
@@ -357,7 +386,7 @@ impl<'db> DictionaryExtraItems<'db> {
         match self {
             Self::Closed => None,
             Self::Value(ty) => Some(ty),
-            Self::ParamSpec(_) => Some(Type::object()),
+            Self::ParamSpec(_) | Self::KeywordTail(_) => Some(Type::object()),
         }
     }
 
@@ -365,14 +394,18 @@ impl<'db> DictionaryExtraItems<'db> {
     /// component must retain its identity here, just as it does for a direct `**kwargs` argument.
     pub(super) fn argument_type(self) -> Option<Type<'db>> {
         match self {
-            Self::ParamSpec(ParamSpecKeywords(component)) => Some(Type::TypeVar(component)),
+            Self::ParamSpec(ParamSpecKeywords(component))
+            | Self::KeywordTail(CapturedKeywordTail {
+                component: ParamSpecKeywords(component),
+                fixed: _,
+            }) => Some(Type::TypeVar(component)),
             _ => self.value_type(),
         }
     }
 
     fn forget_paramspec(self) -> Self {
         match self {
-            Self::ParamSpec(_) => Self::Value(Type::object()),
+            Self::ParamSpec(_) | Self::KeywordTail(_) => Self::Value(Type::object()),
             _ => self,
         }
     }

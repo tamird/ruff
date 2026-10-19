@@ -359,9 +359,10 @@ impl<'db> MappingContents<'db> {
                 items: items.into_values().collect(),
                 extra_items: match (dictionary.extra_items, other_dictionary.extra_items) {
                     (
-                        DictionaryExtraItems::ParamSpec(left),
-                        DictionaryExtraItems::ParamSpec(right),
-                    ) if left == right => DictionaryExtraItems::ParamSpec(left),
+                        left @ (DictionaryExtraItems::ParamSpec(_)
+                        | DictionaryExtraItems::KeywordTail(_)),
+                        right,
+                    ) if left == right => left,
                     _ if extra_value.is_never() => DictionaryExtraItems::Closed,
                     _ => DictionaryExtraItems::Value(extra_value),
                 },
@@ -936,7 +937,7 @@ fn initial_contents<'db>(
     }
     if matches!(
         mapping.dictionary.extra_items,
-        DictionaryExtraItems::ParamSpec(_)
+        DictionaryExtraItems::ParamSpec(_) | DictionaryExtraItems::KeywordTail(_)
     ) {
         // A copied parameter bundle loses its identity when exposed, but its ordinary value
         // type still constrains what can be forwarded afterward.
@@ -980,10 +981,16 @@ fn initial_contents<'db>(
         definition.kind(db),
         DefinitionKind::Parameter(ParameterDefinitionNodeKind::VariadicKeywordParameter(_))
     ) && let Some(entry) = domain.and_then(|domain| domain.parameter_type(db, definition))
-        && let Some(dictionary) = DictionaryItems::unpacked(db, &env, entry, source)
+        && let Some(mut dictionary) = DictionaryItems::unpacked(db, &env, entry, source)
     {
         // Parameter coverage proves these initial fields. Keep the source writable bound so
         // an escape restores its field types instead of perpetuating the narrowed entry row.
+        if let Some(tail) = domain.and_then(|domain| domain.keyword_tail(db)) {
+            dictionary.extra_items = DictionaryExtraItems::KeywordTail(tail);
+            dictionary.first_entry = DictionaryFirstEntry::Unknown;
+        } else if let Some(component) = ParamSpecKeywords::from_type(db, entry) {
+            dictionary.extra_items = DictionaryExtraItems::ParamSpec(component);
+        }
         mapping.dictionary = dictionary;
         mapping.uses_residual_presence = false;
     }
@@ -1220,12 +1227,24 @@ impl<'db> MappingTransfer<'db> {
                 previous
             };
         };
-        if !matches!(
-            self,
-            Self::Keep {
-                exposes_descendants: _
+        let preserved_tail = match (&self, mapping.dictionary.extra_items) {
+            (Self::Delete { key, source: _ }, DictionaryExtraItems::KeywordTail(tail))
+                if key
+                    .string_literal_value(db)
+                    .is_some_and(|name| tail.fixed.items(db).contains_key(name)) =>
+            {
+                Some(tail)
             }
-        ) {
+            _ => None,
+        };
+        if preserved_tail.is_none()
+            && !matches!(
+                self,
+                Self::Keep {
+                    exposes_descendants: _
+                }
+            )
+        {
             mapping.dictionary.extra_items = mapping.dictionary.extra_items.forget_paramspec();
         }
         match self {
@@ -1265,6 +1284,15 @@ impl<'db> MappingTransfer<'db> {
             }
             Self::Delete { key, source } => {
                 mapping.delete_item(db, env, key, source);
+                if let Some(tail) = preserved_tail
+                    && !mapping.dictionary.items.iter().any(|item| {
+                        item.kind != DictionaryItemKind::Residual
+                            && tail.fixed.items(db).contains_key(&item.name)
+                    })
+                {
+                    mapping.dictionary.extra_items =
+                        DictionaryExtraItems::ParamSpec(tail.component);
+                }
                 previous
             }
             Self::Clear => {
