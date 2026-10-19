@@ -376,21 +376,16 @@ impl<'db> SequentMap<'db> {
         // Most individual constraints produce no sequents. Avoid interning the query arguments
         // and retaining an empty Salsa result for those cases. Keep the checks in sync with the
         // single-constraint `add_sequents` methods below.
-        let may_produce_sequents = match constraint {
-            AtomicConstraint::ConcreteLower(bound) => {
-                bound.bound == bound.typevar.domain(db).bottom(db)
-                    || bound.bound == bound.typevar.domain(db).top(db)
-            }
-            AtomicConstraint::ConcreteUpper(bound) => {
-                bound.bound == bound.typevar.domain(db).top(db)
-                    || bound.bound == bound.typevar.domain(db).bottom(db)
-            }
-            AtomicConstraint::ConcreteEquivalence(_) => false,
-            AtomicConstraint::TypeVarRange(bound) => bound.left.is_same_typevar_as(db, bound.right),
-            AtomicConstraint::TypeVarEquivalence(bound) => {
-                bound.left.is_same_typevar_as(db, bound.right)
-            }
-        };
+        let may_produce_sequents = constraint.is_intrinsically_true(db)
+            || match constraint {
+                AtomicConstraint::ConcreteLower(bound) => {
+                    bound.bound == bound.typevar.domain(db).top(db)
+                }
+                AtomicConstraint::ConcreteUpper(bound) => {
+                    bound.bound == bound.typevar.domain(db).bottom(db)
+                }
+                _ => false,
+            };
         if !may_produce_sequents {
             return None;
         }
@@ -514,18 +509,32 @@ impl ReplacementIs {
 }
 
 impl<'db> AtomicConstraint<'db> {
+    /// A sufficient test for truth without assumptions about other constraints.
+    pub(super) fn is_intrinsically_true(self, db: &'db dyn Db) -> bool {
+        match self {
+            Self::ConcreteLower(bound) => bound.bound == bound.typevar.domain(db).bottom(db),
+            Self::ConcreteUpper(bound) => bound.bound == bound.typevar.domain(db).top(db),
+            Self::ConcreteEquivalence(_) => false,
+            Self::TypeVarRange(bound) => bound.left.is_same_typevar_as(db, bound.right),
+            Self::TypeVarEquivalence(bound) => bound.left.is_same_typevar_as(db, bound.right),
+        }
+    }
+
     fn add_sequents(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         map: &mut SequentMap<'db>,
     ) {
+        if self.is_intrinsically_true(db) {
+            map.add_single_tautology(self);
+        }
         match self {
             AtomicConstraint::ConcreteLower(this) => this.add_sequents(db, env, map),
             AtomicConstraint::ConcreteUpper(this) => this.add_sequents(db, env, map),
-            AtomicConstraint::ConcreteEquivalence(this) => this.add_sequents(db, env, map),
-            AtomicConstraint::TypeVarRange(this) => this.add_sequents(db, env, map),
-            AtomicConstraint::TypeVarEquivalence(this) => this.add_sequents(db, env, map),
+            AtomicConstraint::ConcreteEquivalence(_)
+            | AtomicConstraint::TypeVarRange(_)
+            | AtomicConstraint::TypeVarEquivalence(_) => {}
         }
     }
 
@@ -1398,11 +1407,6 @@ impl<'db> ConcreteLowerBound<'db> {
         _env: &ProgramEnvironment<'db>,
         map: &mut SequentMap<'db>,
     ) {
-        // `⊥ ≤ T` is always true
-        if self.bound == self.typevar.domain(db).bottom(db) {
-            map.add_single_tautology(self.into());
-        }
-
         // `⊤ ≤ T` implies `T = ⊤`
         if self.bound == self.typevar.domain(db).top(db) {
             let derived = ConcreteEquivalenceBound::new(self.provenance, self.typevar, self.bound);
@@ -1629,11 +1633,6 @@ impl<'db> ConcreteUpperBound<'db> {
         _env: &ProgramEnvironment<'db>,
         map: &mut SequentMap<'db>,
     ) {
-        // `T ≤ ⊤` is always true
-        if self.bound == self.typevar.domain(db).top(db) {
-            map.add_single_tautology(self.into());
-        }
-
         // `T ≤ ⊥` implies `T = ⊥`
         if self.bound == self.typevar.domain(db).bottom(db) {
             let derived = ConcreteEquivalenceBound::new(self.provenance, self.typevar, self.bound);
@@ -1802,16 +1801,6 @@ impl<'db> ConcreteUpperBound<'db> {
 }
 
 impl<'db> ConcreteEquivalenceBound<'db> {
-    #[expect(clippy::unused_self)]
-    fn add_sequents(
-        self,
-        _db: &'db dyn Db,
-        _env: &ProgramEnvironment<'db>,
-        _map: &mut SequentMap<'db>,
-    ) {
-        // We cannot infer any sequents from `T = α` on its own.
-    }
-
     fn add_sequents_with_concrete_equivalence(
         self,
         db: &'db dyn Db,
@@ -1922,18 +1911,6 @@ impl<'db> ConcreteEquivalenceBound<'db> {
 }
 
 impl<'db> TypeVarRangeBound<'db> {
-    fn add_sequents(
-        self,
-        db: &'db dyn Db,
-        _env: &ProgramEnvironment<'db>,
-        map: &mut SequentMap<'db>,
-    ) {
-        // `T ≤ T` is always true
-        if self.left.is_same_typevar_as(db, self.right) {
-            map.add_single_tautology(self.into());
-        }
-    }
-
     fn add_sequents_with_typevar_range(
         self,
         db: &'db dyn Db,
@@ -2005,18 +1982,6 @@ impl<'db> TypeVarRangeBound<'db> {
 }
 
 impl<'db> TypeVarEquivalenceBound<'db> {
-    fn add_sequents(
-        self,
-        db: &'db dyn Db,
-        _env: &ProgramEnvironment<'db>,
-        map: &mut SequentMap<'db>,
-    ) {
-        // `T = T` is always true
-        if self.left.is_same_typevar_as(db, self.right) {
-            map.add_single_tautology(self.into());
-        }
-    }
-
     fn add_sequents_with_typevar_equivalence(
         self,
         db: &'db dyn Db,
