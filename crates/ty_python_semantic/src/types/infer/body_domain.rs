@@ -3305,6 +3305,59 @@ mod tests {
     }
 
     #[test]
+    fn complete_domains_check_each_callback_call() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import Callable, overload
+            @overload
+            def f(callback: Callable[[int], None], other: Callable[[str], None], value: int) -> None: ...
+            @overload
+            def f(callback: Callable[[str], None], other: Callable[[str], None], value: str) -> None: ...
+            def f(callback: object, other: object, value: object) -> None:
+                callback(value); other(42)
+        "#};
+        db.write_file("/src/body.py", source)?;
+        let f = function(&db);
+        let ordinary = crate::types::check_types(&db, f.program_file(&db));
+        assert_eq!(ordinary.len(), 2, "{ordinary:#?}");
+        let selected = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
+        assert_eq!(selected.len(), 1, "{selected:#?}");
+        assert_eq!(selected[0].id().as_str(), "invalid-argument-type");
+        assert_eq!(
+            &source[selected[0].primary_span().unwrap().range().unwrap()],
+            "42"
+        );
+
+        for (calls, expected) in [
+            (
+                "callback(value); other(42)  # ty: ignore[invalid-argument-type]",
+                None,
+            ),
+            (
+                "callback(value)  # ty: ignore[call-non-callable]",
+                Some("unused-ignore-comment"),
+            ),
+            ("callback(42)", Some("invalid-argument-type")),
+        ] {
+            db.write_file(
+                "/src/body.py",
+                source.replace("callback(value); other(42)", calls),
+            )?;
+            let f = function(&db);
+            let selected = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
+            assert_eq!(
+                selected
+                    .iter()
+                    .map(|diagnostic| diagnostic.id().as_str())
+                    .collect::<Vec<_>>(),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{calls}: {selected:#?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn overload_body_aggregation_keeps_callable_details() -> anyhow::Result<()> {
         let mut db = setup_db();
         db.write_dedented("/src/body.py", "
