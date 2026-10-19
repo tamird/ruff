@@ -198,11 +198,7 @@ impl<'db> CallableSignature<'db> {
     fn is_cycle_initial(&self) -> bool {
         matches!(
             self.overloads.as_slice(),
-            [signature]
-                if signature.generic_context.is_none()
-                    && signature.definition.is_none()
-                    && signature.parameters == Parameters::bottom()
-                    && signature.return_ty.is_divergent()
+            [signature] if signature.is_cycle_initial()
         )
     }
 
@@ -1230,6 +1226,18 @@ impl<'db> Signature<'db> {
         Self::new(Parameters::bottom(), Type::Never)
     }
 
+    /// The signature that rejects every call and returns the top type.
+    fn top() -> Self {
+        Self::new(Parameters::top(), Type::object())
+    }
+
+    fn is_cycle_initial(&self) -> bool {
+        self.generic_context.is_none()
+            && self.definition.is_none()
+            && self.parameters == Parameters::bottom()
+            && self.return_ty.is_divergent()
+    }
+
     /// Returns `true` if `Self` should be hidden from the generic context display.
     ///
     /// `Self` is hidden if it does not appear in:
@@ -1269,30 +1277,72 @@ impl<'db> Signature<'db> {
         previous: &Self,
         cycle: &salsa::Cycle,
     ) -> Self {
-        let return_ty = self
-            .return_ty
-            .cycle_normalized(db, env, previous.return_ty, cycle);
+        // Materialization can also produce this signature, so only absorb it after taint,
+        // when this normalizer can have produced it as a widening.
+        if cycle.iteration() > crate::TAINTED_CYCLES
+            && previous.parameters.is_top()
+            && previous == &Self::top()
+        {
+            return previous.clone();
+        }
+        if previous.is_cycle_initial() {
+            return Self {
+                return_ty: self
+                    .return_ty
+                    .cycle_normalized(db, env, previous.return_ty, cycle),
+                ..self.clone()
+            };
+        }
 
-        let parameters = if self.parameters.len() == previous.parameters.len() {
+        let Self {
+            generic_context,
+            definition,
+            extras,
+            parameters,
+            return_ty,
+        } = self;
+        // A parameter and return type can reference this signature's type variables and
+        // receiver constraints. Never combine types from different signature contexts.
+        if *generic_context != previous.generic_context
+            || *definition != previous.definition
+            || *extras != previous.extras
+        {
+            return if cycle.iteration() <= crate::TAINTED_CYCLES {
+                self.clone()
+            } else {
+                Self::top()
+            };
+        }
+
+        // Resolving `Unpack[TypedDict]` can replace one source parameter with several
+        // keyword-only parameters. Prefer the resolved row in either direction.
+        let normalized_parameters = if parameters.same_cycle_layout(&previous.parameters) {
             Parameters::new(
-                self.parameters
+                parameters
                     .iter()
                     .zip(previous.parameters.iter())
                     .map(|(curr, prev)| curr.cycle_normalized(db, env, prev, cycle))
                     .collect::<Box<[_]>>(),
-                self.parameters.kind(),
+                parameters.kind(),
             )
+        } else if definition.is_some() && parameters.is_keyword_expansion_of(&previous.parameters) {
+            parameters.clone()
+        } else if definition.is_some() && previous.parameters.is_keyword_expansion_of(parameters) {
+            previous.parameters.clone()
+        } else if cycle.iteration() <= crate::TAINTED_CYCLES {
+            return self.clone();
         } else {
-            debug_assert_eq!(previous.parameters, Parameters::bottom());
-            self.parameters.clone()
+            // No supported refinement establishes a common call domain. Widen the entire
+            // signature so its parameter and return types remain bound by the same context.
+            return Self::top();
         };
 
         Self {
-            generic_context: self.generic_context,
-            definition: self.definition,
-            extras: self.extras.clone(),
-            parameters,
-            return_ty,
+            generic_context: *generic_context,
+            definition: *definition,
+            extras: extras.clone(),
+            parameters: normalized_parameters,
+            return_ty: return_ty.cycle_normalized(db, env, previous.return_ty, cycle),
         }
     }
 
@@ -5737,6 +5787,49 @@ pub struct Parameters<'db> {
 }
 
 impl<'db> Parameters<'db> {
+    fn same_cycle_layout(&self, other: &Self) -> bool {
+        self.kind() == other.kind()
+            && self.len() == other.len()
+            && self
+                .iter()
+                .zip(other.iter())
+                .all(|(current, previous)| current.same_cycle_layout(previous))
+    }
+
+    /// Whether this parameter list refines an unresolved `**kwargs` parameter into its
+    /// `TypedDict` keys. Source positions distinguish the generated keys from other parameters.
+    /// An open row that already contains keys from the same source parameter is not unresolved;
+    /// treating it as unresolved would let the row grow without bound.
+    fn is_keyword_expansion_of(&self, unresolved: &Self) -> bool {
+        if !self.is_standard() || !unresolved.is_standard() {
+            return false;
+        }
+        let Some((kwargs, prefix)) = unresolved.as_slice().split_last() else {
+            return false;
+        };
+        if !kwargs.is_keyword_variadic() || !kwargs.annotated_type().is_unknown() {
+            return false;
+        }
+        let Some(index) = kwargs.source_parameter_index() else {
+            return false;
+        };
+        if prefix
+            .iter()
+            .any(|parameter| parameter.source_parameter_index() == Some(index))
+        {
+            return false;
+        }
+        let Some(expansion) = self.as_slice().strip_prefix(prefix) else {
+            return false;
+        };
+        expansion.first().is_some_and(Parameter::is_keyword_only)
+            && expansion.iter().enumerate().all(|(offset, parameter)| {
+                parameter.source_parameter_index() == Some(index)
+                    && (parameter.is_keyword_only()
+                        || (offset + 1 == expansion.len() && parameter.is_keyword_variadic()))
+            })
+    }
+
     /// Create a parameter list with an explicit kind.
     ///
     /// This constructor does not infer the kind from the parameter types or normalize an unpacked
@@ -6937,6 +7030,37 @@ enum ParameterAnnotationKind {
 }
 
 impl<'db> Parameter<'db> {
+    /// Compare the parameter's call semantics, provenance, and default identity. Positional-only
+    /// and variadic names are presentation metadata; cycle normalization retains the prior name.
+    fn same_cycle_layout(&self, other: &Self) -> bool {
+        let Self {
+            annotated_type: _,
+            source,
+            inferred_annotation,
+            implicit,
+            annotation_kind,
+            source_parameter_index,
+            kind,
+        } = self;
+        let default_layout = |default: Option<ParameterDefault<'db>>| {
+            default.map(|default| default.map_type(|_| Type::Never))
+        };
+        *source == other.source
+            && *inferred_annotation == other.inferred_annotation
+            && *implicit == other.implicit
+            && *annotation_kind == other.annotation_kind
+            && *source_parameter_index == other.source_parameter_index
+            && std::mem::discriminant(kind) == std::mem::discriminant(&other.kind)
+            && (self.name() == other.name()
+                || matches!(
+                    kind,
+                    ParameterKind::PositionalOnly { .. }
+                        | ParameterKind::Variadic { .. }
+                        | ParameterKind::KeywordVariadic { .. }
+                ))
+            && default_layout(self.default()) == default_layout(other.default())
+    }
+
     fn new(kind: ParameterKind<'db>) -> Self {
         Self {
             annotated_type: Type::unknown(),
@@ -7540,11 +7664,15 @@ impl<'db> ParameterKind<'db> {
             (
                 ParameterKind::PositionalOnly { name, default_type },
                 ParameterKind::PositionalOnly {
+                    name: previous_name,
                     default_type: prev_default,
-                    ..
                 },
             ) => ParameterKind::PositionalOnly {
-                name: name.clone(),
+                name: if cycle.iteration() <= crate::TAINTED_CYCLES {
+                    name.clone()
+                } else {
+                    previous_name.clone()
+                },
                 default_type: Self::cycle_normalized_default(
                     db,
                     env,
@@ -7585,9 +7713,14 @@ impl<'db> ParameterKind<'db> {
                     cycle,
                 ),
             },
-            // Variadic / KeywordVariadic have no types to normalize.
-            // Also, if the current `ParameterKind` is different from `previous`, it means that `previous` is the cycle initial value,
-            // and the current value should take precedence.
+            (ParameterKind::Variadic { .. }, ParameterKind::Variadic { .. })
+            | (ParameterKind::KeywordVariadic { .. }, ParameterKind::KeywordVariadic { .. }) => {
+                if cycle.iteration() <= crate::TAINTED_CYCLES {
+                    self.clone()
+                } else {
+                    previous.clone()
+                }
+            }
             _ => self.clone(),
         }
     }
@@ -7638,6 +7771,7 @@ mod tests {
     use crate::types::{FunctionType, KnownClass, LiteralValueType};
     use ruff_db::system::DbWithWritableSystem as _;
     use ty_python_core::ProgramFile;
+    use ty_python_core::program::Program;
 
     #[track_caller]
     fn get_function_f<'db>(db: &'db TestDb, file: &'static str) -> FunctionType<'db> {
@@ -7647,6 +7781,186 @@ mod tests {
             .place
             .expect_type()
             .expect_function_literal()
+    }
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, salsa::SalsaValue)]
+    enum CycleScenario {
+        DelayedExpansion { source_index: usize },
+        GrowingOpenRow,
+        ProvisionalTop,
+        EvolvingTopReturn,
+        PositionalName,
+        AnnotationKind,
+        GenericOwner,
+    }
+
+    const DELAYED_EXPANSION: u32 = crate::TAINTED_CYCLES + 2;
+
+    #[salsa::tracked(
+        cycle_initial=|db, id, program, _, _| {
+            let env = ProgramEnvironment::from_program(program);
+            (0, Signature::new(Parameters::bottom(), Type::divergent(id).bottom_materialization(db, &env)))
+        },
+        cycle_fn=|db, cycle, previous: &(u32, Signature<'db>), (phase, current): (u32, Signature<'db>), program: Program<'db>, _, _| {
+            (phase, current.cycle_normalized(db, &ProgramEnvironment::from_program(program), &previous.1, cycle))
+        }
+    )]
+    fn signature_cycle<'db>(
+        db: &'db dyn Db,
+        program: Program<'db>,
+        scenario: CycleScenario,
+        generic: FunctionType<'db>,
+    ) -> (u32, Signature<'db>) {
+        let (phase, previous) = signature_cycle(db, program, scenario, generic);
+        let signature = match scenario {
+            CycleScenario::DelayedExpansion { source_index } => {
+                let mut signature = generic.last_definition_signature(db).clone();
+                if *phase >= DELAYED_EXPANSION {
+                    signature.parameters = Parameters::standard(["item", "other"].map(|name| {
+                        Parameter::keyword_only(Name::new_static(name))
+                            .with_annotated_type(Type::object())
+                            .with_source_parameter_index(Some(source_index))
+                    }));
+                }
+                signature
+            }
+            CycleScenario::GrowingOpenRow => {
+                let mut signature = generic.last_definition_signature(db).clone();
+                let [kwargs] = signature.parameters.as_slice() else {
+                    panic!("expected the fixture's single variadic parameter");
+                };
+                let mut fields: Vec<_> = previous
+                    .parameters()
+                    .iter()
+                    .filter(|parameter| parameter.is_keyword_only())
+                    .cloned()
+                    .collect();
+                fields.push(
+                    Parameter::keyword_only(Name::new(format!("item{}", fields.len())))
+                        .with_annotated_type(Type::object())
+                        .with_source_parameter_index(Some(0)),
+                );
+                fields.push(kwargs.clone());
+                signature.parameters = Parameters::standard(fields);
+                signature
+            }
+            CycleScenario::ProvisionalTop => {
+                if *phase == 0 {
+                    Signature::top()
+                } else {
+                    Signature::new(
+                        Parameters::standard([Parameter::keyword_only(Name::new_static("item"))]),
+                        Type::object(),
+                    )
+                }
+            }
+            CycleScenario::EvolvingTopReturn => {
+                let mut signature = generic.last_definition_signature(db).clone();
+                signature.parameters = Parameters::top();
+                signature.return_ty = if *phase < DELAYED_EXPANSION {
+                    Type::Never
+                } else {
+                    KnownClass::Int.to_instance(db, &ProgramEnvironment::from_program(program))
+                };
+                signature
+            }
+            CycleScenario::PositionalName => {
+                let name = if previous.parameters().get(0).and_then(Parameter::name)
+                    == Some(&Name::new_static("left"))
+                {
+                    "right"
+                } else {
+                    "left"
+                };
+                Signature::new(
+                    Parameters::standard([Parameter::positional_only(Some(Name::new_static(
+                        name,
+                    )))]),
+                    Type::object(),
+                )
+            }
+            CycleScenario::AnnotationKind => {
+                let parameter = Parameter::variadic(Name::new_static("args"));
+                let parameter = if previous.parameters().get(0).is_some_and(|parameter| {
+                    parameter.annotation_kind == ParameterAnnotationKind::Normal
+                }) {
+                    parameter.with_starred_annotation()
+                } else {
+                    parameter
+                };
+                Signature::new(Parameters::standard([parameter]), Type::object())
+            }
+            CycleScenario::GenericOwner => {
+                if *phase < DELAYED_EXPANSION {
+                    let mut signature = generic.last_definition_signature(db).clone();
+                    signature.parameters =
+                        Parameters::standard([Parameter::keyword_only(Name::new_static("item"))
+                            .with_annotated_type(signature.return_ty)
+                            .with_source_parameter_index(Some(0))]);
+                    signature
+                } else {
+                    Signature::new(
+                        Parameters::standard([Parameter::keyword_variadic(Name::new_static(
+                            "kwargs",
+                        ))
+                        .with_source_parameter_index(Some(0))]),
+                        Type::object(),
+                    )
+                }
+            }
+        };
+        ((phase + 1).min(DELAYED_EXPANSION + 1), signature)
+    }
+
+    #[test]
+    fn changing_parameter_layouts_converge() {
+        let mut db = setup_db();
+        db.write_dedented("/src/owner.py", "def f[T](**kwargs) -> T: ...")
+            .unwrap();
+        let generic = get_function_f(&db, "/src/owner.py");
+        let program = db.program_environment().program(&db);
+
+        let (_, expanded) = signature_cycle(
+            &db,
+            program,
+            CycleScenario::DelayedExpansion { source_index: 0 },
+            generic,
+        );
+        assert_eq!(expanded.parameters().len(), 2);
+        assert!(expanded.parameters().iter().all(Parameter::is_keyword_only));
+
+        let (_, provisional) =
+            signature_cycle(&db, program, CycleScenario::ProvisionalTop, generic);
+        assert_eq!(
+            provisional.parameters().as_slice(),
+            [Parameter::keyword_only(Name::new_static("item"))]
+        );
+
+        let (_, materialized) =
+            signature_cycle(&db, program, CycleScenario::EvolvingTopReturn, generic);
+        assert_eq!(
+            materialized.return_ty,
+            KnownClass::Int.to_instance(&db, &db.program_environment())
+        );
+        assert_eq!(
+            materialized.generic_context,
+            generic.last_definition_signature(&db).generic_context
+        );
+
+        let (_, positional) = signature_cycle(&db, program, CycleScenario::PositionalName, generic);
+        assert!(
+            matches!(positional.parameters().as_slice(), [parameter] if parameter.is_positional_only())
+        );
+
+        for scenario in [
+            CycleScenario::DelayedExpansion { source_index: 1 },
+            CycleScenario::GrowingOpenRow,
+            CycleScenario::AnnotationKind,
+            CycleScenario::GenericOwner,
+        ] {
+            let (_, signature) = signature_cycle(&db, program, scenario, generic);
+            assert_eq!(signature, &Signature::top(), "{scenario:?}");
+        }
     }
 
     #[test]
