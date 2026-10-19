@@ -13,7 +13,8 @@ use crate::{Db, ProgramEnvironment};
 pub enum CheckedArgument<'a, 'db> {
     /// No argument supplied this parameter.
     Omitted,
-    /// A single value supplied this parameter. A synthetic receiver has no source expression.
+    /// A single value supplied this parameter. A synthetic receiver or unpacked argument has no
+    /// individual source expression.
     Value {
         ty: Type<'db>,
         expression: Option<&'a ast::Expr>,
@@ -139,22 +140,32 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
             return CheckedArgument::Indeterminate;
         };
         let expression = match source {
-            Some((source, _)) => {
-                let expression = match source {
+            Some((source, _, argument)) => {
+                let mut matches = argument
+                    .parameters
+                    .iter()
+                    .filter(|matched| matched.index == parameter);
+                let (Some(matched), None) = (matches.next(), matches.next()) else {
+                    return CheckedArgument::Indeterminate;
+                };
+                match source {
                     ast::ArgOrKeyword::Arg(expression) => {
                         if expression.is_starred_expr() {
                             return CheckedArgument::Indeterminate;
                         }
-                        expression
+                        Some(expression)
                     }
                     ast::ArgOrKeyword::Keyword(keyword) => {
-                        if keyword.arg.is_none() {
-                            return CheckedArgument::Indeterminate;
+                        if keyword.arg.is_some() {
+                            Some(&keyword.value)
+                        } else {
+                            if !matched.is_definite_keyword() {
+                                return CheckedArgument::Indeterminate;
+                            }
+                            None
                         }
-                        &keyword.value
                     }
-                };
-                Some(expression)
+                }
             }
             None => None,
         };
@@ -166,8 +177,14 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
     fn matched_arguments(
         &self,
         parameter: usize,
-    ) -> impl Iterator<Item = Option<(ast::ArgOrKeyword<'a>, &CallArgumentTypes<'db>)>> {
-        let matches = move |argument: &super::MatchedArgument<'db>| {
+    ) -> impl Iterator<
+        Item = Option<(
+            ast::ArgOrKeyword<'a>,
+            &CallArgumentTypes<'db>,
+            &super::MatchedArgument<'db>,
+        )>,
+    > {
+        let matches_parameter = move |argument: &super::MatchedArgument<'db>| {
             argument
                 .parameters
                 .iter()
@@ -177,7 +194,7 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
             .binding
             .argument_matches()
             .first()
-            .filter(|argument| self.bound_receiver && matches(argument))
+            .filter(|argument| self.bound_receiver && matches_parameter(argument))
             .map(|_| None);
         let sources = self
             .call
@@ -189,7 +206,7 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
                 let argument = self
                     .binding
                     .matched_argument_for_call_argument(self.bound_receiver, index)?;
-                matches(argument).then_some(Some((source, types)))
+                matches_parameter(argument).then_some(Some((source, types, argument)))
             });
         receiver.into_iter().chain(sources)
     }
@@ -204,7 +221,7 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
     ) -> impl Iterator<Item = Type<'db>> {
         self.matched_arguments(parameter)
             .filter_map(move |argument| match argument {
-                Some((_, types)) => {
+                Some((_, types, _)) => {
                     let declared = self.binding.signature.parameters()[parameter].annotated_type();
                     Some(types.get_for_declared_type(declared))
                 }
@@ -215,7 +232,7 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
     /// Returns the complete source argument for diagnostics, including a keyword's name.
     pub(crate) fn argument_node(&self, parameter: usize) -> Option<ast::AnyNodeRef<'a>> {
         let mut arguments = self.matched_arguments(parameter);
-        let (source, _) = arguments.next()??;
+        let (source, _, _) = arguments.next()??;
         if arguments.next().is_some() {
             return None;
         }

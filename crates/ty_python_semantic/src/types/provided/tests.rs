@@ -3308,6 +3308,57 @@ def in_loop() -> None:
 }
 
 #[test]
+fn checked_calls_distinguish_definite_unpacked_arguments() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "def observe(value: object = ...) -> str: ...\ndef collect(**options: object) -> str: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from typing_extensions import Literal, NotRequired, TypedDict, assert_type
+from native import collect, observe
+
+class OptionalValue(TypedDict):
+    value: NotRequired[int]
+
+def use(optional: OptionalValue) -> None:
+    required = {"value": 1}
+    assert_type(observe(**required), Literal["value"])
+    assert_type(observe(**optional), Literal["indeterminate"])
+    assert_type(observe(), Literal["omitted"])
+    options = {"first": 1, "second": 2}
+    assert_type(collect(**options), Literal["indeterminate"])
+    assert_type(collect(first=1, second=2), Literal["indeterminate"])
+    assert_type(collect(**{"first": 1}), Literal["value"])
+"#,
+        )
+        .with_call_result_provider(|db, call| {
+            let parameter = match call
+                .declaration()
+                .and_then(|declaration| declaration.name(db))
+                .as_deref()
+            {
+                Some("observe") => "value",
+                Some("collect") => "options",
+                _ => return None.into(),
+            };
+            let presence = match call.argument(parameter) {
+                CheckedArgument::Omitted => "omitted",
+                CheckedArgument::Value { .. } => "value",
+                CheckedArgument::Indeterminate => "indeterminate",
+            };
+            Some(Type::string_literal(db, presence)).into()
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
 fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
     fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
         if call.declaration()?.name(db)?.as_str() != "observe" {

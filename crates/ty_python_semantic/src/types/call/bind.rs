@@ -5390,6 +5390,15 @@ struct ParameterInfo {
     suppress_missing_error: bool,
 }
 
+/// Whether a specific keyword in an argument supplies a matched parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeywordPresence {
+    Required,
+    Optional,
+    /// The argument is positional or has no known keyword name.
+    Unspecified,
+}
+
 struct ArgumentMatcher<'a, 'db> {
     arguments: &'a CallArguments<'a, 'db>,
     parameters: &'a Parameters<'db>,
@@ -5491,7 +5500,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         parameter: &Parameter<'db>,
         positional: bool,
         variable_argument_length: bool,
-        skip_unknown_keywords: bool,
+        keyword_presence: KeywordPresence,
     ) {
         if self.parameter_info[parameter_index].matched
             && !parameter.is_variadic()
@@ -5525,10 +5534,12 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             argument_type,
             expected_type: None,
             provenance,
+            keyword_presence,
         });
         matched_argument.matched = true;
         self.parameter_info[parameter_index].matched = true;
-        self.parameter_info[parameter_index].skip_unknown_keywords |= skip_unknown_keywords;
+        self.parameter_info[parameter_index].skip_unknown_keywords |=
+            keyword_presence != KeywordPresence::Optional;
     }
 
     fn match_positional(
@@ -5561,7 +5572,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             parameter,
             !parameter.is_variadic(),
             variable_argument_length,
-            true,
+            KeywordPresence::Unspecified,
         );
         Ok(())
     }
@@ -5572,7 +5583,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument: Argument<'a>,
         argument_type: Option<Type<'db>>,
         name: &str,
-        skip_unknown_keywords: bool,
+        required: bool,
     ) -> Result<(), ()> {
         let Some((parameter_index, parameter)) = self.parameters.matching_keyword(name) else {
             if let Some((parameter_index, parameter)) =
@@ -5601,7 +5612,11 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             parameter,
             false,
             false,
-            skip_unknown_keywords,
+            if required {
+                KeywordPresence::Required
+            } else {
+                KeywordPresence::Optional
+            },
         );
         Ok(())
     }
@@ -5989,7 +6004,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 parameter,
                 false,
                 true,
-                true,
+                KeywordPresence::Unspecified,
             );
         }
     }
@@ -6050,6 +6065,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     argument_type: Some(argument_type),
                     expected_type: None,
                     provenance: InvalidArgumentTypeProvenance::Argument,
+                    keyword_presence: KeywordPresence::Unspecified,
                 });
             }
         }
@@ -6068,7 +6084,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 parameter,
                 false,
                 true,
-                true,
+                KeywordPresence::Unspecified,
             );
         } else if has_explicit_extra_items {
             self.errors
@@ -8014,9 +8030,15 @@ pub struct MatchedParameter<'db> {
 
     /// Why this parameter match exists.
     provenance: InvalidArgumentTypeProvenance,
+
+    keyword_presence: KeywordPresence,
 }
 
 impl<'db> MatchedParameter<'db> {
+    pub(super) fn is_definite_keyword(self) -> bool {
+        self.keyword_presence == KeywordPresence::Required
+    }
+
     /// Resolve the actual type using the same formal key as contextual argument inference.
     fn argument_type(
         self,
