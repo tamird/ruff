@@ -65,7 +65,7 @@ declare_lint! {
 declare_lint! {
     #[doc = include_str!("../resources/lint_docs/blanket-ignore-comment.md")]
     pub(crate) static BLANKET_IGNORE_COMMENT = {
-        summary: "detects blanket `ty: ignore` comments",
+        summary: "detects blanket ignore comments",
         status: LintStatus::stable("0.0.57"),
         default_level: Level::Ignore,
     }
@@ -158,18 +158,21 @@ fn check_blanket_suppressions(context: &mut CheckSuppressionsContext) {
         return;
     }
 
+    let candidates = context.suppression_diagnostic_candidates();
     for suppression in context.suppressions.iter().filter(|suppression| {
-        suppression.kind == SuppressionKind::Ty && suppression.target == SuppressionTarget::All
+        suppression.target == SuppressionTarget::All
+            && (suppression.kind == SuppressionKind::Ty || context.require_valid_suppressions)
     }) {
         // A blanket suppression cannot suppress its own diagnostic, but a lint-specific
         // suppression can.
-        if let Some(lint_suppression) = select_preferred_suppression(
-            context
-                .suppressions
-                .lint_suppressions(suppression.range, LintId::of(&BLANKET_IGNORE_COMMENT))
-                .filter(|candidate| candidate.target.is_lint()),
-            suppression.range,
-        ) {
+        if let Some(lint_suppression) = candidates.and_then(|candidates| {
+            select_preferred_suppression(
+                candidates
+                    .lint_suppressions(suppression.range, LintId::of(&BLANKET_IGNORE_COMMENT))
+                    .filter(|candidate| candidate.target.is_lint()),
+                suppression.range,
+            )
+        }) {
             context
                 .diagnostics
                 .borrow_mut()
@@ -177,7 +180,10 @@ fn check_blanket_suppressions(context: &mut CheckSuppressionsContext) {
         } else if let Some(diag) =
             context.report_unchecked(&BLANKET_IGNORE_COMMENT, suppression.range)
         {
-            diag.into_diagnostic("Use specific rule codes in `ty: ignore`");
+            diag.into_diagnostic(format_args!(
+                "Use specific rule codes in `{}`",
+                suppression.kind
+            ));
         }
     }
 }
@@ -216,28 +222,36 @@ struct CheckSuppressionsContext<'a> {
     file: File,
     suppressions: &'a Suppressions,
     diagnostics: std::cell::RefCell<TypeCheckDiagnostics>,
+    require_valid_suppressions: bool,
 }
 
 impl<'a> CheckSuppressionsContext<'a> {
     fn new(db: &'a dyn Db, file: PythonFile<'a>, diagnostics: TypeCheckDiagnostics) -> Self {
         let suppressions = suppressions(db, file);
+        let file = file.file(db);
         Self {
             db,
-            file: file.file(db),
+            file,
             suppressions,
             diagnostics: diagnostics.into(),
+            require_valid_suppressions: db.rule_selection(file).requires_valid_suppressions(),
         }
     }
 
     fn is_lint_disabled(&self, lint: &'static LintMetadata) -> bool {
-        !self
-            .db
-            .rule_selection(self.file)
-            .is_enabled(LintId::of(lint))
+        !self.require_valid_suppressions
+            && !self
+                .db
+                .rule_selection(self.file)
+                .is_enabled(LintId::of(lint))
     }
 
     fn is_suppression_used(&self, id: FileSuppressionId) -> bool {
         self.diagnostics.borrow().is_used(id)
+    }
+
+    fn suppression_diagnostic_candidates(&self) -> Option<&'a Suppressions> {
+        (!self.require_valid_suppressions).then_some(self.suppressions)
     }
 
     fn report_lint<'ctx>(
@@ -245,7 +259,10 @@ impl<'a> CheckSuppressionsContext<'a> {
         lint: &'static LintMetadata,
         range: TextRange,
     ) -> Option<SuppressionDiagnosticGuardBuilder<'ctx, 'a>> {
-        if let Some(suppression) = self.suppressions.find_suppression(range, LintId::of(lint)) {
+        if let Some(suppression) = self
+            .suppression_diagnostic_candidates()
+            .and_then(|candidates| candidates.find_suppression(range, LintId::of(lint)))
+        {
             self.diagnostics.borrow_mut().mark_used(suppression.id());
             return None;
         }
@@ -281,7 +298,11 @@ impl<'ctx, 'db> SuppressionDiagnosticGuardBuilder<'ctx, 'db> {
         lint: &'static LintMetadata,
         range: TextRange,
     ) -> Option<Self> {
-        let severity = ctx.db.rule_selection(ctx.file).severity(LintId::of(lint))?;
+        let severity = if ctx.require_valid_suppressions {
+            Severity::Error
+        } else {
+            ctx.db.rule_selection(ctx.file).severity(LintId::of(lint))?
+        };
 
         Some(Self {
             ctx,
@@ -956,6 +977,72 @@ mod tests {
         diagnostic.annotate(primary);
         diagnostic.info("Additional application context");
         diagnostic
+    }
+
+    #[test]
+    fn suppression_diagnostics_can_be_required() -> anyhow::Result<()> {
+        for (source, required_diagnostic) in [
+            (
+                "value = 1 # ty: ignore[division-by-zero, unused-ignore-comment]\n",
+                "unused-ignore-comment",
+            ),
+            (
+                "value = 1 # type: ignore # ty: ignore[unused-ignore-comment]\n",
+                "unused-type-ignore-comment",
+            ),
+            (
+                "value = 1 # ty: ignore[ignore-comment-unknown-rule, missing-rule]\n",
+                "ignore-comment-unknown-rule",
+            ),
+            (
+                "value = 1 # ty: ignore[invalid-ignore-comment] # ty: ignore[\n",
+                "invalid-ignore-comment",
+            ),
+            (
+                "value = missing # ty: ignore[blanket-ignore-comment] # ty: ignore\n",
+                "blanket-ignore-comment",
+            ),
+            (
+                "# type: ignore\nvalue = missing\n",
+                "blanket-ignore-comment",
+            ),
+        ] {
+            for require in [false, true] {
+                let registry = crate::default_lint_registry();
+                let mut selection = RuleSelection::from_registry(registry);
+                selection.set_require_valid_suppressions(require);
+                let db = TestDbBuilder::new()
+                    .with_rule_selection(selection)
+                    .with_file("/src/main.py", source)
+                    .build()?;
+                let file = system_path_to_file(&db, "/src/main.py")?;
+                let diagnostics = check_types(&db, db.program_file(file));
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .find(|diagnostic| diagnostic.id().as_str() == required_diagnostic)
+                        .map(Diagnostic::severity),
+                    require.then_some(Severity::Error),
+                    "{source}: {diagnostics:?}",
+                );
+            }
+        }
+
+        for source in [
+            "value = missing # ty: ignore[unresolved-reference]\n",
+            "value = missing # type: ignore[ty:unresolved-reference]\n",
+        ] {
+            let mut selection = RuleSelection::from_registry(crate::default_lint_registry());
+            selection.set_require_valid_suppressions(true);
+            let db = TestDbBuilder::new()
+                .with_rule_selection(selection)
+                .with_file("/src/main.py", source)
+                .build()?;
+            let file = system_path_to_file(&db, "/src/main.py")?;
+            let diagnostics = check_types(&db, db.program_file(file));
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+        Ok(())
     }
 
     #[test]

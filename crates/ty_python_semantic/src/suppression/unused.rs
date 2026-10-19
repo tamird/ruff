@@ -22,6 +22,7 @@ pub(super) fn check_unused_suppressions(context: &mut CheckSuppressionsContext) 
         return;
     }
 
+    let candidates = context.suppression_diagnostic_candidates();
     let diagnostics = context.diagnostics.get_mut();
 
     let all = context.suppressions;
@@ -43,13 +44,16 @@ pub(super) fn check_unused_suppressions(context: &mut CheckSuppressionsContext) 
         // suppress its own unused-ignore-comment diagnostic.
         // An `unused-ignore-comment` suppression can't ignore itself. It can only ignore other
         // suppressions, so exclude the suppression whose diagnostic we're checking.
-        if let Some(unused_suppression) = select_preferred_suppression(
-            all.lint_suppressions(suppression.range, LintId::of(&UNUSED_IGNORE_COMMENT))
-                .filter(|candidate| {
-                    candidate.target.is_lint() && candidate.id() != suppression.id()
-                }),
-            suppression.range,
-        ) {
+        if let Some(unused_suppression) = candidates.and_then(|candidates| {
+            select_preferred_suppression(
+                candidates
+                    .lint_suppressions(suppression.range, LintId::of(&UNUSED_IGNORE_COMMENT))
+                    .filter(|candidate| {
+                        candidate.target.is_lint() && candidate.id() != suppression.id()
+                    }),
+                suppression.range,
+            )
+        }) {
             diagnostics.mark_used(unused_suppression.id());
             continue;
         }

@@ -565,6 +565,7 @@ pub struct RuleSelection {
     ///
     /// If a rule isn't present in this map, then it should be considered disabled.
     lints: FxHashMap<LintId, (Severity, LintSource)>,
+    require_valid_suppressions: bool,
 }
 
 impl RuleSelection {
@@ -595,7 +596,10 @@ impl RuleSelection {
             })
             .collect();
 
-        RuleSelection { lints }
+        RuleSelection {
+            lints,
+            require_valid_suppressions: false,
+        }
     }
 
     /// Returns an iterator over all enabled lints.
@@ -634,6 +638,16 @@ impl RuleSelection {
     /// Disables `lint` if it was previously enabled.
     pub fn disable(&mut self, lint: LintId) {
         self.lints.remove(&lint);
+    }
+
+    /// Requires ignore comments to name specific rules and makes diagnostics about them
+    /// unsuppressible errors, regardless of their configured severity.
+    pub fn set_require_valid_suppressions(&mut self, require: bool) {
+        self.require_valid_suppressions = require;
+    }
+
+    pub(crate) fn requires_valid_suppressions(&self) -> bool {
+        self.require_valid_suppressions
     }
 }
 

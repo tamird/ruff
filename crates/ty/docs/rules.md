@@ -207,7 +207,8 @@ Added in <a href="https://github.com/astral-sh/ty/releases/tag/0.0.57">0.0.57</a
 **What it does**
 
 
-Checks for `ty: ignore` comments that don't specify which rules to ignore.
+Checks for `ty: ignore` comments that don't specify which rules to ignore. Applications embedding ty
+can also require rule codes in `type: ignore` comments.
 
 **Why is this bad?**
 
