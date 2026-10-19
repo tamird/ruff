@@ -4670,7 +4670,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 ParamSpecAttrKind::Args => ("args", "*args"),
                 ParamSpecAttrKind::Kwargs => ("kwargs", "**kwargs"),
             };
-            if let Some(builder) = self.context.report_lint(&INVALID_PARAMSPEC, annotation) {
+            if let Some(builder) = self
+                .context
+                .report_shared_body_lint(&INVALID_PARAMSPEC, annotation)
+            {
                 builder.into_diagnostic(format_args!(
                     "`{name}.{attr_name}` is only valid \
                     for annotating `{variadic}` function parameters",
@@ -4692,7 +4695,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 } else {
                     "**kwargs"
                 };
-                if let Some(builder) = self.context.report_lint(&INVALID_PARAMSPEC, annotation) {
+                if let Some(builder) = self
+                    .context
+                    .report_shared_body_lint(&INVALID_PARAMSPEC, annotation)
+                {
                     builder.into_diagnostic(format_args!(
                         "`{name}.{attr_name}` is only valid \
                         for annotating `{variadic}` function parameters",
@@ -4717,16 +4723,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     match qualifier {
                         TypeQualifier::Final => {}
                         TypeQualifier::ClassVar => {
-                            if let Some(builder) =
-                                self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                            if let Some(builder) = self
+                                .context
+                                .report_shared_body_lint(&INVALID_TYPE_FORM, annotation)
                             {
                                 builder
                                     .into_diagnostic("`ClassVar` is only allowed in class bodies");
                             }
                         }
                         TypeQualifier::InitVar => {
-                            if let Some(builder) =
-                                self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                            if let Some(builder) = self
+                                .context
+                                .report_shared_body_lint(&INVALID_TYPE_FORM, annotation)
                             {
                                 builder.into_diagnostic(
                                     "`InitVar` is only allowed in dataclass fields",
@@ -4736,8 +4744,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         TypeQualifier::NotRequired
                         | TypeQualifier::ReadOnly
                         | TypeQualifier::Required => {
-                            if let Some(builder) =
-                                self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                            if let Some(builder) = self
+                                .context
+                                .report_shared_body_lint(&INVALID_TYPE_FORM, annotation)
                             {
                                 builder.into_diagnostic(format_args!(
                                     "`{name}` is only allowed in TypedDict fields",
@@ -4992,7 +5001,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.store_expression_type(target, inferred_ty);
         } else {
             if is_pep_613_type_alias {
-                if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, annotation) {
+                if let Some(builder) = self
+                    .context
+                    .report_shared_body_lint(&INVALID_TYPE_FORM, annotation)
+                {
                     builder.into_diagnostic(
                         "`TypeAlias` must be assigned a value in annotated assignments",
                     );
@@ -10511,7 +10523,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut bindings = match bindings_result {
             Ok(()) => bindings,
             Err(_) => {
-                bindings.report_explicit_call_diagnostics(&self.context, call_expression);
+                bindings.report_diagnostics(&self.context, call_expression.into());
                 self.refine_provided_call_results(
                     call_expression,
                     &call_arguments,

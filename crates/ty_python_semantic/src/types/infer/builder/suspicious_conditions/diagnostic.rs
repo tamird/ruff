@@ -203,7 +203,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             && (test_type.is_subtype_of(db, env, KnownClass::Bool.to_instance(db, env))
                 || test_type.bool(db, env) != *truthiness);
 
-        let builder = self.context.report_lint(rule, test)?;
+        let builder = self.context.report_shared_body_lint(rule, test)?;
 
         let diagnostic = if let ConditionKind::Callable(callables) = kind {
             let mut diagnostic = builder.into_diagnostic("Suspicious boolean test of a `Callable`");

@@ -1298,8 +1298,13 @@ fn full_type_bindings_for_call<'db>(
     call_expr: &ast::ExprCall,
 ) -> crate::types::call::Bindings<'db> {
     let call_arguments = inferred_call_arguments(model, call_expr);
-    bind_inferred_call(model, func_type, &call_arguments)
-        .unwrap_or_else(|CallError(_, bindings)| *bindings)
+    bind_inferred_call(
+        model.db(),
+        &model.program_environment(),
+        func_type,
+        &call_arguments,
+    )
+    .unwrap_or_else(|CallError(_, bindings)| *bindings)
 }
 
 fn inferred_call_arguments<'a, 'db>(
@@ -1325,12 +1330,11 @@ fn inferred_call_arguments_with_context<'a, 'db>(
 }
 
 fn bind_inferred_call<'db>(
-    model: &SemanticModel<'db>,
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
     func_type: Type<'db>,
     call_arguments: &CallArguments<'_, 'db>,
 ) -> Result<crate::types::call::Bindings<'db>, CallError<'db>> {
-    let db = model.db();
-    let env = &model.program_environment();
     let constraints = ConstraintSetBuilder::new();
 
     func_type
@@ -1385,10 +1389,24 @@ pub fn call_input_types_with_context<'db>(
         .inferred_type(model)
         .ok_or(CallInputError::Incomplete)?;
     let arguments = inferred_call_arguments_with_context(model, call_expr, &context);
+    bound_call_input_types(
+        model.db(),
+        &model.program_environment(),
+        func_type,
+        &arguments,
+    )
+}
+
+pub(crate) fn bound_call_input_types<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    func_type: Type<'db>,
+    arguments: &CallArguments<'_, 'db>,
+) -> Result<Vec<Vec<CallInput<'db>>>, CallInputError> {
     let bindings =
-        bind_inferred_call(model, func_type, &arguments).map_err(|_| CallInputError::Invalid)?;
+        bind_inferred_call(db, env, func_type, arguments).map_err(|_| CallInputError::Invalid)?;
     bindings
-        .input_types(model.db(), &model.program_environment(), &arguments)
+        .input_types(db, env, arguments)
         .ok_or(CallInputError::Incomplete)
 }
 

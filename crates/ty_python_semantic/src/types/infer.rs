@@ -75,9 +75,10 @@ use ty_python_core::{ExpressionNodeKey, SemanticIndex, Statement, Truthiness, se
 
 mod body_domain;
 mod builder;
-pub(super) use body_domain::CheckedOverloadBody;
 pub(crate) use body_domain::FunctionBodyDomain;
-pub use body_domain::{BodyDomainError, check_overload_body};
+pub use body_domain::{
+    BodyDomainError, OverloadBodyAnalysis, OverloadBodyView, check_overload_body,
+};
 mod implicit_alias;
 pub(super) use implicit_alias::implicit_alias_parameters;
 mod comparisons;
@@ -2512,7 +2513,7 @@ impl<'db> StatementInferenceInner<'db> {
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub(crate) struct InferenceFlags: u16 {
+    pub(crate) struct InferenceFlags: u32 {
         /// Whether to allow `ParamSpec` in type expressions.
         ///
         /// In most contexts inside type expressions, bare `ParamSpec`s are not allowed.
@@ -2567,6 +2568,9 @@ bitflags::bitflags! {
 
         /// Whether the visitor is currently visiting an explicit `__init__` receiver annotation.
         const IN_INIT_RECEIVER_ANNOTATION = 1 << 15;
+
+        /// Whether the visitor is inferring an annotation, including its outer qualifiers.
+        const IN_ANNOTATION_EXPRESSION = 1 << 16;
     }
 }
 

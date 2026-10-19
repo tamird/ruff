@@ -18,7 +18,6 @@ use crate::diagnostic::DiagnosticGuard;
 use crate::importer::Importer;
 use crate::lint::LintSource;
 use crate::reachability::is_range_reachable_in_domain;
-use crate::types::diagnostic::UnknownKeywordArgument;
 use crate::types::function::FunctionDecorators;
 use crate::types::infer::{FunctionBodyDomain, InferenceFlags};
 use crate::{
@@ -259,28 +258,6 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
         self.diagnostics.get_mut().extend(other);
     }
 
-    pub(super) fn capture_unknown_keyword(
-        &self,
-        source: UnknownKeywordArgument,
-        report: impl FnOnce(&Self),
-    ) {
-        debug_assert!(self.body_domain.is_none());
-        let mut context = Self::new(
-            self.db,
-            self.program_environment,
-            self.scope,
-            self.file,
-            self.program_file,
-            self.module,
-        );
-        context.diagnostics_suppressed = self.diagnostics_suppressed;
-        context.inference_flags = self.inference_flags;
-        report(&context);
-        self.diagnostics
-            .borrow_mut()
-            .extend_unknown_keyword(source, context.finish_uncompacted());
-    }
-
     /// Whether diagnostics inferred separately for a referenced alias should be collected.
     pub(super) fn should_collect_diagnostics(&self) -> bool {
         !self.diagnostics_suppressed
@@ -347,7 +324,23 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
         lint: &'static LintMetadata,
         ranged: T,
     ) -> Option<LintDiagnosticGuardBuilder<'ctx, 'db>> {
-        LintDiagnosticGuardBuilder::new(self, lint, ranged.range())
+        let shared_body = self.body_domain.is_none()
+            && self.inference_flags.intersects(
+                InferenceFlags::IN_TYPE_EXPRESSION | InferenceFlags::IN_ANNOTATION_EXPRESSION,
+            )
+            && self.scope.node(self.db).as_function().is_some();
+        LintDiagnosticGuardBuilder::new(self, lint, ranged.range(), shared_body)
+    }
+
+    /// Report a source annotation or condition heuristic retained with ordinary inference.
+    pub(super) fn report_shared_body_lint<'ctx, T: Ranged>(
+        &'ctx self,
+        lint: &'static LintMetadata,
+        ranged: T,
+    ) -> Option<LintDiagnosticGuardBuilder<'ctx, 'db>> {
+        let shared_body =
+            self.body_domain.is_none() && self.scope.node(self.db).as_function().is_some();
+        LintDiagnosticGuardBuilder::new(self, lint, ranged.range(), shared_body)
     }
 
     /// Optionally return a builder for a diagnostic guard.
@@ -475,6 +468,7 @@ pub(super) struct LintDiagnosticGuard<'db, 'ctx> {
 
     source: LintSource,
     message_override: Option<String>,
+    shared_body: bool,
 }
 
 impl LintDiagnosticGuard<'_, '_> {
@@ -605,7 +599,12 @@ impl Drop for LintDiagnosticGuard<'_, '_> {
             });
         }
 
-        self.ctx.diagnostics.borrow_mut().push(diag);
+        let mut diagnostics = self.ctx.diagnostics.borrow_mut();
+        if self.shared_body {
+            diagnostics.push_shared_body(diag);
+        } else {
+            diagnostics.push(diag);
+        }
     }
 }
 
@@ -642,6 +641,7 @@ pub(super) struct LintDiagnosticGuardBuilder<'db, 'ctx> {
     source: LintSource,
     primary_range: TextRange,
     message_override: Option<(String, String)>,
+    shared_body: bool,
 }
 
 impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
@@ -683,6 +683,7 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
         ctx: &'ctx InferContext<'db, 'ctx>,
         lint: &'static LintMetadata,
         range: TextRange,
+        shared_body: bool,
     ) -> Option<LintDiagnosticGuardBuilder<'db, 'ctx>> {
         let lint_id = LintId::of(lint);
 
@@ -694,10 +695,18 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
             return None;
         }
 
-        let suppressed =
+        let suppressed = if shared_body {
+            ctx.diagnostics.borrow_mut().is_shared_body_suppressed(
+                ctx.db(),
+                ctx.python_file(),
+                range,
+                lint_id,
+            )
+        } else {
             ctx.diagnostics
                 .borrow_mut()
-                .is_suppressed(ctx.db(), ctx.python_file(), range, lint_id);
+                .is_suppressed(ctx.db(), ctx.python_file(), range, lint_id)
+        };
 
         // Suppress diagnostics in unreachable code. This checks both whether
         // the scope itself is unreachable and whether the specific statement or
@@ -717,6 +726,7 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
             source,
             primary_range: range,
             message_override: None,
+            shared_body,
         })
     }
 
@@ -754,6 +764,7 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
             source: self.source,
             diag: Some(diag),
             message_override,
+            shared_body: self.shared_body,
         }
     }
 

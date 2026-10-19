@@ -68,7 +68,6 @@ use ty_module_resolver::{
 };
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
 use ty_python_core::place::{PlaceTable, ScopedPlaceId};
-use ty_python_core::scope::FileScopeId;
 use ty_python_core::{ProgramFile, global_scope, place_table, use_def_map};
 
 const RUNTIME_CHECKABLE_DOCS_URL: &str =
@@ -1447,26 +1446,12 @@ declare_lint! {
 pub struct TypeCheckDiagnostics {
     diagnostics: Vec<Diagnostic>,
     used_suppressions: FxHashSet<FileSuppressionId>,
-    keyword_arguments: Option<Box<SmallVec<[KeywordArgumentDiagnostic; 1]>>>,
+    shared_body_diagnostics: Option<Box<SmallVec<[SharedBodyDiagnostic; 1]>>>,
 }
 
-/// A concrete name rejected while binding a source `**` argument.
-#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
-pub(super) struct UnknownKeywordArgument {
-    pub(super) call: FileRange,
-    pub(super) scope: FileScopeId,
-    pub(super) argument_index: usize,
-    pub(super) name: Name,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
-struct KeywordArgumentDiagnostic {
-    source: UnknownKeywordArgument,
-    outcome: KeywordArgumentOutcome,
-}
-
+/// Ordinary-source diagnostics and suppressions retained when overloads own the typed body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize)]
-enum KeywordArgumentOutcome {
+enum SharedBodyDiagnostic {
     Diagnostic(usize),
     Suppression(FileSuppressionId),
 }
@@ -1507,11 +1492,11 @@ impl TypeCheckDiagnostics {
         let offset = self.diagnostics.len();
         self.diagnostics.extend_from_slice(&other.diagnostics);
         self.used_suppressions.extend(&other.used_suppressions);
-        if let Some(other_arguments) = &other.keyword_arguments {
-            self.keyword_arguments
+        if let Some(other_arguments) = &other.shared_body_diagnostics {
+            self.shared_body_diagnostics
                 .get_or_insert_with(Box::default)
-                .extend(other_arguments.iter().cloned().map(|mut argument| {
-                    if let KeywordArgumentOutcome::Diagnostic(index) = &mut argument.outcome {
+                .extend(other_arguments.iter().copied().map(|mut argument| {
+                    if let SharedBodyDiagnostic::Diagnostic(index) = &mut argument {
                         *index += offset;
                     }
                     argument
@@ -1519,69 +1504,30 @@ impl TypeCheckDiagnostics {
         }
     }
 
-    pub(super) fn extend_unknown_keyword(
-        &mut self,
-        source: UnknownKeywordArgument,
-        other: TypeCheckDiagnostics,
-    ) {
-        let outcome = if other.diagnostics.len() == 1 && other.used_suppressions.is_empty() {
-            KeywordArgumentOutcome::Diagnostic(self.diagnostics.len())
-        } else if other.diagnostics.is_empty()
-            && let Ok(id) = other.used_suppressions.iter().copied().exactly_one()
-        {
-            KeywordArgumentOutcome::Suppression(id)
-        } else {
-            self.extend(&other);
-            return;
-        };
-        debug_assert!(other.keyword_arguments.is_none());
-        self.diagnostics.extend(other.diagnostics);
-        self.keyword_arguments
+    /// Conditions and type expressions retain their source interpretation when overloads own
+    /// the typed body. Keep their suppression ownership with that source view.
+    pub(super) fn push_shared_body(&mut self, diagnostic: Diagnostic) {
+        self.shared_body_diagnostics
             .get_or_insert_with(Box::default)
-            .push(KeywordArgumentDiagnostic { source, outcome });
+            .push(SharedBodyDiagnostic::Diagnostic(self.diagnostics.len()));
+        self.diagnostics.push(diagnostic);
     }
 
-    /// Collect a scope's diagnostics, omitting only matcher occurrences proven impossible.
-    pub(super) fn extend_scope(
-        &mut self,
-        other: &TypeCheckDiagnostics,
-        mut exclude: impl FnMut(&UnknownKeywordArgument) -> bool,
-    ) {
-        let Some(arguments) = &other.keyword_arguments else {
-            self.extend(other);
-            return;
-        };
-        let mut excluded = FxHashSet::default();
-        for argument in arguments.iter() {
-            if exclude(&argument.source) {
-                if let KeywordArgumentOutcome::Diagnostic(index) = argument.outcome {
-                    excluded.insert(index);
+    pub(super) fn extend_shared_body(&mut self, other: &TypeCheckDiagnostics) {
+        for diagnostic in other
+            .shared_body_diagnostics
+            .iter()
+            .flat_map(|items| items.iter())
+        {
+            match *diagnostic {
+                SharedBodyDiagnostic::Diagnostic(index) => {
+                    self.diagnostics.push(other.diagnostics[index].clone());
                 }
-            } else if let KeywordArgumentOutcome::Suppression(id) = argument.outcome {
-                self.used_suppressions.insert(id);
+                SharedBodyDiagnostic::Suppression(id) => {
+                    self.used_suppressions.insert(id);
+                }
             }
         }
-        self.diagnostics.extend(
-            other
-                .diagnostics
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !excluded.contains(index))
-                .map(|(_, diagnostic)| diagnostic.clone()),
-        );
-        self.used_suppressions.extend(&other.used_suppressions);
-    }
-
-    fn suppression_ids(&self) -> impl Iterator<Item = FileSuppressionId> + '_ {
-        self.used_suppressions.iter().copied().chain(
-            self.keyword_arguments
-                .iter()
-                .flat_map(|arguments| arguments.iter())
-                .filter_map(|argument| match argument.outcome {
-                    KeywordArgumentOutcome::Diagnostic(_) => None,
-                    KeywordArgumentOutcome::Suppression(id) => Some(id),
-                }),
-        )
     }
 
     /// Extend with selected diagnostics while retaining all used suppressions.
@@ -1596,7 +1542,8 @@ impl TypeCheckDiagnostics {
                 .filter(|diagnostic| include(diagnostic))
                 .cloned(),
         );
-        self.used_suppressions.extend(other.suppression_ids());
+        self.used_suppressions
+            .extend(other.used_suppressions.iter().copied());
     }
 
     /// Group failures at the same operation while retaining every distinct overload explanation.
@@ -1634,7 +1581,8 @@ impl TypeCheckDiagnostics {
                 self.diagnostics.push(diagnostic.clone());
             }
         }
-        self.used_suppressions.extend(other.suppression_ids());
+        self.used_suppressions
+            .extend(other.used_suppressions.iter().copied());
     }
 
     pub(super) fn extend_diagnostics(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
@@ -1687,31 +1635,39 @@ impl TypeCheckDiagnostics {
         true
     }
 
+    pub(super) fn is_shared_body_suppressed(
+        &mut self,
+        db: &dyn Db,
+        file: PythonFile<'_>,
+        range: TextRange,
+        lint: LintId,
+    ) -> bool {
+        let Some(suppression) = suppressions(db, file).find_suppression(range, lint) else {
+            return false;
+        };
+        self.mark_used(suppression.id());
+        self.shared_body_diagnostics
+            .get_or_insert_with(Box::default)
+            .push(SharedBodyDiagnostic::Suppression(suppression.id()));
+        true
+    }
+
     pub(crate) fn mark_used(&mut self, suppression_id: FileSuppressionId) {
         self.used_suppressions.insert(suppression_id);
     }
 
     pub(crate) fn is_used(&self, suppression_id: FileSuppressionId) -> bool {
         self.used_suppressions.contains(&suppression_id)
-            || self.keyword_arguments.as_ref().is_some_and(|arguments| {
-                arguments.iter().any(|argument| {
-                    argument.outcome == KeywordArgumentOutcome::Suppression(suppression_id)
-                })
-            })
     }
 
     pub(crate) fn used_len(&self) -> usize {
-        if self.keyword_arguments.is_none() {
-            self.used_suppressions.len()
-        } else {
-            self.suppression_ids().collect::<FxHashSet<_>>().len()
-        }
+        self.used_suppressions.len()
     }
 
     pub(crate) fn shrink_to_fit(&mut self) {
         self.used_suppressions.shrink_to_fit();
         self.diagnostics.shrink_to_fit();
-        if let Some(arguments) = &mut self.keyword_arguments {
+        if let Some(arguments) = &mut self.shared_body_diagnostics {
             arguments.shrink_to_fit();
         }
     }
@@ -1723,7 +1679,7 @@ impl TypeCheckDiagnostics {
     pub(crate) fn has_diagnostics_or_used_suppressions(&self) -> bool {
         !self.diagnostics.is_empty()
             || !self.used_suppressions.is_empty()
-            || self.keyword_arguments.is_some()
+            || self.shared_body_diagnostics.is_some()
     }
 
     pub(crate) fn is_empty(&self) -> bool {

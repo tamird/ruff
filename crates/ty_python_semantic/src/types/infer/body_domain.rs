@@ -7,8 +7,7 @@
 use itertools::Itertools;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
-use ruff_python_ast::find_node::covering_node;
-use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
 use ty_python_core::scope::ScopeId;
@@ -24,10 +23,10 @@ use crate::reachability::{ReachabilityEvaluationCache, is_range_reachable_in_dom
 use crate::semantic_model::HasType;
 use crate::types::call::Argument;
 use crate::types::constraints::ConstraintSetBuilder;
-use crate::types::diagnostic::UnknownKeywordArgument;
 use crate::types::dictionary::DictionaryItems;
 use crate::types::function::{KnownFunction, OverloadLiteral};
 use crate::types::generics::Specialization;
+use crate::types::ide_support::{CallInput, CallInputError, bound_call_input_types};
 use crate::types::signatures::{
     ParameterConsistency, PreparedOverloadImplementation, ReturnCallableTypeVarScope,
     ReturnTypeConsistency, keyword_arguments_type,
@@ -79,13 +78,20 @@ pub fn check_overload_body<'db>(
     Ok(diagnostics)
 }
 
-pub(crate) struct CheckedOverloadBody<'db> {
+/// Analysis of all declared call domains of one source implementation.
+///
+/// Complete families can supply the implementation's body facts without joining correlated
+/// inputs. Unsupported families retain ordinary checking and may still add domain diagnostics.
+/// Construct this only for functions whose bodies the embedding application intends to check.
+pub struct OverloadBodyAnalysis<'db> {
+    function: FunctionType<'db>,
     domains: Vec<(FunctionBodyDomain<'db>, &'db ScopeInference<'db>)>,
     complete: bool,
 }
 
-impl<'db> CheckedOverloadBody<'db> {
-    pub(crate) fn new(db: &'db dyn Db, function: FunctionType<'db>) -> Self {
+impl<'db> OverloadBodyAnalysis<'db> {
+    /// Prepare and infer the declared domains using their existing cached inference queries.
+    pub fn new(db: &'db dyn Db, function: FunctionType<'db>) -> Self {
         let count = overload_family(db, function).map_or(0, |(overloads, _)| overloads.len());
         let domains: Vec<_> = (0..count)
             .filter_map(|index| {
@@ -94,9 +100,40 @@ impl<'db> CheckedOverloadBody<'db> {
             })
             .collect();
         Self {
-            complete: count > 0 && domains.len() == count,
+            function,
+            complete: count > 0
+                && domains.len() == count
+                && domains
+                    .iter()
+                    .all(|(_, inference)| inference.fallback_type().is_none()),
             domains,
         }
+    }
+
+    /// The source implementation selected for this analysis.
+    pub fn definition(&self, db: &'db dyn Db) -> Definition<'db> {
+        self.function.definition(db)
+    }
+
+    pub(crate) fn scope(&self, db: &'db dyn Db) -> ScopeId<'db> {
+        self.function.literal(db).last_definition.body_scope(db)
+    }
+
+    /// Whether every declared overload has a supported, non-recovery body inference.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Independent body views, available only when every declared domain is supported.
+    pub fn domains(&self, db: &'db dyn Db) -> impl Iterator<Item = OverloadBodyView<'db>> + '_ {
+        self.domains
+            .iter()
+            .filter(|_| self.complete)
+            .map(move |(domain, inference)| OverloadBodyView {
+                db,
+                domain: *domain,
+                inference,
+            })
     }
 
     pub(crate) fn collect_diagnostics(&self, diagnostics: &mut TypeCheckDiagnostics) {
@@ -106,91 +143,106 @@ impl<'db> CheckedOverloadBody<'db> {
             }
         }
     }
+}
 
-    pub(crate) fn excludes_unknown_keyword(
-        &self,
-        db: &'db dyn Db,
-        source: &UnknownKeywordArgument,
-    ) -> bool {
-        let Some((first, _)) = self.domains.first().filter(|_| self.complete) else {
-            return false;
-        };
-        let scope = first.scope(db);
-        let file = scope.program_file(db);
-        if source.call.file() != file.file(db) || source.scope != scope.file_scope_id(db) {
-            return false;
+/// Facts for one admitted source body under one declared overload.
+///
+/// Views are obtained only from a complete [`OverloadBodyAnalysis`]. They do not change ordinary
+/// inference or declaration types. Missing facts are not proof and must not be replaced with facts
+/// from another domain. AST arguments must belong to this view's source file.
+#[derive(Clone, Copy)]
+pub struct OverloadBodyView<'db> {
+    db: &'db dyn Db,
+    domain: FunctionBodyDomain<'db>,
+    inference: &'db ScopeInference<'db>,
+}
+
+impl<'db> OverloadBodyView<'db> {
+    /// The exact implementation body owning this view.
+    pub fn scope(self) -> ScopeId<'db> {
+        self.domain.scope(self.db)
+    }
+
+    /// Whether this source range is reachable in the domain.
+    pub fn is_reachable(self, range: TextRange) -> bool {
+        let scope = self.scope();
+        is_range_reachable_in_domain(
+            self.db,
+            semantic_index(self.db, scope.program_file(self.db)),
+            scope.file_scope_id(self.db),
+            range,
+            Some(self.domain),
+        )
+    }
+
+    /// An already inferred expression type from this body, without cross-domain fallback.
+    pub fn expression_type(self, expression: &ast::Expr) -> Option<Type<'db>> {
+        let scope = self.scope();
+        let index = semantic_index(self.db, scope.program_file(self.db));
+        if index.try_expression_scope_id(expression) != Some(scope.file_scope_id(self.db)) {
+            return None;
         }
-        let module = parsed_module(db, file.python_file(db)).load(db);
-        let Some(function) = scope.node(db).as_function() else {
-            return false;
-        };
-        let function = function.node(&module);
-        if !function.range().contains_range(source.call.range()) {
-            return false;
+        self.inference.try_expression_type(expression)
+    }
+
+    /// The binding type of a definition owned by this body.
+    pub fn definition_type(self, definition: Definition<'db>) -> Option<Type<'db>> {
+        if definition.scope(self.db) != self.scope() {
+            return None;
         }
-        let ast::AnyNodeRef::ExprCall(call) =
-            covering_node(function.into(), source.call.range()).node()
-        else {
-            return false;
-        };
-        if call.range() != source.call.range() {
-            return false;
-        }
-        let Some(ast::ArgOrKeyword::Keyword(keyword)) = call
-            .arguments
-            .iter_source_order()
-            .nth(source.argument_index)
-        else {
-            return false;
-        };
-        if keyword.arg.is_some() {
-            return false;
-        }
+        Some(infer_body_definition(self.db, definition, self.domain).binding_type(definition))
+    }
+
+    /// Selected call inputs using this domain's callee, arguments, and dictionary effects.
+    pub fn call_input_types(
+        self,
+        call: &ast::ExprCall,
+    ) -> Result<Vec<Vec<CallInput<'db>>>, CallInputError> {
+        let callee = self
+            .expression_type(&call.func)
+            .ok_or(CallInputError::Incomplete)?;
+        let scope = self.scope();
+        let file = scope.program_file(self.db);
         let env = ProgramEnvironment::from_file(file);
-        let index = semantic_index(db, file);
-        let file_scope = scope.file_scope_id(db);
-        self.domains.iter().all(|(domain, inference)| {
-            if inference.fallback_type().is_some() {
-                return false;
-            }
-            if !is_range_reachable_in_domain(db, index, file_scope, call.range(), Some(*domain)) {
-                return true;
-            }
-            if inference
-                .try_expression_type(&call.func)
-                .is_some_and(|callee| callee.bindings(db, &env).accepts_keyword_name(&source.name))
-            {
-                return true;
-            }
-            let Some(argument_type) = inference.try_expression_type(&keyword.value) else {
-                return false;
-            };
-            DictionaryItems::expression_or_observed(
-                db,
-                &env,
-                scope,
-                &keyword.value,
-                Some(*domain),
-                &mut |expression| inference.try_expression_type(expression),
-                || {
-                    let reachability = ReachabilityEvaluationCache::new(
-                        scope,
-                        index.use_def_map(file_scope).reachability_constraints(),
-                    )
-                    .with_body_domain(Some(*domain));
-                    DictionaryItems::observed(
-                        db,
-                        scope,
-                        &keyword.value,
-                        argument_type,
-                        &reachability,
-                    )
-                },
-            )
-            .is_ok_and(|items| {
-                items.is_complete() && items.items.iter().all(|item| item.name != source.name)
+        let index = semantic_index(self.db, file);
+        let missing = std::cell::Cell::new(false);
+        let arguments = CallArguments::from_arguments_typed(&call.arguments, |expression| {
+            self.expression_type(expression).unwrap_or_else(|| {
+                missing.set(true);
+                Type::unknown()
             })
         })
+        .with_known_unpacking(
+            &call.arguments,
+            |expression| self.expression_type(expression),
+            |expression| {
+                let ty = self
+                    .expression_type(expression)
+                    .ok_or(crate::types::dictionary::DictionaryFallback::Unavailable)?;
+                DictionaryItems::expression_or_observed(
+                    self.db,
+                    &env,
+                    scope,
+                    expression,
+                    Some(self.domain),
+                    &mut |expression| self.expression_type(expression),
+                    || {
+                        let reachability = ReachabilityEvaluationCache::new(
+                            scope,
+                            index
+                                .use_def_map(scope.file_scope_id(self.db))
+                                .reachability_constraints(),
+                        )
+                        .with_body_domain(Some(self.domain));
+                        DictionaryItems::observed(self.db, scope, expression, ty, &reachability)
+                    },
+                )
+            },
+        );
+        if missing.get() {
+            return Err(CallInputError::Incomplete);
+        }
+        bound_call_input_types(self.db, &env, callee, &arguments)
     }
 }
 
@@ -677,6 +729,30 @@ fn supported_body(
         }
     }
 
+    fn protocol_method(
+        db: &dyn Db,
+        function: FunctionType<'_>,
+        attribute: &ast::ExprAttribute,
+    ) -> bool {
+        let model = SemanticModel::new(db, function.program_file(db));
+        let Some(Type::BoundMethod(method)) = attribute.inferred_type(&model) else {
+            return false;
+        };
+        let Type::ProtocolInstance(protocol) = method.self_instance(db) else {
+            return false;
+        };
+        let Some(callee) = method.function(db) else {
+            return false;
+        };
+        // Require the declared member itself, not a callable returned by a descriptor or
+        // fallback lookup. Collection methods still use their separate mutation checks.
+        protocol
+            .interface(db)
+            .member_by_name(db, attribute.attr.id.as_str())
+            .and_then(|member| member.definition())
+            == Some(callee.definition(db))
+    }
+
     fn collection_method(
         db: &dyn Db,
         function: FunctionType<'_>,
@@ -801,7 +877,8 @@ fn supported_body(
                     }
                     ast::Expr::Attribute(attribute) => {
                         if !expression(db, function, locals, callees, &attribute.value)
-                            || !collection_method(db, function, attribute)
+                            || !(collection_method(db, function, attribute)
+                                || protocol_method(db, function, attribute))
                         {
                             return false;
                         }
@@ -996,6 +1073,7 @@ mod tests {
     };
     use ruff_db::files::system_path_to_file;
     use ruff_db::system::DbWithWritableSystem;
+    use ruff_text_size::Ranged;
     use ty_python_core::ProgramFile;
 
     use super::*;
@@ -1032,6 +1110,257 @@ mod tests {
     }
 
     #[test]
+    fn complete_domains_preserve_source_annotation_errors() -> anyhow::Result<()> {
+        for annotation in [
+            "42",
+            "MissingName",
+            "list[int, str]",
+            "Required",
+            "Required[int]",
+            "\"list[\"",
+        ] {
+            let mut db = setup_db();
+            db.write_file("/src/body.py", format!("from typing import Literal, Required, overload\n@overload\ndef f(flag: Literal[True]) -> None: ...\n@overload\ndef f(flag: Literal[False]) -> None: ...\ndef f(flag: bool | str) -> None:\n    if isinstance(flag, str):\n        value: {annotation} = 1\n"))?;
+            let f = function(&db);
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            let analysis = OverloadBodyAnalysis::new(&db, f);
+            assert!(analysis.is_complete(), "annotation={annotation}");
+            let selected = crate::types::check_types_with_overload_analysis(
+                &db,
+                f.program_file(&db),
+                [],
+                [analysis],
+            );
+            assert!(!ordinary.is_empty(), "annotation={annotation}");
+            assert_eq!(ordinary, selected, "annotation={annotation}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn complete_domains_own_correlated_body_facts() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {"
+            from typing import Protocol, overload
+            class Context(Protocol):
+                @property
+                def value(self) -> str: ...
+            def use(value: str) -> str:
+                return value
+            @overload
+            def f(ctx: Context, override: str | None = None) -> str: ...
+            @overload
+            def f(ctx: object, override: str) -> str: ...
+            def f(ctx: object, override: str | None = None) -> str:
+                if override is None:
+                    override = ctx.value
+                return use(override)
+        "};
+        db.write_file("/src/body.py", source)?;
+        let f = function(&db);
+        let file = f.program_file(&db);
+        let ordinary = crate::types::check_types(&db, file);
+        assert_eq!(ordinary.len(), 1, "{ordinary:#?}");
+        assert_eq!(ordinary[0].id().as_str(), "unresolved-attribute");
+        let analysis = OverloadBodyAnalysis::new(&db, f);
+        assert!(analysis.is_complete());
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let function_node = f
+            .literal(&db)
+            .last_definition
+            .body_scope(&db)
+            .node(&db)
+            .expect_function()
+            .node(&module);
+        let ast::Stmt::Return(statement) = function_node.body.last().unwrap() else {
+            panic!("expected return")
+        };
+        let ast::Expr::Call(call) = statement.value.as_deref().unwrap() else {
+            panic!("expected call")
+        };
+        let ast::Stmt::If(conditional) = &function_node.body[0] else {
+            panic!("expected condition")
+        };
+        for (index, domain) in analysis.domains(&db).enumerate() {
+            assert_eq!(
+                domain
+                    .expression_type(statement.value.as_deref().unwrap())
+                    .unwrap()
+                    .display(&db, &db.program_environment())
+                    .to_string(),
+                "str"
+            );
+            assert_eq!(domain.is_reachable(conditional.body[0].range()), index == 0);
+            let inputs = domain.call_input_types(call).unwrap();
+            let [input] = inputs[0].as_slice() else {
+                panic!("expected one matched input")
+            };
+            assert_eq!(
+                input
+                    .argument_type
+                    .display(&db, &db.program_environment())
+                    .to_string(),
+                "str"
+            );
+            assert_eq!(
+                input
+                    .parameter_type
+                    .display(&db, &db.program_environment())
+                    .to_string(),
+                "str"
+            );
+        }
+        assert!(
+            crate::types::check_types_with_overload_analysis(&db, file, [], [analysis]).is_empty()
+        );
+
+        for (before, after, expected) in [
+            ("ctx.value", "ctx.missing", "unresolved-attribute"),
+            (
+                "return use(override)",
+                "return use(42)",
+                "invalid-argument-type",
+            ),
+            ("return use(override)", "return 42", "invalid-return-type"),
+            (
+                "ctx.value",
+                "ctx.value  # ty: ignore[unresolved-attribute]",
+                "unused-ignore-comment",
+            ),
+        ] {
+            db.write_file("/src/body.py", source.replace(before, after))?;
+            let f = function(&db);
+            let diagnostics = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
+            let ids: Vec<_> = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            assert_eq!(ids, [expected], "{after}: {diagnostics:#?}");
+        }
+        db.write_file(
+            "/src/body.py",
+            source.replace(
+                "ctx.value",
+                "ctx.missing  # ty: ignore[unresolved-attribute]",
+            ),
+        )?;
+        let f = function(&db);
+        assert!(check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]).is_empty());
+        db.write_file("/src/body.py", source)?;
+        let f = function(&db);
+        assert!(check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn complete_domains_check_bound_method_inputs() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import Protocol, overload
+            class Files(Protocol):
+                def path(self, value: str) -> str: ...
+            class Context(Files, Protocol):
+                @property
+                def value(self) -> str: ...
+            @overload
+            def f(ctx: Context, override: str | None = None) -> str: ...
+            @overload
+            def f(ctx: Files, override: str) -> str: ...
+            def f(ctx: Files, override: str | None = None) -> str:
+                path = ctx.path(".")
+                if override is None:
+                    override = ctx.value
+                return override or path
+        "#};
+        for (argument, expected) in [("\".\"", None), ("42", Some("invalid-argument-type"))] {
+            db.write_file("/src/body.py", source.replace("\".\"", argument))?;
+            let f = function(&db);
+            let analysis = OverloadBodyAnalysis::new(&db, f);
+            assert!(analysis.is_complete());
+            let diagnostics = crate::types::check_types_with_overload_analysis(
+                &db,
+                f.program_file(&db),
+                [],
+                [analysis],
+            );
+            let ids: Vec<_> = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            assert_eq!(ids, expected.into_iter().collect::<Vec<_>>());
+        }
+        for declaration in [
+            "@property\n    def path(self) -> Callable[[str], str]: ...",
+            "path: Callable[[str], str]",
+        ] {
+            db.write_file(
+                "/src/body.py",
+                source
+                    .replace(
+                        "from typing import Protocol, overload",
+                        "from typing import Callable, Protocol, overload",
+                    )
+                    .replace("def path(self, value: str) -> str: ...", declaration),
+            )?;
+            let f = function(&db);
+            assert!(!OverloadBodyAnalysis::new(&db, f).is_complete());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_method_calls_invalidate_keyword_contents() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import Protocol, overload
+            class Mutator(Protocol):
+                def mutate(self, values: dict[str, object]) -> None: ...
+            def consume(*, value: int) -> None: ...
+            @overload
+            def f(ctx: Mutator, flag: int) -> None: ...
+            @overload
+            def f(ctx: Mutator, flag: str) -> None: ...
+            def f(ctx: Mutator, flag: int | str) -> None:
+                values: dict[str, object] = {"value": 1}
+                ctx.mutate(values)
+                consume(**values)
+        "#};
+        for escapes in [false, true] {
+            db.write_file(
+                "/src/body.py",
+                if escapes {
+                    source.to_owned()
+                } else {
+                    source.replace("ctx.mutate(values)", "pass")
+                },
+            )?;
+            let f = function(&db);
+            let analysis = OverloadBodyAnalysis::new(&db, f);
+            assert!(analysis.is_complete());
+            let diagnostics = crate::types::check_types_with_overload_analysis(
+                &db,
+                f.program_file(&db),
+                [],
+                [analysis],
+            );
+            let ids: Vec<_> = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                if escapes {
+                    vec!["invalid-argument-type"]
+                } else {
+                    vec![]
+                },
+                "{diagnostics:#?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn body_domains_preserve_copied_keyword_contents() -> anyhow::Result<()> {
         let mut db = setup_db();
         let source = indoc::indoc! {r#"
@@ -1064,6 +1393,33 @@ mod tests {
             db.write_file("/src/body.py", source.replace(before, after))?;
             let f = function(&db);
             let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            if !wrong {
+                let analysis = OverloadBodyAnalysis::new(&db, f);
+                assert!(analysis.is_complete());
+                let module = parsed_module(&db, f.program_file(&db).python_file(&db)).load(&db);
+                let function = analysis
+                    .scope(&db)
+                    .node(&db)
+                    .expect_function()
+                    .node(&module);
+                let ast::Stmt::Expr(statement) = function.body.last().unwrap() else {
+                    panic!("expected the forwarded call")
+                };
+                let ast::Expr::Call(call) = statement.value.as_ref() else {
+                    panic!("expected the forwarded call")
+                };
+                for domain in analysis.domains(&db) {
+                    let inputs = domain.call_input_types(call).unwrap();
+                    assert!(!inputs.is_empty());
+                    assert!(inputs.iter().flatten().all(|input| {
+                        input.argument_type.is_subtype_of(
+                            &db,
+                            &db.program_environment(),
+                            input.parameter_type,
+                        )
+                    }));
+                }
+            }
             let signature = f.last_definition_signature(&db).clone();
             for index in [0, 1, 0] {
                 let diagnostics = check_overload_body(&db, f, index).unwrap();
@@ -1585,6 +1941,16 @@ mod tests {
                 .collect();
             assert_eq!(ids, expected, "{diagnostics:#?}");
         }
+        db.write_file(
+            "/src/body.py",
+            source.replace(
+                "if not value:",
+                "if always:  # ty: ignore[redundant-condition]",
+            ),
+        )?;
+        let f = function(&db);
+        let diagnostics = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         // Ordinary conditions still warn, and specializing inputs cannot consume an ignore.
         for (condition, expected) in [
             ("if always:", "redundant-condition"),
@@ -2892,7 +3258,7 @@ mod tests {
         assert_eq!(ordinary[0].id().as_str(), "unused-ignore-comment");
         assert!(check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]).is_empty());
 
-        // An ordinary return error retains ownership even when both domains reject that site.
+        // A complete family explains the invalid return separately for each declared result.
         db.write_file(
             "/src/body.py",
             source.replace("return b'wrong'", "return None"),
@@ -2901,7 +3267,9 @@ mod tests {
         let ordinary = crate::types::check_types(&db, f.program_file(&db));
         assert_eq!(ordinary.len(), 1, "{ordinary:#?}");
         let combined = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
-        assert_eq!(combined, ordinary);
+        assert_eq!(combined.len(), 1, "{combined:#?}");
+        assert_eq!(combined[0].id().as_str(), "invalid-return-type");
+        assert!(!combined[0].sub_diagnostics().is_empty(), "{combined:#?}");
         Ok(())
     }
 
@@ -3092,12 +3460,19 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(!unknown.is_empty(), "{case}: {ordinary:#?}");
             let selected = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
-            assert!(
-                unknown
-                    .iter()
-                    .all(|diagnostic| selected.contains(diagnostic)),
-                "{case}: {selected:#?}"
-            );
+            if case == "dynamic callee" {
+                // Each complete domain obeys ordinary gradual semantics: the true branch
+                // invokes Any, and the false branch has no extra keyword. Applications that
+                // require static calls must inspect the per-domain input facts.
+                assert!(selected.is_empty(), "{selected:#?}");
+            } else {
+                assert!(
+                    unknown
+                        .iter()
+                        .all(|diagnostic| selected.contains(diagnostic)),
+                    "{case}: {selected:#?}"
+                );
+            }
         }
         Ok(())
     }

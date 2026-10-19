@@ -187,7 +187,8 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
             range: _,
             parsed: Err(error),
         } = self
-            && let Some(builder) = context.report_lint(&INVALID_TYPE_FORM, error.location)
+            && let Some(builder) =
+                context.report_shared_body_lint(&INVALID_TYPE_FORM, error.location)
         {
             builder.into_diagnostic(format_args!("Invalid type expression: {}", error.error));
         }
@@ -471,7 +472,8 @@ pub(crate) fn parse_string_annotation<'a, 'db>(
     if let Some(string_literal) = string_expr.as_single_part_string() {
         let prefix = string_literal.flags.prefix();
         if prefix.is_raw() {
-            if let Some(builder) = context.report_lint(&RAW_STRING_TYPE_ANNOTATION, string_literal)
+            if let Some(builder) =
+                context.report_shared_body_lint(&RAW_STRING_TYPE_ANNOTATION, string_literal)
             {
                 builder.into_diagnostic(format_args!(
                     "Raw string literals are not allowed in {}s",
@@ -490,8 +492,8 @@ pub(crate) fn parse_string_annotation<'a, 'db>(
                     });
                 }
                 Err(ParseError { error, location }) => {
-                    if let Some(builder) =
-                        context.report_lint(&INVALID_SYNTAX_IN_FORWARD_ANNOTATION, location)
+                    if let Some(builder) = context
+                        .report_shared_body_lint(&INVALID_SYNTAX_IN_FORWARD_ANNOTATION, location)
                     {
                         let mut diagnostic =
                             builder.into_diagnostic("Syntax error in forward annotation");
@@ -522,7 +524,7 @@ pub(crate) fn parse_string_annotation<'a, 'db>(
                 }
             }
         } else if let Some(builder) =
-            context.report_lint(&ESCAPE_CHARACTER_IN_FORWARD_ANNOTATION, string_expr)
+            context.report_shared_body_lint(&ESCAPE_CHARACTER_IN_FORWARD_ANNOTATION, string_expr)
         {
             // The raw contents of the string doesn't match the parsed content. This could be the
             // case for annotations that contain escape sequences.
@@ -532,7 +534,7 @@ pub(crate) fn parse_string_annotation<'a, 'db>(
             ));
         }
     } else if let Some(builder) =
-        context.report_lint(&IMPLICIT_CONCATENATED_STRING_TYPE_ANNOTATION, string_expr)
+        context.report_shared_body_lint(&IMPLICIT_CONCATENATED_STRING_TYPE_ANNOTATION, string_expr)
     {
         // String is implicitly concatenated.
         builder.into_diagnostic("Type expressions cannot span multiple string literals");

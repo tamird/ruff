@@ -166,6 +166,7 @@ pub use infer::{BodyDomainError, check_overload_body};
 pub(crate) use infer::{
     FunctionBodyDomain, infer_definition_with_body_domain, infer_expression_with_body_domain,
 };
+pub use infer::{OverloadBodyAnalysis, OverloadBodyView};
 mod instance;
 mod iteration;
 mod known_instance;
@@ -237,15 +238,37 @@ pub fn check_types_with_diagnostics<'db>(
 /// are ignored. Ty derives declared overloads from inline definitions or whole-signature external
 /// annotation provenance and validates each domain independently. Unsupported domains add no proof
 /// or diagnostic; [`check_overload_body`] reports that status explicitly when coverage is needed.
-/// A concrete keyword rejected from an unpacked argument is omitted when every declared overload
-/// proves that the keyword is absent or accepted at that call. Other ordinary diagnostics take
-/// precedence at the same rule and source location. Suppression usage is merged before unused
-/// suppressions are checked.
+/// Complete families provide the implementation body's type diagnostics. Ordinary inference still
+/// owns source annotations, condition heuristics, and unsupported bodies. Partial families retain all ordinary
+/// diagnostics and may add failures from supported domains. Suppression usage is merged before
+/// unused suppressions are checked.
 pub fn check_types_with_overload_bodies<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
     supplemental: impl IntoIterator<Item = Diagnostic>,
     functions: impl IntoIterator<Item = FunctionType<'db>>,
+) -> Vec<Diagnostic> {
+    check_types_with_overload_analysis(
+        db,
+        file,
+        supplemental,
+        functions
+            .into_iter()
+            .filter(|function| function.program_file(db) == file)
+            .map(|function| OverloadBodyAnalysis::new(db, function)),
+    )
+}
+
+/// Check a file using the same overload analyses used by application body checks.
+///
+/// Complete families replace ordinary type diagnostics in their implementation body. Source
+/// annotations, condition heuristics, enclosing declarations, and unsupported bodies retain ordinary checking.
+/// All diagnostics and suppression usage are combined before checking unused suppressions.
+pub fn check_types_with_overload_analysis<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    supplemental: impl IntoIterator<Item = Diagnostic>,
+    analyses: impl IntoIterator<Item = OverloadBodyAnalysis<'db>>,
 ) -> Vec<Diagnostic> {
     let source_file = file.file(db);
     let _span = tracing::trace_span!("check_types", ?source_file).entered();
@@ -258,11 +281,10 @@ pub fn check_types_with_overload_bodies<'db>(
     let mut body_diagnostics = TypeCheckDiagnostics::default();
     let mut implicit_aliases = Vec::new();
     let mut selected = FxHashMap::default();
-    for function in functions {
-        if function.program_file(db) == file {
-            selected
-                .entry(function.literal(db).last_definition.body_scope(db))
-                .or_insert(function);
+    for analysis in analyses {
+        let definition = analysis.definition(db);
+        if definition.program_file(db) == file {
+            selected.entry(analysis.scope(db)).or_insert(analysis);
         }
     }
 
@@ -274,15 +296,14 @@ pub fn check_types_with_overload_bodies<'db>(
         }
 
         let result = infer_scope_types(db, scope_id, TypeContext::default());
-        let body = selected
-            .remove(&scope_id)
-            .map(|function| infer::CheckedOverloadBody::new(db, function));
+        let body = selected.remove(&scope_id);
 
         if let Some(scope_diagnostics) = result.diagnostics() {
-            diagnostics.extend_scope(scope_diagnostics, |source| {
-                body.as_ref()
-                    .is_some_and(|body| body.excludes_unknown_keyword(db, source))
-            });
+            if body.as_ref().is_some_and(OverloadBodyAnalysis::is_complete) {
+                diagnostics.extend_shared_body(scope_diagnostics);
+            } else {
+                diagnostics.extend(scope_diagnostics);
+            }
         }
         if let Some(body) = body {
             body.collect_diagnostics(&mut body_diagnostics);

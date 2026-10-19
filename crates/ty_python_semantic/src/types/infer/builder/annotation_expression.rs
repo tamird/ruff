@@ -126,7 +126,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .context
             .inference_flags
             .replace(InferenceFlags::CHECK_UNBOUND_TYPEVARS, true);
+        let previous_annotation = self
+            .context
+            .inference_flags
+            .replace(InferenceFlags::IN_ANNOTATION_EXPRESSION, true);
         let annotation_ty = self.infer_annotation_expression_impl(annotation, pep_613_policy);
+        self.context.inference_flags.set(
+            InferenceFlags::IN_ANNOTATION_EXPRESSION,
+            previous_annotation,
+        );
         self.context.inference_flags.set(
             InferenceFlags::CHECK_UNBOUND_TYPEVARS,
             previous_check_unbound_typevars,
