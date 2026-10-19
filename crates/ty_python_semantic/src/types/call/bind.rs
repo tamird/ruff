@@ -89,7 +89,7 @@ use crate::types::{
     LiteralValueTypeKind, MaterializationKind, MemberLookupPolicy, NominalInstanceType,
     PropertyInstanceType, TypeContext, TypeIdentity, TypeMapping, TypeVarBoundOrConstraints,
     TypeVarVariance, UnionAccumulator, UnionBuilder, UnionType, WrapperDescriptorKind, enums,
-    is_property_method, list_members,
+    is_known_class_method, is_property_method, list_members,
 };
 use crate::types::{DictionaryItemKind, ProgramEnvironment};
 use crate::{DisplaySettings, FxOrderSet};
@@ -846,6 +846,34 @@ impl<'db> Bindings<'db> {
             elements,
             enclosing_binding_contexts: None,
         }
+    }
+
+    /// `types.FunctionType.__call__` describes the same function as a more precise callable
+    /// constituent, not an independent overload that can accept otherwise invalid arguments.
+    pub(crate) fn without_redundant_function_call(
+        mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Self {
+        for element in &mut self.elements {
+            if element.items.len() < 2 {
+                continue;
+            }
+            let Some(index) = element.items.iter().position(|item| {
+                matches!(item, CallableItem::Regular(binding) if binding.is_generic_function_call(db, env))
+            }) else {
+                continue;
+            };
+            if element
+                .items
+                .iter()
+                .enumerate()
+                .any(|(other, item)| other != index && item.is_callable())
+            {
+                element.items.remove(index);
+            }
+        }
+        self
     }
 
     pub(crate) fn replace_callable_type(&mut self, before: Type<'db>, after: Type<'db>) {
@@ -3733,6 +3761,20 @@ impl FailingOverloadSelection {
 }
 
 impl<'db> CallableBinding<'db> {
+    fn is_generic_function_call(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+        let ([overload], Type::BoundMethod(method)) =
+            (self.overloads.as_slice(), self.signature_type)
+        else {
+            return false;
+        };
+        overload.signature.parameters().is_gradual()
+            && (overload.return_type().is_dynamic() || overload.return_type().is_object())
+            && method.function(db).is_some_and(|function| {
+                function.name(db) == "__call__"
+                    && is_known_class_method(db, env, function, KnownClass::FunctionType)
+            })
+    }
+
     pub(crate) fn from_overloads(
         signature_type: Type<'db>,
         overloads: impl IntoIterator<Item = Signature<'db>>,

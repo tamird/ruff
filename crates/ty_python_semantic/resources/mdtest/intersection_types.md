@@ -1366,6 +1366,47 @@ def _(x: AcceptsAnything & SpecificArgs) -> None:
     reveal_type(x("foo"))  # revealed: RetA
 ```
 
+### Narrowing a callable to a function
+
+A function's runtime type provides function-specific attributes; its generic `__call__` signature
+does not add another overload to a callable whose signature is already known.
+
+```py
+from types import FunctionType
+from typing import Callable, Protocol
+from ty_extensions import Top
+
+def narrowed(callback: Callable[[int], str]) -> None:
+    if isinstance(callback, FunctionType):
+        reveal_type(callback.__name__)  # revealed: str
+        reveal_type(callback(1))  # revealed: str
+        callback("wrong")  # error: [invalid-argument-type]
+        reveal_type(callback.__call__(1))  # revealed: str
+        callback.__call__("wrong")  # error: [invalid-argument-type]
+
+def without_signature(callback: FunctionType) -> None:
+    callback(1)
+
+class Callback(Protocol):
+    def __call__(self, *, enabled: bool) -> int: ...
+
+def narrowed_protocol(callback: Callback) -> None:
+    if isinstance(callback, FunctionType):
+        reveal_type(callback(enabled=True))  # revealed: int
+        callback(enabled="wrong")  # error: [invalid-argument-type]
+
+def overloads(callback: FunctionType & Callable[[int], str] & Callable[[str], int]) -> None:
+    reveal_type(callback(1))  # revealed: str
+    reveal_type(callback("value"))  # revealed: int
+    # error: [invalid-argument-type]
+    # error: [invalid-argument-type]
+    callback(None)
+
+def unknown_signature(callback: FunctionType & Top[Callable[..., bytes]]) -> None:
+    # error: [call-top-callable]
+    reveal_type(callback())  # revealed: bytes
+```
+
 ### No callable elements
 
 If no positive element is callable, the intersection is not callable:

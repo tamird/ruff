@@ -1644,6 +1644,15 @@ fn is_property_method<'db>(
         _ => return false,
     };
 
+    is_known_class_method(db, env, function, class)
+}
+
+fn is_known_class_method<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    function: FunctionType<'db>,
+    class: KnownClass,
+) -> bool {
     class
         .try_to_class_literal(db, env)
         .and_then(|class| {
@@ -7590,7 +7599,8 @@ impl<'db> Type<'db> {
                         Some(receiver.unwrap_or(self)),
                     )
                 }),
-            ),
+            )
+            .without_redundant_function_call(db, env),
 
             Type::EnumComplement(complement) => {
                 complement
