@@ -101,6 +101,9 @@ struct NarrowingAlias<'ast> {
 }
 
 struct ScopeInfo<'ast> {
+    /// Syntax candidates only; semantic inference validates factory retention.
+    contents_sources: FxHashMap<ScopedPlaceId, SmallVec<[ScopedPlaceId; 2]>>,
+    contents_retaining_calls: FxHashMap<ast::NodeIndex, SmallVec<[ScopedPlaceId; 2]>>,
     file_scope_id: FileScopeId,
     /// Current loop state; None if we are not currently visiting a loop
     current_loop: Option<Loop>,
@@ -574,6 +577,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         // TODO: Cross-scope alias narrowing is not supported yet.
         let saved_aliases = std::mem::take(&mut self.narrowing_aliases);
         self.scope_stack.push(ScopeInfo {
+            contents_sources: FxHashMap::default(),
+            contents_retaining_calls: FxHashMap::default(),
             file_scope_id,
             current_loop: None,
             narrowing_aliases: saved_aliases,
@@ -582,10 +587,33 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             pending_captures: FxHashMap::default(),
         });
 
-        for receiver in
-            dictionary_contents::candidates(node, self.module.suite(), &self.source_exclusions)
-        {
+        let dictionary_contents::ContentsCandidates {
+            receivers,
+            field_sources,
+        } = dictionary_contents::candidates(node, self.module.suite(), &self.source_exclusions);
+        for receiver in receivers {
             self.register_contents_place(receiver);
+        }
+        for (field, source, call) in field_sources {
+            if let Some(receiver) = PlaceExpr::try_from_expr(field)
+                .and_then(|place| self.current_place_table().place_id((&place).into()))
+                && let Some(field) = self.contents_place(field)
+                && let Some(source) = self.contents_place(source)
+            {
+                self.current_scope_info_mut()
+                    .contents_retaining_calls
+                    .entry(call.node_index().load())
+                    .or_default()
+                    .extend([receiver, field]);
+                let sources = self
+                    .current_scope_info_mut()
+                    .contents_sources
+                    .entry(field)
+                    .or_default();
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
         }
     }
 

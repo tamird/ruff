@@ -1,6 +1,7 @@
 //! Syntax-only discovery of places whose mapping contents can be observed.
 
 use ruff_python_ast as ast;
+use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_text_size::Ranged;
 use rustc_hash::FxHashMap;
@@ -272,6 +273,36 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             false,
         );
         self.record_definition(place, initializer, None);
+
+        let (target, value) = match definition.kind(self.db) {
+            DefinitionKind::Assignment(assignment) => (
+                assignment.target(self.module),
+                Some(assignment.value(self.module)),
+            ),
+            DefinitionKind::AnnotatedAssignment(assignment) => (
+                assignment.target(self.module),
+                assignment.value(self.module),
+            ),
+            _ => return,
+        };
+        let Some(ast::Expr::Call(call)) = value else {
+            return;
+        };
+        let Some(fields) = self
+            .current_scope_info()
+            .contents_retaining_calls
+            .get(&call.node_index().load())
+            .cloned()
+        else {
+            return;
+        };
+        // Parent assignment resets descendants to Deleted. Preserve that exact reset's
+        // identity; a later deletion must not look like an untouched retained field.
+        let use_id = self.current_ast_ids_mut().record_use(target);
+        let receiver = definition.place(self.db);
+        self.current_use_def_map_mut().record_use(receiver, use_id);
+        self.current_use_def_map_mut()
+            .record_multi_use(fields.into_iter(), use_id);
     }
 
     pub(super) fn record_contents_store(&mut self, subscript: &'ast ast::ExprSubscript) {
@@ -307,8 +338,29 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     }),
             );
         }
+        self.add_contents_sources(&mut places);
         self.current_use_def_map_mut()
             .record_multi_use(places.into_iter(), use_id);
+    }
+
+    fn add_contents_sources(&self, places: &mut SmallVec<[ScopedPlaceId; 2]>) {
+        // Only direct field candidates are connected; this is not alias propagation.
+        let sources: SmallVec<[_; 2]> = places
+            .iter()
+            .flat_map(|place| {
+                self.current_scope_info()
+                    .contents_sources
+                    .get(place)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
+            .collect();
+        for source in sources {
+            if !places.contains(&source) {
+                places.push(source);
+            }
+        }
     }
 
     pub(super) fn record_contents_snapshot(
@@ -363,8 +415,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             self.current_use_def_map_mut().record_use(*receiver, use_id);
             use_id
         };
+        let mut places = places.into_iter().map(|(_, contents)| contents).collect();
+        self.add_contents_sources(&mut places);
         self.current_use_def_map_mut()
-            .record_multi_use(places.into_iter().map(|(_, contents)| contents), use_id);
+            .record_multi_use(places.into_iter(), use_id);
     }
 
     pub(super) fn record_contents_call(
@@ -381,6 +435,23 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         {
             // The default expression can mutate the receiver before get reads its key.
             self.record_contents_snapshot(expression, &[&attribute.value]);
+        }
+
+        // Retained fields refer to values after all factory arguments have evaluated,
+        // but before this call exposes the original source mappings.
+        if self
+            .current_scope_info()
+            .contents_retaining_calls
+            .contains_key(&call.node_index().load())
+        {
+            let keywords: SmallVec<[_; 2]> = call
+                .arguments
+                .keywords
+                .iter()
+                .filter(|keyword| keyword.arg.is_some())
+                .map(|keyword| &keyword.value)
+                .collect();
+            self.record_contents_snapshot(expression, &keywords);
         }
 
         let occurrences = call_receivers(call);
@@ -573,6 +644,8 @@ struct Candidate<'ast> {
     receiver: &'ast ast::Expr,
     dependencies: Vec<usize>,
     observed: bool,
+    assigned: bool,
+    retaining_call: Option<&'ast ast::ExprCall>,
 }
 
 /// The graph carries only place identity, and is discarded before normal indexing. A demand
@@ -597,6 +670,8 @@ impl<'ast> Candidates<'ast, '_> {
                 receiver,
                 dependencies: Vec::new(),
                 observed: false,
+                assigned: false,
+                retaining_call: None,
             });
             next
         });
@@ -619,6 +694,23 @@ impl<'ast> Candidates<'ast, '_> {
         let Some(index) = self.place(target) else {
             return;
         };
+        let candidate = &mut self.nodes[index];
+        candidate.retaining_call = if !candidate.assigned
+            && target.is_name_expr()
+            && let ast::Expr::Call(call) = value
+            && call.arguments.args.is_empty()
+            && !call.arguments.keywords.is_empty()
+            && call
+                .arguments
+                .keywords
+                .iter()
+                .all(|keyword| keyword.arg.is_some())
+        {
+            Some(call)
+        } else {
+            None
+        };
+        candidate.assigned = true;
         let mapping_syntax = match value {
             ast::Expr::Dict(_) => true,
             ast::Expr::DictComp(_) => true,
@@ -680,11 +772,11 @@ impl<'ast> Candidates<'ast, '_> {
         }
     }
 
-    fn finish(self) -> Vec<&'ast ast::Expr> {
+    fn finish(self) -> ContentsCandidates<'ast> {
         let Self {
             exclusions: _,
             keyword_capture: _,
-            by_place: _,
+            by_place,
             nodes: mut candidates,
         } = self;
         let mut pending: Vec<_> = candidates
@@ -700,17 +792,43 @@ impl<'ast> Candidates<'ast, '_> {
                 }
             }
         }
-        candidates
+        let mut field_sources = Vec::new();
+        for candidate in &candidates {
+            if candidate.observed
+                && let ast::Expr::Attribute(attribute) = candidate.receiver
+                && attribute.value.is_name_expr()
+                && let Some(holder) = MemberExprBuilder::visit_expr(attribute.value.as_ref().into())
+                && let Some(index) = by_place.get(&holder)
+                && let Some(call) = candidates[*index].retaining_call
+            {
+                for keyword in &call.arguments.keywords {
+                    if keyword
+                        .arg
+                        .as_ref()
+                        .is_some_and(|name| name.as_str() == attribute.attr.as_str())
+                    {
+                        field_sources.push((candidate.receiver, &keyword.value, call));
+                    }
+                }
+            }
+        }
+        let receivers = candidates
             .into_iter()
             .filter_map(|candidate| {
                 let Candidate {
                     receiver,
                     dependencies: _,
                     observed,
+                    assigned: _,
+                    retaining_call: _,
                 } = candidate;
                 observed.then_some(receiver)
             })
-            .collect()
+            .collect();
+        ContentsCandidates {
+            receivers,
+            field_sources,
+        }
     }
 }
 
@@ -863,11 +981,16 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
     }
 }
 
+pub(super) struct ContentsCandidates<'ast> {
+    pub(super) receivers: Vec<&'ast ast::Expr>,
+    pub(super) field_sources: Vec<(&'ast ast::Expr, &'ast ast::Expr, &'ast ast::ExprCall)>,
+}
+
 pub(super) fn candidates<'ast>(
     node: NodeWithScopeRef<'ast>,
     module: &'ast [ast::Stmt],
     exclusions: &SourceExclusions,
-) -> Vec<&'ast ast::Expr> {
+) -> ContentsCandidates<'ast> {
     let mut visitor = Candidates {
         exclusions,
         keyword_capture: None,

@@ -2328,6 +2328,275 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
 }
 
 #[test]
+fn dictionary_observations_follow_retained_fields() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "class Record:\n    values: dict[str, int]\ndef record(*, values: dict[str, int], other: object = ...) -> Record: ...\ndef untrusted(*, values: dict[str, int]) -> Record: ...\ndef observe(value: object) -> str: ...\ndef touch(value: object) -> None: ...\ncondition: bool\n",
+        )
+        .with_file("/src/main.py", "")
+        .with_keyword_field_factory(|db, declaration| {
+            declaration.name(db).is_some_and(|name| name == "record")
+                && declaration
+                    .program_file(db)
+                    .file(db)
+                    .path(db)
+                    .as_system_path()
+                    .is_some_and(|path| path.as_str() == "/src/native.pyi")
+        })
+        .with_call_result_provider(|db, call| {
+            if call
+                .declaration()
+                .and_then(|declaration| declaration.name(db))
+                .is_none_or(|name| name != "observe")
+            {
+                return ProvidedCallResult::default();
+            }
+            let known = call.dictionary_argument(db, "value").is_some_and(|contents| {
+                contents.is_complete()
+                    && contents.items.iter().any(|item| item.name == "first" && item.is_required())
+            });
+            Some(Type::string_literal(db, if known { "known" } else { "unknown" })).into()
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    // Reuse one database/file across mutations: a recovered snapshot must be invalidated
+    // when either the source history, factory identity, or field history changes.
+    for (before, call, intervening, read, expected) in [
+        ("", "record(values=values)", "", "holder.values", "known"),
+        ("", "record(values=values)", "", "values", "unknown"),
+        (
+            "",
+            "record(values=values)",
+            "",
+            "dict(holder.values)",
+            "known",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "",
+            "dict(second=2, **holder.values)",
+            "known",
+        ),
+        (
+            "values['second'] = 2\n",
+            "record(values=values)",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "holder.values.clear()\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "holder.values.clear()\n",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "values.clear()\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "values['second'] = 2\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "alias = values\n",
+            "record(values=values)",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "alias = values\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "alias = holder\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "touch(holder)\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "touch(values)\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "values = {}\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "holder = record(values={})\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "holder.values = {}\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "del holder.values\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "len(values)\n",
+            "holder.values",
+            "known",
+        ),
+        (
+            "def captured() -> None:\n    values.clear()\n",
+            "record(values=values)",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "def captured() -> None:\n    values.clear()\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "def captured() -> None:\n    holder.values.clear()\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "if condition:\n    values.clear()\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "for item in [1]:\n    values['second'] = item\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values, other=values)",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values, other=values.clear())",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values, other=(values := {}))",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "untrusted(values=values)",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        // Even an earlier field read can expose its value; this first slice does not install
+        // persistent field contents or propagate effects through a retained alias.
+        (
+            "",
+            "record(values=values)",
+            "touch(holder.values)\n",
+            "holder.values",
+            "unknown",
+        ),
+        ("", "record(values=values)", "", "holder.values", "known"),
+    ] {
+        let source = format!(
+            "from native import condition, observe, record, touch, untrusted\nvalues = {{'first': 1}}\n{before}holder = {call}\n{intervening}result = observe({read})\n"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let result = crate::place::global_symbol(&db, db.program_file(file), "result")
+            .place
+            .expect_type();
+        assert_eq!(result.string_literal_value(&db), Some(expected), "{source}");
+    }
+    db.write_file(
+        "/src/main.py",
+        r#"
+from typing_extensions import Literal, assert_type
+from native import observe, record
+
+def from_parameter(values: dict[str, int]) -> None:
+    holder = record(values=values)
+    assert_type(observe(holder.values), Literal["unknown"])
+
+def from_allocation() -> None:
+    values = dict(first=1)
+    holder = record(values=values, other=42)
+    assert_type(observe(dict(second=2, **holder.values)), Literal["known"])
+
+def in_loop() -> None:
+    values = dict(first=1)
+    for _ in range(2):
+        holder = record(values=values)
+        assert_type(observe(holder.values), Literal["unknown"])
+"#,
+    )?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
 fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
     fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
         if call.declaration()?.name(db)?.as_str() != "observe" {

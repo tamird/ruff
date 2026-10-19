@@ -2,6 +2,7 @@
 
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
+use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::helpers::any_over_expr;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor::{Visitor, walk_expr};
@@ -1830,6 +1831,10 @@ enum KeyHistoryOrigin<'a, 'db> {
     },
     /// Ordinary member seeds may start at a parameter, but not after a known escape.
     UnexposedParent,
+    /// A retained source must originate in a fresh local allocation, never a parameter.
+    FreshSource,
+    /// All paths must reach this exact retaining call without changing the whole mapping.
+    RetainedCall(ast::NodeIndex),
 }
 
 /// A member store does not create a new containing object. Read the receiver's snapshot before
@@ -1917,8 +1922,11 @@ fn check_contents_history<'db>(
                     } => {
                         return KeyPreservation::Changed;
                     }
-                    KeyHistoryOrigin::UnexposedParent => {
-                        if definition.kind(db).is_parameter_def() {
+                    KeyHistoryOrigin::RetainedCall(_) => return KeyPreservation::Changed,
+                    KeyHistoryOrigin::UnexposedParent | KeyHistoryOrigin::FreshSource => {
+                        if matches!(origin, KeyHistoryOrigin::UnexposedParent)
+                            && definition.kind(db).is_parameter_def()
+                        {
                             continue;
                         }
                         match fresh_allocation(db, *definition, domain) {
@@ -1937,6 +1945,16 @@ fn check_contents_history<'db>(
                 continue;
             }
             DictionaryContentsDefinitionKind::Operation { receiver, effect } => {
+                if let KeyHistoryOrigin::RetainedCall(anchor) = origin
+                    && let DictionaryContentsEffect::Call {
+                        call,
+                        owner: _,
+                        retained: _,
+                    } = effect
+                    && call.index() == anchor
+                {
+                    continue;
+                }
                 let transfer = mapping_transfer(db, definition, receiver, effect, domain);
                 if matches!(transfer, MappingTransfer::Result(ContentsValue::Pending)) {
                     provisional = true;
@@ -1947,6 +1965,9 @@ fn check_contents_history<'db>(
                         transfer.preserves_key(db, name)
                     }
                     KeyHistoryOrigin::UnexposedParent => transfer.preserves_confinement(),
+                    KeyHistoryOrigin::FreshSource | KeyHistoryOrigin::RetainedCall(_) => {
+                        matches!(transfer, MappingTransfer::Keep { .. })
+                    }
                 };
                 if !preserved {
                     return KeyPreservation::Changed;
@@ -2076,6 +2097,179 @@ pub(crate) fn at_snapshot<'db>(
     }
 }
 
+/// Recover a first field observation from a factory's pre-retention snapshot. No alias is
+/// installed in the contents graph: later field effects, uncertain source history, or another
+/// binding all fall back to ordinary inference.
+fn retained_field_contents<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    expression: &ast::Expr,
+    snapshot: ast::ExprRef<'_>,
+    reachability: &ReachabilityEvaluationCache<'db>,
+) -> Option<ContentsValue<'db>> {
+    let ast::Expr::Attribute(attribute) = expression else {
+        return None;
+    };
+    let ast::Expr::Name(holder) = attribute.value.as_ref() else {
+        return None;
+    };
+    let file = scope.program_file(db);
+    let index = semantic_index(db, file);
+    let table = index.place_table(scope.file_scope_id(db));
+    let holder_symbol = table.symbol(table.symbol_id(holder.id.as_str())?);
+    if !holder_symbol.is_local() || holder_symbol.is_reassigned() {
+        return None;
+    }
+    let use_def = index.use_def_map(scope.file_scope_id(db));
+    let holder_use = index.try_expression_use_id(attribute.value.as_ref().into())?;
+    let mut bindings = use_def.bindings_at_use(holder_use);
+    let definition = bindings.next()?.binding.definition()?;
+    if bindings.next().is_some() || definition.scope(db) != scope {
+        return None;
+    }
+    let module = parsed_module(db, file.python_file(db)).load(db);
+    let (target, value) = match definition.kind(db) {
+        DefinitionKind::Assignment(assignment) if assignment.is_single_target(&module) => {
+            (assignment.target(&module), assignment.value(&module))
+        }
+        DefinitionKind::AnnotatedAssignment(assignment) => {
+            (assignment.target(&module), assignment.value(&module)?)
+        }
+        _ => return None,
+    };
+    let field_place = table.place_id(&PlaceExpr::contents(expression)?)?;
+    let target_use = index.try_expression_use_id(target.into())?;
+    let current_use = index.try_expression_use_id(snapshot)?;
+    let field_value = table.place_id(&PlaceExpr::try_from_expr(expression)?)?;
+    let field_use = index.try_expression_use_id(expression.into())?;
+    for (place, mut current) in [
+        (
+            field_place,
+            use_def.multi_bindings_at_use(current_use, field_place)?,
+        ),
+        (field_value, use_def.bindings_at_use(field_use)),
+    ] {
+        let mut initial = use_def.multi_bindings_at_use(target_use, place)?;
+        let initial_binding = initial.next()?;
+        if initial_binding.binding != DefinitionState::Deleted
+            || initial.next().is_some()
+            || current.next()?.binding_order != initial_binding.binding_order
+            || current.next().is_some()
+        {
+            return None;
+        }
+    }
+    let ast::Expr::Call(call) = value else {
+        return None;
+    };
+    // No unpacking or repeated/nested occurrences of the retained source are admitted.
+    if !call.arguments.args.is_empty()
+        || call
+            .arguments
+            .keywords
+            .iter()
+            .any(|keyword| keyword.arg.is_none())
+    {
+        return None;
+    }
+    let keyword = call.arguments.keywords.iter().find(|keyword| {
+        keyword
+            .arg
+            .as_ref()
+            .is_some_and(|name| name.as_str() == attribute.attr.as_str())
+    })?;
+    let source = &keyword.value;
+    let ast::Expr::Name(source_name) = source else {
+        return None;
+    };
+    let source_symbol = table.symbol(table.symbol_id(source_name.id.as_str())?);
+    if !source_symbol.is_local() || source_symbol.is_reassigned() {
+        return None;
+    }
+    let source_place = PlaceExpr::try_from_expr(source)?;
+    let mentions_source = |expression: &ast::Expr| {
+        any_over_expr(expression, |expression| {
+            PlaceExpr::try_from_expr(expression).as_ref() == Some(&source_place)
+        })
+    };
+    if mentions_source(&call.func)
+        || call
+            .arguments
+            .keywords
+            .iter()
+            .filter(|keyword| mentions_source(&keyword.value))
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let domain = reachability.body_domain();
+    let inference = infer_definition_with_body_domain(db, definition, domain);
+    if StatementInference::Definition(definition, inference).is_provisional() {
+        return Some(ContentsValue::Pending);
+    }
+    let callee @ Type::FunctionLiteral(_) = inference.try_expression_type(&call.func)? else {
+        return None;
+    };
+    let env = ProgramEnvironment::from_scope(scope);
+    let bindings = callee.bindings(db, &env);
+    let callable = bindings.single_element()?;
+    if callable.bound_type.is_some() {
+        return None;
+    }
+    let [binding] = callable.overloads() else {
+        return None;
+    };
+    if !db.provided_keyword_field_factory(binding.signature.definition()?) {
+        return None;
+    }
+    let arguments = CallArguments::from_arguments_typed(&call.arguments, |expression| {
+        inference
+            .try_expression_type(expression)
+            .unwrap_or(Type::unknown())
+    });
+    let matched = bindings.match_parameters(db, &env, &arguments);
+    let [binding] = matched.single_element()?.overloads() else {
+        return None;
+    };
+    if !binding.errors().is_empty() {
+        return None;
+    }
+
+    let source_contents = table.place_id(&PlaceExpr::contents(source)?)?;
+    let call_use = index.try_expression_use_id(call.into())?;
+    let before = use_def.multi_bindings_at_use(call_use, source_contents)?;
+    let current_use = index.try_expression_use_id(snapshot)?;
+    let after = use_def.multi_bindings_at_use(current_use, source_contents)?;
+    for (bindings, origin) in [
+        (before, KeyHistoryOrigin::FreshSource),
+        (
+            after,
+            KeyHistoryOrigin::RetainedCall(call.node_index().load()),
+        ),
+    ] {
+        match check_contents_history(
+            db,
+            scope,
+            bindings.map(|binding| binding.binding).collect(),
+            origin,
+            domain,
+        ) {
+            KeyPreservation::Preserved => {}
+            KeyPreservation::Pending => return Some(ContentsValue::Pending),
+            KeyPreservation::Changed => return None,
+        }
+    }
+    Some(snapshot_contents(
+        db,
+        scope,
+        source,
+        call.into(),
+        inference.try_expression_type(source)?,
+        reachability,
+    ))
+}
+
 pub(super) fn snapshot_contents<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
@@ -2119,6 +2313,13 @@ pub(super) fn snapshot_contents<'db>(
             }
         }
         let bindings = use_def.multi_bindings_at_use(use_id, contents_place)?;
+        if let ast::Expr::Attribute(attribute) = expression
+            && attribute.value.is_name_expr()
+            && let Some(retained) =
+                retained_field_contents(db, scope, expression, snapshot, reachability)
+        {
+            return Some(retained);
+        }
         let Contents { value, captured: _ } = from_bindings(db, scope, bindings, reachability);
         Some(value)
     })();

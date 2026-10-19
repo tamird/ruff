@@ -165,13 +165,18 @@ pub trait Db: PythonCoreDb {
         None
     }
 
-    /// Whether a factory stores direct named keyword arguments unchanged in same-named
-    /// readable result fields.
+    /// Whether a factory returns a fresh object retaining each direct named keyword argument
+    /// unchanged in an inert, readonly, same-named field.
     ///
-    /// This declaration fact lets ordinary argument inference use the corresponding readonly
-    /// property of an expected protocol as context. It does not supply the actual result type
-    /// or replace argument checking. Implementations must identify the resolved declaration
-    /// and read tracked inputs without inferring its body or the calling scope.
+    /// The factory must not mutate the arguments or retain additional aliases to them or the
+    /// result. Reading a field must return the original argument without executing user code.
+    /// This permits argument context from an expected readonly protocol property and contents
+    /// observations through a field while the original argument is independently proved
+    /// unchanged. The original argument still escapes through the call.
+    ///
+    /// This declaration fact does not supply the result type or replace argument checking.
+    /// Implementations must identify the resolved declaration and read tracked inputs without
+    /// inferring its body or the calling scope.
     fn provided_keyword_field_factory(&self, _definition: Definition<'_>) -> bool {
         false
     }
