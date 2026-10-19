@@ -71,6 +71,57 @@ def loop_carried(flag: bool):
     consume(**values)  # error: [invalid-argument-type]
 ```
 
+## TypedDict fields in comprehensions
+
+When a comprehension copies a field under its original key, each key keeps its own value type.
+
+```py
+from typing_extensions import NotRequired, TypedDict
+
+class Options(TypedDict):
+    enabled: NotRequired[bool]
+    tags: NotRequired[list[str]]
+
+def consume(*, enabled: bool = False, tags: list[str] = []) -> None: ...
+def copied(options: Options) -> None:
+    selected = {key: options[key] for key in ("enabled", "tags") if key in options}
+    consume(**selected)  # no diagnostic
+
+def removed(options: Options) -> None:
+    selected = {key: options.pop(key) for key in ("enabled", "tags") if key in options}
+    consume(**selected)  # no diagnostic
+```
+
+Other lookups, subsequent mutations, and incomplete key sets still require checking.
+
+```py
+def different_key(options: Options) -> None:
+    selected = {key: options["enabled"] for key in ("enabled", "tags") if "enabled" in options}
+    consume(**selected)  # error: [invalid-argument-type]
+
+def default_value(options: Options) -> None:
+    selected = {key: options.pop(key, ["wrong"]) for key in ("enabled",)}
+    consume(**selected)  # error: [invalid-argument-type]
+
+def modified(options: Options) -> None:
+    selected = {key: options.pop(key) for key in ("enabled", "tags") if key in options}
+    selected["enabled"] = ["wrong"]
+    consume(**selected)  # error: [invalid-argument-type]
+
+def require_tags(*, tags: list[str]) -> None: ...
+def incomplete(options: Options) -> None:
+    selected = {key: options[key] for key in ("enabled",) if key in options}
+    require_tags(**selected)  # error: [missing-argument]
+
+class OpenOptions(TypedDict, extra_items=object):
+    enabled: NotRequired[bool]
+
+def consume_enabled(*, enabled: bool = False) -> None: ...
+def unknown_keys(options: OpenOptions, keys: list[str]) -> None:
+    selected = {key: options[key] for key in keys if key in options}
+    consume_enabled(**selected)  # error: [invalid-argument-type]
+```
+
 ## Literal spreads
 
 Dictionary literals retain each known key when unpacked at a call. Later entries replace earlier

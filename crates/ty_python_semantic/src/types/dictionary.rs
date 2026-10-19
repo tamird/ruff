@@ -13,8 +13,8 @@ use crate::types::typed_dict::{
     UnpackedTypedDict, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
 };
 use crate::types::{
-    BoundTypeVarInstance, KnownClass, MemberLookupPolicy, ProgramEnvironment, Truthiness, Type,
-    TypedDictOpenness, TypedDictType, UnionType,
+    BoundTypeVarInstance, IntersectionType, KnownClass, MemberLookupPolicy, ProgramEnvironment,
+    Truthiness, Type, TypedDictOpenness, TypedDictType, UnionType,
 };
 use crate::{Db, FxIndexMap};
 
@@ -434,6 +434,38 @@ impl<'db> DictionaryExtraItems<'db> {
     }
 }
 
+/// A direct field read keyed by the same local name as the comprehension's output key.
+fn comprehension_field_source<'db>(
+    db: &'db dyn Db,
+    key: &ast::Expr,
+    value: &ast::Expr,
+    expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+) -> Option<TypedDictType<'db>> {
+    let output_key = key.as_name_expr()?;
+    let (receiver, lookup_key) = match value {
+        ast::Expr::Subscript(subscript) => (subscript.value.as_ref(), subscript.slice.as_ref()),
+        ast::Expr::Call(call) if call.arguments.keywords.is_empty() => {
+            let attribute = call.func.as_attribute_expr()?;
+            let [lookup_key] = call.arguments.args.as_ref() else {
+                return None;
+            };
+            if attribute.attr.as_str() != "pop" {
+                return None;
+            }
+            (attribute.value.as_ref(), lookup_key)
+        }
+        _ => return None,
+    };
+    // Reading a local receiver cannot rebind the key between its two uses.
+    if !receiver.is_name_expr() || lookup_key.as_name_expr()?.id != output_key.id {
+        return None;
+    }
+    let Type::TypedDict(source) = expression_type(receiver)?.resolve_type_alias(db) else {
+        return None;
+    };
+    Some(source)
+}
+
 impl<'db> DictionaryItems<'db> {
     /// Whether the named entries account for every possible key.
     pub const fn is_complete(&self) -> bool {
@@ -514,15 +546,28 @@ impl<'db> DictionaryItems<'db> {
                     Type::Union(union) => union.elements(db),
                     ty => std::slice::from_ref(ty),
                 };
+                let source_fields = comprehension_field_source(db, key, value, expression_type)
+                    .map(|source| source.items(db));
                 let items = keys
                     .iter()
                     .map(|ty| {
                         let name = ty
                             .string_literal_value(db)
                             .ok_or(DictionaryFallback::Unavailable)?;
+                        let ty = source_fields.and_then(|fields| fields.get(name)).map_or(
+                            value_ty,
+                            |field| {
+                                IntersectionType::from_two_elements(
+                                    db,
+                                    env,
+                                    value_ty,
+                                    field.declared_type(),
+                                )
+                            },
+                        );
                         Ok(DictionaryItem {
                             name: Name::new(name),
-                            ty: value_ty,
+                            ty,
                             // Iteration and filtering need not supply any particular key.
                             kind: DictionaryItemKind::Residual,
                             source: key.range(),
