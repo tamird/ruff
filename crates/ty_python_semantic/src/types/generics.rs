@@ -4143,6 +4143,29 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 }
             }
 
+            (
+                formal @ (Type::ProtocolInstance(_) | Type::Union(_)),
+                Type::TypeVar(actual_typevar),
+            ) if polarity.is_covariant()
+                && !actual_typevar.is_inferable(db, self.inferable)
+                && actual_typevar
+                    .typevar(db)
+                    .upper_bound(db, self.env)
+                    .is_some()
+                && (!formal.is_union()
+                    || !self.inferable.iter(db).any(|typevar| {
+                        typevar.is_paramspec(db) || typevar.is_typevartuple(db)
+                    }))
+                && let Some(when) = formal.when_constraint_set_satisfied_by_typevar(
+                    db,
+                    self.env,
+                    actual_typevar,
+                    self.constraints,
+                ) =>
+            {
+                return self.infer_from_constraint_set(when);
+            }
+
             // Union alternatives use the complete relation where ordinary type variables can
             // be inferred together. Self and variadics still require the specialized rules below.
             (Type::Union(formal_union), Type::Union(actual_union)) => {
@@ -4452,22 +4475,6 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     && let Some(bound) = actual_typevar.typevar(db).upper_bound(db, self.env) =>
             {
                 let when = self.constraint_for_relation(formal, bound, relation_polarity);
-                return self.infer_from_constraint_set(when);
-            }
-
-            (Type::ProtocolInstance(protocol), Type::TypeVar(actual_typevar))
-                if polarity.is_covariant()
-                    && actual_typevar
-                        .typevar(db)
-                        .upper_bound(db, self.env)
-                        .is_some() =>
-            {
-                let when = protocol.when_constraint_set_satisfied_by_typevar(
-                    db,
-                    self.env,
-                    actual_typevar,
-                    self.constraints,
-                );
                 return self.infer_from_constraint_set(when);
             }
 

@@ -4713,15 +4713,22 @@ class Keyed[K, V](Protocol):
 def capture[K, V](value: Keyed[K, V]) -> tuple[K, V]:
     raise NotImplementedError
 
+def capture_either[K, V](value: Keyed[K, V] | Iterable[tuple[K, V]]) -> tuple[K, V]:
+    raise NotImplementedError
+
 def require_same_values[K, V](value: Keyed[K, V], values: list[V]) -> None: ...
+def require_same_either[K, V](value: Keyed[K, V] | Iterable[tuple[K, V]], values: list[V]) -> None: ...
 
 def bounded[T: dict[str, int]](value: T) -> None:
     reveal_type(capture(value))  # revealed: tuple[str, int]
+    reveal_type(capture_either(value))  # revealed: tuple[str, int]
     require_same_values(value, ["wrong"])  # error: [invalid-argument-type]
+    require_same_either(value, ["wrong"])  # error: [invalid-argument-type]
 
 def arguments[**P](callback: Callable[P, None], *args: P.args, **kwargs: P.kwargs) -> None:
     reveal_type(dict(kwargs))  # revealed: dict[str, object]
     reveal_type(capture(kwargs))  # revealed: tuple[str, object]
+    reveal_type(capture_either(kwargs))  # revealed: tuple[str, object]
 
 class Clonable[T](Protocol):
     def clone(self) -> T: ...
@@ -4742,6 +4749,41 @@ class Widens:
 
 def clone_widens[S: Widens](value: S) -> S:
     return capture_clone(value)  # error: [invalid-return-type]
+
+class Left[T](Protocol):
+    def left(self) -> T: ...
+
+class Right[T](Protocol):
+    def right(self) -> T: ...
+
+class FromLeft:
+    def left(self) -> int:
+        return 1
+
+class FromRight:
+    def right(self) -> str:
+        return "right"
+
+class Neither: ...
+
+def capture_distributed[T](value: Left[T] | Right[T]) -> T:
+    raise NotImplementedError
+
+def distributed[S: FromLeft | FromRight](value: S) -> None:
+    reveal_type(capture_distributed(value))  # revealed: int | str
+
+def missing_method[S: Neither](value: S) -> None:
+    capture_distributed(value)  # error: [invalid-argument-type]
+
+class Owner(Parent):
+    def accept[T](self, value: Clonable[Self] | Iterable[T], fallback: T) -> tuple[Self, T]:
+        return self, fallback
+
+def preserve_owner[S: Owner](owner: S) -> tuple[S, str]:
+    return owner.accept(owner, "fallback")  # no diagnostic
+
+def reject_other_owner[S: Owner, O: Owner](owner: S, other: O) -> None:
+    owner.accept(other, "fallback")  # error: [invalid-argument-type]
 ```
 
 ## Generic protocol inference from module objects

@@ -3,6 +3,7 @@ use std::borrow::Cow;
 
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 
 use crate::place::{DefinedPlace, Place};
 use crate::types::callable::CallableTypeKind;
@@ -20,10 +21,11 @@ use crate::types::signatures::{ParametersKind, SignatureRelationVisitor};
 use crate::types::tuple::TupleType;
 use crate::types::typevar::TypeVarDomain;
 use crate::types::{
-    ApplyTypeMappingVisitor, CallableType, ClassBase, ClassLiteral, ClassType, CycleDetector,
-    IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType, LiteralValueTypeKind,
-    MemberLookupPolicy, PropertyInstanceType, ProtocolInstanceType, SubclassOfInner,
-    SubclassOfType, TypeVarBoundOrConstraints, UnionType, UpcastPolicy,
+    ApplyTypeMappingVisitor, BoundTypeVarInstance, CallableType, ClassBase, ClassLiteral,
+    ClassType, CycleDetector, IntersectionType, KnownBoundMethodType, KnownClass,
+    KnownInstanceType, LiteralValueTypeKind, MemberLookupPolicy, PropertyInstanceType,
+    ProtocolInstanceType, SubclassOfInner, SubclassOfType, TypeVarBoundOrConstraints, UnionType,
+    UpcastPolicy,
 };
 use crate::{
     Db,
@@ -1340,6 +1342,59 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         source: Type<'db>,
         union: UnionType<'db>,
     ) -> ConstraintSet<'db, 'c> {
+        self.check_target_union_with(
+            db,
+            source,
+            union,
+            union
+                .elements(db)
+                .iter()
+                .map(|element| self.check_type_pair(db, source, *element)),
+        )
+    }
+
+    pub(super) fn check_bounded_typevar_protocol_target(
+        &self,
+        db: &'db dyn Db,
+        candidate: BoundTypeVarInstance<'db>,
+        target: Type<'db>,
+    ) -> Option<ConstraintSet<'db, 'c>> {
+        let source = Type::TypeVar(candidate);
+        match target {
+            Type::ProtocolInstance(protocol) => {
+                Some(self.check_type_satisfies_protocol(db, source, protocol))
+            }
+            Type::Union(union) => {
+                let protocols = union
+                    .elements(db)
+                    .iter()
+                    .map(|element| element.as_protocol_instance())
+                    .collect::<Option<SmallVec<[_; 2]>>>()?;
+                Some(
+                    self.check_target_union_with(
+                        db,
+                        source,
+                        union,
+                        protocols.into_iter().map(|protocol| {
+                            self.check_type_satisfies_protocol(db, source, protocol)
+                        }),
+                    ),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// Each lazy check corresponds to one target member, in order, so its error context can be
+    /// captured immediately after the relation is evaluated.
+    fn check_target_union_with(
+        &self,
+        db: &'db dyn Db,
+        source: Type<'db>,
+        union: UnionType<'db>,
+        member_checks: impl ExactSizeIterator<Item = ConstraintSet<'db, 'c>>,
+    ) -> ConstraintSet<'db, 'c> {
+        debug_assert_eq!(member_checks.len(), union.elements(db).len());
         let target = Type::Union(union);
         if let Type::Intersection(intersection) = source
             && let Some(alternatives) = intersection.finite_alternative_union(db, self.env)
@@ -1385,11 +1440,8 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         let mut elements_context = vec![];
         let context_tree = self.context_tree.as_ref().filter(|tree| tree.is_enabled());
 
-        let elements = union.elements(db);
-        let result = elements
-            .iter()
-            .when_any(db, self.constraints, |&element| {
-                let result = self.check_type_pair(db, source, element);
+        let result = member_checks
+            .when_any(db, self.constraints, |result| {
                 if let Some(context_tree) = context_tree {
                     let context = context_tree.take();
                     if !context.is_empty() {
@@ -1404,8 +1456,8 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             && !elements_context.is_empty()
             && result.is_never_satisfied(db, self.env)
         {
-            let elements_without_context = elements.len() - elements_context.len();
-            if elements_without_context > 0 && elements_without_context < elements.len() {
+            let elements_without_context = union.elements(db).len() - elements_context.len();
+            if elements_without_context > 0 && elements_without_context < union.elements(db).len() {
                 elements_context.push(ErrorContextTree::from_context(
                     ErrorContext::NotAssignableToNOtherUnionElements {
                         n: elements_without_context,

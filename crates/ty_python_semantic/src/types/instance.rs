@@ -79,6 +79,27 @@ impl<'db> Type<'db> {
         )))
     }
 
+    /// Infer protocol member constraints from a bounded type variable. Comparing the variable
+    /// directly would produce one opaque constraint, while replacing it with its bound would
+    /// lose the original receiver for `Self`-returning members.
+    pub(super) fn when_constraint_set_satisfied_by_typevar<'c>(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        candidate: BoundTypeVarInstance<'db>,
+        constraints: &'c ConstraintSetBuilder<'db>,
+    ) -> Option<ConstraintSet<'db, 'c>> {
+        TypeRelationChecker::constraint_set_assignability(
+            env,
+            constraints,
+            &HasRelationToVisitor::default(constraints),
+            &IsDisjointVisitor::default(constraints),
+            &SignatureRelationVisitor::default(),
+            &ApplyTypeMappingVisitor::new(env),
+        )
+        .check_bounded_typevar_protocol_target(db, candidate, self)
+    }
+
     pub(crate) const fn object() -> Self {
         Type::NominalInstance(NominalInstanceType(NominalInstanceInner::Object))
     }
@@ -1579,27 +1600,6 @@ pub(super) fn walk_protocol_instance_type<'db, V: super::visitor::TypeVisitor<'d
 }
 
 impl<'db> ProtocolInstanceType<'db> {
-    /// Infer constraints from the candidate's protocol members. Comparing a type variable
-    /// directly would produce one opaque constraint, while replacing it with its bound would
-    /// lose the original receiver for `Self`-returning members.
-    pub(super) fn when_constraint_set_satisfied_by_typevar<'c>(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        candidate: BoundTypeVarInstance<'db>,
-        constraints: &'c ConstraintSetBuilder<'db>,
-    ) -> ConstraintSet<'db, 'c> {
-        TypeRelationChecker::constraint_set_assignability(
-            env,
-            constraints,
-            &HasRelationToVisitor::default(constraints),
-            &IsDisjointVisitor::default(constraints),
-            &SignatureRelationVisitor::default(),
-            &ApplyTypeMappingVisitor::new(env),
-        )
-        .check_type_satisfies_protocol(db, Type::TypeVar(candidate), self)
-    }
-
     /// Return `true` if this is the standard-library `Hashable` protocol.
     pub(super) fn is_hashable(self, db: &'db dyn Db) -> bool {
         self.class_origin(db)
