@@ -318,7 +318,7 @@ impl<'db> RecursiveDefinition<'db> {
     ) -> BoundTypeVarIdentity<'db> {
         let identity = parameter.identity(db);
         if identity.is_paramspec(db) {
-            identity.without_paramspec_attr(db)
+            identity.paramspec_base(db)
         } else {
             identity
         }

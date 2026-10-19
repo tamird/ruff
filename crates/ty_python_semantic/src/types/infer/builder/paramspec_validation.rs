@@ -35,7 +35,7 @@ pub(super) fn validate_paramspec_components<'db>(
             && typevar.is_paramspec(db)
             && typevar.paramspec_attr(db) == Some(ParamSpecAttrKind::Args)
         {
-            Some((typevar.without_paramspec_attr(db), annotation))
+            Some((typevar.paramspec_base(db), annotation))
         } else {
             None
         }
@@ -48,7 +48,7 @@ pub(super) fn validate_paramspec_components<'db>(
             && typevar.is_paramspec(db)
             && typevar.paramspec_attr(db) == Some(ParamSpecAttrKind::Kwargs)
         {
-            Some((typevar.without_paramspec_attr(db), annotation))
+            Some((typevar.paramspec_base(db), annotation))
         } else {
             None
         }

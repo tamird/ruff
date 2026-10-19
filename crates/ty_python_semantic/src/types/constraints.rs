@@ -112,8 +112,8 @@ use crate::types::constraints::projection::{
 use crate::types::constraints::support::{Support, SupportId};
 use crate::types::generics::{ApplySpecialization, GenericContext};
 use crate::types::typevar::{
-    BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarConstraints, TypeVarInstance, TypeVarNonce,
-    TypeVarSet,
+    BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarConstraints, TypeVarDomain, TypeVarInstance,
+    TypeVarNonce, TypeVarSet,
 };
 use crate::types::visitor::{
     NonAtomicType, TypeCollector, TypeKind, TypeVisitor, any_over_type_expanding_aliases,
@@ -551,6 +551,24 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
         debug_assert!(std::ptr::eq(self.builder, builder));
     }
 
+    pub(crate) fn referenced_typevars(
+        self,
+        db: &'db dyn Db,
+        mut filter: impl FnMut(BoundTypeVarInstance<'db>) -> bool,
+    ) -> TypeVarSet<'db> {
+        let storage = self.builder.storage.borrow();
+        let Some(support) = storage.node_support(self.node) else {
+            return TypeVarSet::None;
+        };
+        TypeVarSet::from_typevars(
+            db,
+            support
+                .iter()
+                .map(|id| storage.typevar_data(id))
+                .filter(|variable| filter(*variable)),
+        )
+    }
+
     /// Returns whether this constraint set never holds, ignoring free type variables'
     /// declared bounds or constraints. Quantified witnesses satisfy their declared domains.
     /// Use [`Self::has_no_valid_solutions`] to include free variables' declarations.
@@ -776,11 +794,23 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
         }
         let mut storage = builder.storage.borrow_mut();
         let mut locals = Support::from_typevar_set(db, &mut storage, to_remove);
+        let mut has_paramspec = false;
         for typevar in to_remove.iter(db) {
-            if typevar.is_paramspec(db) && typevar.paramspec_attr(db).is_none() {
+            if typevar.domain(db) == TypeVarDomain::ParameterSignature {
+                has_paramspec = true;
                 for attr in [ParamSpecAttrKind::Args, ParamSpecAttrKind::Kwargs] {
                     locals
                         .insert(storage.intern_typevar(db, typevar.with_paramspec_attr(db, attr)));
+                }
+            }
+        }
+        if has_paramspec && let Some(support) = storage.node_support(self.node) {
+            for id in support.iter() {
+                let variable = storage.typevar_data(id);
+                if variable.keyword_projection(db).is_some()
+                    && variable.paramspec_base(db).is_inferable(db, to_remove)
+                {
+                    locals.insert(id);
                 }
             }
         }
@@ -2586,6 +2616,27 @@ impl NodeId {
             &mut UnboundedSolutionLimits,
         );
         result
+    }
+
+    /// Checks whether the root alone proves a constant value. An intrinsically true root atom
+    /// selects its true branch; the uncertain branch must not contribute another value.
+    fn proves_value_from_root<'db>(
+        self,
+        db: &'db dyn Db,
+        storage: &ConstraintSetStorage<'db>,
+        value: bool,
+    ) -> bool {
+        let expected = if value { ALWAYS_TRUE } else { ALWAYS_FALSE };
+        if self.is_terminal() {
+            return self == expected;
+        }
+        let root = storage.interior_node_data(self);
+        root.if_true == expected
+            && root.if_uncertain == ALWAYS_FALSE
+            && storage
+                .constraint_data(root.constraint)
+                .as_atomic()
+                .is_some_and(|atom| atom.is_intrinsically_true(db))
     }
 
     /// Returns whether this BDD is always satisfied, charging each visited node to `limits`.
@@ -6047,6 +6098,14 @@ mod tests {
         );
         let args = paramspec.with_paramspec_attr(db, ParamSpecAttrKind::Args);
         let kwargs = paramspec.with_paramspec_attr(db, ParamSpecAttrKind::Kwargs);
+        let captured_kwargs = paramspec.captured_keyword_arguments(db);
+        let keyword_parameters = paramspec.keyword_parameters(db);
+        assert_ne!(kwargs.identity(db), captured_kwargs.identity(db));
+        assert_ne!(
+            captured_kwargs.identity(db),
+            keyword_parameters.identity(db)
+        );
+        assert_ne!(kwargs.identity(db), keyword_parameters.identity(db));
         let builder = ConstraintSetBuilder::new();
         let string = KnownClass::Str.to_instance(db, &env);
         let free = create_typevar(db, "Free");
@@ -6057,8 +6116,26 @@ mod tests {
         )
         .and(db, &builder, || {
             ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, kwargs, keywords)
+        })
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                captured_kwargs,
+                keywords,
+            )
+        })
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                keyword_parameters,
+                keywords,
+            )
         });
-        // Reduction expands a base ParamSpec to both components, even if the result
+        // Reduction expands a base ParamSpec to all its components, even if the result
         // simplifies to a terminal. Inspect identity ownership on the unsimplified scope.
         let reduced = body.reduce_inferable(
             db,
@@ -6070,7 +6147,10 @@ mod tests {
         let scoped = quantify_constraint(
             db,
             body,
-            TypeVarSet::from_typevars(db, [paramspec, args, kwargs]),
+            TypeVarSet::from_typevars(
+                db,
+                [paramspec, args, kwargs, captured_kwargs, keyword_parameters],
+            ),
         );
         assert!(scoped.is_always_satisfied(db, &env));
         assert!(!scoped.is_never_satisfied(db, &env));
@@ -6100,13 +6180,31 @@ mod tests {
             .copied()
             .find(|variable| variable.paramspec_attr(db) == Some(ParamSpecAttrKind::Kwargs))
             .expect("quantifier must retain its keyword component");
+        let fresh_captured_kwargs = variables
+            .iter()
+            .copied()
+            .find(|variable| variable.is_captured_keyword_arguments(db))
+            .expect("quantifier must retain its captured keyword arguments");
+        let fresh_keyword_parameters = variables
+            .iter()
+            .copied()
+            .find(|variable| variable.is_keyword_parameters(db))
+            .expect("quantifier must retain its keyword parameter projection");
         assert_ne!(
-            fresh_args.without_paramspec_attr(db).identity(db),
+            fresh_args.paramspec_base(db).identity(db),
             paramspec.identity(db)
         );
         assert_eq!(
-            fresh_args.without_paramspec_attr(db).identity(db),
-            fresh_kwargs.without_paramspec_attr(db).identity(db)
+            fresh_args.paramspec_base(db).identity(db),
+            fresh_kwargs.paramspec_base(db).identity(db)
+        );
+        assert_eq!(
+            fresh_args.paramspec_base(db).identity(db),
+            fresh_captured_kwargs.paramspec_base(db).identity(db)
+        );
+        assert_eq!(
+            fresh_args.paramspec_base(db).identity(db),
+            fresh_keyword_parameters.paramspec_base(db).identity(db)
         );
         drop(storage);
         assert_eq!(

@@ -207,10 +207,10 @@ fn check_method_typevar_variance<'db>(
                         .iter()
                         .nth(parameter.source_parameter_index()?)?
                         .annotation()?;
-                    // `P.args` and `P.kwargs` both consume `P`, despite having distinct identities.
+                    // Parameter components consume their ParamSpec despite having distinct identities.
                     let parameter_type = match parameter.annotated_type() {
-                        Type::TypeVar(typevar) if typevar.paramspec_attr(db).is_some() => {
-                            Type::TypeVar(typevar.without_paramspec_attr(db))
+                        Type::TypeVar(typevar) if typevar.is_paramspec(db) => {
+                            Type::TypeVar(typevar.paramspec_base(db))
                         }
                         ty => ty,
                     };

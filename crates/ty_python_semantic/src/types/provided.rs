@@ -383,6 +383,15 @@ pub trait TypeExpressionContext<'db> {
         expression: &ast::Expr,
     ) -> (Type<'db>, TypeQualifiers);
 
+    /// Captures the keyword parameters of a previously inferred parameter specification.
+    ///
+    /// The application must be the direct annotation of a keyword-variadic parameter.
+    fn capture_keyword_parameters(
+        &mut self,
+        application: &ast::ExprSubscript,
+        parameter_specification: Type<'db>,
+    ) -> Option<Type<'db>>;
+
     /// Specializes a signature's result using the application's explicit type arguments.
     ///
     /// Type argument inference, defaults, and validation follow ordinary generic applications.

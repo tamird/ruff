@@ -29,6 +29,7 @@ use crate::types::infer::{
 use crate::types::signatures::{ConcatenateTail, Signature};
 use crate::types::special_form::{AliasSpec, LegacyStdlibAlias};
 use crate::types::tuple::{TupleSpec, TupleSpecBuilder, TupleType};
+use crate::types::typevar::TypeVarDomain;
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::place_table;
 use ty_python_core::scope::ScopeKind;
@@ -61,6 +62,45 @@ impl<'db> TypeExpressionContext<'db> for TypeInferenceBuilder<'db, '_> {
     ) -> (Type<'db>, TypeQualifiers) {
         let annotation = self.infer_annotation_expression(expression, self.deferred_state);
         (annotation.inner_type(), annotation.qualifiers())
+    }
+
+    fn capture_keyword_parameters(
+        &mut self,
+        application: &ast::ExprSubscript,
+        parameter_specification: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let db = self.db();
+        let flags = self.inference_flags();
+        let Type::TypeVar(parameter_specification) = parameter_specification
+            .in_type_expression(
+                db,
+                self.scope(),
+                self.typevar_binding_context,
+                flags | InferenceFlags::ALLOW_PARAMSPEC_TYPE_EXPR,
+            )
+            .ok()?
+        else {
+            return None;
+        };
+        if parameter_specification.domain(db) != TypeVarDomain::ParameterSignature {
+            return None;
+        }
+        if !flags.contains(InferenceFlags::IN_KWARG_ANNOTATION)
+            || flags.contains(InferenceFlags::IN_NESTED_TYPE_EXPRESSION)
+        {
+            self.report_invalid_type_form(
+                application.range(),
+                "Keyword parameters must annotate a keyword-variadic parameter directly",
+            );
+            return Some(Type::unknown());
+        }
+        self.store_type_expression_flags(
+            ast::ExprRef::from(application),
+            TypeExpressionFlags::KEYWORD_PARAM_SPEC,
+        );
+        Some(Type::TypeVar(
+            parameter_specification.captured_keyword_arguments(db),
+        ))
     }
 
     fn infer_specialized_return_type(

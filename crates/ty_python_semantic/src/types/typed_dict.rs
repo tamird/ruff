@@ -3474,7 +3474,7 @@ impl<'db> TypedDictFieldBuilder<'db> {
         self
     }
 
-    fn first_declaration(mut self, definition: Option<Definition<'db>>) -> Self {
+    pub(crate) fn first_declaration(mut self, definition: Option<Definition<'db>>) -> Self {
         self.first_declaration = definition;
         self
     }

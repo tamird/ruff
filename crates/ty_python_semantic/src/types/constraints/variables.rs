@@ -205,6 +205,28 @@ impl<'db> MappedAtomicConstraint<'db> {
             Self::Relation(relation) => storage.load(db, env, &relation),
         }
     }
+
+    /// Tests whether the root of a mapped atom proves the given value without traversing a
+    /// cached relation. A false result leaves the value unproved.
+    pub(super) fn proves_value_from_root(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        value: bool,
+    ) -> bool {
+        match self {
+            Self::Relation(relation) => relation.query(|builder, relation| {
+                relation
+                    .node
+                    .proves_value_from_root(db, &builder.storage.borrow(), value)
+            }),
+            mapped => {
+                let mut storage = ConstraintSetStorage::default();
+                let (node, _) = mapped.load(db, env, &mut storage);
+                node.proves_value_from_root(db, &storage, value)
+            }
+        }
+    }
 }
 
 impl<'db> From<AtomicConstraint<'db>> for Constraint<'db> {

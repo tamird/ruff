@@ -418,7 +418,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             &function.parameters,
             |parameter| {
                 self.parameter_annotation_type(parameter)
-                    .map(|(annotation, ty, _flags)| (ty, annotation.range()))
+                    .and_then(|(annotation, ty, flags)| {
+                        (!flags.contains(TypeExpressionFlags::KEYWORD_PARAM_SPEC))
+                            .then_some((ty, annotation.range()))
+                    })
             },
         );
         self.validate_unpacked_typed_dict_kwargs(&function.parameters);
@@ -1748,6 +1751,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     // `**kwargs: P.kwargs`
                     Some(ParamSpecAttrKind::Kwargs) => annotated_type,
+
+                    None if typevar.is_captured_keyword_arguments(db) => annotated_type,
 
                     // `**kwargs: P`
                     None => {

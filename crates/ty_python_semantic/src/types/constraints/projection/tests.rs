@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use itertools::Itertools;
 use ruff_db::files::system_path_to_file;
 use ruff_db::system::DbWithWritableSystem;
@@ -112,6 +114,79 @@ fn collect_paths<'db, 'c>(
             Ok(paths)
         },
     )
+}
+
+#[test]
+fn specialization_proof_preserves_original_graph() {
+    let db = setup_db();
+    let db = &db;
+    let env = db.program_environment();
+    let variable = create_typevar(db, "T");
+    let builder = ConstraintSetBuilder::new();
+    let integer = known_instance(db, KnownClass::Int);
+    let relation = exact(db, &builder, variable, integer);
+    let tautology =
+        ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, variable, Type::Never);
+    assert!(!tautology.node.is_terminal());
+    assert!(
+        tautology
+            .node
+            .proves_value_from_root(db, &builder.storage.borrow(), true)
+    );
+    assert!(
+        !relation
+            .node
+            .proves_value_from_root(db, &builder.storage.borrow(), true)
+    );
+    assert!(
+        !relation
+            .node
+            .proves_value_from_root(db, &builder.storage.borrow(), false)
+    );
+    let original_nodes = builder.storage.borrow().nodes.len();
+    let prove = |solution, remaining_visits| {
+        relation.prove_specialization(
+            db,
+            &env,
+            &[binding(variable, solution)],
+            &mut BoundedSolutionLimits {
+                remaining_paths: 0,
+                remaining_visits,
+            },
+            &mut ProjectionTypeBudget::new(64),
+        )
+    };
+    assert_eq!(
+        prove(integer, 0),
+        ControlFlow::Break(ProjectionError::TraversalBudgetExceeded)
+    );
+    assert_eq!(builder.storage.borrow().nodes.len(), original_nodes);
+    assert_eq!(prove(integer, 64), ControlFlow::Continue(true));
+    assert_eq!(
+        prove(known_instance(db, KnownClass::Str), 64),
+        ControlFlow::Continue(false)
+    );
+
+    let list = |element| KnownClass::List.to_specialized_instance(db, &env, &[element]);
+    let relation = exact(db, &builder, variable, list(integer));
+    let original_nodes = builder.storage.borrow().nodes.len();
+    assert_eq!(
+        relation.prove_specialization(
+            db,
+            &env,
+            &[binding(
+                variable,
+                list(Type::TypeVar(create_typevar(db, "U")))
+            )],
+            &mut BoundedSolutionLimits {
+                remaining_paths: 0,
+                remaining_visits: 64,
+            },
+            &mut ProjectionTypeBudget::new(64),
+        ),
+        ControlFlow::Continue(false)
+    );
+    assert_eq!(builder.storage.borrow().nodes.len(), original_nodes);
 }
 
 #[test]

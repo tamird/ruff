@@ -117,7 +117,7 @@ pub(crate) use crate::types::typevar::{
     TypeVarNonce,
 };
 pub use crate::types::typevar::{BoundTypeVarInstance, TypeVarKind};
-use crate::types::typevar::{TypeVarInstance, TypeVarSet};
+use crate::types::typevar::{TypeVarDomain, TypeVarInstance, TypeVarSet};
 pub use crate::types::variance::TypeVarVariance;
 use crate::types::variance::{VarianceInferable, VarianceTerm};
 pub use crate::types::visitor::any_over_type;
@@ -6707,7 +6707,7 @@ impl<'db> Type<'db> {
                 }
 
                 Type::TypeVar(typevar)
-                    if typevar.is_paramspec(db)
+                    if typevar.domain(db) == TypeVarDomain::ParameterSignature
                         && let Some(attr) = ParamSpecAttrKind::from_name(name_str) =>
                 {
                     Place::declared(Type::TypeVar(typevar.with_paramspec_attr(db, attr))).into()
@@ -7019,10 +7019,10 @@ impl<'db> Type<'db> {
         non_negative_int_literal(db, env, return_ty)
     }
 
-    /// If this type is a `ParamSpec` type variable, returns it. Otherwise, returns `None`.
-    fn as_paramspec_typevar(self, db: &'db dyn Db) -> Option<Type<'db>> {
+    /// Return this type if it represents a runtime keyword-argument dictionary.
+    fn as_paramspec_keyword_component(self, db: &'db dyn Db) -> Option<Type<'db>> {
         match self {
-            Type::TypeVar(tv) if tv.is_paramspec(db) => Some(self),
+            Type::TypeVar(tv) if tv.is_keyword_argument_component(db) => Some(self),
             _ => None,
         }
     }
@@ -10325,7 +10325,7 @@ impl<'db> Type<'db> {
                 {
                     // For `ParamSpec`, we're only interested in `P` itself, not `P.args` or
                     // `P.kwargs`.
-                    Some(bound_typevar.without_paramspec_attr(db))
+                    Some(bound_typevar.paramspec_base(db))
                 }
                 _ => None,
             }

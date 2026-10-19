@@ -1836,8 +1836,8 @@ impl<'db> BoundTypeVarIdentity<'db> {
             {
                 write!(f, "@{binding_context_name}")?;
             }
-            if let Some(paramspec_attr) = self.paramspec_attr {
-                write!(f, ".{paramspec_attr}")?;
+            if let Some(projection) = self.paramspec_projection {
+                write!(f, "{projection}")?;
             }
             Ok(())
         })

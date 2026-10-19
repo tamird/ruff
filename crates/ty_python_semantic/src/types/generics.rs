@@ -532,7 +532,7 @@ impl<'db> GenericContext<'db> {
         bound_typevar: BoundTypeVarIdentity<'db>,
     ) -> bool {
         let bound_typevar = if bound_typevar.is_paramspec(db) {
-            bound_typevar.without_paramspec_attr(db)
+            bound_typevar.paramspec_base(db)
         } else {
             bound_typevar
         };
@@ -787,7 +787,7 @@ impl<'db> GenericContext<'db> {
                 bound_typevar: BoundTypeVarInstance<'db>,
             ) {
                 let bound_typevar = if bound_typevar.is_paramspec(db) {
-                    bound_typevar.without_paramspec_attr(db)
+                    bound_typevar.paramspec_base(db)
                 } else {
                     bound_typevar
                 };
@@ -2728,6 +2728,8 @@ pub(crate) enum TypeVarInferenceFallback {
     Variadic,
     Unsatisfiable,
     BudgetExceeded,
+    /// A complete parameter signature could not be verified from keyword-only evidence.
+    UnverifiedKeywordProjection,
 }
 
 /// An owned projection before allocating a cached inference result. Correlated callers retain
@@ -3040,7 +3042,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     ) -> Result<TypeVarInference<'db>, Vec<SpecializationError<'db>>> {
         let db = self.db;
         let mut specialization_errors = Vec::new();
-        let inference = self.solve_pending_projection(choose, |builder, choose| {
+        let mut inference = self.solve_pending_projection(choose, |builder, choose| {
             let solutions = builder.pending.solutions_with(
                 db,
                 builder.env,
@@ -3106,6 +3108,24 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             })
         })
         .map_err(|()| specialization_errors)?;
+
+        if matches!(
+            &inference.solutions,
+            Err(TypeVarInferenceFallback::Variadic)
+        ) && self
+            .generic_context
+            .variables(db)
+            .any(|variable| variable.is_paramspec(db))
+        {
+            match self.infer_keyword_components(&mut inference.merged_types, budget) {
+                Ok(true) => {}
+                Ok(false) => return Err(Vec::new()),
+                Err(_) => {
+                    inference.solutions =
+                        Err(TypeVarInferenceFallback::UnverifiedKeywordProjection);
+                }
+            }
+        }
 
         Ok(self.finish_inference(inference, budget))
     }
@@ -3203,6 +3223,111 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         }
 
         Ok(inference)
+    }
+
+    /// Infers complete signatures from keyword-only evidence. `false` proves the call
+    /// constraints unsatisfiable; an error leaves their satisfiability unknown.
+    fn infer_keyword_components(
+        &self,
+        types: &mut FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
+        budget: SolutionBudget,
+    ) -> Result<bool, ProjectionError> {
+        let db = self.db;
+        let components = self.pending.referenced_typevars(db, |variable| {
+            if !variable.is_keyword_parameters(db) {
+                return false;
+            }
+            let base = variable.paramspec_base(db);
+            base.is_inferable(db, self.inferable) && !types.contains_key(&base.identity(db))
+        });
+        if components == TypeVarSet::None {
+            return Ok(true);
+        }
+        let bases: Vec<_> = components
+            .iter(db)
+            .map(|component| (component, component.paramspec_base(db)))
+            .collect();
+        let fixed: Vec<_> = self
+            .generic_context
+            .variables(db)
+            .filter_map(|bound_typevar| {
+                types
+                    .get(&bound_typevar.identity(db))
+                    .map(|solution| TypeVarSolution {
+                        bound_typevar,
+                        solution: *solution,
+                    })
+            })
+            .collect();
+        let remaining = TypeVarSet::from_typevars(
+            db,
+            self.inferable.iter(db).filter(|variable| {
+                !types.contains_key(&variable.identity(db))
+                    && !bases
+                        .iter()
+                        .any(|(_, base)| base.is_same_typevar_as(db, *variable))
+            }),
+        );
+        let candidate_variables =
+            TypeVarSet::from_typevars(db, components.iter(db).chain(remaining.iter(db)));
+        // The top signature admits no calls. It can represent the intersection of unrelated
+        // keyword signatures, but it still needs to satisfy the complete call relation.
+        let fallback = fixed
+            .iter()
+            .copied()
+            .chain(bases.iter().map(|(_, base)| TypeVarSolution {
+                bound_typevar: *base,
+                solution: base.domain(db).top(db),
+            }))
+            .collect();
+        // A keyword projection cannot determine positional behavior. Propose complete
+        // signatures and verify them against the original joint call constraints.
+        let Some(bindings) = self.pending.find_verified_specialization(
+            db,
+            self.env,
+            candidate_variables,
+            budget,
+            |solved, type_budget| {
+                let mut bindings = fixed.clone();
+                bindings.extend(
+                    solved
+                        .iter()
+                        .copied()
+                        .filter(|binding| binding.bound_typevar.is_inferable(db, remaining)),
+                );
+                for (component, base) in &bases {
+                    let Some(binding) = solved
+                        .iter()
+                        .find(|binding| binding.bound_typevar.is_same_typevar_as(db, *component))
+                    else {
+                        return Ok(None);
+                    };
+                    if let Type::TypedDict(schema) = binding.solution {
+                        type_budget.charge_items(schema.items(db).len())?;
+                    }
+                    let Some(solution) =
+                        Parameters::keyword_projection_witness(db, binding.solution)
+                    else {
+                        return Ok(None);
+                    };
+                    bindings.push(TypeVarSolution {
+                        bound_typevar: *base,
+                        solution,
+                    });
+                }
+                Ok(Some(bindings))
+            },
+            fallback,
+        )?
+        else {
+            return Ok(false);
+        };
+        types.extend(
+            bindings
+                .into_iter()
+                .map(|binding| (binding.bound_typevar.identity(db), binding.solution)),
+        );
+        Ok(true)
     }
 
     fn finish_inference(
@@ -5334,6 +5459,74 @@ mod tests {
             );
             assert_eq!(inference.merged_types(db), [Some(Type::unknown())]);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn keyword_projection_exhaustion_is_not_a_verified_signature() -> anyhow::Result<()> {
+        use crate::types::signatures::Parameter;
+        use crate::types::typevar::{KeywordProjection, TypeVarNonce};
+
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let identity = TypeVarIdentity::new(
+            db,
+            Name::new_static("P"),
+            None,
+            TypeVarKind::Pep695ParamSpec,
+        );
+        let variable = BoundTypeVarInstance::new(
+            db,
+            TypeVarInstance::new(db, identity, None, Some(TypeVarVariance::Invariant), None),
+            BindingContext::Synthetic(env.program(db)),
+            None,
+            TypeVarNonce::NONE,
+        );
+        let signature = Type::paramspec_value_callable(
+            db,
+            Parameters::standard([Parameter::keyword_only(Name::new_static("key"))
+                .with_annotated_type(KnownClass::Int.to_instance(db, &env))]),
+        );
+        let shape = signature
+            .keyword_projection(db, &env, KeywordProjection::Parameters)
+            .unwrap();
+        let context = GenericContext::from_typevar_instances(db, &env, [variable]);
+        let constraints = ConstraintSetBuilder::new();
+        let mut builder = SpecializationBuilder::new(db, &env, &constraints, context);
+        builder.record_constraint_set(ConstraintSet::constrain_typevar_upper_bound(
+            db,
+            &env,
+            &constraints,
+            variable.keyword_parameters(db),
+            shape,
+        ));
+        let exhausted = builder
+            .solve_pending_with(
+                SolutionBudget {
+                    visits: 0,
+                    ..SolutionBudget::default()
+                },
+                &mut |_, _| None,
+            )
+            .map_err(|_| anyhow::anyhow!("exhaustion must retain an incomplete inference"))?;
+        assert_eq!(
+            exhausted.solutions(db),
+            &TypeVarInferenceSolutions::Unavailable(
+                TypeVarInferenceFallback::UnverifiedKeywordProjection
+            )
+        );
+        let inferred = builder
+            .build_inference_with(|_, _| None)
+            .map_err(|_| anyhow::anyhow!("expected a verified keyword signature"))?;
+        assert_eq!(
+            inferred.merged_types(db)[0].and_then(|ty| ty.keyword_projection(
+                db,
+                &env,
+                KeywordProjection::Parameters
+            )),
+            Some(shape),
+        );
         Ok(())
     }
 

@@ -12,7 +12,6 @@ use crate::types::set_theoretic::UnionBuilder;
 use crate::types::typed_dict::{
     UnpackedTypedDict, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
 };
-use crate::types::typevar::ParamSpecAttrKind;
 use crate::types::{
     BoundTypeVarInstance, KnownClass, MemberLookupPolicy, ProgramEnvironment, Truthiness, Type,
     UnionType,
@@ -337,11 +336,22 @@ impl<'db> ParamSpecKeywords<'db> {
         let Type::TypeVar(component) = ty else {
             return None;
         };
-        (component.paramspec_attr(db) == Some(ParamSpecAttrKind::Kwargs)).then_some(Self(component))
+        component.is_keyword_argument_component(db).then_some(Self(component))
     }
 }
 
 impl<'db> DictionaryExtraItems<'db> {
+    pub(super) fn keyword_paramspec(self, db: &'db dyn Db) -> Option<BoundTypeVarInstance<'db>> {
+        match self {
+            Self::ParamSpec(ParamSpecKeywords(component))
+                if component.is_captured_keyword_arguments(db) =>
+            {
+                Some(component.paramspec_base(db))
+            }
+            _ => None,
+        }
+    }
+
     /// The type of one additional mapping value.
     pub fn value_type(self) -> Option<Type<'db>> {
         match self {

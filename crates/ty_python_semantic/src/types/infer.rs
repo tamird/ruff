@@ -179,6 +179,10 @@ bitflags::bitflags! {
 
         /// The expression refers to a `TypeVarTuple` without unpacking it.
         const INVALID_BARE_TYPE_VAR_TUPLE = 1 << 2;
+
+        /// An application-defined `**kwargs` annotation captures only a parameter
+        /// specification's keyword arguments.
+        const KEYWORD_PARAM_SPEC = 1 << 3;
     }
 }
 

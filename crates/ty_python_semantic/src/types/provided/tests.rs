@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use anyhow::Context;
 use ruff_db::diagnostic::{Annotation, DiagnosticId, Severity, Span};
-use ruff_db::files::system_path_to_file;
+use ruff_db::files::{File, system_path_to_file};
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_db::system::DbWithWritableSystem as _;
@@ -794,6 +794,399 @@ def scoped() -> None:
             .expect_type();
         assert!(callable.single_callable_signature(&db, &env).is_none());
     }
+    Ok(())
+}
+
+fn keyword_capture_db(source: &str) -> anyhow::Result<TestDb> {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the type application hook requires this signature"
+    )]
+    fn application<'db>(
+        db: &'db TestDb,
+        application: ProvidedTypeApplication<'_, 'db>,
+        context: &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<Type<'db>> {
+        let Type::ClassLiteral(ClassLiteral::Static(class)) = application.value_type else {
+            return None;
+        };
+        if class.name(db) != "Keywords" {
+            return None;
+        }
+        let value = context.infer_value_expression(&application.expression.slice);
+        context.capture_keyword_parameters(application.expression, value)
+    }
+
+    TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_type_application_provider(application)
+        .with_file("/src/main.py", source)
+        .build()
+}
+
+fn assert_keyword_diagnostics(db: &TestDb, file: File, expected: &[(&str, &str)]) {
+    let diagnostics = db.check_file(file);
+    let source = source_text(db, file);
+    let actual: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let span = diagnostic
+                .primary_span()
+                .and_then(|span| span.range())
+                .expect("diagnostic has a source range");
+            (diagnostic.id().as_str(), &source[span])
+        })
+        .collect();
+    assert_eq!(actual, expected, "{diagnostics:#?}");
+}
+
+#[test]
+fn supplied_keyword_parameters_preserve_callback_contracts() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+
+def invoke[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    copied = dict(kwargs)
+    callback(generated="made", **copied)
+
+def wrong_body[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated=1, **kwargs)
+
+def missing_body[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(**kwargs)
+
+def cleared_body[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    kwargs.clear()
+    callback(generated="made", **kwargs)
+
+def omitted_body[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated="made")
+
+def empty_body[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **{})
+
+def target(*, generated: str, required: int, optional: bool = False) -> None: ...
+def generated_only(*, generated: str) -> None: ...
+class Handler[T]:
+    def target(self, *, generated: str, required: T) -> None: ...
+handler = Handler[int]()
+invoke(target, required=1)
+invoke(target, required="wrong")
+invoke(target)
+invoke(target, required=1, generated="overridden")
+invoke(generated_only)
+invoke(handler.target, required=1)
+invoke(handler.target, required="wrong")
+
+def consume[**P](callback: Injected[P], *, consumed: int, **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **kwargs)
+def requires_consumed(*, generated: str, consumed: int) -> None: ...
+def optional_consumed(*, generated: str, consumed: int = 0) -> None: ...
+consume(requires_consumed, consumed=1)
+consume(optional_consumed, consumed=1)
+consume(target, consumed=1, required=1)
+"#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-argument-type",
+            "missing-argument",
+            "missing-argument",
+            "missing-argument",
+            "missing-argument",
+            "invalid-argument-type",
+            "missing-argument",
+            "unknown-argument",
+            "invalid-argument-type",
+            "missing-argument",
+        ],
+        "{diagnostics:#?}",
+    );
+    let collision = diagnostics
+        .last()
+        .and_then(|diagnostic| diagnostic.primary_span())
+        .and_then(|span| span.range())
+        .context("the required collision must have a source range")?;
+    assert_eq!(
+        &source_text(&db, file)[collision],
+        "consume(requires_consumed, consumed=1)"
+    );
+    let env = db.program_environment();
+    let program_file = ProgramFile::new(&db, file, env.program(&db));
+    let parsed = parsed_module(&db, program_file.python_file(&db)).load(&db);
+    let call = parsed
+        .suite()
+        .iter()
+        .find_map(|statement| statement.as_expr_stmt()?.value.as_call_expr())
+        .context("expected the successful invocation")?;
+    let model = SemanticModel::new(&db, program_file);
+    let inputs = crate::types::ide_support::call_input_types(&model, call)
+        .expect("the checked call has complete inputs");
+    assert_eq!(
+        inputs[1][0].parameter_type,
+        KnownClass::Int.to_instance(&db, &env)
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_keyword_parameters_preserve_symbolic_callback_contracts() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, enabled: bool, **kwargs: Keywords[P]) -> None: ...
+class Flexible[**P](Protocol):
+    def __call__(self, enabled: bool, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+class Wrong[**P](Protocol):
+    def __call__(self, *, generated: int, enabled: bool, **kwargs: Keywords[P]) -> None: ...
+def passthrough[**P](callback: Injected[P]) -> Injected[P]:
+    return callback
+def relay[**Q](callback: Injected[Q]) -> Injected[Q]:
+    return passthrough(callback)
+def flexible[**Q](callback: Flexible[Q]) -> Injected[Q]:
+    return passthrough(callback)
+def wrong[**Q](callback: Wrong[Q]) -> None:
+    passthrough(callback)
+def shared[**P](left: Injected[P], right: Injected[P]) -> Injected[P]:
+    return right
+def different_rows[**Q, **R](left: Injected[Q], right: Injected[R]) -> Injected[Q]:
+    return shared(left, right)
+"#,
+    )?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    assert_keyword_diagnostics(
+        &db,
+        file.file(&db),
+        &[
+            ("invalid-argument-type", "callback"),
+            ("invalid-return-type", "shared(left, right)"),
+        ],
+    );
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let model = SemanticModel::new(&db, file);
+    for name in ["relay", "flexible"] {
+        let function = module
+            .suite()
+            .iter()
+            .filter_map(ast::Stmt::as_function_def_stmt)
+            .find(|function| function.name.as_str() == name)
+            .unwrap();
+        let result = function
+            .body
+            .last()
+            .unwrap()
+            .as_return_stmt()
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap();
+        let declared = crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type()
+            .expect_function_literal()
+            .last_definition_signature(&db)
+            .return_type();
+        assert_eq!(result.inferred_type(&model), Some(declared), "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn keyword_projection_does_not_constrain_positional_parameters() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Callable, Concatenate, Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+def choose[**P](callback: Injected[P], full: Callable[P, int]) -> Callable[P, int]:
+    return full
+def relay[**Q](callback: Injected[Q], full: Callable[Concatenate[int, Q], int]) -> Callable[Concatenate[int, Q], int]:
+    return choose(callback, full)
+def callback(*, generated: str, key: str) -> None: ...
+def full(x: int, /, *, key: str) -> int: return x
+result = choose(callback, full)
+result(1, key="ok")
+result("wrong", key="ok")
+def incompatible_full(x: int, /, *, key: int) -> int: return x
+choose(callback, incompatible_full)
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[
+            ("invalid-argument-type", "\"wrong\""),
+            ("invalid-argument-type", "callback"),
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn callback_keyword_projection_combines_argument_evidence() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+def both[**P](first: Injected[P], second: Injected[P], **kwargs: Keywords[P]) -> None:
+    first(generated="first", **kwargs)
+    second(generated="second", **kwargs)
+def accepts_object(*, generated: str, key: object) -> None: ...
+def accepts_str(*, generated: str, key: str) -> None: ...
+both(accepts_object, accepts_str, key="ok")
+both(accepts_str, accepts_object, key="ok")
+both(accepts_object, accepts_str, key=42)
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[("invalid-argument-type", "key=42")],
+    );
+    Ok(())
+}
+
+#[test]
+fn callback_keyword_projection_rejects_unpromised_keywords() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+def invoke[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **kwargs)
+def relay[**Q](callback: Injected[Q], **kwargs: Keywords[Q]) -> None:
+    invoke(callback, unexpected=42, **kwargs)
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[("invalid-argument-type", "unexpected=42")],
+    );
+    Ok(())
+}
+
+#[test]
+fn callback_keyword_projection_preserves_only_keyword_calls() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Named[**P](Protocol):
+    def __call__(self, *, name: str, **kwargs: Keywords[P]) -> None: ...
+def wrap[**P](callback: Named[P]) -> Named[P]:
+    def wrapped(*, name: str, **kwargs: Keywords[P]) -> None:
+        callback(name=name, **kwargs)
+    return wrapped
+def legacy(name: str, *, flag: bool = False) -> None: ...
+wrapped = wrap(legacy)
+wrapped(name="ok", flag=True)
+wrapped("not keyword-only", name="ok", flag=True)
+wrapped(name="ok", flag="not bool")
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[
+            ("too-many-positional-arguments", "\"not keyword-only\""),
+            ("invalid-argument-type", "flag=\"not bool\""),
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_kwargs_do_not_supply_all_keyword_parameters() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+def broken[**P](callback: Injected[P], *args: P.args, **kwargs: P.kwargs) -> None:
+    callback(generated="made", **kwargs)
+def complete[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **kwargs)
+def mixed[**P](*args: P.args, **kwargs: Keywords[P]) -> None: ...
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[
+            ("invalid-argument-type", "**kwargs"),
+            ("invalid-paramspec", "**kwargs: Keywords[P]"),
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn keyword_components_have_runtime_dictionary_behavior() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Callback[**P](Protocol):
+    def __call__(self, **kwargs: Keywords[P]) -> None: ...
+def accept_strings(*values: str) -> None: ...
+def accept_integers(*values: int) -> None: ...
+def captured[**P](**keywords: Keywords[P]) -> None:
+    keywords.args
+    keywords.kwargs
+    keywords.items()
+    accept_strings(*keywords)
+    accept_integers(*keywords)
+def python[**P](*args: P.args, **kwargs: P.kwargs) -> None:
+    kwargs.args
+    accept_strings(*kwargs)
+    accept_integers(*kwargs)
+def wrap[**P](callback: Callback[P]) -> Callback[P]:
+    return lambda **kwargs: callback(**kwargs)
+"#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    assert_keyword_diagnostics(
+        &db,
+        file,
+        &[
+            ("unresolved-attribute", "keywords.args"),
+            ("unresolved-attribute", "keywords.kwargs"),
+            ("invalid-argument-type", "*keywords"),
+            ("unresolved-attribute", "kwargs.args"),
+            ("invalid-argument-type", "*kwargs"),
+        ],
+    );
+    let program = db.program_file(file);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let ast::Stmt::FunctionDef(wrap) = module.suite().last().unwrap() else {
+        panic!("expected the wrapper function");
+    };
+    let [ast::Stmt::Return(returned)] = wrap.body.as_slice() else {
+        panic!("expected the returned callback");
+    };
+    let Some(ast::Expr::Lambda(lambda)) = returned.value.as_deref() else {
+        panic!("expected a contextual lambda");
+    };
+    let ast::Expr::Call(call) = lambda.body.as_ref() else {
+        panic!("expected callback forwarding");
+    };
+    let model = SemanticModel::new(&db, program);
+    let inferred = call.arguments.keywords[0].value.inferred_type(&model);
+    assert!(
+        matches!(inferred, Some(Type::TypeVar(variable)) if variable.is_captured_keyword_arguments(&db)),
+        "{inferred:?}",
+    );
     Ok(())
 }
 

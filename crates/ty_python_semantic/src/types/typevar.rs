@@ -1070,7 +1070,7 @@ impl<'db> BoundTypeVarInstance<'db> {
         let identity = BoundTypeVarIdentity {
             identity: typevar.identity(db),
             binding_context,
-            paramspec_attr,
+            paramspec_projection: paramspec_attr.map(ParamSpecProjection::Attribute),
             freshness,
             canonical_domain: typevar.is_self(db).then(|| {
                 Self::canonical_domain_key(db, typevar, typevar._bound_or_constraints(db))
@@ -1084,7 +1084,10 @@ impl<'db> BoundTypeVarInstance<'db> {
     }
 
     pub(super) fn paramspec_attr(self, db: &'db dyn Db) -> Option<ParamSpecAttrKind> {
-        self.identity(db).paramspec_attr
+        match self.identity(db).paramspec_projection {
+            Some(ParamSpecProjection::Attribute(attr)) => Some(attr),
+            Some(ParamSpecProjection::Keyword(_)) | None => None,
+        }
     }
 
     pub(super) fn freshness(self, db: &'db dyn Db) -> TypeVarNonce {
@@ -1108,7 +1111,7 @@ impl<'db> BoundTypeVarInstance<'db> {
 
     /// Get the identity of this bound typevar occurrence.
     ///
-    /// This includes the source-level typevar, binding context, `ParamSpec` attribute, freshness
+    /// This includes the source-level typevar, binding context, `ParamSpec` projection, freshness
     /// nonce, and any specialized domain. Materialized views of the same occurrence retain the
     /// same identity.
     pub(crate) fn identity(self, db: &'db dyn Db) -> BoundTypeVarIdentity<'db> {
@@ -1126,7 +1129,7 @@ impl<'db> BoundTypeVarInstance<'db> {
     pub(crate) fn domain(self, db: &'db dyn Db) -> TypeVarDomain {
         let identity = self.identity(db);
         let kind = identity.kind(db);
-        if kind.is_paramspec() && identity.paramspec_attr.is_none() {
+        if kind.is_paramspec() && identity.paramspec_projection.is_none() {
             TypeVarDomain::ParameterSignature
         } else if kind.is_typevartuple() {
             TypeVarDomain::TypeTuple
@@ -1164,6 +1167,50 @@ impl<'db> BoundTypeVarInstance<'db> {
     /// It's the caller's responsibility to ensure that this method is only called on a `ParamSpec`
     /// type variable.
     pub(crate) fn with_paramspec_attr(self, db: &'db dyn Db, kind: ParamSpecAttrKind) -> Self {
+        self.with_paramspec_projection(db, ParamSpecProjection::Attribute(kind))
+    }
+
+    /// The accepted keyword parameters of a callable parameter specification. This is not
+    /// `P.kwargs`: that runtime dictionary can omit a parameter supplied positionally.
+    pub(crate) fn keyword_parameters(self, db: &'db dyn Db) -> Self {
+        self.with_keyword_projection(db, KeywordProjection::Parameters)
+    }
+
+    pub(crate) fn is_keyword_parameters(self, db: &'db dyn Db) -> bool {
+        self.keyword_projection(db) == Some(KeywordProjection::Parameters)
+    }
+
+    /// The dictionary received by a function that captures an entire keyword-call surface.
+    pub(crate) fn captured_keyword_arguments(self, db: &'db dyn Db) -> Self {
+        self.with_keyword_projection(db, KeywordProjection::Arguments)
+    }
+
+    pub(crate) fn is_captured_keyword_arguments(self, db: &'db dyn Db) -> bool {
+        self.keyword_projection(db) == Some(KeywordProjection::Arguments)
+    }
+
+    /// A parameter-specification component representing a runtime keyword dictionary.
+    pub(super) fn is_keyword_argument_component(self, db: &'db dyn Db) -> bool {
+        self.paramspec_attr(db) == Some(ParamSpecAttrKind::Kwargs)
+            || self.is_captured_keyword_arguments(db)
+    }
+
+    pub(super) fn with_keyword_projection(
+        self,
+        db: &'db dyn Db,
+        projection: KeywordProjection,
+    ) -> Self {
+        self.with_paramspec_projection(db, ParamSpecProjection::Keyword(projection))
+    }
+
+    pub(super) fn keyword_projection(self, db: &'db dyn Db) -> Option<KeywordProjection> {
+        match self.identity(db).paramspec_projection {
+            Some(ParamSpecProjection::Keyword(projection)) => Some(projection),
+            _ => None,
+        }
+    }
+
+    fn with_paramspec_projection(self, db: &'db dyn Db, projection: ParamSpecProjection) -> Self {
         debug_assert!(
             self.is_paramspec(db),
             "Expected a ParamSpec, got {:?}",
@@ -1171,15 +1218,24 @@ impl<'db> BoundTypeVarInstance<'db> {
         );
 
         let env = ProgramEnvironment::from_program(self.binding_context(db).program(db));
-        let upper_bound = TypeVarBoundOrConstraints::UpperBound(match kind {
-            ParamSpecAttrKind::Args => Type::homogeneous_tuple(db, &env, Type::object()),
-            ParamSpecAttrKind::Kwargs => KnownClass::Dict
+        let upper_bound = TypeVarBoundOrConstraints::UpperBound(match projection {
+            ParamSpecProjection::Attribute(ParamSpecAttrKind::Args) => {
+                Type::homogeneous_tuple(db, &env, Type::object())
+            }
+            ParamSpecProjection::Attribute(ParamSpecAttrKind::Kwargs)
+            | ParamSpecProjection::Keyword(KeywordProjection::Arguments) => KnownClass::Dict
                 .to_specialized_instance(
                     db,
                     &env,
                     &[KnownClass::Str.to_instance(db, &env), Type::any()],
                 )
                 .top_materialization(db, &env),
+            ParamSpecProjection::Keyword(KeywordProjection::Parameters) => KnownClass::Mapping
+                .to_specialized_instance(
+                    db,
+                    &env,
+                    &[KnownClass::Str.to_instance(db, &env), Type::object()],
+                ),
         });
 
         let typevar = self.typevar(db);
@@ -1188,22 +1244,21 @@ impl<'db> BoundTypeVarInstance<'db> {
             typevar.identity(db),
             Some(TypeVarBoundOrConstraintsEvaluation::Eager(upper_bound)),
             typevar.explicit_variance(db),
-            None, // `P.args` and `P.kwargs` cannot have defaults even though `P` can
+            None, // ParamSpec projections have no defaults of their own.
         );
 
         let mut identity = self.identity(db);
-        identity.paramspec_attr = Some(kind);
+        identity.paramspec_projection = Some(projection);
         Self::new_internal(db, typevar, typevar, identity)
     }
 
-    /// Returns a new bound typevar instance without any `ParamSpec` attribute set.
+    /// Returns the parameter specification underlying this occurrence.
     ///
-    /// This method will also remove any upper bound that was set by `with_paramspec_attr`. This
-    /// means that the returned typevar will have no upper bound or constraints.
+    /// This removes the projection's upper bound.
     ///
     /// It's the caller's responsibility to ensure that this method is only called on a `ParamSpec`
     /// type variable.
-    pub(crate) fn without_paramspec_attr(self, db: &'db dyn Db) -> Self {
+    pub(crate) fn paramspec_base(self, db: &'db dyn Db) -> Self {
         debug_assert!(
             self.is_paramspec(db),
             "Expected a ParamSpec, got {:?}",
@@ -1214,16 +1269,11 @@ impl<'db> BoundTypeVarInstance<'db> {
         let typevar = TypeVarInstance::new(
             db,
             typevar.identity(db),
-            None, // Remove the upper bound set by `with_paramspec_attr`
+            None,
             typevar.explicit_variance(db),
             None, // `P.args` and `P.kwargs` cannot have defaults even though `P` can
         );
-        Self::new_internal(
-            db,
-            typevar,
-            typevar,
-            self.identity(db).without_paramspec_attr(db),
-        )
+        Self::new_internal(db, typevar, typevar, self.identity(db).paramspec_base(db))
     }
 
     /// Returns whether two bound typevars represent the same occurrence, regardless of e.g.
@@ -1424,24 +1474,29 @@ impl<'db> BoundTypeVarInstance<'db> {
     ) -> Type<'db> {
         let mapped_specialization_type =
             |specialization: &ApplySpecialization<'a, 'db>| -> Option<Type<'db>> {
-                if self.paramspec_attr(db).is_some()
+                if self.identity(db).paramspec_projection.is_some()
                     && let Some(ty) = specialization.get(db, self)
                 {
                     return Some(ty);
                 }
                 let typevar = if self.is_paramspec(db) {
-                    self.without_paramspec_attr(db)
+                    self.paramspec_base(db)
                 } else {
                     self
                 };
-                specialization.get(db, typevar).map(|ty| {
-                    if let Some(attr) = self.paramspec_attr(db)
+                specialization.get(db, typevar).and_then(|ty| {
+                    if let Some(projection) = self.keyword_projection(db) {
+                        return ty.keyword_projection(db, visitor.env, projection);
+                    }
+                    if let Some(projection) = self.identity(db).paramspec_projection
                         && let Type::TypeVar(typevar) = ty
                         && typevar.is_paramspec(db)
                     {
-                        return Type::TypeVar(typevar.with_paramspec_attr(db, attr));
+                        return Some(Type::TypeVar(
+                            typevar.with_paramspec_projection(db, projection),
+                        ));
                     }
-                    ty
+                    Some(ty)
                 })
             };
 
@@ -1921,6 +1976,28 @@ pub(crate) enum ParamSpecAttrKind {
     Kwargs,
 }
 
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, get_size2::GetSize)]
+pub(super) enum ParamSpecProjection {
+    Attribute(ParamSpecAttrKind),
+    Keyword(KeywordProjection),
+}
+
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, get_size2::GetSize)]
+pub(super) enum KeywordProjection {
+    Arguments,
+    Parameters,
+}
+
+impl std::fmt::Display for ParamSpecProjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Attribute(attribute) => write!(f, ".{attribute}"),
+            Self::Keyword(KeywordProjection::Arguments) => f.write_str("[captured keywords]"),
+            Self::Keyword(KeywordProjection::Parameters) => f.write_str("[keyword parameters]"),
+        }
+    }
+}
+
 impl ParamSpecAttrKind {
     /// Returns the component represented by a `ParamSpec` attribute name.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
@@ -1953,9 +2030,7 @@ impl std::fmt::Display for ParamSpecAttrKind {
 pub struct BoundTypeVarIdentity<'db> {
     pub(crate) identity: TypeVarIdentity<'db>,
     pub(crate) binding_context: BindingContext<'db>,
-    /// If [`Some`], this indicates that this type variable is the `args` or `kwargs` component
-    /// of a `ParamSpec` i.e., `P.args` or `P.kwargs`.
-    pub(super) paramspec_attr: Option<ParamSpecAttrKind>,
+    pub(super) paramspec_projection: Option<ParamSpecProjection>,
     /// The freshness nonce for this bound typevar occurrence; `0` is the source-level occurrence.
     freshness: TypeVarNonce,
     /// The specialized domain before identity-preserving transformations such as materialization
@@ -1972,14 +2047,14 @@ impl<'db> BoundTypeVarIdentity<'db> {
         self.kind(db).is_paramspec()
     }
 
-    pub(crate) fn without_paramspec_attr(mut self, db: &'db dyn Db) -> Self {
+    pub(crate) fn paramspec_base(mut self, db: &'db dyn Db) -> Self {
         debug_assert!(
             self.is_paramspec(db),
             "Expected a ParamSpec, got {:?}",
             self.kind(db)
         );
 
-        self.paramspec_attr = None;
+        self.paramspec_projection = None;
         self
     }
 }
@@ -3297,13 +3372,13 @@ mod tests {
         let paramspec_only = TypeVarSet::from_typevars(db, [paramspec]);
         assert!(
             args.identity(db)
-                .without_paramspec_attr(db)
+                .paramspec_base(db)
                 .is_inferable(db, paramspec_only)
         );
         assert!(
             kwargs
                 .identity(db)
-                .without_paramspec_attr(db)
+                .paramspec_base(db)
                 .is_inferable(db, paramspec_only)
         );
     }

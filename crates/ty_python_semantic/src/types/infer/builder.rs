@@ -9725,7 +9725,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         {
             let mapping_type = self.expression_type(&keyword.value);
 
-            if mapping_type.as_paramspec_typevar(self.db()).is_some()
+            if mapping_type.as_paramspec_keyword_component(self.db()).is_some()
                 || mapping_type.unpack_keys_and_items(db, env).is_some()
             {
                 continue;

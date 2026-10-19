@@ -57,7 +57,8 @@ use crate::types::function::{
 };
 use crate::types::generics::{
     GenericContext, Specialization, SpecializationBuilder, SpecializationError, TypeVarInference,
-    TypeVarProjection, walk_specialization_types,
+    TypeVarInferenceFallback, TypeVarInferenceSolutions, TypeVarProjection,
+    walk_specialization_types,
 };
 use crate::types::infer::original_class_type;
 use crate::types::known_instance::{
@@ -73,7 +74,9 @@ use crate::types::typed_dict::{
     TypedDictOpenness, UnpackedTypedDict, UnpackedTypedDictKey,
     extract_unpacked_typed_dict_from_value_type,
 };
-use crate::types::typevar::{BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVarSet};
+use crate::types::typevar::{
+    BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarDomain, TypeVarNonceGenerator, TypeVarSet,
+};
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
     TypeCollector, TypeKind, TypeVisitor, any_over_type, walk_non_atomic_type,
@@ -259,7 +262,7 @@ fn normalize_constraint_bound<'db>(
     bound: Type<'db>,
 ) -> Option<Type<'db>> {
     let bound = bound.project_type_form(db, env);
-    if !typevar.is_paramspec(db) || typevar.paramspec_attr(db).is_some() {
+    if typevar.domain(db) != TypeVarDomain::ParameterSignature {
         return Some(bound);
     }
     match bound.resolve_type_alias(db) {
@@ -271,7 +274,7 @@ fn normalize_constraint_bound<'db>(
             Some(Type::TypeVar(paramspec))
         }
         Type::Callable(callable) => Some(Type::Callable(callable.into_paramspec_value(db))),
-        Type::TypeVar(bound) if bound.is_paramspec(db) && bound.paramspec_attr(db).is_none() => {
+        Type::TypeVar(bound) if bound.domain(db) == TypeVarDomain::ParameterSignature => {
             Some(Type::TypeVar(bound))
         }
         _ => None,
@@ -1066,6 +1069,7 @@ impl<'db> Bindings<'db> {
                     if signature.parameters().is_gradual()
                         || signature.parameters().is_incomplete()
                         || signature.parameters().as_paramspec_with_prefix().is_some()
+                        || signature.parameters().keyword_paramspec_capture().is_some()
                     {
                         return None;
                     }
@@ -5632,15 +5636,19 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             VariadicArgumentType::Other(tuple)
         } else {
             match argument_type {
-                Some(argument_type) => match argument_type.as_paramspec_typevar(db) {
+                Some(argument_type) => match argument_type.as_typevar() {
                     // If the argument is a `ParamSpec` `P.args`, we should not call `iterate` on it.
                     // This would lose the `ParamSpec` information and just flatten to `object` from
                     // the upper bound. What we want is to always use the `P.args` type to perform type
                     // checking against the parameter type. This will allow us to error when `*args:
                     // P.args` is matched against, for example, `n: int` and correctly type check when
                     // `*args: P.args` is matched against `*args: P.args` (another `ParamSpec`).
-                    Some(paramspec) => VariadicArgumentType::ParamSpec(paramspec),
-                    None => match argument_type {
+                    Some(variable)
+                        if variable.paramspec_attr(db) == Some(ParamSpecAttrKind::Args) =>
+                    {
+                        VariadicArgumentType::ParamSpec(argument_type)
+                    }
+                    _ => match argument_type {
                         // `Type::iterate` unions tuple specs in a way that can invent additional
                         // arities. Iterate each union element individually and compute per-position
                         // union types, length bounds, and variable element so that the rest of the
@@ -5915,8 +5923,21 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             }
             let residual_values = keywords.residual_values(db, env);
             if !residual_values.is_never() {
+                let matching_capture = self
+                    .parameters
+                    .as_keyword_paramspec_with_prefix(db)
+                    .is_some_and(|(_, captured)| {
+                        keywords
+                            .extra_items
+                            .keyword_paramspec(db)
+                            .is_some_and(|argument| argument.is_same_typevar_as(db, captured))
+                    });
                 self.match_mapping_keywords(argument_index, |name| {
-                    keywords.residual_value(db, name, residual_values)
+                    if matching_capture && name.is_some() {
+                        None
+                    } else {
+                        keywords.residual_value(db, name, residual_values)
+                    }
                 });
             }
         } else if let Some(unpacked) =
@@ -5927,7 +5948,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             self.match_mapping_keywords(argument_index, |parameter_name| {
                 Some(match argument_type {
                     Some(argument_type) => argument_type
-                        .as_paramspec_typevar(db)
+                        .as_paramspec_keyword_component(db)
                         .or_else(|| argument_type.getitem_dunder_call(db, env, parameter_name))
                         .unwrap_or(Type::unknown()),
 
@@ -6173,6 +6194,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         mut self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
+        generic_context: Option<GenericContext<'db>>,
     ) -> Box<[MatchedArgument<'db>]> {
         if let Some(first_excess_argument_index) = self.first_excess_positional {
             self.errors.push(BindingError::TooManyPositionalArguments {
@@ -6182,12 +6204,19 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             });
         }
 
-        // For ParamSpec parameters, both *args and **kwargs are required since we don't know
-        // what arguments the underlying callable expects. For all other callables, variadic
-        // and keyword_variadic parameters are optional.
+        // A caller-fixed ParamSpec may require arguments even if none are visible here. A
+        // callee-inferable keyword capture can instead resolve to an empty signature.
         let paramspec = self.parameters.as_paramspec();
+        let required_keyword = self
+            .parameters
+            .as_keyword_paramspec_with_prefix(db)
+            .filter(|(_, paramspec)| {
+                generic_context.is_none_or(|context| !context.contains(db, paramspec.identity(db)))
+            })
+            .map(|(prefix, paramspec)| (prefix.len(), paramspec));
 
         let mut missing = vec![];
+        let mut missing_paramspec = paramspec;
         for (
             index,
             ParameterInfo {
@@ -6202,12 +6231,19 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     continue;
                 }
                 let param = &self.parameters[index];
-                if paramspec.is_none() && (param.is_variadic() || param.is_keyword_variadic())
+                let required_keyword =
+                    required_keyword.filter(|(capture_index, _)| *capture_index == index);
+                if paramspec.is_none()
+                    && required_keyword.is_none()
+                    && (param.is_variadic() || param.is_keyword_variadic())
                     || param.has_default()
                 {
                     // variadic/keywords and defaulted arguments are not required
                     // (unless the parameters represent a ParamSpec)
                     continue;
+                }
+                if let Some((_, paramspec)) = required_keyword {
+                    missing_paramspec = Some(paramspec);
                 }
                 missing.push(ParameterContext::new(param, index, false));
             }
@@ -6216,7 +6252,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         if !missing.is_empty() {
             self.errors.push(BindingError::MissingArguments {
                 parameters: ParameterContexts(missing),
-                paramspec,
+                paramspec: missing_paramspec,
             });
         }
 
@@ -6308,7 +6344,7 @@ fn validate_keyword_unpack_key_type<'db>(
     inferable_typevars: TypeVarSet<'db>,
 ) -> KeywordUnpackKeyTypeCheck<'db> {
     if matches!(argument_type, Type::TypedDict(_))
-        || argument_type.as_paramspec_typevar(db).is_some()
+        || argument_type.as_paramspec_keyword_component(db).is_some()
     {
         return KeywordUnpackKeyTypeCheck::NotApplicable;
     }
@@ -7548,7 +7584,10 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     }
 
     fn check_argument_types(&mut self, constraints: &ConstraintSetBuilder<'db>) {
-        let paramspec = self.signature.parameters().as_paramspec_with_prefix();
+        let paramspec = self
+            .signature
+            .parameters()
+            .forwarded_paramspec_with_prefix(self.db);
         let paramspec_component_start = paramspec.and_then(|(prefix, paramspec)| {
             let prefix_len = prefix.len();
             let paramspec_argument_indices = self.paramspec_argument_indices(prefix_len);
@@ -7641,6 +7680,19 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     }
                 }
             }
+        }
+
+        if self.errors.is_empty()
+            && self.inference.is_some_and(|inference| {
+                matches!(
+                    inference.solutions(self.db),
+                    TypeVarInferenceSolutions::Unavailable(
+                        TypeVarInferenceFallback::UnverifiedKeywordProjection
+                    )
+                )
+            })
+        {
+            self.errors.push(BindingError::UnverifiedKeywordProjection);
         }
     }
 
@@ -7851,28 +7903,29 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             return;
         }
 
-        let value_type_paramspec = if let Some(paramspec) = argument_type.as_paramspec_typevar(db) {
-            Some(paramspec)
-        } else {
-            match validate_keyword_unpack_key_type(
-                db,
-                self.env,
-                constraints,
-                argument_type,
-                self.inferable_typevars,
-            ) {
-                KeywordUnpackKeyTypeCheck::NotApplicable => return,
-                KeywordUnpackKeyTypeCheck::Valid => {}
-                KeywordUnpackKeyTypeCheck::Invalid(provided_ty) => {
-                    self.errors.push(BindingError::InvalidKeyType {
-                        argument_index: adjusted_argument_index,
-                        provided_ty,
-                    });
+        let value_type_paramspec =
+            if let Some(paramspec) = argument_type.as_paramspec_keyword_component(db) {
+                Some(paramspec)
+            } else {
+                match validate_keyword_unpack_key_type(
+                    db,
+                    self.env,
+                    constraints,
+                    argument_type,
+                    self.inferable_typevars,
+                ) {
+                    KeywordUnpackKeyTypeCheck::NotApplicable => return,
+                    KeywordUnpackKeyTypeCheck::Valid => {}
+                    KeywordUnpackKeyTypeCheck::Invalid(provided_ty) => {
+                        self.errors.push(BindingError::InvalidKeyType {
+                            argument_index: adjusted_argument_index,
+                            provided_ty,
+                        });
+                    }
                 }
-            }
 
-            None
-        };
+                None
+            };
 
         if let Some(KnownUnpacking::Keywords(_)) = self.arguments.known_unpacking(argument_index) {
             self.check_variadic_argument_type(
@@ -8141,7 +8194,7 @@ fn inferable_typevar_occurrences<'db>(
         fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
             if let Type::TypeVar(typevar) = ty {
                 let identity = if typevar.is_paramspec(db) {
-                    typevar.without_paramspec_attr(db).identity(db)
+                    typevar.paramspec_base(db).identity(db)
                 } else {
                     typevar.identity(db)
                 };
@@ -8577,7 +8630,10 @@ impl<'db> Binding<'db> {
             mode,
         } = *context;
 
-        let (prefix, _) = self.signature.parameters().as_paramspec_with_prefix()?;
+        let (prefix, _) = self
+            .signature
+            .parameters()
+            .forwarded_paramspec_with_prefix(db)?;
         let paramspec_argument_indices =
             self.paramspec_call_argument_indices(binding, prefix.len());
         let sub_argument_index = paramspec_argument_indices
@@ -8816,7 +8872,7 @@ impl<'db> Binding<'db> {
                 && typevar.is_paramspec(db)
                 && typevar.paramspec_attr(db).is_some()
             {
-                Some(typevar.without_paramspec_attr(db))
+                Some(typevar.paramspec_base(db))
             } else {
                 None
             };
@@ -9084,7 +9140,7 @@ impl<'db> Binding<'db> {
         self.parameter_tys = vec![None; parameters.len()].into_boxed_slice();
         self.variadic_argument_matched_to_variadic_parameter =
             matcher.variadic_argument_matched_to_variadic_parameter;
-        self.argument_matches = matcher.finish(db, env);
+        self.argument_matches = matcher.finish(db, env, self.signature.generic_context);
     }
 
     fn check_types(
@@ -9913,6 +9969,8 @@ pub(crate) enum BindingError<'db> {
         /// The callable that actually declared the parameter, when reached through a `ParamSpec`.
         parameter_source: Option<ForwardedParameterSource<'db>>,
     },
+    /// Argument checking depended on a callback keyword projection that could not be verified.
+    UnverifiedKeywordProjection,
     /// The type of the keyword-variadic argument's key is not `str`.
     InvalidKeyType {
         argument_index: Option<usize>,
@@ -10017,6 +10075,7 @@ impl BindingError<'_> {
         matches!(
             self,
             Self::InvalidArgumentType { .. }
+                | Self::UnverifiedKeywordProjection
                 | Self::InvalidKeyType { .. }
                 | Self::UnknownArgument { .. }
                 | Self::UnknownKeywordVariadicArgument { .. }
@@ -10095,6 +10154,7 @@ impl BindingError<'_> {
             | BindingError::InvalidDataclassApplication(..)
             | BindingError::InvalidDataclassArgument(..)
             | BindingError::MissingArguments { .. }
+            | BindingError::UnverifiedKeywordProjection
             | BindingError::UnmatchedOverload
             | BindingError::PropertyHasNoGetter(..)
             | BindingError::PropertyHasNoSetter(..)
@@ -10168,6 +10228,7 @@ impl<'db> BindingError<'db> {
 
             // Matching errors: the overload doesn't apply to these arguments
             Self::InvalidArgumentType { .. }
+            | Self::UnverifiedKeywordProjection
             | Self::InvalidKeyType { .. }
             | Self::MissingArguments { .. }
             | Self::UnknownArgument { .. }
@@ -10200,6 +10261,16 @@ impl<'db> BindingError<'db> {
         };
 
         match self {
+            Self::UnverifiedKeywordProjection => {
+                let range = context.get_range(node, None);
+                if let Some(builder) = context.report_lint(&INVALID_ARGUMENT_TYPE, range) {
+                    let mut diag =
+                        builder.into_diagnostic("Cannot verify the callback's keyword parameters");
+                    if let Some(compound_diag) = compound_diag {
+                        compound_diag.add_context(db, env, &mut diag);
+                    }
+                }
+            }
             Self::InvalidArgumentType {
                 parameter,
                 argument_index,
