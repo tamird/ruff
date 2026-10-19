@@ -8764,19 +8764,32 @@ impl<'db> Binding<'db> {
         if matches!(binding.callable_type, Type::FunctionLiteral(_))
             && binding.overloads().len() == 1
             && let Some(expected) = call_expression_tcx.annotation
-            && let Type::ProtocolInstance(protocol) = expected.resolve_type_alias(db)
             && let Some((argument, _)) = arguments_types.iter().nth(argument_index)
             && let Argument::Keyword(name) = argument
             && let Some(definition) = self.signature.definition()
             && db.provided_keyword_field_factory(definition)
-            && let Some(field_type) = protocol
-                .interface(db)
-                .readonly_property_type(db, env, expected, name)
         {
-            return Some(ArgumentTypeContext::standard(
-                original_parameter_type,
-                field_type,
-            ));
+            let field_type =
+                if let Type::ProtocolInstance(protocol) = expected.resolve_type_alias(db) {
+                    protocol
+                        .interface(db)
+                        .readonly_property_type(db, env, expected, name)
+                } else if expected.has_immutable_field_path(db, env, &[Name::new(name)]) {
+                    // A nominal schema can carry different types for each stored field even
+                    // when the factory's generic signature has one shared value parameter.
+                    expected
+                        .member(db, env, name)
+                        .place
+                        .ignore_possibly_undefined()
+                } else {
+                    None
+                };
+            if let Some(field_type) = field_type {
+                return Some(ArgumentTypeContext::standard(
+                    original_parameter_type,
+                    field_type,
+                ));
+            }
         }
         let mut parameter_type = matched_parameter
             .expected_type

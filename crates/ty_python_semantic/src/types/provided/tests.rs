@@ -18,7 +18,7 @@ use crate::types::ide_support::{
 use crate::types::{
     CheckedArgument, CheckedCall, DictionaryExtraItems, DictionaryFirstEntry, DictionaryItem,
     DictionaryItemKind, DictionaryItems, KnownClass, Parameter, Parameters, Signature,
-    TypedDictFieldBuilder, TypedDictOpenness, TypedDictType,
+    TypedDictFieldBuilder, TypedDictOpenness, TypedDictSchema, TypedDictType,
 };
 use crate::{HasType, SemanticModel};
 
@@ -3698,6 +3698,197 @@ fn schema_getattr_result<'db>(
     } else {
         ProvidedGetattrPresence::PossiblyMissing.into()
     }
+}
+
+#[test]
+fn supplied_keyword_fields_use_immutable_member_context() -> anyhow::Result<()> {
+    let native = r#"
+from typing import Protocol, TypeVar
+from typing_extensions import NotRequired, ReadOnly, TypedDict
+class Store[S]:
+    def __getattr__(self, name: str) -> object: ...
+class Uniform[V, S](Store[S]): ...
+class Metadata(TypedDict):
+    deps: NotRequired[list[str]]
+class Fields(TypedDict, closed=True):
+    metadata: ReadOnly[Metadata]
+    values: ReadOnly[dict[str, str]]
+class Readonly(Protocol):
+    @property
+    def metadata(self) -> Metadata: ...
+    @property
+    def values(self) -> dict[str, str]: ...
+def record[T](**kwargs: T) -> Uniform[T, Fields]: ...
+def untrusted[T](**kwargs: T) -> Uniform[T, Fields]: ...
+"#;
+    let source = r#"
+from native import Uniform, Metadata, Fields, Readonly, record, untrusted
+from ty_extensions import Intersection
+
+def fields(metadata: Metadata) -> Uniform[Metadata | dict[str, str], Fields]:
+    return record(metadata=metadata, values={"name": "crate"})
+def reversed_fields(metadata: Metadata) -> Uniform[Metadata | dict[str, str], Fields]:
+    return record(values={"name": "crate"}, metadata=metadata)
+def empty(metadata: Metadata) -> Uniform[Metadata | dict[str, str], Fields]:
+    return record(metadata=metadata, values={})
+def protocol(metadata: Metadata) -> Readonly:
+    return record(metadata=metadata, values={"name": "crate"})
+def intersection(metadata: Metadata) -> Intersection[Uniform[Metadata | dict[str, str], Fields], Readonly]:
+    return record(metadata=metadata, values={"name": "crate"})
+"#;
+    let mut db =
+        TestDbBuilder::new()
+            .with_python_version(ruff_python_ast::PythonVersion::PY313)
+            .with_getattr_result_provider(schema_getattr_result)
+            .with_keyword_field_factory(|db, declaration| {
+                declaration.name(db).as_deref() == Some("record")
+                    && declaration
+                        .program_file(db)
+                        .file(db)
+                        .path(db)
+                        .as_system_path()
+                        .is_some_and(|path| path.as_str() == "/src/native.pyi")
+            })
+            .with_call_result_provider(|db, call| {
+                if !matches!(
+                    call.declaration()
+                        .and_then(|declaration| declaration.name(db))
+                        .as_deref(),
+                    Some("record" | "untrusted")
+                ) {
+                    return ProvidedCallResult::default();
+                }
+                let mut fields = TypedDictSchema::default();
+                let mut values = Vec::new();
+                for keyword in &call.call().arguments.keywords {
+                    let Some(name) = &keyword.arg else {
+                        return ProvidedCallResult::default();
+                    };
+                    let Some(ty) = call.expression_type(&keyword.value) else {
+                        return ProvidedCallResult::default();
+                    };
+                    values.push(ty);
+                    fields.insert(
+                        name.id.clone(),
+                        TypedDictFieldBuilder::new(ty)
+                            .required(true)
+                            .read_only(true)
+                            .build(),
+                    );
+                }
+                let schema = Type::TypedDict(TypedDictType::from_schema_items_with_openness(
+                    db,
+                    fields,
+                    TypedDictOpenness::Closed,
+                ));
+                let Some(declaration) = call.declaration() else {
+                    return ProvidedCallResult::default();
+                };
+                let Type::ClassLiteral(class) =
+                    crate::place::global_symbol(db, declaration.program_file(db), "Uniform")
+                        .place
+                        .expect_type()
+                else {
+                    return ProvidedCallResult::default();
+                };
+                let env = ProgramEnvironment::from_file(call.file());
+                let values = crate::types::UnionType::from_elements(db, &env, values);
+                Type::from(class.apply_specialization(db, |context| {
+                    context.specialize(db, vec![values, schema])
+                }))
+                .to_instance_approximation(db, &env)
+                .into()
+            })
+            .with_file("/src/native.pyi", native)
+            .with_file("/src/main.py", source)
+            .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let native_file = system_path_to_file(&db, "/src/native.pyi")?;
+    for declaration in [
+        native.to_string(),
+        native
+            .replace("def record[T]", "T = TypeVar('T')\ndef record")
+            .replace("def untrusted[T]", "def untrusted"),
+    ] {
+        db.write_file("/src/native.pyi", declaration)?;
+        for checked in [native_file, file] {
+            let diagnostics = db.check_file(checked);
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        }
+        let program = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program);
+        let module = parsed_module(&db, program.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, program);
+        for statement in module.suite() {
+            let ruff_python_ast::Stmt::FunctionDef(function) = statement else {
+                continue;
+            };
+            let ruff_python_ast::Stmt::Return(returned) = &function.body[0] else {
+                anyhow::bail!("Expected a return");
+            };
+            let Some(ruff_python_ast::Expr::Call(call)) = returned.value.as_deref() else {
+                anyhow::bail!("Expected a call");
+            };
+            let argument = call
+                .arguments
+                .keywords
+                .iter()
+                .find(|keyword| keyword.arg.as_ref().is_some_and(|name| name.id == "values"))
+                .context("missing values argument")?;
+            let ty = argument
+                .value
+                .inferred_type(&model)
+                .context("missing argument type")?;
+            assert_eq!(
+                ty.display(&db, &env).to_string(),
+                "dict[str, str]",
+                "{}",
+                function.name
+            );
+        }
+    }
+    db.write_file("/src/main.py", source.replace("\"crate\"", "42"))?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.id().as_str() == "invalid-return-type"),
+        "{diagnostics:#?}"
+    );
+    db.write_file(
+        "/src/main.py",
+        source.replace("dict[str, str]", "dict[str, int]"),
+    )?;
+    db.write_file(
+        "/src/native.pyi",
+        native.replace("dict[str, str]", "dict[str, int]"),
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.id().as_str() == "invalid-return-type"),
+        "{diagnostics:#?}"
+    );
+    db.write_file("/src/native.pyi", native)?;
+    db.write_file(
+        "/src/main.py",
+        r#"
+from native import Uniform, Metadata, Fields, untrusted
+def ordinary(metadata: Metadata) -> Uniform[Metadata | dict[str, str], Fields]:
+    return untrusted(metadata=metadata, values={})
+"#,
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].id().as_str(),
+        "invalid-return-type",
+        "{diagnostics:#?}"
+    );
+    Ok(())
 }
 
 #[test]
