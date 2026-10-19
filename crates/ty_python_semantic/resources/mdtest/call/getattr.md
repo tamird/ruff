@@ -85,6 +85,32 @@ def _(value: Child | Other):
     reveal_type(getattr(value, "extra", None))  # revealed: Any | None
 ```
 
+## Empty collection defaults
+
+A finite member type provides context for a fresh empty list or dictionary default, including
+`Iterable` and `Mapping` fields. This does not establish that the attribute exists or prevent a
+property from raising `AttributeError`; the default remains a possible result.
+
+```py
+from collections.abc import Iterable, Mapping
+
+class Collections:
+    items: list[str]
+    iterable: Iterable[str]
+    mapping: Mapping[str, Iterable[str]]
+
+    @property
+    def unavailable(self) -> list[str]:
+        raise AttributeError("unavailable")
+
+def _(value: Collections, fallback: bytes):
+    reveal_type(getattr(value, "items", []))  # revealed: list[str]
+    reveal_type(getattr(value, "iterable", []))  # revealed: Iterable[str]
+    reveal_type(getattr(value, "mapping", {}))  # revealed: Mapping[str, Iterable[str]]
+    reveal_type(getattr(value, "unavailable", []))  # revealed: list[str]
+    reveal_type(getattr(value, "unavailable", fallback))  # revealed: list[str] | bytes
+```
+
 ## Typing-only operations
 
 An operation declaration that is unavailable as a runtime attribute does not refine `getattr`.

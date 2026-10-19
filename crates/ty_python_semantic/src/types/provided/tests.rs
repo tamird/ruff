@@ -4159,6 +4159,7 @@ def unions(value: Store[Required] | Store[Other], default: bytes):
 
 def optional(value: Store[Required] | Store[Optional], default: bytes):
     assert_type(getattr(value, "items", default), list[str] | bytes)
+    assert_type(getattr(value, "items", None), list[str] | None)
 
 def ordinary(property: Property, intercepted: Intercepted, mutable: Mutable, default: bytes):
     assert_type(getattr(property, "items", default), str | bytes)
@@ -4196,6 +4197,8 @@ fn supplied_getter_storage_contextualizes_empty_defaults() -> anyhow::Result<()>
         .with_file(
             "/src/native.pyi",
             r#"
+from collections.abc import Iterable, Mapping
+from typing import Any
 from typing_extensions import NotRequired, TypedDict
 
 class Row(TypedDict):
@@ -4208,8 +4211,27 @@ class Other(TypedDict, closed=True):
     items: list[int]
 class Optional(TypedDict, closed=True):
     items: NotRequired[list[str]]
+    mapping: NotRequired[dict[str, int]]
+    iterable: NotRequired[Iterable[str]]
+    abstract_mapping: NotRequired[Mapping[str, Iterable[str]]]
+    row: NotRequired[Row]
+    nullable: NotRequired[list[str] | None]
+class Missing(TypedDict, closed=True):
+    pass
+class ListSubclass(list[str]): ...
+class SubclassField(TypedDict, closed=True):
+    items: NotRequired[ListSubclass]
+class Gradual(TypedDict, closed=True):
+    items: NotRequired[list[Any]]
 class Store[S]:
     def __getattr__(self, name: str) -> object: ...
+class Property(Store[Required]):
+    @property
+    def items(self) -> bytes: ...
+class Intercepted(Store[Required]):
+    def __getattribute__(self, name: str) -> bytes: ...
+class Mutable(Store[Required]):
+    items: list[bytes]
 "#,
         )
         .with_file(
@@ -4217,7 +4239,7 @@ class Store[S]:
             r#"
 from builtins import getattr as lookup
 from typing import Literal
-from native import Store, Required, Other, Optional
+from native import Store, Required, Other, Optional, Missing, SubclassField, Gradual, Property, Intercepted, Mutable
 
 def required_list(value: Store[Required]):
     return lookup(value, "items", [])
@@ -4226,6 +4248,30 @@ def required_dict(value: Store[Required]):
 def union_list(value: Store[Required] | Store[Other]):
     return lookup(value, "items", [])
 def optional_list(value: Store[Optional]):
+    return lookup(value, "items", [])
+def optional_dict(value: Store[Optional]):
+    return lookup(value, "mapping", {})
+def optional_iterable(value: Store[Optional]):
+    return lookup(value, "iterable", [])
+def optional_mapping(value: Store[Optional]):
+    return lookup(value, "abstract_mapping", {})
+def missing_alternative(value: Store[Optional] | Store[Missing]):
+    return lookup(value, "items", [])
+def optional_row(value: Store[Optional]):
+    return lookup(value, "row", {})
+def optional_nullable(value: Store[Optional]):
+    return lookup(value, "nullable", [])
+def optional_subclass(value: Store[SubclassField]):
+    return lookup(value, "items", [])
+def missing(value: Store[Missing]):
+    return lookup(value, "items", [])
+def gradual(value: Store[Gradual]):
+    return lookup(value, "items", [])
+def property(value: Property):
+    return lookup(value, "items", [])
+def intercepted(value: Intercepted):
+    return lookup(value, "items", [])
+def mutable(value: Mutable):
     return lookup(value, "items", [])
 
 # Every fallback value is legal, even when it differs from the stored field.
@@ -4289,7 +4335,19 @@ def division_default(value: Store[Required]):
             ("required_dict", "dict[str, int]".into()),
             // Existing collection inference selects one compatible arm for the empty literal.
             ("union_list", "list[str]".into()),
-            ("optional_list", "list[Any]".into()),
+            ("optional_list", "list[str]".into()),
+            ("optional_dict", "dict[str, int]".into()),
+            ("optional_iterable", "list[str]".into()),
+            ("optional_mapping", "dict[str, Iterable[str]]".into()),
+            ("missing_alternative", "list[str]".into()),
+            ("optional_row", "dict[Any, Any]".into()),
+            ("optional_nullable", "list[Any]".into()),
+            ("optional_subclass", "list[Any]".into()),
+            ("missing", "list[Any]".into()),
+            ("gradual", "list[Any]".into()),
+            ("property", "list[Any]".into()),
+            ("intercepted", "list[Any]".into()),
+            ("mutable", "list[bytes]".into()),
             ("required_row", "dict[Any, Any]".into()),
             ("mismatched_list", "dict[Any, Any]".into()),
             ("mismatched_dict", "list[Any]".into()),

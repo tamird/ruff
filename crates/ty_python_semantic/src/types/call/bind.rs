@@ -8297,9 +8297,17 @@ impl<'db> Binding<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> Option<Type<'db>> {
-        let (instance, names, default) = match self.parameter_types() {
-            [Some(instance), Some(names)] => (*instance, *names, None),
-            [Some(instance), Some(names), default] => (*instance, *names, *default),
+        self.getattr_result_with_default(db, env, self.parameter_types().get(2).copied().flatten())
+    }
+
+    fn getattr_result_with_default(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        default: Option<Type<'db>>,
+    ) -> Option<Type<'db>> {
+        let (instance, names) = match self.parameter_types() {
+            [Some(instance), Some(names)] | [Some(instance), Some(names), _] => (*instance, *names),
             _ => return None,
         };
         let names = match names.resolve_type_alias(db) {
@@ -8387,15 +8395,26 @@ impl<'db> Binding<'db> {
         if parameter.index != 2 {
             return None;
         }
-        let context = self.getattr_call_result(db, env)?;
+        // The fallback is still being inferred. Use the finite member facts before
+        // joining its type, including when the member may be missing. The completed
+        // call separately joins the actual fallback without changing presence facts.
+        let context = self.getattr_result_with_default(db, env, Some(Type::Never))?;
         if !context.is_fully_static(db, env) {
             return None;
         }
-        let matching_kind = |ty: &Type<'db>| match ty {
-            Type::NominalInstance(instance) => {
-                instance.class(db, env).known(db) == Some(collection)
+        let matching_kind = |ty: &Type<'db>| {
+            let class = match ty {
+                Type::NominalInstance(instance) => instance.class(db, env).known(db),
+                Type::ProtocolInstance(protocol) => {
+                    protocol.class_origin(db).and_then(|class| class.known(db))
+                }
+                _ => None,
+            };
+            match collection {
+                KnownClass::List => matches!(class, Some(KnownClass::List | KnownClass::Iterable)),
+                KnownClass::Dict => matches!(class, Some(KnownClass::Dict | KnownClass::Mapping)),
+                _ => false,
             }
-            _ => false,
         };
         let matches = match context.expand_top_level_aliases(db, env) {
             Type::Union(union) => union.elements(db).iter().all(matching_kind),
