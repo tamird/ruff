@@ -6653,14 +6653,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         specialization,
                     ))
                 } else {
-                    MatchingArgumentTypeContext::Many(
-                        overloads_with_binding
-                            .iter()
-                            .map(|(overload, binding, specialization)| {
-                                parameter_tcx(overload, binding, specialization)
-                            })
-                            .collect(),
-                    )
+                    let contexts: Vec<_> = overloads_with_binding
+                        .iter()
+                        .map(|(overload, binding, specialization)| {
+                            parameter_tcx(overload, binding, specialization)
+                        })
+                        .collect();
+
+                    // A context shared by every overload can be committed just like the
+                    // context from a single overload. Keep the full context, including its
+                    // argument lookup key, so distinct bindings remain independent.
+                    if let [Some(first), rest @ ..] = contexts.as_slice()
+                        && rest.iter().all(|context| *context == Some(*first))
+                    {
+                        MatchingArgumentTypeContext::Unique(Some(*first))
+                    } else {
+                        MatchingArgumentTypeContext::Many(contexts)
+                    }
                 };
 
                 Some(parameter_contexts)

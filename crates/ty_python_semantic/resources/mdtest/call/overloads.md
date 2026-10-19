@@ -1345,6 +1345,29 @@ def _(values: tuple[int] | tuple[str, str]):
     reveal_type(n(lambda value: value, *values))  # revealed: int | str
 ```
 
+### Shared argument context after type expansion
+
+Overloads selected for different expansions can agree on another argument's type context.
+
+```py
+from typing import Protocol, overload
+
+class Callback(Protocol):
+    def __call__(self, *, name: str) -> object: ...
+
+@overload
+def invoke(value: str, callback: Callback) -> str: ...
+@overload
+def invoke(value: list[str], callback: Callback) -> list[str]: ...
+def invoke(value: str | list[str], callback: Callback) -> str | list[str]:
+    return value
+
+def caller(value: str | list[str]) -> None:
+    invoke(value, lambda *, name: reveal_type(name))  # revealed: str
+    # error: [unsupported-operator]
+    invoke(value, lambda *, name: name + 1)
+```
+
 ## Filtering based on variadic arguments
 
 This is step 4 of the overload call evaluation algorithm which specifies that:
