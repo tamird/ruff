@@ -13,7 +13,7 @@ use super::*;
 use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
 use crate::types::definition_resolution::definitions_for_attribute;
 use crate::types::ide_support::{
-    definitions_for_keyword_argument, inlay_hint_call_argument_details,
+    call_signature_details, definitions_for_keyword_argument, inlay_hint_call_argument_details,
 };
 use crate::types::{
     CheckedArgument, CheckedCall, DictionaryFirstEntry, DictionaryItem, DictionaryItemKind,
@@ -4368,6 +4368,85 @@ fn synthesized_default_keeps_its_source_spelling() -> anyhow::Result<()> {
         signature.display(&db, &env).to_string(),
         "(*, value: str = ('préfix' + 'suffix')) -> None"
     );
+    Ok(())
+}
+
+#[test]
+fn implicit_keywords_bind_without_appearing_in_the_signature() -> anyhow::Result<()> {
+    fn factory<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        let name = call.declaration()?.name(db)?;
+        let env = ProgramEnvironment::from_file(call.file());
+        let operation = Type::function_like_callable(
+            db,
+            Signature::new(
+                Parameters::standard([
+                    Parameter::keyword_only(Name::new_static("before"))
+                        .with_annotated_type(KnownClass::Int.to_instance(db, &env)),
+                    Parameter::implicit_keyword_only(Name::new_static("$internal"))
+                        .with_annotated_type(if name == "make" {
+                            KnownClass::Bool.to_instance(db, &env)
+                        } else {
+                            KnownClass::Str.to_instance(db, &env)
+                        }),
+                    Parameter::keyword_only(Name::new_static("after"))
+                        .with_annotated_type(KnownClass::Str.to_instance(db, &env)),
+                ]),
+                Type::none(db, &env),
+            ),
+        );
+        match name.as_str() {
+            "make" => Some(operation),
+            "consumer" => Some(Type::function_like_callable(
+                db,
+                Signature::new(
+                    Parameters::standard([
+                        Parameter::positional_only(None).with_annotated_type(operation)
+                    ]),
+                    Type::none(db, &env),
+                ),
+            )),
+            _ => None,
+        }
+    }
+    let source = "from native import make, consumer\noperation = make()\noperation(before=1, **{'$internal': True}, after='ok')\noperation(before=1, after='ok', **{'$internal': 'bad'})\nconsumer()(operation)\n";
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "def make() -> object: ...\ndef consumer() -> object: ...\n",
+        )
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(|db, call| factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+    assert_eq!(diagnostics[1].id().as_str(), "invalid-argument-type");
+    let diagnostic = diagnostics[1]
+        .primary_annotation()
+        .unwrap()
+        .get_message()
+        .unwrap();
+    assert!(diagnostic.contains("$internal: bool"), "{diagnostic}");
+    assert!(diagnostic.contains("$internal: str"), "{diagnostic}");
+
+    let file = db.program_file(file);
+    let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
+    let call = parsed.suite()[2]
+        .as_expr_stmt()
+        .unwrap()
+        .value
+        .as_call_expr()
+        .unwrap();
+    let model = SemanticModel::new(&db, file);
+    let details = call_signature_details(&model, call);
+    let [signature] = details.as_slice() else {
+        anyhow::bail!("Expected one signature, got {details:?}");
+    };
+    assert_eq!(signature.label, "(*, before: int, after: str) -> None");
+    assert_eq!(signature.active_parameter(0), Some(0));
+    assert_eq!(signature.active_parameter(1), None);
+    assert_eq!(signature.active_parameter(2), Some(1));
     Ok(())
 }
 

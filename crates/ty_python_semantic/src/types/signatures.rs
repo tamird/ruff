@@ -6878,6 +6878,9 @@ pub struct Parameter<'db> {
     /// receivers. This field also controls whether the annotated type is displayed.
     pub(crate) inferred_annotation: bool,
 
+    /// The callable accepts this optional keyword, but it is not part of its documented interface.
+    implicit: bool,
+
     /// Syntax-level annotation kind for cases where the annotation has special parameter semantics.
     annotation_kind: ParameterAnnotationKind,
 
@@ -6920,68 +6923,55 @@ enum ParameterAnnotationKind {
 }
 
 impl<'db> Parameter<'db> {
-    pub fn positional_only(name: Option<Name>) -> Self {
+    fn new(kind: ParameterKind<'db>) -> Self {
         Self {
             annotated_type: Type::unknown(),
             source: None,
             inferred_annotation: true,
+            implicit: false,
             annotation_kind: ParameterAnnotationKind::Normal,
             source_parameter_index: None,
-            kind: ParameterKind::PositionalOnly {
-                name,
-                default_type: None,
-            },
+            kind,
         }
+    }
+
+    pub fn positional_only(name: Option<Name>) -> Self {
+        Self::new(ParameterKind::PositionalOnly {
+            name,
+            default_type: None,
+        })
     }
 
     pub fn positional_or_keyword(name: Name) -> Self {
-        Self {
-            annotated_type: Type::unknown(),
-            source: None,
-            inferred_annotation: true,
-            annotation_kind: ParameterAnnotationKind::Normal,
-            source_parameter_index: None,
-            kind: ParameterKind::PositionalOrKeyword {
-                name,
-                default_type: None,
-            },
-        }
+        Self::new(ParameterKind::PositionalOrKeyword {
+            name,
+            default_type: None,
+        })
     }
 
     pub fn variadic(name: Name) -> Self {
-        Self {
-            annotated_type: Type::unknown(),
-            source: None,
-            inferred_annotation: true,
-            annotation_kind: ParameterAnnotationKind::Normal,
-            source_parameter_index: None,
-            kind: ParameterKind::Variadic { name },
-        }
+        Self::new(ParameterKind::Variadic { name })
     }
 
     pub fn keyword_only(name: Name) -> Self {
-        Self {
-            annotated_type: Type::unknown(),
-            source: None,
-            inferred_annotation: true,
-            annotation_kind: ParameterAnnotationKind::Normal,
-            source_parameter_index: None,
-            kind: ParameterKind::KeywordOnly {
-                name,
-                default_type: None,
-            },
-        }
+        Self::new(ParameterKind::KeywordOnly {
+            name,
+            default_type: None,
+        })
+    }
+
+    /// An optional keyword accepted by the callable but omitted from its presented signature.
+    ///
+    /// This is useful for synthesized callable interfaces with internal keyword inputs. The
+    /// keyword still participates in ordinary call checking and callable relations.
+    pub fn implicit_keyword_only(name: Name) -> Self {
+        let mut parameter = Self::keyword_only(name).with_default_type(Type::unknown());
+        parameter.implicit = true;
+        parameter
     }
 
     pub fn keyword_variadic(name: Name) -> Self {
-        Self {
-            annotated_type: Type::unknown(),
-            source: None,
-            inferred_annotation: true,
-            annotation_kind: ParameterAnnotationKind::Normal,
-            source_parameter_index: None,
-            kind: ParameterKind::KeywordVariadic { name },
-        }
+        Self::new(ParameterKind::KeywordVariadic { name })
     }
 
     /// Set the annotated type for this parameter. This also marks the annotation as explicit
@@ -7100,6 +7090,7 @@ impl<'db> Parameter<'db> {
                 .kind
                 .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
             inferred_annotation: self.inferred_annotation,
+            implicit: self.implicit,
             annotation_kind: self.annotation_kind,
             source_parameter_index: self.source_parameter_index,
         }
@@ -7122,6 +7113,7 @@ impl<'db> Parameter<'db> {
             annotated_type,
             source: self.source.clone(),
             inferred_annotation: self.inferred_annotation,
+            implicit: self.implicit,
             annotation_kind: self.annotation_kind,
             source_parameter_index: self.source_parameter_index,
             kind,
@@ -7140,6 +7132,7 @@ impl<'db> Parameter<'db> {
             source,
             annotation_kind,
             inferred_annotation,
+            implicit,
             source_parameter_index,
             kind,
         } = self;
@@ -7173,6 +7166,7 @@ impl<'db> Parameter<'db> {
             annotated_type,
             source: source.clone(),
             inferred_annotation: *inferred_annotation,
+            implicit: *implicit,
             annotation_kind: *annotation_kind,
             source_parameter_index: *source_parameter_index,
             kind,
@@ -7225,6 +7219,7 @@ impl<'db> Parameter<'db> {
             annotated_type,
             source,
             inferred_annotation,
+            implicit: false,
             annotation_kind,
             source_parameter_index: None,
             kind,
@@ -7234,6 +7229,11 @@ impl<'db> Parameter<'db> {
     /// Returns `true` if this is a keyword-only parameter.
     pub(crate) fn is_keyword_only(&self) -> bool {
         matches!(self.kind, ParameterKind::KeywordOnly { .. })
+    }
+
+    /// Whether this parameter is accepted without being listed in the presented signature.
+    pub(crate) fn is_implicit(&self) -> bool {
+        self.implicit
     }
 
     /// Returns `true` if this is a positional-only parameter.

@@ -1028,7 +1028,10 @@ impl<'db> CallSignatureDetails<'db> {
         let argument_to_parameter_mapping = binding.argument_matches().to_vec();
         let specialization = binding.merged_specialization(db);
         let signature = binding.signature.clone();
-        let display_details = signature.display(db, env).to_string_parts();
+        let display_details = signature
+            .display(db, env)
+            .hide_implicit_parameters()
+            .to_string_parts();
         let (parameters, parameter_to_displayed_parameter_mapping) =
             displayed_parameters_for_signature(db, &signature, &display_details, specialization);
         let argument_to_displayed_parameter_mapping = argument_to_parameter_mapping
@@ -1082,19 +1085,17 @@ fn displayed_parameters_for_signature<'db>(
             let mut displayed_parameters = Vec::new();
             let mut parameter_to_displayed_parameter_mapping = vec![None; parameters.len()];
 
-            for (parameter_index, parameter) in parameters.iter().enumerate() {
-                let Some(range) = display_details
-                    .parameter_ranges
-                    .get(parameter_index)
-                    .copied()
+            for (display_index, (parameter_index, parameter)) in parameters
+                .iter()
+                .enumerate()
+                .filter(|(_, parameter)| !parameter.is_implicit())
+                .enumerate()
+            {
+                let Some(range) = display_details.parameter_ranges.get(display_index).copied()
                 else {
                     continue;
                 };
-                let Some(name) = display_details
-                    .parameter_names
-                    .get(parameter_index)
-                    .cloned()
-                else {
+                let Some(name) = display_details.parameter_names.get(display_index).cloned() else {
                     continue;
                 };
                 let Some(label) = display_details
