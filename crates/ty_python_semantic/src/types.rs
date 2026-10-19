@@ -237,8 +237,10 @@ pub fn check_types_with_diagnostics<'db>(
 /// are ignored. Ty derives declared overloads from inline definitions or whole-signature external
 /// annotation provenance and validates each domain independently. Unsupported domains add no proof
 /// or diagnostic; [`check_overload_body`] reports that status explicitly when coverage is needed.
-/// Ordinary diagnostics take precedence at the same rule and source location. All suppression
-/// usage is merged before unused suppressions are checked.
+/// A concrete keyword rejected from an unpacked argument is omitted when every declared overload
+/// proves that the keyword is absent or accepted at that call. Other ordinary diagnostics take
+/// precedence at the same rule and source location. Suppression usage is merged before unused
+/// suppressions are checked.
 pub fn check_types_with_overload_bodies<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
@@ -253,7 +255,16 @@ pub fn check_types_with_overload_bodies<'db>(
 
     let index = semantic_index(db, file);
     let mut diagnostics = TypeCheckDiagnostics::default();
+    let mut body_diagnostics = TypeCheckDiagnostics::default();
     let mut implicit_aliases = Vec::new();
+    let mut selected = FxHashMap::default();
+    for function in functions {
+        if function.program_file(db) == file {
+            selected
+                .entry(function.literal(db).last_definition.body_scope(db))
+                .or_insert(function);
+        }
+    }
 
     for scope_id in index.scope_ids() {
         // Scopes that may require type context are inferred during the inference of
@@ -263,9 +274,18 @@ pub fn check_types_with_overload_bodies<'db>(
         }
 
         let result = infer_scope_types(db, scope_id, TypeContext::default());
+        let body = selected
+            .remove(&scope_id)
+            .map(|function| infer::CheckedOverloadBody::new(db, function));
 
         if let Some(scope_diagnostics) = result.diagnostics() {
-            diagnostics.extend(scope_diagnostics);
+            diagnostics.extend_scope(scope_diagnostics, |source| {
+                body.as_ref()
+                    .is_some_and(|body| body.excludes_unknown_keyword(db, source))
+            });
+        }
+        if let Some(body) = body {
+            body.collect_diagnostics(&mut body_diagnostics);
         }
         implicit_aliases.extend_from_slice(result.implicit_aliases());
     }
@@ -306,16 +326,6 @@ pub fn check_types_with_overload_bodies<'db>(
         implicit_aliases.extend_from_slice(&inference.implicit_aliases);
     }
 
-    let mut checked_functions = FxHashSet::default();
-    let mut body_diagnostics = TypeCheckDiagnostics::default();
-    for function in functions {
-        if function.program_file(db) != file || !checked_functions.insert(function) {
-            continue;
-        }
-        for domain in infer::overload_body_diagnostics(db, function) {
-            body_diagnostics.extend_overload_domains(&domain);
-        }
-    }
     if body_diagnostics.has_diagnostics_or_used_suppressions() {
         reported.extend((&diagnostics).into_iter().filter_map(diagnostic_key));
         diagnostics.extend_filtered(&body_diagnostics, |diagnostic| {

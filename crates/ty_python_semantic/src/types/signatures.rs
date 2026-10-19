@@ -6304,6 +6304,12 @@ impl<'db> Parameters<'db> {
             .find(|(_, parameter)| parameter.callable_by_name(name))
     }
 
+    /// Return the named or variadic parameter that accepts this keyword.
+    pub(crate) fn matching_keyword(&self, name: &str) -> Option<(usize, &Parameter<'db>)> {
+        self.keyword_by_name(name)
+            .or_else(|| self.keyword_variadic())
+    }
+
     /// Return the keywords parameter (`**kwargs`), if any, and its index, or `None`.
     pub(crate) fn keyword_variadic(&self) -> Option<(usize, &Parameter<'db>)> {
         self.iter()

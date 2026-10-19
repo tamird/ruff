@@ -7,6 +7,8 @@
 use itertools::Itertools;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
+use ruff_python_ast::find_node::covering_node;
+use ruff_text_size::Ranged;
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
 use ty_python_core::scope::ScopeId;
@@ -18,9 +20,12 @@ use super::{
     ScopeInference, StatementInferenceInner, TypeContext, infer_definition_region,
     infer_definition_types, infer_expression_region, infer_scope_region, infer_statement_region,
 };
+use crate::reachability::{ReachabilityEvaluationCache, is_range_reachable_in_domain};
 use crate::semantic_model::HasType;
 use crate::types::call::Argument;
 use crate::types::constraints::ConstraintSetBuilder;
+use crate::types::diagnostic::UnknownKeywordArgument;
+use crate::types::dictionary::DictionaryItems;
 use crate::types::function::{KnownFunction, OverloadLiteral};
 use crate::types::generics::Specialization;
 use crate::types::signatures::{
@@ -74,13 +79,119 @@ pub fn check_overload_body<'db>(
     Ok(diagnostics)
 }
 
-pub(crate) fn overload_body_diagnostics<'db>(
-    db: &'db dyn Db,
-    function: FunctionType<'db>,
-) -> impl Iterator<Item = TypeCheckDiagnostics> + 'db {
-    let count = overload_family(db, function).map_or(0, |(overloads, _)| overloads.len());
-    // Unsupported domains have no additional proof. Each remaining domain is still checked.
-    (0..count).filter_map(move |index| check_overload_body(db, function, index).ok())
+pub(crate) struct CheckedOverloadBody<'db> {
+    domains: Vec<(FunctionBodyDomain<'db>, &'db ScopeInference<'db>)>,
+    complete: bool,
+}
+
+impl<'db> CheckedOverloadBody<'db> {
+    pub(crate) fn new(db: &'db dyn Db, function: FunctionType<'db>) -> Self {
+        let count = overload_family(db, function).map_or(0, |(overloads, _)| overloads.len());
+        let domains: Vec<_> = (0..count)
+            .filter_map(|index| {
+                let domain = prepare_body_domain(db, function, index).ok()?;
+                Some((domain, infer_body_scope(db, domain)))
+            })
+            .collect();
+        Self {
+            complete: count > 0 && domains.len() == count,
+            domains,
+        }
+    }
+
+    pub(crate) fn collect_diagnostics(&self, diagnostics: &mut TypeCheckDiagnostics) {
+        for (_, inference) in &self.domains {
+            if let Some(domain_diagnostics) = inference.diagnostics() {
+                diagnostics.extend_overload_domains(domain_diagnostics);
+            }
+        }
+    }
+
+    pub(crate) fn excludes_unknown_keyword(
+        &self,
+        db: &'db dyn Db,
+        source: &UnknownKeywordArgument,
+    ) -> bool {
+        let Some((first, _)) = self.domains.first().filter(|_| self.complete) else {
+            return false;
+        };
+        let scope = first.scope(db);
+        let file = scope.program_file(db);
+        if source.call.file() != file.file(db) || source.scope != scope.file_scope_id(db) {
+            return false;
+        }
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let Some(function) = scope.node(db).as_function() else {
+            return false;
+        };
+        let function = function.node(&module);
+        if !function.range().contains_range(source.call.range()) {
+            return false;
+        }
+        let ast::AnyNodeRef::ExprCall(call) =
+            covering_node(function.into(), source.call.range()).node()
+        else {
+            return false;
+        };
+        if call.range() != source.call.range() {
+            return false;
+        }
+        let Some(ast::ArgOrKeyword::Keyword(keyword)) = call
+            .arguments
+            .iter_source_order()
+            .nth(source.argument_index)
+        else {
+            return false;
+        };
+        if keyword.arg.is_some() {
+            return false;
+        }
+        let env = ProgramEnvironment::from_file(file);
+        let index = semantic_index(db, file);
+        let file_scope = scope.file_scope_id(db);
+        self.domains.iter().all(|(domain, inference)| {
+            if inference.fallback_type().is_some() {
+                return false;
+            }
+            if !is_range_reachable_in_domain(db, index, file_scope, call.range(), Some(*domain)) {
+                return true;
+            }
+            if inference
+                .try_expression_type(&call.func)
+                .is_some_and(|callee| callee.bindings(db, &env).accepts_keyword_name(&source.name))
+            {
+                return true;
+            }
+            let Some(argument_type) = inference.try_expression_type(&keyword.value) else {
+                return false;
+            };
+            DictionaryItems::expression_or_observed(
+                db,
+                &env,
+                scope,
+                &keyword.value,
+                Some(*domain),
+                &mut |expression| inference.try_expression_type(expression),
+                || {
+                    let reachability = ReachabilityEvaluationCache::new(
+                        scope,
+                        index.use_def_map(file_scope).reachability_constraints(),
+                    )
+                    .with_body_domain(Some(*domain));
+                    DictionaryItems::observed(
+                        db,
+                        scope,
+                        &keyword.value,
+                        argument_type,
+                        &reachability,
+                    )
+                },
+            )
+            .is_ok_and(|items| {
+                items.is_complete() && items.items.iter().all(|item| item.name != source.name)
+            })
+        })
+    }
 }
 
 /// Identity and entry bindings validated by `prepare_body_domain`.
@@ -2819,6 +2930,174 @@ mod tests {
             for detail in details {
                 assert!(combined[0].sub_diagnostics().contains(detail));
             }
+        }
+        Ok(())
+    }
+
+    const CORRELATED_KEYWORD_SOURCE: &str = indoc::indoc! {"
+        from typing import Literal, overload
+        from typing_extensions import NotRequired, TypedDict, Unpack
+        class Common(TypedDict, closed=True):
+            tag: NotRequired[str]
+        class Executable(TypedDict, closed=True):
+            tag: NotRequired[str]
+            args: NotRequired[list[str]]
+        def regular(**kwargs: Unpack[Common]) -> None: ...
+        def executable(**kwargs: Unpack[Executable]) -> None: ...
+        @overload
+        def f(flag: Literal[False], **kwargs: Unpack[Common]) -> None: ...
+        @overload
+        def f(flag: Literal[True], **kwargs: Unpack[Executable]) -> None: ...
+        def f(flag: bool, **kwargs: Unpack[Executable]) -> None:
+            selected = executable if flag else regular
+            selected(**kwargs)
+    "};
+
+    #[test]
+    fn selected_overloads_check_correlated_call_arguments() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let callable_objects = CORRELATED_KEYWORD_SOURCE
+            .replace(
+                "def regular(**kwargs: Unpack[Common]) -> None: ...",
+                "class RegularRule:\n    def __call__(self, **kwargs: Unpack[Common]) -> None: ...\nregular = RegularRule()",
+            )
+            .replace(
+                "def executable(**kwargs: Unpack[Executable]) -> None: ...",
+                "class ExecutableRule:\n    def __call__(self, **kwargs: Unpack[Executable]) -> None: ...\nexecutable = ExecutableRule()",
+            );
+        for source in [CORRELATED_KEYWORD_SOURCE, callable_objects.as_str()] {
+            db.write_file("/src/body.py", source)?;
+            let f = function(&db);
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            assert_eq!(ordinary.len(), 1, "{ordinary:#?}");
+            assert_eq!(ordinary[0].id().as_str(), "unknown-argument");
+            let selected = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
+            assert!(selected.is_empty(), "{selected:#?}");
+        }
+
+        for call in [
+            "selected(**dict(kwargs, args=['value']))",
+            "copied = dict(kwargs, args=['value'])\n    selected(**copied)",
+        ] {
+            db.write_file(
+                "/src/body.py",
+                CORRELATED_KEYWORD_SOURCE.replace("selected(**kwargs)", call),
+            )?;
+            let f = function(&db);
+            let selected = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
+            assert_eq!(selected.len(), 1, "{call}: {selected:#?}");
+            assert_eq!(selected[0].id().as_str(), "unknown-argument");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_overloads_preserve_keyword_suppression_ownership() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        for (call, expected) in [
+            (
+                "selected(**kwargs)  # ty: ignore[unknown-argument]",
+                Some("unused-ignore-comment"),
+            ),
+            ("selected(**kwargs); missing_name  # ty: ignore", None),
+        ] {
+            db.write_file(
+                "/src/body.py",
+                CORRELATED_KEYWORD_SOURCE.replace("selected(**kwargs)", call),
+            )?;
+            let f = function(&db);
+            let selected = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
+            let actual: Vec<_> = selected
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            assert_eq!(
+                actual,
+                expected.into_iter().collect::<Vec<_>>(),
+                "{call}: {selected:#?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_overloads_distinguish_keywords_at_one_spread() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = CORRELATED_KEYWORD_SOURCE
+            .replace(
+                "class Executable(TypedDict, closed=True):",
+                "class Executable(TypedDict, closed=True):\n    bad: NotRequired[int]",
+            )
+            .replace(
+                "def executable(**kwargs: Unpack[Executable])",
+                "class Accepted(TypedDict, closed=True):\n    tag: NotRequired[str]\n    args: NotRequired[list[str]]\ndef executable(**kwargs: Unpack[Accepted])",
+            );
+        db.write_file("/src/body.py", source)?;
+        let f = function(&db);
+        let selected = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
+        assert!(!selected.is_empty());
+        assert!(
+            selected.iter().all(|diagnostic| {
+                diagnostic.id().as_str() == "unknown-argument"
+                    && diagnostic.headline_message().to_string().contains("`bad`")
+            }),
+            "{selected:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_overloads_keep_unknown_keywords_without_proof() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let dynamic = CORRELATED_KEYWORD_SOURCE
+            .replace(
+                "from typing import Literal, overload",
+                "from typing import Any, Literal, overload",
+            )
+            .replace("def regular(", "dynamic: Any = ...\ndef regular(")
+            .replace(
+                "selected = executable if flag else regular",
+                "selected = dynamic if flag else regular",
+            );
+        let incomplete = CORRELATED_KEYWORD_SOURCE.replace(
+            "flag: Literal[True], **kwargs:",
+            "flag: Literal[True], *rest: object, **kwargs:",
+        );
+        let forwarded = CORRELATED_KEYWORD_SOURCE
+            .replace(
+                "from typing import Literal, overload",
+                "from typing import Callable, Literal, overload",
+            )
+            .replace(
+                "def regular(",
+                "def forward[**P](callback: Callable[P, object], /, *args: P.args, **kwargs: P.kwargs) -> object: ...\ndef regular(",
+            )
+            .replace("selected(**kwargs)", "forward(regular, **kwargs)");
+        for (case, source, admitted) in [
+            ("dynamic callee", dynamic, [true, true]),
+            ("unsupported overload", incomplete, [true, false]),
+            ("forwarded ParamSpec", forwarded, [true, true]),
+        ] {
+            db.write_file("/src/body.py", source)?;
+            let f = function(&db);
+            assert_eq!(
+                [0, 1].map(|index| check_overload_body(&db, f, index).is_ok()),
+                admitted,
+                "{case}",
+            );
+            let ordinary = crate::types::check_types(&db, f.program_file(&db));
+            let unknown = ordinary
+                .iter()
+                .filter(|diagnostic| diagnostic.id().as_str() == "unknown-argument")
+                .collect::<Vec<_>>();
+            assert!(!unknown.is_empty(), "{case}: {ordinary:#?}");
+            let selected = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
+            assert!(
+                unknown
+                    .iter()
+                    .all(|diagnostic| selected.contains(diagnostic)),
+                "{case}: {selected:#?}"
+            );
         }
         Ok(())
     }

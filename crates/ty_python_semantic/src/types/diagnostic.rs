@@ -60,6 +60,7 @@ use ruff_python_ast::{self as ast, AnyNodeRef, HasNodeIndex, PythonVersion, Stri
 use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::fmt::{self, Formatter};
 use ty_module_resolver::{
     ImportingFile, KnownModule, Module, ModuleName, SearchPath, file_to_module,
@@ -67,6 +68,7 @@ use ty_module_resolver::{
 };
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
 use ty_python_core::place::{PlaceTable, ScopedPlaceId};
+use ty_python_core::scope::FileScopeId;
 use ty_python_core::{ProgramFile, global_scope, place_table, use_def_map};
 
 const RUNTIME_CHECKABLE_DOCS_URL: &str =
@@ -1445,6 +1447,28 @@ declare_lint! {
 pub struct TypeCheckDiagnostics {
     diagnostics: Vec<Diagnostic>,
     used_suppressions: FxHashSet<FileSuppressionId>,
+    keyword_arguments: Option<Box<SmallVec<[KeywordArgumentDiagnostic; 1]>>>,
+}
+
+/// A concrete name rejected while binding a source `**` argument.
+#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
+pub(super) struct UnknownKeywordArgument {
+    pub(super) call: FileRange,
+    pub(super) scope: FileScopeId,
+    pub(super) argument_index: usize,
+    pub(super) name: Name,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
+struct KeywordArgumentDiagnostic {
+    source: UnknownKeywordArgument,
+    outcome: KeywordArgumentOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize)]
+enum KeywordArgumentOutcome {
+    Diagnostic(usize),
+    Suppression(FileSuppressionId),
 }
 
 pub(crate) fn report_mismatched_type_name<'db>(
@@ -1480,8 +1504,84 @@ impl TypeCheckDiagnostics {
     }
 
     pub(super) fn extend(&mut self, other: &TypeCheckDiagnostics) {
+        let offset = self.diagnostics.len();
         self.diagnostics.extend_from_slice(&other.diagnostics);
         self.used_suppressions.extend(&other.used_suppressions);
+        if let Some(other_arguments) = &other.keyword_arguments {
+            self.keyword_arguments
+                .get_or_insert_with(Box::default)
+                .extend(other_arguments.iter().cloned().map(|mut argument| {
+                    if let KeywordArgumentOutcome::Diagnostic(index) = &mut argument.outcome {
+                        *index += offset;
+                    }
+                    argument
+                }));
+        }
+    }
+
+    pub(super) fn extend_unknown_keyword(
+        &mut self,
+        source: UnknownKeywordArgument,
+        other: TypeCheckDiagnostics,
+    ) {
+        let outcome = if other.diagnostics.len() == 1 && other.used_suppressions.is_empty() {
+            KeywordArgumentOutcome::Diagnostic(self.diagnostics.len())
+        } else if other.diagnostics.is_empty()
+            && let Ok(id) = other.used_suppressions.iter().copied().exactly_one()
+        {
+            KeywordArgumentOutcome::Suppression(id)
+        } else {
+            self.extend(&other);
+            return;
+        };
+        debug_assert!(other.keyword_arguments.is_none());
+        self.diagnostics.extend(other.diagnostics);
+        self.keyword_arguments
+            .get_or_insert_with(Box::default)
+            .push(KeywordArgumentDiagnostic { source, outcome });
+    }
+
+    /// Collect a scope's diagnostics, omitting only matcher occurrences proven impossible.
+    pub(super) fn extend_scope(
+        &mut self,
+        other: &TypeCheckDiagnostics,
+        mut exclude: impl FnMut(&UnknownKeywordArgument) -> bool,
+    ) {
+        let Some(arguments) = &other.keyword_arguments else {
+            self.extend(other);
+            return;
+        };
+        let mut excluded = FxHashSet::default();
+        for argument in arguments.iter() {
+            if exclude(&argument.source) {
+                if let KeywordArgumentOutcome::Diagnostic(index) = argument.outcome {
+                    excluded.insert(index);
+                }
+            } else if let KeywordArgumentOutcome::Suppression(id) = argument.outcome {
+                self.used_suppressions.insert(id);
+            }
+        }
+        self.diagnostics.extend(
+            other
+                .diagnostics
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !excluded.contains(index))
+                .map(|(_, diagnostic)| diagnostic.clone()),
+        );
+        self.used_suppressions.extend(&other.used_suppressions);
+    }
+
+    fn suppression_ids(&self) -> impl Iterator<Item = FileSuppressionId> + '_ {
+        self.used_suppressions.iter().copied().chain(
+            self.keyword_arguments
+                .iter()
+                .flat_map(|arguments| arguments.iter())
+                .filter_map(|argument| match argument.outcome {
+                    KeywordArgumentOutcome::Diagnostic(_) => None,
+                    KeywordArgumentOutcome::Suppression(id) => Some(id),
+                }),
+        )
     }
 
     /// Extend with selected diagnostics while retaining all used suppressions.
@@ -1496,7 +1596,7 @@ impl TypeCheckDiagnostics {
                 .filter(|diagnostic| include(diagnostic))
                 .cloned(),
         );
-        self.used_suppressions.extend(&other.used_suppressions);
+        self.used_suppressions.extend(other.suppression_ids());
     }
 
     /// Group failures at the same operation while retaining every distinct overload explanation.
@@ -1534,7 +1634,7 @@ impl TypeCheckDiagnostics {
                 self.diagnostics.push(diagnostic.clone());
             }
         }
-        self.used_suppressions.extend(&other.used_suppressions);
+        self.used_suppressions.extend(other.suppression_ids());
     }
 
     pub(super) fn extend_diagnostics(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
@@ -1593,15 +1693,27 @@ impl TypeCheckDiagnostics {
 
     pub(crate) fn is_used(&self, suppression_id: FileSuppressionId) -> bool {
         self.used_suppressions.contains(&suppression_id)
+            || self.keyword_arguments.as_ref().is_some_and(|arguments| {
+                arguments.iter().any(|argument| {
+                    argument.outcome == KeywordArgumentOutcome::Suppression(suppression_id)
+                })
+            })
     }
 
     pub(crate) fn used_len(&self) -> usize {
-        self.used_suppressions.len()
+        if self.keyword_arguments.is_none() {
+            self.used_suppressions.len()
+        } else {
+            self.suppression_ids().collect::<FxHashSet<_>>().len()
+        }
     }
 
     pub(crate) fn shrink_to_fit(&mut self) {
         self.used_suppressions.shrink_to_fit();
         self.diagnostics.shrink_to_fit();
+        if let Some(arguments) = &mut self.keyword_arguments {
+            arguments.shrink_to_fit();
+        }
     }
 
     pub(crate) fn into_diagnostics(self) -> Vec<Diagnostic> {
@@ -1609,7 +1721,9 @@ impl TypeCheckDiagnostics {
     }
 
     pub(crate) fn has_diagnostics_or_used_suppressions(&self) -> bool {
-        !self.diagnostics.is_empty() || !self.used_suppressions.is_empty()
+        !self.diagnostics.is_empty()
+            || !self.used_suppressions.is_empty()
+            || self.keyword_arguments.is_some()
     }
 
     pub(crate) fn is_empty(&self) -> bool {

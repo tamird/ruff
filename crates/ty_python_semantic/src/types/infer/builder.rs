@@ -10487,7 +10487,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut bindings = match bindings_result {
             Ok(()) => bindings,
             Err(_) => {
-                bindings.report_diagnostics(&self.context, call_expression.into());
+                bindings.report_explicit_call_diagnostics(&self.context, call_expression);
                 self.refine_provided_call_results(
                     call_expression,
                     &call_arguments,

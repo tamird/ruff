@@ -48,7 +48,7 @@ use crate::types::diagnostic::{
     CALL_NON_CALLABLE, CALL_TOP_CALLABLE, INVALID_ARGUMENT_TYPE, INVALID_DATACLASS,
     MISSING_ARGUMENT, NO_MATCHING_OVERLOAD, PARAMETER_ALREADY_ASSIGNED,
     POSITIONAL_ONLY_PARAMETER_AS_KWARG, TOO_MANY_POSITIONAL_ARGUMENTS, UNKNOWN_ARGUMENT,
-    add_invariant_generic_hints, note_numbers_module_not_supported,
+    UnknownKeywordArgument, add_invariant_generic_hints, note_numbers_module_not_supported,
 };
 use crate::types::enums::is_enum_class;
 use crate::types::function::{
@@ -91,6 +91,7 @@ use crate::types::{
 use crate::types::{DictionaryItemKind, ProgramEnvironment};
 use crate::{DisplaySettings, FxOrderSet};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
+use ruff_db::files::FileRange;
 use ruff_python_ast::{self as ast, AnyNodeRef, ArgOrKeyword, PythonVersion};
 use ty_python_core::definition::Definition;
 use ty_python_core::{ProgramFile, semantic_index};
@@ -114,6 +115,7 @@ struct CallDiagnosticContext<'context, 'overrides, 'db, 'ast> {
     context: &'context InferContext<'db, 'ast>,
     overrides: Option<&'context CallDiagnosticOverride<'overrides>>,
     argument_index_offset: usize,
+    capture_unknown_keywords: bool,
 }
 
 impl<'db> CallDiagnosticContext<'_, '_, 'db, '_> {
@@ -1732,6 +1734,20 @@ impl<'db> Bindings<'db> {
         }
     }
 
+    /// Whether a single concrete callable accepts this keyword name.
+    pub(crate) fn accepts_keyword_name(&self, name: &str) -> bool {
+        let Some(CallableItem::Regular(callable)) = self.single_item() else {
+            return false;
+        };
+        let [binding] = callable.overloads() else {
+            return false;
+        };
+        let parameters = binding.signature.parameters();
+        !callable.dunder_call_is_possibly_unbound
+            && parameters.is_standard()
+            && parameters.matching_keyword(name).is_some()
+    }
+
     pub(crate) fn callable_type(&self) -> Type<'db> {
         self.callable_type
     }
@@ -1786,8 +1802,29 @@ impl<'db> Bindings<'db> {
                 context,
                 overrides: None,
                 argument_index_offset: 0,
+                capture_unknown_keywords: false,
             },
             node,
+        );
+    }
+
+    pub(crate) fn report_explicit_call_diagnostics(
+        &self,
+        context: &InferContext<'db, '_>,
+        call: &ast::ExprCall,
+    ) {
+        self.report_diagnostics_impl(
+            &CallDiagnosticContext {
+                context,
+                overrides: None,
+                argument_index_offset: 0,
+                // An object's `__call__` receives the source arguments. Constructor bindings
+                // may additionally report errors from a downstream implicit call.
+                capture_unknown_keywords: self
+                    .iter_callable_items()
+                    .all(|item| matches!(item, CallableItem::Regular(_))),
+            },
+            call.into(),
         );
     }
 
@@ -1802,6 +1839,7 @@ impl<'db> Bindings<'db> {
                 context,
                 overrides: Some(overrides),
                 argument_index_offset: 0,
+                capture_unknown_keywords: false,
             },
             node,
         );
@@ -1855,6 +1893,7 @@ impl<'db> Bindings<'db> {
             if !reported_ctor_init_callables.insert(callable) {
                 continue;
             }
+            debug_assert!(!context.capture_unknown_keywords);
             downstream_bindings.report_diagnostics_impl(context, node);
         }
     }
@@ -5570,11 +5609,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         name: &str,
         skip_unknown_keywords: bool,
     ) -> Result<(), ()> {
-        let Some((parameter_index, parameter)) = self
-            .parameters
-            .keyword_by_name(name)
-            .or_else(|| self.parameters.keyword_variadic())
-        else {
+        let Some((parameter_index, parameter)) = self.parameters.matching_keyword(name) else {
             if let Some((parameter_index, parameter)) =
                 self.parameters.positional_only_by_name(name)
             {
@@ -10399,24 +10434,56 @@ impl<'db> BindingError<'db> {
                 argument_name,
                 argument_index,
             } => {
-                let range = context.get_range(node, *argument_index);
-                if let Some(builder) = context.report_lint(&UNKNOWN_ARGUMENT, range) {
-                    let mut diag = builder.into_diagnostic(format_args!(
-                        "Argument `{argument_name}` does not match any known parameter{}",
-                        callable_description
-                            .map(|description| format!(" of {description}"))
-                            .unwrap_or_default()
-                    ));
-                    if let Some(compound_diag) = compound_diag {
-                        compound_diag.add_context(db, env, &mut diag);
-                    } else if let Some(spans) = callable_ty.function_spans(context.db()) {
-                        let mut sub = SubDiagnostic::new(
-                            SubDiagnosticSeverity::Info,
-                            format_args!("{callable_kind} signature here"),
-                        );
-                        sub.annotate(Annotation::primary(spans.signature));
-                        diag.sub(sub);
+                let report = |context: &CallDiagnosticContext<'_, '_, 'db, '_>| {
+                    let range = context.get_range(node, *argument_index);
+                    if let Some(builder) = context.report_lint(&UNKNOWN_ARGUMENT, range) {
+                        let mut diag = builder.into_diagnostic(format_args!(
+                            "Argument `{argument_name}` does not match any known parameter{}",
+                            callable_description
+                                .map(|description| format!(" of {description}"))
+                                .unwrap_or_default()
+                        ));
+                        if let Some(compound_diag) = compound_diag {
+                            compound_diag.add_context(db, env, &mut diag);
+                        } else if let Some(spans) = callable_ty.function_spans(context.db()) {
+                            let mut sub = SubDiagnostic::new(
+                                SubDiagnosticSeverity::Info,
+                                format_args!("{callable_kind} signature here"),
+                            );
+                            sub.annotate(Annotation::primary(spans.signature));
+                            diag.sub(sub);
+                        }
                     }
+                };
+                if context.capture_unknown_keywords
+                    && context.body_domain.is_none()
+                    && let Some(argument_index) = *argument_index
+                    && let ast::AnyNodeRef::ExprCall(call) = node
+                    && let Some(ast::ArgOrKeyword::Keyword(keyword)) =
+                        call.arguments.iter_source_order().nth(argument_index)
+                    && keyword.arg.is_none()
+                    && context.scope().node(db).as_function().is_some()
+                    && semantic_index(db, context.program_file())
+                        .try_expression_scope_id(call.func.as_ref())
+                        == Some(context.scope().file_scope_id(db))
+                    && context.is_range_reachable(context.get_range(node, Some(argument_index)))
+                {
+                    let source = UnknownKeywordArgument {
+                        call: FileRange::new(context.file(), call.range()),
+                        scope: context.scope().file_scope_id(db),
+                        argument_index,
+                        name: argument_name.clone(),
+                    };
+                    context.capture_unknown_keyword(source, |inner| {
+                        report(&CallDiagnosticContext {
+                            context: inner,
+                            overrides: None,
+                            argument_index_offset: 0,
+                            capture_unknown_keywords: false,
+                        });
+                    });
+                } else {
+                    report(context);
                 }
             }
 
@@ -10697,6 +10764,7 @@ impl<'db> BindingError<'db> {
                     context: context.context,
                     overrides: context.overrides,
                     argument_index_offset: error.argument_index_offset,
+                    capture_unknown_keywords: false,
                 };
                 error.bindings.report_diagnostics_impl(&context, node);
             }

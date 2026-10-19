@@ -18,6 +18,7 @@ use crate::diagnostic::DiagnosticGuard;
 use crate::importer::Importer;
 use crate::lint::LintSource;
 use crate::reachability::is_range_reachable_in_domain;
+use crate::types::diagnostic::UnknownKeywordArgument;
 use crate::types::function::FunctionDecorators;
 use crate::types::infer::{FunctionBodyDomain, InferenceFlags};
 use crate::{
@@ -256,6 +257,28 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
 
     pub(crate) fn extend(&mut self, other: &TypeCheckDiagnostics) {
         self.diagnostics.get_mut().extend(other);
+    }
+
+    pub(super) fn capture_unknown_keyword(
+        &self,
+        source: UnknownKeywordArgument,
+        report: impl FnOnce(&Self),
+    ) {
+        debug_assert!(self.body_domain.is_none());
+        let mut context = Self::new(
+            self.db,
+            self.program_environment,
+            self.scope,
+            self.file,
+            self.program_file,
+            self.module,
+        );
+        context.diagnostics_suppressed = self.diagnostics_suppressed;
+        context.inference_flags = self.inference_flags;
+        report(&context);
+        self.diagnostics
+            .borrow_mut()
+            .extend_unknown_keyword(source, context.finish_uncompacted());
     }
 
     /// Whether diagnostics inferred separately for a referenced alias should be collected.
