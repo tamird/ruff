@@ -8275,6 +8275,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             .or_insert(variance);
                         CandidateSolutions::preliminary_solve(db, env, &constraints, path_bound)
                     });
+                    let compatible = !matches!(&solutions, Solutions::Unsatisfiable(_));
 
                     match solutions {
                         // If the type context is not compatible with the collection type (e.g., a
@@ -8323,6 +8324,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             // for typevars with actual type context constraints.
                             elt_tcx_variance
                                 .retain(|identity, _| elt_tcx_constraints.contains_key(identity));
+                        }
+                    }
+
+                    if compatible && elts.is_empty() && has_unspecialized_context {
+                        // Provisional context slots impose no relation constraints. An empty
+                        // literal has no element evidence either, so keep its unresolved slots
+                        // provisional until the call can provide final context.
+                        for typevar in generic_context.variables(db) {
+                            elt_tcx_constraints
+                                .entry(typevar.identity(db))
+                                .or_insert_with(|| {
+                                    UnionAccumulator::new(Type::Dynamic(
+                                        DynamicType::UnspecializedTypeVar,
+                                    ))
+                                });
                         }
                     }
                 }

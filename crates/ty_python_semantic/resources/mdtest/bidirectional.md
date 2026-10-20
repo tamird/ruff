@@ -4508,3 +4508,71 @@ def gradual(any_value: Any, unknown: Unknown):
     reveal_type(a[1])  # revealed: Any
     reveal_type(u[1])  # revealed: Unknown
 ```
+
+## Empty collections with abstract generic context
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Literal, Mapping, Protocol, Sequence, overload
+from ty_extensions._internal import Unknown
+
+def capture[K: str = str, V: int = int](value: Mapping[K, V]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def partial[V: int](value: Mapping[str, V]) -> V:
+    raise NotImplementedError
+
+def sequence[T: str](value: Sequence[T]) -> T:
+    raise NotImplementedError
+
+def unbounded[T](value: Sequence[T]) -> T:
+    raise NotImplementedError
+
+def sibling[T: str](value: Sequence[T], seed: T) -> T:
+    return seed
+
+def constrained[T: (str, int)](value: Sequence[T]) -> T:
+    raise NotImplementedError
+
+reveal_type(capture({}))  # revealed: tuple[str, int]
+reveal_type(capture(dict()))  # revealed: tuple[str, int]
+reveal_type(partial({}))  # revealed: int
+reveal_type(sequence([]))  # revealed: str
+reveal_type(unbounded([]))  # revealed: Unknown
+reveal_type(sibling([], "seed"))  # revealed: str
+reveal_type(constrained([]))  # revealed: Unknown
+reveal_type(capture({"key": 1}))  # revealed: tuple[str, int]
+capture({42: 1})  # error: [invalid-argument-type]
+capture({"key": "wrong"})  # error: [invalid-argument-type]
+
+def gradual(value: Mapping[Any, Any], unknown: Mapping[Unknown, Unknown]) -> None:
+    reveal_type(capture(value))  # revealed: tuple[Any, Any]
+    reveal_type(capture(unknown))  # revealed: tuple[Unknown, Unknown]
+
+stored = {}
+stored[42] = "value"
+reveal_type(stored)  # revealed: dict[int, str]
+capture(stored)  # error: [invalid-argument-type]
+
+@overload
+def choose[T: str](value: Sequence[T], kind: Literal["string"]) -> T: ...
+@overload
+def choose[T: int](value: Sequence[T], kind: Literal["integer"]) -> T: ...
+def choose(value: Sequence[object], kind: str) -> object:
+    raise NotImplementedError
+
+reveal_type(choose([], "integer"))  # revealed: int
+reveal_type(choose([], "string"))  # revealed: str
+
+class Unrelated[T](Protocol):
+    def __len__(self) -> int: ...
+
+def unrelated[T: str](value: Unrelated[T]) -> T:
+    raise NotImplementedError
+
+reveal_type(unrelated({}))  # revealed: Unknown
+```

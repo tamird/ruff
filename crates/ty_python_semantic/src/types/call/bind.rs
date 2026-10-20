@@ -9046,16 +9046,15 @@ impl<'db> Binding<'db> {
             }
         }
 
-        // The marker distinguishes unsolved type variables without defaults from gradual types
-        // inferred from arguments. Only the former are ignored during fixpoint iteration.
+        // An unsolved type variable contributes no argument evidence. Preserve that distinction
+        // from an inferred gradual type during iteration and when selecting the final context.
         let argument_specialization = match source {
             ArgumentTypeContextSource::All => self.inference,
             ArgumentTypeContextSource::WithoutArguments => None,
         }
         .map(|inference| {
             inference.merged_specialization_with(db, |typevar, inferred| {
-                if mode.is_provisional() && inferred.is_none() && typevar.default_type(db).is_none()
-                {
+                if inferred.is_none() && typevar.default_type(db).is_none() {
                     TypeVarProjection::Override(Type::Dynamic(DynamicType::UnspecializedTypeVar))
                 } else {
                     TypeVarProjection::Inferred
