@@ -442,6 +442,57 @@ alice["extra"] = True
 bob["extra"] = True
 ```
 
+## Merging with built-in dictionaries
+
+A merge can preserve the value types from both dictionaries when the `TypedDict` bounds all of its
+values. An implicitly open `TypedDict` can contain hidden values of any type.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Any
+from typing_extensions import TypedDict
+
+class Closed(TypedDict, closed=True):
+    count: int
+
+class Extra(TypedDict, extra_items=str):
+    count: int
+
+class Open(TypedDict):
+    count: int
+
+class Other(TypedDict, closed=True):
+    name: str
+
+def accept_ints(values: dict[str, int]) -> None: ...
+def merge(closed: Closed, extra: Extra, open_: Open, other: dict[str, str], record: Other) -> None:
+    reveal_type(closed | other)  # revealed: dict[str, int | str]
+    reveal_type(other | closed)  # revealed: dict[str, int | str]
+    reveal_type(closed.__or__(other))  # revealed: dict[str, int | str]
+    reveal_type(extra | other)  # revealed: dict[str, int | str]
+    reveal_type(open_ | other)  # revealed: dict[str, object]
+    reveal_type(closed | record)  # revealed: dict[str, object]
+    # error: [invalid-argument-type]
+    accept_ints(closed | other)
+
+def merge_generic[T](closed: Closed, other: dict[str, T]) -> dict[str, int | T]:
+    return closed | other  # no diagnostic
+
+def merge_alternatives(closed: Closed, other: dict[str, str] | Other, gradual: dict[str, Any]) -> None:
+    reveal_type(closed | other)  # revealed: dict[str, int | str] | dict[str, object]
+    reveal_type(closed | gradual)  # revealed: dict[str, int | Any]
+
+class Recursive(TypedDict, closed=True):
+    child: "Recursive | None"
+
+def merge_recursive(record: Recursive, other: dict[str, int]) -> None:
+    record | other  # no diagnostic
+```
+
 ## Merging with empty built-in dictionaries
 
 An empty built-in dictionary leaves the `TypedDict` unchanged in either operand position:
@@ -495,7 +546,7 @@ The contents at the merge must still be empty after intervening writes:
 def mutated(record: Record):
     empty = {}
     empty["value"] = "wrong"
-    reveal_type(record | empty)  # revealed: dict[str, object]
+    reveal_type(record | empty)  # revealed: dict[str, int | str]
 ```
 
 Evaluating the other operand can also change the dictionary before the merge:
@@ -507,7 +558,7 @@ def populate(record: Record, empty: dict[str, str]) -> Record:
 
 def operand_effect(record: Record):
     empty = {}
-    reveal_type(empty | populate(record, empty))  # revealed: dict[str, object]
+    reveal_type(empty | populate(record, empty))  # revealed: dict[str, int | str]
 ```
 
 ## Unpacked assignments to `TypedDict` variables

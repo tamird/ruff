@@ -38,7 +38,6 @@ pub(super) fn synthesize_typed_dict_method<'db>(
     method_name: &str,
     fields: impl Fn() -> TypedDictFields<'db>,
 ) -> Option<Type<'db>> {
-    let instance_ty = Type::TypedDict(typed_dict);
     match method_name {
         "__init__" => Some(synthesize_typed_dict_init(db, env, typed_dict, fields())),
         "__getitem__" => Some(synthesize_typed_dict_getitem(db, env, typed_dict, fields())),
@@ -91,7 +90,7 @@ pub(super) fn synthesize_typed_dict_method<'db>(
         "__or__" | "__ror__" | "__ior__" => Some(synthesize_typed_dict_merge(
             db,
             env,
-            instance_ty,
+            typed_dict,
             method_name,
         )),
         _ => None,
@@ -769,100 +768,83 @@ fn synthesize_typed_dict_view_method<'db>(
 fn synthesize_typed_dict_merge<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
-    instance_ty: Type<'db>,
+    typed_dict: TypedDictType<'db>,
     name: &str,
 ) -> Type<'db> {
-    let mut overloads: smallvec::SmallVec<[Signature<'db>; 3]>;
-
-    let first_overload_value_ty = if name == "__ior__"
-        && let Type::TypedDict(typed_dict) = instance_ty
-    {
+    let instance_ty = Type::TypedDict(typed_dict);
+    let first_overload_value_ty = if name == "__ior__" {
         Type::TypedDict(typed_dict.to_update_patch(db))
     } else {
         instance_ty
     };
-
-    let first_overload_parameters = [
-        Parameter::positional_only(Some(Name::new_static("self"))).with_annotated_type(instance_ty),
-        Parameter::positional_only(Some(Name::new_static("value")))
-            .with_annotated_type(first_overload_value_ty),
-    ];
-
-    overloads = smallvec::smallvec![Signature::new(
-        Parameters::standard(first_overload_parameters),
-        instance_ty,
-    )];
+    let parameters = |value_ty| {
+        Parameters::standard([
+            Parameter::positional_only(Some(Name::new_static("self")))
+                .with_annotated_type(instance_ty),
+            Parameter::positional_only(Some(Name::new_static("value")))
+                .with_annotated_type(value_ty),
+        ])
+    };
+    let mut overloads: smallvec::SmallVec<[Signature<'db>; 4]> =
+        smallvec::smallvec![Signature::new(
+            parameters(first_overload_value_ty),
+            instance_ty,
+        )];
 
     if name != "__ior__" {
-        let partial_ty = if let Type::TypedDict(td) = instance_ty {
-            Type::TypedDict(if name == "__ror__" {
-                td.to_reflected_merge_patch(db)
-            } else {
-                td.to_partial(db)
-            })
+        let partial_ty = Type::TypedDict(if name == "__ror__" {
+            typed_dict.to_reflected_merge_patch(db)
         } else {
-            instance_ty
-        };
+            typed_dict.to_partial(db)
+        });
+        overloads.push(Signature::new(parameters(partial_ty), instance_ty));
 
+        let string_ty = KnownClass::Str.to_instance(db, env);
+        let dictionary =
+            |value_ty| KnownClass::Dict.to_specialized_instance(db, env, &[string_ty, value_ty]);
         let value_typevar = BoundTypeVarInstance::synthetic(
             db,
             env,
             Name::new_static("V"),
             TypeVarVariance::Invariant,
         );
-        let dict_param_ty = KnownClass::Dict.to_specialized_instance(
+        let other_typed_dict = Type::TypedDict(TypedDictType::from_schema_items(
             db,
-            env,
-            &[
-                KnownClass::Str.to_instance(db, env),
-                Type::TypeVar(value_typevar),
-            ],
-        );
-
-        let dict_return_ty = KnownClass::Dict.to_specialized_instance(
-            db,
-            env,
-            &[
-                KnownClass::Str.to_instance(db, env),
-                KnownClass::Object.to_instance(db, env),
-            ],
-        );
-
-        let overload_two_parameters = [
-            Parameter::positional_only(Some(Name::new_static("self")))
-                .with_annotated_type(instance_ty),
-            Parameter::positional_only(Some(Name::new_static("value")))
-                .with_annotated_type(partial_ty),
-        ];
-        overloads.push(Signature::new(
-            Parameters::standard(overload_two_parameters),
-            instance_ty,
+            TypedDictSchema::default(),
         ));
-
-        let overload_three_parameters = [
-            Parameter::positional_only(Some(Name::new_static("self")))
-                .with_annotated_type(instance_ty),
-            Parameter::positional_only(Some(Name::new_static("value"))).with_annotated_type(
+        let value_ty = typed_dict.value_type(db, env);
+        let (operand_ty, result_value_ty) = if value_ty.is_object() {
+            (
                 UnionType::from_two_elements(
                     db,
                     env,
-                    dict_param_ty,
-                    Type::TypedDict(TypedDictType::from_schema_items(
-                        db,
-                        TypedDictSchema::default(),
-                    )),
+                    dictionary(Type::TypeVar(value_typevar)),
+                    other_typed_dict,
                 ),
-            ),
-        ];
+                value_ty,
+            )
+        } else {
+            (
+                dictionary(Type::TypeVar(value_typevar)),
+                UnionType::from_two_elements(db, env, value_ty, Type::TypeVar(value_typevar)),
+            )
+        };
         overloads.push(Signature::new_generic(
             Some(GenericContext::from_typevar_instances(
                 db,
                 env,
                 [value_typevar],
             )),
-            Parameters::standard(overload_three_parameters),
-            dict_return_ty,
+            parameters(operand_ty),
+            dictionary(result_value_ty),
         ));
+        if !value_ty.is_object() {
+            // A TypedDict operand leaves V unconstrained, so it cannot share the precise return.
+            overloads.push(Signature::new(
+                parameters(other_typed_dict),
+                dictionary(Type::object()),
+            ));
+        }
     }
 
     Type::Callable(CallableType::new(
