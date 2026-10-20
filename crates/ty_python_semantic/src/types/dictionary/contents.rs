@@ -810,8 +810,16 @@ fn initial_contents<'db>(
     if StatementInference::Definition(owner, owner_inference).is_provisional() {
         return ContentsValue::Pending;
     }
+    let builtin_allocation = !owner_inference.discards_dict_key_assignments()
+        && value.is_some_and(|value| is_builtin_allocation(db, value, owner_inference));
     let observed = value
-        .filter(|_| !owner_inference.discards_dict_key_assignments())
+        .filter(|value| {
+            !owner_inference.discards_dict_key_assignments()
+                // A conditional can select an existing dictionary. Its contents describe the
+                // expression at this point, but later mutation through an alias can invalidate
+                // them. Only persist the observation when both arms allocate fresh dictionaries.
+                && (!matches!(value, ast::Expr::If(_)) || builtin_allocation)
+        })
         .map_or(Err(DictionaryFallback::Unavailable), |value| {
             DictionaryItems::expression(db, &env, scope, value, domain, &mut |expression| {
                 owner_inference.try_expression_type(expression)
@@ -834,8 +842,6 @@ fn initial_contents<'db>(
     {
         return ContentsValue::Unavailable;
     }
-    let builtin_allocation = !owner_inference.discards_dict_key_assignments()
-        && value.is_some_and(|value| is_builtin_allocation(db, value, owner_inference));
     let parent_preserved = if builtin_allocation && !shared && !place.is_symbol() {
         match parent_allows_seed(db, owner, domain) {
             KeyPreservation::Preserved => true,
@@ -1113,6 +1119,10 @@ fn is_builtin_allocation<'db>(
     match value {
         ast::Expr::Dict(_) => true,
         ast::Expr::DictComp(_) => true,
+        ast::Expr::If(conditional) => {
+            is_builtin_allocation(db, &conditional.body, inference)
+                && is_builtin_allocation(db, &conditional.orelse, inference)
+        }
         ast::Expr::Call(call) => inference
             .try_expression_type(&call.func)
             .and_then(Type::as_class_literal)

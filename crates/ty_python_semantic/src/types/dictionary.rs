@@ -604,6 +604,7 @@ impl<'db> DictionaryItems<'db> {
         contents::unpacked_keyword(db, scope, expression, call, name, reachability)
     }
 
+    /// Observe syntax whose result is a builtin dictionary.
     pub(crate) fn expression(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -613,6 +614,37 @@ impl<'db> DictionaryItems<'db> {
         expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
     ) -> DictionaryObservation<'db> {
         match expression {
+            ast::Expr::If(conditional) => {
+                let test_type = expression_type(&conditional.test);
+                if test_type.is_some_and(|ty| ty.resolve_type_alias(db).is_never()) {
+                    return Err(DictionaryFallback::Unreachable);
+                }
+                let truthiness = test_type
+                    .and_then(|ty| ty.bool_if_inhabited(db, env))
+                    .unwrap_or(Truthiness::Ambiguous);
+                let mut observe = |branch: &ast::Expr| {
+                    Self::builtin_source(
+                        db,
+                        env,
+                        scope,
+                        branch.into(),
+                        branch,
+                        domain,
+                        expression_type,
+                    )
+                };
+                match truthiness {
+                    Truthiness::AlwaysTrue => return observe(&conditional.body),
+                    Truthiness::AlwaysFalse => return observe(&conditional.orelse),
+                    Truthiness::Ambiguous => {}
+                }
+                match (observe(&conditional.body), observe(&conditional.orelse)) {
+                    (Ok(left), Ok(right)) => Ok(left.join(db, env, &right, false)),
+                    (Err(DictionaryFallback::Unreachable), other)
+                    | (other, Err(DictionaryFallback::Unreachable)) => other,
+                    _ => Err(DictionaryFallback::Unavailable),
+                }
+            }
             ast::Expr::BinOp(binary) => {
                 Self::union(db, env, scope, binary, domain, expression_type)
             }
