@@ -6171,9 +6171,12 @@ impl<'db> Parameters<'db> {
             )
     }
 
-    /// Returns `true` if the parameters are a complete standard parameter list (not gradual,
-    /// top, `ParamSpec`, or `Concatenate`).
-    pub(crate) fn is_standard(&self) -> bool {
+    /// Whether this is a standard parameter list, rather than an incomplete, gradual, top,
+    /// `ParamSpec`, or `Concatenate` form.
+    ///
+    /// This describes the list's stored form. A standard list may contain variadic parameters or
+    /// parameters with gradual types and belong to a generic signature; normalization is separate.
+    pub fn is_standard(&self) -> bool {
         matches!(self.data.kind, ParametersKind::Standard)
     }
 
