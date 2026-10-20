@@ -723,22 +723,46 @@ fn supported_body(
         })
     }
 
+    fn function_callee(db: &dyn Db, function: FunctionType<'_>, callee: FunctionType<'_>) -> bool {
+        callee != function
+            && !matches!(
+                callee.known(db),
+                Some(KnownFunction::NewClass | KnownFunction::NamedTuple)
+            )
+    }
+
     fn nonlocal_callee(db: &dyn Db, function: FunctionType<'_>, value: &ast::Expr) -> bool {
         let model = SemanticModel::new(db, function.program_file(db));
         match value.inferred_type(&model) {
             Some(Type::ClassLiteral(class)) => [KnownClass::List, KnownClass::Dict]
                 .into_iter()
                 .any(|known| class.is_known(db, known)),
-            Some(Type::FunctionLiteral(callee)) => {
-                callee != function
-                    && !matches!(
-                        callee.known(db),
-                        Some(KnownFunction::NewClass | KnownFunction::NamedTuple)
-                    )
-            }
+            Some(Type::FunctionLiteral(callee)) => function_callee(db, function, callee),
             Some(ty) => callable_entry(db, &model.program_environment(), ty),
             None => false,
         }
+    }
+
+    fn stored_function_callee(
+        db: &dyn Db,
+        function: FunctionType<'_>,
+        attribute: &ast::ExprAttribute,
+    ) -> bool {
+        let model = SemanticModel::new(db, function.program_file(db));
+        let Some(Type::FunctionLiteral(callee)) = attribute.inferred_type(&model) else {
+            return false;
+        };
+        function_callee(db, function, callee)
+            && attribute
+                .value
+                .inferred_type(&model)
+                .is_some_and(|receiver| {
+                    receiver.has_immutable_field_path(
+                        db,
+                        &model.program_environment(),
+                        std::slice::from_ref(&attribute.attr.id),
+                    )
+                })
     }
 
     fn assigned_callee(
@@ -908,7 +932,8 @@ fn supported_body(
                     ast::Expr::Attribute(attribute) => {
                         if !expression(db, function, locals, callees, &attribute.value)
                             || !(collection_method(db, function, attribute)
-                                || protocol_method(db, function, attribute))
+                                || protocol_method(db, function, attribute)
+                                || stored_function_callee(db, function, attribute))
                         {
                             return false;
                         }
