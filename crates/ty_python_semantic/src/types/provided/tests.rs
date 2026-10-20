@@ -2530,6 +2530,70 @@ other = record({'guard': guard, 'target': target})
 ";
 
 #[test]
+fn overload_bodies_check_functions_in_immutable_storage() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    for (base, branch, complete, expected) in [
+        ("object", "return namespace.operation('ok')", true, None),
+        (
+            "object",
+            "namespace.operation('ok')\n        return None",
+            true,
+            Some("invalid-return-type"),
+        ),
+        ("Shadowed", "return namespace.operation('ok')", false, None),
+    ] {
+        let source = format!(
+            r#"from typing import Literal, overload
+from ty_extensions._internal import TypeOf
+from native import record
+
+def operation(value: str) -> str:
+    return value
+
+class Shadowed:
+    @property
+    def operation(self) -> TypeOf[operation]:
+        return operation
+
+namespace = record({{'operation': operation}}, base={base})
+
+@overload
+def f(flag: Literal[True]) -> str: ...
+@overload
+def f(flag: Literal[False]) -> None: ...
+def f(flag: bool) -> str | None:
+    if flag:
+        {branch}
+    return None
+"#
+        );
+        db.write_file("/src/main.py", source)?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let function = crate::place::global_symbol(&db, file, "f")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        let analysis = crate::types::OverloadBodyAnalysis::new(&db, function);
+        assert_eq!(analysis.is_complete(), complete, "{base}: {branch}");
+        let diagnostics =
+            crate::types::check_types_with_overload_analysis(&db, file, [], [analysis]);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            expected.into_iter().collect::<Vec<_>>(),
+            "{base}: {branch}: {diagnostics:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_storage_getattr_comparisons_preserve_saved_receivers() -> anyhow::Result<()> {
     let declarations = format!(
         "{FIELD_IMPLICATION_DECLARATIONS}\
