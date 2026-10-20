@@ -2,8 +2,9 @@
 
 ## Comprehension key domains
 
-A comprehension with a finite string key type restricts which parameters its values can supply.
-Iteration and filtering do not guarantee that any particular key is present. Ordinary dictionary
+A comprehension with a finite string key type restricts which parameters its values can supply. A
+single unfiltered generator over a direct tuple or list display consisting entirely of string
+literals supplies each key when the comprehension preserves the iteration key. Ordinary dictionary
 type inference and assignability remain unchanged.
 
 ```toml
@@ -25,10 +26,13 @@ def finite(flag: bool, rows: tuple[tuple[Literal["value"], int | None], ...]):
     pair(**{key: 1 for key in ("left", "right")})
     consume(**{key: value for key, value in rows if value is not None})
     consume(**{key: "bad" for key in ("value",)})  # error: [invalid-argument-type]
+    # error: [unknown-argument]
     consume(**{key: 1 for key in ("other",)})  # error: [missing-argument]
-    empty(**{key: 1 for key in ("other",) if flag})
-    empty(**{key: 1 for key in ("other",) if False})
-    empty(**{key: 1 for key in ()})
+    empty(**{key: 1 for key in ("other",)})  # error: [unknown-argument]
+    empty(**{key: 1 for key in ["other"]})  # error: [unknown-argument]
+    empty(**{key: 1 for key in ("other",) if flag})  # no diagnostic
+    empty(**{key: 1 for key in ("other",) if False})  # no diagnostic
+    empty(**{key: 1 for key in ()})  # no diagnostic
     variadic(**{key: "bad" for key in ("value",)})  # error: [invalid-argument-type]
     mutable: dict[str, int] = {key: 1 for key in ("value",)}
     mutable["other"] = 2
@@ -42,6 +46,30 @@ def aliases(keys: list[Key], recursive: list[Recursive], unknown: list[Any], str
     consume(**{key: 1 for key in unknown})  # error: [invalid-argument-type]
     consume(**{key: 1 for key in strings})  # error: [invalid-argument-type]
     consume(**{key: 1 for key in (0,)})  # error: [invalid-argument-type]
+```
+
+Comprehensions over other iterables, with changed keys or multiple generators, and escaped results
+retain the existing conservative analysis.
+
+```py
+from collections.abc import AsyncIterable
+from typing import TypedDict
+
+class OpenInputs(TypedDict):
+    other: int
+
+def mutate(values: dict[str, int]) -> None: ...
+def uncertain(keys: list[Literal["other"]], inputs: OpenInputs):
+    empty(**{key: 1 for key in keys})  # no diagnostic
+    empty(**{key: 1 for key in inputs})  # no diagnostic
+    empty(**{key: 1 for key in ("other",) for _ in ()})  # no diagnostic
+    empty(**{"other": 1 for key in ("value",)})  # no diagnostic
+    values = {key: 1 for key in ("other",)}
+    mutate(values)
+    empty(**values)  # no diagnostic
+
+async def asynchronous(keys: AsyncIterable[Literal["other"]]):
+    empty(**{key: 1 async for key in keys})  # no diagnostic
 ```
 
 A bottom key or value type does not establish whether constructing a comprehension reaches its
@@ -63,6 +91,8 @@ def impossible(rows: list[int]):
     bottom_empty(**{"value": stop() for _ in rows})
     bottom_consume(**{"value": stop() for _ in rows})
     bottom_consume(**{"value": stop() for _ in [0]})
+    bottom_empty(**{key: stop() for key in ("other",)})  # no diagnostic
+    bottom_consume(**{key: stop() for key in ()})  # error: [missing-argument]
 
 def loop_carried(flag: bool):
     values = {"value": 1}

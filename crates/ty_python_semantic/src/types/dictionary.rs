@@ -466,6 +466,35 @@ fn comprehension_field_source<'db>(
     Some(source)
 }
 
+/// String literal keys visited by an unfiltered comprehension over a direct list or tuple display.
+fn definite_comprehension_keys<'ast>(
+    comprehension: &'ast ast::ExprDictComp,
+    output: &ast::Expr,
+) -> Option<FxHashSet<&'ast str>> {
+    let [generator] = comprehension.generators.as_ref() else {
+        return None;
+    };
+    if generator.is_async
+        || !generator.ifs.is_empty()
+        || generator.target.as_name_expr()?.id != output.as_name_expr()?.id
+    {
+        return None;
+    }
+    let elements = match &generator.iter {
+        ast::Expr::List(list) => &list.elts,
+        ast::Expr::Tuple(tuple) => &tuple.elts,
+        _ => return None,
+    };
+    elements
+        .iter()
+        .map(|element| {
+            element
+                .as_string_literal_expr()
+                .map(|literal| literal.value.to_str())
+        })
+        .collect()
+}
+
 impl<'db> DictionaryItems<'db> {
     /// Whether the named entries account for every possible key.
     pub const fn is_complete(&self) -> bool {
@@ -533,6 +562,10 @@ impl<'db> DictionaryItems<'db> {
                     generators: _,
                 } = comprehension;
                 let key = key.as_deref().ok_or(DictionaryFallback::Unavailable)?;
+                let definite_keys = definite_comprehension_keys(comprehension, key);
+                if definite_keys.as_ref().is_some_and(FxHashSet::is_empty) {
+                    return Ok(DictionaryItemsBuilder::default().finish());
+                }
                 let key_ty = expression_type(key).ok_or(DictionaryFallback::Unavailable)?;
                 let value_ty = expression_type(value).ok_or(DictionaryFallback::Unavailable)?;
                 let resolved_value = value_ty.resolve_type_alias(db);
@@ -581,8 +614,14 @@ impl<'db> DictionaryItems<'db> {
                         Ok(DictionaryItem {
                             name: Name::new(name),
                             ty,
-                            // Iteration and filtering need not supply any particular key.
-                            kind: DictionaryItemKind::Residual,
+                            kind: if definite_keys
+                                .as_ref()
+                                .is_some_and(|keys| keys.contains(name))
+                            {
+                                DictionaryItemKind::Required
+                            } else {
+                                DictionaryItemKind::Residual
+                            },
                             source: key.range(),
                         })
                     })
