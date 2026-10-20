@@ -11644,7 +11644,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut resolution =
             resolve_place_load(self.db(), self.index, self.scope(), place_expr, mode);
         if self.is_annotation_reference(expr_ref) {
-            resolution = resolution.with_external_type_parameters();
+            resolution = resolution.with_annotation_sources();
         }
         let mut place = PlaceAndQualifiers::from(Place::Undefined);
         let mut failure = None;
@@ -11756,6 +11756,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 ConsideredDefinitions::AllReachable,
             ),
             PlaceLoadSourceKind::Implicit(implicit) => match implicit {
+                ImplicitPlaceLoad::TypeOnlyAlias(definition) => {
+                    Place::bound(binding_type(db, definition))
+                        .with_definition(definition)
+                        .into()
+                }
                 ImplicitPlaceLoad::DunderClass(definition) => original_class_type(db, definition)
                     .map_or_else(
                         || Place::Undefined.into(),

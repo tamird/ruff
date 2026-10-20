@@ -60,6 +60,15 @@ pub trait Db: ModuleResolverDb {
     fn provided_statements(&self, _file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
         Vec::new()
     }
+
+    /// Whether a `type` statement binds its name in ordinary control flow.
+    ///
+    /// Python aliases have runtime values. A frontend that returns `false` places aliases in a
+    /// separate annotation namespace for their lexical scope.
+    /// Implementations must read tracked inputs without requesting the file's semantic index.
+    fn type_aliases_bind_runtime_names(&self, _file: ProgramFile<'_>) -> bool {
+        true
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]

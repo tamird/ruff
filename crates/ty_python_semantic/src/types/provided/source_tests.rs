@@ -21,6 +21,60 @@ use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
 use crate::types::{BodyDomainError, KnownClass, check_overload_body};
 use crate::{HasType, ProgramEnvironment, SemanticModel};
 
+#[test]
+fn type_only_aliases_follow_lexical_annotation_lookup() -> anyhow::Result<()> {
+    let ordinary = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY312)
+        .with_file("/src/main.py", "type Value = str\nruntime = Value\n")
+        .build()?;
+    let diagnostics = ordinary.check_file(system_path_to_file(&ordinary, "/src/main.py")?);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    let source = indoc::indoc! {r#"
+        Value = 42
+        type Value = str
+        typed: Value = "ok"
+        runtime: int = Value
+
+        type T = str
+        type Identity[T] = T
+        specialized: Identity[int] = 1
+
+        def nested():
+            type Local = int
+            Local = "runtime"
+            typed: Local = 1
+            runtime: str = Local
+    "#};
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY312)
+        .with_file("/src/main.py", source)
+        .without_runtime_type_aliases()
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    db.write_file(
+        "/src/main.py",
+        format!(
+            "{}\nmissing = T\n",
+            source.replace("typed: Value = \"ok\"", "typed: Value = 42")
+        ),
+    )?;
+    let diagnostics = db.check_file(file);
+    let ids: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.id().as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        ["invalid-assignment", "unresolved-reference"],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
 /// Pairs top-level functions by name and their ordinary parameters by position.
 /// Signature compatibility is the consumer's responsibility; this fixture exercises
 /// annotation ownership after the consumer has selected a correspondence.

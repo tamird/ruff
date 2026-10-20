@@ -380,6 +380,9 @@ pub struct SemanticIndex<'db> {
     /// Map from a node creating a definition to its definition.
     definitions_by_node: DefinitionsByNode<'db>,
 
+    /// Aliases in a separate annotation namespace. Absent in ordinary Python files.
+    type_only_aliases: Option<Box<FrozenMap<(FileScopeId, ScopedSymbolId), Definition<'db>>>>,
+
     /// Map from a standalone expression to its [`Expression`] ingredient.
     expressions_by_node: FxHashMap<ExpressionNodeKey, Expression<'db>>,
 
@@ -861,6 +864,13 @@ impl<'db> SemanticIndex<'db> {
             .single
             .get(&definition_key.into())
             .copied()
+    }
+
+    /// Resolves an alias in the annotation namespace of `scope`.
+    pub fn type_only_alias(&self, scope: FileScopeId, name: &str) -> Option<Definition<'db>> {
+        let aliases = self.type_only_aliases.as_deref()?;
+        let symbol = self.place_table(scope).symbol_id(name)?;
+        aliases.get(&(scope, symbol)).copied()
     }
 
     /// Returns the [`Expression`] ingredient for an expression node.

@@ -433,6 +433,7 @@ pub(crate) mod tests {
         keyword_field_factory: Option<DeclarationPredicate>,
         parameter_contents_preserver: Option<ParameterPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
+        type_aliases_bind_runtime_names: bool,
     }
 
     impl TestDb {
@@ -469,6 +470,7 @@ pub(crate) mod tests {
                 keyword_field_factory: None,
                 parameter_contents_preserver: None,
                 source_provider: None,
+                type_aliases_bind_runtime_names: true,
             }
         }
 
@@ -530,6 +532,10 @@ pub(crate) mod tests {
 
     #[salsa::db]
     impl ty_python_core::Db for TestDb {
+        fn type_aliases_bind_runtime_names(&self, _file: ProgramFile<'_>) -> bool {
+            self.type_aliases_bind_runtime_names
+        }
+
         fn source_exclusions(&self, file: ProgramFile<'_>) -> ty_python_core::SourceExclusions {
             self.source_provider
                 .as_ref()
@@ -798,6 +804,7 @@ pub(crate) mod tests {
         keyword_field_factory: Option<DeclarationPredicate>,
         parameter_contents_preserver: Option<ParameterPredicate>,
         source_provider: Option<Arc<dyn SourceProvider>>,
+        type_aliases_bind_runtime_names: bool,
     }
 
     impl<'a> TestDbBuilder<'a> {
@@ -824,6 +831,7 @@ pub(crate) mod tests {
                 keyword_field_factory: None,
                 parameter_contents_preserver: None,
                 source_provider: None,
+                type_aliases_bind_runtime_names: true,
             }
         }
 
@@ -867,6 +875,11 @@ pub(crate) mod tests {
             provider: impl SourceProvider + 'static,
         ) -> Self {
             self.source_provider = Some(Arc::new(provider));
+            self
+        }
+
+        pub(crate) fn without_runtime_type_aliases(mut self) -> Self {
+            self.type_aliases_bind_runtime_names = false;
             self
         }
 
@@ -972,6 +985,7 @@ pub(crate) mod tests {
             db.keyword_field_factory = self.keyword_field_factory;
             db.parameter_contents_preserver = self.parameter_contents_preserver;
             db.source_provider = self.source_provider;
+            db.type_aliases_bind_runtime_names = self.type_aliases_bind_runtime_names;
 
             if let Some(registry) = self.lint_registry {
                 db.rule_selection = Arc::new(RuleSelection::from_registry(&registry));

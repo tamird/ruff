@@ -286,6 +286,7 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     scopes_by_node: FxHashMap<NodeWithScopeKey, FileScopeId>,
     scopes_by_expression: ExpressionsScopeMapBuilder,
     definitions_by_node: FxHashMap<DefinitionNodeKey, Definitions<'db>>,
+    type_only_aliases: Vec<((FileScopeId, ScopedSymbolId), Definition<'db>)>,
     provided_statements: FxHashMap<NodeIndex, Box<[ProvidedBinding]>>,
     source_exclusions: crate::SourceExclusions,
     expressions_by_node: FxHashMap<ExpressionNodeKey, Expression<'db>>,
@@ -372,6 +373,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             scopes_by_expression: ExpressionsScopeMapBuilder::new(),
             scopes_by_node: FxHashMap::default(),
             definitions_by_node: FxHashMap::default(),
+            type_only_aliases: Vec::new(),
             provided_statements,
             source_exclusions,
             expressions_by_node: FxHashMap::default(),
@@ -3884,6 +3886,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             place_tables,
             scopes: self.scopes.into(),
             definitions_by_node: DefinitionsByNode::from_map(self.definitions_by_node),
+            type_only_aliases: (!self.type_only_aliases.is_empty())
+                .then(|| Box::new(self.type_only_aliases.into_iter().collect())),
             expressions_by_node: self.expressions_by_node,
             unpacks_by_target: FrozenMap::from(self.unpacks_by_target),
             statements_by_node: self.statements_by_node,
@@ -4720,7 +4724,13 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         .map(|name| name.id.clone())
                         .unwrap_or("<unknown>".into()),
                 );
-                self.add_definition(symbol.into(), type_alias);
+                if self.db.type_aliases_bind_runtime_names(self.file) {
+                    self.add_definition(symbol.into(), type_alias);
+                } else {
+                    let definition = self.create_definition(symbol.into(), type_alias);
+                    self.type_only_aliases
+                        .push(((self.current_scope(), symbol), definition));
+                }
                 self.visit_expr(&type_alias.name);
 
                 self.with_type_params(

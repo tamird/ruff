@@ -151,6 +151,9 @@ impl<'db> SemanticModel<'db> {
                         .reachable_bindings(id)
                 }
                 PlaceLoadSourceKind::Implicit(implicit) => match implicit {
+                    ImplicitPlaceLoad::TypeOnlyAlias(definition) => {
+                        return Some(candidates.contains(&definition));
+                    }
                     ImplicitPlaceLoad::ExplicitGlobalSymbol { file, name } => {
                         if file != self.file {
                             return None;
