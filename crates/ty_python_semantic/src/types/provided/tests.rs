@@ -5017,6 +5017,58 @@ def ordinary(metadata: Metadata) -> Uniform[Metadata | dict[str, str], Fields]:
 }
 
 #[test]
+fn supplied_keyword_field_callbacks_have_contextual_body_types() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_keyword_field_factory(|db, definition| {
+            definition.name(db).as_deref() == Some("record")
+        })
+        .with_file(
+            "/src/native.pyi",
+            "from typing import Protocol
+from typing_extensions import Unpack
+class Callback(Protocol):
+    def __call__(self, *args: Unpack[tuple[str, Unpack[tuple[str, ...]]]]) -> int: ...
+class Holder(Protocol):
+    @property
+    def callback(self) -> Callback: ...
+def record(**kwargs: object) -> Holder: ...
+def consume(args: tuple[str, ...]) -> int: ...
+",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import Holder, consume, record
+def make() -> Holder:
+    result: Holder = record(callback=lambda *args: consume(args))
+    return result
+",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let program = db.program_file(file);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let function = module.suite()[1].as_function_def_stmt().unwrap();
+    let assignment = function.body[0].as_ann_assign_stmt().unwrap();
+    let factory = assignment.value.as_ref().unwrap().as_call_expr().unwrap();
+    let callback = factory.arguments.keywords[0]
+        .value
+        .as_lambda_expr()
+        .unwrap();
+    let call = callback.body.as_call_expr().unwrap();
+    let model = SemanticModel::new(&db, program);
+    let argument = call.arguments.args[0].inferred_type(&model).unwrap();
+    assert_eq!(
+        argument
+            .display(&db, &model.program_environment())
+            .to_string(),
+        "tuple[str, *tuple[str, ...]]"
+    );
+    Ok(())
+}
+
+#[test]
 fn supplied_getters_can_reject_attributes_on_specialized_receivers() -> anyhow::Result<()> {
     let db = TestDbBuilder::new()
         .with_python_version(ruff_python_ast::PythonVersion::PY313)

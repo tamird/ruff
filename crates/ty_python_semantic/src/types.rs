@@ -2686,12 +2686,21 @@ impl<'db> Type<'db> {
             // this cycle, if any.
             UnionType::from_elements_cycle_recovery(db, env, [previous, self])
         };
-        // An inferred attribute updated with `self.items += (item,)` can settle on the
-        // initializer plus a single update during the first few iterations. Widen new tuple
-        // lengths during those iterations too, so repeated updates are represented.
-        UnionType::widen_growing_tuples(db, env, previous, result)
-            .unwrap_or(result)
-            .recursive_type_normalized_impl_with_cycle(db, env, cycle)
+        let result = if cycle.iteration() <= crate::TAINTED_CYCLES
+            && previous.exact_tuple_instance_spec(db).is_some_and(|tuple| {
+                tuple.as_ref()
+                    == &TupleSpec::homogeneous(Type::Dynamic(DynamicType::UnknownLambdaParameter))
+            }) {
+            // An unconstrained lambda `*args` parameter has no established tuple shape.
+            // Its contextual type becoming more precise is not recursive tuple growth.
+            result
+        } else {
+            // An inferred attribute updated with `self.items += (item,)` can settle on the
+            // initializer plus a single update during the first few iterations. Widen new tuple
+            // lengths during those iterations too, so repeated updates are represented.
+            UnionType::widen_growing_tuples(db, env, previous, result).unwrap_or(result)
+        };
+        result.recursive_type_normalized_impl_with_cycle(db, env, cycle)
     }
 
     pub fn is_none(&self, db: &'db dyn Db) -> bool {

@@ -81,6 +81,22 @@ reveal_type(Tuples().appended)  # revealed: tuple[int, ...]
 reveal_type(Tuples().prepended)  # revealed: tuple[int, ...]
 ```
 
+## Concatenating an unconstrained lambda result
+
+An unconstrained variadic lambda can initialize a tuple that grows on repeated updates. Its inferred
+element type remains gradual while preserving the appended element type.
+
+```py
+class Tuples:
+    def __init__(self) -> None:
+        self.items = (lambda *args: args)()
+
+    def update(self, value: int) -> None:
+        self.items += (value,)
+
+reveal_type(Tuples().items)  # revealed: tuple[Unknown | int, ...]
+```
+
 ## Cycle normalization preserves non-gradual variadic parameters
 
 Normalizing a recursive implicit-attribute type does not reinterpret specialized variadic parameters
