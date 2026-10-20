@@ -2250,7 +2250,7 @@ f6: Callable[[*tuple[int, ...]], None] = lambda x, y, z: None
 reveal_type(f6)  # revealed: (*tuple[int, ...]) -> None
 
 f7: Callable[[int, str], None] = lambda *args: None
-reveal_type(f7)  # revealed: (*args) -> None
+reveal_type(f7)  # revealed: (*tuple[int, str]) -> None
 
 # N.B. `Callable` annotations only support positional parameters.
 # error: [invalid-assignment]
@@ -2260,14 +2260,13 @@ reveal_type(f8)  # revealed: (int, /) -> None
 # An optional keyword-only parameter does not prevent `*args` from accepting the positional
 # suffix in a `Callable` annotation.
 f9: Callable[[*tuple[int, ...], int], None] = lambda *args, x=1: None
-reveal_type(f9)  # revealed: (*args, x=1) -> None
+reveal_type(f9)  # revealed: (*tuple[*tuple[int, ...], int], x=1) -> None
 
 f10: Callable[[str, int, str], tuple[str, int, str]] = lambda x, y, z: reveal_type((x, y, z))  # revealed: tuple[str, int, str]
 reveal_type(f10)  # revealed: (x: str, y: int, z: str) -> tuple[str, int, str]
 
-# TODO: This should reveal `tuple[int, ...]` once we support `Unpack`.
-f11: Callable[[*tuple[int, ...]], tuple[int, ...]] = lambda *args: reveal_type(args)  # revealed: tuple[Unknown, ...]
-reveal_type(f11)  # revealed: (*args) -> tuple[Unknown, ...]
+f11: Callable[[*tuple[int, ...]], tuple[int, ...]] = lambda *args: reveal_type(args)  # revealed: tuple[int, ...]
+reveal_type(f11)  # revealed: (*args: int) -> tuple[int, ...]
 
 def _(x: list[int]):
     f12 = list(map(lambda y: reveal_type(y) + 1, x))  # revealed: int

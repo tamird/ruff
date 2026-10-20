@@ -9452,7 +9452,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .index
             .try_node_scope(NodeWithScopeRef::Lambda(lambda_expression))
             .map(|scope| scope.to_scope_id(db, self.program_file()));
-        let contextual_parameters = callable_tcx.map(Signature::parameters);
+        let variadic_context = parameters.as_ref().and_then(|source| {
+            let vararg = source.vararg.as_ref()?;
+            callable_tcx?.parameters().lambda_variadic_context(
+                db,
+                env,
+                source.posonlyargs.len() + source.args.len(),
+                vararg.name().id.clone(),
+            )
+        });
+        let contextual_parameters = variadic_context
+            .as_ref()
+            .map(|(parameters, _)| parameters)
+            .or_else(|| callable_tcx.map(Signature::parameters));
         let positional_context = |index| {
             let parameters = contextual_parameters?;
             parameters.get_positional(index).or_else(|| {
@@ -9537,18 +9549,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 })
                 .collect::<Vec<_>>();
             let variadic = vararg.as_ref().map(|param| {
-                let parameter = Parameter::variadic(param.name().id.clone())
-                    .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter));
-                if let Some(parameters) = contextual_parameters
-                    && parameters.is_standard()
-                    && let Some((index, context)) = parameters.variadic()
-                    && index == posonlyargs.len() + args.len()
-                    && !context.has_starred_annotation()
-                {
-                    parameter.with_annotated_type(context.annotated_type())
-                } else {
-                    parameter
-                }
+                variadic_context.as_ref().map_or_else(
+                    || {
+                        Parameter::variadic(param.name().id.clone())
+                            .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
+                    },
+                    |(_, parameter)| parameter.clone(),
+                )
             });
             let mut parameters = positional_only
                 .into_iter()

@@ -5217,44 +5217,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                             if let Some(source_parameter_count) =
                                 as_target_typevartuple(target_param)
                             {
-                                let source_tail = parameters.source_iter.as_slice();
-                                let captured_source_parameters = || {
+                                let inferred_tuple = positional_parameters_tuple(
+                                    db,
+                                    env,
                                     std::iter::once(source_param)
-                                        .chain(source_tail)
-                                        .take(source_parameter_count)
-                                };
-                                let inferred_tuple =
-                                    if let Some((source_variadic_index, source_variadic)) =
-                                        captured_source_parameters()
-                                            .find_position(|parameter| parameter.is_variadic())
-                                    {
-                                        let variable = match source_variadic.annotated_type() {
-                                            Type::TypeVar(typevartuple)
-                                                if typevartuple.is_typevartuple(db) =>
-                                            {
-                                                VariableSegment::TypeVarTuple(typevartuple)
-                                            }
-                                            element => VariableSegment::Homogeneous(element),
-                                        };
-                                        Type::tuple(TupleType::mixed_with_segment(
-                                            db,
-                                            env,
-                                            captured_source_parameters()
-                                                .take(source_variadic_index)
-                                                .map(Parameter::annotated_type),
-                                            variable,
-                                            captured_source_parameters()
-                                                .skip(source_variadic_index + 1)
-                                                .map(Parameter::annotated_type),
-                                        ))
-                                    } else {
-                                        Type::heterogeneous_tuple(
-                                            db,
-                                            env,
-                                            captured_source_parameters()
-                                                .map(Parameter::annotated_type),
-                                        )
-                                    };
+                                        .chain(parameters.source_iter.as_slice())
+                                        .take(source_parameter_count),
+                                );
 
                                 reuse_current_source = source_parameter_count == 0;
                                 for _ in 1..source_parameter_count {
@@ -5597,6 +5566,39 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         }
 
         result
+    }
+}
+
+fn positional_parameters_tuple<'db, 'parameter>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    parameters: impl Iterator<Item = &'parameter Parameter<'db>> + Clone,
+) -> Type<'db>
+where
+    'db: 'parameter,
+{
+    if let Some((index, parameter)) = parameters
+        .clone()
+        .find_position(|parameter| parameter.is_variadic())
+    {
+        let variable = match parameter.annotated_type() {
+            Type::TypeVar(typevartuple) if typevartuple.is_typevartuple(db) => {
+                VariableSegment::TypeVarTuple(typevartuple)
+            }
+            element => VariableSegment::Homogeneous(element),
+        };
+        Type::tuple(TupleType::mixed_with_segment(
+            db,
+            env,
+            parameters
+                .clone()
+                .take(index)
+                .map(Parameter::annotated_type),
+            variable,
+            parameters.skip(index + 1).map(Parameter::annotated_type),
+        ))
+    } else {
+        Type::heterogeneous_tuple(db, env, parameters.map(Parameter::annotated_type))
     }
 }
 
@@ -6694,6 +6696,65 @@ impl<'db> Parameters<'db> {
         self.iter()
             .enumerate()
             .find(|(_, parameter)| parameter.is_variadic())
+    }
+
+    /// Supplies a lambda's fixed parameters and `*args` with one consistent positional context.
+    /// The capture must account for every remaining positional argument, including any suffix.
+    /// Optional or keyword-routable fixed arguments do not have one unambiguous tuple shape.
+    pub(super) fn lambda_variadic_context(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        source_prefix_len: usize,
+        source_name: Name,
+    ) -> Option<(Self, Parameter<'db>)> {
+        if !self.is_standard() {
+            return None;
+        }
+
+        let normalized = self.expand_starred_variadic_annotations(db);
+        let (prefix, remaining) = normalized.as_slice().split_at_checked(source_prefix_len)?;
+        if !prefix.iter().all(Parameter::is_positional) {
+            return None;
+        }
+        let positional_len = remaining
+            .iter()
+            .take_while(|parameter| parameter.is_positional() || parameter.is_variadic())
+            .count();
+        let (captured, keywords) = remaining.split_at(positional_len);
+        if !keywords
+            .iter()
+            .all(|parameter| parameter.is_keyword_only() || parameter.is_keyword_variadic())
+        {
+            return None;
+        }
+
+        let source = Parameter::variadic(source_name);
+        if let [parameter] = captured
+            && parameter.is_variadic()
+            && !parameter.has_starred_annotation()
+        {
+            let source = source.with_annotated_type(parameter.annotated_type());
+            return Some((normalized, source));
+        }
+
+        if prefix.iter().any(Parameter::has_default) {
+            return None;
+        }
+        let mut has_variadic = false;
+        for parameter in captured {
+            if parameter.is_positional_only() && !parameter.has_default() {
+                continue;
+            }
+            if !parameter.is_variadic() || parameter.has_starred_annotation() || has_variadic {
+                return None;
+            }
+            has_variadic = true;
+        }
+
+        let tuple = positional_parameters_tuple(db, env, captured.iter());
+        let source = source.with_annotated_type(tuple).with_starred_annotation();
+        Some((normalized, source))
     }
 
     /// Return parameter (with index) for given name, or `None` if no such parameter.

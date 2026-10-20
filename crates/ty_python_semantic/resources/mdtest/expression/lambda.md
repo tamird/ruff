@@ -319,7 +319,112 @@ collect(1, "a", "b")
 # error: [invalid-argument-type]
 collect(1, "a", 2)
 
-shifted: Collect = lambda *attrs: (reveal_type(attrs), attrs)[1]  # revealed: tuple[Unknown, ...]
+# error: [invalid-assignment]
+shifted: Collect = lambda *attrs: (reveal_type(attrs), attrs)[1]  # revealed: tuple[int, *tuple[str, ...]]
+```
+
+## Callback unpacked positional arguments
+
+```py
+from typing import Callable, Protocol, TypedDict
+from typing_extensions import TypeVarTuple, Unpack
+
+class RequiredStrings(Protocol):
+    def __call__(self, *args: Unpack[tuple[str, Unpack[tuple[str, ...]]]]) -> str: ...
+
+first: RequiredStrings = lambda *args: (reveal_type(args), args[0].upper())[1]  # revealed: tuple[str, *tuple[str, ...]]
+# error: [missing-argument]
+first()
+
+class Holder(TypedDict):
+    callback: RequiredStrings
+
+holder: Holder = {"callback": lambda *args: (reveal_type(args), args[0].upper())[1]}  # revealed: tuple[str, *tuple[str, ...]]
+holder["callback"]("one", "two")  # no diagnostic
+# error: [missing-argument]
+holder["callback"]()
+# error: [invalid-argument-type]
+holder["callback"]("one", 42)
+# error: [unknown-argument]
+holder["callback"]("one", unexpected="two")
+# error: [invalid-assignment]
+wrong_result: RequiredStrings = lambda *args: 42
+
+raw_callable: Callable[[Unpack[tuple[str, Unpack[tuple[str, ...]]]]], str] = (
+    lambda *xs: reveal_type(xs)[0]  # revealed: tuple[str, *tuple[str, ...]]
+)
+RequiredCallable = Callable[[Unpack[tuple[str, Unpack[tuple[str, ...]]]]], str]
+aliased_callable: RequiredCallable = lambda *xs: reveal_type(xs)[0]  # revealed: tuple[str, *tuple[str, ...]]
+# error: [missing-argument]
+raw_callable()
+# error: [missing-argument]
+aliased_callable()
+```
+
+The unpacked tuple may describe a mixed positional prefix and suffix, or no arguments.
+
+```py
+class Mixed(Protocol):
+    def __call__(self, *args: Unpack[tuple[int, Unpack[tuple[str, ...]], bytes]]) -> int: ...
+
+mixed: Mixed = lambda *args: (reveal_type(args), args[0] + len(args[-1]))[1]  # revealed: tuple[int, *tuple[str, ...], bytes]
+mixed(1, "middle", b"end")  # no diagnostic
+# error: [invalid-argument-type]
+mixed(1, "middle", 42)
+
+class Empty(Protocol):
+    def __call__(self, *args: Unpack[tuple[()]]) -> int: ...
+
+empty: Empty = lambda *args: (reveal_type(args), 0)[1]  # revealed: tuple[()]
+empty()  # no diagnostic
+# error: [too-many-positional-arguments]
+empty(1)
+```
+
+A separate positional suffix is included in the captured tuple, even through an alias.
+
+```py
+raw: Callable[[Unpack[tuple[str, ...]], int], int] = lambda *xs: reveal_type(xs)[-1]  # revealed: tuple[*tuple[str, ...], int]
+SeparateSuffix = Callable[[Unpack[tuple[str, ...]], int], int]
+aliased: SeparateSuffix = lambda *xs: reveal_type(xs)[-1]  # revealed: tuple[*tuple[str, ...], int]
+two_unpacks: Callable[[Unpack[tuple[str, ...]], Unpack[tuple[int]]], int] = (
+    lambda *xs: reveal_type(xs)[-1]  # revealed: tuple[*tuple[str, ...], int]
+)
+# error: [missing-argument]
+two_unpacks()
+```
+
+Fixed source parameters consume the corresponding contextual parameters before the remaining
+positional inputs flow into `*args`.
+
+```py
+FixedPair = Callable[[Unpack[tuple[int, str]]], str]
+pair: FixedPair = lambda first, *rest: (
+    reveal_type(first),  # revealed: int
+    reveal_type(rest),  # revealed: tuple[str]
+    rest[0],
+)[2]
+# error: [invalid-argument-type]
+pair("wrong", "right")
+```
+
+Optional or keyword-routable parameters do not have a single captured positional tuple.
+
+```py
+class Optional(Protocol):
+    def __call__(self, first: str = ..., /, *rest: str) -> int: ...
+
+optional: Optional = lambda *args: (reveal_type(args), len(args))[1]  # revealed: tuple[Unknown, ...]
+
+class KeywordRoutable(Protocol):
+    def __call__(self, first: str, *rest: str) -> int: ...
+
+routable: KeywordRoutable = lambda *args, **kwargs: (reveal_type(args), len(args))[1]  # revealed: tuple[Unknown, ...]
+
+Ts = TypeVarTuple("Ts")
+
+def symbolic(callback: Callable[[Unpack[Ts]], int]) -> None:
+    value: Callable[[Unpack[Ts]], int] = lambda *args: (reveal_type(args), len(args))[1]  # revealed: tuple[Unknown, ...]
 ```
 
 ## Callback keyword variadic parameters

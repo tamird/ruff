@@ -1842,11 +1842,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         definition: Definition<'db>,
     ) {
         let db = self.db();
-        let element_type = self.contextual_lambda_parameter(index, lambda).map_or(
+        let context = self.contextual_lambda_parameter(index, lambda);
+        let annotated_type = context.map_or(
             Type::Dynamic(DynamicType::UnknownLambdaParameter),
             Parameter::annotated_type,
         );
-        let ty = Type::homogeneous_tuple(db, self.program_environment(), element_type);
+        let ty = if context.is_some_and(Parameter::has_starred_annotation) {
+            annotated_type
+        } else {
+            Type::homogeneous_tuple(db, self.program_environment(), annotated_type)
+        };
         self.add_binding(parameter.into(), definition)
             .insert(self, ty);
     }
