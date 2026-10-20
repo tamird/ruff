@@ -171,6 +171,8 @@ pub(crate) struct Analysis {
     #[serde(alias = "strict-literal-narrowing")]
     pub(crate) strict_equality_semantics: Option<bool>,
 
+    pub(crate) widen_singleton_collection_elements: Option<bool>,
+
     /// Whether ty should support `type: ignore` comments.
     pub(crate) respect_type_ignore_comments: Option<bool>,
 

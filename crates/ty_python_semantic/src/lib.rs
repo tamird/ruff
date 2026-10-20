@@ -106,6 +106,12 @@ pub struct AnalysisSettings {
     /// Whether ty should use conservative equality and inequality semantics.
     pub strict_equality_semantics: bool,
 
+    /// Whether to widen singleton elements of mutable collections with `Unknown`.
+    ///
+    /// Widening permits later mutations when a singleton, such as `None`, is used as a
+    /// placeholder. Disabling it preserves the inferred element type instead.
+    pub widen_singleton_collection_elements: bool,
+
     /// Whether errors can be suppressed with `type: ignore` comments.
     ///
     /// If set to false, ty won't:
@@ -125,6 +131,7 @@ impl Default for AnalysisSettings {
         Self {
             strict_generic_narrowing: false,
             strict_equality_semantics: false,
+            widen_singleton_collection_elements: true,
             respect_type_ignore_comments: true,
             allowed_unresolved_imports: ModuleGlobSet::empty(),
             replace_imports_with_any: ModuleGlobSet::empty(),

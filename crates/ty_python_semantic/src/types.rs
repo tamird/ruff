@@ -3759,9 +3759,9 @@ impl<'db> Type<'db> {
     }
 
     /// Finalizes the element type of a mutable collection after combining its element evidence.
-    /// Literal types supplied by explicit annotations remain unpromotable. Without contextual
-    /// constraints, singleton types also widen: `[None]` permits later mutation, as does the list
-    /// created by `*rest, = (None,)`.
+    /// Literal types supplied by explicit annotations remain unpromotable. By default, without
+    /// contextual constraints, singleton types also widen: `[None]` permits later mutation, as
+    /// does the list created by `*rest, = (None,)`.
     /// Evidence from later collection uses also passes through this helper, since those types
     /// have not necessarily undergone the promotion applied to literal elements during inference.
     fn promote_collection_element_type(
@@ -3787,11 +3787,18 @@ impl<'db> Type<'db> {
         }
 
         let promoted = ty.promote_singletons_recursively(db, env);
+        if promoted == ty
+            || env.program_file(db).is_some_and(|file| {
+                !db.analysis_settings(file.file(db))
+                    .widen_singleton_collection_elements
+            })
+        {
+            return ty;
+        }
         // A later declared consumer can require a singleton even though the initializer had no
         // annotation. Preserve regular literal and tuple promotion, but keep singleton widening
         // within that slot's static domain. Inferred mutation evidence supplies no such domain.
-        if promoted != ty
-            && let Some(context) = singleton_context
+        if let Some(context) = singleton_context
             && context.is_fully_static(db, env)
             && ty.is_subtype_of(db, env, context)
             && !promoted.is_subtype_of(db, env, context)

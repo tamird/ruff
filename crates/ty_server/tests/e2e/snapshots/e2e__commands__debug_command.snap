@@ -166,6 +166,7 @@ Settings: Settings {
     analysis: AnalysisSettings {
         strict_generic_narrowing: false,
         strict_equality_semantics: false,
+        widen_singleton_collection_elements: true,
         respect_type_ignore_comments: true,
         allowed_unresolved_imports: ModuleGlobSet {
             regex_set: RegexSet([]),
