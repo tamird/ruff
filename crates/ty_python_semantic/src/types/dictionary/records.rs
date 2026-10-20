@@ -14,7 +14,6 @@ use crate::types::infer::{StatementInference, infer_definition_types, infer_stat
 use crate::types::{KnownClass, MemberLookupPolicy, ProgramEnvironment, Type};
 use crate::{Db, FxIndexSet, SemanticModel};
 
-use super::DictionaryItems;
 use super::contents::{ContentsValue, MappingContents};
 
 fn local_binding<'db>(
@@ -341,7 +340,7 @@ fn element_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         let inference =
             StatementInference::Definition(definition, infer_definition_types(db, definition));
         for value in &initial.elts {
-            match literal(db, &env, scope, value, &inference) {
+            match ContentsValue::from_literal(db, &env, scope, value, &inference) {
                 ContentsValue::Mapping(mapping) => add(mapping),
                 fallback => return fallback,
             }
@@ -390,63 +389,12 @@ fn element_contents<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Conten
         if function.definition(db) != declaration.definition(db) {
             return ContentsValue::Unavailable;
         }
-        match literal(db, &env, scope, value, &inference) {
+        match ContentsValue::from_literal(db, &env, scope, value, &inference) {
             ContentsValue::Mapping(mapping) => add(mapping),
             fallback => return fallback,
         }
     }
     result.map_or(ContentsValue::Unavailable, ContentsValue::Mapping)
-}
-
-fn literal<'db>(
-    db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
-    scope: ty_python_core::scope::ScopeId<'db>,
-    value: &ast::Expr,
-    inference: &StatementInference<'db>,
-) -> ContentsValue<'db> {
-    if inference.is_provisional() {
-        return ContentsValue::Pending;
-    }
-    let ast::Expr::Dict(dictionary) = value else {
-        return ContentsValue::Unavailable;
-    };
-    if dictionary.items.iter().any(|item| {
-        !item
-            .key
-            .as_ref()
-            .is_some_and(ast::Expr::is_string_literal_expr)
-    }) {
-        return ContentsValue::Unavailable;
-    }
-    let mut pending = false;
-    let observed = DictionaryItems::expression(db, env, scope, value, None, &mut |expression| {
-        let ty = inference.try_expression_type(expression)?;
-        if crate::types::visitor::any_over_type_expanding_aliases(db, env, ty, |ty| {
-            matches!(ty, Type::Divergent(_))
-        }) {
-            pending = true;
-            return None;
-        }
-        if matches!(ty.resolve_type_alias(db), Type::Never) {
-            return None;
-        }
-        Some(ty)
-    });
-    if pending {
-        ContentsValue::Pending
-    } else {
-        match observed {
-            Ok(dictionary) => ContentsValue::Mapping(MappingContents {
-                file: scope.program_file(db),
-                dictionary,
-                builtin: true,
-                uses_residual_presence: false,
-                bound: None,
-            }),
-            Err(_) => ContentsValue::Unavailable,
-        }
-    }
 }
 
 #[cfg(test)]

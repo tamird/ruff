@@ -375,6 +375,58 @@ impl<'db> MappingContents<'db> {
 }
 
 impl<'db> ContentsValue<'db> {
+    pub(super) fn from_literal(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
+        value: &ast::Expr,
+        inference: &StatementInference<'db>,
+    ) -> Self {
+        if inference.is_provisional() {
+            return Self::Pending;
+        }
+        let ast::Expr::Dict(dictionary) = value else {
+            return Self::Unavailable;
+        };
+        if dictionary.items.iter().any(|item| {
+            !item
+                .key
+                .as_ref()
+                .is_some_and(ast::Expr::is_string_literal_expr)
+        }) {
+            return Self::Unavailable;
+        }
+        let mut pending = false;
+        let observed =
+            DictionaryItems::expression(db, env, scope, value, None, &mut |expression| {
+                let ty = inference.try_expression_type(expression)?;
+                if crate::types::visitor::any_over_type_expanding_aliases(db, env, ty, |ty| {
+                    matches!(ty, Type::Divergent(_))
+                }) {
+                    pending = true;
+                    return None;
+                }
+                if matches!(ty.resolve_type_alias(db), Type::Never) {
+                    return None;
+                }
+                Some(ty)
+            });
+        if pending {
+            Self::Pending
+        } else {
+            match observed {
+                Ok(dictionary) => Self::Mapping(MappingContents {
+                    file: scope.program_file(db),
+                    dictionary,
+                    builtin: true,
+                    uses_residual_presence: false,
+                    bound: None,
+                }),
+                Err(_) => Self::Unavailable,
+            }
+        }
+    }
+
     fn join(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>, other: Self) -> Self {
         match self {
             Self::Pending => {
@@ -1027,6 +1079,95 @@ fn frozen_export_contents<'db>(
         &reachability,
     );
     Some(value)
+}
+
+/// Observe an exported field when the holder's assignment completes module evaluation. Within
+/// the indexed evaluation model, the fresh dictionary cannot change: later argument evaluation
+/// is inert, the checked factory retains it unchanged, and the holder's first binding replaces
+/// no earlier value whose destructor could run during assignment.
+#[salsa::tracked(
+    returns(clone),
+    cycle_initial=|_, _, _, _, _| ContentsValue::Pending,
+    cycle_fn=|db, cycle, previous: &ContentsValue<'db>, result: ContentsValue<'db>, file: ProgramFile<'db>, _, _| {
+        result.cycle_normalized(db, &ProgramEnvironment::from_file(file), previous, cycle)
+    },
+    heap_size=get_size2::GetSize::get_heap_size,
+)]
+fn frozen_exported_field_contents<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    name: Name,
+    field: Name,
+) -> ContentsValue<'db> {
+    let observed = (|| {
+        if !db.provided_exports_are_frozen(file) {
+            return None;
+        }
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let ast::Stmt::Assign(assignment) = module.suite().last()? else {
+            return None;
+        };
+        let [ast::Expr::Name(holder)] = assignment.targets.as_slice() else {
+            return None;
+        };
+        if holder.id != name {
+            return None;
+        }
+        let ast::Expr::Call(call) = assignment.value.as_ref() else {
+            return None;
+        };
+        let mut keywords = call.arguments.keywords.iter();
+        let keyword =
+            keywords.find(|keyword| keyword.arg.as_ref().is_some_and(|name| name.id == field))?;
+        if !keyword.value.is_dict_expr()
+            || std::iter::once(keyword)
+                .chain(keywords)
+                .any(|keyword| keyword.arg.is_none() || !inert_field_argument(&keyword.value))
+        {
+            return None;
+        }
+        let index = semantic_index(db, file);
+        let definition = index.try_definition(holder)?;
+        let scope = definition.scope(db);
+        if index
+            .place_table(scope.file_scope_id(db))
+            .symbol(definition.place(db).as_symbol()?)
+            .is_reassigned()
+        {
+            return None;
+        }
+        let inference = StatementInference::Definition(
+            definition,
+            infer_definition_with_body_domain(db, definition, None),
+        );
+        if inference.is_provisional() {
+            return Some(ContentsValue::Pending);
+        }
+        checked_keyword_field_factory(db, scope, call, &inference)?;
+        Some(ContentsValue::from_literal(
+            db,
+            &ProgramEnvironment::from_scope(scope),
+            scope,
+            &keyword.value,
+            &inference,
+        ))
+    })();
+    observed.unwrap_or(ContentsValue::Unavailable)
+}
+
+/// Expressions that cannot call user code while evaluating a factory argument. Dictionary keys
+/// are limited to string literals because hashing other objects can execute user code.
+fn inert_field_argument(expression: &ast::Expr) -> bool {
+    !any_over_expr(expression, |expression| match expression {
+        ast::Expr::Name(_) | ast::Expr::List(_) | ast::Expr::Tuple(_) => false,
+        ast::Expr::Dict(dictionary) => dictionary.items.iter().any(|item| {
+            !item
+                .key
+                .as_ref()
+                .is_some_and(ast::Expr::is_string_literal_expr)
+        }),
+        expression => !expression.is_literal_expr(),
+    })
 }
 
 fn is_builtin_allocation<'db>(
@@ -2282,9 +2423,9 @@ pub(super) fn unpacked_keyword<'db>(
     Some(mapping.dictionary)
 }
 
-/// Recover a first field observation from a factory's pre-retention snapshot. No alias is
-/// installed in the contents graph: later field effects, uncertain source history, or another
-/// binding all fall back to ordinary inference.
+/// Recover a first field observation from a factory's pre-retention snapshot or from a frozen
+/// exported holder. No alias is installed in the contents graph: later field effects, uncertain
+/// source history, or another binding all fall back to ordinary inference.
 fn retained_field_contents<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
@@ -2311,6 +2452,19 @@ fn retained_field_contents<'db>(
     let definition = bindings.next()?.binding.definition()?;
     if bindings.next().is_some() || definition.scope(db) != scope {
         return None;
+    }
+    if matches!(definition.kind(db), DefinitionKind::ProvidedBinding(_))
+        && let ProvidedBindingValue::Export {
+            file,
+            name,
+            value: None,
+        } = db.provided_binding(definition).value
+    {
+        let result = frozen_exported_field_contents(db, file, name, attribute.attr.id.clone());
+        return match result {
+            ContentsValue::Unavailable => None,
+            result => Some(result),
+        };
     }
     let module = parsed_module(db, file.python_file(db)).load(db);
     let (target, value) = match definition.kind(db) {

@@ -2321,6 +2321,87 @@ fn frozen_exports_observe_completed_mapping_contents() -> anyhow::Result<()> {
 }
 
 #[test]
+fn frozen_exported_holder_fields_observe_completed_mapping_contents() -> anyhow::Result<()> {
+    let source = "include(\"holder\")\ndef observe(value: object) -> None: pass\nobserve({'name': 0} | holder.values)\n";
+    for frozen in [true, false] {
+        let mut db = TestDbBuilder::new()
+            .with_source_provider(FrozenExports(frozen))
+            .with_file("/src/main.py", source)
+            .with_file("/src/exporter.py", "")
+            .with_file(
+                "/src/native.pyi",
+                "class Record:\n    values: dict[str, int]\ndef record(*, values: dict[str, int], other: object = ...) -> Record: ...\ndef untrusted(*, values: dict[str, int]) -> Record: ...\ndef invoke() -> int: ...\n",
+            )
+            .with_keyword_field_factory(|db, definition| {
+                definition.name(db).is_some_and(|name| name == "record")
+                    && definition
+                        .program_file(db)
+                        .file(db)
+                        .path(db)
+                        .as_system_path()
+                        .is_some_and(|path| path.as_str() == "/src/native.pyi")
+            })
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        for (exporter, expected) in [
+            (
+                "holder = record(values={}, other=['safe', 1])",
+                Some("Literal[0]"),
+            ),
+            ("holder = record(values={'name': 1})", Some("Literal[1]")),
+            (
+                "holder = record(values={})\nholder.values['name'] = 2",
+                None,
+            ),
+            ("values = {}\nholder = record(values=values)", None),
+            (
+                "holder = record(values={})\nholder = record(values={})",
+                None,
+            ),
+            ("holder = record(values={'name': invoke()})", None),
+            ("holder = record(values={}, other=invoke())", None),
+            ("holder = untrusted(values={})", None),
+            ("holder = record(values={})", Some("Literal[0]")),
+        ] {
+            db.write_file(
+                "/src/exporter.py",
+                format!("from native import invoke, record, untrusted\n{exporter}\n"),
+            )?;
+            let program = db.program_file(file);
+            let module = parsed_module(&db, program.python_file(&db)).load(&db);
+            let Some(ast::Stmt::Expr(statement)) = module.suite().last() else {
+                panic!("expected observation");
+            };
+            let ast::Expr::Call(call) = statement.value.as_ref() else {
+                panic!("expected observation call");
+            };
+            let model = SemanticModel::new(&db, program);
+            let items = model.dictionary_items(&call.arguments.args[0]);
+            let actual = items
+                .as_ref()
+                .filter(|items| items.is_complete())
+                .and_then(|items| {
+                    items
+                        .items
+                        .iter()
+                        .find(|item| item.name == "name" && item.is_required())
+                })
+                .map(|item| {
+                    item.ty
+                        .display(&db, &model.program_environment())
+                        .to_string()
+                });
+            assert_eq!(
+                actual.as_deref(),
+                expected.filter(|_| frozen),
+                "frozen={frozen}, {exporter}: {items:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_export_refinements_keep_source_resolution() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file("/src/main.py", "include(\"refined\")\nrefined\n")
