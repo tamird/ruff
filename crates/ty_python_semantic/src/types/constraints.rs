@@ -4300,21 +4300,27 @@ impl<'db> CandidateSolutions<'db> {
             }
         }
 
-        let mut mappings: FxIndexMap<BoundTypeVarInstance<'db>, CandidateTypeVarSolver<'db>> =
+        let mut mappings: FxIndexMap<TypeVarId, CandidateTypeVarSolver<'db>> =
             FxIndexMap::default();
         constraints.sort_by_key(|(_, source_order)| *source_order);
         for (constraint, _) in constraints {
             match constraint {
                 AtomicConstraint::ConcreteLower(lower) => {
-                    let bounds = mappings.entry(lower.typevar).or_default();
+                    let bounds = mappings
+                        .entry(storage.typevar_id(db, lower.typevar))
+                        .or_default();
                     bounds.add_lower(lower.provenance, lower.bound);
                 }
                 AtomicConstraint::ConcreteUpper(upper) => {
-                    let bounds = mappings.entry(upper.typevar).or_default();
+                    let bounds = mappings
+                        .entry(storage.typevar_id(db, upper.typevar))
+                        .or_default();
                     bounds.add_upper(upper.provenance, upper.bound);
                 }
                 AtomicConstraint::ConcreteEquivalence(equivalence) => {
-                    let bounds = mappings.entry(equivalence.typevar).or_default();
+                    let bounds = mappings
+                        .entry(storage.typevar_id(db, equivalence.typevar))
+                        .or_default();
                     bounds.add_lower(equivalence.provenance, equivalence.bound);
                     bounds.add_upper(equivalence.provenance, equivalence.bound);
                 }
@@ -4334,7 +4340,8 @@ impl<'db> CandidateSolutions<'db> {
         // that the solution does not depend on any cross-typevar relationships, so the validity
         // bounds of unmentioned typevars cannot affect the solution of the typevars we have
         // evidence for.
-        for (bound_typevar, bounds) in &mut mappings {
+        for (&typevar, bounds) in &mut mappings {
+            let bound_typevar = storage.typevar_data(typevar);
             let bound = match bound_typevar.typevar(db).bound_or_constraints(db, env) {
                 Some(TypeVarBoundOrConstraints::UpperBound(bound)) => bound,
                 // A constrained typevar introduces a disjunction over its declared constraints,
@@ -4358,7 +4365,8 @@ impl<'db> CandidateSolutions<'db> {
 
         limits.satisfied_path()?;
         let mut typevars = Vec::with_capacity(mappings.len());
-        for (bound_typevar, bounds) in mappings {
+        for (typevar, bounds) in mappings {
+            let bound_typevar = storage.typevar_data(typevar);
             let Some(solution) = bounds.finish(db, env, storage, bound_typevar) else {
                 // If any of the typevars doesn't have a solution (either because the constraint set is
                 // overly restrictive, or because a candidate solution doesn't satisfy the declared

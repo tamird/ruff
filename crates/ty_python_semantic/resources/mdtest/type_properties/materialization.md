@@ -187,6 +187,34 @@ def _(top: Top[C3], bottom: Bottom[C3]) -> None:
     reveal_type(bottom)
 ```
 
+## Generic function signatures
+
+A function with fully static parameter and return types is equivalent to both materializations.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Any
+from ty_extensions import Bottom, Top, static_assert
+from ty_extensions._internal import TypeOf, is_equivalent_to
+
+def optional[T: int](value: T | None) -> T | None:
+    return value
+
+static_assert(is_equivalent_to(TypeOf[optional], Top[TypeOf[optional]]))
+static_assert(is_equivalent_to(TypeOf[optional], Bottom[TypeOf[optional]]))
+optional("wrong")  # error: [invalid-argument-type]
+
+def gradual[T: int](value: T | None, other: Any) -> T | None:
+    return value
+
+static_assert(not is_equivalent_to(TypeOf[gradual], Top[TypeOf[gradual]]))
+static_assert(not is_equivalent_to(TypeOf[gradual], Bottom[TypeOf[gradual]]))
+```
+
 ## `TypeIs`
 
 `TypeIs` is invariant in its type argument, and so the top and bottom materializations of

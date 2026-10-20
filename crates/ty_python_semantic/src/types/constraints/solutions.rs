@@ -21,7 +21,7 @@ use crate::types::constraints::{
     ConstraintFailureEvidence, ConstraintId, ConstraintSet, ConstraintSetBuilder,
     ConstraintSetStorage, InteriorNodeData, Node, NodeId, OwnedConstraintSet,
     OwnedConstraintSetBuilder, SolutionLimits, SolutionValidity, SolutionViolation,
-    SolutionViolationKind, SourceOrderId, TypeVarSolution, UnboundedSolutionLimits,
+    SolutionViolationKind, SourceOrderId, TypeVarId, TypeVarSolution, UnboundedSolutionLimits,
 };
 use crate::types::typevar::{TypeVarBoundOrConstraints, TypeVarConstraints, TypeVarSet};
 use crate::types::{BoundTypeVarIdentity, BoundTypeVarInstance, Type, any_over_type};
@@ -1969,7 +1969,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             .collect();
 
         // Then collect the combined lower and upper bounds for each typevar.
-        let mut mappings: FxIndexMap<BoundTypeVarInstance<'db>, CandidateTypeVarSolver<'db>> =
+        // Different materializations can refer to the same logical typevar. Group their
+        // constraints by the identity used by the storage and its validity constraints.
+        let mut mappings: FxIndexMap<TypeVarId, CandidateTypeVarSolver<'db>> =
             FxIndexMap::default();
 
         for (constraint, _) in typevars {
@@ -1977,19 +1979,25 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             match constraint {
                 AtomicConstraint::ConcreteLower(lower) => {
                     if lower.typevar.is_inferable(db, inferable) {
-                        let solver = mappings.entry(lower.typevar).or_default();
+                        let solver = mappings
+                            .entry(storage.typevar_id(db, lower.typevar))
+                            .or_default();
                         solver.add_constraint(db, lower.typevar, constraint);
                     }
                 }
                 AtomicConstraint::ConcreteUpper(upper) => {
                     if upper.typevar.is_inferable(db, inferable) {
-                        let solver = mappings.entry(upper.typevar).or_default();
+                        let solver = mappings
+                            .entry(storage.typevar_id(db, upper.typevar))
+                            .or_default();
                         solver.add_constraint(db, upper.typevar, constraint);
                     }
                 }
                 AtomicConstraint::ConcreteEquivalence(equivalence) => {
                     if equivalence.typevar.is_inferable(db, inferable) {
-                        let solver = mappings.entry(equivalence.typevar).or_default();
+                        let solver = mappings
+                            .entry(storage.typevar_id(db, equivalence.typevar))
+                            .or_default();
                         solver.add_constraint(db, equivalence.typevar, constraint);
                     }
                 }
@@ -2000,9 +2008,13 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     if bound.left.is_inferable(db, inferable)
                         || bound.right.is_inferable(db, inferable)
                     {
-                        let solver = mappings.entry(bound.left).or_default();
+                        let solver = mappings
+                            .entry(storage.typevar_id(db, bound.left))
+                            .or_default();
                         solver.add_constraint(db, bound.left, constraint);
-                        let solver = mappings.entry(bound.right).or_default();
+                        let solver = mappings
+                            .entry(storage.typevar_id(db, bound.right))
+                            .or_default();
                         solver.add_constraint(db, bound.right, constraint);
                     }
                 }
@@ -2012,9 +2024,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     // reverse, non-inferable binding to preserve relationships to outer typevars.
                     let (left, right) = bound.in_builder(db, storage);
                     if left.is_inferable(db, inferable) || right.is_inferable(db, inferable) {
-                        let solver = mappings.entry(left).or_default();
+                        let solver = mappings.entry(storage.typevar_id(db, left)).or_default();
                         solver.add_constraint(db, left, constraint);
-                        let solver = mappings.entry(right).or_default();
+                        let solver = mappings.entry(storage.typevar_id(db, right)).or_default();
                         solver.add_constraint(db, right, constraint);
                     }
                 }
@@ -2024,7 +2036,8 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         let mut violations = Vec::new();
         let typevars: Option<Box<[_]>> = mappings
             .into_iter()
-            .map(|(bound_typevar, solver)| {
+            .map(|(typevar, solver)| {
+                let bound_typevar = storage.typevar_data(typevar);
                 let mut solution = solver.finish(db, env, storage, bound_typevar)?;
                 let argument = match self
                     .declared_constraint_solutions
