@@ -2539,6 +2539,66 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         }
     }
 
+    /// Recover a saved call when its result and local subject retain their original bindings.
+    fn saved_runtime_type_call(
+        &self,
+        name: &ast::ExprName,
+        expression: Expression<'db>,
+    ) -> Option<Expression<'db>> {
+        let db = self.db;
+        let file = expression.program_file(db);
+        let index = semantic_index(db, file);
+        let alias = index
+            .narrowing_alias_predicate(ast::ExprRef::Name(name))?
+            .expression;
+        let scope = expression.scope(db);
+        if alias.scope(db) != scope {
+            return None;
+        }
+        let original = alias.node_ref(db).node(self.module);
+        let [subject @ ast::Expr::Name(_)] = original.as_call_expr()?.arguments.args.as_ref()
+        else {
+            return None;
+        };
+        let use_id = name.scoped_use_id(db, file);
+        let use_def = index.use_def_map(scope.file_scope_id(db));
+        // A loop-carried result can come from a previous iteration even when the
+        // assignment's source location is unchanged.
+        let definition = use_def
+            .bindings_at_use(use_id)
+            .exactly_one()
+            .ok()?
+            .binding
+            .definition()?;
+        if ExpressionNodeKey::from(definition.kind(db).value(self.module)?)
+            != ExpressionNodeKey::from(original)
+        {
+            return None;
+        }
+        let subject_place = index
+            .place_table(scope.file_scope_id(db))
+            .place_id(&PlaceExpr::try_from_expr(subject)?)?;
+        // A nested writer can rebind the subject without appearing between the two uses.
+        if use_def.reachable_bindings(subject_place).any(|binding| {
+            binding.binding.definition().is_some_and(|definition| {
+                matches!(definition.kind(db), DefinitionKind::NestedBindings(_))
+            })
+        }) {
+            return None;
+        }
+        let captured: SmallVec<[_; 2]> = use_def
+            .bindings_at_use(index.try_expression_use_id(subject.into())?)
+            .map(|binding| binding.binding_order)
+            .collect();
+        let mut current = use_def.multi_bindings_at_use(use_id, subject_place)?;
+        std::iter::once(current.next()?)
+            .chain(current)
+            .all(|binding| {
+                binding.binding.definition().is_some() && captured.contains(&binding.binding_order)
+            })
+            .then_some(alias)
+    }
+
     fn binding_assigns_alias(
         &self,
         definition: Definition<'db>,
@@ -5164,6 +5224,23 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             for (operand, compared_value) in
                 std::iter::once((left, lhs_narrowing_rhs_ty)).chain(reversed)
             {
+                let (operand, operand_inference) = if let ast::Expr::Name(name) = operand
+                    && let Some(alias) = self.saved_runtime_type_call(name, expression)
+                {
+                    let alias_inference = infer_expression_with_body_domain(
+                        db,
+                        alias,
+                        TypeContext::default(),
+                        self.body_domain,
+                    );
+                    if alias_inference.is_provisional() {
+                        self.is_provisional = true;
+                        continue;
+                    }
+                    (alias.node_ref(db).node(self.module), alias_inference)
+                } else {
+                    (operand, inference)
+                };
                 if let Some(test) = RuntimeTypeTest::from_comparison(
                     db,
                     self.scope(),
@@ -5171,7 +5248,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                     compared_value,
                     *op,
                     is_positive,
-                    &|expression| inference.expression_type(expression),
+                    &|expression| operand_inference.expression_type(expression),
                 ) && let Some(target) = PlaceExpr::try_from_expr(test.subject)
                 {
                     let place = self.expect_place(&target);

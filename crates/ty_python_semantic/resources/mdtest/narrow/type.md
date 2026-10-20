@@ -53,6 +53,20 @@ def _(x: A | B, y: A | C):
         reveal_type(y)  # revealed: A | C
 ```
 
+## Saved runtime class
+
+```py
+class A: ...
+class B: ...
+
+def f(value: A | B):
+    value_type = type(value)
+    if value_type is A:
+        reveal_type(value)  # revealed: A
+    else:
+        reveal_type(value)  # revealed: A | B
+```
+
 ## `type(x) is C` in chained comparisons
 
 ```py

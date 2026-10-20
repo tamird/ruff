@@ -1446,6 +1446,41 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         });
     }
 
+    /// Record the current subject bindings for a comparison against a saved call result.
+    fn record_compared_call_subject(&mut self, operand: &'ast ast::Expr) {
+        let Some(name) = operand.as_name_expr() else {
+            return;
+        };
+        let Some(call) = self
+            .narrowing_aliases
+            .get(&name.id)
+            .and_then(|alias| alias.expression.as_call_expr())
+        else {
+            return;
+        };
+        let [ast::Expr::Name(subject)] = call.arguments.args.as_ref() else {
+            return;
+        };
+        if !call.arguments.keywords.is_empty() {
+            return;
+        }
+        let places = self.current_place_table();
+        let (Some(alias_symbol), Some(subject_symbol)) = (
+            places.symbol_id(name.id.as_str()),
+            places.symbol_id(subject.id.as_str()),
+        ) else {
+            return;
+        };
+        if !places.symbol(alias_symbol).is_local() || !places.symbol(subject_symbol).is_local() {
+            return;
+        }
+        let Some(use_id) = self.current_ast_ids().try_use_id(operand) else {
+            return;
+        };
+        self.current_use_def_map_mut()
+            .record_binding_snapshot(subject_symbol.into(), use_id);
+    }
+
     /// Add narrowed places from aliased expressions to the possibly-narrowed set.
     fn add_alias_narrowed_places(&self, expr: &ast::Expr, places: &mut PossiblyNarrowedPlaces) {
         Self::walk_narrowing_alias_predicate(expr, &mut |leaf| {
@@ -4326,6 +4361,18 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         op,
                         ast::CmpOp::Is | ast::CmpOp::IsNot
                     ));
+                }
+                if context == ExpressionContext::Condition
+                    && !self.narrowing_aliases.is_empty()
+                    && self.scopes[self.current_scope()].kind() == ScopeKind::Function
+                    && let Some((
+                        left,
+                        ast::CmpOp::Eq | ast::CmpOp::NotEq | ast::CmpOp::Is | ast::CmpOp::IsNot,
+                        right,
+                    )) = compare.as_single()
+                {
+                    self.record_compared_call_subject(left);
+                    self.record_compared_call_subject(right);
                 }
             }
             ast::Expr::BoolOp(node) => self.visit_bool_expression(node, context),

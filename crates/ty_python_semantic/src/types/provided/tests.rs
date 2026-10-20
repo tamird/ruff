@@ -2344,6 +2344,83 @@ tag: str
     Ok(())
 }
 
+#[test]
+fn supplied_type_tests_recover_saved_call_results() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", "def category(value: object) -> str: ...")
+        .with_file(
+            "/src/main.py",
+            r#"
+from native import category
+from typing_extensions import assert_type
+
+def saved(value: list[int] | str):
+    tag = category(value)
+    if tag == "list":
+        assert_type(value, list[int])
+    else:
+        assert_type(value, str)
+
+def per_iteration(values: list[list[int] | str]):
+    for value in values:
+        tag = category(value)
+        if "list" == tag:
+            assert_type(value, list[int])
+        else:
+            assert_type(value, str)
+
+def reassigned_subject(value: list[int] | str, replacement: list[int] | str):
+    tag = category(value)
+    value = replacement
+    if tag == "list":
+        assert_type(value, list[int] | str)
+
+def reassigned_tag(value: list[int] | str, replacement: str):
+    tag = category(value)
+    tag = replacement
+    if tag == "list":
+        assert_type(value, list[int] | str)
+
+def nested_writer(value: list[int] | str, replacement: list[int] | str):
+    def replace():
+        nonlocal value
+        value = replacement
+    tag = category(value)
+    replace()
+    if tag == "list":
+        assert_type(value, list[int] | str)
+
+def prior_iteration(values: list[list[int] | str], original: list[int] | str, refresh: bool):
+    tag = category(original)
+    for value in values:
+        if refresh:
+            tag = category(value)
+        if tag == "list":
+            assert_type(value, list[int] | str)
+
+def later_iteration(value: list[int] | str, replacement: list[int] | str, repeat: bool):
+    tag = category(value)
+    while repeat:
+        if tag == "list":
+            assert_type(value, list[int] | str)
+        value = replacement
+
+def shadowed(value: list[int] | str):
+    def category(value: object) -> str:
+        return "list"
+    tag = category(value)
+    if tag == "list":
+        assert_type(value, list[int] | str)
+"#,
+        )
+        .with_type_test_provider(runtime_type_test)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
 fn field_implication_factory<'db>(
     db: &'db TestDb,
     call: &CheckedCall<'_, 'db>,

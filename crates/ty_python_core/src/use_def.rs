@@ -2857,6 +2857,20 @@ impl<'db> UseDefMapBuilder<'db> {
         places: impl Iterator<Item = ScopedPlaceId>,
         use_id: ScopedUseId,
     ) {
+        self.record_multi_bindings(places, use_id, true);
+    }
+
+    /// Record a place's bindings at another expression's use without marking them as read.
+    pub(super) fn record_binding_snapshot(&mut self, place: ScopedPlaceId, use_id: ScopedUseId) {
+        self.record_multi_bindings(std::iter::once(place), use_id, false);
+    }
+
+    fn record_multi_bindings(
+        &mut self,
+        places: impl Iterator<Item = ScopedPlaceId>,
+        use_id: ScopedUseId,
+        mark_used: bool,
+    ) {
         let pending = self.pending_reachability.current;
         for place in places {
             let place_state =
@@ -2868,8 +2882,9 @@ impl<'db> UseDefMapBuilder<'db> {
             );
             let bindings = place_state.bindings().clone();
 
-            let binding_definition_ids = bindings.iter().map(LiveBinding::binding);
-            self.mark_definition_ids_used(binding_definition_ids);
+            if mark_used {
+                self.mark_definition_ids_used(bindings.iter().map(LiveBinding::binding));
+            }
 
             self.multi_bindings_by_use
                 .entry(use_id)

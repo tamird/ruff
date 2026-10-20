@@ -327,6 +327,23 @@ print(visible)
     }
 
     #[test]
+    fn saved_type_test_does_not_read_its_subject_again() -> anyhow::Result<()> {
+        let source = dedent(
+            "
+            def f(value: object, repeat: bool):
+                tag = type(value)
+                while repeat:
+                    if tag is str:
+                        break
+                    value = 1
+            ",
+        );
+
+        assert_eq!(collect_unused_names(&source)?, ["value"]);
+        Ok(())
+    }
+
+    #[test]
     fn captures_safe_local_binding_kinds() -> anyhow::Result<()> {
         let source = dedent(
             "
