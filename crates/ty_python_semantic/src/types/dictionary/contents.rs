@@ -21,6 +21,7 @@ use ty_python_core::{
     BindingWithConstraintsIterator, NarrowingEvaluator, ProgramFile, Statement, semantic_index,
 };
 
+use crate::Db;
 use crate::place::loop_header_reachability;
 use crate::provided::ProvidedBindingValue;
 use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
@@ -31,7 +32,6 @@ use crate::types::infer::{
 };
 use crate::types::narrow::NarrowingEvaluatorExtension;
 use crate::types::{KnownClass, KnownFunction, ProgramEnvironment, Type, UnionBuilder, UnionType};
-use crate::{Db, FxIndexMap};
 
 use super::{
     DictionaryExtraItems, DictionaryFallback, DictionaryFirstEntry, DictionaryItem,
@@ -71,21 +71,6 @@ pub(super) struct MappingBound<'db> {
 }
 
 impl<'db> MappingContents<'db> {
-    fn value_at(&self, name: &Name) -> Type<'db> {
-        self.dictionary
-            .items
-            .iter()
-            .find(|item| &item.name == name)
-            .map_or_else(|| self.extra_value(), |item| item.ty)
-    }
-
-    fn extra_value(&self) -> Type<'db> {
-        self.dictionary
-            .extra_items
-            .value_type()
-            .unwrap_or(Type::Never)
-    }
-
     fn bound_value(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
         self.bound
             .and_then(|MappingBound { ty, source: _ }| ty.unpack_keys_and_items(db, env))
@@ -189,7 +174,7 @@ impl<'db> MappingContents<'db> {
                 item.ty = UnionType::from_two_elements(db, env, item.ty, value);
             }
             self.dictionary.extra_items = DictionaryExtraItems::Value(
-                UnionType::from_two_elements(db, env, self.extra_value(), value),
+                UnionType::from_two_elements(db, env, self.dictionary.extra_value(), value),
             );
         }
     }
@@ -314,59 +299,9 @@ impl<'db> MappingContents<'db> {
             ty: UnionType::from_two_elements(db, env, left.ty, right.ty),
             source: left.source,
         });
-        let extra_value =
-            UnionType::from_two_elements(db, env, self.extra_value(), other.extra_value());
-        let mut items: FxIndexMap<_, _> = dictionary
-            .items
-            .iter()
-            .map(|item| (item.name.clone(), item.clone()))
-            .collect();
-        for item in &other_dictionary.items {
-            items
-                .entry(item.name.clone())
-                .or_insert_with(|| item.clone());
-        }
-        for (name, item) in &mut items {
-            let left = dictionary.items.iter().find(|item| &item.name == name);
-            let right = other_dictionary
-                .items
-                .iter()
-                .find(|item| &item.name == name);
-            item.ty =
-                UnionType::from_two_elements(db, env, self.value_at(name), other.value_at(name));
-            item.kind = if uses_residual_presence {
-                DictionaryItemKind::Residual
-            } else if left.is_some_and(DictionaryItem::is_required)
-                && right.is_some_and(DictionaryItem::is_required)
-            {
-                DictionaryItemKind::Required
-            } else if left
-                .into_iter()
-                .chain(right)
-                .any(|item| item.kind != DictionaryItemKind::Residual)
-            {
-                DictionaryItemKind::Optional
-            } else {
-                DictionaryItemKind::Residual
-            };
-        }
         Self {
             file: *file,
-            dictionary: DictionaryItems {
-                first_entry: dictionary
-                    .first_entry
-                    .join(db, env, &other_dictionary.first_entry),
-                items: items.into_values().collect(),
-                extra_items: match (dictionary.extra_items, other_dictionary.extra_items) {
-                    (
-                        left @ (DictionaryExtraItems::ParamSpec(_)
-                        | DictionaryExtraItems::KeywordTail(_)),
-                        right,
-                    ) if left == right => left,
-                    _ if extra_value.is_never() => DictionaryExtraItems::Closed,
-                    _ => DictionaryExtraItems::Value(extra_value),
-                },
-            },
+            dictionary: dictionary.join(db, env, other_dictionary, uses_residual_presence),
             uses_residual_presence,
             bound,
             builtin: *builtin && *other_builtin,
@@ -474,14 +409,14 @@ impl<'db> ContentsValue<'db> {
             }
             for item in &mut mapping.dictionary.items {
                 let previous_ty = match previous {
-                    Self::Mapping(previous) => previous.value_at(&item.name),
+                    Self::Mapping(previous) => previous.dictionary.value_at(&item.name),
                     _ => Type::Never,
                 };
                 item.ty = item.ty.cycle_normalized(db, env, previous_ty, cycle);
             }
             if let DictionaryExtraItems::Value(ty) = &mut mapping.dictionary.extra_items {
                 let previous_ty = match previous {
-                    Self::Mapping(previous) => previous.extra_value(),
+                    Self::Mapping(previous) => previous.dictionary.extra_value(),
                     _ => Type::Never,
                 };
                 *ty = ty.cycle_normalized(db, env, previous_ty, cycle);

@@ -496,6 +496,72 @@ fn definite_comprehension_keys<'ast>(
 }
 
 impl<'db> DictionaryItems<'db> {
+    fn value_at(&self, name: &Name) -> Type<'db> {
+        self.items
+            .iter()
+            .find(|item| &item.name == name)
+            .map_or_else(|| self.extra_value(), |item| item.ty)
+    }
+
+    fn extra_value(&self) -> Type<'db> {
+        self.extra_items.value_type().unwrap_or(Type::Never)
+    }
+
+    fn join(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        other: &Self,
+        uses_residual_presence: bool,
+    ) -> Self {
+        let extra_value =
+            UnionType::from_two_elements(db, env, self.extra_value(), other.extra_value());
+        let mut items: FxIndexMap<_, _> = self
+            .items
+            .iter()
+            .map(|item| (item.name.clone(), item.clone()))
+            .collect();
+        for item in &other.items {
+            items
+                .entry(item.name.clone())
+                .or_insert_with(|| item.clone());
+        }
+        for (name, item) in &mut items {
+            let left = self.items.iter().find(|item| &item.name == name);
+            let right = other.items.iter().find(|item| &item.name == name);
+            item.ty =
+                UnionType::from_two_elements(db, env, self.value_at(name), other.value_at(name));
+            item.kind = if uses_residual_presence {
+                DictionaryItemKind::Residual
+            } else if left.is_some_and(DictionaryItem::is_required)
+                && right.is_some_and(DictionaryItem::is_required)
+            {
+                DictionaryItemKind::Required
+            } else if left
+                .into_iter()
+                .chain(right)
+                .any(|item| item.kind != DictionaryItemKind::Residual)
+            {
+                DictionaryItemKind::Optional
+            } else {
+                DictionaryItemKind::Residual
+            };
+        }
+        Self {
+            first_entry: self.first_entry.join(db, env, &other.first_entry),
+            items: items.into_values().collect(),
+            extra_items: match (self.extra_items, other.extra_items) {
+                (
+                    left @ (DictionaryExtraItems::ParamSpec(_)
+                    | DictionaryExtraItems::KeywordTail(_)),
+                    right,
+                ) if left == right => left,
+                _ if extra_value.is_never() => DictionaryExtraItems::Closed,
+                _ => DictionaryExtraItems::Value(extra_value),
+            },
+        }
+    }
+
     /// Whether the named entries account for every possible key.
     pub const fn is_complete(&self) -> bool {
         matches!(self.extra_items, DictionaryExtraItems::Closed)
