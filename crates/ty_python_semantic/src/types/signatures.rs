@@ -14,6 +14,7 @@ use crate::ProgramEnvironment;
 use crate::types::string_annotation::SourceAnnotation;
 use std::fmt;
 use std::num::NonZeroU32;
+use std::ops::ControlFlow;
 use std::slice::Iter;
 use std::sync::Arc;
 
@@ -905,23 +906,21 @@ impl<'db> SignatureRelationKey<'db> {
 pub(crate) type SignatureRelationVisitor<'db> =
     ActiveRecursionDetector<SignatureRelationKey<'db>, Option<(Type<'db>, Type<'db>)>>;
 
-/// Compare explicit type arguments and finite aliases without expanding recursive definitions,
+/// Visit explicit type arguments and finite aliases without expanding recursive definitions,
 /// bounds, or class members, which can grow indefinitely.
-fn contains_type_argument<'db>(
+fn visit_type_arguments<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     outer: Type<'db>,
-    inner: Type<'db>,
-) -> bool {
+    mut visit: impl FnMut(Type<'db>) -> ControlFlow<()>,
+) -> ControlFlow<()> {
     let mut pending = SmallVec::<[Type<'db>; 4]>::from_slice(&[outer]);
     let mut visited = FxHashSet::default();
     while let Some(ty) = pending.pop() {
-        if ty == inner {
-            return true;
-        }
         if !visited.insert(ty) {
             continue;
         }
+        visit(ty)?;
         match ty {
             Type::Union(union) => pending.extend_from_slice(union.elements(db)),
             Type::Intersection(intersection) => {
@@ -942,7 +941,65 @@ fn contains_type_argument<'db>(
             }
         }
     }
-    false
+    ControlFlow::Continue(())
+}
+
+fn contains_type_argument<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    outer: Type<'db>,
+    inner: Type<'db>,
+) -> bool {
+    if outer == inner {
+        return true;
+    }
+    visit_type_arguments(db, env, outer, |ty| {
+        if ty == inner {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
+}
+
+fn protocol_count<'db>(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> usize {
+    let mut count = 0;
+    let _ = visit_type_arguments(db, env, ty, |ty| {
+        count += usize::from(matches!(ty, Type::ProtocolInstance(_)));
+        ControlFlow::Continue(())
+    });
+    count
+}
+
+fn protocol_requirements_decrease<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    previous: Type<'db>,
+    current: Type<'db>,
+) -> bool {
+    let (Some(previous_protocol), Some(current_protocol)) = (
+        previous.as_protocol_instance(),
+        current.as_protocol_instance(),
+    ) else {
+        return false;
+    };
+    let (Some(previous_origin), Some(current_origin)) = (
+        previous_protocol.class_origin(db),
+        current_protocol.class_origin(db),
+    ) else {
+        return false;
+    };
+    if previous_origin.class_literal(db) != current_origin.class_literal(db)
+        || previous_protocol.materialization_kind(db) != current_protocol.materialization_kind(db)
+    {
+        return false;
+    }
+    let previous_count = protocol_count(db, env, previous);
+    if previous_count < 2 {
+        return false;
+    }
+    protocol_count(db, env, current) < previous_count
 }
 
 fn receiver_class<'db>(
@@ -3553,6 +3610,9 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // `Items[Items[int]]` with `Iterable[Iterable[str]]`. Continue when both receivers'
         // arguments decrease componentwise and at least one decreases strictly. Comparing
         // against the nearest active visit makes this a well-founded progress measure.
+        // A method may also replace a nested protocol with its return type. A strict decrease
+        // in the number of reachable target protocols permits continued comparison: argument
+        // descent cannot increase this count, so it is a well-founded primary progress measure.
         // Growing or unrecognized contexts retain the declaration-based approximation.
         self.signature_relation_visitor.visit_with_context(
             &key,
@@ -3563,13 +3623,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 else {
                     return false;
                 };
-                let (Some(source_decreases), Some(target_decreases)) = (
+                if let (Some(source_decreases), Some(target_decreases)) = (
                     receiver_arguments_decrease(db, self.env, previous_source, source),
                     receiver_arguments_decrease(db, self.env, previous_target, target),
-                ) else {
-                    return false;
-                };
-                source_decreases || target_decreases
+                ) {
+                    return source_decreases || target_decreases;
+                }
+                protocol_requirements_decrease(db, self.env, previous_target, target)
             },
             || self.always(),
             work,

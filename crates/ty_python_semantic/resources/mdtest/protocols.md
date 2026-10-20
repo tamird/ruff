@@ -6411,6 +6411,35 @@ def check(
     nested(right_alias)  # no diagnostic
 ```
 
+## Iterable protocol nested in a method return
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from collections.abc import Iterable, Iterator
+from typing import Protocol
+
+class Box[T]:
+    def __iter__(self) -> Iterator[T]:
+        raise NotImplementedError
+
+class HasItems[K, V](Protocol):
+    def items(self) -> Iterable[tuple[K, V]]: ...
+
+class Entries[K, V]:
+    def items(self) -> Box[tuple[K, V]]:
+        raise NotImplementedError
+
+def consume(values: Iterable[HasItems[str, str]]) -> None: ...
+def check(good: Box[Entries[str, str]], bad_key: Box[Entries[int, str]], bad_value: Box[Entries[str, int]]):
+    consume(good)
+    consume(bad_key)  # error: [invalid-argument-type]
+    consume(bad_value)  # error: [invalid-argument-type]
+```
+
 ## Recursive protocols
 
 ### Properties
