@@ -4828,7 +4828,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             // Each alternative in a nominal union contributes constraints. The structural
             // paths below only accept a single actual instance, while the constraint solver
             // handles the entire union. Self and variadics retain their existing inference.
-            // A gradual or provisional alternative must not leave only concrete evidence.
+            // Gradual and unresolved alternatives must not leave only concrete evidence.
             (
                 formal @ Type::NominalInstance(formal_instance),
                 actual @ Type::Union(actual_union),
@@ -4843,8 +4843,14 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     // in this comparison can contribute to its projected mapping independently.
                     !contains_self_or_variadic(formal)
                         && !contains_self_or_variadic(actual)
-                        && !actual.has_indeterminate_inference(db, self.env)
-                        && !actual_union.elements(db).iter().any(Type::is_dynamic)
+                        && actual_union.elements(db).iter().all(|element| {
+                            // A recursive query's unmaterialized cycle marker can be solved
+                            // together with the concrete alternatives that began the cycle.
+                            (element.is_recursive_divergent()
+                                && element.materialized_divergent_fallback().is_none())
+                                || (!element.is_dynamic()
+                                    && !element.has_indeterminate_inference(db, self.env))
+                        })
                 };
                 if can_infer {
                     let when = self.constraint_for_relation(formal, actual, relation_polarity);

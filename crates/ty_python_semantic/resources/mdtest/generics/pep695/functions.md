@@ -4171,6 +4171,30 @@ def contra(values: Sink[str] | Sink[int]):
     reveal_type(contravariant(values))  # revealed: Never
 ```
 
+A generic call in a loop preserves the type of the initial binding. Other branches can still
+contribute types to the result.
+
+```py
+def preserve_cell[T](value: Cell[T]) -> Cell[T]:
+    return value
+
+def loop_cell[T](values: list[Cell[T]]) -> Cell[T]:
+    result = values[0]
+    for _ in values[1:]:
+        result = preserve_cell(result)
+    reveal_type(result)  # revealed: Cell[T@loop_cell]
+    return result
+
+def loop_cell_or_none[T](values: list[Cell[T]], stop: bool) -> Cell[T] | None:
+    result = values[0]
+    for _ in values[1:]:
+        if result is None:
+            break
+        result = None if stop else preserve_cell(result)
+    reveal_type(result)  # revealed: Cell[T@loop_cell_or_none] | None
+    return result
+```
+
 An unrelated parameter pack does not prevent ordinary nominal parameters from contributing
 constraints. Callback signatures and forwarded packs retain their own inference.
 
