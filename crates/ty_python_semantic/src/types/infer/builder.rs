@@ -9684,7 +9684,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 name,
                 self.reachability_cache(),
             ),
-            None => self.dictionary_items(expression, ty),
+            None => {
+                let items = self.dictionary_items(expression, ty)?;
+                if items.is_complete() || !expression.is_name_expr() {
+                    return Some(items);
+                }
+                crate::types::dictionary::contents::retained_argument_items(
+                    self.db(),
+                    self.scope(),
+                    call,
+                    expression,
+                    self.reachability_cache(),
+                )
+                .or(Some(items))
+            }
         }
     }
 

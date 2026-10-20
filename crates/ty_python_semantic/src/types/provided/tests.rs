@@ -3222,7 +3222,7 @@ fn dictionary_observations_follow_retained_fields() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file(
             "/src/native.pyi",
-            "class Record:\n    values: dict[str, int]\ndef record(*, values: dict[str, int], other: object = ...) -> Record: ...\ndef untrusted(*, values: dict[str, int]) -> Record: ...\ndef observe(value: object) -> str: ...\ndef touch(value: object) -> None: ...\ncondition: bool\n",
+            "class Record:\n    values: dict[str, int]\n    other: object\ndef record(*, values: dict[str, int], other: object = ...) -> Record: ...\ndef untrusted(*, values: dict[str, int]) -> Record: ...\ndef observe(value: object, *, other: object = ...) -> str: ...\ndef touch(value: object) -> None: ...\ncondition: bool\n",
         )
         .with_file("/src/main.py", "")
         .with_keyword_field_factory(|db, declaration| {
@@ -3254,7 +3254,6 @@ fn dictionary_observations_follow_retained_fields() -> anyhow::Result<()> {
     // when either the source history, factory identity, or field history changes.
     for (before, call, intervening, read, expected) in [
         ("", "record(values=values)", "", "holder.values", "known"),
-        ("", "record(values=values)", "", "values", "unknown"),
         (
             "",
             "record(values=values)",
@@ -3287,6 +3286,55 @@ fn dictionary_observations_follow_retained_fields() -> anyhow::Result<()> {
             "",
             "record(values=values)",
             "holder.values.clear()\n",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "touch(holder)\n",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "alias = holder\n",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "if condition:\n    holder.values.clear()\n",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "",
+            "values, other=holder.values.clear()",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "",
+            "values, other=holder.other",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values, other=values)",
+            "",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values, other=[values])",
+            "",
             "values",
             "unknown",
         ),
@@ -3447,6 +3495,14 @@ fn dictionary_observations_follow_retained_fields() -> anyhow::Result<()> {
             "unknown",
         ),
         ("", "record(values=values)", "", "holder.values", "known"),
+        ("", "record(values=values)", "", "values", "known"),
+        (
+            "",
+            "record(values=values, other=42)",
+            "",
+            "values, other=holder.other",
+            "known",
+        ),
     ] {
         let source = format!(
             "from native import condition, observe, record, touch, untrusted\nvalues = {{'first': 1}}\n{before}holder = {call}\n{intervening}result = observe({read})\n"
@@ -3479,6 +3535,20 @@ def in_loop() -> None:
     for _ in range(2):
         holder = record(values=values)
         assert_type(observe(holder.values), Literal["unknown"])
+
+def at_next_call() -> None:
+    values = {"first": 1}
+    holder = record(values=values)
+    first = observe(values)
+    later = observe(values)
+    assert_type(first, Literal["known"])
+    assert_type(later, Literal["unknown"])
+
+class InClass:
+    values = {"first": 1}
+    holder = record(values=values)
+    result = observe(values)
+    assert_type(result, Literal["unknown"])
 "#,
     )?;
     let diagnostics = db.check_file(file);

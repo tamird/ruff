@@ -2347,79 +2347,22 @@ fn retained_field_contents<'db>(
     let ast::Expr::Call(call) = value else {
         return None;
     };
-    // No unpacking or repeated/nested occurrences of the retained source are admitted.
-    if !call.arguments.args.is_empty()
-        || call
-            .arguments
-            .keywords
-            .iter()
-            .any(|keyword| keyword.arg.is_none())
-    {
-        return None;
-    }
     let keyword = call.arguments.keywords.iter().find(|keyword| {
         keyword
             .arg
             .as_ref()
             .is_some_and(|name| name.as_str() == attribute.attr.as_str())
     })?;
-    let source = &keyword.value;
-    let ast::Expr::Name(source_name) = source else {
-        return None;
-    };
-    let source_symbol = table.symbol(table.symbol_id(source_name.id.as_str())?);
-    if !source_symbol.is_local() || source_symbol.is_reassigned() {
-        return None;
-    }
-    let source_place = PlaceExpr::try_from_expr(source)?;
-    let mentions_source = |expression: &ast::Expr| {
-        any_over_expr(expression, |expression| {
-            PlaceExpr::try_from_expr(expression).as_ref() == Some(&source_place)
-        })
-    };
-    if mentions_source(&call.func)
-        || call
-            .arguments
-            .keywords
-            .iter()
-            .filter(|keyword| mentions_source(&keyword.value))
-            .count()
-            != 1
-    {
-        return None;
-    }
+    let source = retained_keyword_source(table, call, keyword)?;
     let domain = reachability.body_domain();
-    let inference = infer_definition_with_body_domain(db, definition, domain);
-    if StatementInference::Definition(definition, inference).is_provisional() {
+    let inference = StatementInference::Definition(
+        definition,
+        infer_definition_with_body_domain(db, definition, domain),
+    );
+    if inference.is_provisional() {
         return Some(ContentsValue::Pending);
     }
-    let callee @ Type::FunctionLiteral(_) = inference.try_expression_type(&call.func)? else {
-        return None;
-    };
-    let env = ProgramEnvironment::from_scope(scope);
-    let bindings = callee.bindings(db, &env);
-    let callable = bindings.single_element()?;
-    if callable.bound_type.is_some() {
-        return None;
-    }
-    let [binding] = callable.overloads() else {
-        return None;
-    };
-    if !db.provided_keyword_field_factory(binding.signature.definition()?) {
-        return None;
-    }
-    let arguments = CallArguments::from_arguments_typed(&call.arguments, |expression| {
-        inference
-            .try_expression_type(expression)
-            .unwrap_or(Type::unknown())
-    });
-    let matched = bindings.match_parameters(db, &env, &arguments);
-    let [binding] = matched.single_element()?.overloads() else {
-        return None;
-    };
-    if !binding.errors().is_empty() {
-        return None;
-    }
+    checked_keyword_field_factory(db, scope, call, &inference)?;
 
     let source_contents = table.place_id(&PlaceExpr::contents(source)?)?;
     let call_use = index.try_expression_use_id(call.into())?;
@@ -2453,6 +2396,271 @@ fn retained_field_contents<'db>(
         inference.try_expression_type(source)?,
         reachability,
     ))
+}
+
+fn retained_keyword_source<'ast>(
+    table: &PlaceTable,
+    call: &'ast ast::ExprCall,
+    keyword: &'ast ast::Keyword,
+) -> Option<&'ast ast::Expr> {
+    // No unpacking or repeated/nested occurrences of the retained source are admitted.
+    if !call.arguments.args.is_empty()
+        || call
+            .arguments
+            .keywords
+            .iter()
+            .any(|keyword| keyword.arg.is_none())
+    {
+        return None;
+    }
+    let source = &keyword.value;
+    let ast::Expr::Name(name) = source else {
+        return None;
+    };
+    let symbol = table.symbol(table.symbol_id(name.id.as_str())?);
+    if !symbol.is_local() || symbol.is_reassigned() {
+        return None;
+    }
+    let source_place = PlaceExpr::from_expr_name(name);
+    let mentions_source = |expression: &ast::Expr| {
+        any_over_expr(expression, |expression| {
+            PlaceExpr::try_from_expr(expression).as_ref() == Some(&source_place)
+        })
+    };
+    if mentions_source(&call.func)
+        || call
+            .arguments
+            .keywords
+            .iter()
+            .filter(|keyword| mentions_source(&keyword.value))
+            .count()
+            != 1
+    {
+        return None;
+    }
+    Some(source)
+}
+
+fn checked_keyword_field_factory<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    call: &ast::ExprCall,
+    inference: &StatementInference<'db>,
+) -> Option<Definition<'db>> {
+    let callee @ Type::FunctionLiteral(_) = inference.try_expression_type(&call.func)? else {
+        return None;
+    };
+    let env = ProgramEnvironment::from_scope(scope);
+    let bindings = callee.bindings(db, &env);
+    let callable = bindings.single_element()?;
+    if callable.bound_type.is_some() {
+        return None;
+    }
+    let [binding] = callable.overloads() else {
+        return None;
+    };
+    let declaration = binding.signature.definition()?;
+    if !db.provided_keyword_field_factory(declaration) {
+        return None;
+    }
+    let arguments = CallArguments::from_arguments_typed(&call.arguments, |expression| {
+        inference
+            .try_expression_type(expression)
+            .unwrap_or(Type::unknown())
+    });
+    let matched = bindings.match_parameters(db, &env, &arguments);
+    let [binding] = matched.single_element()?.overloads() else {
+        return None;
+    };
+    binding.errors().is_empty().then_some(declaration)
+}
+
+/// Recover a retained dictionary only for the next checked call. The ordinary contents state
+/// remains exposed: the returned holder is another path to the mutable dictionary.
+pub(crate) fn retained_argument_items<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    observed: &ast::ExprCall,
+    expression: &ast::Expr,
+    reachability: &ReachabilityEvaluationCache<'db>,
+) -> Option<DictionaryItems<'db>> {
+    let ast::Expr::Name(name) = expression else {
+        return None;
+    };
+    let file = scope.program_file(db);
+    let index = semantic_index(db, file);
+    let table = index.place_table(scope.file_scope_id(db));
+    let contents_place = table.place_id(&PlaceExpr::contents(expression)?)?;
+    let use_id = index.try_expression_use_id(expression.into())?;
+    let use_def = index.use_def_map(scope.file_scope_id(db));
+    let mut source_bindings = use_def.bindings_at_use(use_id);
+    let source_definition = source_bindings.next()?.binding.definition()?;
+    if source_bindings.next().is_some() || source_definition.scope(db) != scope {
+        return None;
+    }
+    let mut bindings = use_def.multi_bindings_at_use(use_id, contents_place)?;
+    let effect_definition = bindings.next()?.binding.definition()?;
+    if bindings.next().is_some() || effect_definition.scope(db) != scope {
+        return None;
+    }
+    let DefinitionKind::DictionaryContents(contents) = effect_definition.kind(db) else {
+        return None;
+    };
+    let DictionaryContentsDefinitionKind::Operation {
+        receiver,
+        effect:
+            DictionaryContentsEffect::Call {
+                call,
+                owner: Some(owner @ DictionaryContentsInferenceOwner::Statement(statement)),
+                retained: true,
+            },
+    } = contents.as_ref()
+    else {
+        return None;
+    };
+    let module = parsed_module(db, file.python_file(db)).load(db);
+    let statement = statement.node(&module);
+    let ast::Stmt::Assign(retaining_assignment) = statement else {
+        return None;
+    };
+    let [ast::Expr::Name(holder)] = retaining_assignment.targets.as_slice() else {
+        return None;
+    };
+    let retaining_call = call.node(&module);
+    if !retaining_assignment
+        .value
+        .as_call_expr()
+        .is_some_and(|value| std::ptr::eq(value, retaining_call))
+    {
+        return None;
+    }
+    let body = match scope.node(db) {
+        NodeWithScopeKind::Module => module.suite(),
+        NodeWithScopeKind::Function(function) => &function.node(&module).body,
+        _ => return None,
+    };
+    let end = body.partition_point(|statement| statement.start() < observed.start());
+    let [previous, ast::Stmt::Assign(observing_assignment)] = body.get(end.checked_sub(2)?..end)?
+    else {
+        return None;
+    };
+    if !std::ptr::eq(previous, statement)
+        || !matches!(
+            observing_assignment.targets.as_slice(),
+            [ast::Expr::Name(_)]
+        )
+        || !observing_assignment
+            .value
+            .as_call_expr()
+            .is_some_and(|value| std::ptr::eq(value, observed))
+    {
+        return None;
+    }
+    let holder_symbol = table.symbol(table.symbol_id(holder.id.as_str())?);
+    if !holder_symbol.is_local() || holder_symbol.is_reassigned() {
+        return None;
+    }
+    let keyword = retaining_call.arguments.keywords.iter().find(|keyword| {
+        keyword
+            .value
+            .as_name_expr()
+            .is_some_and(|value| value.id == name.id)
+    })?;
+    let source = retained_keyword_source(table, retaining_call, keyword)?;
+    if !std::ptr::eq(receiver.node(&module), source)
+        || !inert_retained_argument_call(
+            observed,
+            name,
+            holder,
+            retaining_call,
+            keyword.arg.as_ref()?.as_str(),
+        )
+    {
+        return None;
+    }
+    let domain = reachability.body_domain();
+    let inference = operand_types(db, scope, Some(owner), domain)?;
+    if inference.is_provisional() {
+        return None;
+    }
+    checked_keyword_field_factory(db, scope, retaining_call, &inference)?;
+    if !matches!(
+        check_contents_history(
+            db,
+            scope,
+            use_def
+                .bindings_at_definition(effect_definition)
+                .map(|binding| binding.binding)
+                .collect(),
+            KeyHistoryOrigin::FreshSource,
+            domain,
+        ),
+        KeyPreservation::Preserved
+    ) {
+        return None;
+    }
+    let Contents {
+        value: ContentsValue::Mapping(mut mapping),
+        captured: false,
+    } = from_bindings(
+        db,
+        scope,
+        use_def.bindings_at_definition(effect_definition),
+        reachability,
+    )
+    else {
+        return None;
+    };
+    if !mapping.dictionary.is_complete() {
+        return None;
+    }
+    mapping.localize(file, expression.range());
+    Some(mapping.dictionary)
+}
+
+fn inert_retained_argument_call(
+    observed: &ast::ExprCall,
+    source: &ast::ExprName,
+    holder: &ast::ExprName,
+    retaining_call: &ast::ExprCall,
+    retained_field: &str,
+) -> bool {
+    let Some(callee) = observed.func.as_name_expr() else {
+        return false;
+    };
+    if callee.id == holder.id || callee.id == source.id {
+        return false;
+    }
+    let mut found = false;
+    let inert = observed.arguments.iter_source_order().all(|argument| {
+        let expression = match argument {
+            ast::ArgOrKeyword::Arg(expression) => expression,
+            ast::ArgOrKeyword::Keyword(keyword) if keyword.arg.is_some() => &keyword.value,
+            ast::ArgOrKeyword::Keyword(_) => return false,
+        };
+        match expression {
+            ast::Expr::Name(name) if std::ptr::eq(name, source) => {
+                found = true;
+                true
+            }
+            ast::Expr::Name(name) => name.id != holder.id && name.id != source.id,
+            ast::Expr::Attribute(attribute) => {
+                attribute
+                    .value
+                    .as_name_expr()
+                    .is_some_and(|name| name.id == holder.id)
+                    && attribute.attr.as_str() != retained_field
+                    && retaining_call.arguments.keywords.iter().any(|keyword| {
+                        keyword
+                            .arg
+                            .as_ref()
+                            .is_some_and(|name| name.as_str() == attribute.attr.as_str())
+                    })
+            }
+            expression => expression.is_literal_expr(),
+        }
+    });
+    inert && found
 }
 
 pub(super) fn snapshot_contents<'db>(
