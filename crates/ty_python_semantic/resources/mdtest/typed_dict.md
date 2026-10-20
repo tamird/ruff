@@ -3238,6 +3238,77 @@ def _(destination: Named, patch: AbsentCountPatch):
     destination.update(patch)
 ```
 
+## Updating a dictionary from a closed `TypedDict`
+
+A closed `TypedDict` contributes only its declared value types when consumed through a mapping
+protocol, including by `dict.update()`.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from collections.abc import Mapping
+from typing import Generic, TypeVar
+from typing_extensions import TypedDict
+
+T_co = TypeVar("T_co", covariant=True)
+
+class Descriptor(Generic[T_co]): ...
+
+class Closed(TypedDict, closed=True):
+    item: Descriptor[str]
+
+def accept[V: Descriptor[object]](values: Mapping[str, V]) -> None: ...
+def check(source: Closed, initial: Descriptor[bool]) -> None:
+    accept(source)  # no diagnostic
+    values = {"existing": initial}
+    values.update(source)
+    reveal_type(values)  # revealed: dict[str, Descriptor[str] | Descriptor[bool]]
+    accept(values)  # no diagnostic
+```
+
+Other values may enter through the source mapping or another mutable reference:
+
+```py
+class Open(TypedDict):
+    item: Descriptor[str]
+
+class Mixed(TypedDict, closed=True):
+    item: Descriptor[str]
+    other: int
+
+def reject(source: Closed, initial: Descriptor[bool], opened: Open, mixed: Mixed) -> None:
+    from_open = {"existing": initial}
+    from_open.update(opened)
+    accept(from_open)  # error: [invalid-argument-type]
+    from_mixed = {"existing": initial}
+    from_mixed.update(mixed)
+    accept(from_mixed)  # error: [invalid-argument-type]
+
+    exposed = {"existing": initial}
+    alias: dict[str, object] = exposed
+    alias["other"] = 42
+    exposed.update(source)
+    accept(exposed)  # error: [invalid-argument-type]
+```
+
+Calling `__getitem__` directly exposes the same value type as indexing. An empty closed schema has
+no readable values.
+
+```py
+def read(source: Closed, key: str) -> None:
+    # error: [invalid-key]
+    reveal_type(source[key])  # revealed: Descriptor[str]
+    reveal_type(source.__getitem__(key))  # revealed: Descriptor[str]
+
+class Empty(TypedDict, closed=True): ...
+
+def read_empty(source: Empty, key: str) -> None:
+    reveal_type(source.__getitem__(key))  # revealed: Never
+```
+
 ## Methods on `TypedDict`
 
 ```py

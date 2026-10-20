@@ -250,11 +250,7 @@ fn synthesize_typed_dict_getitem<'db>(
                 Parameter::positional_only(Some(Name::new_static("key")))
                     .with_annotated_type(KnownClass::Str.to_instance(db, env)),
             ]),
-            if typed_dict.explicit_extra_items(db).is_some() {
-                typed_dict.value_type(db, env)
-            } else {
-                Type::object()
-            },
+            typed_dict.value_type(db, env),
         )));
 
     Type::Callable(CallableType::new(
