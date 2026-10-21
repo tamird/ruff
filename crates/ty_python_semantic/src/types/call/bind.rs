@@ -79,8 +79,8 @@ use crate::types::typevar::{
 };
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
-    TypeCollector, TypeKind, TypeVisitor, any_over_type, walk_non_atomic_type,
-    walk_type_with_recursion_guard,
+    TypeCollector, TypeKind, TypeVisitor, any_over_type, any_over_type_expanding_aliases,
+    walk_non_atomic_type, walk_type_with_recursion_guard,
 };
 use crate::types::{
     BindingContext, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
@@ -1085,7 +1085,7 @@ impl<'db> Bindings<'db> {
                     match result {
                         OverloadCallResult::ArgumentTypeExpansion(_) => return None,
                         OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => return None,
-                        OverloadCallResult::Ambiguous => {}
+                        OverloadCallResult::Ambiguous { .. } => {}
                     }
                 }
                 let mut selected = callable.selected_overloads().peekable();
@@ -3616,7 +3616,7 @@ impl<'db> Bindings<'db> {
             // Known method overrides can resolve ambiguous return types.
             if matches!(
                 binding.overload_call_result,
-                Some(OverloadCallResult::Ambiguous)
+                Some(OverloadCallResult::Ambiguous { .. })
             ) && binding
                 .matching_overloads()
                 .map(|(_, overload)| overload.return_type())
@@ -3718,7 +3718,8 @@ pub(crate) struct CallableBinding<'db> {
     /// overloads for the expanded argument lists. We also retain the overloads selected for
     /// deprecation reporting without discarding the other matches used for argument inference.
     ///
-    /// For (2) and (3), the final return type is [`Unknown`].
+    /// For (2), the final return type retains a gradual bound unless an application explicitly
+    /// refines every selected overload to the same fully static result. For (3), it is [`Unknown`].
     ///
     /// [`Unknown`]: crate::types::DynamicType::Unknown
     overload_call_result: Option<OverloadCallResult<'db>>,
@@ -4766,7 +4767,9 @@ impl<'db> CallableBinding<'db> {
 
         if !are_return_types_equivalent_for_all_matching_overloads {
             // Overload matching is ambiguous.
-            self.overload_call_result = Some(OverloadCallResult::Ambiguous);
+            self.overload_call_result = Some(OverloadCallResult::Ambiguous {
+                shared_return: false,
+            });
         }
         !are_return_types_equivalent_for_all_matching_overloads
     }
@@ -4880,11 +4883,14 @@ impl<'db> CallableBinding<'db> {
         // snapshot for each overload. It cannot supply a complete checked view.
         let complete = self
             .overload_call_result
-            .as_ref()
+            .as_mut()
             .is_none_or(|result| match result {
                 OverloadCallResult::ArgumentTypeExpansion(_) => false,
                 OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => false,
-                OverloadCallResult::Ambiguous => true,
+                OverloadCallResult::Ambiguous { shared_return } => {
+                    *shared_return = false;
+                    true
+                }
             });
         let selected: SmallVec<[usize; 2]> = if self.overloads.len() == 1 {
             smallvec::smallvec![0]
@@ -4897,6 +4903,45 @@ impl<'db> CallableBinding<'db> {
             .iter_mut()
             .enumerate()
             .filter_map(move |(index, binding)| selected.contains(&index).then_some(binding))
+    }
+
+    /// Resolve an ambiguous return after every selected binding received an explicit refinement.
+    /// The overloads stay selected so their input contracts and diagnostics remain available.
+    pub(crate) fn resolve_shared_provided_return(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) {
+        if !matches!(
+            self.overload_call_result,
+            Some(OverloadCallResult::Ambiguous { .. })
+        ) {
+            return;
+        }
+        let shared = {
+            let mut returns = self
+                .matching_overloads()
+                .map(|(_, overload)| overload.return_type());
+            let (Some(first), Some(second)) = (returns.next(), returns.next()) else {
+                return;
+            };
+            if first != second || returns.any(|returned| returned != first) {
+                return;
+            }
+            first
+        };
+        if any_over_type_expanding_aliases(db, env, shared, |ty| {
+            matches!(
+                ty,
+                Type::Divergent(_) | Type::TypeIs(_) | Type::TypeGuard(_)
+            )
+        }) || !shared.is_fully_static(db, env)
+        {
+            return;
+        }
+        self.overload_call_result = Some(OverloadCallResult::Ambiguous {
+            shared_return: true,
+        });
     }
 
     /// Returns an iterator over all the overloads that matched for this call binding.
@@ -4921,7 +4966,7 @@ impl<'db> CallableBinding<'db> {
             OverloadCallResult::ArgumentTypeExpansion(expanded) => {
                 expanded.selected_overloads.contains(index)
             }
-            OverloadCallResult::Ambiguous => true,
+            OverloadCallResult::Ambiguous { .. } => true,
             OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => false,
         }))
     }
@@ -5013,7 +5058,8 @@ impl<'db> CallableBinding<'db> {
     /// For a valid call, this is the return type of either a successful argument type expansion of
     /// an overloaded function, or the return type of the first overload that the arguments matched
     /// against.
-    /// Ambiguous calls retain a gradual bound from all remaining return types.
+    /// Ambiguous calls retain a gradual bound from all remaining return types unless every
+    /// selected overload has the same complete, static, non-predicate supplied result.
     ///
     /// For an invalid call to a non-overloaded function, this is the return type of the function.
     ///
@@ -5024,7 +5070,7 @@ impl<'db> CallableBinding<'db> {
             return match overload_call_result {
                 OverloadCallResult::ArgumentTypeExpansion(expanded) => expanded.return_type,
                 OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => Type::unknown(),
-                OverloadCallResult::Ambiguous => {
+                OverloadCallResult::Ambiguous { shared_return } => {
                     let bound = self.common_type_is_return(db, env).unwrap_or_else(|| {
                         UnionType::from_elements(
                             db,
@@ -5033,6 +5079,9 @@ impl<'db> CallableBinding<'db> {
                                 .map(|(_, overload)| overload.return_type()),
                         )
                     });
+                    if *shared_return {
+                        return bound;
+                    }
                     if any_over_type(db, env, bound, false, |ty| ty.is_divergent()) {
                         // Keep the unresolved dependency without introducing a lasting gradual
                         // marker before overload selection has enough information.
@@ -5415,8 +5464,9 @@ enum OverloadCallResult<'db> {
     ArgumentTypeExpansion(Box<ExpandedOverloadCall<'db>>),
     /// Argument expansion stopped at this argument's expansion limit.
     ArgumentTypeExpansionLimitReached(usize),
-    /// Several overloads remain with non-equivalent return types.
-    Ambiguous,
+    /// Several overloads remain selected. Their returned value may independently be known if
+    /// every selected overload received the same complete application-supplied refinement.
+    Ambiguous { shared_return: bool },
 }
 
 /// The combined return type and selected overloads from successful argument expansion.

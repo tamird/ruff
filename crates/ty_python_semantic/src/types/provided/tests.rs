@@ -2073,6 +2073,11 @@ fn supplied_call_results_follow_selected_overloads() -> anyhow::Result<()> {
                 Some(Type::int_literal(value)).into()
             }
             Some("expanded") => panic!("expanded arguments do not retain every checked binding"),
+            Some("shared") => Some(Type::int_literal(3)).into(),
+            Some("partial") if matches!(call.argument("one"), CheckedArgument::Value { .. }) => {
+                Some(KnownClass::Str.to_instance(db, &ProgramEnvironment::from_file(call.file())))
+                    .into()
+            }
             Some("recover") => {
                 assert!(call.has_binding_errors());
                 Some(Type::int_literal(-1)).into()
@@ -2100,6 +2105,14 @@ def ambiguous(one: int) -> int: ...
 @overload
 def ambiguous(two: str) -> str: ...
 @overload
+def shared(one: int) -> int: ...
+@overload
+def shared(two: str) -> str: ...
+@overload
+def partial(one: int) -> int: ...
+@overload
+def partial(two: str) -> str: ...
+@overload
 def expanded(one: int) -> int: ...
 @overload
 def expanded(two: str) -> str: ...
@@ -2110,7 +2123,7 @@ def gradual() -> Any: ...
         .with_file(
             "/src/main.py",
             r#"
-from native import select, first, ambiguous, expanded, recover, gradual
+from native import select, first, ambiguous, shared, partial, expanded, recover, gradual
 from typing import Literal
 from typing_extensions import assert_type
 
@@ -2119,6 +2132,8 @@ assert_type(select("a", "b"), Literal[2])
 assert_type(first(1), Literal[1])
 value = gradual()
 ambiguous_result = ambiguous(value)
+assert_type(shared(value), Literal[3])
+partial_result = partial(value)
 def expand(value: int | str):
     assert_type(expanded(value), int | str)
 invalid = select([])
@@ -2151,6 +2166,16 @@ assert_type(recovered, Literal[-1])
             &env,
             [Type::int_literal(1), Type::int_literal(2)],
         ),
+    );
+    assert_eq!(actual, expected);
+    let actual = crate::place::global_symbol(&db, file, "partial_result")
+        .place
+        .expect_type();
+    let expected = crate::types::IntersectionType::from_two_elements(
+        &db,
+        &env,
+        Type::Dynamic(crate::types::DynamicType::AmbiguousOverload),
+        KnownClass::Str.to_instance(&db, &env),
     );
     assert_eq!(actual, expected);
     Ok(())

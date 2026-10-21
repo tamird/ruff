@@ -170,7 +170,9 @@ pub trait Db: PythonCoreDb {
     /// The declaration, bound arguments, and inferred child types come from this inference pass.
     /// Implementations must identify the resolved declaration, rather than the spelling of the
     /// call, and must not request completed inference of the scope currently being inferred.
-    /// Selected overloads are refined separately and retain ordinary result aggregation.
+    /// Selected overloads are refined separately. If every selected overload receives the same
+    /// complete static non-predicate result, that result is known even if overload selection
+    /// remains ambiguous.
     /// Calls requiring argument expansion retain ordinary inference because their complete
     /// checked bindings are not available. Invalid single-signature calls retain their
     /// diagnostics and can supply a recovery result.

@@ -11055,6 +11055,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut diagnostics = Vec::new();
         for callable in bindings.iter_flat_mut() {
             let bound_receiver = callable.bound_type.is_some();
+            let mut all_results_refined = !has_binding_errors;
             for binding in callable.result_refinement_overloads_mut() {
                 let mut context = crate::types::CheckedCall {
                     binding,
@@ -11072,9 +11073,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     diagnostics: supplied_diagnostics,
                 } = self.db().provided_call_result(&context);
                 diagnostics.extend(supplied_diagnostics);
+                all_results_refined &= return_type.is_some();
                 if let Some(result) = return_type {
                     context.set_return_type(result);
                 }
+            }
+            if all_results_refined {
+                callable.resolve_shared_provided_return(self.db(), self.program_environment());
             }
         }
         if !diagnostics.is_empty()
