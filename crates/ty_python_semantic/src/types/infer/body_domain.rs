@@ -807,17 +807,23 @@ fn supported_body(
             == Some(callee.definition(db))
     }
 
-    fn collection_method(
+    fn builtin_method(
         db: &dyn Db,
         function: FunctionType<'_>,
         attribute: &ast::ExprAttribute,
     ) -> bool {
         let model = SemanticModel::new(db, function.program_file(db));
-        let (class, mutates) = match attribute.attr.id.as_str() {
-            "get" => (KnownClass::Dict, false),
-            "pop" => (KnownClass::Dict, true),
-            "append" => (KnownClass::List, true),
-            _ => return false,
+        let (class, mutates) = if attribute.value.is_string_literal_expr() {
+            // A literal has an exact immutable receiver. Argument effects still follow
+            // ordinary call inference; the method is not assumed to be pure.
+            (KnownClass::Str, false)
+        } else {
+            match attribute.attr.id.as_str() {
+                "get" => (KnownClass::Dict, false),
+                "pop" => (KnownClass::Dict, true),
+                "append" => (KnownClass::List, true),
+                _ => return false,
+            }
         };
         if mutates && !fresh_receiver(db, function, &attribute.value, class) {
             return false;
@@ -931,7 +937,7 @@ fn supported_body(
                     }
                     ast::Expr::Attribute(attribute) => {
                         if !expression(db, function, locals, callees, &attribute.value)
-                            || !(collection_method(db, function, attribute)
+                            || !(builtin_method(db, function, attribute)
                                 || protocol_method(db, function, attribute)
                                 || stored_function_callee(db, function, attribute))
                         {
@@ -1359,6 +1365,110 @@ mod tests {
             )?;
             let f = function(&db);
             assert!(!OverloadBodyAnalysis::new(&db, f).is_complete());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn complete_domains_check_literal_string_methods() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import Literal, overload
+            @overload
+            def f(flag: Literal[True]) -> str: ...
+            @overload
+            def f(flag: Literal[False]) -> int: ...
+            def f(flag: bool) -> str | int:
+                if flag:
+                    return EXPRESSION
+                return 42
+        "#};
+        for (expression, expected) in [
+            (r#""{}".format("value")"#, None),
+            (r#""value".replace("a", "x")"#, None),
+            (r#""value".replace(42, "x")"#, Some("no-matching-overload")),
+            (
+                r#"("{}".format("value"), 42)[1]"#,
+                Some("invalid-return-type"),
+            ),
+        ] {
+            db.write_file("/src/body.py", source.replace("EXPRESSION", expression))?;
+            let f = function(&db);
+            let analysis = OverloadBodyAnalysis::new(&db, f);
+            assert!(analysis.is_complete(), "{expression}");
+            let diagnostics = crate::types::check_types_with_overload_analysis(
+                &db,
+                f.program_file(&db),
+                [],
+                [analysis],
+            );
+            let ids: Vec<_> = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                expected.into_iter().collect::<Vec<_>>(),
+                "{expression}"
+            );
+        }
+        for declaration in [
+            "class Custom:\n    def format(self, value: object) -> str: ...",
+            "class Custom(str):\n    def format(self, value: object) -> str: ...",
+        ] {
+            db.write_file(
+                "/src/body.py",
+                source
+                    .replace(
+                        "from typing import Literal, overload",
+                        &format!(
+                            "from typing import Literal, overload\n{declaration}\ncustom = Custom()"
+                        ),
+                    )
+                    .replace("EXPRESSION", "custom.format('value')"),
+            )?;
+            assert!(!OverloadBodyAnalysis::new(&db, function(&db)).is_complete());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn literal_string_methods_invalidate_argument_contents() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import overload
+            def consume(*, value: int) -> None: ...
+            @overload
+            def f(flag: int) -> None: ...
+            @overload
+            def f(flag: str) -> None: ...
+            def f(flag: int | str) -> None:
+                values: dict[str, object] = {"value": 1}
+                CALL
+                consume(**values)
+        "#};
+        for (call, expected) in [
+            ("pass", None),
+            (
+                r#""{value}".format_map(values)"#,
+                Some("invalid-argument-type"),
+            ),
+        ] {
+            db.write_file("/src/body.py", source.replace("CALL", call))?;
+            let f = function(&db);
+            let analysis = OverloadBodyAnalysis::new(&db, f);
+            assert!(analysis.is_complete(), "{call}");
+            let diagnostics = crate::types::check_types_with_overload_analysis(
+                &db,
+                f.program_file(&db),
+                [],
+                [analysis],
+            );
+            let ids: Vec<_> = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            assert_eq!(ids, expected.into_iter().collect::<Vec<_>>(), "{call}");
         }
         Ok(())
     }
