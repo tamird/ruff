@@ -7,6 +7,7 @@ use crate::files::{File, Files};
 use crate::system::System;
 use crate::vendored::VendoredFileSystem;
 use ruff_python_ast::{PySourceType, PythonVersion};
+pub use ruff_python_parser::StringLiteralDecoder;
 use rustc_hash::FxHasher;
 use std::hash::BuildHasherDefault;
 use std::num::NonZeroUsize;
@@ -27,12 +28,12 @@ pub mod vendored;
 
 /// A file paired with the configuration used to parse its contents.
 ///
-/// This is the key for [`parsed::parsed_module`]. Including the Python version and source type
-/// allows the same file to be parsed with different grammars within a single Salsa revision
-/// without sharing an incompatible AST or syntax diagnostics.
+/// This is the key for [`parsed::parsed_module`]. Including the Python version, source type, and
+/// literal interpretation allows the same file to have different parse results within a single
+/// Salsa revision without sharing an incompatible AST or syntax diagnostics.
 #[salsa::interned(
     debug,
-    constructor = new_with_source_type,
+    constructor = new_with_parse_options,
     heap_size = ruff_memory_usage::heap_size
 )]
 pub struct PythonFile<'db> {
@@ -43,12 +44,25 @@ pub struct PythonFile<'db> {
     /// The parser grammar, independent of source decoding and [`File::is_stub`].
     #[returns(copy)]
     pub source_type: PySourceType,
+    /// The embedding application's stable name for a string literal interpretation. When
+    /// present, [`Db::string_literal_decoder`] must resolve it for the database's lifetime.
+    #[returns(copy)]
+    pub literal_namespace: Option<&'static str>,
 }
 
 impl<'db> PythonFile<'db> {
     /// Selects the default parser grammar using [`File::source_type`].
     pub fn new(db: &'db dyn Db, file: File, python_version: PythonVersion) -> Self {
         Self::new_with_source_type(db, file, python_version, file.source_type(db))
+    }
+
+    pub fn new_with_source_type(
+        db: &'db dyn Db,
+        file: File,
+        python_version: PythonVersion,
+        source_type: PySourceType,
+    ) -> Self {
+        Self::new_with_parse_options(db, file, python_version, source_type, None)
     }
 }
 
@@ -91,6 +105,14 @@ pub trait Db: salsa::Database {
     fn vendored(&self) -> &VendoredFileSystem;
     fn system(&self) -> &dyn System;
     fn files(&self) -> &Files;
+
+    /// Resolves an embedding application's stable literal interpretation name.
+    ///
+    /// A namespace must resolve to the same deterministic decoder for the lifetime of the
+    /// database. Changing interpretation requires a new namespace.
+    fn string_literal_decoder(&self, _namespace: &'static str) -> Option<StringLiteralDecoder> {
+        None
+    }
 }
 
 /// Returns the maximum number of tasks that ty is allowed
@@ -208,6 +230,14 @@ mod tests {
 
         fn files(&self) -> &Files {
             &self.files
+        }
+
+        fn string_literal_decoder(
+            &self,
+            namespace: &'static str,
+        ) -> Option<ruff_python_parser::StringLiteralDecoder> {
+            (namespace == "test:uppercase")
+                .then_some(|source| Some(source.to_ascii_uppercase().into_boxed_str()))
         }
     }
 

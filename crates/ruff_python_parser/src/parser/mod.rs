@@ -26,7 +26,7 @@ use crate::token_source::{TokenSource, TokenSourceCheckpoint};
 use crate::{Mode, ParseError, ParseErrorType, UnsupportedSyntaxErrorKind};
 use crate::{Parsed, Tokens};
 
-pub use crate::parser::options::ParseOptions;
+pub use crate::parser::options::{ParseOptions, StringLiteralDecoder};
 
 mod expression;
 mod helpers;

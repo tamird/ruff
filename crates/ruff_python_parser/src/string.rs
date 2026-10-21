@@ -7,6 +7,7 @@ use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::{self as ast, AnyStringFlags, AtomicNodeIndex, Expr, StringFlags};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
+use crate::ParseOptions;
 use crate::error::{LexicalError, LexicalErrorType};
 
 #[derive(Debug)]
@@ -443,11 +444,14 @@ impl<'src> StringParser<'src> {
         }))
     }
 
-    fn parse_string(mut self) -> Result<StringType, LexicalError> {
+    fn parse_string(mut self, options: &ParseOptions) -> Result<StringType, LexicalError> {
         if self.flags.is_raw_string() {
             // For raw strings, no escaping is necessary.
             return Ok(StringType::Str(ast::StringLiteral {
-                value: self.source.into(),
+                value: options
+                    .decode_string_literal_source(self.source)
+                    .into_owned()
+                    .into_boxed_str(),
                 range: self.range,
                 flags: self.flags.into(),
                 node_index: AtomicNodeIndex::NONE,
@@ -457,7 +461,10 @@ impl<'src> StringParser<'src> {
         let Some(mut escape) = memchr::memchr(b'\\', self.source.as_bytes()) else {
             // If the string doesn't contain any escape sequences, return the owned string.
             return Ok(StringType::Str(ast::StringLiteral {
-                value: self.source.into(),
+                value: options
+                    .decode_string_literal_source(self.source)
+                    .into_owned()
+                    .into_boxed_str(),
                 range: self.range,
                 flags: self.flags.into(),
                 node_index: AtomicNodeIndex::NONE,
@@ -471,7 +478,7 @@ impl<'src> StringParser<'src> {
             // Add the characters before the escape sequence to the string.
             let before_with_slash = self.skip_bytes(escape + 1);
             let before = &before_with_slash[..before_with_slash.len() - 1];
-            value.push_str(before);
+            value.push_str(&options.decode_string_literal_source(before));
 
             // Add the escaped character to the string.
             match self.parse_escaped_char()? {
@@ -486,7 +493,7 @@ impl<'src> StringParser<'src> {
             let Some(next_escape) = self.source[self.cursor..].find('\\') else {
                 // Add the rest of the string to the value.
                 let rest = &self.source[self.cursor..];
-                value.push_str(rest);
+                value.push_str(&options.decode_string_literal_source(rest));
                 break;
             };
 
@@ -502,11 +509,11 @@ impl<'src> StringParser<'src> {
         }))
     }
 
-    fn parse(self) -> Result<StringType, LexicalError> {
+    fn parse(self, options: &ParseOptions) -> Result<StringType, LexicalError> {
         if self.flags.is_byte_string() {
             self.parse_bytes()
         } else {
-            self.parse_string()
+            self.parse_string(options)
         }
     }
 }
@@ -515,8 +522,9 @@ pub(crate) fn parse_string_literal(
     source: &str,
     flags: AnyStringFlags,
     range: TextRange,
+    options: &ParseOptions,
 ) -> Result<StringType, LexicalError> {
-    StringParser::new(source, flags, range.start() + flags.opener_len(), range).parse()
+    StringParser::new(source, flags, range.start() + flags.opener_len(), range).parse(options)
 }
 
 pub(crate) fn parse_interpolated_string_literal_element(

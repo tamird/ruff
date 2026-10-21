@@ -1538,7 +1538,7 @@ impl<'src> Parser<'src> {
 
         let value = self.bump_string_value();
 
-        match parse_string_literal(value, flags, range) {
+        match parse_string_literal(value, flags, range, &self.options) {
             Ok(string) => string,
             Err(error) => {
                 let location = error.location();

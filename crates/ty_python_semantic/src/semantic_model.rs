@@ -2,7 +2,7 @@ use compact_str::CompactString;
 use ruff_db::PythonFile;
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::{parsed_annotation_range, parsed_module, parsed_string_annotation};
-use ruff_db::source::{line_index, source_text};
+use ruff_db::source::line_index;
 use ruff_python_ast::find_node::{CoveringNode, covering_node};
 use ruff_python_ast::{self as ast, ExprStringLiteral, ModExpression, NodeIndex};
 use ruff_python_ast::{Expr, ExprRef, name::Name};
@@ -374,8 +374,7 @@ impl<'db> SemanticModel<'db> {
             }
             _ => return None,
         };
-        let source = source_text(self.db, self.file());
-        let parsed = parsed_annotation_range(&source, range, owner).ok()?;
+        let parsed = parsed_annotation_range(self.db, self.python_file(), range, owner).ok()?;
         Some((parsed, definition))
     }
 
@@ -846,9 +845,8 @@ impl<'db> SemanticModel<'db> {
         }
 
         // Parse the sub-AST and preserve the scope that owns its inferred types.
-        let source = source_text(self.db, self.file());
         let string_literal = string_expr.as_single_part_string()?;
-        let ast = parsed_string_annotation(source.as_str(), string_literal).ok()?;
+        let ast = parsed_string_annotation(self.db, self.python_file(), string_literal).ok()?;
         let model = Self {
             db: self.db,
             file: self.file,
