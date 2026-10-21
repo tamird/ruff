@@ -7,7 +7,7 @@ use crate::types::dictionary::has_dict_type;
 use crate::types::typed_dict::{
     extract_unpacked_typed_dict_keys_from_value_type, infer_unpacked_keyword_types,
 };
-use crate::types::{KnownClass, Type, TypeContext};
+use crate::types::{KnownClass, Type, TypeContext, UnionType};
 
 impl<'db> TypeInferenceBuilder<'db, '_> {
     pub(super) fn infer_dict_call(
@@ -18,15 +18,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         call_expression_tcx: TypeContext<'db>,
     ) -> Option<Type<'db>> {
         let db = self.db();
+        let env = self.program_environment();
+        let typed_dict_context = call_expression_tcx.annotation.map(|annotation| {
+            annotation
+                .expand_top_level_aliases(db, env)
+                .filter_union(db, env, Type::is_typed_dict)
+        });
         // Fast-path dict(...) in TypedDict context: infer keyword values against fields,
         // then validate and return the TypedDict type. A TypedDict-shaped positional source
         // supplies fields that can be overwritten by keyword arguments.
-        if let Some(tcx) = call_expression_tcx.annotation
-            && let Some(typed_dict) = tcx
-                .resolve_type_alias(db)
-                .filter_union(db, self.program_environment(), Type::is_typed_dict)
-                .as_typed_dict()
-        {
+        if let Some(typed_dict) = typed_dict_context.and_then(Type::as_typed_dict) {
             // Only speculate applicability checks. A positional source must expose a TypedDict
             // shape or observed copy contents without context; the target must not manufacture
             // its input fields.
@@ -95,6 +96,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 
                 return Some(Type::TypedDict(typed_dict));
             }
+        } else if let Some(Type::Union(union)) = typed_dict_context
+            && arguments.args.is_empty()
+            && let Some(ty) = self.infer_dict_call_in_typed_dict_union(func, arguments, union)
+        {
+            return Some(ty);
         }
 
         if !arguments.args.is_empty()
@@ -157,5 +163,55 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 .is_none()
                 .then(Type::unknown)
         })
+    }
+
+    fn infer_dict_call_in_typed_dict_union(
+        &mut self,
+        func: &ast::Expr,
+        arguments: &ast::Arguments,
+        union: UnionType<'db>,
+    ) -> Option<Type<'db>> {
+        let db = self.db();
+        let env = self.program_environment();
+        let teardown_expression_cache = self.setup_expression_cache();
+        let mut first_match = None;
+        let mut additional_matches = Vec::new();
+
+        for typed_dict in union
+            .elements(db)
+            .iter()
+            .filter_map(|ty| ty.as_typed_dict())
+        {
+            let mut candidate = self.speculate();
+            if candidate.complete_typed_dict_constructor(typed_dict, arguments, func.into()) {
+                if first_match.is_none() {
+                    first_match = Some((Type::TypedDict(typed_dict), candidate));
+                } else {
+                    additional_matches.push(Type::TypedDict(typed_dict));
+                }
+            }
+        }
+
+        let result = first_match.map(|(first_type, candidate)| {
+            if additional_matches.is_empty() {
+                self.extend(candidate);
+                first_type
+            } else {
+                // Multiple schemas accept the call. Infer the arguments once without selecting
+                // one schema's field contexts for all of them.
+                for keyword in &arguments.keywords {
+                    self.infer_expression(&keyword.value, TypeContext::default());
+                }
+                UnionType::from_elements(
+                    db,
+                    env,
+                    std::iter::once(first_type).chain(additional_matches),
+                )
+            }
+        });
+        if teardown_expression_cache {
+            self.teardown_expression_cache();
+        }
+        result
     }
 }

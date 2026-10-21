@@ -1072,6 +1072,58 @@ def return_invalid_dict() -> TD:
     return dict()
 ```
 
+## Built-in `dict` constructors in a union context
+
+```py
+from collections.abc import Callable
+from typing import Literal, TypedDict
+
+class Empty(TypedDict):
+    kind: Literal["empty"]
+
+class Value(TypedDict):
+    kind: Literal["value"]
+    value: int
+
+empty: Empty | Value = dict(kind="empty")  # no diagnostic
+value: Empty | Value = dict(kind="value", value=1)  # no diagnostic
+invalid: Empty | Value = dict(kind="value")  # error: [invalid-assignment]
+
+reveal_type(empty)  # revealed: Empty
+reveal_type(value)  # revealed: Value
+
+class Callback(TypedDict):
+    kind: Literal["callback"]
+    callback: Callable[[int], int]
+
+callback: Empty | Callback = dict(kind="callback", callback=lambda x: reveal_type(x))  # revealed: int
+
+class StringCallback(TypedDict):
+    kind: Literal["callback"]
+    callback: Callable[[str], str]
+
+ambiguous_callback: Callback | StringCallback = dict(kind="callback", callback=lambda x: reveal_type(x))  # revealed: Unknown
+reveal_type(ambiguous_callback)  # revealed: Callback | StringCallback
+
+class OtherValue(TypedDict):
+    kind: Literal["value"]
+    value: int
+
+ambiguous: Value | OtherValue = dict(kind="value", value=1)
+reveal_type(ambiguous)  # revealed: Value | OtherValue
+
+plain: Empty | Value | dict[str, int] = dict(other=1)
+reveal_type(plain)  # revealed: dict[str, int]
+
+def unpack(payload: Value) -> Empty | Value:
+    return dict(**payload)
+
+invalid_value: Empty | Value = dict(kind="value", value="wrong")  # error: [invalid-assignment]
+
+def missing_name() -> Empty | Value:
+    return dict(kind="value", value=unknown)  # error: [unresolved-reference]
+```
+
 ## Contextual built-in dictionary copies
 
 ```toml

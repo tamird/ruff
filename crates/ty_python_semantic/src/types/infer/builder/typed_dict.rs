@@ -690,6 +690,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             | TypedDictConstructorForm::MultiplePositionalArguments => {}
         }
 
+        self.complete_typed_dict_constructor(typed_dict, arguments, error_node);
+    }
+
+    /// Infer keyword values and validate a constructor after preparing its positional arguments.
+    pub(super) fn complete_typed_dict_constructor<'expr>(
+        &mut self,
+        typed_dict: TypedDictType<'db>,
+        arguments: &'expr ast::Arguments,
+        error_node: AnyNodeRef<'expr>,
+    ) -> bool {
         if !arguments.keywords.is_empty() {
             self.infer_typed_dict_constructor_keyword_values(typed_dict, arguments);
         }
@@ -700,7 +710,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             arguments,
             error_node,
             |expr, _tcx| self.expression_type(expr),
-        );
+        )
     }
 
     /// Infer keyword argument values for a `TypedDict` constructor.
