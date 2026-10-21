@@ -429,7 +429,19 @@ impl<'db> ContentsValue<'db> {
 #[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
 struct Contents<'db> {
     value: ContentsValue<'db>,
-    captured: bool,
+    captured: CaptureEffect,
+}
+
+/// A lazy capture applies to later assignments to the same lexical binding. A read through a
+/// builtin dictionary method preserves the mapping only when the joined allocation is builtin.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, get_size2::GetSize, salsa::SalsaValue,
+)]
+enum CaptureEffect {
+    None,
+    /// Preserves entries of a builtin dictionary, but can still expose mutable descendants.
+    BuiltinRead,
+    Expose,
 }
 
 impl<'db> Contents<'db> {
@@ -450,7 +462,7 @@ impl<'db> Contents<'db> {
         let captured = if cycle.iteration() <= crate::TAINTED_CYCLES {
             captured
         } else {
-            *previous_captured || captured
+            (*previous_captured).max(captured)
         };
         Self { value, captured }
     }
@@ -458,7 +470,7 @@ impl<'db> Contents<'db> {
     fn new(value: ContentsValue<'db>) -> Self {
         Self {
             value,
-            captured: false,
+            captured: CaptureEffect::None,
         }
     }
 
@@ -468,9 +480,15 @@ impl<'db> Contents<'db> {
             value: other_value,
             captured: other_captured,
         } = other;
-        let captured = captured || other_captured;
+        let captured = captured.max(other_captured);
         let mut value = value.join(db, env, other_value);
-        if captured && let ContentsValue::Mapping(mapping) = &mut value {
+        if let ContentsValue::Mapping(mapping) = &mut value
+            && match captured {
+                CaptureEffect::None => false,
+                CaptureEffect::BuiltinRead => !mapping.builtin,
+                CaptureEffect::Expose => true,
+            }
+        {
             mapping.expose(db, env);
         }
         Self { value, captured }
@@ -597,7 +615,7 @@ fn infer_definition_contents<'db>(
             {
                 return Contents {
                     value: ContentsValue::Unavailable,
-                    captured: true,
+                    captured: CaptureEffect::Expose,
                 };
             }
             let loop_header = loop_header_reachability(db, definition);
@@ -678,14 +696,24 @@ fn infer_definition_contents<'db>(
                     };
                 }
                 match execution {
-                    NestedBindingExecution::Lazy => Contents {
-                        value: ContentsValue::Unreachable,
-                        captured: true,
-                    },
+                    NestedBindingExecution::Lazy => {
+                        let captured =
+                            if capture_preserves_contents(db, definition, *nested_scope, |effect| {
+                                is_builtin_readonly_capture(db, effect)
+                            }) {
+                                CaptureEffect::BuiltinRead
+                            } else {
+                                CaptureEffect::Expose
+                            };
+                        Contents {
+                            value: ContentsValue::Unreachable,
+                            captured,
+                        }
+                    }
                     NestedBindingExecution::Eager => {
                         let mut result = previous();
                         if let ContentsValue::Mapping(mapping) = &mut result.value
-                            && !capture_has_no_reachable_effects(db, definition, *nested_scope)
+                            && !capture_preserves_contents(db, definition, *nested_scope, |_| false)
                         {
                             mapping.expose(db, &env);
                         }
@@ -698,10 +726,11 @@ fn infer_definition_contents<'db>(
     }
 }
 
-fn capture_has_no_reachable_effects<'db>(
+fn capture_preserves_contents<'db>(
     db: &'db dyn Db,
     capture: Definition<'db>,
     nested_scope: FileScopeId,
+    preserves: impl Fn(Definition<'db>) -> bool,
 ) -> bool {
     let scope = capture.scope(db);
     let file = scope.program_file(db);
@@ -722,15 +751,42 @@ fn capture_has_no_reachable_effects<'db>(
         return false;
     }
     bindings.all(|binding| {
-        evaluate_reachability_with_cache(
-            db,
-            Some(&reachability),
-            use_def.reachability_constraints(),
-            use_def.predicates(),
-            binding.reachability_constraint,
-        )
-        .is_always_false()
+        binding.binding.definition().is_some_and(&preserves)
+            || evaluate_reachability_with_cache(
+                db,
+                Some(&reachability),
+                use_def.reachability_constraints(),
+                use_def.predicates(),
+                binding.reachability_constraint,
+            )
+            .is_always_false()
     })
+}
+
+fn is_builtin_readonly_capture(db: &dyn Db, definition: Definition<'_>) -> bool {
+    let DefinitionKind::DictionaryContents(kind) = definition.kind(db) else {
+        return false;
+    };
+    let DictionaryContentsDefinitionKind::Operation {
+        receiver,
+        effect:
+            DictionaryContentsEffect::Call {
+                call,
+                owner: _,
+                retained: false,
+            },
+    } = kind.as_ref()
+    else {
+        return false;
+    };
+    let module = parsed_module(db, definition.program_file(db).python_file(db)).load(db);
+    let call = call.node(&module);
+    let Some(method) = call.func.as_attribute_expr() else {
+        return false;
+    };
+    call.arguments.is_empty()
+        && std::ptr::eq(method.value.as_ref(), receiver.node(&module))
+        && DictionaryContentsEffect::is_zero_argument_readonly_method(method.attr.as_str())
 }
 
 /// Seed the contents graph from the same binding that owns ordinary value inference.
@@ -1812,23 +1868,24 @@ fn mapping_transfer<'db>(
             let Some(method) = method else {
                 return MappingTransfer::Expose;
             };
-            match method.attr.as_str() {
-                "copy" | "get" | "keys" | "items" | "values" | "__getitem__" | "__contains__" => {
-                    // A read-only operation can return an argument, including this receiver
-                    // supplied again as a default value.
-                    if *retained
-                        || call.arguments.args.iter().any(|argument| {
-                            PlaceExpr::try_from_expr(argument) == PlaceExpr::try_from_expr(receiver)
-                        })
-                    {
-                        MappingTransfer::Expose
-                    } else {
-                        MappingTransfer::Keep {
-                            exposes_descendants: !discarded
-                                && method.attr.as_str() != "__contains__",
-                        }
+            let method_name = method.attr.as_str();
+            if DictionaryContentsEffect::is_zero_argument_readonly_method(method_name)
+                || matches!(method_name, "get" | "__getitem__" | "__contains__")
+            {
+                // A read-only operation can return an argument, including this receiver
+                // supplied again as a default value.
+                return if *retained
+                    || call.arguments.args.iter().any(|argument| {
+                        PlaceExpr::try_from_expr(argument) == PlaceExpr::try_from_expr(receiver)
+                    }) {
+                    MappingTransfer::Expose
+                } else {
+                    MappingTransfer::Keep {
+                        exposes_descendants: !discarded && method_name != "__contains__",
                     }
-                }
+                };
+            }
+            match method_name {
                 "setdefault" => {
                     let (key, default) = match call.arguments.args.as_ref() {
                         [key] => (key, None),
@@ -2359,7 +2416,7 @@ pub(super) fn unpacked_keyword<'db>(
         .multi_bindings_at_use(use_id, child)?;
     let Contents {
         value: ContentsValue::Mapping(mut mapping),
-        captured: false,
+        captured: CaptureEffect::None,
     } = from_bindings(db, scope, bindings, reachability)
     else {
         return None;
@@ -2700,7 +2757,7 @@ pub(crate) fn retained_argument_items<'db>(
     }
     let Contents {
         value: ContentsValue::Mapping(mut mapping),
-        captured: false,
+        captured: CaptureEffect::None,
     } = from_bindings(
         db,
         scope,

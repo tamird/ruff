@@ -674,6 +674,45 @@ def capture_before_assignment():
     remove()
     empty(**values)
 
+def readonly_capture():
+    def inspect():
+        for _ in values.keys():
+            pass
+    values = {"extra": 1}
+    inspect()
+    empty(**values)  # error: [unknown-argument]
+
+def captured_alias():
+    def inspect():
+        saved = values
+        saved.clear()
+        return values.keys()
+    values = {"extra": 1}
+    inspect()
+    empty(**values)  # no diagnostic
+
+def captured_values_expose_descendants():
+    def inspect():
+        saved = values.values()
+        for child in saved:
+            child.clear()
+    values = {"child": {"extra": 1}}
+    inspect()
+    empty(**values["child"])  # no diagnostic
+
+class ClearingDict(dict[str, int]):
+    def keys(self):
+        self.clear()
+        return super().keys()
+
+def mixed_allocation_capture(condition: bool):
+    def inspect():
+        for _ in values.keys():
+            pass
+    values = {"extra": 1} if condition else ClearingDict(extra=1)
+    inspect()
+    empty(**values)  # no diagnostic
+
 def default_capture():
     values = {"extra": 1}
     def remove(saved=values):

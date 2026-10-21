@@ -698,6 +698,7 @@ enum CandidateAssignment<'ast> {
 /// and the ordinary source-ordered visit owns all effects.
 struct Candidates<'ast, 'a> {
     exclusions: &'a SourceExclusions,
+    enclosing_places: Option<&'a PlaceTableBuilder>,
     keyword_capture: Option<&'ast str>,
     by_place: FxHashMap<MemberExprBuilder, usize>,
     nodes: Vec<Candidate<'ast>>,
@@ -874,6 +875,7 @@ impl<'ast> Candidates<'ast, '_> {
         }
         let Self {
             exclusions: _,
+            enclosing_places: _,
             keyword_capture: _,
             by_place,
             nodes: mut candidates,
@@ -1020,10 +1022,18 @@ impl<'ast> Visitor<'ast> for Candidates<'ast, '_> {
                     self.demand(argument);
                 }
                 if let ast::Expr::Attribute(attribute) = call.func.as_ref()
-                    && matches!(
+                    && (matches!(
                         attribute.attr.as_str(),
                         "update" | "clear" | "pop" | "popitem" | "setdefault" | "copy" | "get"
-                    )
+                    ) || call.arguments.is_empty()
+                        && DictionaryContentsEffect::is_zero_argument_readonly_method(
+                            attribute.attr.as_str(),
+                        )
+                        && attribute.value.is_name_expr()
+                        && self.enclosing_places.is_some_and(|places| {
+                            PlaceExpr::contents(&attribute.value)
+                                .is_some_and(|place| places.place_id((&place).into()).is_some())
+                        }))
                 {
                     self.demand(&attribute.value);
                     if attribute.attr.as_str() == "update"
@@ -1092,9 +1102,11 @@ pub(super) fn candidates<'ast>(
     node: NodeWithScopeRef<'ast>,
     module: &'ast [ast::Stmt],
     exclusions: &SourceExclusions,
+    enclosing_places: Option<&PlaceTableBuilder>,
 ) -> ContentsCandidates<'ast> {
     let mut visitor = Candidates {
         exclusions,
+        enclosing_places,
         keyword_capture: None,
         by_place: FxHashMap::default(),
         nodes: Vec::new(),

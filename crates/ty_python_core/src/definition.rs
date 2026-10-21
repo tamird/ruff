@@ -1681,6 +1681,14 @@ pub enum DictionaryContentsEffect<'db> {
     Expose,
 }
 
+impl DictionaryContentsEffect<'_> {
+    /// A syntactic hint for builtin dictionary methods that take no arguments and preserve the
+    /// receiver's entries. Semantic consumers must independently establish builtin identity.
+    pub fn is_zero_argument_readonly_method(name: &str) -> bool {
+        matches!(name, "copy" | "keys" | "items" | "values")
+    }
+}
+
 /// The inference region that owns bindings created while evaluating an assignment's value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub enum BindingsOwner {

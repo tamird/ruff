@@ -593,7 +593,12 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             receivers,
             field_sources,
             unpacked_values,
-        } = dictionary_contents::candidates(node, self.module.suite(), &self.source_exclusions);
+        } = dictionary_contents::candidates(
+            node,
+            self.module.suite(),
+            &self.source_exclusions,
+            parent.map(|parent| &self.place_tables[parent]),
+        );
         for receiver in receivers {
             self.register_contents_place(receiver);
         }
