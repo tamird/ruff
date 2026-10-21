@@ -43,7 +43,8 @@ use crate::place::{
     explicit_global_symbol, implicit_builtins_symbol, loop_header_reachability,
     module_type_implicit_global_declaration, module_type_implicit_global_symbol, place_by_id,
     place_from_bindings_assuming_boolean, place_from_bindings_with_reachability_cache,
-    place_from_declarations_with_reachability_cache, typing_extensions_symbol,
+    place_from_bindings_with_replacement, place_from_declarations_with_reachability_cache,
+    typing_extensions_symbol,
 };
 use crate::place_load::{
     ImplicitPlaceLoad, PlaceExprPrefixLoad, PlaceExprPrefixLoads, PlaceLoadFailure, PlaceLoadMode,
@@ -63,7 +64,7 @@ use crate::types::call::bind::{
 use crate::types::call::{Binding, Bindings, CallArguments, CallError, CallErrorKind};
 use crate::types::callable::CallableTypeKind;
 use crate::types::class::{
-    ClassLiteral, CodeGeneratorKind, FrozenDataclassDispatch, MethodDecorator,
+    ClassLiteral, CodeGeneratorKind, FrozenDataclassDispatch, MethodDecorator, StaticClassLiteral,
 };
 use crate::types::constraints::{CandidateSolutions, ConstraintSetBuilder, Solutions};
 use crate::types::context::InferContext;
@@ -9898,6 +9899,81 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         (!visitor.has_free_typevar.get()).then_some(constraint)
     }
 
+    /// Substitute the identity specialization only for the reaching empty allocation. Other
+    /// bindings still constrain the call, but cannot become contents of the allocated dictionary.
+    fn joined_empty_dictionary_identity(
+        &self,
+        expression: &ast::Expr,
+        snapshot: ast::ExprRef<'_>,
+        origin: Definition<'db>,
+    ) -> Option<(StaticClassLiteral<'db>, Type<'db>)> {
+        let db = self.db();
+        let env = self.program_environment();
+        let ast::Expr::Name(name) = expression else {
+            return None;
+        };
+        if self.is_deferred() || origin.file_scope(db) != self.scope().file_scope_id(db) {
+            return None;
+        }
+        let DefinitionKind::Assignment(assignment) = origin.kind(db) else {
+            return None;
+        };
+        let ast::Expr::Dict(dictionary) = assignment.value(self.module()) else {
+            return None;
+        };
+        if !dictionary.items.is_empty() {
+            return None;
+        }
+
+        let mut resolution = resolve_place_load(
+            db,
+            self.index,
+            self.scope(),
+            PlaceExpr::from_expr_name(name),
+            PlaceLoadMode::AtExpression(expression.into()),
+        );
+        let PlaceLoadResolutionStep::Source(source) = resolution.next()? else {
+            return None;
+        };
+        if !resolution.narrowing_constraints_for(&source).is_empty() {
+            return None;
+        }
+        let PlaceLoadSourceKind::Bindings(bindings) = source.kind else {
+            return None;
+        };
+        if bindings.clone().take(2).count() < 2
+            || !crate::types::dictionary::contents::unchanged_allocation_at_snapshot(
+                db,
+                self.index,
+                self.scope(),
+                expression,
+                snapshot,
+                origin,
+            )
+        {
+            return None;
+        }
+        let (class, _) = infer_definition_with_body_domain(db, origin, self.context.body_domain)
+            .binding_type(origin)
+            .class_specialization(db, env)?;
+        let place = place_from_bindings_with_replacement(
+            db,
+            env,
+            bindings,
+            self.reachability_cache(),
+            self.context.body_domain,
+            origin,
+            Type::instance(db, env, class.identity_specialization(db)),
+        )?
+        .place;
+        let Place::Defined(defined) = place else {
+            return None;
+        };
+        defined
+            .is_definitely_defined()
+            .then_some((class, defined.ty))
+    }
+
     fn infer_call_expression(
         &mut self,
         call_expression: &ast::ExprCall,
@@ -10736,9 +10812,28 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => None,
         };
 
+        // Preserve the reaching bindings even after the inferred allocation and its peers
+        // collapse into a single nominal type, or the feedback can oscillate across cycles.
         if let Some((value, collection_def, source)) = collection
-            && let Some((collection_literal, _)) =
-                self.expression_type(value).class_specialization(db, env)
+            && let Some((collection_literal, substituted_argument)) = match source {
+                CollectionConstraintSource::Argument(index) => {
+                    // A later argument can mutate the dictionary before the call. The last
+                    // argument's own snapshot is current; otherwise require a call snapshot.
+                    let snapshot = if index + 1 == arguments.len() {
+                        value.into()
+                    } else {
+                        call_expression.into()
+                    };
+                    self.joined_empty_dictionary_identity(value, snapshot, collection_def)
+                        .map(|(class, argument)| (class, Some(argument)))
+                }
+                CollectionConstraintSource::Receiver(_) => None,
+            }
+            .or_else(|| {
+                self.expression_type(value)
+                    .class_specialization(db, env)
+                    .map(|(class, _)| (class, None))
+            })
         {
             let identity_instance =
                 Type::instance(db, env, collection_literal.identity_specialization(db));
@@ -10773,7 +10868,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         if collection_argument_index == Some(argument_index) {
                             // Keep the collection's type variables free. Its literal elements
                             // are incorporated separately when the initializer is inferred.
-                            identity_instance
+                            substituted_argument.unwrap_or(identity_instance)
                         } else {
                             builder.infer_expression(expr, tcx)
                         }

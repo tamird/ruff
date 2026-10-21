@@ -3823,6 +3823,136 @@ def exact_markers(keys: list[str]):
     reveal_type(markers)  # revealed: dict[str, None]
 ```
 
+## Inferring an empty dictionary across a control-flow join
+
+A generic call can constrain an empty dictionary even when the argument may instead be a typed
+dictionary from another branch.
+
+```py
+from collections.abc import Mapping
+
+def use_patterns[T](patterns: Mapping[str, T]) -> dict[str, str | T]:
+    return {"pattern": patterns.get("host", "")}
+
+def choose[T](patterns: dict[str, T]) -> dict[str, str | T]:
+    selected = {}
+    if patterns:
+        selected = patterns
+    return reveal_type(use_patterns(selected))  # revealed: dict[str, str | T@choose]
+
+def competing(left: dict[str, int], right: dict[str, bytes]) -> dict[str, str | int | bytes]:
+    selected = {}
+    if left:
+        selected = left
+    elif right:
+        selected = right
+    return reveal_type(use_patterns(selected))  # revealed: dict[str, str | int | bytes]
+```
+
+## A joined dictionary must still be empty at the call
+
+```py
+from collections.abc import Mapping
+
+def use_patterns[T](patterns: Mapping[str, T]) -> dict[str, str | T]:
+    return {"pattern": patterns.get("host", "")}
+
+def populated(patterns: dict[str, str]) -> dict[str, str]:
+    selected = {"host": 42}
+    if patterns:
+        selected = patterns
+    return use_patterns(selected)  # error: [invalid-return-type]
+
+def mutated(patterns: dict[str, str]) -> dict[str, str]:
+    selected = {}
+    alias = selected
+    alias["host"] = 42
+    if patterns:
+        selected = patterns
+    return reveal_type(use_patterns(selected))  # revealed: dict[str, str | Unknown]
+
+def mutated_after_join(patterns: dict[str, str]) -> dict[str, str]:
+    selected = {}
+    if patterns:
+        selected = patterns
+    selected["host"] = 42  # error: [invalid-assignment]
+    return use_patterns(selected)
+
+def use_patterns_with_marker[T](patterns: Mapping[str, T], marker: int) -> dict[str, str | T]:
+    return use_patterns(patterns)
+
+def mutate_and_marker(values: object) -> int:
+    assert isinstance(values, dict)
+    values["host"] = 42
+    return 0
+
+def later_argument_mutation(patterns: dict[str, str]) -> dict[str, str]:
+    selected = {}
+    if patterns:
+        selected = patterns
+    return reveal_type(use_patterns_with_marker(selected, mutate_and_marker(selected)))  # revealed: dict[str, str | Unknown]
+
+def mutation_on_other_branch(patterns: dict[str, str]) -> dict[str, str]:
+    selected = {}
+    if patterns:
+        selected = patterns
+        selected["host"] = "valid"
+    return reveal_type(use_patterns(selected))  # revealed: dict[str, str | Unknown]
+```
+
+## A joined dictionary does not constrain an unrelated type parameter
+
+```py
+from collections.abc import Mapping
+from typing import Literal
+
+def unrelated[U](patterns: Mapping[str, int], other: U) -> U:
+    return other
+
+def choose_unrelated(patterns: dict[str, int]) -> bytes:
+    selected = {}
+    if patterns:
+        selected = patterns
+    return reveal_type(unrelated(selected, b"other"))  # revealed: Literal[b"other"]
+```
+
+## A joined dictionary cannot match an incompatible overload
+
+```py
+from collections.abc import Mapping
+from typing import Literal, overload
+
+@overload
+def overloaded[T: int](patterns: Mapping[str, T], kind: Literal["int"]) -> T: ...
+@overload
+def overloaded[T: str](patterns: Mapping[str, T], kind: Literal["str"]) -> T: ...
+def overloaded(patterns: Mapping[str, int | str], kind: str) -> int | str:
+    return next(iter(patterns.values()), "")
+
+def incompatible_overload(patterns: dict[str, str]) -> int:
+    selected = {}
+    if patterns:
+        selected = patterns
+    return overloaded(selected, "int")  # error: [no-matching-overload]
+```
+
+## Inferring a joined dictionary across a recursive generic call
+
+```py
+from collections.abc import Mapping
+
+def use_patterns[T](patterns: Mapping[str, T]) -> dict[str, str | T]:
+    return {"pattern": patterns.get("host", "")}
+
+def recursive[T](patterns: Mapping[str, T], recurse: bool) -> dict[str, str | T]:
+    selected = {}
+    if patterns:
+        selected = patterns
+    if recurse:
+        return recursive(selected, False)
+    return reveal_type(use_patterns(selected))  # revealed: dict[str, str | T@recursive]
+```
+
 ## Attribute fallbacks through intersection bounds
 
 Fallback lookup through a type variable combines the getter results from its intersection bound.

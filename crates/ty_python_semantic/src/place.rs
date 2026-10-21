@@ -862,7 +862,7 @@ pub(super) fn place_from_bindings<'db>(
         RequiresExplicitReExport::No,
         None,
         None,
-        None,
+        BindingTypeContext::default(),
     )
 }
 
@@ -880,8 +880,43 @@ pub(super) fn place_from_bindings_with_reachability_cache<'db>(
         RequiresExplicitReExport::No,
         Some(reachability_cache),
         None,
-        body_domain,
+        BindingTypeContext {
+            body_domain,
+            replacement: None,
+        },
     )
+}
+
+/// Join bindings while replacing one reachable definition's type before narrowing.
+///
+/// Returns `None` if the definition does not contribute to the resulting place.
+pub(super) fn place_from_bindings_with_replacement<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    bindings: BindingWithConstraintsIterator<'_, 'db>,
+    reachability_cache: &ReachabilityEvaluationCache<'db>,
+    body_domain: Option<FunctionBodyDomain<'db>>,
+    definition: Definition<'db>,
+    ty: Type<'db>,
+) -> Option<PlaceWithDefinition<'db>> {
+    let mut replacement = BindingTypeReplacement {
+        definition,
+        ty,
+        applied: false,
+    };
+    let place = place_from_bindings_impl(
+        db,
+        env,
+        bindings,
+        RequiresExplicitReExport::No,
+        Some(reachability_cache),
+        None,
+        BindingTypeContext {
+            body_domain,
+            replacement: Some(&mut replacement),
+        },
+    );
+    replacement.applied.then_some(place)
 }
 
 /// Join the existing bindings under a transient Boolean assumption.
@@ -899,7 +934,7 @@ pub(super) fn place_from_bindings_assuming_boolean<'db>(
         RequiresExplicitReExport::No,
         None,
         Some((identity, value)),
-        None,
+        BindingTypeContext::default(),
     )
 }
 
@@ -1418,7 +1453,7 @@ pub(crate) fn place_by_id<'db>(
             requires_explicit_reexport,
             None,
             None,
-            None,
+            BindingTypeContext::default(),
         )
         .place
         .with_qualifiers(qualifiers);
@@ -1446,7 +1481,7 @@ pub(crate) fn place_by_id<'db>(
                 requires_explicit_reexport,
                 None,
                 None,
-                None,
+                BindingTypeContext::default(),
             )
             .place
             {
@@ -1504,7 +1539,7 @@ pub(crate) fn place_by_id<'db>(
                 requires_explicit_reexport,
                 None,
                 None,
-                None,
+                BindingTypeContext::default(),
             );
 
             let place = match inferred.place {
@@ -1557,7 +1592,7 @@ pub(crate) fn place_by_id<'db>(
                 requires_explicit_reexport,
                 None,
                 None,
-                None,
+                BindingTypeContext::default(),
             )
             .place;
 
@@ -1945,6 +1980,18 @@ pub(crate) struct ReachableLoopBinding<'db> {
     pub(crate) narrowing_constraint: ScopedNarrowingConstraint,
 }
 
+struct BindingTypeReplacement<'db> {
+    definition: Definition<'db>,
+    ty: Type<'db>,
+    applied: bool,
+}
+
+#[derive(Default)]
+struct BindingTypeContext<'a, 'db> {
+    body_domain: Option<FunctionBodyDomain<'db>>,
+    replacement: Option<&'a mut BindingTypeReplacement<'db>>,
+}
+
 /// Implementation of [`place_from_bindings`].
 ///
 /// ## Implementation Note
@@ -1957,7 +2004,10 @@ fn place_from_bindings_impl<'db>(
     requires_explicit_reexport: RequiresExplicitReExport,
     reachability_cache: Option<&ReachabilityEvaluationCache<'db>>,
     boolean_assumption: Option<(BooleanIdentity<'_, 'db>, bool)>,
-    body_domain: Option<FunctionBodyDomain<'db>>,
+    BindingTypeContext {
+        body_domain,
+        mut replacement,
+    }: BindingTypeContext<'_, 'db>,
 ) -> PlaceWithDefinition<'db> {
     let predicates = bindings_with_constraints.predicates();
     let reachability_constraints = bindings_with_constraints.reachability_constraints();
@@ -2128,8 +2178,14 @@ fn place_from_bindings_impl<'db>(
 
             first_definition.get_or_insert(binding);
             provenance = provenance.or(Provenance::SingleDefinition(binding));
-            let binding_ty =
-                infer_definition_with_body_domain(db, binding, body_domain).binding_type(binding);
+            let replacement = replacement
+                .as_deref_mut()
+                .filter(|replacement| replacement.definition == binding);
+            let binding_ty = if let Some(replacement) = &replacement {
+                replacement.ty
+            } else {
+                infer_definition_with_body_domain(db, binding, body_domain).binding_type(binding)
+            };
             let narrowed = match narrowing_constraint.constraint() {
                 ScopedNarrowingConstraint::ALWAYS_TRUE => binding_ty,
                 ScopedNarrowingConstraint::ALWAYS_FALSE => Type::Never,
@@ -2146,6 +2202,9 @@ fn place_from_bindings_impl<'db>(
                     })
                     .narrow(constraint, binding_ty),
             };
+            if let Some(replacement) = replacement {
+                replacement.applied |= narrowed != Type::Never;
+            }
             Some((narrowed, static_reachability))
         },
     );

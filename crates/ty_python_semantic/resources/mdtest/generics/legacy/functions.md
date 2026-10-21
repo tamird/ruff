@@ -3202,6 +3202,24 @@ def exact_markers(keys: list[str]):
     reveal_type(markers)  # revealed: dict[str, None]
 ```
 
+## Inferring an empty dictionary across a control-flow join
+
+```py
+from collections.abc import Mapping
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def use_patterns(patterns: Mapping[str, T]) -> dict[str, str | T]:
+    return {"pattern": patterns.get("host", "")}
+
+def choose(patterns: dict[str, T]) -> dict[str, str | T]:
+    selected = {}
+    if patterns:
+        selected = patterns
+    return reveal_type(use_patterns(selected))  # revealed: dict[str, str | T@choose]
+```
+
 ## Attribute fallbacks through intersection bounds
 
 Fallback lookup through a type variable combines the getter results from its intersection bound.

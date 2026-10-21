@@ -18,7 +18,8 @@ use ty_python_core::place::{PlaceExpr, PlaceTable};
 use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, ScopeId};
 use ty_python_core::symbol::Symbol;
 use ty_python_core::{
-    BindingWithConstraintsIterator, NarrowingEvaluator, ProgramFile, Statement, semantic_index,
+    BindingWithConstraintsIterator, NarrowingEvaluator, ProgramFile, SemanticIndex, Statement,
+    semantic_index,
 };
 
 use crate::Db;
@@ -2376,6 +2377,49 @@ pub(super) fn at_use<'db>(
         argument_type,
         reachability,
     )
+}
+
+/// Whether the snapshot still contains an unchanged dictionary allocated by `origin`.
+/// Every reaching contents binding must be an initialization: an operation, capture, or
+/// unavailable history could have changed the allocation through an alias.
+pub(crate) fn unchanged_allocation_at_snapshot<'db>(
+    db: &'db dyn Db,
+    index: &SemanticIndex<'db>,
+    scope: ScopeId<'db>,
+    expression: &ast::Expr,
+    snapshot: ast::ExprRef<'_>,
+    origin: Definition<'db>,
+) -> bool {
+    let table = index.place_table(scope.file_scope_id(db));
+    let Some(place) = PlaceExpr::contents(expression).and_then(|place| table.place_id(&place))
+    else {
+        return false;
+    };
+    let Some(use_id) = index.try_expression_use_id(snapshot) else {
+        return false;
+    };
+    let use_def = index.use_def_map(scope.file_scope_id(db));
+    let Some(bindings) = use_def.multi_bindings_at_use(use_id, place) else {
+        return false;
+    };
+    let mut found = false;
+    for binding in bindings {
+        let Some(definition) = binding.binding.definition() else {
+            return false;
+        };
+        let DefinitionKind::DictionaryContents(contents) = definition.kind(db) else {
+            return false;
+        };
+        let DictionaryContentsDefinitionKind::Initialize {
+            definition,
+            range: _,
+        } = contents.as_ref()
+        else {
+            return false;
+        };
+        found |= *definition == origin;
+    }
+    found
 }
 
 pub(crate) fn at_snapshot<'db>(
