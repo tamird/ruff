@@ -7,9 +7,10 @@ use crate::{
     place::Place,
     types::{
         ApplyTypeMappingVisitor, BoundTypeVarInstance, ClassType, FindLegacyTypeVarsVisitor,
-        FunctionType, InternedType, KnownBoundMethodType, KnownClass, KnownInstanceType,
-        LiteralValueTypeKind, MemberLookupPolicy, Parameter, Parameters, Signature,
-        SubclassOfInner, Type, TypeContext, TypeMapping, TypeVarBoundOrConstraints, UnionType,
+        FunctionType, InternedType, IntersectionType, KnownBoundMethodType, KnownClass,
+        KnownInstanceType, LiteralValueTypeKind, MemberLookupPolicy, Parameter, Parameters,
+        Signature, SubclassOfInner, Type, TypeContext, TypeMapping, TypeVarBoundOrConstraints,
+        UnionType,
         constraints::{ConstraintSet, IteratorConstraintsExtension},
         cyclic::ActiveRecursionDetector,
         function::OverloadLiteral,
@@ -490,6 +491,32 @@ impl<'db> Type<'db> {
             | Type::SlotDescriptor(_)
             | Type::BoundSuper(_) => None,
         }
+    }
+}
+
+impl<'db> IntersectionType<'db> {
+    /// The nominal function class can describe the same value as an explicit callable
+    /// constituent. Its generic `__call__` contributes no independent signature evidence.
+    pub(crate) fn redundant_function_type_for_callable(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        target: Type<'db>,
+    ) -> Option<Type<'db>> {
+        if !matches!(target, Type::Callable(_))
+            || !self
+                .iter_positive(db)
+                .any(|element| matches!(element, Type::Callable(_)))
+        {
+            return None;
+        }
+        self.iter_positive(db).find(|element| {
+            matches!(element, Type::NominalInstance(instance) if instance.has_known_class(db, KnownClass::FunctionType))
+                && element
+                    .bindings(db, env)
+                    .single_element()
+                    .is_some_and(|binding| binding.is_generic_function_call(db, env))
+        })
     }
 }
 

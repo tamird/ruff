@@ -4684,7 +4684,12 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 // They don't all have to.
                 let mut first_error = None;
                 let mut found_matching_element = false;
+                let redundant_function =
+                    actual_intersection.redundant_function_type_for_callable(db, self.env, formal);
                 for positive in actual_intersection.iter_positive(db) {
+                    if Some(positive) == redundant_function {
+                        continue;
+                    }
                     let result = self.infer_map_impl(formal, positive, polarity, visitor);
                     if let Err(err) = result {
                         // TODO: `infer_map_impl` can have side effects even in the error case, so

@@ -1556,9 +1556,12 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         // as the implicit positive element (e.g., `~str` is semantically `object & ~str`).
         let mut elements_context = vec![];
         let context_tree = self.context_tree.as_ref().filter(|tree| tree.is_enabled());
+        let redundant_function =
+            intersection.redundant_function_type_for_callable(db, self.env, target);
 
         let result = intersection
             .positive_elements_or_object(db)
+            .filter(|element| Some(*element) != redundant_function)
             .when_any(db, self.constraints, |element| {
                 let result = self.check_type_pair(db, element, target);
                 if let Some(context_tree) = context_tree {

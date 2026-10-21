@@ -1373,7 +1373,7 @@ does not add another overload to a callable whose signature is already known.
 
 ```py
 from types import FunctionType
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 from ty_extensions import Top
 
 def narrowed(callback: Callable[[int], str]) -> None:
@@ -1405,6 +1405,38 @@ def overloads(callback: FunctionType & Callable[[int], str] & Callable[[str], in
 def unknown_signature(callback: FunctionType & Top[Callable[..., bytes]]) -> None:
     # error: [call-top-callable]
     reveal_type(callback())  # revealed: bytes
+```
+
+Passing the narrowed function through a generic callable preserves its parameter type.
+
+```py
+def capture[T](callback: Callable[[T], str]) -> Callable[[T], str]:
+    return callback
+
+def inferred(callback: Callable[[int], str]) -> None:
+    if isinstance(callback, FunctionType):
+        reveal_type(capture(callback))  # revealed: (int, /) -> str
+        capture(callback)("wrong")  # error: [invalid-argument-type]
+
+def nominal_only(callback: FunctionType) -> None:
+    reveal_type(capture(callback))  # revealed: (Any, /) -> str
+
+def gradual(callback: FunctionType & Callable[[Any], str]) -> None:
+    reveal_type(capture(callback))  # revealed: (Any, /) -> str
+
+def incompatible(callback: FunctionType & Callable[[int], int]) -> None:
+    capture(callback)  # error: [invalid-argument-type]
+
+def independent_signatures(
+    callback: FunctionType & Callable[[int], str] & Callable[[str], str],
+) -> None:
+    reveal_type(capture(callback))  # revealed: (Never, /) -> str
+
+class IndependentCallable:
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+def independent(callback: IndependentCallable & Callable[[int], str]) -> None:
+    reveal_type(capture(callback))  # revealed: (Any & int, /) -> str
 ```
 
 ### No callable elements

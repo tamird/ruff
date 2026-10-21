@@ -3760,7 +3760,11 @@ impl FailingOverloadSelection {
 }
 
 impl<'db> CallableBinding<'db> {
-    fn is_generic_function_call(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+    pub(crate) fn is_generic_function_call(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
         let ([overload], Type::BoundMethod(method)) =
             (self.overloads.as_slice(), self.signature_type)
         else {
