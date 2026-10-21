@@ -268,7 +268,7 @@ fn external_overload_body_domains() -> anyhow::Result<()> {
         assert!(diagnostics.is_empty(), "domain {index}: {diagnostics:#?}");
         assert!(db.check_file(source_file).is_empty());
         for (name, expected) in [
-            ("ordinary", "str | int | bytes"),
+            ("ordinary", "int"),
             ("public_test", "str"),
             ("public_executable", "int"),
             ("public_alias", "bytes"),
@@ -353,6 +353,30 @@ fn external_overload_body_domains() -> anyhow::Result<()> {
             .len(),
         1
     );
+
+    db.write_file("/src/contracts.pyi", donor)?;
+    db.write_file(
+        "/src/main.py",
+        format!("{source}\ninvalid = pick(executable='bad', test=False)\n"),
+    )?;
+    let diagnostics = db.check_file(source_file);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "no-matching-overload");
+    for (message, path) in [
+        ("First overload defined here", "/src/contracts.pyi"),
+        ("Overload implementation defined here", "/src/main.py"),
+    ] {
+        let span = diagnostics[0]
+            .sub_diagnostics()
+            .iter()
+            .find(|detail| detail.headline_message() == message)
+            .and_then(ruff_db::diagnostic::SubDiagnostic::primary_span_ref)
+            .expect("the invalid call should identify its declarations");
+        assert_eq!(
+            span.file(),
+            &ruff_db::diagnostic::UnifiedFile::Ty(system_path_to_file(&db, path)?)
+        );
+    }
     Ok(())
 }
 
@@ -613,7 +637,7 @@ fn external_overload_body_domains_use_source_defaults() -> anyhow::Result<()> {
         }
         let file = db.program_file(source_file);
         for (name, expected) in [
-            ("ordinary", "int | str"),
+            ("ordinary", "int"),
             ("public_omitted", "int"),
             ("public_supplied", "str"),
         ] {

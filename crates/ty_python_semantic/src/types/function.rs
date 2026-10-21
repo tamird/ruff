@@ -79,6 +79,7 @@ use crate::types::known_instance::DeprecatedInstance;
 use crate::types::narrow::ClassInfoConstraintFunction;
 use crate::types::relation::TypeRelationChecker;
 use crate::types::signatures::{CallableSignature, ReturnCallableTypeVarScope, Signature};
+use crate::types::string_annotation::SourceAnnotation;
 use crate::types::variance::{VarianceInferable, VarianceOrigin, VarianceTerm};
 use crate::types::{
     ApplyTypeMappingVisitor, BoundMethodType, BoundTypeVarIdentity, BoundTypeVarInstance,
@@ -1225,6 +1226,12 @@ pub struct FunctionType<'db> {
 // The Salsa heap is tracked separately.
 impl get_size2::GetSize for FunctionType<'_> {}
 
+#[derive(Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
+struct LiteralSignature<'db> {
+    signature: CallableSignature<'db>,
+    declaration: FunctionType<'db>,
+}
+
 pub(super) fn walk_function_type<'db, V: super::visitor::TypeVisitor<'db> + ?Sized>(
     db: &'db dyn Db,
     function: FunctionType<'db>,
@@ -1743,6 +1750,39 @@ impl<'db> FunctionType<'db> {
         self.literal(db).overloads_and_implementation(db)
     }
 
+    /// The external declaration supplying a module-level function's whole signature, if it
+    /// belongs to an overload family. The implementation still belongs to this function.
+    pub(super) fn external_overload_donor(self, db: &'db dyn Db) -> Option<FunctionType<'db>> {
+        let declaration = self.literal_signature(db).declaration;
+        (declaration != self).then_some(declaration)
+    }
+
+    fn resolve_external_overload_donor(self, db: &'db dyn Db) -> Option<FunctionType<'db>> {
+        let literal = self.literal(db);
+        if literal.overloaded
+            || literal.known(db).is_some()
+            || !literal.last_definition.has_explicit_return_annotation(db)
+        {
+            return None;
+        }
+        let file = self.program_file(db);
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let donor = SourceAnnotation::external_function_definition(
+            db,
+            file,
+            self.node(db, file.file(db), &module),
+        )?;
+        if !self.definition(db).file_scope(db).is_global() {
+            return None;
+        }
+        let function = infer_definition_types(db, donor).function_type(donor)?;
+        (function.known(db).is_none()
+            && donor.file_scope(db).is_global()
+            && function.literal(db).has_separate_implementation(db)
+            && function.definition(db) == donor)
+            .then_some(function)
+    }
+
     /// Returns an iterator of all of the definitions of this function, including both overload
     /// signatures and any implementation, all in source order.
     pub fn iter_overloads_and_implementation(
@@ -1764,7 +1804,7 @@ impl<'db> FunctionType<'db> {
     /// overloaded.
     pub(crate) fn signature(self, db: &'db dyn Db) -> &'db CallableSignature<'db> {
         self.updated_signature(db)
-            .unwrap_or_else(|| self.literal_signature(db))
+            .unwrap_or_else(|| &self.literal_signature(db).signature)
     }
 
     /// The signature of this function, with the return type possibly inferred from the body.
@@ -1945,25 +1985,36 @@ impl<'db> FunctionType<'db> {
     }
 
     /// This query isolates the function's AST dependency, so callers only invalidate when the
-    /// computed signature changes. Updated signatures are already stored on the interned function.
+    /// computed signature or its declaration changes. Updated signatures are already stored on
+    /// the interned function.
     #[salsa::tracked(
         returns(ref),
         cycle_initial=|db, id, function: FunctionType<'db>| {
             let env = ProgramEnvironment::from_scope(
                 function.literal(db).last_definition.body_scope(db),
             );
-            CallableSignature::cycle_initial(db, &env, id)
+            LiteralSignature {
+                signature: CallableSignature::cycle_initial(db, &env, id),
+                declaration: function,
+            }
         },
-        cycle_fn=|db, cycle, previous, value: CallableSignature<'db>, function: FunctionType<'db>| {
+        cycle_fn=|db, cycle, previous: &LiteralSignature<'db>, value: LiteralSignature<'db>, function: FunctionType<'db>| {
             let env = ProgramEnvironment::from_scope(
                 function.literal(db).last_definition.body_scope(db),
             );
-            value.cycle_normalized(db, &env, previous, cycle)
+            LiteralSignature {
+                signature: value.signature.cycle_normalized(db, &env, &previous.signature, cycle),
+                declaration: value.declaration,
+            }
         },
         heap_size=ruff_memory_usage::heap_size,
     )]
-    fn literal_signature(self, db: &'db dyn Db) -> CallableSignature<'db> {
-        self.literal(db).signature(db)
+    fn literal_signature(self, db: &'db dyn Db) -> LiteralSignature<'db> {
+        let declaration = self.resolve_external_overload_donor(db).unwrap_or(self);
+        LiteralSignature {
+            signature: declaration.literal(db).signature(db),
+            declaration,
+        }
     }
 
     /// Refer to this signature's equation, including recursive `TypeOf` references to itself.

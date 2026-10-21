@@ -306,25 +306,11 @@ fn overload_family<'db>(
     let (mut overloads, implementation) = function.overloads_and_implementation(db);
     let implementation = implementation.ok_or(BodyDomainError::Unsupported)?;
     if overloads.is_empty() {
-        let file = implementation.definition(db).program_file(db);
-        let module = parsed_module(db, file.python_file(db)).load(db);
-        let node = implementation
-            .body_scope(db)
-            .node(db)
-            .expect_function()
-            .node(&module);
-        let donor = SourceAnnotation::external_function_definition(db, file, node)
-            .ok_or(BodyDomainError::Unsupported)?;
-        let donor_function = infer_definition_types(db, donor)
-            .function_type(donor)
-            .ok_or(BodyDomainError::Unsupported)?;
-        let (donor_overloads, donor_implementation) =
-            donor_function.overloads_and_implementation(db);
-        if donor_implementation.is_none_or(|implementation| implementation.definition(db) != donor)
-        {
-            return Err(BodyDomainError::Unsupported);
-        }
-        overloads = donor_overloads;
+        overloads = function
+            .external_overload_donor(db)
+            .ok_or(BodyDomainError::Unsupported)?
+            .overloads_and_implementation(db)
+            .0;
     }
     Ok((overloads, implementation))
 }

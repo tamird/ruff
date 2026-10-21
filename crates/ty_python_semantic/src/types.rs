@@ -7449,15 +7449,29 @@ impl<'db> Type<'db> {
                     .into()
                 }
 
-                _ => CallableBinding::from_overloads(
-                    self,
-                    function_type
-                        .signature_with_inferred_return_type(db)
-                        .overloads
-                        .iter()
-                        .cloned(),
-                )
-                .into(),
+                _ => {
+                    let signature = function_type.signature_with_inferred_return_type(db);
+                    let signature_type = if function_type.updated_signature(db).is_none()
+                        && signature
+                            .overloads
+                            .first()
+                            .is_some_and(|overload| overload.source_overload_index().is_some())
+                    {
+                        function_type
+                            .external_overload_donor(db)
+                            .map_or(self, Type::FunctionLiteral)
+                    } else {
+                        self
+                    };
+                    let mut bindings = Bindings::from(CallableBinding::from_overloads(
+                        signature_type,
+                        signature.overloads.iter().cloned(),
+                    ));
+                    if signature_type != self {
+                        bindings.replace_callable_type(signature_type, self);
+                    }
+                    bindings
+                }
             },
 
             Type::ClassLiteral(class) => self

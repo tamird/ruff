@@ -3689,9 +3689,8 @@ pub(crate) struct CallableBinding<'db> {
     /// The type that is (hopefully) callable.
     pub(crate) callable_type: Type<'db>,
 
-    /// The type we'll use for error messages referring to details of the called signature. For
-    /// calls to functions this will be the same as `callable_type`; for other callable instances
-    /// it may be a `__call__` method.
+    /// The type that owns the called signature. This can differ from `callable_type` for callable
+    /// instances and for a function whose overloads come from an external declaration.
     pub(crate) signature_type: Type<'db>,
 
     /// Whether the callable is reached through an implicit `__call__` or constructor lookup,
@@ -4945,8 +4944,9 @@ impl<'db> CallableBinding<'db> {
         let (overloads, implementation) = function
             .map(|function| function.overloads_and_implementation(db))
             .unwrap_or_default();
-        if let Some(implementation) =
-            implementation.filter(|function| function.deprecated(db).is_some())
+        if let Some(implementation) = self
+            .executed_implementation(db, implementation)
+            .filter(|function| function.deprecated(db).is_some())
         {
             return Either::Left(Some(implementation).into_iter());
         }
@@ -4957,6 +4957,20 @@ impl<'db> CallableBinding<'db> {
                 .copied()
                 .filter(|overload| overload.deprecated(db).is_some())
         }))
+    }
+
+    fn executed_implementation(
+        &self,
+        db: &'db dyn Db,
+        declaration: Option<OverloadLiteral<'db>>,
+    ) -> Option<OverloadLiteral<'db>> {
+        if let Type::FunctionLiteral(source) = self.callable_type
+            && self.callable_type != self.signature_type
+        {
+            source.overloads_and_implementation(db).1
+        } else {
+            declaration
+        }
     }
 
     /// Returns the overload which call arguments should be inferred against, if every overload is
@@ -5352,7 +5366,7 @@ impl<'db> CallableBinding<'db> {
                         ));
                     }
 
-                    if let Some(implementation) = implementation {
+                    if let Some(implementation) = self.executed_implementation(db, implementation) {
                         let mut sub = SubDiagnostic::new(
                             SubDiagnosticSeverity::Info,
                             "Overload implementation defined here",
@@ -8326,9 +8340,7 @@ pub(crate) struct Binding<'db> {
     /// The type that is (hopefully) callable.
     callable_type: Type<'db>,
 
-    /// The type we'll use for error messages referring to details of the called signature. For
-    /// calls to functions this will be the same as `callable_type`; for other callable instances
-    /// it may be a `__call__` method.
+    /// The type that owns the called signature; see [`CallableBinding::signature_type`].
     signature_type: Type<'db>,
 
     /// Return type of the call.
