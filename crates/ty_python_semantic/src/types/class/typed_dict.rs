@@ -785,7 +785,7 @@ fn synthesize_typed_dict_merge<'db>(
                 .with_annotated_type(value_ty),
         ])
     };
-    let mut overloads: smallvec::SmallVec<[Signature<'db>; 4]> =
+    let mut overloads: smallvec::SmallVec<[Signature<'db>; 3]> =
         smallvec::smallvec![Signature::new(
             parameters(first_overload_value_ty),
             instance_ty,
@@ -808,27 +808,28 @@ fn synthesize_typed_dict_merge<'db>(
             Name::new_static("V"),
             TypeVarVariance::Invariant,
         );
-        let other_typed_dict = Type::TypedDict(TypedDictType::from_schema_items(
-            db,
-            TypedDictSchema::default(),
-        ));
         let value_ty = typed_dict.value_type(db, env);
-        let (operand_ty, result_value_ty) = if value_ty.is_object() {
-            (
-                UnionType::from_two_elements(
-                    db,
-                    env,
-                    dictionary(Type::TypeVar(value_typevar)),
-                    other_typed_dict,
-                ),
-                value_ty,
-            )
+        let (openness, result_value_ty) = if value_ty.is_object() {
+            (TypedDictOpenness::ImplicitlyOpen, value_ty)
         } else {
+            // Read-only extra items constrain V from every possible operand value without
+            // permitting writes to the operand. The fresh result remains an ordinary dict.
             (
-                dictionary(Type::TypeVar(value_typevar)),
+                TypedDictOpenness::extra(db, Type::TypeVar(value_typevar), true),
                 UnionType::from_two_elements(db, env, value_ty, Type::TypeVar(value_typevar)),
             )
         };
+        let other_typed_dict = Type::TypedDict(TypedDictType::from_schema_items_with_openness(
+            db,
+            TypedDictSchema::default(),
+            openness,
+        ));
+        let operand_ty = UnionType::from_two_elements(
+            db,
+            env,
+            dictionary(Type::TypeVar(value_typevar)),
+            other_typed_dict,
+        );
         overloads.push(Signature::new_generic(
             Some(GenericContext::from_typevar_instances(
                 db,
@@ -838,13 +839,6 @@ fn synthesize_typed_dict_merge<'db>(
             parameters(operand_ty),
             dictionary(result_value_ty),
         ));
-        if !value_ty.is_object() {
-            // A TypedDict operand leaves V unconstrained, so it cannot share the precise return.
-            overloads.push(Signature::new(
-                parameters(other_typed_dict),
-                dictionary(Type::object()),
-            ));
-        }
     }
 
     Type::Callable(CallableType::new(

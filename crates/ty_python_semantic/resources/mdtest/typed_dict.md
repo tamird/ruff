@@ -475,7 +475,7 @@ def merge(closed: Closed, extra: Extra, open_: Open, other: dict[str, str], reco
     reveal_type(closed.__or__(other))  # revealed: dict[str, int | str]
     reveal_type(extra | other)  # revealed: dict[str, int | str]
     reveal_type(open_ | other)  # revealed: dict[str, object]
-    reveal_type(closed | record)  # revealed: dict[str, object]
+    reveal_type(closed | record)  # revealed: dict[str, int | str]
     # error: [invalid-argument-type]
     accept_ints(closed | other)
 
@@ -483,14 +483,15 @@ def merge_generic[T](closed: Closed, other: dict[str, T]) -> dict[str, int | T]:
     return closed | other  # no diagnostic
 
 def merge_alternatives(closed: Closed, other: dict[str, str] | Other, gradual: dict[str, Any]) -> None:
-    reveal_type(closed | other)  # revealed: dict[str, int | str] | dict[str, object]
+    reveal_type(closed | other)  # revealed: dict[str, int | str]
     reveal_type(closed | gradual)  # revealed: dict[str, int | Any]
 
 class Recursive(TypedDict, closed=True):
     child: "Recursive | None"
 
-def merge_recursive(record: Recursive, other: dict[str, int]) -> None:
+def merge_recursive(record: Recursive, other: dict[str, int], closed: Closed) -> None:
     record | other  # no diagnostic
+    record | closed  # no diagnostic
 ```
 
 ## Merging with empty built-in dictionaries
@@ -1303,8 +1304,8 @@ def consume(value: AB) -> None: ...
 def merge(a: A, b: B, c: C) -> AB:
     ab: AB = a | b  # no diagnostic
     consume(a | b)  # no diagnostic
-    reveal_type(a | b)  # revealed: dict[str, object]
-    reveal_type(a.__or__(b))  # revealed: dict[str, object]
+    reveal_type(a | b)  # revealed: dict[str, int | str]
+    reveal_type(a.__or__(b))  # revealed: dict[str, int | str]
     abc: ABC = a | b | c  # no diagnostic
     return a | b  # no diagnostic
 
@@ -1320,6 +1321,26 @@ def make_a() -> A:
 
 def called(b: B) -> AB:
     return make_a() | b  # no diagnostic
+```
+
+Without a result schema, the fresh dictionary retains the possible value types from both bounded
+operands. The result can be mutated independently of either input.
+
+```py
+from collections.abc import Mapping
+
+class Reflected:
+    def __ror__(self, other: object) -> bytes:
+        return b""
+
+def bounded(a: A, b: B, mapping: Mapping[str, int], reflected: Reflected):
+    reveal_type(b | a)  # revealed: dict[str, str | int]
+    reveal_type(a.__ror__(b))  # revealed: dict[str, int | str]
+    merged = a | b
+    merged["new"] = 1  # no diagnostic
+    merged["new"] = []  # error: [invalid-assignment]
+    a | mapping  # error: [unsupported-operator]
+    reveal_type(a | reflected)  # revealed: bytes
 ```
 
 A required right-hand field replaces the old value. An optional field preserves both possible values
@@ -1338,6 +1359,8 @@ class Either(TypedDict, closed=True):
 class Empty(TypedDict, closed=True): ...
 
 def overwrite(a: A, text: Text, maybe: MaybeText, empty: Empty):
+    reveal_type(a | maybe)  # revealed: dict[str, int | str]
+    reveal_type(empty | text)  # revealed: dict[str, str]
     replaced: Text = a | text  # no diagnostic
     # error: [invalid-argument-type]
     wrong_order: Text = text | a
@@ -1364,6 +1387,7 @@ def same(a: OpenB, b: OpenB) -> OpenB:
     return same
 
 def hidden(a: A, b: OpenB):
+    reveal_type(a | b)  # revealed: dict[str, object]
     # error: [invalid-argument-type]
     # error: [invalid-key]
     unsafe_override: AB = a | b
@@ -1389,8 +1413,26 @@ class Wider(TypedDict, closed=True):
 
 def shallow(source: Readonly, b: B):
     mutable: Mutable = source | b  # no diagnostic
+    fresh = source | b
+    fresh["other"] = [1]  # no diagnostic
     # error: [invalid-argument-type]
     widened: Wider = source | b
+```
+
+Explicit extra items contribute their declared value type, including gradual types.
+
+```py
+from typing import Any
+
+class Extra(TypedDict, extra_items=ReadOnly[bytes]):
+    b: str
+
+class Gradual(TypedDict, closed=True):
+    b: Any
+
+def extra_items(a: A, extra: Extra, gradual: Gradual):
+    reveal_type(a | extra)  # revealed: dict[str, int | bytes | str]
+    reveal_type(a | gradual)  # revealed: dict[str, int | Any]
 ```
 
 Fresh literal values still receive contextual types for mutable containers and lambda parameters.
