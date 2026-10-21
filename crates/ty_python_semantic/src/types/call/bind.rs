@@ -7021,6 +7021,19 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         }
         self.errors.extend(specialization_errors);
 
+        let deferred_return = inference
+            .as_ref()
+            .ok()
+            .filter(|_| self.errors.is_empty())
+            .and_then(|inference| {
+                inference.deferred_return_type(
+                    db,
+                    env,
+                    self.return_ty,
+                    self.argument_relations()
+                        .map(|relation| (relation.declared_type, relation.argument_type)),
+                )
+            });
         let inference = match inference {
             Ok(inference) => inference,
             Err(errors) => {
@@ -7052,7 +7065,8 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         };
         let specialization = inference.merged_specialization(db);
 
-        self.return_ty = self.return_ty.apply_specialization(db, specialization);
+        self.return_ty = deferred_return
+            .unwrap_or_else(|| self.return_ty.apply_specialization(db, specialization));
         // A captured ParamSpec can carry a generic callback's own variables into the inferred
         // return type. They remain bound in a returned Callable[P, R], but cannot escape into an
         // ordinary result R. Project those free occurrences to their static upper materialization;

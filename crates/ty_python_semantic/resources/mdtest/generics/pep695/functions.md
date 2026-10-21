@@ -4540,5 +4540,69 @@ def wrong_return[T: str | bytes](value: T, **kwargs: object) -> T:
     return value
 ```
 
+## Composing generic calls in a loop
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Protocol
+
+type Box[T] = tuple[list[T]]
+
+class Transform(Protocol):
+    def __call__[T](self, value: Box[T], /) -> Box[T]: ...
+
+def rebuild[T](groups: list[T]) -> Box[T]:
+    return (groups,)
+
+def repeat[T](value: Box[T], transforms: list[Transform]) -> Box[T]:
+    current = value
+    for transform in transforms:
+        result = transform(current)
+        current = rebuild(result[0])
+    reveal_type(current)  # revealed: tuple[list[T@repeat]]
+    return current
+```
+
+Deferring inference for one argument preserves the other argument's independent result, including
+the zero-iteration path.
+
+```py
+def rebuild_with_metadata[T = object, U = object](groups: list[T], metadata: U) -> tuple[Box[T], U]:
+    return ((groups,), metadata)
+
+def repeat_with_metadata[T](value: Box[T], transforms: list[Transform]) -> tuple[Box[T], int]:
+    current = value
+    metadata = 0
+    for transform in transforms:
+        result = transform(current)
+        current, metadata = rebuild_with_metadata(result[0], 42)
+    return current, metadata  # no diagnostic
+```
+
+Overload selection still distinguishes a valid discriminator from an invalid call.
+
+```py
+from typing import Literal, overload
+
+@overload
+def rebuild_overloaded[T](groups: list[T], kind: Literal["box"]) -> Box[T]: ...
+@overload
+def rebuild_overloaded(groups: list[str], kind: Literal["count"]) -> int: ...
+def rebuild_overloaded[T](groups: list[T], kind: Literal["box", "count"]) -> Box[T] | int:
+    return (groups,) if kind == "box" else len(groups)
+
+def repeat_overloaded[T](value: Box[T], transforms: list[Transform]) -> Box[T]:
+    current = value
+    for transform in transforms:
+        result = transform(current)
+        rebuild_overloaded(result[0], "invalid")  # error: [no-matching-overload]
+        current = rebuild_overloaded(result[0], "box")
+    return current  # no diagnostic
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

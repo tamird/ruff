@@ -2578,6 +2578,57 @@ pub(crate) enum TypeVarProjection<'db> {
 }
 
 impl<'db> TypeVarInference<'db> {
+    /// Preserve a recursive argument's placeholder when the call result cannot yet be inferred.
+    ///
+    /// A recursive query may temporarily supply a bare placeholder for an argument such as
+    /// `list[T]`. It gives the solver no evidence for `T`. If the result also depends on `T`,
+    /// applying the usual default would make that default part of the loop's fixed point. Keep
+    /// the placeholder at the top level until the argument query produces usable evidence.
+    pub(crate) fn deferred_return_type(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        return_type: Type<'db>,
+        argument_relations: impl Iterator<Item = (Type<'db>, Type<'db>)>,
+    ) -> Option<Type<'db>> {
+        let inferred_types = self.merged_types(db);
+        if !inferred_types.contains(&None) {
+            return None;
+        }
+
+        argument_relations
+            .filter_map(|(formal, actual)| {
+                if !actual.is_recursive_divergent()
+                    || actual.materialized_divergent_fallback().is_some()
+                    || formal.is_type_var()
+                {
+                    return None;
+                }
+
+                self.generic_context(db)
+                    .variables(db)
+                    .zip(inferred_types)
+                    .any(|(variable, inferred)| {
+                        inferred.is_none()
+                            && !variable.is_paramspec(db)
+                            && !variable.is_typevartuple(db)
+                            && formal
+                                .variance_of(db, env, variable.identity(db))
+                                .evaluate(db)
+                                != TypeVarVariance::Bivariant
+                            && return_type
+                                .variance_of(db, env, variable.identity(db))
+                                .evaluate(db)
+                                != TypeVarVariance::Bivariant
+                    })
+                    .then_some(actual)
+            })
+            // A single recursive query can resume this result. Distinct origins do not identify
+            // one query to resume, and their union is no longer a bare recursive placeholder.
+            .all_equal_value()
+            .ok()
+    }
+
     /// Merge the alternatives into one closed specialization, discarding their correlations and
     /// completeness. Compatibility and diagnostic results use their recovery mapping.
     pub(crate) fn merged_specialization(self, db: &'db dyn Db) -> Specialization<'db> {
@@ -5152,6 +5203,51 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn recursive_arguments_defer_only_dependent_uninferred_returns() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let [t, u] = create_typevars(db, ["T", "U"]);
+        let context = GenericContext::from_typevar_instances(db, &env, [t, u]);
+        let inference = TypeVarInference::new(
+            db,
+            context,
+            &[None, Some(KnownClass::Int.to_instance(db, &env))][..],
+            TypeVarInferenceSolutions::Unavailable(TypeVarInferenceFallback::Unconstrained),
+        );
+        let formal = KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(t)]);
+        let unrelated = KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(u)]);
+        let first = Type::divergent(salsa::plumbing::Id::from_bits(1));
+        let second = Type::divergent(salsa::plumbing::Id::from_bits(2));
+        let defer = |return_type, arguments: Vec<_>| {
+            inference.deferred_return_type(db, &env, return_type, arguments.into_iter())
+        };
+
+        assert_eq!(defer(Type::TypeVar(t), vec![(formal, first)]), Some(first));
+        assert_eq!(defer(Type::TypeVar(u), vec![(formal, first)]), None);
+        assert_eq!(defer(Type::TypeVar(t), vec![(unrelated, first)]), None);
+        assert_eq!(defer(Type::TypeVar(u), vec![(unrelated, first)]), None);
+        assert_eq!(
+            defer(Type::TypeVar(t), vec![(formal, Type::unknown())]),
+            None
+        );
+        let materialized = first.materialize(
+            db,
+            MaterializationKind::Top,
+            &ApplyTypeMappingVisitor::new(&env),
+        );
+        assert_eq!(defer(Type::TypeVar(t), vec![(formal, materialized)]), None);
+        assert_eq!(
+            defer(Type::TypeVar(t), vec![(formal, first), (formal, first)]),
+            Some(first),
+        );
+        assert_eq!(
+            defer(Type::TypeVar(t), vec![(formal, first), (formal, second)]),
+            None,
+        );
     }
 
     fn exact_alternatives<'db, 'c, const N: usize>(

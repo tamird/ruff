@@ -3868,3 +3868,68 @@ def wrong_keywords(value: bytes, **kwargs: str) -> bytes: ...  # error: [invalid
 def wrong_keywords(value: R, **kwargs: int) -> R:
     return value
 ```
+
+## Composing generic calls in a loop
+
+```py
+from typing import Protocol, TypeVar
+
+T = TypeVar("T")
+Box = tuple[list[T]]
+
+class Transform(Protocol):
+    def __call__(self, value: Box[T], /) -> Box[T]: ...
+
+def rebuild(groups: list[T]) -> Box[T]:
+    return (groups,)
+
+def repeat(value: Box[T], transforms: list[Transform]) -> Box[T]:
+    current = value
+    for transform in transforms:
+        result = transform(current)
+        current = rebuild(result[0])
+    reveal_type(current)  # revealed: tuple[list[T@repeat]]
+    return current
+```
+
+Deferring inference for one argument preserves the other argument's independent result, including
+the zero-iteration path.
+
+```py
+from typing_extensions import TypeVar as TypeVarWithDefault
+
+D = TypeVarWithDefault("D", default=object)
+U = TypeVarWithDefault("U", default=object)
+
+def rebuild_with_metadata(groups: list[D], metadata: U) -> tuple[Box[D], U]:
+    return ((groups,), metadata)
+
+def repeat_with_metadata(value: Box[T], transforms: list[Transform]) -> tuple[Box[T], int]:
+    current = value
+    metadata = 0
+    for transform in transforms:
+        result = transform(current)
+        current, metadata = rebuild_with_metadata(result[0], 42)
+    return current, metadata  # no diagnostic
+```
+
+Overload selection still distinguishes a valid discriminator from an invalid call.
+
+```py
+from typing import Literal, overload
+
+@overload
+def rebuild_overloaded(groups: list[T], kind: Literal["box"]) -> Box[T]: ...
+@overload
+def rebuild_overloaded(groups: list[str], kind: Literal["count"]) -> int: ...
+def rebuild_overloaded(groups: list[T], kind: Literal["box", "count"]) -> Box[T] | int:
+    return (groups,) if kind == "box" else len(groups)
+
+def repeat_overloaded(value: Box[T], transforms: list[Transform]) -> Box[T]:
+    current = value
+    for transform in transforms:
+        result = transform(current)
+        rebuild_overloaded(result[0], "invalid")  # error: [no-matching-overload]
+        current = rebuild_overloaded(result[0], "box")
+    return current  # no diagnostic
+```
