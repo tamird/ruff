@@ -9,8 +9,9 @@ use crate::types::CheckedCall;
 use crate::{AnalysisSettings, PythonVersionWithSource};
 use ruff_db::diagnostic::Diagnostic;
 use ruff_db::files::File;
-use ruff_python_ast::name::Name;
+use ruff_python_ast::{Expr, name::Name};
 use ty_python_core::definition::Definition;
+use ty_python_core::scope::ScopeId;
 use ty_python_core::{Db as PythonCoreDb, ProgramFile};
 
 /// Database giving access to semantic information about a Python program.
@@ -31,6 +32,19 @@ pub trait Db: PythonCoreDb {
     /// every alias. This permits observing the existing end-of-module contents; it does not
     /// erase mutations or escapes during evaluation. Ordinary Python modules do not qualify.
     fn provided_exports_are_frozen(&self, _file: ProgramFile<'_>) -> bool {
+        false
+    }
+
+    /// Whether `owner` completed evaluation and froze its module environment before the
+    /// `callee` in `scope` could invoke a function defined there. Implementations must use
+    /// tracked inputs, must not infer either module's values, and must not resolve unrelated
+    /// module dependencies. Ordinary Python modules do not qualify.
+    fn provided_module_precedes_call(
+        &self,
+        _scope: ScopeId<'_>,
+        _callee: &Expr,
+        _owner: ProgramFile<'_>,
+    ) -> bool {
         false
     }
 

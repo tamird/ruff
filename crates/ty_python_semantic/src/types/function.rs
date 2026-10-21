@@ -67,6 +67,7 @@ use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::ConstraintSet;
 use crate::types::context::InferContext;
 use crate::types::cyclic::ActiveRecursionDetector;
+use crate::types::dictionary::DictionaryItems;
 
 use crate::types::generics::{
     GenericContext, Specialization, typing_self, walk_specialization_types,
@@ -1805,6 +1806,70 @@ impl<'db> FunctionType<'db> {
     pub(crate) fn signature(self, db: &'db dyn Db) -> &'db CallableSignature<'db> {
         self.updated_signature(db)
             .unwrap_or_else(|| &self.literal_signature(db).signature)
+    }
+
+    /// Observe a fresh dictionary returned by a simple source function. Callers establish that
+    /// the defining module's environment is complete and frozen before invoking this query.
+    #[salsa::tracked(
+        returns(ref),
+        cycle_initial=|_, _, _| None,
+        heap_size=ruff_memory_usage::heap_size,
+    )]
+    pub(super) fn returned_dictionary_items(self, db: &'db dyn Db) -> Option<DictionaryItems<'db>> {
+        let scope = self.literal(db).last_definition.body_scope(db);
+        if scope.program_file(db).is_stub(db)
+            || !db.should_check_file(self.file(db))
+            || !self.definition(db).file_scope(db).is_global()
+        {
+            return None;
+        }
+        let module = parsed_module(db, scope.python_file(db)).load(db);
+        let function = scope.node(db).expect_function().node(&module);
+        if function.is_async
+            || !function.decorator_list.is_empty()
+            || !function.parameters.is_empty()
+            || function.type_params.is_some()
+        {
+            return None;
+        }
+        let returned = match function.body.as_slice() {
+            [ast::Stmt::Return(returned)] => returned,
+            [ast::Stmt::Expr(doc), ast::Stmt::Return(returned)]
+                if doc.value.is_string_literal_expr() =>
+            {
+                returned
+            }
+            _ => return None,
+        };
+        let expression = returned.value.as_deref()?;
+        let ast::Expr::Dict(literal) = expression else {
+            return None;
+        };
+        if literal.items.iter().any(|item| {
+            !item
+                .key
+                .as_ref()
+                .is_some_and(ast::Expr::is_string_literal_expr)
+        }) {
+            return None;
+        }
+        let inference = infer_complete_scope_types(db, scope);
+        if inference
+            .diagnostics()
+            .is_some_and(|diagnostics| !diagnostics.is_empty())
+        {
+            return None;
+        }
+        let env = ProgramEnvironment::from_scope(scope);
+        let items = DictionaryItems::literal(db, &env, scope, expression, None, &mut |value| {
+            inference.try_expression_type(value)
+        })
+        .ok()?;
+        items
+            .items
+            .iter()
+            .all(|item| !item.ty.is_never() && !item.ty.is_divergent())
+            .then_some(items)
     }
 
     /// The signature of this function, with the return type possibly inferred from the body.

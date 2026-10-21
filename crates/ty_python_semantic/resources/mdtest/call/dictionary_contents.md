@@ -1,5 +1,19 @@
 # Dictionary contents at a call
 
+## Ordinary function return contracts
+
+An ordinary Python call uses its declared return contract even when the current function body
+returns a dictionary literal.
+
+```py
+def values() -> dict[str, object]:
+    return {"value": 1}
+
+def consume(value: int) -> None: ...
+
+consume(**values())  # error: [invalid-argument-type]
+```
+
 ## Assignments and copies
 
 The contents of a fresh dictionary follow its reaching assignment. A shallow copy starts a new

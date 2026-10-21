@@ -737,9 +737,23 @@ impl<'db> DictionaryItems<'db> {
                     func,
                     arguments,
                 } = call;
-                let Type::ClassLiteral(class) =
-                    expression_type(func).ok_or(DictionaryFallback::Unavailable)?
-                else {
+                let callee = expression_type(func).ok_or(DictionaryFallback::Unavailable)?;
+                if let Type::FunctionLiteral(function) = callee
+                    && arguments.is_empty()
+                    && db.provided_module_precedes_call(scope, func, function.program_file(db))
+                {
+                    let mut items = function
+                        .returned_dictionary_items(db)
+                        .clone()
+                        .ok_or(DictionaryFallback::Unavailable)?;
+                    // Dictionary item spans belong to the observing file. The call is the
+                    // origin available there; donor-file spans cannot be reused as offsets.
+                    for item in &mut items.items {
+                        item.source = expression.range();
+                    }
+                    return Ok(items);
+                }
+                let Type::ClassLiteral(class) = callee else {
                     return Err(DictionaryFallback::Unavailable);
                 };
                 if !class.is_known(db, KnownClass::Dict) {
@@ -968,7 +982,7 @@ impl<'db> DictionaryItems<'db> {
         }
     }
 
-    fn literal(
+    pub(super) fn literal(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         scope: ScopeId<'db>,
