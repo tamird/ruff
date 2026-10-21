@@ -1,7 +1,6 @@
 //! Parameters of implicit type aliases, including parameters used only in forward references.
 
 use ruff_db::parsed::{parsed_module, parsed_string_annotation};
-use ruff_db::source::source_text;
 use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::{self as ast, visitor as ast_visitor};
 use ty_python_core::ast_ids::HasScopedUseId;
@@ -128,8 +127,9 @@ impl<'ast> Visitor<'ast> for ImplicitAliasLegacyTypeVarCollector<'_, '_> {
             && let Some(string_literal) = string.as_single_part_string()
         {
             let file = self.alias_definition.program_file(self.db);
-            let source = source_text(self.db, file.python_file(self.db).file(self.db));
-            if let Ok(parsed) = parsed_string_annotation(source.as_str(), string_literal) {
+            if let Ok(parsed) =
+                parsed_string_annotation(self.db, file.python_file(self.db), string_literal)
+            {
                 let string_scope = self
                     .string_annotation_scope
                     .unwrap_or_else(|| self.index.expression_scope_id(expr));

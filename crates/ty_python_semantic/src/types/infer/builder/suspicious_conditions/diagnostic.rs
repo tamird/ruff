@@ -968,9 +968,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let db = self.db();
         match annotation {
             ast::Expr::StringLiteral(string) => {
-                let source = source_text(db, definition.file(db));
-                let parsed =
-                    parsed_string_annotation(&source, string.as_single_part_string()?).ok()?;
+                let parsed = parsed_string_annotation(
+                    db,
+                    definition.python_file(db),
+                    string.as_single_part_string()?,
+                )
+                .ok()?;
                 self.iterable_annotation_ranges(definition, parsed.expr())
             }
             ast::Expr::Subscript(subscript) => {

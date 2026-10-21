@@ -145,8 +145,8 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
                 return Self::external(db, file, owner, foreign_file, foreign_owner);
             }
         };
-        let source = source_text(db, file.file(db));
-        let parsed = parsed_annotation_range(&source, range, owner.node_index().load());
+        let parsed =
+            parsed_annotation_range(db, file.python_file(db), range, owner.node_index().load());
         Some(Self::Detached {
             owner: NodeKey::from_node(owner),
             range,
@@ -483,7 +483,11 @@ pub(crate) fn parse_string_annotation<'a, 'db>(
         // Compare the raw contents (without quotes) of the expression with the parsed contents
         // contained in the string literal.
         } else if &source[string_literal.content_range()] == string_literal.as_str() {
-            match parsed_string_annotation(source.as_str(), string_literal) {
+            match parsed_string_annotation(
+                db,
+                context.program_file().python_file(db),
+                string_literal,
+            ) {
                 Ok(parsed) => {
                     return Some(SourceAnnotation::Detached {
                         owner,
@@ -522,6 +526,19 @@ pub(crate) fn parse_string_annotation<'a, 'db>(
                         }
                     }
                 }
+            }
+        } else if context
+            .program_file()
+            .python_file(db)
+            .literal_namespace(db)
+            .is_some()
+            && !source[string_literal.content_range()].contains('\\')
+        {
+            if let Some(builder) = context.report_shared_body_lint(&INVALID_TYPE_FORM, string_expr)
+            {
+                builder.into_diagnostic(
+                    "Cannot analyze a forward annotation whose interpreted text differs from its source spelling",
+                );
             }
         } else if let Some(builder) =
             context.report_shared_body_lint(&ESCAPE_CHARACTER_IN_FORWARD_ANNOTATION, string_expr)
