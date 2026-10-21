@@ -3498,6 +3498,7 @@ def _(p: Person) -> None:
     # `pop()` only works on non-required fields
     reveal_type(p.pop("extra"))  # revealed: str
     reveal_type(p.pop("extra", "fallback"))  # revealed: str
+    p.pop("extra", default="fallback")  # error: [no-matching-overload]
     # error: [invalid-argument-type] "Cannot pop required field 'name' from TypedDict `Person`"
     reveal_type(p.pop("name"))  # revealed: Unknown
 

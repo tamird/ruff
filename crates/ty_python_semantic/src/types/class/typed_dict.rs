@@ -604,6 +604,11 @@ fn synthesize_typed_dict_pop<'db>(
     fields: TypedDictFields<'db>,
 ) -> Type<'db> {
     let instance_ty = Type::TypedDict(typed_dict);
+    let default_parameter = if db.provided_dict_pop_keyword_default(env.program(db)) {
+        Parameter::positional_or_keyword(Name::new_static("default"))
+    } else {
+        Parameter::positional_only(Some(Name::new_static("default")))
+    };
     let pop_overloads = |key_ty, value_ty| {
         let pop_parameters = [
             Parameter::positional_only(Some(Name::new_static("self")))
@@ -618,8 +623,7 @@ fn synthesize_typed_dict_pop<'db>(
             Parameter::positional_only(Some(Name::new_static("self")))
                 .with_annotated_type(instance_ty),
             Parameter::positional_only(Some(Name::new_static("key"))).with_annotated_type(key_ty),
-            Parameter::positional_only(Some(Name::new_static("default")))
-                .with_annotated_type(value_ty),
+            default_parameter.clone().with_annotated_type(value_ty),
         ];
         let pop_with_typed_default_sig = Signature::new(
             Parameters::standard(pop_with_typed_default_parameters),
@@ -636,7 +640,8 @@ fn synthesize_typed_dict_pop<'db>(
             Parameter::positional_only(Some(Name::new_static("self")))
                 .with_annotated_type(instance_ty),
             Parameter::positional_only(Some(Name::new_static("key"))).with_annotated_type(key_ty),
-            Parameter::positional_only(Some(Name::new_static("default")))
+            default_parameter
+                .clone()
                 .with_annotated_type(Type::TypeVar(t_default)),
         ];
         let pop_with_default_sig = Signature::new_generic(

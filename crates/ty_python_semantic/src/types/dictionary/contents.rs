@@ -26,7 +26,7 @@ use crate::Db;
 use crate::place::loop_header_reachability;
 use crate::provided::ProvidedBindingValue;
 use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
-use crate::types::call::CallArguments;
+use crate::types::call::{Argument, CallArguments};
 use crate::types::infer::{
     DefinitionInference, FunctionBodyDomain, StatementInference, infer_definition_with_body_domain,
     infer_statement_with_body_domain,
@@ -1932,14 +1932,44 @@ fn mapping_transfer<'db>(
                     }
                 }
                 "pop" => {
-                    let key = match call.arguments.args.as_ref() {
-                        [key] => key,
-                        [key, _default] => key,
+                    let key = match (
+                        call.arguments.args.as_ref(),
+                        call.arguments.keywords.as_ref(),
+                    ) {
+                        ([key] | [key, _], []) => key,
+                        ([key], [default])
+                            if !key.is_starred_expr()
+                                && default.arg.as_ref().is_some_and(|name| name == "default") =>
+                        {
+                            if *retained {
+                                return MappingTransfer::Expose;
+                            }
+                            let Some(Type::TypedDict(_)) = inference
+                                .try_expression_type(receiver)
+                                .map(|ty| ty.resolve_type_alias(db))
+                            else {
+                                return unavailable();
+                            };
+                            let (Some(callee), Some(key_ty), Some(default_ty)) = (
+                                inference.try_expression_type(&call.func),
+                                inference.try_expression_type(key),
+                                inference.try_expression_type(&default.value),
+                            ) else {
+                                return unavailable();
+                            };
+                            let arguments = [
+                                (Argument::Positional, Some(key_ty)),
+                                (Argument::Keyword("default"), Some(default_ty)),
+                            ]
+                            .into_iter()
+                            .collect();
+                            if callee.try_call(db, &env, &arguments).is_err() {
+                                return unavailable();
+                            }
+                            key
+                        }
                         _ => return unavailable(),
                     };
-                    if !call.arguments.keywords.is_empty() {
-                        return unavailable();
-                    }
                     let Some(key_ty) = inference.try_expression_type(key) else {
                         return unavailable();
                     };

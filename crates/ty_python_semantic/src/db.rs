@@ -62,6 +62,16 @@ pub trait Db: PythonCoreDb {
         None
     }
 
+    /// Whether a builtin dictionary's positional fallback may also be passed as `default=`.
+    ///
+    /// The application must guarantee that the named form accepts the same positional key and
+    /// fallback value domains and has the same return and mutation behavior as the positional
+    /// form. Implementations must use tracked inputs of the requesting program. Ordinary Python
+    /// dictionaries accept the fallback only positionally.
+    fn provided_dict_pop_keyword_default(&self, _program: crate::Program<'_>) -> bool {
+        false
+    }
+
     /// Supplies the initial body type of an unannotated parameter.
     ///
     /// This does not change the function's public signature or declare a type for later
