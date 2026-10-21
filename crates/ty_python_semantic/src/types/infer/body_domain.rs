@@ -21,7 +21,7 @@ use super::{
 };
 use crate::reachability::{ReachabilityEvaluationCache, is_range_reachable_in_domain};
 use crate::semantic_model::HasType;
-use crate::types::call::Argument;
+use crate::types::call::{Argument, has_exact_runtime_class};
 use crate::types::constraints::ConstraintSetBuilder;
 use crate::types::dictionary::{CapturedKeywordTail, DictionaryItems};
 use crate::types::function::{KnownFunction, OverloadLiteral};
@@ -720,9 +720,11 @@ fn supported_body(
     fn nonlocal_callee(db: &dyn Db, function: FunctionType<'_>, value: &ast::Expr) -> bool {
         let model = SemanticModel::new(db, function.program_file(db));
         match value.inferred_type(&model) {
-            Some(Type::ClassLiteral(class)) => [KnownClass::List, KnownClass::Dict]
-                .into_iter()
-                .any(|known| class.is_known(db, known)),
+            Some(Type::ClassLiteral(class)) => {
+                [KnownClass::List, KnownClass::Dict, KnownClass::Str]
+                    .into_iter()
+                    .any(|known| class.is_known(db, known))
+            }
             Some(Type::FunctionLiteral(callee)) => function_callee(db, function, callee),
             Some(ty) => callable_entry(db, &model.program_environment(), ty),
             None => false,
@@ -799,9 +801,16 @@ fn supported_body(
         attribute: &ast::ExprAttribute,
     ) -> bool {
         let model = SemanticModel::new(db, function.program_file(db));
-        let (class, mutates) = if attribute.value.is_string_literal_expr() {
-            // A literal has an exact immutable receiver. Argument effects still follow
-            // ordinary call inference; the method is not assumed to be pure.
+        let env = model.program_environment();
+        let receiver = attribute.value.inferred_type(&model);
+        let (class, mutates) = if receiver.is_some_and(|ty| {
+            has_exact_runtime_class(db, &env, ty)
+                && ty
+                    .nominal_class(db, &env)
+                    .is_some_and(|class| class.is_known(db, KnownClass::Str))
+        }) {
+            // An exact string receiver cannot dispatch to an overriding subclass. Argument
+            // effects still follow ordinary call inference; the method is not assumed pure.
             (KnownClass::Str, false)
         } else {
             match attribute.attr.id.as_str() {
@@ -815,10 +824,7 @@ fn supported_body(
             return false;
         }
         if !mutates
-            && attribute
-                .value
-                .inferred_type(&model)
-                .is_some_and(|ty| matches!(ty.resolve_type_alias(db), Type::TypedDict(_)))
+            && receiver.is_some_and(|ty| matches!(ty.resolve_type_alias(db), Type::TypedDict(_)))
         {
             // TypedDict get is checked by the ordinary specialized call owner.
             return true;
@@ -826,7 +832,6 @@ fn supported_body(
         let Some(Type::BoundMethod(method)) = attribute.inferred_type(&model) else {
             return false;
         };
-        let env = ProgramEnvironment::from_file(function.program_file(db));
         let Some(Type::BoundMethod(declared)) = class
             .to_instance(db, &env)
             .member_lookup_with_policy(
@@ -1356,15 +1361,16 @@ mod tests {
     }
 
     #[test]
-    fn complete_domains_check_literal_string_methods() -> anyhow::Result<()> {
+    fn complete_domains_check_string_calls() -> anyhow::Result<()> {
         let mut db = setup_db();
         let source = indoc::indoc! {r#"
             from typing import Literal, overload
             @overload
-            def f(flag: Literal[True]) -> str: ...
+            def f(flag: Literal[True], value: object) -> str: ...
             @overload
-            def f(flag: Literal[False]) -> int: ...
-            def f(flag: bool) -> str | int:
+            def f(flag: Literal[False], value: object) -> int: ...
+            def f(flag: bool, value: object) -> str | int:
+                text = "value"
                 if flag:
                     return EXPRESSION
                 return 42
@@ -1372,11 +1378,18 @@ mod tests {
         for (expression, expected) in [
             (r#""{}".format("value")"#, None),
             (r#""value".replace("a", "x")"#, None),
+            (r#"text.replace("a", "x")"#, None),
+            ("str(value)", None),
+            (
+                r#"str(b"value", encoding=42)"#,
+                Some("invalid-argument-type"),
+            ),
             (r#""value".replace(42, "x")"#, Some("no-matching-overload")),
             (
                 r#"("{}".format("value"), 42)[1]"#,
                 Some("invalid-return-type"),
             ),
+            ("(str(value), 42)[1]", Some("invalid-return-type")),
         ] {
             db.write_file("/src/body.py", source.replace("EXPRESSION", expression))?;
             let f = function(&db);
@@ -1415,11 +1428,17 @@ mod tests {
             )?;
             assert!(!OverloadBodyAnalysis::new(&db, function(&db)).is_complete());
         }
+        db.write_file(
+            "/src/body.py",
+            source.replace("EXPRESSION", r#"str(value).replace("a", "x")"#),
+        )?;
+        // Python's `str` can return a subclass from `value.__str__`.
+        assert!(!OverloadBodyAnalysis::new(&db, function(&db)).is_complete());
         Ok(())
     }
 
     #[test]
-    fn literal_string_methods_invalidate_argument_contents() -> anyhow::Result<()> {
+    fn string_calls_invalidate_argument_contents() -> anyhow::Result<()> {
         let mut db = setup_db();
         let source = indoc::indoc! {r#"
             from typing import overload
@@ -1439,6 +1458,7 @@ mod tests {
                 r#""{value}".format_map(values)"#,
                 Some("invalid-argument-type"),
             ),
+            ("str(values)", Some("invalid-argument-type")),
         ] {
             db.write_file("/src/body.py", source.replace("CALL", call))?;
             let f = function(&db);

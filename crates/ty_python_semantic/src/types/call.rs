@@ -56,9 +56,8 @@ pub(crate) enum BinaryOperatorMethod {
 
 /// Returns whether every inhabitant of `ty` has the same nominal runtime class.
 ///
-/// This is intentionally conservative: a false negative only widens a binary operation's result,
-/// while a false positive could discard a valid normal-method result.
-fn has_exact_runtime_class<'db>(
+/// A false positive could incorrectly rule out subclass-specific method dispatch.
+pub(super) fn has_exact_runtime_class<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
