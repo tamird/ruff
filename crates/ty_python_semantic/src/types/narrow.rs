@@ -4895,6 +4895,10 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             TypeContext::default(),
             self.body_domain,
         );
+        if inference.is_provisional() {
+            self.is_provisional = true;
+            return None;
+        }
 
         let mut constraints = NarrowingConstraints::default();
 

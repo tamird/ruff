@@ -8321,6 +8321,46 @@ def test_nested_in(x: OuterWithBaz):
         reveal_type(x)  # revealed: (Foo & <TypedDict with items 'baz'>) | Baz
 ```
 
+## Traversing a recursive tagged union
+
+A comparison guard narrows the loop-carried value before a variant-specific field is read. An access
+that remains invalid after narrowing still reports an error.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Literal, TypedDict, assert_type
+
+class Leaf(TypedDict):
+    kind: Literal["leaf"]
+
+class Branch(TypedDict):
+    kind: Literal["branch"]
+    children: dict[str, "Node"]
+
+type Node = Leaf | Branch
+
+def traverse(initial: Node, keys: list[str]) -> Node:
+    node = initial
+    for key in keys:
+        if node["kind"] != "branch":
+            return node
+        assert_type(node, Branch)
+        node = node["children"][key]
+    assert_type(node, Node)
+    return node
+
+def invalid_traverse(node: Node, keys: list[str]) -> Node:
+    for key in keys:
+        if node["kind"] == "branch":
+            return node
+        node = node["children"][key]  # error: [invalid-key]
+    return node
+```
+
 ## Only annotated declarations are allowed in the class body
 
 <!-- snapshot-diagnostics -->
