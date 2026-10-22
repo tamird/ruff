@@ -1244,6 +1244,21 @@ fn map_member_lookup_type<'db>(
     }
 }
 
+fn rebind_member_receiver<'db>(
+    db: &'db dyn Db,
+    result: MemberLookupResult<'db>,
+    instance: Type<'db>,
+    signature_receiver: Type<'db>,
+) -> MemberLookupResult<'db> {
+    map_member_lookup_type(db, result, |ty| match ty {
+        // A descriptor can return a method captured from a different object.
+        Type::BoundMethod(method) if method.self_instance(db) == signature_receiver => {
+            Type::BoundMethod(method.with_receivers(db, instance, signature_receiver))
+        }
+        _ => ty,
+    })
+}
+
 fn distribute_member_lookup_over_bound_or_constraints<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -1266,12 +1281,7 @@ fn distribute_member_lookup_over_bound_or_constraints<'db>(
                     policy,
                     Some(*constraint),
                 );
-                let result = map_member_lookup_type(db, result, |ty| match ty {
-                    Type::BoundMethod(method) => Type::BoundMethod(
-                        method.with_constrained_receiver(db, symbolic_receiver, *constraint),
-                    ),
-                    _ => ty,
-                });
+                let result = rebind_member_receiver(db, result, symbolic_receiver, *constraint);
                 error = error.or_else(|| result.err().map(|error| error.kind(db)));
                 let member = result.unwrap_or_else(|error| error.fallback_member(db));
                 properties =
@@ -6294,9 +6304,24 @@ impl<'db> Type<'db> {
                     let mut error = None;
                     let mut properties = None;
                     let member = union.map_with_boundness_and_qualifiers(db, env, |elem| {
-                        let result = elem.member_lookup_with_policy_and_receiver(
-                            db, env, name_str, policy, receiver,
-                        );
+                        // The type variable may specialize to a proper subtype of this
+                        // alternative, so retain it while binding the descriptor.
+                        let result = if let Some(receiver @ Type::TypeVar(_)) = receiver {
+                            let refined =
+                                IntersectionType::from_two_elements(db, env, receiver, *elem);
+                            let result = elem.member_lookup_with_policy_and_receiver(
+                                db,
+                                env,
+                                name_str,
+                                policy,
+                                Some(refined),
+                            );
+                            rebind_member_receiver(db, result, receiver, refined)
+                        } else {
+                            elem.member_lookup_with_policy_and_receiver(
+                                db, env, name_str, policy, receiver,
+                            )
+                        };
                         error = error.or_else(|| result.err().map(|error| error.kind(db)));
                         let member = result.unwrap_or_else(|error| error.fallback_member(db));
                         properties = union_deprecated_properties(
@@ -6696,6 +6721,22 @@ impl<'db> Type<'db> {
                 Type::TypeAlias(alias) => alias
                     .value_type(db)
                     .member_lookup_with_policy_and_receiver(db, env, name_str, policy, receiver),
+
+                // Class-only lookup must distribute a union upper bound before invoking
+                // descriptors, so each descriptor is bound to a compatible receiver.
+                Type::TypeVar(typevar)
+                    if let Some(TypeVarBoundOrConstraints::UpperBound(bound)) =
+                        typevar.typevar(db).bound_or_constraints(db, env)
+                        && let bound @ Type::Union(_) = bound.resolve_type_alias(db) =>
+                {
+                    bound.member_lookup_with_policy_and_receiver(
+                        db,
+                        env,
+                        name_str,
+                        policy,
+                        Some(receiver.unwrap_or(this)),
+                    )
+                }
 
                 _ if policy.no_instance_fallback() => {
                     let receiver = receiver.unwrap_or(this);

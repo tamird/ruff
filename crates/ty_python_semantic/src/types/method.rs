@@ -39,32 +39,34 @@ pub struct BoundMethodType<'db> {
 impl get_size2::GetSize for BoundMethodType<'_> {}
 
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
-pub struct ConstrainedBoundMethodReceiver<'db> {
+pub struct SplitBoundMethodReceiver<'db> {
     #[returns(copy)]
-    receiver: Type<'db>,
+    instance: Type<'db>,
     #[returns(copy)]
-    constraint: Type<'db>,
+    signature_receiver: Type<'db>,
 }
 
 // The Salsa heap is tracked separately.
-impl get_size2::GetSize for ConstrainedBoundMethodReceiver<'_> {}
+impl get_size2::GetSize for SplitBoundMethodReceiver<'_> {}
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
 pub enum BoundMethodReceiver<'db> {
     /// The captured receiver is also used to check the signature.
     Instance(Type<'db>),
-    /// Looking up `x.method` for `T: (A, B)` checks each alternative separately.
-    /// In the `A` alternative, the signature receives `A`, but `__self__` retains `T`.
-    Constrained(ConstrainedBoundMethodReceiver<'db>),
+    /// The signature is checked with a receiver refined for one alternative, while
+    /// `__self__` and `typing.Self` retain the original instance.
+    Split(SplitBoundMethodReceiver<'db>),
 }
 
 impl<'db> BoundMethodReceiver<'db> {
-    fn constrained(db: &'db dyn Db, receiver: Type<'db>, constraint: Type<'db>) -> Self {
-        if receiver == constraint {
-            Self::Instance(receiver)
+    fn split(db: &'db dyn Db, instance: Type<'db>, signature_receiver: Type<'db>) -> Self {
+        if instance == signature_receiver {
+            Self::Instance(instance)
         } else {
-            Self::Constrained(ConstrainedBoundMethodReceiver::new(
-                db, receiver, constraint,
+            Self::Split(SplitBoundMethodReceiver::new(
+                db,
+                instance,
+                signature_receiver,
             ))
         }
     }
@@ -72,25 +74,23 @@ impl<'db> BoundMethodReceiver<'db> {
     fn self_instance(self, db: &'db dyn Db) -> Type<'db> {
         match self {
             Self::Instance(receiver) => receiver,
-            Self::Constrained(constrained) => constrained.receiver(db),
+            Self::Split(split) => split.instance(db),
         }
     }
 
     fn signature_receiver(self, db: &'db dyn Db) -> Type<'db> {
         match self {
             Self::Instance(receiver) => receiver,
-            Self::Constrained(constrained) => constrained.constraint(db),
+            Self::Split(split) => split.signature_receiver(db),
         }
     }
 
     fn map(self, db: &'db dyn Db, mut f: impl FnMut(Type<'db>) -> Type<'db>) -> Self {
         match self {
             Self::Instance(receiver) => Self::Instance(f(receiver)),
-            Self::Constrained(constrained) => Self::constrained(
-                db,
-                f(constrained.receiver(db)),
-                f(constrained.constraint(db)),
-            ),
+            Self::Split(split) => {
+                Self::split(db, f(split.instance(db)), f(split.signature_receiver(db)))
+            }
         }
     }
 
@@ -101,11 +101,11 @@ impl<'db> BoundMethodReceiver<'db> {
     ) -> Option<Self> {
         Some(match self {
             Self::Instance(receiver) => Self::Instance(f(receiver)?),
-            Self::Constrained(constrained) => Self::constrained(
-                db,
-                f(constrained.receiver(db))?,
-                f(constrained.constraint(db))?,
-            ),
+            Self::Split(split) => {
+                let instance = f(split.instance(db))?;
+                let signature_receiver = f(split.signature_receiver(db))?;
+                Self::split(db, instance, signature_receiver)
+            }
         })
     }
 }
@@ -240,18 +240,18 @@ impl<'db> BoundMethodType<'db> {
         )
     }
 
-    pub(crate) fn with_constrained_receiver(
+    pub(crate) fn with_receivers(
         self,
         db: &'db dyn Db,
-        receiver: Type<'db>,
-        constraint: Type<'db>,
+        instance: Type<'db>,
+        signature_receiver: Type<'db>,
     ) -> Self {
         Self::new_internal(
             db,
             self.func(db),
             self.program(db),
             self.class_method(db),
-            BoundMethodReceiver::constrained(db, receiver, constraint),
+            BoundMethodReceiver::split(db, instance, signature_receiver),
         )
     }
 

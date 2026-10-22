@@ -133,6 +133,42 @@ def slice_sequence[T: Sequence[int]](value: T) -> T:
     return value[:2]
 ```
 
+## Subscripting a type variable with a union upper bound
+
+Each specialization of the upper bound accepts the generic key. An overload returning `Self`
+preserves the receiver's type variable.
+
+```py
+from typing import Self, TypeVar, overload
+
+class Key[T]: ...
+
+class Box[T]:
+    @overload
+    def __getitem__[V](self, key: Key[V]) -> V: ...
+    @overload
+    def __getitem__(self, key: bytes) -> Self: ...
+    def __getitem__(self, key): ...
+
+def read[T: Box[int] | Box[None]](value: T, key: Key[str]) -> None:
+    reveal_type(value[key])  # revealed: str
+    reveal_type(value[b""])  # revealed: T@read
+    value[42]  # error: [invalid-argument-type]
+
+type Boxes = Box[int] | Box[None]
+T = TypeVar("T", bound=Boxes)
+
+def read_legacy(value: T, key: Key[str]) -> None:
+    reveal_type(value[key])  # revealed: str
+
+class InstanceOnly:
+    def __init__(self) -> None:
+        self.__getitem__ = lambda key: ""
+
+def missing[T: Box[int] | InstanceOnly](value: T, key: Key[str]) -> None:
+    value[key]  # error: [possibly-missing-implicit-call]
+```
+
 ## Subscripting an unsupported constrained type
 
 A subscript remains invalid when any declared constraint does not support it.

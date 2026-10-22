@@ -212,13 +212,9 @@ intersection:
 
 ```py
 def generic_bounds[U: E1 | E2, I: E1 & E2](union: U, intersection: I):
-    # revealed: (bound method U@generic_bounds.f() -> list[U@generic_bounds]) | (bound method U@generic_bounds.f() -> list[U@generic_bounds])
+    # revealed: (bound method U@generic_bounds when (U@generic_bounds & E1).f() -> list[U@generic_bounds]) | (bound method U@generic_bounds when (U@generic_bounds & E2).f() -> list[U@generic_bounds])
     reveal_type(union.f)
-    # TODO: This call should be accepted without errors. Pyright and mypy reveal `list[E1] | list[E2]` here, but
-    # `list[U@generic_bounds]` seems more accurate.
-    # error: [invalid-argument-type] "`U@generic_bounds` does not satisfy upper bound `E2` of type variable `Self`"
-    # error: [invalid-argument-type] "`U@generic_bounds` does not satisfy upper bound `E1` of type variable `Self`"
-    reveal_type(union.f())  # revealed: list[Unknown]
+    reveal_type(union.f())  # revealed: list[U@generic_bounds]
 
     # revealed: (bound method I@generic_bounds.f() -> list[I@generic_bounds]) & (bound method I@generic_bounds.f() -> list[I@generic_bounds])
     reveal_type(intersection.f)
@@ -311,6 +307,41 @@ def _(
     reveal_type(intersection_internal.f())  # revealed: G1[Self@f] & G2[Self@f]
 ```
 
+#### Descriptor receivers on a union-bounded type variable
+
+A classmethod captures the class, while a custom descriptor can return a method bound to an
+unrelated object.
+
+```py
+from typing import Self
+
+class Other:
+    def method(self) -> str:
+        return ""
+
+class Descriptor[T]:
+    def __init__(self, value: T) -> None:
+        self.value = value
+
+    def __get__(self, instance: object, owner: type[object]) -> T:
+        return self.value
+
+class Base:
+    descriptor = Descriptor(Other().method)
+
+    @classmethod
+    def make(cls) -> Self:
+        return cls()
+
+class Left(Base): ...
+class Right(Base): ...
+
+def generic_bound[T: Left | Right](value: T) -> T:
+    owner: type[T] = value.make.__self__
+    reveal_type(value.descriptor.__self__)  # revealed: Other
+    return value.make()
+```
+
 ### Method defined on a single element
 
 #### Instance methods
@@ -350,13 +381,11 @@ intersection:
 
 ```py
 def generic_bounds[U: E1 | E2, I: E1 & E2](union: U, intersection: I):
-    # revealed: bound method U@generic_bounds.f() -> list[U@generic_bounds]
+    # revealed: bound method U@generic_bounds when (U@generic_bounds & E1).f() -> list[U@generic_bounds]
     # error: [unresolved-attribute]
     reveal_type(union.f)
-    # TODO: Ideally, this would not emit the `invalid-argument-type` error and reveal `list[U@generic_bounds]`
-    # error: [invalid-argument-type] "`U@generic_bounds` does not satisfy upper bound `E1` of type variable `Self`"
     # error: [unresolved-attribute]
-    reveal_type(union.f())  # revealed: list[Unknown]
+    reveal_type(union.f())  # revealed: list[U@generic_bounds]
 
     # revealed: bound method I@generic_bounds.f() -> list[I@generic_bounds]
     reveal_type(intersection.f)
