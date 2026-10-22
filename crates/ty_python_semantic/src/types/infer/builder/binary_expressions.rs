@@ -189,9 +189,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
 
         let ast::ExprBinOp {
-            left,
+            left: _,
             op,
-            right,
+            right: _,
             range: _,
             node_index: _,
         } = binary;
@@ -201,48 +201,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             && let Some(typed_dict) = tcx
                 .annotation
                 .and_then(|ty| ty.resolve_type_alias(self.db()).as_typed_dict())
-            // Preserve bidirectional inference for fresh values in literal operands.
-            && !has_dict_literal_operand(left)
-            && !has_dict_literal_operand(right)
+            && let Some(result) = self.try_infer_contextual_typed_dict_union(binary, typed_dict)
         {
-            let mut candidate = self.speculate();
-            let result = candidate.infer_binary_expression(binary, TypeContext::default());
-            let db = candidate.db();
-            let env = candidate.program_environment();
-            if !result.has_provisional_marker(db, env)
-                && [left.as_ref(), right.as_ref()].into_iter().all(|operand| {
-                    candidate
-                        .try_expression_type(operand)
-                        .is_some_and(|ty| !ty.has_provisional_marker(db, env))
-                })
-            {
-                if result.is_assignable_to(db, env, Type::TypedDict(typed_dict)) {
-                    self.extend(candidate);
-                    return result;
-                }
-                if let Some((key_ty, _)) = result.unpack_keys_and_items(db, env)
-                    && let Ok(dictionary) = DictionaryItems::union(
-                        db,
-                        env,
-                        candidate.scope(),
-                        binary,
-                        candidate.context.body_domain,
-                        &mut |expression| candidate.try_expression_type(expression),
-                    )
-                {
-                    // Validate the complete fresh result: intermediate unions need not contain
-                    // every required field, and a later operand can replace an earlier value.
-                    validate_typed_dict_copy(
-                        &candidate.context,
-                        typed_dict,
-                        binary.into(),
-                        key_ty,
-                        dictionary,
-                    );
-                    self.extend(candidate);
-                    return Type::TypedDict(typed_dict);
-                }
-            }
+            return result;
         }
 
         let (left_ty, right_ty) = match self.infer_binary_expression_operand_types(binary, tcx) {
@@ -263,6 +224,87 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             report_unsupported_binary_operation(&self.context, binary, left_ty, right_ty, *op);
             Type::unknown()
         })
+    }
+
+    fn try_infer_contextual_typed_dict_union(
+        &mut self,
+        binary: &ast::ExprBinOp,
+        typed_dict: TypedDictType<'db>,
+    ) -> Option<Type<'db>> {
+        let ast::ExprBinOp {
+            left,
+            right,
+            op: _,
+            range: _,
+            node_index: _,
+        } = binary;
+        if has_dict_literal_operand(left) {
+            return None;
+        }
+
+        let mut candidate = self.speculate();
+        let db = candidate.db();
+        let env = candidate.program_environment();
+        let result = if let ast::Expr::Dict(literal) = right.as_ref() {
+            let left_ty = candidate.infer_expression(left, TypeContext::default());
+            // Other mapping-like types, including intersections, may override `__or__`.
+            if left_ty.resolve_type_alias(db).as_typed_dict().is_none() {
+                return None;
+            }
+            candidate.infer_typed_dict_literal_values(typed_dict, literal);
+            // The literal's entries depend on this result schema, so inferring the root through
+            // the expression cache would lose their context or cache it under a default key.
+            let right_ty = candidate.infer_expression_uncached(right, TypeContext::default());
+            let (left_key_ty, _) = left_ty.unpack_keys_and_items(db, env)?;
+            let (right_key_ty, _) = right_ty.unpack_keys_and_items(db, env)?;
+            let key_ty = UnionType::from_two_elements(db, env, left_key_ty, right_key_ty);
+            candidate.validate_contextual_typed_dict_union(binary, typed_dict, key_ty)?
+        } else {
+            if has_dict_literal_operand(right) {
+                return None;
+            }
+            let result = candidate.infer_binary_expression(binary, TypeContext::default());
+            if result.has_provisional_marker(db, env) {
+                return None;
+            }
+            if result.is_assignable_to(db, env, Type::TypedDict(typed_dict)) {
+                result
+            } else {
+                let (key_ty, _) = result.unpack_keys_and_items(db, env)?;
+                candidate.validate_contextual_typed_dict_union(binary, typed_dict, key_ty)?
+            }
+        };
+
+        if [left.as_ref(), right.as_ref()].into_iter().any(|operand| {
+            candidate
+                .try_expression_type(operand)
+                .is_none_or(|ty| ty.has_provisional_marker(db, env))
+        }) {
+            return None;
+        }
+        self.extend(candidate);
+        Some(result)
+    }
+
+    fn validate_contextual_typed_dict_union(
+        &self,
+        binary: &ast::ExprBinOp,
+        typed_dict: TypedDictType<'db>,
+        key_ty: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let dictionary = DictionaryItems::union(
+            self.db(),
+            self.program_environment(),
+            self.scope(),
+            binary,
+            self.context.body_domain,
+            &mut |expression| self.try_expression_type(expression),
+        )
+        .ok()?;
+        // Intermediate unions need not contain every required field, and a later operand can
+        // replace an earlier value. Validate the complete fresh result.
+        validate_typed_dict_copy(&self.context, typed_dict, binary.into(), key_ty, dictionary);
+        Some(Type::TypedDict(typed_dict))
     }
 
     fn infer_pep_604_union_type_alias(

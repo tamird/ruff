@@ -1452,6 +1452,43 @@ balanced: Config = ({} | {"values": [1]}) | ({} | {"values": [2]})  # no diagnos
 callback: Callback = {} | {"callback": lambda value: reveal_type(value)}  # revealed: int
 ```
 
+A dictionary literal on the right can supply fields missing from a `TypedDict` on the left. Fresh
+nested values receive the result schema's field types, and the combined result must satisfy the
+entire schema.
+
+```py
+from typing import overload
+
+class WithValues(TypedDict, closed=True):
+    a: int
+    values: list[object]
+
+@overload
+def consume_shape(value: WithValues) -> int: ...
+@overload
+def consume_shape(value: str) -> str: ...
+def consume_shape(value: WithValues | str) -> int | str:
+    return 1
+
+class Custom:
+    def keys(self) -> list[str]:
+        return []
+
+    def __getitem__(self, key: str) -> int:
+        return 0
+
+    def __or__(self, other: object) -> int:
+        return 1
+
+def literal_operand(a: A):
+    combined: AB = a | {"b": "value"}  # no diagnostic
+    contextual: WithValues = a | {"values": [1]}  # no diagnostic
+    reveal_type(consume_shape(a | {"values": [1]}))  # revealed: int
+    wrong: AB = a | {"a": "wrong", "b": "value"}  # error: [invalid-argument-type]
+    missing: ABC = a | {"b": "value"}  # error: [missing-typed-dict-key]
+    custom: AB = Custom() | {"a": 1, "b": "value"}  # error: [invalid-assignment]
+```
+
 ## Copying observed dictionary contents
 
 A fresh dictionary can be checked against a `TypedDict` using the source's known entries and

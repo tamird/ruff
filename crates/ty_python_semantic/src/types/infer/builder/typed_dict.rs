@@ -682,7 +682,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 self.get_or_infer_expression(&arguments.args[0], TypeContext::new(Some(target_ty)));
             }
             TypedDictConstructorForm::MixedLiteralAndKeywords(dict_expr) => {
-                self.infer_typed_dict_constructor_dict_literal_values(typed_dict, dict_expr);
+                self.infer_typed_dict_literal_values(typed_dict, dict_expr);
                 self.store_expression_type(&arguments.args[0], Type::unknown());
             }
             TypedDictConstructorForm::KeywordOnly
@@ -734,13 +734,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
     }
 
-    /// Infer the key and value expressions of a positional dict literal passed to a
-    /// `TypedDict` constructor alongside keyword arguments.
-    ///
-    /// The outer dict literal is intentionally left uninferred for later call binding; this helper only
-    /// pre-infers its nested expressions so full constructor validation can still combine keys
-    /// from the dict literal and keyword arguments without double-inferring the dict itself.
-    fn infer_typed_dict_constructor_dict_literal_values(
+    /// Infer a dictionary literal's entries against the schema before validating a larger
+    /// expression that combines them with other entries.
+    pub(super) fn infer_typed_dict_literal_values(
         &mut self,
         typed_dict: TypedDictType<'db>,
         dict_expr: &ast::ExprDict,
