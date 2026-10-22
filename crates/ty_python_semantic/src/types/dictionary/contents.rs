@@ -50,6 +50,26 @@ pub(super) enum ContentsValue<'db> {
     Mapping(MappingContents<'db>),
 }
 
+/// What the mapping history establishes about its named entries. Later variants carry less
+/// evidence, so their ordering also defines the join of two histories.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, get_size2::GetSize, salsa::SalsaValue,
+)]
+enum MappingPresence {
+    /// Named entries can carry evidence of presence; the key set may still be open.
+    Known,
+    /// Named entries constrain values without proving presence.
+    Residual,
+    /// The original inventory was exposed to an operation that may have changed it.
+    Exposed,
+}
+
+impl MappingPresence {
+    fn tracks_presence(self) -> bool {
+        self == Self::Known
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
 pub(super) struct MappingContents<'db> {
     /// All ranges belong to this file. Copying from another file rebases them to the local use.
@@ -58,9 +78,7 @@ pub(super) struct MappingContents<'db> {
     /// Builtin construction or a checked final allocation class establishes builtin operations.
     /// Exposure changes contents while preserving this class identity.
     pub(super) builtin: bool,
-    /// Opaque exposure leaves only value restrictions, rather than evidence of key presence.
-    /// An explicitly described `TypedDict` retains its schema and can track subsequent mutations.
-    pub(super) uses_residual_presence: bool,
+    presence: MappingPresence,
     /// The original mapping bound and its local source survive exposure.
     pub(super) bound: Option<MappingBound<'db>>,
 }
@@ -82,6 +100,9 @@ impl<'db> MappingContents<'db> {
         self.dictionary.first_entry = DictionaryFirstEntry::Unknown;
         self.dictionary.items = Box::default();
         self.generalize_presence(db, env);
+        if self.presence == MappingPresence::Residual {
+            self.presence = MappingPresence::Exposed;
+        }
     }
 
     /// Retain observed values without treating ordinary dictionary entries as supplied keys.
@@ -91,10 +112,10 @@ impl<'db> MappingContents<'db> {
             && let Some(dictionary) = DictionaryItems::unpacked(db, env, ty, source)
         {
             self.dictionary = dictionary;
-            self.uses_residual_presence = false;
+            self.presence = MappingPresence::Known;
             return;
         }
-        self.uses_residual_presence = true;
+        self.presence = self.presence.max(MappingPresence::Residual);
         self.dictionary.items = std::mem::take(&mut self.dictionary.items)
             .into_vec()
             .into_iter()
@@ -122,10 +143,10 @@ impl<'db> MappingContents<'db> {
             let item = DictionaryItem {
                 name: name.clone(),
                 ty: value,
-                kind: if self.uses_residual_presence {
-                    DictionaryItemKind::Residual
-                } else {
+                kind: if self.presence.tracks_presence() {
                     DictionaryItemKind::Required
+                } else {
+                    DictionaryItemKind::Residual
                 },
                 source,
             };
@@ -148,10 +169,10 @@ impl<'db> MappingContents<'db> {
                     .map(|name| DictionaryItem {
                         name: Name::new(name),
                         ty: value,
-                        kind: if self.uses_residual_presence {
-                            DictionaryItemKind::Residual
-                        } else {
+                        kind: if self.presence.tracks_presence() {
                             DictionaryItemKind::Optional
+                        } else {
+                            DictionaryItemKind::Residual
                         },
                         source,
                     })
@@ -237,7 +258,7 @@ impl<'db> MappingContents<'db> {
             items.retain(|item| item.name != name);
             // A closed inventory already excludes missing names. An open remainder needs an
             // explicit exclusion so it cannot supply the deleted key.
-            if !self.uses_residual_presence && !self.dictionary.is_complete() {
+            if self.presence.tracks_presence() && !self.dictionary.is_complete() {
                 items.push(DictionaryItem {
                     name,
                     ty: Type::Never,
@@ -285,25 +306,25 @@ impl<'db> MappingContents<'db> {
             file,
             dictionary,
             builtin,
-            uses_residual_presence,
+            presence,
             bound,
         } = self;
         let Self {
             file: _,
             dictionary: other_dictionary,
             builtin: other_builtin,
-            uses_residual_presence: other_uses_residual_presence,
+            presence: other_presence,
             bound: other_bound,
         } = other;
-        let uses_residual_presence = *uses_residual_presence || *other_uses_residual_presence;
+        let presence = (*presence).max(*other_presence);
         let bound = bound.zip(*other_bound).map(|(left, right)| MappingBound {
             ty: UnionType::from_two_elements(db, env, left.ty, right.ty),
             source: left.source,
         });
         Self {
             file: *file,
-            dictionary: dictionary.join(db, env, other_dictionary, uses_residual_presence),
-            uses_residual_presence,
+            dictionary: dictionary.join(db, env, other_dictionary, !presence.tracks_presence()),
+            presence,
             bound,
             builtin: *builtin && *other_builtin,
         }
@@ -355,7 +376,7 @@ impl<'db> ContentsValue<'db> {
                     file: scope.program_file(db),
                     dictionary,
                     builtin: true,
-                    uses_residual_presence: false,
+                    presence: MappingPresence::Known,
                     bound: None,
                 }),
                 Err(_) => Self::Unavailable,
@@ -817,7 +838,12 @@ fn initial_contents<'db>(
     )
     .then(|| ParamSpecKeywords::from_type(db, bound_type))
     .flatten();
-    if !explicit_typed_dict && paramspec.is_none() && !super::has_dict_type(db, &env, bound_type) {
+    let implicit_typed_dict = contains_implicit_typed_dict(db, bound_type);
+    if !explicit_typed_dict
+        && !implicit_typed_dict
+        && paramspec.is_none()
+        && !super::has_dict_type(db, &env, bound_type)
+    {
         return ContentsValue::Unavailable;
     }
     if matches!(definition.kind(db), DefinitionKind::ProvidedBinding(_))
@@ -882,6 +908,28 @@ fn initial_contents<'db>(
                 owner_inference.try_expression_type(expression)
             })
         });
+    if implicit_typed_dict {
+        // An implicitly open TypedDict can hide keys, but a fully observed local allocation
+        // has no hidden entries. Its declared type still controls writes and escaped uses.
+        if builtin_allocation
+            && !shared
+            && place.as_symbol().is_some_and(Symbol::is_local)
+            && let Ok(dictionary) = observed
+            && dictionary.is_complete()
+        {
+            return ContentsValue::Mapping(MappingContents {
+                file,
+                dictionary,
+                builtin: true,
+                presence: MappingPresence::Known,
+                bound: Some(MappingBound {
+                    ty: bound_type,
+                    source: definition.kind(db).target_range(&module),
+                }),
+            });
+        }
+        return ContentsValue::Unavailable;
+    }
     let fresh_nested_allocation =
         matches!(definition.kind(db), DefinitionKind::DictKeyAssignment(_))
             && matches!(owner.kind(db), DefinitionKind::Assignment(assignment)
@@ -950,7 +998,7 @@ fn initial_contents<'db>(
         file,
         dictionary,
         builtin: explicit_typed_dict || provided_allocation || kwargs_parameters.is_some(),
-        uses_residual_presence: false,
+        presence: MappingPresence::Known,
         bound,
     };
     if !owner_inference.discards_dict_key_assignments()
@@ -1051,7 +1099,7 @@ fn initial_contents<'db>(
             dictionary.extra_items = DictionaryExtraItems::ParamSpec(component);
         }
         mapping.dictionary = dictionary;
-        mapping.uses_residual_presence = false;
+        mapping.presence = MappingPresence::Known;
     }
     ContentsValue::Mapping(mapping)
 }
@@ -1451,10 +1499,10 @@ impl<'db> MappingTransfer<'db> {
                 mapping.dictionary = DictionaryItems {
                     first_entry: DictionaryFirstEntry::Empty,
                     items: Box::default(),
-                    extra_items: if mapping.uses_residual_presence {
-                        DictionaryExtraItems::Value(mapping.bound_value(db, env))
-                    } else {
+                    extra_items: if mapping.presence.tracks_presence() {
                         DictionaryExtraItems::Closed
+                    } else {
+                        DictionaryExtraItems::Value(mapping.bound_value(db, env))
                     },
                 };
                 previous
@@ -1469,7 +1517,7 @@ impl<'db> MappingTransfer<'db> {
                 mapping.dictionary = result.finish();
                 if retained {
                     mapping.expose(db, env);
-                } else if mapping.uses_residual_presence {
+                } else if !mapping.presence.tracks_presence() {
                     mapping.generalize_presence(db, env);
                 }
                 previous
@@ -2901,9 +2949,11 @@ pub(super) fn snapshot_contents<'db>(
     argument_type: Type<'db>,
     reachability: &ReachabilityEvaluationCache<'db>,
 ) -> ContentsValue<'db> {
+    let implicit_typed_dict = contains_implicit_typed_dict(db, argument_type);
     let observed = (|| {
         let explicit_typed_dict = has_explicit_typed_dict_items(db, argument_type);
         if !explicit_typed_dict
+            && !implicit_typed_dict
             && ParamSpecKeywords::from_type(db, argument_type).is_none()
             && !super::has_dict_type(db, &ProgramEnvironment::from_scope(scope), argument_type)
         {
@@ -2949,11 +2999,28 @@ pub(super) fn snapshot_contents<'db>(
     })();
     match observed {
         Some(ContentsValue::Mapping(mut mapping)) => {
+            // Exposure loses the allocation's inventory. Preserve the TypedDict call policy
+            // for hidden fields instead of treating them as ordinary mapping values.
+            if implicit_typed_dict && mapping.presence == MappingPresence::Exposed {
+                return ContentsValue::Unavailable;
+            }
             mapping.localize(scope.program_file(db), expression.range());
             ContentsValue::Mapping(mapping)
         }
         Some(contents) => contents,
         None => ContentsValue::Unavailable,
+    }
+}
+
+fn contains_implicit_typed_dict<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
+    let is_implicit = |ty: Type<'db>| {
+        ty.resolve_type_alias(db)
+            .as_typed_dict()
+            .is_some_and(|typed_dict| typed_dict.openness(db).is_implicitly_open())
+    };
+    match ty.resolve_type_alias(db) {
+        Type::Union(union) => union.elements(db).iter().copied().any(is_implicit),
+        ty => is_implicit(ty),
     }
 }
 

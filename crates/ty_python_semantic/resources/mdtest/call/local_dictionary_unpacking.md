@@ -169,6 +169,44 @@ def get_with_default(options: OpenOptions, keys: list[str]) -> None:
     consume_enabled(**selected)  # error: [invalid-argument-type]
 ```
 
+## Joining an annotated dictionary with a copied field set
+
+A fully observed fresh dictionary has no hidden entries even when its annotation is an implicitly
+open TypedDict.
+
+```py
+from typing_extensions import NotRequired, TypedDict
+
+class Options(TypedDict, extra_items=object):
+    common: NotRequired[str]
+
+class Shared(TypedDict):
+    common: NotRequired[str]
+
+def consume(*, common: str = "") -> None: ...
+def forward(options: Options, keys: list[str], copy: bool) -> None:
+    if copy:
+        selected = {key: options.pop(key) for key in keys if key in options}
+    else:
+        selected: Shared = {}
+    consume(**selected)  # no diagnostic
+    consume(**(selected | {"common": 1}))  # error: [invalid-argument-type]
+```
+
+After a dictionary escapes, its declared TypedDict contract governs keyword arguments again.
+
+```py
+def mutate(options: Shared) -> None: ...
+def wrong(*, common: int = 0) -> None: ...
+def required(*, common: str = "", other: int) -> None: ...
+def exposed() -> None:
+    options: Shared = {}
+    mutate(options)
+    consume(**options)  # no diagnostic
+    wrong(**options)  # error: [invalid-argument-type]
+    required(**options)  # error: [missing-argument]
+```
+
 ## Literal spreads
 
 Dictionary literals retain each known key when unpacked at a call. Later entries replace earlier
