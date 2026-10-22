@@ -23,7 +23,7 @@ use ty_python_core::{
 };
 
 use crate::Db;
-use crate::place::loop_header_reachability;
+use crate::place::{loop_header_reachability, place_from_declarations_with_reachability_cache};
 use crate::provided::ProvidedBindingValue;
 use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
 use crate::types::call::{Argument, CallArguments};
@@ -956,12 +956,35 @@ fn initial_contents<'db>(
     } else {
         true
     };
-    let bounded = !place.is_symbol() || place.is_declared() || value.is_none();
+    let generalize_initial_contents = !place.is_symbol()
+        || value.is_none()
+        || (place.is_declared()
+            && (inference
+                .inferred_declaration(definition)
+                .declared()
+                .is_some()
+                || {
+                    let use_def = index.use_def_map(scope.file_scope_id(db));
+                    let reachability =
+                        ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints())
+                            .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
+                    place_from_declarations_with_reachability_cache(
+                        db,
+                        &env,
+                        use_def.declarations_at_binding(definition),
+                        &reachability,
+                    )
+                    .first_declaration
+                    .is_some()
+                }));
     let source = definition.kind(db).target_range(&module);
-    let bound = (bounded || explicit_typed_dict).then_some(MappingBound {
-        ty: bound_type,
-        source,
-    });
+    // A declaration elsewhere in the scope can govern later escaped uses even if it does not
+    // constrain this binding's initial inventory.
+    let bound = (generalize_initial_contents || place.is_declared() || explicit_typed_dict)
+        .then_some(MappingBound {
+            ty: bound_type,
+            source,
+        });
     let Some(mut dictionary) = DictionaryItems::unpacked(db, &env, bound_type, source) else {
         return ContentsValue::Unavailable;
     };
@@ -1054,7 +1077,7 @@ fn initial_contents<'db>(
     }
     if paramspec.is_none()
         && !fresh_nested_allocation
-        && (bounded
+        && (generalize_initial_contents
             || shared
             || value.is_some_and(|value| PlaceExpr::try_from_expr(value).is_some()))
     {

@@ -191,9 +191,19 @@ def forward(options: Options, keys: list[str], copy: bool) -> None:
         selected: Shared = {}
     consume(**selected)  # no diagnostic
     consume(**(selected | {"common": 1}))  # error: [invalid-argument-type]
+
+def consume_with_unrelated(*, common: str = "", unrelated: int = 0) -> None: ...
+def finite(options: Options, copy: bool) -> None:
+    if copy:
+        selected = {key: options.pop(key) for key in ("common",) if key in options}
+    else:
+        selected: Shared = {}
+    consume_with_unrelated(**selected)  # no diagnostic
+    consume_with_unrelated(**(selected | {"unrelated": "wrong"}))  # error: [invalid-argument-type]
 ```
 
-After a dictionary escapes, its declared TypedDict contract governs keyword arguments again.
+After a dictionary escapes, its type governs keyword arguments again, including when the
+declaration follows the allocation.
 
 ```py
 def mutate(options: Shared) -> None: ...
@@ -205,6 +215,14 @@ def exposed() -> None:
     consume(**options)  # no diagnostic
     wrong(**options)  # error: [invalid-argument-type]
     required(**options)  # error: [missing-argument]
+
+def mutate_strings(options: dict[str, str]) -> None: ...
+def takes_int(*, value: int) -> None: ...
+def later_declaration() -> None:
+    options = {"value": "bad"}
+    options: dict[str, str]
+    mutate_strings(options)
+    takes_int(**options)  # error: [invalid-argument-type]
 ```
 
 ## Literal spreads
