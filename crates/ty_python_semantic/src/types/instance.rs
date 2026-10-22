@@ -46,6 +46,20 @@ pub(super) use synthesized_protocol::SynthesizedProtocolType;
 use ty_python_core::definition::Definition;
 
 impl<'db> Type<'db> {
+    /// Returns storage attached by [`Type::with_provided_instance_fields`].
+    ///
+    /// Fields reflect specialization already applied to this instance.
+    /// Class declarations and deferred class fields are not resolved by this accessor.
+    /// An instance without attached storage returns `None`; explicitly empty storage
+    /// returns `Some(&[])`.
+    pub fn provided_instance_fields(self, db: &'db dyn Db) -> Option<&'db [ProvidedField<'db>]> {
+        let Self::NominalInstance(instance) = self else {
+            return None;
+        };
+        let provided = instance.provided_instance()?;
+        Some(provided.fields(db))
+    }
+
     /// Refines an instance with immutable storage supplied by an embedding application.
     ///
     /// The runtime class is unchanged. Present fields reside in instance storage,

@@ -445,12 +445,23 @@ descriptor: Descriptor
         generic_callback.apply_specialization(&db, context.specialize(&db, &[int]));
     let member = specialized_callback.member(&db, &env, "value");
     assert!(!member.place.is_definitely_bound());
-    assert!(
-        member
-            .place
-            .expect_type()
-            .is_equivalent_to(&db, &env, callback(int))
-    );
+    let fields = specialized_callback
+        .provided_instance_fields(&db)
+        .context("specialized callback storage")?;
+    let [field] = fields else {
+        anyhow::bail!("Expected one callback field, found {fields:?}");
+    };
+    let ProvidedField {
+        name,
+        ty,
+        is_required,
+        source,
+    } = field;
+    assert_eq!(name, "value");
+    assert!(!is_required);
+    assert_eq!(*source, None);
+    assert!(ty.is_equivalent_to(&db, &env, callback(int)));
+    assert!(member.place.expect_type().is_equivalent_to(&db, &env, *ty));
     let constraints = ConstraintSetBuilder::new();
     let mut inference = SpecializationBuilder::new(&db, &env, &constraints, context);
     inference
