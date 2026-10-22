@@ -11948,8 +11948,8 @@ bitflags! {
         /// `__getattr__` function. We need this in order to implement precedence of submodules
         /// over module-level `__getattr__`, for compatibility with other type checkers.
         const FROM_MODULE_GETATTR = 1 << 7;
-        /// A synthesized field whose value is guaranteed to be stored on the instance.
-        /// Unlike a declaration alone, this storage shadows class defaults and non-data
+        /// A synthesized field whose value, when present, is stored on the instance.
+        /// When definitely defined, this storage shadows class defaults and non-data
         /// descriptors. Data descriptors retain their usual precedence.
         const GUARANTEED_INSTANCE_STORAGE = 1 << 8;
         /// An undefined member proven absent by a supplied getter's runtime contract.

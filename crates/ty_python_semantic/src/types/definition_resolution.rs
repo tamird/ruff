@@ -1135,6 +1135,7 @@ WithMeta.meta_method
                         fields: Box::from([ProvidedField {
                             name: Name::new_static("value"),
                             ty: Type::int_literal(1),
+                            is_required: true,
                             source: Some(source),
                         }]),
                         has_dynamic_fields: false,

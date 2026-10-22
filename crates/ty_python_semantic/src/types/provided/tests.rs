@@ -119,6 +119,7 @@ fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyh
                 Box::from([ProvidedField {
                     name: Name::new_static("value"),
                     ty,
+                    is_required: true,
                     source,
                 }]),
                 display,
@@ -320,6 +321,298 @@ fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyh
 }
 
 #[test]
+fn optional_supplied_fields_preserve_storage_relations_and_specialization() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.pyi",
+            r#"
+class Box[T]: ...
+class Other: ...
+class Descriptor(Box[int]):
+    @property
+    def value(self) -> object: ...
+
+box: Box[int]
+other: Other
+descriptor: Descriptor
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.pyi")?;
+    let program_file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program_file);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, program_file, name)
+            .place
+            .expect_type()
+    };
+    let refine = |receiver, ty, is_required| {
+        Type::with_provided_instance_fields(
+            receiver,
+            &db,
+            Box::from([ProvidedField {
+                name: Name::new_static("value"),
+                ty,
+                is_required,
+                source: None,
+            }]),
+            ProvidedInstanceDisplay::Full,
+        )
+        .expect("nominal instance")
+    };
+    let int = KnownClass::Int.to_instance(&db, &env);
+    let str = KnownClass::Str.to_instance(&db, &env);
+    let box_type = symbol("box");
+    let optional = refine(box_type, int, false);
+    let required = refine(box_type, int, true);
+    let absent = refine(box_type, Type::Never, false);
+    let wrong = refine(box_type, str, false);
+    let nullable = refine(
+        box_type,
+        crate::types::UnionType::from_two_elements(&db, &env, int, Type::none(&db, &env)),
+        true,
+    );
+    assert!(required.is_assignable_to(&db, &env, optional));
+    assert!(absent.is_assignable_to(&db, &env, optional));
+    assert!(!optional.is_assignable_to(&db, &env, required));
+    assert!(!absent.is_assignable_to(&db, &env, required));
+    assert!(!optional.is_assignable_to(&db, &env, absent));
+    assert!(!wrong.is_assignable_to(&db, &env, optional));
+    assert!(!nullable.is_assignable_to(&db, &env, optional));
+    assert!(!optional.is_assignable_to(&db, &env, nullable));
+    // A missing declaration does not prove that an instance lacks this field.
+    assert!(!box_type.is_assignable_to(&db, &env, optional));
+    assert!(!refine(symbol("other"), int, false).is_assignable_to(&db, &env, optional));
+    let protocol = Type::protocol_with_readonly_members(&db, &env, [("value", int)]);
+    assert!(!protocol.is_assignable_to(&db, &env, optional));
+    let structural = IntersectionBuilder::new(&db, &env)
+        .positive_elements([box_type, protocol])
+        .build();
+    assert!(!structural.is_assignable_to(&db, &env, optional));
+    let guarded = IntersectionBuilder::new(&db, &env)
+        .positive_elements([optional, protocol])
+        .build();
+    assert!(!guarded.is_assignable_to(&db, &env, required));
+
+    let lists = |element| KnownClass::List.to_specialized_instance(&db, &env, &[element]);
+    assert!(!refine(box_type, lists(str), false).is_assignable_to(
+        &db,
+        &env,
+        refine(box_type, lists(Type::object()), false),
+    ));
+
+    // A descriptor or protocol can narrow the read without narrowing physical storage.
+    let masked = refine(symbol("descriptor"), Type::object(), false);
+    let narrowed = IntersectionBuilder::new(&db, &env)
+        .positive_elements([masked, protocol])
+        .build();
+    assert!(!narrowed.is_assignable_to(&db, &env, optional));
+    assert!(!refine(symbol("descriptor"), int, false).is_assignable_to(&db, &env, optional));
+
+    let Type::ClassLiteral(class) = symbol("Box") else {
+        anyhow::bail!("Expected Box class");
+    };
+    let context = class.generic_context(&db).context("generic Box")?;
+    let variable = context
+        .variables(&db)
+        .next()
+        .context("Box type parameter")?;
+    let variable = Type::TypeVar(variable);
+    let generic = refine(box_type, variable, false);
+    let specialized = generic.apply_specialization(&db, context.specialize(&db, &[int]));
+    assert!(specialized.is_equivalent_to(&db, &env, optional));
+    assert!(
+        !specialized
+            .member(&db, &env, "value")
+            .place
+            .is_definitely_bound()
+    );
+    assert!(!absent.has_immutable_field_path(&db, &env, &[Name::new_static("value")]));
+    let callback = |ty| {
+        Type::function_like_callable(
+            &db,
+            Signature::new(
+                Parameters::standard([Parameter::positional_only(Some(Name::new_static(
+                    "argument",
+                )))
+                .with_annotated_type(ty)]),
+                ty,
+            ),
+        )
+    };
+    let generic_callback = refine(box_type, callback(variable), false);
+    let specialized_callback =
+        generic_callback.apply_specialization(&db, context.specialize(&db, &[int]));
+    let member = specialized_callback.member(&db, &env, "value");
+    assert!(!member.place.is_definitely_bound());
+    assert!(
+        member
+            .place
+            .expect_type()
+            .is_equivalent_to(&db, &env, callback(int))
+    );
+    let constraints = ConstraintSetBuilder::new();
+    let mut inference = SpecializationBuilder::new(&db, &env, &constraints, context);
+    inference
+        .infer(generic, optional)
+        .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
+    let inferred = inference
+        .build_inference_with(|_, _| None)
+        .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?;
+    let inferred = inferred.merged_specialization(&db);
+    assert_eq!(inferred.types(&db), [int]);
+    Ok(())
+}
+
+#[test]
+fn optional_supplied_fields_require_checked_absence_evidence() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_getattr_result_provider(|_db, _definition, _receiver, _attribute| {
+            ProvidedGetattrPresence::Absent.into()
+        })
+        .with_file(
+            "/src/main.pyi",
+            r#"
+class Closed:
+    def __getattr__(self, name: str) -> object: ...
+
+class Malformed(Closed):
+    def __getattr__(self, name: int) -> object: ...
+
+class Intercepted(Closed):
+    def __getattribute__(self, name: str) -> object: ...
+
+class Declared(Closed):
+    value: object
+
+closed: Closed
+malformed: Malformed
+intercepted: Intercepted
+declared: Declared
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.pyi")?;
+    let file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(file);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type()
+    };
+    let target = symbol("closed")
+        .with_provided_instance_fields(
+            &db,
+            Box::from([ProvidedField {
+                name: Name::new_static("value"),
+                ty: KnownClass::Int.to_instance(&db, &env),
+                is_required: false,
+                source: None,
+            }]),
+            ProvidedInstanceDisplay::Full,
+        )
+        .context("nominal instance")?;
+    assert!(symbol("closed").is_assignable_to(&db, &env, target));
+    for name in ["malformed", "intercepted", "declared"] {
+        assert!(!symbol(name).is_assignable_to(&db, &env, target), "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn optional_supplied_fields_keep_getattr_defaults_and_hasattr_guards() -> anyhow::Result<()> {
+    fn factory<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        let declaration = call.declaration()?;
+        let name = declaration.name(db)?;
+        let ty = match name.as_str() {
+            "optional" => {
+                let CheckedArgument::Value { ty, expression: _ } = call.argument("value") else {
+                    return None;
+                };
+                ty
+            }
+            "absent" => Type::Never,
+            _ => return None,
+        };
+        let native = system_path_to_file(db, "/src/native.pyi").ok()?;
+        let native = db.program_file(native);
+        let env = ProgramEnvironment::from_file(native);
+        let class = crate::place::global_symbol(db, native, "Record")
+            .place
+            .ignore_possibly_undefined()?;
+        let instance = class.to_instance_approximation(db, &env)?;
+        instance.with_provided_instance_fields(
+            db,
+            Box::from([ProvidedField {
+                name: Name::new_static("value"),
+                ty,
+                is_required: false,
+                source: None,
+            }]),
+            ProvidedInstanceDisplay::Full,
+        )
+    }
+    let registry = crate::default_lint_registry();
+    let mut rules = crate::lint::RuleSelection::from_registry(registry);
+    let possibly_missing_attribute = registry.get("possibly-missing-attribute")?;
+    rules.enable(
+        possibly_missing_attribute,
+        Severity::Error,
+        crate::lint::LintSource::Default,
+    );
+    let source = r#"
+from native import absent, optional
+from typing_extensions import assert_type, Literal
+
+record = optional(1)
+assert_type(getattr(record, "value", None), Literal[1] | None)
+unguarded = record.value
+if hasattr(record, "value"):
+    assert_type(record.value, Literal[1])
+else:
+    negative = record.value
+
+def callback(value: int, *, flag: bool) -> str:
+    return str(value)
+
+handler = optional(callback)
+if hasattr(handler, "value"):
+    assert_type(handler.value(1, flag=True), str)
+    handler.value("wrong", flag=True)
+
+empty = absent()
+assert_type(getattr(empty, "value", None), None)
+"#;
+    let db = TestDbBuilder::new()
+        .with_rule_selection(rules)
+        .with_file(
+            "/src/native.pyi",
+            "class Record: ...\ndef optional(value: object) -> Record: ...\ndef absent() -> Record: ...\n",
+        )
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(|db, call| factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.id().as_str(),
+                &source[diagnostic.range().unwrap()]
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("possibly-missing-attribute", "record.value"),
+            ("possibly-missing-attribute", "record.value"),
+            ("invalid-argument-type", "\"wrong\""),
+        ],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn deferred_nominal_fields_preserve_identity_and_follow_edits() -> anyhow::Result<()> {
     fn annotation<'db>(
         db: &'db TestDb,
@@ -378,21 +671,26 @@ fn deferred_nominal_fields_preserve_identity_and_follow_edits() -> anyhow::Resul
         let constructor = resolve(other)?;
         let other = annotation(db, file, constructor, None)?;
         let value = resolve("value")?;
+        let required = resolve("required")?;
+        let is_required = required == Type::bool_literal(true);
         Some(ProvidedInstanceFields {
             fields: Box::from([
                 ProvidedField {
                     name: Name::new_static("peer"),
                     ty: peer,
+                    is_required: true,
                     source: None,
                 },
                 ProvidedField {
                     name: Name::new_static("other"),
                     ty: other,
+                    is_required: true,
                     source: None,
                 },
                 ProvidedField {
                     name: Name::new_static("value"),
                     ty: value,
+                    is_required,
                     source: Some(FileRange::new(
                         file.file(db),
                         TextRange::new(0.into(), 5.into()),
@@ -405,12 +703,21 @@ fn deferred_nominal_fields_preserve_identity_and_follow_edits() -> anyhow::Resul
         })
     }
 
+    let registry = crate::default_lint_registry();
+    let mut rules = crate::lint::RuleSelection::from_registry(registry);
+    let possibly_missing_attribute = registry.get("possibly-missing-attribute")?;
+    rules.enable(
+        possibly_missing_attribute,
+        Severity::Error,
+        crate::lint::LintSource::Default,
+    );
     let mut db = TestDbBuilder::new()
+        .with_rule_selection(rules)
         .with_type_reference_provider(annotation)
         .with_instance_fields_provider(fields)
         .with_file(
             "/src/native.pyi",
-            "value: int\ndef first() -> int: ...\ndef second() -> int: ...\n",
+            "value: int\nrequired = True\ndef first() -> int: ...\ndef second() -> int: ...\n",
         )
         .with_file(
             "/src/main.py",
@@ -476,7 +783,7 @@ runtime: int = First()
 
     db.write_file(
         "/src/native.pyi",
-        "value: str\ndef first() -> int: ...\ndef second() -> int: ...\n",
+        "value: str\nrequired = True\ndef first() -> int: ...\ndef second() -> int: ...\n",
     )?;
     let diagnostics = db.check_file(file);
     assert_eq!(
@@ -486,6 +793,35 @@ runtime: int = First()
             .collect::<Vec<_>>(),
         ["invalid-assignment", "invalid-assignment"],
         "{diagnostics:#?}"
+    );
+    db.write_file(
+        "/src/native.pyi",
+        "value: int\nrequired = False\ndef first() -> int: ...\ndef second() -> int: ...\n",
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["possibly-missing-attribute", "invalid-assignment"],
+        "{diagnostics:#?}"
+    );
+    let native = db.program_file(native_file);
+    let constructor = crate::place::global_symbol(&db, native, "first")
+        .place
+        .expect_type();
+    let first = annotation(&db, native, constructor, None).context("missing nominal annotation")?;
+    let env = ProgramEnvironment::from_file(native);
+    assert!(!first.member(&db, &env, "value").place.is_definitely_bound());
+    assert_eq!(
+        definitions_for_attribute(&db, &env, first, "value"),
+        [
+            crate::types::ide_support::ResolvedDefinition::FileWithRange(FileRange::new(
+                native_file,
+                TextRange::new(0.into(), 5.into()),
+            ))
+        ]
     );
     Ok(())
 }
@@ -2486,6 +2822,7 @@ fn field_implication_factory<'db>(
                 ProvidedField {
                     name,
                     ty,
+                    is_required: true,
                     source: None,
                 }
             },
@@ -4206,6 +4543,7 @@ fn factory_result<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<T
                 fields: Box::from([ProvidedField {
                     name: Name::new("value"),
                     ty: field_type,
+                    is_required: true,
                     source: None,
                 }]),
                 has_dynamic_fields: false,
@@ -4250,6 +4588,7 @@ fn source_call_class_matches_factory_result_identity() -> anyhow::Result<()> {
                     fields: Box::from([ProvidedField {
                         name: Name::new("value"),
                         ty: Type::int_literal(1),
+                        is_required: true,
                         source: None,
                     }]),
                     has_dynamic_fields: false,
@@ -4276,9 +4615,10 @@ fn supplied_instance_storage_shadows_inherited_defaults_but_not_data_descriptors
     fn derived_factory<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
         let name = call.declaration()?.name(db)?;
         let fields = match name.as_str() {
-            "make" => Box::from([ProvidedField {
+            "make" | "make_optional" => Box::from([ProvidedField {
                 name: Name::new_static("value"),
                 ty: Type::int_literal(1),
+                is_required: name == "make",
                 source: None,
             }]),
             "make_open" => Box::default(),
@@ -4308,6 +4648,7 @@ fn supplied_instance_storage_shadows_inherited_defaults_but_not_data_descriptors
 
     for (declaration, property) in [
         ("class Base:\n    value: int\n", false),
+        ("class Base:\n    value: str = 'default'\n", false),
         ("class Base:\n    def value(self) -> str: ...\n", false),
         (
             "class Base:\n    @property\n    def value(self) -> str: ...\n",
@@ -4315,13 +4656,13 @@ fn supplied_instance_storage_shadows_inherited_defaults_but_not_data_descriptors
         ),
     ] {
         let native = format!(
-            "{declaration}\nclass Other:\n    def value(self) -> str: ...\ndef make() -> object: ...\ndef make_open() -> object: ...\n"
+            "{declaration}\nclass Other:\n    def value(self) -> str: ...\ndef make() -> object: ...\ndef make_optional() -> object: ...\ndef make_open() -> object: ...\n"
         );
         let db = TestDbBuilder::new()
             .with_file("/src/native.pyi", &native)
             .with_file(
                 "/src/main.py",
-                "from native import make, make_open\nstored = make()\nresult = stored.value\nopened = make_open()\nopen_result = opened.value\n",
+                "from native import make, make_optional, make_open\nstored = make()\nresult = stored.value\noptional = make_optional()\noptional_result = optional.value\nopened = make_open()\nopen_result = opened.value\n",
             )
             .with_call_result_provider(|db, call| derived_factory(db, call).into())
             .build()?;
@@ -4360,6 +4701,37 @@ fn supplied_instance_storage_shadows_inherited_defaults_but_not_data_descriptors
         let open_result = crate::place::global_symbol(&db, file, "open_result")
             .place
             .expect_type();
+        let optional_result = crate::place::global_symbol(&db, file, "optional_result")
+            .place
+            .expect_type();
+        let optional = crate::place::global_symbol(&db, file, "optional")
+            .place
+            .expect_type();
+        let optional_default = optional
+            .member_lookup_with_policy(
+                &db,
+                &env,
+                "value",
+                crate::types::MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+            )
+            .place
+            .expect_type();
+        let expected_optional = if property {
+            expected
+        } else {
+            crate::types::UnionType::from_two_elements(
+                &db,
+                &env,
+                Type::int_literal(1),
+                optional_default,
+            )
+        };
+        assert!(
+            optional_result.is_equivalent_to(&db, &env, expected_optional),
+            "{declaration}: expected {}, got {}",
+            expected_optional.display(&db, &env),
+            optional_result.display(&db, &env),
+        );
         let expected_open = if property {
             expected
         } else {
@@ -4443,6 +4815,7 @@ fn supplied_declarations_preserve_keyword_and_attribute_navigation() -> anyhow::
                         fields: Box::from([ProvidedField {
                             name: Name::new_static("value"),
                             ty: Type::int_literal(1),
+                            is_required: true,
                             source: (name == "make").then_some(source),
                         }]),
                         has_dynamic_fields: false,
@@ -4578,6 +4951,7 @@ Derived(1)
                             fields: Box::from([ProvidedField {
                                 name: Name::new_static("value"),
                                 ty: Type::int_literal(1),
+                                is_required: true,
                                 source: Some(source),
                             }]),
                             has_dynamic_fields: false,

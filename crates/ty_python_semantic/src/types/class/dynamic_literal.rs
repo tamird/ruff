@@ -645,15 +645,23 @@ impl<'db> DynamicClassLiteral<'db> {
             })) => {
                 let fields = fields
                     .iter()
-                    .map(|ProvidedField { name, ty, source }| {
-                        let ty = ty.recursive_type_normalized_impl(db, env, div, true);
-                        let ty = if nested { ty? } else { ty.unwrap_or(div) };
-                        Some(ProvidedField {
-                            name: name.clone(),
-                            ty,
-                            source: *source,
-                        })
-                    })
+                    .map(
+                        |ProvidedField {
+                             name,
+                             ty,
+                             is_required,
+                             source,
+                         }| {
+                            let ty = ty.recursive_type_normalized_impl(db, env, div, true);
+                            let ty = if nested { ty? } else { ty.unwrap_or(div) };
+                            Some(ProvidedField {
+                                name: name.clone(),
+                                ty,
+                                is_required: *is_required,
+                                source: *source,
+                            })
+                        },
+                    )
                     .collect::<Option<Box<_>>>()?;
                 let implications = implications
                     .iter()

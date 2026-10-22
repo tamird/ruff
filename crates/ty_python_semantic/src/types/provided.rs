@@ -17,7 +17,7 @@ use ty_python_core::semantic_index;
 
 use crate::Db;
 use crate::ProgramEnvironment;
-use crate::place::{Place, PlaceAndQualifiers};
+use crate::place::{Definedness, Place, PlaceAndQualifiers};
 use crate::types::CheckedCall;
 use crate::types::ClassLiteral;
 use crate::types::class::{DynamicClassAnchor, DynamicClassLiteral, DynamicClassScopeOffset};
@@ -184,6 +184,8 @@ pub struct ProvidedFieldImplication<'db> {
 pub struct ProvidedField<'db> {
     pub name: Name,
     pub ty: Type<'db>,
+    /// Whether the field is always present, independently of its value type.
+    pub is_required: bool,
     pub source: Option<FileRange>,
 }
 
@@ -201,8 +203,22 @@ pub enum ProvidedInstanceDisplay {
 
 impl<'db> ProvidedField<'db> {
     pub(super) fn instance_member(&self) -> PlaceAndQualifiers<'db> {
-        Place::declared(self.ty)
-            .with_qualifiers(TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE)
+        let Self {
+            name: _,
+            ty,
+            is_required,
+            source: _,
+        } = self;
+        let definedness = if *is_required {
+            Definedness::AlwaysDefined
+        } else {
+            Definedness::PossiblyUndefined
+        };
+        let mut place = Place::declared(*ty);
+        if let Place::Defined(member) = &mut place {
+            member.definedness = definedness;
+        }
+        place.with_qualifiers(TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE)
     }
 }
 
@@ -637,7 +653,7 @@ impl<'db> Type<'db> {
     }
 
     /// Validates stored-field precedence before descriptor lookup consumes its qualifiers.
-    fn permits_instance_storage(
+    pub(super) fn permits_instance_storage(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,

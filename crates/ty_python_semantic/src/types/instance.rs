@@ -48,7 +48,7 @@ use ty_python_core::definition::Definition;
 impl<'db> Type<'db> {
     /// Refines an instance with immutable storage supplied by an embedding application.
     ///
-    /// The runtime class is unchanged. Each field is guaranteed to exist in instance storage,
+    /// The runtime class is unchanged. Present fields reside in instance storage,
     /// and callable field values do not bind as methods. Field names must be unique. Returns
     /// `None` for instances whose class has special semantics, including tuple and `Any` bases.
     /// Field source locations and display style affect presentation only; relations ignore them.
@@ -1509,42 +1509,57 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             .fields(db)
             .iter()
             .when_all(db, self.constraints, |field| {
-                let Some(storage) = provided_field_storage_type(db, env, source, field) else {
+                let Some(storage) = provided_field_storage(db, env, source, field) else {
                     return self.never();
                 };
-                self.check_type_pair(db, storage, field.ty)
-                    .and(db, self.constraints, || {
-                        let visible = |receiver: Type<'db>| {
-                            let Place::Defined(member) =
-                                receiver.member(db, env, field.name.as_str()).place
-                            else {
-                                return None;
-                            };
-                            member.is_definitely_defined().then_some(member.ty)
-                        };
-                        match (visible(source), visible(target)) {
-                            (Some(source), Some(target)) => {
-                                self.check_type_pair(db, source, target)
+                if field.is_required && !storage.is_definitely_bound() {
+                    return self.never();
+                }
+                self.check_type_pair(
+                    db,
+                    storage.ignore_possibly_undefined().unwrap_or(Type::Never),
+                    field.ty,
+                )
+                .and(db, self.constraints, || {
+                    let source = source.member(db, env, field.name.as_str());
+                    let target = target.member(db, env, field.name.as_str());
+                    match (source.place, target.place) {
+                        (Place::Defined(source), Place::Defined(target)) => {
+                            if target.is_definitely_defined() && !source.is_definitely_defined() {
+                                return self.never();
                             }
-                            _ => self.never(),
+                            self.check_type_pair(db, source.ty, target.ty)
                         }
-                    })
+                        (Place::Undefined, Place::Defined(target)) => {
+                            if !target.is_definitely_defined()
+                                && source.qualifiers.contains(TypeQualifiers::KNOWN_ABSENT)
+                            {
+                                self.always()
+                            } else {
+                                self.never()
+                            }
+                        }
+                        _ => self.never(),
+                    }
+                })
             })
     }
 }
 
-/// Returns the guaranteed physical storage type for one field on the receiver.
-fn provided_field_storage_type<'db>(
+/// Returns physical storage, including its presence, when the receiver supplies evidence for it.
+fn provided_field_storage<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     receiver: Type<'db>,
     field: &ProvidedField<'db>,
-) -> Option<Type<'db>> {
+) -> Option<Place<'db>> {
     if receiver.has_immutable_field_path(db, env, std::slice::from_ref(&field.name)) {
         let Place::Defined(member) = receiver.member(db, env, field.name.as_str()).place else {
             return None;
         };
-        return member.is_definitely_defined().then_some(member.ty);
+        return member
+            .is_definitely_defined()
+            .then_some(Place::Defined(member));
     }
 
     // When a data descriptor masks instance storage, a protocol can narrow what is read without
@@ -1556,6 +1571,7 @@ fn provided_field_storage_type<'db>(
         }
         _ => return None,
     };
+    let mut absence_candidates = constituents.clone();
     let mut storage = constituents.filter_map(|constituent| {
         if !matches!(constituent, Type::NominalInstance(_)) {
             return None;
@@ -1564,19 +1580,42 @@ fn provided_field_storage_type<'db>(
         let Place::Defined(place) = member.place else {
             return None;
         };
-        (place.is_definitely_defined()
-            && member
-                .qualifiers
-                .contains(TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE))
-        .then_some(place.ty)
+        member
+            .qualifiers
+            .contains(TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE)
+            .then_some(place)
     });
-    let first = storage.next()?;
-    Some(match storage.next() {
-        None => first,
-        Some(second) => IntersectionBuilder::new(db, env)
-            .positive_elements([first, second].into_iter().chain(storage))
-            .build(),
-    })
+    let Some(mut combined) = storage.next() else {
+        // A getter's absence contract describes physical storage only when ordinary lookup
+        // would expose that storage. Descriptors, interception, and recovery cannot prove it.
+        if !absence_candidates.all(|constituent| match constituent {
+            Type::NominalInstance(_) => {
+                constituent
+                    .instance_member(db, env, field.name.as_str())
+                    .place
+                    .is_undefined()
+                    && constituent.permits_instance_storage(db, env, &field.name, false)
+            }
+            Type::ProtocolInstance(_) => true,
+            _ => false,
+        }) {
+            return None;
+        }
+        let member = receiver
+            .try_member_lookup(db, env, field.name.as_str())
+            .ok()?;
+        let member = member.member(db);
+        return (member.place.is_undefined()
+            && member.qualifiers.contains(TypeQualifiers::KNOWN_ABSENT))
+        .then_some(Place::Undefined);
+    };
+    for next in storage {
+        combined.ty = IntersectionBuilder::new(db, env)
+            .positive_elements([combined.ty, next.ty])
+            .build();
+        combined.definedness = combined.definedness.max(next.definedness);
+    }
+    Some(Place::Defined(combined))
 }
 
 /// Returns the finite members of a protocol interface, omitting members that refer back to its
@@ -1833,13 +1872,22 @@ impl<'db> NominalInstanceClass<'db> {
                 let fields = provided
                     .fields(db)
                     .iter()
-                    .map(|ProvidedField { name, ty, source }| {
-                        Ok(ProvidedField {
-                            name: name.clone(),
-                            ty: map(*ty)?,
-                            source: *source,
-                        })
-                    })
+                    .map(
+                        |ProvidedField {
+                             name,
+                             ty,
+                             is_required,
+                             source,
+                         }| {
+                            let ty = map(*ty)?;
+                            Ok(ProvidedField {
+                                name: name.clone(),
+                                ty,
+                                is_required: *is_required,
+                                source: *source,
+                            })
+                        },
+                    )
                     .collect::<Result<Box<_>, E>>()?;
                 Self::WithFields(ProvidedNominalInstance::new(
                     db,
