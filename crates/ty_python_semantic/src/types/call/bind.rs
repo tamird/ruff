@@ -2808,6 +2808,25 @@ impl<'db> Bindings<'db> {
                             overload.infer_getattr(db, env);
                         }
 
+                        Some(KnownFunction::HasAttr) => {
+                            if !overload.errors.is_empty() {
+                                continue;
+                            }
+                            let [instance, name] = overload.parameter_types() else {
+                                continue;
+                            };
+                            let Some(instance) = instance else {
+                                continue;
+                            };
+                            let Some(name) = name.and_then(Type::as_string_literal) else {
+                                continue;
+                            };
+                            let path = [Name::new(name.value(db))];
+                            if instance.has_immutable_field_path(db, env, &path) {
+                                overload.set_return_type(Type::bool_literal(true));
+                            }
+                        }
+
                         Some(KnownFunction::GetattrStatic) => {
                             let [Some(instance_ty), Some(attr_name), default] =
                                 overload.parameter_types()

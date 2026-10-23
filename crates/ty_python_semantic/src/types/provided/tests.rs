@@ -536,7 +536,7 @@ fn optional_supplied_fields_keep_getattr_defaults_and_hasattr_guards() -> anyhow
         let declaration = call.declaration()?;
         let name = declaration.name(db)?;
         let ty = match name.as_str() {
-            "optional" => {
+            "optional" | "required" => {
                 let CheckedArgument::Value { ty, expression: _ } = call.argument("value") else {
                     return None;
                 };
@@ -557,7 +557,7 @@ fn optional_supplied_fields_keep_getattr_defaults_and_hasattr_guards() -> anyhow
             Box::from([ProvidedField {
                 name: Name::new_static("value"),
                 ty,
-                is_required: false,
+                is_required: name == "required",
                 source: None,
             }]),
             ProvidedInstanceDisplay::Full,
@@ -572,10 +572,23 @@ fn optional_supplied_fields_keep_getattr_defaults_and_hasattr_guards() -> anyhow
         crate::lint::LintSource::Default,
     );
     let source = r#"
-from native import absent, optional
+from native import absent, optional, required
 from typing_extensions import assert_type, Literal
 
+stored = required(1)
+assert_type(hasattr(stored, "value"), Literal[True])
+assert_type(stored.value if hasattr(stored, "value") else None, Literal[1])
+assert_type(hasattr(stored, "missing"), bool)
+nullable = required(None)
+assert_type(hasattr(nullable, "value"), Literal[True])
+check = hasattr
+assert_type(check(stored, "value"), Literal[True])
+
+def named(name: str):
+    assert_type(hasattr(stored, name), bool)
+
 record = optional(1)
+assert_type(hasattr(record, "value"), bool)
 assert_type(getattr(record, "value", None), Literal[1] | None)
 unguarded = record.value
 if hasattr(record, "value"):
@@ -593,12 +606,15 @@ if hasattr(handler, "value"):
 
 empty = absent()
 assert_type(getattr(empty, "value", None), None)
+assert_type(hasattr(empty, "value"), bool)
+assert_type(hasattr(stored, "value", 1), bool)
+assert_type(hasattr(stored, name="value"), bool)
 "#;
     let db = TestDbBuilder::new()
         .with_rule_selection(rules)
         .with_file(
             "/src/native.pyi",
-            "class Record: ...\ndef optional(value: object) -> Record: ...\ndef absent() -> Record: ...\n",
+            "class Record: ...\ndef optional(value: object) -> Record: ...\ndef absent() -> Record: ...\ndef required(value: object) -> Record: ...\n",
         )
         .with_file("/src/main.py", source)
         .with_call_result_provider(|db, call| factory(db, call).into())
@@ -617,6 +633,8 @@ assert_type(getattr(empty, "value", None), None)
             ("possibly-missing-attribute", "record.value"),
             ("possibly-missing-attribute", "record.value"),
             ("invalid-argument-type", "\"wrong\""),
+            ("too-many-positional-arguments", "1"),
+            ("positional-only-parameter-as-kwarg", "name=\"value\""),
         ],
         "{diagnostics:#?}"
     );
@@ -3119,6 +3137,43 @@ def run(default: object):
             expected,
             "{source}: {diagnostics:#?}"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn hasattr_respects_supplied_storage_lookup_precedence() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (definition, expected) in [
+        ("class Base: pass", "Literal[True]"),
+        (
+            "class Base:\n    @property\n    def field(self) -> int: raise AttributeError()",
+            "bool",
+        ),
+        (
+            "class Base:\n    def __getattribute__(self, name: str) -> int: raise AttributeError()",
+            "bool",
+        ),
+        (
+            "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> int: raise AttributeError()\n    def __set__(self, instance: object, value: object) -> None: pass\nclass Base:\n    field = Descriptor()",
+            "bool",
+        ),
+        (
+            "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> int: raise AttributeError()\nclass Base:\n    field = Descriptor()",
+            "Literal[True]",
+        ),
+    ] {
+        let source = format!(
+            "from typing import Literal\nfrom typing_extensions import assert_type\nfrom native import record\n{definition}\nvalue = record({{'field': 1}}, base=Base)\nassert_type(hasattr(value, 'field'), {expected})\n"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
     }
     Ok(())
 }
