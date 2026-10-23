@@ -1384,6 +1384,7 @@ class OpenAB(TypedDict, extra_items=ReadOnly[object]):
 
 def same(a: OpenB, b: OpenB) -> OpenB:
     same: OpenB = a | b  # no diagnostic
+    updated: OpenB = a | {"b": "updated"}  # no diagnostic
     return same
 
 def hidden(a: A, b: OpenB):
@@ -1487,6 +1488,23 @@ def literal_operand(a: A):
     wrong: AB = a | {"a": "wrong", "b": "value"}  # error: [invalid-argument-type]
     missing: ABC = a | {"b": "value"}  # error: [missing-typed-dict-key]
     custom: AB = Custom() | {"a": 1, "b": "value"}  # error: [invalid-assignment]
+```
+
+Replacing a mutable field can require a different element type from the left operand. An empty
+literal receives the result schema's element type.
+
+```py
+class Integers(TypedDict, closed=True):
+    values: list[int]
+
+class Strings(TypedDict, closed=True):
+    values: list[str]
+
+def replace_values(source: Integers) -> Strings:
+    replaced: Strings = source | {"values": []}  # no diagnostic
+    reveal_type(replaced["values"])  # revealed: list[str]
+    wrong: Strings = source | {"values": [42]}  # error: [invalid-argument-type]
+    return replaced
 ```
 
 ## Copying observed dictionary contents

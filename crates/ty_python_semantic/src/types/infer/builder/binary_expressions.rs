@@ -238,19 +238,48 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             range: _,
             node_index: _,
         } = binary;
-        if has_dict_literal_operand(left) {
+        if has_dict_literal_operand(left)
+            || (!matches!(right.as_ref(), ast::Expr::Dict(_)) && has_dict_literal_operand(right))
+        {
             return None;
         }
 
         let mut candidate = self.speculate();
         let db = candidate.db();
         let env = candidate.program_environment();
+        let inferred = candidate.infer_binary_expression(binary, TypeContext::default());
+        // Other mapping-like types, including intersections, may override `__or__`
+        // and need the caller's result context to infer their return type.
+        if matches!(right.as_ref(), ast::Expr::Dict(_))
+            && candidate
+                .try_expression_type(left)?
+                .resolve_type_alias(db)
+                .as_typed_dict()
+                .is_none()
+        {
+            return None;
+        }
+        let operands_resolved = |candidate: &Self| {
+            [left.as_ref(), right.as_ref()].into_iter().all(|operand| {
+                candidate
+                    .try_expression_type(operand)
+                    .is_some_and(|ty| !ty.has_provisional_marker(db, env))
+            })
+        };
+        // Reconstructing an already compatible merge would reject the hidden keys of an
+        // open TypedDict as new entries. Preserve the ordinary merge's result instead.
+        if !inferred.has_provisional_marker(db, env)
+            && inferred.is_assignable_to(db, env, Type::TypedDict(typed_dict))
+            && operands_resolved(&candidate)
+        {
+            self.extend(candidate);
+            return Some(inferred);
+        }
+
         let result = if let ast::Expr::Dict(literal) = right.as_ref() {
+            // The result schema may give fresh values a different context from the left operand.
+            candidate = self.speculate();
             let left_ty = candidate.infer_expression(left, TypeContext::default());
-            // Other mapping-like types, including intersections, may override `__or__`.
-            if left_ty.resolve_type_alias(db).as_typed_dict().is_none() {
-                return None;
-            }
             candidate.infer_typed_dict_literal_values(typed_dict, literal);
             // The literal's entries depend on this result schema, so inferring the root through
             // the expression cache would lose their context or cache it under a default key.
@@ -260,26 +289,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             let key_ty = UnionType::from_two_elements(db, env, left_key_ty, right_key_ty);
             candidate.validate_contextual_typed_dict_union(binary, typed_dict, key_ty)?
         } else {
-            if has_dict_literal_operand(right) {
+            if inferred.has_provisional_marker(db, env) {
                 return None;
             }
-            let result = candidate.infer_binary_expression(binary, TypeContext::default());
-            if result.has_provisional_marker(db, env) {
-                return None;
-            }
-            if result.is_assignable_to(db, env, Type::TypedDict(typed_dict)) {
-                result
-            } else {
-                let (key_ty, _) = result.unpack_keys_and_items(db, env)?;
-                candidate.validate_contextual_typed_dict_union(binary, typed_dict, key_ty)?
-            }
+            let (key_ty, _) = inferred.unpack_keys_and_items(db, env)?;
+            candidate.validate_contextual_typed_dict_union(binary, typed_dict, key_ty)?
         };
 
-        if [left.as_ref(), right.as_ref()].into_iter().any(|operand| {
-            candidate
-                .try_expression_type(operand)
-                .is_none_or(|ty| ty.has_provisional_marker(db, env))
-        }) {
+        if !operands_resolved(&candidate) {
             return None;
         }
         self.extend(candidate);
