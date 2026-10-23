@@ -6,10 +6,8 @@ use ruff_db::diagnostic::Span;
 use ruff_python_ast::name::Name;
 use ruff_python_stdlib::identifiers::is_identifier;
 use ruff_text_size::TextRange;
-use ty_module_resolver::KnownModule;
 
 use crate::place::PlaceAndQualifiers;
-use crate::place::known_module_symbol;
 use crate::types::callable::CallableTypeKind;
 use crate::types::class::{
     DynamicClassHeaderAnchor, DynamicClassScopeOffset, dynamic_class_header_range,
@@ -23,9 +21,9 @@ use crate::types::typed_dict::{
     deferred_functional_typed_dict_openness, deferred_functional_typed_dict_schema,
 };
 use crate::types::{
-    BoundTypeVarInstance, CallableType, ClassBase, ClassLiteral, ClassType, IntersectionBuilder,
-    KnownClass, MemberLookupPolicy, RecursivelyDefined, Type, TypeContext, TypeMapping,
-    TypeVarVariance, TypedDictType, TypingModule, UnionType, determine_upper_bound,
+    BoundTypeVarInstance, CallArguments, CallableType, ClassBase, ClassLiteral, ClassType,
+    IntersectionBuilder, KnownClass, MemberLookupPolicy, RecursivelyDefined, Type, TypeContext,
+    TypeMapping, TypeVarVariance, TypedDictType, TypingModule, UnionType, determine_upper_bound,
 };
 use crate::{Db, FxIndexMap};
 use ty_python_core::definition::Definition;
@@ -78,15 +76,12 @@ pub(super) fn synthesize_typed_dict_method<'db>(
                 db, typed_dict, return_ty,
             ))
         }
-        "items" if !typed_dict.openness(db).is_implicitly_open() => Some(
-            synthesize_typed_dict_view_method(db, env, typed_dict, "dict_items"),
-        ),
-        "keys" if !typed_dict.openness(db).is_implicitly_open() => Some(
-            synthesize_typed_dict_view_method(db, env, typed_dict, "dict_keys"),
-        ),
-        "values" if !typed_dict.openness(db).is_implicitly_open() => Some(
-            synthesize_typed_dict_view_method(db, env, typed_dict, "dict_values"),
-        ),
+        "items" | "keys" | "values" => Some(synthesize_typed_dict_view_method(
+            db,
+            env,
+            typed_dict,
+            method_name,
+        )),
         "__or__" | "__ror__" | "__ior__" => Some(synthesize_typed_dict_merge(
             db,
             env,
@@ -744,26 +739,29 @@ fn synthesize_typed_dict_no_argument_method<'db>(
     )
 }
 
-/// Synthesize `items`, `keys`, or `values` for a closed or extra-items `TypedDict`.
+/// Synthesize `items`, `keys`, or `values` using the builtin dictionary's declaration.
 fn synthesize_typed_dict_view_method<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     typed_dict: TypedDictType<'db>,
-    view_name: &str,
+    method_name: &str,
 ) -> Type<'db> {
-    let return_ty = known_module_symbol(db, env, KnownModule::CollectionsAbcInternal, view_name)
+    let dictionary = KnownClass::Dict.to_specialized_instance(
+        db,
+        env,
+        &[typed_dict.key_type(db, env), typed_dict.value_type(db, env)],
+    );
+    let return_ty = dictionary
+        .member_lookup_with_policy(
+            db,
+            env,
+            method_name,
+            MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+        )
         .place
         .ignore_possibly_undefined()
-        .and_then(Type::as_class_literal)
-        .map(|class| {
-            class.apply_specialization(db, |generic_context| {
-                generic_context.specialize(
-                    db,
-                    &[typed_dict.key_type(db, env), typed_dict.value_type(db, env)],
-                )
-            })
-        })
-        .and_then(|class| Type::from(class).to_instance_approximation(db, env))
+        .and_then(|method| method.try_call(db, env, &CallArguments::none()).ok())
+        .map(|bindings| bindings.return_type(db, env))
         .unwrap_or_else(Type::unknown);
 
     synthesize_typed_dict_no_argument_method(db, typed_dict, return_ty)

@@ -56,6 +56,88 @@ fn with_builtin_declaration<'a>(
     Ok(TestDbBuilder::new().with_vendored(archive.finish()?))
 }
 
+#[test]
+fn typed_dict_views_use_dictionary_declarations() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration(
+        "dict",
+        "class dict[K, V]:
+    def items(self) -> list[tuple[K, V]]: ...
+    def keys(self) -> list[K]: ...
+    def values(self) -> list[V]: ...",
+    )?;
+    let source = r#"
+from typing_extensions import Literal, Never, NotRequired, ReadOnly, TypedDict, assert_type
+
+class Closed(TypedDict, closed=True):
+    name: str
+
+class Extra(TypedDict, extra_items=int):
+    name: str
+
+class Open(TypedDict):
+    name: str
+
+class Empty(TypedDict, closed=True):
+    pass
+
+class ReadOnlyFields(TypedDict, closed=True):
+    name: ReadOnly[str]
+
+class Recursive(TypedDict, closed=True):
+    child: NotRequired["Recursive"]
+
+def check(
+    closed: Closed,
+    extra: Extra,
+    opened: Open,
+    empty: Empty,
+    readonly: ReadOnlyFields,
+    recursive: Recursive,
+):
+    assert_type(closed.items(), list[tuple[Literal["name"], str]])
+    assert_type(closed.keys(), list[Literal["name"]])
+    assert_type(closed.values(), list[str])
+    assert_type(extra.items(), list[tuple[str, str | int]])
+    assert_type(extra.keys(), list[str])
+    assert_type(extra.values(), list[str | int])
+    assert_type(opened.items(), list[tuple[str, object]])
+    assert_type(opened.keys(), list[str])
+    assert_type(opened.values(), list[object])
+    assert_type(empty.items(), list[tuple[Never, Never]])
+    assert_type(empty.keys(), list[Never])
+    assert_type(empty.values(), list[Never])
+    assert_type(readonly.items(), list[tuple[Literal["name"], str]])
+    assert_type(readonly.keys(), list[Literal["name"]])
+    assert_type(readonly.values(), list[str])
+    assert_type(recursive.items(), list[tuple[Literal["child"], Recursive]])
+    assert_type(recursive.keys(), list[Literal["child"]])
+    assert_type(recursive.values(), list[Recursive])
+    wrong_items: list[tuple[str, int]] = closed.items()
+    wrong_keys: list[int] = closed.keys()
+    wrong_values: list[int] = closed.values()
+"#;
+    let db = builder.with_file("/src/check.py", source).build()?;
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let file = db.program_file(file);
+    let diagnostics = crate::check_file_unwrap(&db, file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.id().as_str(),
+                &source[diagnostic.range().unwrap()],
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("invalid-assignment", "closed.items()"),
+            ("invalid-assignment", "closed.keys()"),
+            ("invalid-assignment", "closed.values()"),
+        ],
+        "{diagnostics:#?}",
+    );
+    Ok(())
+}
+
 #[test_case("class str"; "without_sequence_base")]
 #[test_case("class str(Sequence[str])"; "with_sequence_base")]
 fn string_iteration_respects_disabled_dunder(class_header: &str) -> anyhow::Result<()> {
