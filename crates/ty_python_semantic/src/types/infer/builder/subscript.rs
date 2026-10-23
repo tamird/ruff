@@ -1661,7 +1661,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         );
 
         // Record the constraints for the object of the subscript assignment, if the object is an
-        // unannotated collection initializer.
+        // unannotated collection initializer. A pending value query can supply concrete evidence
+        // in a later cycle iteration. Keep that dependency, but do not feed the receiver's own
+        // provisional slot back into its initializer as independent evidence.
         if is_valid_assignment
             && let Some(collection_def) = self.index.unannotated_collection_initializer(object)
             && let Some((class_literal, _)) = object_ty.class_specialization(db, env)
@@ -1669,7 +1671,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             && let inferred_value_ty =
                 checked_value_ty.filter_union(db, env, |ty| !ty.is_divergent())
             && (!inferred_value_ty.is_never() || checked_value_ty.is_never())
-            && !any_over_type(db, env, inferred_value_ty, false, |ty| ty.is_divergent())
+            && ((inferred_value_ty.is_recursive_divergent()
+                && !any_over_type(db, env, object_ty, false, |ty| {
+                    ty.same_divergent_marker(inferred_value_ty)
+                }))
+                || !any_over_type(db, env, inferred_value_ty, false, |ty| ty.is_divergent()))
         {
             let identity_instance =
                 Type::instance(db, env, class_literal.identity_specialization(db));

@@ -93,17 +93,285 @@ fn merge_overlapping_ranges(mut ranges: Vec<UnreachableRange>) -> Box<[Unreachab
 mod tests {
     use super::{UnreachableKind, unreachable_ranges};
     use crate::db::tests::{TestDb, TestDbBuilder};
+    use crate::types::infer::{TypeContext, infer_definition_types, infer_expression_types};
+    use crate::{Db as _, HasType, SemanticModel};
+    use anyhow::Context;
     use insta::assert_snapshot;
     use ruff_db::diagnostic::{
         Annotation, Diagnostic, DiagnosticId, DisplayDiagnosticConfig, DisplayDiagnostics, Severity,
     };
     use ruff_db::files::{FileRange, system_path_to_file};
-    use ruff_python_ast::PythonVersion;
+    use ruff_db::parsed::parsed_module;
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_python_ast::{self as ast, PythonVersion};
     use ruff_python_trivia::textwrap::dedent;
+    use ruff_text_size::Ranged;
     use ty_python_core::ProgramFile;
     use ty_python_core::platform::PythonPlatform;
+    use ty_python_core::semantic_index;
 
     const TEST_PATH: &str = "/src/main.py";
+
+    #[derive(Clone, Copy, Debug)]
+    enum FirstQuery {
+        Inference,
+        Reachability,
+        Callee,
+        Call,
+    }
+
+    fn collection_types_after_query(
+        source: &str,
+        first: FirstQuery,
+    ) -> anyhow::Result<Vec<String>> {
+        struct Expressions<'a>(Vec<&'a ast::Expr>);
+
+        impl<'a> Visitor<'a> for Expressions<'a> {
+            fn visit_expr(&mut self, expression: &'a ast::Expr) {
+                let Self(expressions) = self;
+                expressions.push(expression);
+                visitor::walk_expr(self, expression);
+            }
+        }
+
+        let db = TestDbBuilder::new().with_file(TEST_PATH, source).build()?;
+        let file = system_path_to_file(&db, TEST_PATH)?;
+        let program = db.program_file(file);
+        let parsed = parsed_module(&db, program.python_file(&db)).load(&db);
+        let mut expressions = Expressions(Vec::new());
+        expressions.visit_body(parsed.suite());
+        let find_expression = |text: &str| {
+            expressions
+                .0
+                .iter()
+                .rev()
+                .copied()
+                .find(|expression| &source[expression.range()] == text)
+                .with_context(|| format!("expected expression {text:?}"))
+        };
+        let model = SemanticModel::new(&db, program);
+        let environment = model.program_environment();
+        let queried_expression = match first {
+            FirstQuery::Inference => None,
+            FirstQuery::Reachability => {
+                assert_eq!(unreachable_ranges(&db, program), []);
+                None
+            }
+            FirstQuery::Callee => {
+                let expression = find_expression("values.append")?;
+                Some(expression)
+            }
+            FirstQuery::Call => {
+                let expression = find_expression("values.append(artifact)")?;
+                Some(expression)
+            }
+        };
+        if let Some(expression) = queried_expression {
+            let index = semantic_index(&db, program);
+            let expression = index
+                .try_expression(expression)
+                .context("expected a separately tracked call expression")?;
+            let _ = infer_expression_types(&db, expression, TypeContext::default());
+        }
+        let mut types = Vec::new();
+        for text in [
+            "{}",
+            "grouped.get(coord, [])",
+            "values.append",
+            "values",
+            "grouped",
+        ] {
+            let expression = find_expression(text)?;
+            let ty = expression
+                .inferred_type(&model)
+                .context("expected inferred type")?;
+            types.push(ty.display(&db, &environment).to_string());
+        }
+        assert_eq!(unreachable_ranges(&db, program), []);
+        Ok(types)
+    }
+
+    #[test]
+    fn collection_types_do_not_depend_on_reachability_query_order() -> anyhow::Result<()> {
+        for (source, key) in [
+            (
+                r#"
+                def example(artifact):
+                    grouped = {}
+                    coord = artifact['coord']
+                    values = grouped.get(coord, [])
+                    values.append(artifact)
+                    grouped[coord] = values
+                    return grouped
+                "#,
+                "Unknown",
+            ),
+            (
+                r#"
+                def example(artifacts: list[dict[str, str]]):
+                    grouped = {}
+                    for artifact in artifacts:
+                        coord = artifact['coord']
+                        values = grouped.get(coord, [])
+                        values.append(artifact)
+                        grouped[coord] = values
+                    return grouped
+                "#,
+                "str",
+            ),
+            (
+                r#"
+                def example():
+                    artifacts = [{'coord': 'a'}]
+                    grouped = {}
+                    for artifact in artifacts:
+                        coord = artifact['coord']
+                        values = grouped.get(coord, [])
+                        values.append(artifact)
+                        grouped[coord] = values
+                    return grouped
+                "#,
+                "str",
+            ),
+        ] {
+            let expected = [
+                format!("dict[{key}, list[Unknown]]"),
+                "list[Unknown]".to_owned(),
+                "bound method list[Unknown].append(object: Unknown, /) -> None".to_owned(),
+                "list[Unknown]".to_owned(),
+                format!("dict[{key}, list[Unknown]]"),
+            ];
+            let source = dedent(source);
+            for first in [
+                FirstQuery::Inference,
+                FirstQuery::Reachability,
+                FirstQuery::Callee,
+                FirstQuery::Call,
+            ] {
+                let actual = collection_types_after_query(&source, first)?;
+                assert_eq!(actual, expected, "{first:?}:\n{source}");
+            }
+
+            // Assigning the call's result avoids the separately tracked statement-call
+            // query. Both forms must retain the same collection evidence.
+            let assigned = source.replace("values.append(artifact)", "_ = values.append(artifact)");
+            for first in [FirstQuery::Inference, FirstQuery::Reachability] {
+                let actual = collection_types_after_query(&assigned, first)?;
+                assert_eq!(actual, expected, "{first:?}:\n{assigned}");
+            }
+        }
+        Ok(())
+    }
+
+    fn returned_type_after_definition_query(
+        source: &str,
+        first: Option<usize>,
+    ) -> anyhow::Result<String> {
+        let db = TestDbBuilder::new().with_file(TEST_PATH, source).build()?;
+        let file = system_path_to_file(&db, TEST_PATH)?;
+        let program = db.program_file(file);
+        let module = parsed_module(&db, program.python_file(&db)).load(&db);
+        let function = module.suite()[0]
+            .as_function_def_stmt()
+            .context("expected function")?;
+        if let Some(first) = first {
+            let assignment = function.body[first]
+                .as_assign_stmt()
+                .context("expected initializer")?;
+            let target = assignment.targets[0]
+                .as_name_expr()
+                .context("expected local name")?;
+            let definition = semantic_index(&db, program).expect_single_definition(target);
+            let _ = infer_definition_types(&db, definition);
+        }
+        let statement = function.body.last().context("expected function body")?;
+        let returned = statement.as_return_stmt().context("expected return")?;
+        let value = returned.value.as_deref().context("expected return value")?;
+        let model = SemanticModel::new(&db, program);
+        let ty = value
+            .inferred_type(&model)
+            .context("expected inferred type")?;
+        assert_eq!(unreachable_ranges(&db, program), []);
+        Ok(ty.display(&db, &model.program_environment()).to_string())
+    }
+
+    #[test]
+    fn collection_cycles_preserve_evidence_free_fallback() -> anyhow::Result<()> {
+        for (statements, expected, definition) in [
+            (
+                "    grouped['key'] = grouped['key']",
+                "dict[str, Unknown]",
+                0,
+            ),
+            (
+                "    value = grouped['key']\n    grouped['key'] = value",
+                "dict[str, Unknown]",
+                1,
+            ),
+            (
+                "    value = grouped.get('key')\n    grouped['key'] = value",
+                "dict[str, None | Unknown]",
+                1,
+            ),
+        ] {
+            let source =
+                format!("def example():\n    grouped = {{}}\n{statements}\n    return grouped\n");
+            for first in [None, Some(definition)] {
+                let actual = returned_type_after_definition_query(&source, first)?;
+                assert_eq!(actual, expected, "{first:?}:\n{source}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn collection_write_errors_survive_reachability_query() -> anyhow::Result<()> {
+        let source = dedent(
+            r#"
+            def example(artifact):
+                grouped = {}
+                coord = artifact['coord']
+                values = grouped.get(coord, [])
+                values.append(artifact)
+                values.no_such_member()
+                grouped[coord] = values
+                return grouped
+            "#,
+        );
+        let db = TestDbBuilder::new().with_file(TEST_PATH, &source).build()?;
+        let file = system_path_to_file(&db, TEST_PATH)?;
+        let program = db.program_file(file);
+        assert_eq!(unreachable_ranges(&db, program), []);
+        let diagnostics = crate::check_file_unwrap(&db, program);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].id(),
+            DiagnosticId::lint("unresolved-attribute")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collection_cycles_between_containers_have_no_independent_evidence() -> anyhow::Result<()> {
+        for (writes, expected) in [
+            (
+                "    a['k'] = b['k']\n    b['k'] = a['k']",
+                "tuple[dict[str, Unknown], dict[str, Unknown]]",
+            ),
+            (
+                "    a['k'] = b['k']",
+                "tuple[dict[str, Unknown], dict[Unknown, Unknown]]",
+            ),
+        ] {
+            let source =
+                format!("def example():\n    a = {{}}\n    b = {{}}\n{writes}\n    return a, b\n");
+            for first in [None, Some(0), Some(1)] {
+                let actual = returned_type_after_definition_query(&source, first)?;
+                assert_eq!(actual, expected, "{first:?}:\n{source}");
+            }
+        }
+        Ok(())
+    }
 
     struct UnreachableTest {
         python_version: Option<PythonVersion>,
