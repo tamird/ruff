@@ -102,6 +102,7 @@ mod tests {
     };
     use ruff_db::files::{FileRange, system_path_to_file};
     use ruff_db::parsed::parsed_module;
+    use ruff_db::system::DbWithWritableSystem as _;
     use ruff_python_ast::visitor::{self, Visitor};
     use ruff_python_ast::{self as ast, PythonVersion};
     use ruff_python_trivia::textwrap::dedent;
@@ -258,6 +259,93 @@ mod tests {
             for first in [FirstQuery::Inference, FirstQuery::Reachability] {
                 let actual = collection_types_after_query(&assigned, first)?;
                 assert_eq!(actual, expected, "{first:?}:\n{assigned}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generic_loop_types_do_not_depend_on_reachability_query_order() -> anyhow::Result<()> {
+        for guard in ["not isinstance(result, Bundle)", "tag(result) != 'Bundle'"] {
+            let source = dedent(
+                r#"
+                from typing import Protocol
+
+                class Bundle[T]:
+                    values: list[T]
+
+                    def __init__(self, values: list[T]) -> None:
+                        self.values = values
+
+                class Transformer(Protocol):
+                    def __call__[T](self, value: Bundle[T], /) -> Bundle[T]: ...
+
+                def wrap[T](values: list[T]) -> Bundle[T]:
+                    return Bundle(values)
+
+                def tag(value: object) -> str:
+                    return type(value).__name__
+
+                def run[T](transform: Transformer, values: list[T]) -> Bundle[T]:
+                    current = wrap(values)
+                    for _ in [0]:
+                        result = transform(current)
+                        if GUARD:
+                            raise AssertionError("expected a bundle")
+                        current = wrap(result.values)
+                    return current
+                "#,
+            )
+            .replace("GUARD", guard);
+            let invalid = source.replace("return Bundle(values)", "return Bundle([42])");
+            for reachability_first in [false, true] {
+                let mut db = TestDbBuilder::new()
+                    .with_python_version(PythonVersion::PY313)
+                    .with_file(TEST_PATH, "")
+                    .build()?;
+                for (source, invalid_return) in [
+                    (source.as_str(), false),
+                    (invalid.as_str(), true),
+                    (source.as_str(), false),
+                ] {
+                    db.write_file(TEST_PATH, source)?;
+                    let file = system_path_to_file(&db, TEST_PATH)?;
+                    let program = db.program_file(file);
+                    if reachability_first {
+                        let _ = unreachable_ranges(&db, program);
+                    }
+                    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+                    let function = module.suite().last().context("expected run function")?;
+                    let function = function
+                        .as_function_def_stmt()
+                        .context("expected function")?;
+                    let statement = function.body.last().context("expected function body")?;
+                    let returned = statement.as_return_stmt().context("expected return")?;
+                    let value = returned.value.as_deref().context("expected return value")?;
+                    let model = SemanticModel::new(&db, program);
+                    let ty = value
+                        .inferred_type(&model)
+                        .context("expected inferred type")?;
+                    assert_eq!(
+                        ty.display(&db, &model.program_environment()).to_string(),
+                        "Bundle[T@run]",
+                        "{guard}, reachability_first={reachability_first}, invalid_return={invalid_return}",
+                    );
+                    let diagnostics = crate::check_file_unwrap(&db, program);
+                    let ids: Vec<_> = diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.id().as_str())
+                        .collect();
+                    assert_eq!(
+                        ids,
+                        if invalid_return {
+                            vec!["invalid-return-type"]
+                        } else {
+                            vec![]
+                        },
+                        "{guard}, reachability_first={reachability_first}: {diagnostics:?}",
+                    );
+                }
             }
         }
         Ok(())

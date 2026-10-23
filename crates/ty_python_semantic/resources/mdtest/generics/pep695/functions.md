@@ -4697,6 +4697,20 @@ def repeat[T](value: Box[T], transforms: list[Transform]) -> Box[T]:
     return current
 ```
 
+A guard between the callback and the next generic call preserves the element type.
+
+```py
+def repeat_guarded[T](value: Box[T], transforms: list[Transform]) -> Box[T]:
+    current = value
+    for transform in transforms:
+        result = transform(current)
+        if not isinstance(result, tuple):
+            raise TypeError("expected a tuple")
+        current = rebuild(result[0])
+    reveal_type(current)  # revealed: tuple[list[T@repeat_guarded]]
+    return current  # no diagnostic
+```
+
 Deferring inference for one argument preserves the other argument's independent result, including
 the zero-iteration path.
 

@@ -2578,9 +2578,9 @@ pub(crate) enum TypeVarProjection<'db> {
 }
 
 impl<'db> TypeVarInference<'db> {
-    /// Preserve a recursive argument's placeholder when the call result cannot yet be inferred.
+    /// Preserve an unresolved argument's placeholder when the call result cannot yet be inferred.
     ///
-    /// A recursive query may temporarily supply a bare placeholder for an argument such as
+    /// A recursive query or pending narrowing may supply a bare placeholder for an argument such as
     /// `list[T]`. It gives the solver no evidence for `T`. If the result also depends on `T`,
     /// applying the usual default would make that default part of the loop's fixed point. Keep
     /// the placeholder at the top level until the argument query produces usable evidence.
@@ -2598,7 +2598,7 @@ impl<'db> TypeVarInference<'db> {
 
         argument_relations
             .filter_map(|(formal, actual)| {
-                if !actual.is_recursive_divergent()
+                if !actual.is_divergent()
                     || actual.materialized_divergent_fallback().is_some()
                     || formal.is_type_var()
                 {
@@ -2623,8 +2623,8 @@ impl<'db> TypeVarInference<'db> {
                     })
                     .then_some(actual)
             })
-            // A single recursive query can resume this result. Distinct origins do not identify
-            // one query to resume, and their union is no longer a bare recursive placeholder.
+            // Preserve a shared placeholder. Distinct recursive origins do not identify one
+            // query to resume, and their union is no longer a bare placeholder.
             .all_equal_value()
             .ok()
     }
@@ -4903,9 +4903,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     !contains_self_or_variadic(formal)
                         && !contains_self_or_variadic(actual)
                         && actual_union.elements(db).iter().all(|element| {
-                            // A recursive query's unmaterialized cycle marker can be solved
-                            // together with the concrete alternatives that began the cycle.
-                            (element.is_recursive_divergent()
+                            // An unresolved query or narrowing can be solved together with
+                            // the concrete alternatives that began the cycle.
+                            (element.is_divergent()
                                 && element.materialized_divergent_fallback().is_none())
                                 || (!element.is_dynamic()
                                     && !element.has_indeterminate_inference(db, self.env))
@@ -5183,14 +5183,39 @@ mod tests {
         let formal = KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(t)]);
         let int = KnownClass::Int.to_instance(db, &env);
         let integers = KnownClass::List.to_specialized_instance(db, &env, &[int]);
-        for marker in [
-            Type::Dynamic(DynamicType::UnspecializedTypeVar),
-            Type::Dynamic(DynamicType::UnknownLambdaParameter),
-            Type::divergent(salsa::plumbing::Id::from_bits(1)),
+        let pending = Type::pending_narrowing();
+        let materialized_pending = pending.materialize(
+            db,
+            MaterializationKind::Top,
+            &ApplyTypeMappingVisitor::new(&env),
+        );
+        for (marker, bare_expected, nested_expected) in [
+            (Type::any(), Type::unknown(), int),
+            (Type::unknown(), Type::unknown(), int),
+            (
+                Type::Dynamic(DynamicType::UnspecializedTypeVar),
+                Type::unknown(),
+                Type::unknown(),
+            ),
+            (
+                Type::Dynamic(DynamicType::UnknownLambdaParameter),
+                Type::unknown(),
+                Type::unknown(),
+            ),
+            (
+                Type::divergent(salsa::plumbing::Id::from_bits(1)),
+                int,
+                Type::unknown(),
+            ),
+            (pending, int, Type::unknown()),
+            (materialized_pending, Type::unknown(), Type::unknown()),
         ] {
-            for alternative in [
-                marker,
-                KnownClass::List.to_specialized_instance(db, &env, &[marker]),
+            for (alternative, expected) in [
+                (marker, bare_expected),
+                (
+                    KnownClass::List.to_specialized_instance(db, &env, &[marker]),
+                    nested_expected,
+                ),
             ] {
                 let actual = UnionType::from_two_elements(db, &env, integers, alternative);
                 let constraints = ConstraintSetBuilder::new();
@@ -5203,7 +5228,8 @@ mod tests {
                     .map_err(|_| anyhow::anyhow!("expected unconstrained inference"))?;
                 assert_eq!(
                     inference.merged_specialization(db).types(db),
-                    [Type::unknown()]
+                    [expected],
+                    "marker={marker:?}, alternative={alternative:?}",
                 );
             }
         }
@@ -5232,6 +5258,30 @@ mod tests {
         };
 
         assert_eq!(defer(Type::TypeVar(t), vec![(formal, first)]), Some(first));
+        let pending = Type::pending_narrowing();
+        assert_eq!(
+            defer(Type::TypeVar(t), vec![(formal, pending)]),
+            Some(pending)
+        );
+        assert_eq!(defer(Type::TypeVar(u), vec![(formal, pending)]), None);
+        assert_eq!(defer(Type::TypeVar(t), vec![(unrelated, pending)]), None);
+        assert_eq!(
+            defer(Type::TypeVar(t), vec![(Type::TypeVar(t), pending)]),
+            None
+        );
+        assert_eq!(
+            defer(Type::TypeVar(t), vec![(formal, first), (formal, pending)]),
+            None,
+        );
+        let materialized_pending = pending.materialize(
+            db,
+            MaterializationKind::Top,
+            &ApplyTypeMappingVisitor::new(&env),
+        );
+        assert_eq!(
+            defer(Type::TypeVar(t), vec![(formal, materialized_pending)]),
+            None,
+        );
         assert_eq!(defer(Type::TypeVar(u), vec![(formal, first)]), None);
         assert_eq!(defer(Type::TypeVar(t), vec![(unrelated, first)]), None);
         assert_eq!(defer(Type::TypeVar(u), vec![(unrelated, first)]), None);
