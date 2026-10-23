@@ -4785,7 +4785,12 @@ impl<'db> Type<'db> {
         else {
             return class_attr;
         };
-        let metaclass_attr = metaclass_instance.instance_member(db, env, name);
+        let metaclass_attr = metaclass_instance.instance_member_with_policy(
+            db,
+            env,
+            name,
+            policy & MemberLookupPolicy::REQUIRE_CONCRETE,
+        );
 
         if own_declaration_definedness.is_some() {
             // A conditionally-declared attribute is a contract only on paths where that
@@ -5014,6 +5019,10 @@ impl<'db> Type<'db> {
                 .unfold(db, env)
                 .map(|unfolded| unfolded.instance_member_with_policy(db, env, name, policy))
                 .unwrap_or(Place::bound(self).into()),
+
+            Type::Dynamic(_) | Type::Divergent(_) if policy.require_concrete() => {
+                Place::Undefined.into()
+            }
 
             Type::Dynamic(_) | Type::Divergent(_) | Type::Never => Place::bound(self).into(),
 

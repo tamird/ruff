@@ -302,6 +302,107 @@ fn member_lookup_result_size() {
 }
 
 #[test]
+fn concrete_member_lookup_dynamic_instances() {
+    let db = setup_db();
+    let env = db.program_environment();
+    for bound in [
+        Type::any(),
+        Type::unknown(),
+        Type::divergent(salsa::plumbing::Id::from_bits(1)),
+    ] {
+        let typevar = BoundTypeVarInstance::synthetic_self(
+            &db,
+            bound,
+            BindingContext::Synthetic(env.program(&db)),
+        );
+        for ty in [bound, Type::TypeVar(typevar)] {
+            assert_eq!(
+                ty.instance_member(&db, &env, "field").place.expect_type(),
+                bound
+            );
+            assert!(
+                ty.instance_member_with_policy(
+                    &db,
+                    &env,
+                    "field",
+                    MemberLookupPolicy::REQUIRE_CONCRETE,
+                )
+                .is_undefined()
+            );
+        }
+    }
+}
+
+#[test]
+fn concrete_member_lookup_dynamic_class_objects() {
+    let db = setup_db();
+    let env = db.program_environment();
+    for (class, expected) in [
+        (SubclassOfType::subclass_of_any(), Type::any()),
+        (SubclassOfType::subclass_of_unknown(), Type::unknown()),
+    ] {
+        assert_eq!(
+            class
+                .class_object_member(&db, &env, "field", MemberLookupPolicy::default())
+                .place
+                .expect_type(),
+            expected,
+        );
+        assert!(
+            class
+                .class_object_member(&db, &env, "field", MemberLookupPolicy::REQUIRE_CONCRETE)
+                .is_undefined()
+        );
+    }
+}
+
+#[test]
+fn concrete_member_lookup_declared_storage() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/check.py",
+        r#"
+        class Declared:
+            class_field: int = 1
+            instance_field: int
+
+        class Meta(type):
+            generated: int
+
+        class Constructed(metaclass=Meta): ...
+        "#,
+    )?;
+    let env = db.program_environment();
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let file = db.program_file(file);
+    let class = global_symbol(&db, file, "Declared").place.expect_type();
+    let constructed = global_symbol(&db, file, "Constructed").place.expect_type();
+    let instance = class.to_instance_approximation(&db, &env).unwrap();
+    let typevar = Type::TypeVar(BoundTypeVarInstance::synthetic_self(
+        &db,
+        instance,
+        BindingContext::Synthetic(env.program(&db)),
+    ));
+    let int = KnownClass::Int.to_instance(&db, &env);
+    for policy in [
+        MemberLookupPolicy::default(),
+        MemberLookupPolicy::REQUIRE_CONCRETE,
+    ] {
+        for (class, field) in [(class, "class_field"), (constructed, "generated")] {
+            let member = class.class_object_member(&db, &env, field, policy);
+            assert!(member.place.is_definitely_bound());
+            assert_eq!(member.place.expect_type(), int);
+        }
+        for ty in [instance, typevar] {
+            let member = ty.instance_member_with_policy(&db, &env, "instance_field", policy);
+            assert!(member.place.is_definitely_bound());
+            assert_eq!(member.place.expect_type(), int);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn property_deprecations_do_not_infer_accessor_signatures() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(
