@@ -2472,7 +2472,7 @@ fn supplied_call_results_follow_selected_overloads() -> anyhow::Result<()> {
                 Some(Type::int_literal(value)).into()
             }
             Some("generic") => call.expected_parameter_type(db, "value").into(),
-            Some("expanded") => panic!("expanded arguments do not retain every checked binding"),
+            Some("expanded") => panic!("one overload handles two expansions"),
             Some("shared") => Some(Type::int_literal(3)).into(),
             Some("partial") if matches!(call.argument("one"), CheckedArgument::Value { .. }) => {
                 Some(KnownClass::Str.to_instance(db, &ProgramEnvironment::from_file(call.file())))
@@ -2513,7 +2513,7 @@ def partial(one: int) -> int: ...
 @overload
 def partial(two: str) -> str: ...
 @overload
-def expanded(one: int) -> int: ...
+def expanded(one: int | bytes) -> int: ...
 @overload
 def expanded(two: str) -> str: ...
 def recover(value: int) -> int: ...
@@ -2538,7 +2538,7 @@ value = gradual()
 ambiguous_result = ambiguous(value)
 assert_type(shared(value), Literal[3])
 partial_result = partial(value)
-def expand(value: int | str):
+def expand(value: int | bytes | str):
     assert_type(expanded(value), int | str)
 invalid = select([])
 recovered = recover("bad")
@@ -2582,6 +2582,118 @@ assert_type(recovered, Literal[-1])
         KnownClass::Str.to_instance(&db, &env),
     );
     assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
+fn supplied_call_results_follow_complete_expansion_bindings() -> anyhow::Result<()> {
+    fn result<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
+        match call
+            .declaration()
+            .and_then(|definition| definition.name(db))
+            .as_deref()
+        {
+            Some("ambiguous_expansion" | "limited") => {
+                panic!("an incomplete expansion cannot supply checked bindings")
+            }
+            Some("correlated") => {}
+            _ => return ProvidedCallResult::default(),
+        }
+        let CheckedArgument::Value { ty, expression } = call.argument("value") else {
+            panic!("a checked value and source are retained for each expansion");
+        };
+        assert!(matches!(expression, Some(ast::Expr::Name(_))));
+        let env = ProgramEnvironment::from_file(call.file());
+        let mut common = Diagnostic::new(
+            DiagnosticId::Lint(PROVIDED_CALL_CHECK.name()),
+            Severity::Warning,
+            "Both alternatives violate an application contract",
+        );
+        common.annotate(Annotation::primary(
+            Span::from(call.file().file(db)).with_range(call.call().range()),
+        ));
+        if ty == KnownClass::Str.to_instance(db, &env) {
+            return ProvidedCallResult {
+                return_type: None,
+                diagnostics: vec![common],
+            };
+        }
+        assert_eq!(ty, KnownClass::Int.to_instance(db, &env));
+        let mut integer_only = common.clone();
+        integer_only.set_headline_message("Only the integer arm violates another contract");
+        ProvidedCallResult {
+            return_type: Some(Type::int_literal(0)),
+            diagnostics: vec![common, integer_only],
+        }
+    }
+
+    let mut registry =
+        crate::lint::LintRegistryBuilder::from(crate::default_lint_registry().clone());
+    registry.register_lint(&PROVIDED_CALL_CHECK);
+    let registry = registry.build();
+    let rules = crate::lint::RuleSelection::from_registry(&registry);
+    let db = TestDbBuilder::new()
+        .with_lint_registry(registry)
+        .with_rule_selection(rules)
+        .with_call_result_provider(result)
+        .with_file(
+            "/src/native.pyi",
+            r#"from typing import overload
+@overload
+def correlated(value: int) -> int: ...
+@overload
+def correlated(value: str) -> str: ...
+@overload
+def ambiguous_expansion(first: int, second: int) -> int: ...
+@overload
+def ambiguous_expansion(first: int, second: str) -> str: ...
+@overload
+def ambiguous_expansion(first: str, second: str) -> str: ...
+@overload
+def limited(*values: int) -> int: ...
+@overload
+def limited(*values: str) -> str: ...
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            r#"from typing import Any, Literal
+from typing_extensions import assert_type
+from native import ambiguous_expansion, correlated, limited
+
+def check(value: int | str, uncertain: tuple[int, Any] | tuple[str, str]) -> None:
+    assert_type(correlated(value), Literal[0] | str)
+    ambiguous_expansion(*uncertain)
+    limited(value, value, value, value, value, value, value, value, value)
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = crate::types::check_types_with_diagnostics(&db, db.program_file(file), []);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "provided-call-check",
+            "provided-call-check",
+            "no-matching-overload",
+        ],
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics[0].headline_message(),
+        "Both alternatives violate an application contract"
+    );
+    assert_eq!(
+        diagnostics[1].headline_message(),
+        "Only the integer arm violates another contract"
+    );
+    assert!(diagnostics[2].sub_diagnostics().iter().any(|sub| {
+        sub.headline_message()
+            .starts_with("Limit of argument type expansion reached")
+    }));
     Ok(())
 }
 

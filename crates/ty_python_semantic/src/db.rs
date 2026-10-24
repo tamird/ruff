@@ -173,9 +173,9 @@ pub trait Db: PythonCoreDb {
     /// Selected overloads are refined separately. If every selected overload receives the same
     /// complete static non-predicate result, that result is known even if overload selection
     /// remains ambiguous.
-    /// Calls requiring argument expansion retain ordinary inference because their complete
-    /// checked bindings are not available. Invalid single-signature calls retain their
-    /// diagnostics and can supply a recovery result.
+    /// Calls requiring argument expansion can be refined when each expansion retains its
+    /// complete selected binding. Other expanded calls retain ordinary inference. Invalid
+    /// single-signature calls retain their diagnostics and can supply a recovery result.
     /// Supplied diagnostics use the current lint rules and source suppressions and are omitted
     /// for unreachable calls and `@no_type_check` scopes. Reporting diagnostics does not require
     /// a return-type refinement.

@@ -11056,6 +11056,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         for callable in bindings.iter_flat_mut() {
             let bound_receiver = callable.bound_type.is_some();
             let mut all_results_refined = !has_binding_errors;
+            let mut any_result_refined = false;
             for binding in callable.result_refinement_overloads_mut() {
                 let mut context = crate::types::CheckedCall {
                     binding,
@@ -11076,16 +11077,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 all_results_refined &= return_type.is_some();
                 if let Some(result) = return_type {
                     context.set_return_type(result);
+                    any_result_refined = true;
                 }
             }
-            if all_results_refined {
-                callable.resolve_shared_provided_return(self.db(), self.program_environment());
+            if any_result_refined {
+                callable.resolve_provided_return(
+                    self.db(),
+                    self.program_environment(),
+                    all_results_refined,
+                );
             }
         }
         if !diagnostics.is_empty()
             && self.context.should_collect_diagnostics()
             && self.context.is_range_reachable(call.range())
         {
+            if diagnostics.len() > 1 {
+                // Different bindings can report the same failure for one call.
+                let mut seen = FxHashSet::default();
+                diagnostics.retain(|diagnostic| seen.insert(diagnostic.clone()));
+            }
             self.context.extend_provided_diagnostics(diagnostics);
         }
     }

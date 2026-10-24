@@ -4372,6 +4372,7 @@ impl<'db> CallableBinding<'db> {
             let mut return_types = Vec::new();
             let mut selected_overloads = SmallVec::<[usize; 2]>::new();
             let mut type_guard_argument = TypeGuardArgument::NoTarget;
+            let mut complete_bindings = true;
 
             for expanded_arguments in &expanded_argument_lists {
                 self.overload_call_result = None;
@@ -4463,6 +4464,12 @@ impl<'db> CallableBinding<'db> {
                 // 2. An unmatched overload after evaluating the first argument list becomes a
                 //    matched overload when evaluating the second argument list
                 if let Some(merged_evaluation_state) = merged_evaluation_state.as_mut() {
+                    // Updating replaces every successful snapshot, including one selected by a
+                    // previous expansion when another overload wins the current expansion.
+                    complete_bindings = complete_bindings
+                        && selected_overloads
+                            .iter()
+                            .all(|&index| !self.overloads[index].errors.is_empty());
                     merged_evaluation_state.update(self);
                 } else {
                     merged_evaluation_state = Some(snapshotter.take(self));
@@ -4482,7 +4489,8 @@ impl<'db> CallableBinding<'db> {
                     } else {
                         Either::Right(matching.take(1))
                     };
-                    for (index, _) in selected {
+                    for (index, binding) in selected {
+                        complete_bindings &= !is_ambiguous && binding.errors.is_empty();
                         if !selected_overloads.contains(&index) {
                             selected_overloads.push(index);
                         }
@@ -4512,6 +4520,7 @@ impl<'db> CallableBinding<'db> {
                         return_type: UnionType::from_elements(db, env, return_types),
                         selected_overloads,
                         type_guard_argument,
+                        complete_bindings,
                     }),
                 ));
 
@@ -4893,13 +4902,11 @@ impl<'db> CallableBinding<'db> {
     pub(crate) fn result_refinement_overloads_mut(
         &mut self,
     ) -> impl Iterator<Item = &mut Binding<'db>> {
-        // Expansion caches a combined result, but retains only the last argument
-        // snapshot for each overload. It cannot supply a complete checked view.
         let complete = self
             .overload_call_result
             .as_mut()
             .is_none_or(|result| match result {
-                OverloadCallResult::ArgumentTypeExpansion(_) => false,
+                OverloadCallResult::ArgumentTypeExpansion(expanded) => expanded.complete_bindings,
                 OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => false,
                 OverloadCallResult::Ambiguous { shared_return } => {
                     *shared_return = false;
@@ -4919,17 +4926,33 @@ impl<'db> CallableBinding<'db> {
             .filter_map(move |(index, binding)| selected.contains(&index).then_some(binding))
     }
 
-    /// Resolve an ambiguous return after every selected binding received an explicit refinement.
-    /// The overloads stay selected so their input contracts and diagnostics remain available.
-    pub(crate) fn resolve_shared_provided_return(
+    /// Resolve the call's return after an application refined a selected binding.
+    pub(crate) fn resolve_provided_return(
         &mut self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
+        all_results_refined: bool,
     ) {
-        if !matches!(
-            self.overload_call_result,
-            Some(OverloadCallResult::Ambiguous { .. })
-        ) {
+        if let Some(OverloadCallResult::ArgumentTypeExpansion(expanded)) =
+            self.overload_call_result.as_mut()
+        {
+            debug_assert!(expanded.complete_bindings);
+            expanded.return_type = UnionType::from_elements(
+                db,
+                env,
+                expanded
+                    .selected_overloads
+                    .iter()
+                    .map(|&index| self.overloads[index].return_type()),
+            );
+            return;
+        }
+        if !all_results_refined
+            || !matches!(
+                self.overload_call_result,
+                Some(OverloadCallResult::Ambiguous { .. })
+            )
+        {
             return;
         }
         let shared = {
@@ -5490,6 +5513,8 @@ struct ExpandedOverloadCall<'db> {
     selected_overloads: SmallVec<[usize; 2]>,
     /// The target must agree before expansion snapshots discard individual argument matches.
     type_guard_argument: TypeGuardArgument,
+    /// Each expanded argument list selected one overload whose snapshot remains intact.
+    complete_bindings: bool,
 }
 
 #[derive(Debug)]
