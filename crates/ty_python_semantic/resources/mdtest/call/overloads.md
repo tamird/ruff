@@ -1089,6 +1089,40 @@ def _(foo: Foo, ab: A | B, a: int | Any):
     )
 ```
 
+### Optimization: Preserve generic callbacks before expansion
+
+A callback can become compatible with an overload when another argument is expanded and its type
+variables are inferred.
+
+`overloaded.pyi`:
+
+```pyi
+from collections.abc import Callable
+from typing import Concatenate, ParamSpec, TypeVar, overload
+
+T = TypeVar("T")
+P = ParamSpec("P")
+
+@overload
+def transform(value: list[T], /, *, render: Callable[Concatenate[T, P], str]) -> str: ...
+@overload
+def transform(prefix: str, value: list[T], /, *, render: Callable[Concatenate[T, P], str]) -> bytes: ...
+```
+
+```py
+from overloaded import transform
+
+def render(value: int) -> str:
+    return str(value)
+
+def wrong(value: int) -> int:
+    return value
+
+def check(arguments: tuple[list[int]] | tuple[str, list[int]]) -> None:
+    reveal_type(transform(*arguments, render=render))  # revealed: str | bytes
+    transform(*arguments, render=wrong)  # error: [no-matching-overload]
+```
+
 ### Optimization: Limit expansion size
 
 To prevent combinatorial explosion, ty limits the number of argument lists created by expanding a

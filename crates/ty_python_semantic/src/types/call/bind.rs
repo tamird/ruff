@@ -4330,15 +4330,10 @@ impl<'db> CallableBinding<'db> {
                         .argument_type
                         .unwrap_or_else(|| argument_types.get_for_declared_type(parameter_type));
 
-                    argument_type
-                        .when_assignable_to(
-                            db,
-                            env,
-                            parameter_type,
-                            constraints,
-                            overload.inferable_typevars,
-                        )
-                        .is_always_satisfied(db, env)
+                    // Expansion can infer a specialization for which this argument matches.
+                    !argument_type
+                        .when_constraint_set_assignable_to(db, env, parameter_type, constraints)
+                        .is_never_satisfied(db, env)
                 })
             });
             if !is_argument_assignable_to_any_overload {
