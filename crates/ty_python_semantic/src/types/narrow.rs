@@ -2389,8 +2389,13 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         is_positive: bool,
     ) -> bool {
         let db = self.db;
-        if alias.node_ref(db).node(self.module).is_attribute_expr() {
-            return self.saved_attribute_lookup(name, expression).is_some();
+        match alias.node_ref(db).node(self.module) {
+            ast::Expr::Attribute(_) => {
+                return self.saved_member_lookup(name, expression).is_some();
+            }
+            // Saved keys are checked by comparisons, which also validate contents history.
+            ast::Expr::Subscript(_) => return false,
+            _ => {}
         }
         let scope = expression.scope(db);
         let index = semantic_index(db, expression.program_file(db));
@@ -2451,9 +2456,10 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             })
     }
 
-    /// Recover a saved attribute lookup only while its receiver bindings remain unchanged.
-    /// As with unpacked locals, whole-scope histories deliberately reject later writes too.
-    fn saved_attribute_lookup(
+    /// Recover a saved member lookup from the unique current assignment.
+    /// Attributes additionally require unchanged whole-scope receiver histories; saved keys
+    /// use the dictionary contents proof at their comparison site.
+    fn saved_member_lookup(
         &self,
         name: &ast::ExprName,
         expression: Expression<'db>,
@@ -2474,6 +2480,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         let original = alias.node_ref(db).node(self.module);
         let mut receiver = match original {
             ast::Expr::Attribute(_) => original,
+            ast::Expr::Subscript(subscript) => &subscript.value,
             ast::Expr::Call(call) => call.arguments.args.first()?,
             _ => return None,
         };
@@ -2494,11 +2501,21 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 )
                 .is_always_false()
                     || binding.binding.definition().is_some_and(|definition| {
-                        self.binding_assigns_alias(definition, alias_key, false)
+                        // A carried key may describe a receiver from an earlier iteration.
+                        !(original.is_subscript_expr() && definition.kind(db).is_loop_header())
+                            && self.binding_assigns_alias(definition, alias_key, false)
                     })
             })
         {
             return None;
+        }
+
+        if let ast::Expr::Subscript(subscript) = original {
+            let root = subscript.value.as_name_expr()?;
+            return places
+                .symbol_by_name(root.id.as_str())?
+                .is_local()
+                .then_some(alias);
         }
 
         loop {
@@ -5005,52 +5022,110 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         //
         // Importantly, `my_typeddict_union["tag"]` isn't the place we're going to constrain.
         // Instead, we're going to constrain `my_typeddict_union` itself.
-        if let Some((left, operator @ (ast::CmpOp::Eq | ast::CmpOp::NotEq), right)) =
-            expr_compare.as_single()
-        {
-            let mut narrow_subscript = |subscript: &ast::ExprSubscript, other_type: Type<'db>| {
-                let value_type = inference.expression_type(&*subscript.value);
-                let slice_type = inference.expression_type(&*subscript.slice);
-
-                if let Some((place, constraint)) = self.narrow_typeddict_subscript(
-                    value_type,
-                    &subscript.value,
-                    slice_type,
-                    other_type,
-                    *operator,
-                    is_positive,
-                ) {
-                    insert_narrowing_constraint(&mut constraints, place, constraint);
-                } else if let Some((place, constraint)) = self.narrow_tuple_subscript(
-                    value_type,
-                    &subscript.value,
-                    slice_type,
-                    other_type,
-                    *operator,
-                    is_positive,
-                ) {
-                    insert_narrowing_constraint(&mut constraints, place, constraint);
-                }
-            };
-
-            if let ast::Expr::Subscript(subscript) = left.expression_value() {
-                narrow_subscript(subscript, inference.expression_type(right));
-            }
-
-            if let ast::Expr::Subscript(subscript) = right.expression_value() {
-                narrow_subscript(subscript, inference.expression_type(left));
-            }
-        }
-
         if let Some((
             left,
             operator @ (ast::CmpOp::Eq | ast::CmpOp::NotEq | ast::CmpOp::Is | ast::CmpOp::IsNot),
             right,
         )) = expr_compare.as_single()
         {
-            let mut narrow_lookup = |lookup_inference: &ExpressionInference<'db>,
-                                     lookup: &ast::Expr,
-                                     other: &ast::Expr| {
+            for (candidate, other) in [(left, right), (right, left)] {
+                let (lookup, lookup_inference) = match candidate {
+                    ast::Expr::Name(name) => {
+                        let Some(alias) = self.saved_member_lookup(name, expression) else {
+                            continue;
+                        };
+                        let original = alias.node_ref(db).node(self.module);
+                        if original.is_subscript_expr() {
+                            if !matches!(operator, ast::CmpOp::Eq | ast::CmpOp::NotEq) {
+                                continue;
+                            }
+                            let index = semantic_index(db, expression.program_file(db));
+                            let Some(key_place) =
+                                PlaceExpr::try_from_expr(original).and_then(|place| {
+                                    index
+                                        .place_table(expression.scope(db).file_scope_id(db))
+                                        .place_id(&place)
+                                })
+                            else {
+                                continue;
+                            };
+                            // saved_member_lookup rejects loop-carried key bindings.
+                            match crate::types::dictionary::contents::alias_preserves_key(
+                                db,
+                                expression.scope(db),
+                                original,
+                                candidate,
+                                key_place,
+                                false,
+                                self.body_domain,
+                            ) {
+                                Some(
+                                    crate::types::dictionary::contents::KeyPreservation::Preserved,
+                                ) => {}
+                                Some(
+                                    crate::types::dictionary::contents::KeyPreservation::Pending,
+                                ) => {
+                                    self.is_provisional = true;
+                                    continue;
+                                }
+                                Some(
+                                    crate::types::dictionary::contents::KeyPreservation::Changed,
+                                )
+                                | None => continue,
+                            }
+                        }
+                        let alias_inference = infer_expression_with_body_domain(
+                            db,
+                            alias,
+                            TypeContext::default(),
+                            self.body_domain,
+                        );
+                        if alias_inference.is_provisional() {
+                            self.is_provisional = true;
+                            continue;
+                        }
+                        (original, alias_inference)
+                    }
+                    ast::Expr::Attribute(_) | ast::Expr::Call(_) => (candidate, inference),
+                    _ => {
+                        let lookup = candidate.expression_value();
+                        if !lookup.is_subscript_expr()
+                            || !matches!(operator, ast::CmpOp::Eq | ast::CmpOp::NotEq)
+                        {
+                            continue;
+                        }
+                        (lookup, inference)
+                    }
+                };
+
+                if let ast::Expr::Subscript(subscript) = lookup {
+                    let value_type = lookup_inference.expression_type(&*subscript.value);
+                    let slice_type = lookup_inference.expression_type(&*subscript.slice);
+                    let constraint = self
+                        .narrow_typeddict_subscript(
+                            value_type,
+                            &subscript.value,
+                            slice_type,
+                            inference.expression_type(other),
+                            *operator,
+                            is_positive,
+                        )
+                        .or_else(|| {
+                            self.narrow_tuple_subscript(
+                                value_type,
+                                &subscript.value,
+                                slice_type,
+                                inference.expression_type(other),
+                                *operator,
+                                is_positive,
+                            )
+                        });
+                    if let Some((place, constraint)) = constraint {
+                        insert_narrowing_constraint(&mut constraints, place, constraint);
+                    }
+                    continue;
+                }
+
                 let rebound = other
                     .as_named_expr()
                     .and_then(|named| PlaceExpr::try_from_expr(&named.target));
@@ -5076,34 +5151,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 if let Some(attribute_constraints) = attribute_constraints {
                     merge_constraints_and(&mut constraints, attribute_constraints);
                 }
-            };
-
-            let mut provisional = false;
-            for (candidate, other) in [(left, right), (right, left)] {
-                match candidate {
-                    ast::Expr::Attribute(_) => narrow_lookup(inference, candidate, other),
-                    ast::Expr::Call(_) => narrow_lookup(inference, candidate, other),
-                    ast::Expr::Name(name) => {
-                        let Some(alias) = self.saved_attribute_lookup(name, expression) else {
-                            continue;
-                        };
-                        let lookup = alias.node_ref(db).node(self.module);
-                        let alias_inference = infer_expression_with_body_domain(
-                            db,
-                            alias,
-                            TypeContext::default(),
-                            self.body_domain,
-                        );
-                        if alias_inference.is_provisional() {
-                            provisional = true;
-                            continue;
-                        }
-                        narrow_lookup(alias_inference, lookup, other);
-                    }
-                    _ => {}
-                }
             }
-            self.is_provisional |= provisional;
         }
 
         // Narrow types when a key membership test proves that a key is present, and narrow unions

@@ -1215,3 +1215,142 @@ def chained(value: Text | Binary):
     if other == "text":
         reveal_type(value)  # revealed: Text | Binary
 ```
+
+## Saved dictionary tags
+
+A saved literal-key lookup can distinguish a TypedDict union while the receiver and its key remain
+unchanged. The same relation holds for tokens read in a loop.
+
+```py
+from typing import Any, Literal, TypedDict, cast
+from typing_extensions import NotRequired
+
+class NameToken(TypedDict):
+    kind: Literal["name"]
+    value: str
+    count: NotRequired[int]
+
+class EndToken(TypedDict):
+    kind: Literal["end"]
+    count: NotRequired[int]
+
+def saved(token: NameToken | EndToken) -> str:
+    kind = token["kind"]
+    if kind == "name":
+        return token["value"]  # no diagnostic
+    return ""
+
+def reflected(token: NameToken | EndToken) -> str:
+    kind = token["kind"]
+    if "name" == kind:
+        return token["value"]  # no diagnostic
+    return ""
+
+def names(tokens: list[NameToken | EndToken]) -> list[str]:
+    result: list[str] = []
+    for token in tokens:
+        kind = token["kind"]
+        if kind == "name":
+            result.append(token["value"])  # no diagnostic
+    return result
+```
+
+The selected alternative still governs field access and return values. Invalid payloads do not
+become valid inputs.
+
+```py
+def wrong_tag(token: NameToken | EndToken) -> str:
+    kind = token["kind"]
+    if kind == "end":
+        return token["value"]  # error: [invalid-key]
+    return ""
+
+def wrong_return(token: NameToken | EndToken) -> str:
+    kind = token["kind"]
+    if kind == "name":
+        return 42  # error: [invalid-return-type]
+    return ""
+
+saved({"kind": "name", "value": 42})  # error: [invalid-argument-type]
+saved({"kind": "unknown"})  # error: [invalid-argument-type]
+```
+
+Changing the key, exposing an alias to a call, or replacing either saved value invalidates the
+relationship.
+
+```py
+def changed_key(token: NameToken | EndToken):
+    kind = token["kind"]
+    token["kind"] = "end"  # error: [invalid-assignment]
+    if kind == "name":
+        reveal_type(token)  # revealed: NameToken | EndToken
+
+def touch(value: object) -> None: ...
+def exposed(token: NameToken | EndToken):
+    kind = token["kind"]
+    alias = token
+    touch(alias)
+    if kind == "name":
+        reveal_type(token)  # revealed: NameToken | EndToken
+
+def replaced_receiver(token: NameToken | EndToken):
+    kind = token["kind"]
+    token = {"kind": "end"}
+    if kind == "name":
+        reveal_type(token)  # revealed: EndToken
+
+def replaced_tag(token: NameToken | EndToken):
+    kind = token["kind"]
+    kind = "name"
+    if kind == "name":
+        reveal_type(token)  # revealed: NameToken | EndToken
+
+def changed_through_erasure(token: NameToken | EndToken):
+    kind = token["kind"]
+    cast(Any, token)["kind"] = "end"
+    if kind == "name":
+        reveal_type(token)  # revealed: NameToken | EndToken
+
+# The index currently discards the alias even for a write to another key.
+def other_key(token: NameToken | EndToken):
+    kind = token["kind"]
+    token["count"] = 42
+    if kind == "name":
+        reveal_type(token)  # revealed: NameToken | EndToken
+
+def stale_loop(tokens: list[NameToken | EndToken], capture: bool):
+    kind = "name"
+    for token in tokens:
+        if capture:
+            kind = token["kind"]
+        if kind == "name":
+            reveal_type(token)  # revealed: NameToken | EndToken
+
+def exposed_loop(tokens: list[NameToken | EndToken]):
+    for token in tokens:
+        kind = token["kind"]
+        touch(token)
+        if kind == "name":
+            reveal_type(token)  # revealed: NameToken | EndToken
+```
+
+A capture with no other assignment can still carry a tag from a previous iteration.
+
+```py
+def carried_without_initial_value(tokens: list[NameToken | EndToken], refresh: bool):
+    for index, token in enumerate(tokens):
+        if index == 0 or refresh:
+            kind = token["kind"]
+        if kind == "name":  # error: [possibly-unresolved-reference]
+            reveal_type(token)  # revealed: NameToken | EndToken
+
+def refresh_token(token: object) -> bool:
+    return False
+
+def carried_with_call(tokens: list[NameToken | EndToken]):
+    for index, token in enumerate(tokens):
+        if index == 0 or refresh_token(token):
+            kind = token["kind"]
+        if kind == "name":  # error: [possibly-unresolved-reference]
+            reveal_type(token)  # revealed: NameToken | EndToken
+```

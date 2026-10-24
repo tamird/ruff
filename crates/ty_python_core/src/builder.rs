@@ -1292,8 +1292,12 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         let Some(value) = value else { return };
         let target_name = &target_name_expr.id;
 
-        let attribute_path = value.is_attribute_expr() && PlaceExpr::try_from_expr(value).is_some();
-        if !attribute_path && !Self::can_register_narrowing_alias(value) {
+        let saved_key = self.scopes[self.current_scope()].kind() == ScopeKind::Function
+            && matches!(value, ast::Expr::Subscript(subscript)
+                if subscript.value.is_name_expr() && subscript.slice.is_string_literal_expr());
+        let member_path =
+            (value.is_attribute_expr() || saved_key) && PlaceExpr::try_from_expr(value).is_some();
+        if !member_path && !Self::can_register_narrowing_alias(value) {
             return;
         }
 
