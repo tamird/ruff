@@ -677,15 +677,15 @@ fn external_overload_body_domains_use_source_defaults() -> anyhow::Result<()> {
 }
 
 #[test]
-fn external_overload_body_domains_require_whole_signature_provenance() -> anyhow::Result<()> {
+fn external_overload_body_domains_reject_mismatched_annotation_provenance() -> anyhow::Result<()> {
     for (provider, source) in [
         (
             ExternalSource::MixedFunctionAnnotations,
             "def pick(flag):\n    return flag\n",
         ),
         (
-            ExternalSource::Annotation,
-            "def pick(flag: bool):\n    return flag\n",
+            ExternalSource::MixedFunctionAnnotations,
+            "def pick(flag) -> bool:\n    return flag\n",
         ),
     ] {
         let db = TestDbBuilder::new()
@@ -714,6 +714,179 @@ fn external_overload_body_domains_require_whole_signature_provenance() -> anyhow
             BodyDomainError::Unsupported
         );
     }
+    Ok(())
+}
+
+#[test]
+fn external_overloads_preserve_native_annotations_and_local_calls() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/main.py", "")
+        .with_file(
+            "/src/contracts.pyi",
+            indoc::indoc! {r#"
+                from collections.abc import Collection
+                from typing import Literal, overload
+                @overload
+                def pick(value: Collection[str], *, local: Literal[True]) -> None: ...
+                @overload
+                def pick(value: list[str], *, local: bool) -> None: ...
+                def pick(value: Collection[str], *, local: bool) -> None: ...
+            "#},
+        )
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    for signature in [
+        "value, *, local",
+        "value: Collection[str], *, local",
+        "value, *, local: bool",
+        "value: Collection[str], *, local: bool",
+    ] {
+        for returns in ["", " -> None"] {
+            let source = format!(
+                indoc::indoc! {r#"
+                    from collections.abc import Collection
+                    def pick({signature}){returns}:
+                        if local:
+                            return
+                        prefixed = ['prefix'] + value
+                    pick({{'ok': 1}}, local=True)
+                    pick({{'bad': 1}}, local=False)
+                "#},
+                signature = signature,
+                returns = returns
+            );
+            db.write_file("/src/main.py", &source)?;
+            let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+            let function = crate::place::global_symbol(&db, file, "pick")
+                .place
+                .expect_type()
+                .expect_function_literal();
+            let analysis = crate::types::OverloadBodyAnalysis::new(&db, function);
+            assert!(analysis.is_complete(), "{signature}{returns}");
+            let diagnostics =
+                crate::types::check_types_with_overload_analysis(&db, file, [], [analysis]);
+            assert_eq!(
+                diagnostics.len(),
+                1,
+                "{signature}{returns}: {diagnostics:#?}"
+            );
+            assert_eq!(diagnostics[0].id().as_str(), "no-matching-overload");
+            if signature == "value: Collection[str], *, local: bool" && returns == " -> None" {
+                db.write_file(
+                    "/src/main.py",
+                    source.replace("        return", "        pass"),
+                )?;
+                let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+                let function = crate::place::global_symbol(&db, file, "pick")
+                    .place
+                    .expect_type()
+                    .expect_function_literal();
+                let analysis = crate::types::OverloadBodyAnalysis::new(&db, function);
+                assert!(analysis.is_complete());
+                let diagnostics =
+                    crate::types::check_types_with_overload_analysis(&db, file, [], [analysis]);
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.id().as_str())
+                        .collect::<Vec<_>>(),
+                    ["no-matching-overload", "unsupported-operator"],
+                    "{diagnostics:#?}"
+                );
+            }
+        }
+    }
+    // Native source types still control whether each call domain fits the implementation.
+    for (signature, returns) in [
+        ("value: int, *, local", "None"),
+        ("value, *, local: str", "None"),
+        ("value, *, local", "str"),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!("def pick({signature}) -> {returns}:\n    pass\n"),
+        )?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let function = crate::place::global_symbol(&db, file, "pick")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        assert_eq!(
+            check_overload_body(&db, function, 0).unwrap_err(),
+            BodyDomainError::Inconsistent
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn external_generic_overload_members_preserve_native_implementation() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY312)
+        .with_file(
+            "/src/main.py",
+            indoc::indoc! {r#"
+                from typing import assert_type
+                def pick(value: object) -> object:
+                    return value
+                assert_type(pick([1]), list[int])
+                assert_type(pick(None), None)
+                pick(1)
+            "#},
+        )
+        .with_file(
+            "/src/contracts.pyi",
+            indoc::indoc! {r#"
+                from typing import overload
+                @overload
+                def pick[T](value: list[T]) -> list[T]: ...
+                @overload
+                def pick(value: None) -> None: ...
+                def pick(value: object) -> object: ...
+            "#},
+        )
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let function = crate::place::global_symbol(&db, file, "pick")
+        .place
+        .expect_type()
+        .expect_function_literal();
+    let analysis = crate::types::OverloadBodyAnalysis::new(&db, function);
+    assert!(analysis.is_complete());
+    let diagnostics = crate::types::check_types_with_overload_analysis(&db, file, [], [analysis]);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "no-matching-overload");
+    Ok(())
+}
+
+#[test]
+fn external_generic_overloads_require_whole_signature_provenance() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY312)
+        .with_file("/src/main.py", "def pick(flag: bool):\n    return flag\n")
+        .with_file(
+            "/src/contracts.pyi",
+            indoc::indoc! {r#"
+                from typing import Literal, overload
+                @overload
+                def pick(flag: Literal[True]) -> Literal[True]: ...
+                @overload
+                def pick(flag: Literal[False]) -> Literal[False]: ...
+                def pick[T](flag: T) -> T: ...
+            "#},
+        )
+        .with_source_provider(ExternalSource::Annotation)
+        .build()?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let function = crate::place::global_symbol(&db, file, "pick")
+        .place
+        .expect_type()
+        .expect_function_literal();
+    assert_eq!(
+        check_overload_body(&db, function, 0).unwrap_err(),
+        BodyDomainError::Unsupported
+    );
     Ok(())
 }
 

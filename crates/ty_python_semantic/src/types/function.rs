@@ -1751,8 +1751,8 @@ impl<'db> FunctionType<'db> {
         self.literal(db).overloads_and_implementation(db)
     }
 
-    /// The external declaration supplying a module-level function's whole signature, if it
-    /// belongs to an overload family. The implementation still belongs to this function.
+    /// The external overload family governing calls to a module-level function.
+    /// The implementation annotations and body still belong to this function.
     pub(super) fn external_overload_donor(self, db: &'db dyn Db) -> Option<FunctionType<'db>> {
         let declaration = self.literal_signature(db).declaration;
         (declaration != self).then_some(declaration)
@@ -1768,15 +1768,22 @@ impl<'db> FunctionType<'db> {
         }
         let file = self.program_file(db);
         let module = parsed_module(db, file.python_file(db)).load(db);
-        let donor = SourceAnnotation::external_function_definition(
-            db,
-            file,
-            self.node(db, file.file(db), &module),
-        )?;
+        let node = self.node(db, file.file(db), &module);
+        let donor = SourceAnnotation::external_function_declaration(db, file, node)?;
         if !self.definition(db).file_scope(db).is_global() {
             return None;
         }
         let function = infer_definition_types(db, donor).function_type(donor)?;
+        // Adopting implementation quantifiers still requires an entirely external signature.
+        // A nongeneric implementation can combine native annotations with an external call family.
+        if function
+            .literal(db)
+            .last_definition_signature(db)
+            .is_generic()
+            && SourceAnnotation::external_function_definition(db, file, node) != Some(donor)
+        {
+            return None;
+        }
         (function.known(db).is_none()
             && donor.file_scope(db).is_global()
             && function.literal(db).has_separate_implementation(db)

@@ -119,6 +119,43 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         Some(donor)
     }
 
+    /// A function declaration explicitly associated with this source function.
+    /// Native annotations retain precedence when inferring the implementation signature.
+    pub(super) fn external_function_declaration(
+        db: &'db dyn Db,
+        file: ProgramFile<'db>,
+        function: &'a ast::StmtFunctionDef,
+    ) -> Option<Definition<'db>> {
+        let ProvidedAnnotation::External {
+            file: foreign_file,
+            owner: foreign_owner,
+        } = db.provided_annotation(file, function.node_index().load())?
+        else {
+            return None;
+        };
+        let Self::External {
+            annotation,
+            range: _,
+        } = Self::external(db, file, function, foreign_file, foreign_owner)?
+        else {
+            return None;
+        };
+        let donor = annotation.definition;
+        for parameter in &function.parameters {
+            let parameter = parameter.as_parameter();
+            let annotation = Self::new(db, file, parameter, parameter.annotation.as_deref())?;
+            if let Self::External {
+                annotation,
+                range: _,
+            } = annotation
+                && annotation.definition != donor
+            {
+                return None;
+            }
+        }
+        Some(donor)
+    }
+
     pub(crate) fn function_return(
         db: &'db dyn Db,
         file: ProgramFile<'db>,
