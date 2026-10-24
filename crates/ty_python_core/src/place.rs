@@ -363,6 +363,13 @@ impl PlaceTable {
         self.place_id(&contents)
     }
 
+    /// Find an already indexed attribute of the receiver.
+    pub fn attribute_place(&self, receiver: ScopedPlaceId, name: &str) -> Option<ScopedPlaceId> {
+        let attribute = MemberExprBuilder::from_place(self.place(receiver)).with_attribute(name)?;
+        let attribute = PlaceExpr::try_from_member_expr(attribute)?;
+        self.place_id(&attribute)
+    }
+
     /// Find an existing scalar key place belonging to an internal mapping-contents place.
     pub fn contents_key(&self, contents: ScopedPlaceId, name: &str) -> Option<ScopedPlaceId> {
         let ScopedPlaceId::Member(contents) = contents else {

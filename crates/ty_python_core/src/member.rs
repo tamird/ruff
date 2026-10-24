@@ -349,6 +349,10 @@ impl MemberExprBuilder {
         self.with_subscript(SegmentKind::Contents, "")
     }
 
+    pub(super) fn with_attribute(&self, name: &str) -> Option<Self> {
+        self.with_subscript(SegmentKind::Attribute, name)
+    }
+
     fn with_subscript(&self, kind: SegmentKind, key: &str) -> Option<Self> {
         let Self { path, segments } = self;
         let start_offset = path.text_len();

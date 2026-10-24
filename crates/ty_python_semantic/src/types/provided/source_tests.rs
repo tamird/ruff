@@ -2583,7 +2583,7 @@ fn frozen_exports_observe_completed_mapping_contents() -> anyhow::Result<()> {
 
 #[test]
 fn frozen_exported_holder_fields_observe_completed_mapping_contents() -> anyhow::Result<()> {
-    let source = "include(\"holder\")\ndef observe(value: object) -> None: pass\nobserve({'name': 0} | holder.values)\n";
+    let source = "include(\"holder\")\ndef observe(value: object) -> None: pass\nobserve(holder.values['name'])\nobserve({'name': 0} | holder.values)\n";
     for frozen in [true, false] {
         let mut db = TestDbBuilder::new()
             .with_source_provider(FrozenExports(frozen))
@@ -2591,7 +2591,7 @@ fn frozen_exported_holder_fields_observe_completed_mapping_contents() -> anyhow:
             .with_file("/src/exporter.py", "")
             .with_file(
                 "/src/native.pyi",
-                "class Record:\n    values: dict[str, int]\ndef record(*, values: dict[str, int], other: object = ...) -> Record: ...\ndef untrusted(*, values: dict[str, int]) -> Record: ...\ndef invoke() -> int: ...\n",
+                "class Record[T]:\n    values: dict[str, T]\n    other: object\ndef record[T](*, values: dict[str, T], other: object = ...) -> Record[T]: ...\ndef untrusted(*, values: dict[str, int]) -> Record[int]: ...\ndef invoke() -> int: ...\ndef consume(value: object) -> None: ...\n",
             )
             .with_keyword_field_factory(|db, definition| {
                 definition.name(db).is_some_and(|name| name == "record")
@@ -2616,6 +2616,78 @@ fn frozen_exported_holder_fields_observe_completed_mapping_contents() -> anyhow:
             ),
             ("values = {}\nholder = record(values=values)", None),
             (
+                "values = {'name': 1}\nholder = record(values=values)\ncopy = dict(**holder.values)",
+                Some("Literal[1]"),
+            ),
+            (
+                "values = {'name': 1}\nholder = record(values=values)\ncopy = dict(**holder.values)\nalias = holder\nalias.values.clear()",
+                None,
+            ),
+            (
+                "values = {'name': 1}\nholder = record(values=values)\ncopy = dict(**holder.values)\nvalues = {}",
+                None,
+            ),
+            (
+                "values = {'name': 1}\nholder = record(values=values)\ncopy = dict(**holder.values)\nholder = record(values={})",
+                None,
+            ),
+            (
+                "values = {'name': 2}\nholder = record(values=values)\ncopy = dict(**holder.values)",
+                Some("Literal[2]"),
+            ),
+            (
+                "values = {'name': 1}\nholder = record(values=values, other=[])\ncopy = dict(**holder.values)\nconsume(holder.other)",
+                Some("Literal[1]"),
+            ),
+            (
+                "values = {'name': 1}\nsibling: list[object] = []\nholder = record(values=values, other=sibling)\ncopy = dict(**holder.values)\nsibling.append(holder.values)\nconsume(holder.other)",
+                None,
+            ),
+            (
+                "values = {'name': 1}\nsibling: list[object] = []\nholder = record(values=values, other=sibling)\ncopy = dict(**holder.values)\nsibling.append(holder)\nconsume(holder.other)",
+                None,
+            ),
+            (
+                "values = {'name': 1}\nsibling: list[object] = []\nholder = record(values=values, other=sibling)\ncopy = dict(**holder.values)\nsibling.append(lambda: holder.values.clear())\nconsume(holder.other)",
+                None,
+            ),
+            (
+                "values = {'name': 1}\ndef mutate(arg: object): values.clear()\nholder = record(values=values, other=mutate)\ncopy = dict(**holder.values)\nmutate(holder.other)",
+                None,
+            ),
+            (
+                "values = {'name': 1}\ndef mutate(arg: object): holder.values.clear()\nholder = record(values=values, other=mutate)\ncopy = dict(**holder.values)\nmutate(holder.other)",
+                None,
+            ),
+            (
+                "values = {'name': 1}\ndef mutate(): values.clear()\nholder = record(values=values, other=mutate)\ncopy = dict(**holder.values)\nconsume(holder.other)",
+                None,
+            ),
+            (
+                "def mutate(): values.clear()\nvalues = {'name': 1}\nholder = record(values=values, other=mutate)\ncopy = dict(**holder.values)\nconsume(holder.other)",
+                None,
+            ),
+            (
+                "def mutate(): holder.values.clear()\nvalues = {'name': 1}\nholder = record(values=values, other=mutate)\ncopy = dict(**holder.values)\nconsume(holder.other)",
+                None,
+            ),
+            (
+                "values = {'name': 1}\nholder = record(values=values)\ncopy = dict(**holder.values)\ndel holder.values",
+                None,
+            ),
+            (
+                "values = {'name': 1}\nholder = record(values=values)\ncopy = dict(**holder.values)\nholder.values = {}\ndel holder.values",
+                None,
+            ),
+            (
+                "values = {'name': 1}\nalias = values\nholder = record(values=values)\ncopy = dict(**holder.values)\nalias.clear()",
+                None,
+            ),
+            (
+                "child: dict[str, int] = {'first': 1}\nvalues = {'name': child}\nholder = record(values=values)\ncopy = dict(**holder.values)\nchild.clear()",
+                Some("dict[str, int]"),
+            ),
+            (
                 "holder = record(values={})\nholder = record(values={})",
                 None,
             ),
@@ -2626,7 +2698,7 @@ fn frozen_exported_holder_fields_observe_completed_mapping_contents() -> anyhow:
         ] {
             db.write_file(
                 "/src/exporter.py",
-                format!("from native import invoke, record, untrusted\n{exporter}\n"),
+                format!("from native import consume, invoke, record, untrusted\n{exporter}\n"),
             )?;
             let program = db.program_file(file);
             let module = parsed_module(&db, program.python_file(&db)).load(&db);
@@ -2637,6 +2709,21 @@ fn frozen_exported_holder_fields_observe_completed_mapping_contents() -> anyhow:
                 panic!("expected observation call");
             };
             let model = SemanticModel::new(&db, program);
+            if frozen && expected == Some("dict[str, int]") {
+                let ast::Stmt::Expr(nested) = &module.suite()[2] else {
+                    unreachable!()
+                };
+                let ast::Expr::Call(nested) = nested.value.as_ref() else {
+                    unreachable!()
+                };
+                assert!(
+                    model
+                        .dictionary_items(&nested.arguments.args[0])
+                        .is_none_or(|items| {
+                            items.items.iter().all(|item| item.name != "first")
+                        })
+                );
+            }
             let items = model.dictionary_items(&call.arguments.args[0]);
             let actual = items
                 .as_ref()

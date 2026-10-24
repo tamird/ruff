@@ -1111,10 +1111,9 @@ fn frozen_export_contents<'db>(
     Some(value)
 }
 
-/// Observe an exported field when the holder's assignment completes module evaluation. Within
-/// the indexed evaluation model, the fresh dictionary cannot change: later argument evaluation
-/// is inert, the checked factory retains it unchanged, and the holder's first binding replaces
-/// no earlier value whose destructor could run during assignment.
+/// Observe a frozen holder through the same source and field histories as a local retained
+/// field. The factory call retains the original mapping; later writes or escapes must not be
+/// replaced by its initializer snapshot.
 #[salsa::tracked(
     returns(clone),
     cycle_initial=|_, _, _, _, _| ContentsValue::Pending,
@@ -1133,39 +1132,32 @@ fn frozen_exported_field_contents<'db>(
         if !db.provided_exports_are_frozen(file) {
             return None;
         }
-        let module = parsed_module(db, file.python_file(db)).load(db);
-        let ast::Stmt::Assign(assignment) = module.suite().last()? else {
-            return None;
-        };
-        let [ast::Expr::Name(holder)] = assignment.targets.as_slice() else {
-            return None;
-        };
-        if holder.id != name {
+        let scope = ty_python_core::global_scope(db, file);
+        let index = semantic_index(db, file);
+        let table = index.place_table(scope.file_scope_id(db));
+        let holder = table.symbol_id(name.as_str())?;
+        if table.symbol(holder).is_reassigned() {
             return None;
         }
-        let ast::Expr::Call(call) = assignment.value.as_ref() else {
+        let use_def = index.use_def_map(scope.file_scope_id(db));
+        let mut bindings = use_def.end_of_scope_bindings(holder.into());
+        let definition = bindings.next()?.binding.definition()?;
+        if bindings.next().is_some() || definition.scope(db) != scope {
+            return None;
+        }
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let DefinitionKind::Assignment(assignment) = definition.kind(db) else {
+            return None;
+        };
+        if !assignment.is_single_target(&module) {
+            return None;
+        }
+        let ast::Expr::Call(call) = assignment.value(&module) else {
             return None;
         };
         let mut keywords = call.arguments.keywords.iter();
         let keyword =
             keywords.find(|keyword| keyword.arg.as_ref().is_some_and(|name| name.id == field))?;
-        if !keyword.value.is_dict_expr()
-            || std::iter::once(keyword)
-                .chain(keywords)
-                .any(|keyword| keyword.arg.is_none() || !inert_field_argument(&keyword.value))
-        {
-            return None;
-        }
-        let index = semantic_index(db, file);
-        let definition = index.try_definition(holder)?;
-        let scope = definition.scope(db);
-        if index
-            .place_table(scope.file_scope_id(db))
-            .symbol(definition.place(db).as_symbol()?)
-            .is_reassigned()
-        {
-            return None;
-        }
         let inference = StatementInference::Definition(
             definition,
             infer_definition_with_body_domain(db, definition, None),
@@ -1174,13 +1166,65 @@ fn frozen_exported_field_contents<'db>(
             return Some(ContentsValue::Pending);
         }
         checked_keyword_field_factory(db, scope, call, &inference)?;
-        Some(ContentsValue::from_literal(
+        if keyword.value.is_dict_expr() {
+            // A final, first assignment cannot expose this literal after the call.
+            if !matches!(module.suite().last(), Some(ast::Stmt::Assign(last))
+                if last.value.node_index().load() == call.node_index().load())
+            {
+                return None;
+            }
+            if std::iter::once(keyword)
+                .chain(keywords)
+                .any(|keyword| keyword.arg.is_none() || !inert_field_argument(&keyword.value))
+            {
+                return None;
+            }
+            return Some(ContentsValue::from_literal(
+                db,
+                &ProgramEnvironment::from_scope(scope),
+                scope,
+                &keyword.value,
+                &inference,
+            ));
+        }
+        let source = retained_keyword_source(table, call, keyword)?;
+        let field_value = table.attribute_place(holder.into(), field.as_str())?;
+        let target_use = index.try_expression_use_id(assignment.target(&module).into())?;
+        if !retains_initial_field_binding(
+            use_def.multi_bindings_at_use(target_use, field_value)?,
+            use_def.end_of_scope_bindings(field_value),
+        ) {
+            return None;
+        }
+        let field_contents = table.contents_place(field_value)?;
+        // The fresh source occurred in just this retained argument. Receiving a
+        // different field does not expose this mapping through that argument.
+        let siblings: Vec<_> = call
+            .arguments
+            .keywords
+            .iter()
+            .filter_map(|keyword| keyword.arg.as_ref())
+            .filter(|name| name.id != field)
+            .filter_map(|name| table.attribute_place(holder.into(), name.as_str()))
+            .filter_map(|sibling| table.contents_place(sibling))
+            .collect();
+        match check_contents_history(
             db,
-            &ProgramEnvironment::from_scope(scope),
             scope,
-            &keyword.value,
-            &inference,
-        ))
+            use_def
+                .end_of_scope_bindings(field_contents)
+                .map(|binding| binding.binding)
+                .collect(),
+            KeyHistoryOrigin::RetainedField(&siblings),
+            None,
+        ) {
+            KeyPreservation::Preserved => {}
+            KeyPreservation::Pending => return Some(ContentsValue::Pending),
+            KeyPreservation::Changed => return None,
+        }
+        let reachability =
+            ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints());
+        retained_source_contents(db, scope, call, source, &inference, &reachability, None)
     })();
     observed.unwrap_or(ContentsValue::Unavailable)
 }
@@ -2190,6 +2234,8 @@ enum KeyHistoryOrigin<'a, 'db> {
         anchors: &'a [DefinitionState<'db>],
         name: &'a str,
     },
+    /// A retained field must reach its original binding without a contents change.
+    RetainedField(&'a [ScopedPlaceId]),
     /// Ordinary member seeds may start at a parameter, but not after a known escape.
     UnexposedParent,
     /// A retained source must originate in a fresh local allocation, never a parameter.
@@ -2255,6 +2301,11 @@ fn check_contents_history<'db>(
     let mut visited = FxHashSet::default();
     let mut provisional = false;
     while let Some(binding) = pending.pop() {
+        if matches!(origin, KeyHistoryOrigin::RetainedField(_))
+            && binding == DefinitionState::Deleted
+        {
+            continue;
+        }
         if let KeyHistoryOrigin::SavedRead { anchors, name: _ } = origin
             && anchors.contains(&binding)
         {
@@ -2277,6 +2328,7 @@ fn check_contents_history<'db>(
                 range: _,
             } => {
                 let allocation = match origin {
+                    KeyHistoryOrigin::RetainedField(_) => return KeyPreservation::Changed,
                     KeyHistoryOrigin::SavedRead {
                         anchors: _,
                         name: _,
@@ -2316,7 +2368,17 @@ fn check_contents_history<'db>(
                 {
                     continue;
                 }
-                let transfer = mapping_transfer(db, definition, receiver, effect, domain);
+                let transfer = match (origin, effect) {
+                    (
+                        KeyHistoryOrigin::RetainedField(siblings),
+                        DictionaryContentsEffect::ProjectedCall(original),
+                    ) if original.scope(db) == scope && siblings.contains(&original.place(db)) => {
+                        MappingTransfer::Keep {
+                            exposes_descendants: false,
+                        }
+                    }
+                    _ => mapping_transfer(db, definition, receiver, effect, domain),
+                };
                 if matches!(transfer, MappingTransfer::Result(ContentsValue::Pending)) {
                     provisional = true;
                     continue;
@@ -2326,7 +2388,9 @@ fn check_contents_history<'db>(
                         transfer.preserves_key(db, name)
                     }
                     KeyHistoryOrigin::UnexposedParent => transfer.preserves_confinement(),
-                    KeyHistoryOrigin::FreshSource | KeyHistoryOrigin::RetainedCall(_) => {
+                    KeyHistoryOrigin::FreshSource
+                    | KeyHistoryOrigin::RetainedCall(_)
+                    | KeyHistoryOrigin::RetainedField(_) => {
                         matches!(transfer, MappingTransfer::Keep { .. })
                     }
                 };
@@ -2643,20 +2707,17 @@ fn retained_field_contents<'db>(
     let current_use = index.try_expression_use_id(snapshot)?;
     let field_value = table.place_id(&PlaceExpr::try_from_expr(expression)?)?;
     let field_use = index.try_expression_use_id(expression.into())?;
-    for (place, mut current) in [
+    for (place, current) in [
         (
             field_place,
             use_def.multi_bindings_at_use(current_use, field_place)?,
         ),
         (field_value, use_def.bindings_at_use(field_use)),
     ] {
-        let mut initial = use_def.multi_bindings_at_use(target_use, place)?;
-        let initial_binding = initial.next()?;
-        if initial_binding.binding != DefinitionState::Deleted
-            || initial.next().is_some()
-            || current.next()?.binding_order != initial_binding.binding_order
-            || current.next().is_some()
-        {
+        if !retains_initial_field_binding(
+            use_def.multi_bindings_at_use(target_use, place)?,
+            current,
+        ) {
             return None;
         }
     }
@@ -2680,11 +2741,54 @@ fn retained_field_contents<'db>(
     }
     checked_keyword_field_factory(db, scope, call, &inference)?;
 
+    retained_source_contents(
+        db,
+        scope,
+        call,
+        source,
+        &inference,
+        reachability,
+        Some(snapshot),
+    )
+}
+
+/// A later deletion is a different definition from the initially unassigned field.
+fn retains_initial_field_binding(
+    mut initial: BindingWithConstraintsIterator<'_, '_>,
+    mut current: BindingWithConstraintsIterator<'_, '_>,
+) -> bool {
+    let (Some(first), Some(last)) = (initial.next(), current.next()) else {
+        return false;
+    };
+    first.binding == DefinitionState::Deleted
+        && first.binding_order == last.binding_order
+        && initial.next().is_none()
+        && current.next().is_none()
+}
+
+/// The checked factory retained the source once. Preserve its slots only while its
+/// pre-retention and subsequent contents histories both reach the same allocation.
+fn retained_source_contents<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    call: &ast::ExprCall,
+    source: &ast::Expr,
+    inference: &StatementInference<'db>,
+    reachability: &ReachabilityEvaluationCache<'db>,
+    snapshot: Option<ast::ExprRef<'_>>,
+) -> Option<ContentsValue<'db>> {
+    let index = semantic_index(db, scope.program_file(db));
+    let table = index.place_table(scope.file_scope_id(db));
+    let use_def = index.use_def_map(scope.file_scope_id(db));
     let source_contents = table.place_id(&PlaceExpr::contents(source)?)?;
     let call_use = index.try_expression_use_id(call.into())?;
     let before = use_def.multi_bindings_at_use(call_use, source_contents)?;
-    let current_use = index.try_expression_use_id(snapshot)?;
-    let after = use_def.multi_bindings_at_use(current_use, source_contents)?;
+    let after = if let Some(snapshot) = snapshot {
+        let current = index.try_expression_use_id(snapshot)?;
+        use_def.multi_bindings_at_use(current, source_contents)?
+    } else {
+        use_def.end_of_scope_bindings(source_contents)
+    };
     for (bindings, origin) in [
         (before, KeyHistoryOrigin::FreshSource),
         (
@@ -2697,7 +2801,7 @@ fn retained_field_contents<'db>(
             scope,
             bindings.map(|binding| binding.binding).collect(),
             origin,
-            domain,
+            reachability.body_domain(),
         ) {
             KeyPreservation::Preserved => {}
             KeyPreservation::Pending => return Some(ContentsValue::Pending),
