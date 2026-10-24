@@ -87,16 +87,32 @@ def _(value: Child | Other):
 
 ## Empty collection defaults
 
-A finite member type provides context for a fresh empty list or dictionary default, including
-`Iterable` and `Mapping` fields. This does not establish that the attribute exists or prevent a
+```toml
+[environment]
+python-version = "3.12"
+```
+
+A finite member type provides context for a compatible fresh empty list or dictionary default,
+including abstract collection fields. This does not establish that the attribute exists or prevent a
 property from raising `AttributeError`; the default remains a possible result.
 
+The custom protocol below has fully static members, unlike `typing.Collection` whose inherited
+membership parameter is `Any`.
+
 ```py
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Protocol
+
+class StaticCollection[T](Iterable[T], Protocol):
+    def __len__(self) -> int: ...
+    def __contains__(self, value: object, /) -> bool: ...
 
 class Collections:
     items: list[str]
     iterable: Iterable[str]
+    collection: StaticCollection[str]
+    union_collection: StaticCollection[str | int]
+    sequence: Sequence[str]
     mapping: Mapping[str, Iterable[str]]
 
     @property
@@ -106,9 +122,29 @@ class Collections:
 def _(value: Collections, fallback: bytes):
     reveal_type(getattr(value, "items", []))  # revealed: list[str]
     reveal_type(getattr(value, "iterable", []))  # revealed: Iterable[str]
+    reveal_type(getattr(value, "collection", []))  # revealed: StaticCollection[str]
+    reveal_type(getattr(value, "union_collection", []))  # revealed: StaticCollection[str | int]
+    reveal_type(getattr(value, "sequence", []))  # revealed: Sequence[str]
     reveal_type(getattr(value, "mapping", {}))  # revealed: Mapping[str, Iterable[str]]
     reveal_type(getattr(value, "unavailable", []))  # revealed: list[str]
     reveal_type(getattr(value, "unavailable", fallback))  # revealed: list[str] | bytes
+
+def consume[T](items: StaticCollection[T]) -> T:
+    return next(iter(items))
+
+def nested(value: Collections):
+    reveal_type(consume(getattr(value, "collection", [])))  # revealed: str
+    reveal_type(consume(getattr(value, "union_collection", [])))  # revealed: str | int
+    reveal_type(consume(getattr(value, "sequence", [])))  # revealed: str
+
+def strings(items: StaticCollection[str]) -> None: ...
+def wrong_default(value: Collections):
+    # error: [invalid-argument-type]
+    strings(getattr(value, "collection", 42))
+
+def wrong_empty_default(value: Collections) -> Mapping[str, Iterable[str]]:
+    # error: [invalid-return-type]
+    return getattr(value, "mapping", [])
 ```
 
 ## Typing-only operations

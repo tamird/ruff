@@ -6157,10 +6157,15 @@ fn supplied_getter_storage_contextualizes_empty_defaults() -> anyhow::Result<()>
         .with_file(
             "/src/native.pyi",
             r#"
-from collections.abc import Iterable, Mapping
-from typing import Any
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from typing import Any, Protocol
 from typing_extensions import NotRequired, TypedDict
 
+class StaticCollection[T](Iterable[T], Protocol):
+    def __len__(self) -> int: ...
+    def __contains__(self, value: object, /) -> bool: ...
+class TaggedCollection[T](StaticCollection[T], Protocol):
+    tag: str
 class Row(TypedDict):
     key: int
 class Required(TypedDict, closed=True):
@@ -6173,6 +6178,11 @@ class Optional(TypedDict, closed=True):
     items: NotRequired[list[str]]
     mapping: NotRequired[dict[str, int]]
     iterable: NotRequired[Iterable[str]]
+    collection: NotRequired[StaticCollection[str]]
+    union_collection: NotRequired[StaticCollection[str | int]]
+    tagged_collection: NotRequired[TaggedCollection[str]]
+    python_collection: NotRequired[Collection[str]]
+    sequence: NotRequired[Sequence[str]]
     abstract_mapping: NotRequired[Mapping[str, Iterable[str]]]
     row: NotRequired[Row]
     nullable: NotRequired[list[str] | None]
@@ -6213,6 +6223,16 @@ def optional_dict(value: Store[Optional]):
     return lookup(value, "mapping", {})
 def optional_iterable(value: Store[Optional]):
     return lookup(value, "iterable", [])
+def optional_collection(value: Store[Optional]):
+    return lookup(value, "collection", [])
+def optional_union_collection(value: Store[Optional]):
+    return lookup(value, "union_collection", [])
+def optional_tagged_collection(value: Store[Optional]):
+    return lookup(value, "tagged_collection", [])
+def optional_python_collection(value: Store[Optional]):
+    return lookup(value, "python_collection", [])
+def optional_sequence(value: Store[Optional]):
+    return lookup(value, "sequence", [])
 def optional_mapping(value: Store[Optional]):
     return lookup(value, "abstract_mapping", {})
 def missing_alternative(value: Store[Optional] | Store[Missing]):
@@ -6298,6 +6318,12 @@ def division_default(value: Store[Required]):
             ("optional_list", "list[str]".into()),
             ("optional_dict", "dict[str, int]".into()),
             ("optional_iterable", "list[str]".into()),
+            ("optional_collection", "list[str]".into()),
+            ("optional_union_collection", "list[str | int]".into()),
+            ("optional_tagged_collection", "list[Any]".into()),
+            // Python's Collection inherits Container[Any], so its full protocol is gradual.
+            ("optional_python_collection", "list[Any]".into()),
+            ("optional_sequence", "list[str]".into()),
             ("optional_mapping", "dict[str, Iterable[str]]".into()),
             ("missing_alternative", "list[str]".into()),
             ("optional_row", "dict[Any, Any]".into()),

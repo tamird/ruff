@@ -8571,7 +8571,7 @@ impl<'db> Binding<'db> {
         }
     }
 
-    /// Supplies context for a fresh empty default whose kind matches a finite lookup result.
+    /// Supplies context for a fresh empty default compatible with a finite lookup result.
     pub(crate) fn empty_getattr_default_context(
         &self,
         db: &'db dyn Db,
@@ -8600,26 +8600,24 @@ impl<'db> Binding<'db> {
         if !context.is_fully_static(db, env) {
             return None;
         }
-        let matching_kind = |ty: &Type<'db>| {
-            let class = match ty {
-                Type::NominalInstance(instance) => instance.class(db, env).known(db),
-                Type::ProtocolInstance(protocol) => {
-                    protocol.class_origin(db).and_then(|class| class.known(db))
-                }
-                _ => None,
-            };
-            match collection {
-                KnownClass::List => matches!(class, Some(KnownClass::List | KnownClass::Iterable)),
-                KnownClass::Dict => matches!(class, Some(KnownClass::Dict | KnownClass::Mapping)),
-                _ => false,
+        let default = collection.to_instance_unknown(db, env);
+        if default.is_dynamic() {
+            return None;
+        }
+        let compatible = |ty: &Type<'db>| {
+            match ty {
+                Type::NominalInstance(_) => {}
+                Type::ProtocolInstance(_) => {}
+                _ => return false,
             }
+            default.is_assignable_to(db, env, *ty)
         };
         let matches = match context.expand_top_level_aliases(db, env) {
-            Type::Union(union) => union.elements(db).iter().all(matching_kind),
-            context => matching_kind(&context),
+            Type::Union(union) => union.elements(db).iter().all(compatible),
+            context => compatible(&context),
         };
-        // A TypedDict or a different container kind can impose obligations on an empty default.
-        // An empty builtin list or dict has no such obligations on its elements.
+        // A TypedDict can require keys even when its value types are compatible. Ordinary
+        // instances and protocols instead let the container relation check their requirements.
         matches.then(|| {
             ArgumentTypeContext::standard(
                 self.signature.parameters()[parameter.index].annotated_type(),
