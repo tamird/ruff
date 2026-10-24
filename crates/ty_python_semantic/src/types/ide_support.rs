@@ -1070,11 +1070,6 @@ fn displayed_parameters_for_signature<'db>(
     display_details: &crate::types::display::SignatureDisplayDetails,
     specialization: Option<crate::types::generics::Specialization<'db>>,
 ) -> (Vec<CallSignatureParameter<'db>>, Vec<Option<usize>>) {
-    // Apply any inferred specialization to displayed parameter types so
-    // call-site substitutions are reflected in the rendered signature. For
-    // example, if `_KT` was inferred as `str`, display `str` instead of `_KT`.
-    let apply_specialization =
-        |ty: Type<'db>| specialization.map_or(ty, |spec| ty.apply_specialization(db, spec));
     let parameters = signature.parameters();
 
     match parameters.kind() {
@@ -1111,7 +1106,9 @@ fn displayed_parameters_for_signature<'db>(
                 displayed_parameters.push(CallSignatureParameter {
                     label,
                     name,
-                    ty: apply_specialization(parameter.annotated_type()),
+                    ty: parameter
+                        .annotated_type()
+                        .apply_optional_specialization(db, specialization),
                     is_positional_only: parameter.is_positional_only(),
                     is_variadic: parameter.is_variadic(),
                     is_keyword_variadic: parameter.is_keyword_variadic(),

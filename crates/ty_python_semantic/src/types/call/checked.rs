@@ -100,6 +100,17 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
         self.argument_at(parameter)
     }
 
+    /// The named parameter's annotated type, specialized for this binding.
+    pub fn expected_parameter_type(&self, db: &'db dyn Db, name: &str) -> Option<Type<'db>> {
+        let index = self.parameter_index(name)?;
+        let parameter = self.binding.signature.parameters().get(index)?;
+        Some(
+            parameter
+                .annotated_type()
+                .apply_optional_specialization(db, self.binding.merged_specialization(db)),
+        )
+    }
+
     /// Known entries of a definitely supplied dictionary argument.
     pub fn dictionary_argument(&self, db: &'db dyn Db, name: &str) -> Option<DictionaryItems<'db>> {
         let parameter = self.parameter_index(name)?;

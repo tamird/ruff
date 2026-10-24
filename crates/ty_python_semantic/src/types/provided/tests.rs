@@ -2454,17 +2454,24 @@ fn supplied_call_results_follow_selected_overloads() -> anyhow::Result<()> {
                     call.argument("rejected"),
                     CheckedArgument::Value { .. }
                 ));
-                let value = if matches!(call.argument("one"), CheckedArgument::Value { .. }) {
-                    1
-                } else {
-                    assert!(matches!(
-                        call.argument("two"),
-                        CheckedArgument::Value { .. }
-                    ));
-                    2
-                };
+                let (parameter, value, expected) =
+                    if matches!(call.argument("one"), CheckedArgument::Value { .. }) {
+                        ("one", 1, KnownClass::Int)
+                    } else {
+                        assert!(matches!(
+                            call.argument("two"),
+                            CheckedArgument::Value { .. }
+                        ));
+                        ("two", 2, KnownClass::Str)
+                    };
+                let env = ProgramEnvironment::from_file(call.file());
+                assert_eq!(
+                    call.expected_parameter_type(db, parameter),
+                    Some(expected.to_instance(db, &env)),
+                );
                 Some(Type::int_literal(value)).into()
             }
+            Some("generic") => call.expected_parameter_type(db, "value").into(),
             Some("expanded") => panic!("expanded arguments do not retain every checked binding"),
             Some("shared") => Some(Type::int_literal(3)).into(),
             Some("partial") if matches!(call.argument("one"), CheckedArgument::Value { .. }) => {
@@ -2511,18 +2518,22 @@ def expanded(one: int) -> int: ...
 def expanded(two: str) -> str: ...
 def recover(value: int) -> int: ...
 def gradual() -> Any: ...
+def generic[T](values: list[T], value: T) -> object: ...
 "#,
         )
         .with_file(
             "/src/main.py",
             r#"
-from native import select, first, ambiguous, shared, partial, expanded, recover, gradual
+from native import select, first, ambiguous, shared, partial, expanded, recover, gradual, generic
 from typing import Literal
 from typing_extensions import assert_type
 
 assert_type(select(1), Literal[1])
 assert_type(select("a", "b"), Literal[2])
 assert_type(first(1), Literal[1])
+integers: list[int] = []
+assert_type(generic(integers, value=True), int)
+assert_type(generic(integers, **{"value": True}), int)
 value = gradual()
 ambiguous_result = ambiguous(value)
 assert_type(shared(value), Literal[3])
