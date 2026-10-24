@@ -28,7 +28,7 @@ use crate::provided::ProvidedBindingValue;
 use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
 use crate::types::call::{Argument, CallArguments};
 use crate::types::infer::{
-    DefinitionInference, FunctionBodyDomain, StatementInference, infer_definition_with_body_domain,
+    FunctionBodyDomain, StatementInference, infer_definition_with_body_domain,
     infer_statement_with_body_domain,
 };
 use crate::types::narrow::NarrowingEvaluatorExtension;
@@ -867,7 +867,9 @@ fn initial_contents<'db>(
         return ContentsValue::Pending;
     }
     let builtin_allocation = !owner_inference.discards_dict_key_assignments()
-        && value.is_some_and(|value| is_builtin_allocation(db, value, owner_inference));
+        && value.is_some_and(|value| {
+            is_builtin_allocation(db, value, &|expr| owner_inference.try_expression_type(expr))
+        });
     let observed = value
         .filter(|value| {
             !owner_inference.discards_dict_key_assignments()
@@ -1184,17 +1186,16 @@ fn inert_field_argument(expression: &ast::Expr) -> bool {
 fn is_builtin_allocation<'db>(
     db: &'db dyn Db,
     value: &ast::Expr,
-    inference: &DefinitionInference<'db>,
+    expression_type: &impl Fn(&ast::Expr) -> Option<Type<'db>>,
 ) -> bool {
     match value {
         ast::Expr::Dict(_) => true,
         ast::Expr::DictComp(_) => true,
         ast::Expr::If(conditional) => {
-            is_builtin_allocation(db, &conditional.body, inference)
-                && is_builtin_allocation(db, &conditional.orelse, inference)
+            is_builtin_allocation(db, &conditional.body, expression_type)
+                && is_builtin_allocation(db, &conditional.orelse, expression_type)
         }
-        ast::Expr::Call(call) => inference
-            .try_expression_type(&call.func)
+        ast::Expr::Call(call) => expression_type(&call.func)
             .and_then(Type::as_class_literal)
             .is_some_and(|class| class.is_known(db, KnownClass::Dict)),
         _ => false,
@@ -1226,7 +1227,9 @@ fn fresh_allocation<'db>(
     if StatementInference::Definition(owner, inference).is_provisional() {
         return KeyPreservation::Pending;
     }
-    if !inference.discards_dict_key_assignments() && is_builtin_allocation(db, value, inference) {
+    if !inference.discards_dict_key_assignments()
+        && is_builtin_allocation(db, value, &|expr| inference.try_expression_type(expr))
+    {
         KeyPreservation::Preserved
     } else {
         KeyPreservation::Changed
@@ -2479,6 +2482,35 @@ pub(crate) fn at_snapshot<'db>(
         ContentsValue::Pending => Err(DictionaryFallback::Unavailable),
         ContentsValue::Unavailable => Err(DictionaryFallback::Unavailable),
     }
+}
+
+/// A later argument can mutate a previously evaluated dictionary before the callee receives
+/// it. A fresh allocation has no earlier reference through which it could be changed.
+pub(crate) fn needs_call_snapshot<'db>(
+    db: &'db dyn Db,
+    call: &ast::ExprCall,
+    expression: &ast::Expr,
+    expression_type: impl Fn(&ast::Expr) -> Option<Type<'db>>,
+) -> Option<bool> {
+    if is_builtin_allocation(db, expression, &expression_type) {
+        return Some(false);
+    }
+    // Python evaluates all positional arguments (including starred ones) before keywords.
+    let mut arguments = call
+        .arguments
+        .args
+        .iter()
+        .map(ast::ArgOrKeyword::Arg)
+        .chain(
+            call.arguments
+                .keywords
+                .iter()
+                .map(ast::ArgOrKeyword::Keyword),
+        );
+    arguments.find(|argument| std::ptr::eq(argument.value(), expression))?;
+    Some(
+        arguments.any(|argument| argument.is_variadic() || !inert_field_argument(argument.value())),
+    )
 }
 
 /// Observe the dictionary stored under a key of an unpacked call argument after all arguments

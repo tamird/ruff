@@ -11,6 +11,7 @@ use ruff_python_ast as ast;
 mod arguments;
 mod checked;
 pub(super) use arguments::collect_keyword_items;
+pub(crate) use checked::DictionaryAccess;
 pub use checked::{CheckedArgument, CheckedCall};
 pub(crate) mod bind;
 pub(super) use arguments::{Argument, CallArguments};

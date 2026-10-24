@@ -3740,10 +3740,20 @@ def use() -> None:
 #[test]
 fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
     fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
-        if call.declaration()?.name(db)?.as_str() != "observe" {
-            return None;
-        }
-        let description = match call.dictionary_argument(db, "value") {
+        let contents = match call.declaration()?.name(db)?.as_str() {
+            "observe" => call.dictionary_argument(db, "value"),
+            "observe_child" => {
+                let [argument] = call.call().arguments.args.as_slice() else {
+                    return None;
+                };
+                let [element] = argument.as_tuple_expr()?.elts.as_slice() else {
+                    return None;
+                };
+                call.dictionary_items(db, element)
+            }
+            _ => return None,
+        };
+        let description = match contents {
             None => "unavailable".to_owned(),
             Some(dictionary) => match dictionary.first_entry {
                 DictionaryFirstEntry::Unknown => "unknown".to_owned(),
@@ -3761,7 +3771,7 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file(
             "/src/native.pyi",
-            "def observe(value: object) -> str: ...\ndef expose(value: object) -> None: ...\ndef preserve(data: object, other: object = ...) -> object: ...\nflag: bool\nkey: str\n",
+            "def observe(value: object, other: object = ...) -> str: ...\ndef observe_child(value: object, other: object = ...) -> str: ...\ndef expose(value: object) -> None: ...\ndef preserve(data: object, other: object = ...) -> object: ...\nflag: bool\nkey: str\n",
         )
         .with_file("/src/main.py", "")
 .with_call_result_provider(|db, call| observe(db, call).into())
@@ -3780,6 +3790,58 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
     for (source, expected) in [
         ("result = observe({})", "empty"),
         ("result = observe(dict())", "empty"),
+        (
+            "values = {'first': 1}\nresult = observe(value=values, *(values.clear() or ()))",
+            "empty",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(other=values.clear(), *(values,))",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe_child((values,), other=values.clear())",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(value=values, other=values.clear())",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, other=values.clear())",
+            "empty",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, values.update({'first': 2}))",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, other=values.update({'first': 2}))",
+            "first: Literal[2]",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, (values := {'new': 2}))",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, other=(values := {'new': 2}))",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe({'fresh': 3}, expose(values))",
+            "fresh: Literal[3]",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values if flag else values, other=values.clear())",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(dict(), other=values.clear())",
+            "empty",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(value=values, other='doc')",
+            "first: Literal[1]",
+        ),
         (
             "values = {'first': 1}\npreserve(values)\npreserve(data=values)\nresult = observe(values)",
             "first: Literal[1]",
@@ -3951,7 +4013,9 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
     ] {
         db.write_file(
             "/src/main.py",
-            format!("from native import observe, expose, preserve, flag, key\n{source}\n"),
+            format!(
+                "from native import observe, observe_child, expose, preserve, flag, key\n{source}\n"
+            ),
         )?;
         let diagnostics = db.check_file(file);
         assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");

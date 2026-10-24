@@ -23,6 +23,14 @@ pub enum CheckedArgument<'a, 'db> {
     Indeterminate,
 }
 
+/// Where to observe the dictionary associated with a checked call.
+#[derive(Clone, Copy)]
+pub(crate) enum DictionaryAccess<'a> {
+    Expression,
+    Argument,
+    UnpackedArgument(&'a str),
+}
+
 enum ArgumentSource<'a> {
     Expression(&'a ast::Expr),
     KeywordUnpacking(&'a ast::Expr),
@@ -51,7 +59,7 @@ pub struct CheckedCall<'a, 'db> {
     pub(crate) call: &'a ast::ExprCall,
     pub(crate) expression_type: &'a dyn Fn(&ast::Expr) -> Option<Type<'db>>,
     pub(crate) dictionary_items:
-        &'a dyn Fn(&ast::Expr, Type<'db>, Option<&str>) -> Option<DictionaryItems<'db>>,
+        &'a dyn Fn(&ast::Expr, Type<'db>, DictionaryAccess<'_>) -> Option<DictionaryItems<'db>>,
     pub(crate) class_anchor: &'a dyn Fn(Box<[Type<'db>]>) -> DynamicClassAnchor<'db>,
     pub(crate) has_binding_errors: bool,
 }
@@ -111,25 +119,25 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
         )
     }
 
-    /// Known entries of a definitely supplied dictionary argument.
+    /// Known entries of a definitely supplied dictionary after all arguments have evaluated.
     pub fn dictionary_argument(&self, db: &'db dyn Db, name: &str) -> Option<DictionaryItems<'db>> {
         let parameter = self.parameter_index(name)?;
         let (ty, source) = self.matched_value(parameter).ok()?;
-        let (expression, keyword) = match source {
-            ArgumentSource::Expression(expression) => (expression, None),
+        let (expression, access) = match source {
+            ArgumentSource::Expression(expression) => (expression, DictionaryAccess::Argument),
             ArgumentSource::KeywordUnpacking(expression) => {
                 // A variadic parameter's name does not identify the caller's keyword.
                 if self.binding.signature.parameters()[parameter].is_variadic() {
                     return None;
                 }
-                (expression, Some(name))
+                (expression, DictionaryAccess::UnpackedArgument(name))
             }
             ArgumentSource::Receiver => return None,
         };
-        self.observed_dictionary_items(db, expression, ty, keyword)
+        self.observed_dictionary_items(db, expression, ty, access)
     }
 
-    /// Dictionary entries observed for an already inferred child expression of this call.
+    /// Dictionary entries when an already inferred child expression of this call was evaluated.
     /// Optional entries and residual value bounds do not establish that a key is present.
     pub fn dictionary_items(
         &self,
@@ -137,7 +145,7 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
         expression: &ast::Expr,
     ) -> Option<DictionaryItems<'db>> {
         let ty = self.expression_type(expression)?;
-        self.observed_dictionary_items(db, expression, ty, None)
+        self.observed_dictionary_items(db, expression, ty, DictionaryAccess::Expression)
     }
 
     fn observed_dictionary_items(
@@ -145,9 +153,9 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
         db: &'db dyn Db,
         expression: &ast::Expr,
         ty: Type<'db>,
-        keyword: Option<&str>,
+        access: DictionaryAccess<'_>,
     ) -> Option<DictionaryItems<'db>> {
-        (self.dictionary_items)(expression, ty, keyword).or_else(|| {
+        (self.dictionary_items)(expression, ty, access).or_else(|| {
             let env = ProgramEnvironment::from_file(self.file);
             DictionaryItems::from_typed_dict_type(db, &env, ty, expression.range())
         })

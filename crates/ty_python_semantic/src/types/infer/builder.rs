@@ -61,7 +61,9 @@ use crate::types::call::bind::{
     ArgumentTypeContext, ArgumentTypeContextSource, CallableDescription, CheckTypesMode,
     OverloadSet, requires_overload_evaluation,
 };
-use crate::types::call::{Binding, Bindings, CallArguments, CallError, CallErrorKind};
+use crate::types::call::{
+    Binding, Bindings, CallArguments, CallError, CallErrorKind, DictionaryAccess,
+};
 use crate::types::callable::CallableTypeKind;
 use crate::types::class::{
     ClassLiteral, CodeGeneratorKind, FrozenDataclassDispatch, MethodDecorator, StaticClassLiteral,
@@ -9696,22 +9698,47 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         call: &ast::ExprCall,
         expression: &ast::Expr,
         ty: Type<'db>,
-        keyword: Option<&str>,
+        access: DictionaryAccess<'_>,
     ) -> Option<DictionaryItems<'db>> {
-        match keyword {
-            Some(_) if self.in_detached_annotation() => None,
-            Some(name) => DictionaryItems::unpacked_keyword(
-                self.db(),
-                self.scope(),
-                expression,
-                call,
-                name,
-                self.reachability_cache(),
-            ),
-            None => {
-                let items = self.dictionary_items(expression, ty)?;
-                if items.is_complete() || !expression.is_name_expr() {
-                    return Some(items);
+        match access {
+            DictionaryAccess::UnpackedArgument(name) => {
+                if self.in_detached_annotation() {
+                    return None;
+                }
+                DictionaryItems::unpacked_keyword(
+                    self.db(),
+                    self.scope(),
+                    expression,
+                    call,
+                    name,
+                    self.reachability_cache(),
+                )
+            }
+            DictionaryAccess::Expression | DictionaryAccess::Argument => {
+                let items = if matches!(access, DictionaryAccess::Argument)
+                    && !self.in_detached_annotation()
+                    && crate::types::dictionary::contents::needs_call_snapshot(
+                        self.db(),
+                        call,
+                        expression,
+                        |expr| self.try_expression_type(expr),
+                    )? {
+                    crate::types::dictionary::contents::at_snapshot(
+                        self.db(),
+                        self.scope(),
+                        expression,
+                        call.into(),
+                        ty,
+                        self.reachability_cache(),
+                    )
+                    .ok()
+                } else {
+                    self.dictionary_items(expression, ty)
+                };
+                if !expression.is_name_expr()
+                    || items.as_ref().is_some_and(DictionaryItems::is_complete)
+                {
+                    return items;
                 }
                 crate::types::dictionary::contents::retained_argument_items(
                     self.db(),
@@ -9720,7 +9747,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     expression,
                     self.reachability_cache(),
                 )
-                .or(Some(items))
+                .or(items)
             }
         }
     }
@@ -10715,8 +10742,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
-        let dictionary_items = |expression: &ast::Expr, ty, keyword: Option<&str>| {
-            self.call_dictionary_items(call_expression, expression, ty, keyword)
+        let dictionary_items = |expression: &ast::Expr, ty, access: DictionaryAccess<'_>| {
+            self.call_dictionary_items(call_expression, expression, ty, access)
         };
         let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
             scope: self.scope(),
@@ -11001,8 +11028,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return;
         };
         let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
-        let dictionary_items = |expression: &ast::Expr, ty, keyword: Option<&str>| {
-            self.call_dictionary_items(call, expression, ty, keyword)
+        let dictionary_items = |expression: &ast::Expr, ty, access: DictionaryAccess<'_>| {
+            self.call_dictionary_items(call, expression, ty, access)
         };
         let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
             scope: self.scope(),
@@ -11044,8 +11071,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         has_binding_errors: bool,
     ) {
         let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
-        let dictionary_items = |expression: &ast::Expr, ty, keyword: Option<&str>| {
-            self.call_dictionary_items(call, expression, ty, keyword)
+        let dictionary_items = |expression: &ast::Expr, ty, access: DictionaryAccess<'_>| {
+            self.call_dictionary_items(call, expression, ty, access)
         };
         let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
             scope: self.scope(),
