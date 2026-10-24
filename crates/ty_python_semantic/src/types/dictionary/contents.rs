@@ -50,6 +50,23 @@ pub(super) enum ContentsValue<'db> {
     Mapping(MappingContents<'db>),
 }
 
+impl<'db> ContentsValue<'db> {
+    pub(super) fn builtin_items(self) -> DictionaryObservation<'db> {
+        match self {
+            Self::Mapping(mapping) => {
+                if mapping.builtin {
+                    Ok(mapping.dictionary)
+                } else {
+                    Err(DictionaryFallback::Unavailable)
+                }
+            }
+            Self::Unreachable => Err(DictionaryFallback::Unreachable),
+            Self::Pending => Err(DictionaryFallback::Unavailable),
+            Self::Unavailable => Err(DictionaryFallback::Unavailable),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
 pub(super) struct MappingContents<'db> {
     /// All ranges belong to this file. Copying from another file rebases them to the local use.
@@ -2488,8 +2505,10 @@ pub(crate) fn at_snapshot<'db>(
 /// it. A fresh allocation has no earlier reference through which it could be changed.
 pub(crate) fn needs_call_snapshot<'db>(
     db: &'db dyn Db,
+    scope: ScopeId<'db>,
     call: &ast::ExprCall,
     expression: &ast::Expr,
+    reachability: &ReachabilityEvaluationCache<'db>,
     expression_type: impl Fn(&ast::Expr) -> Option<Type<'db>>,
 ) -> Option<bool> {
     if is_builtin_allocation(db, expression, &expression_type) {
@@ -2508,9 +2527,31 @@ pub(crate) fn needs_call_snapshot<'db>(
                 .map(ast::ArgOrKeyword::Keyword),
         );
     arguments.find(|argument| std::ptr::eq(argument.value(), expression))?;
-    Some(
-        arguments.any(|argument| argument.is_variadic() || !inert_field_argument(argument.value())),
-    )
+    if !arguments.any(|argument| argument.is_variadic() || !inert_field_argument(argument.value()))
+    {
+        return Some(false);
+    }
+    let ast::Expr::BinOp(ast::ExprBinOp {
+        node_index: _,
+        range: _,
+        left,
+        op: ast::Operator::BitOr,
+        right,
+    }) = expression
+    else {
+        return Some(true);
+    };
+    // A builtin union copies the slots of both operands before the next argument runs.
+    // An overloaded operator could return an existing mapping instead.
+    let builtin = |operand: &ast::Expr| {
+        is_builtin_allocation(db, operand, &expression_type)
+            || expression_type(operand).is_some_and(|ty| {
+                snapshot_contents(db, scope, operand, operand.into(), ty, reachability)
+                    .builtin_items()
+                    .is_ok()
+            })
+    };
+    Some(!builtin(left) || !builtin(right))
 }
 
 /// Observe the dictionary stored under a key of an unpacked call argument after all arguments

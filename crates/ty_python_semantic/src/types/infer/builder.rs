@@ -9719,8 +9719,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     && !self.in_detached_annotation()
                     && crate::types::dictionary::contents::needs_call_snapshot(
                         self.db(),
+                        self.scope(),
                         call,
                         expression,
+                        self.reachability_cache(),
                         |expr| self.try_expression_type(expr),
                     )? {
                     crate::types::dictionary::contents::at_snapshot(

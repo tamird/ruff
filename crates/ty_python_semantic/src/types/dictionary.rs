@@ -968,18 +968,7 @@ impl<'db> DictionaryItems<'db> {
                 .reachability_constraints(),
         )
         .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
-        match contents::snapshot_contents(db, scope, source, snapshot, ty, &cache) {
-            contents::ContentsValue::Mapping(mapping) => {
-                if mapping.builtin {
-                    Ok(mapping.dictionary)
-                } else {
-                    Err(DictionaryFallback::Unavailable)
-                }
-            }
-            contents::ContentsValue::Unreachable => Err(DictionaryFallback::Unreachable),
-            contents::ContentsValue::Pending => Err(DictionaryFallback::Unavailable),
-            contents::ContentsValue::Unavailable => Err(DictionaryFallback::Unavailable),
-        }
+        contents::snapshot_contents(db, scope, source, snapshot, ty, &cache).builtin_items()
     }
 
     pub(super) fn literal(

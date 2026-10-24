@@ -3932,6 +3932,30 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
             "empty",
         ),
         (
+            "left = {'first': 'old'}\nright = {'first': 2}\nresult = observe(left | right, other=right.clear())",
+            "first: Literal[2]",
+        ),
+        (
+            "shared = {'first': 2}\nclass Alias(dict[str, int]):\n    def __ror__(self, other: object) -> dict[str, int]: return shared\nresult = observe({'first': 1} | Alias(), other=shared.clear())",
+            "unavailable",
+        ),
+        (
+            "shared = {'first': 2}\nclass Alias(dict[str, int]):\n    def __or__(self, other: object) -> dict[str, int]: return shared\nleft = Alias()\nresult = observe(left | {'replacement': (left := {})}, other=shared.clear())",
+            "unavailable",
+        ),
+        (
+            "child = {'first': 1}\nleft = {'nested': child}\nresult = observe((left | {})['nested'], other=child.clear())",
+            "unavailable",
+        ),
+        (
+            "left = {'first': 1}\noriginal = left\nresult = observe(left | {'replacement': (left := {})}, other=original.clear())",
+            "unavailable",
+        ),
+        (
+            "left = {'first': 1}\nresult = observe(left | {'replacement': left.clear()}, other=left.clear())",
+            "replacement: None",
+        ),
+        (
             "values = {'first': 1}\nresult = observe(values, values.update({'first': 2}))",
             "unavailable",
         ),
