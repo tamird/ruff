@@ -240,6 +240,17 @@ impl<'db> SemanticModel<'db> {
         }
     }
 
+    /// Observes a named dictionary after the host freezes this module's exports.
+    ///
+    /// The returned file owns the entries' source ranges. Callers applying these facts to
+    /// another expression must establish that the module completed before that expression.
+    pub fn frozen_export_dictionary_items(
+        &self,
+        name: &str,
+    ) -> Option<(ProgramFile<'db>, DictionaryItems<'db>)> {
+        crate::types::dictionary::contents::frozen_export_items(self.db, self.file, name)
+    }
+
     pub(crate) fn dictionary_observation(
         &self,
         expression: &Expr,

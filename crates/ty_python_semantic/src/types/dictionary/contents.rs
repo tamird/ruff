@@ -826,7 +826,6 @@ fn initial_contents<'db>(
             name,
             value: None,
         } = db.provided_binding(definition).value
-        && db.provided_exports_are_frozen(file)
         && let Some(mut contents) = frozen_export_contents(db, file, &name)
     {
         if let ContentsValue::Mapping(mapping) = &mut contents {
@@ -1056,6 +1055,17 @@ fn initial_contents<'db>(
     ContentsValue::Mapping(mapping)
 }
 
+pub(crate) fn frozen_export_items<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    name: &str,
+) -> Option<(ProgramFile<'db>, DictionaryItems<'db>)> {
+    let ContentsValue::Mapping(mapping) = frozen_export_contents(db, file, name)? else {
+        return None;
+    };
+    Some((mapping.file, mapping.dictionary))
+}
+
 /// Observe completion through the same reaching definitions as local dictionary reads.
 /// Missing indexed history declines; no initializer snapshot can stand in for later effects.
 fn frozen_export_contents<'db>(
@@ -1063,6 +1073,9 @@ fn frozen_export_contents<'db>(
     file: ProgramFile<'db>,
     name: &str,
 ) -> Option<ContentsValue<'db>> {
+    if !db.provided_exports_are_frozen(file) {
+        return None;
+    }
     let scope = ty_python_core::global_scope(db, file);
     let index = semantic_index(db, file);
     let table = index.place_table(scope.file_scope_id(db));

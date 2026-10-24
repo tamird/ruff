@@ -2508,21 +2508,31 @@ fn frozen_exports_observe_completed_mapping_contents() -> anyhow::Result<()> {
             };
             let model = SemanticModel::new(&db, program);
             let items = model.dictionary_items(&call.arguments.args[0]);
-            let name = items.as_ref().and_then(|items| {
-                items
-                    .items
-                    .iter()
-                    .find(|item| item.name == "name" && item.is_required())
-            });
-            assert_eq!(
-                name.map(|item| item
-                    .ty
-                    .display(&db, &model.program_environment())
-                    .to_string())
-                    .as_deref(),
-                expected.filter(|_| frozen),
-                "frozen={frozen}, {exporter}: {items:?}",
-            );
+            let exporter_file = system_path_to_file(&db, "/src/exporter.py")?;
+            let exporter_program = db.program_file(exporter_file);
+            let exported = SemanticModel::new(&db, exporter_program)
+                .frozen_export_dictionary_items("attrs")
+                .map(|(source, items)| {
+                    assert_eq!(source, exporter_program);
+                    items
+                });
+            for items in [items, exported] {
+                let name = items.as_ref().and_then(|items| {
+                    items
+                        .items
+                        .iter()
+                        .find(|item| item.name == "name" && item.is_required())
+                });
+                assert_eq!(
+                    name.map(|item| item
+                        .ty
+                        .display(&db, &model.program_environment())
+                        .to_string())
+                        .as_deref(),
+                    expected.filter(|_| frozen),
+                    "frozen={frozen}, {exporter}: {items:?}",
+                );
+            }
         }
     }
 
