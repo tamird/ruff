@@ -110,14 +110,24 @@ impl<'db> Type<'db> {
         Type::Callable(CallableType::single(db, signature))
     }
 
+    /// Returns the overloads when this type has exactly one callable alternative.
+    pub fn callable_overloads(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<&'db [Signature<'db>]> {
+        let callables = self.try_upcast_to_callable(db, env)?;
+        let callable = callables.exactly_one()?;
+        Some(callable.signatures(db).overloads.as_slice())
+    }
+
     /// Returns the signature when this type has exactly one callable alternative and overload.
     pub fn single_callable_signature(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> Option<&'db Signature<'db>> {
-        let callable = self.try_upcast_to_callable(db, env)?.exactly_one()?;
-        let [signature] = callable.signatures(db).overloads.as_slice() else {
+        let [signature] = self.callable_overloads(db, env)? else {
             return None;
         };
         Some(signature)

@@ -1242,13 +1242,15 @@ fn supplied_type_applications_infer_callable_values() -> anyhow::Result<()> {
         .with_file(
             "/src/contracts.pyi",
             "from typing import Callable, overload\n\
+             from ty_extensions import Intersection\n\
              class Arguments: ...\n\
              def target(*, required: str, optional: int = ...) -> None: ...\n\
              @overload\n\
              def overloaded(value: int) -> int: ...\n\
              @overload\n\
              def overloaded(value: str) -> str: ...\n\
-             alternatives: Callable[[int], int] | Callable[[str], str]\n",
+             alternatives: Callable[[int], int] | Callable[[str], str]\n\
+             intersection: Intersection[Callable[[int], int], Callable[[str], str]]\n",
         )
         .with_file(
             "/src/main.py",
@@ -1274,10 +1276,36 @@ def scoped() -> None:
     );
     let contracts = db.program_file(system_path_to_file(&db, "/src/contracts.pyi")?);
     let env = ProgramEnvironment::from_file(contracts);
-    for name in ["overloaded", "alternatives"] {
+    let target = crate::place::global_symbol(&db, contracts, "target")
+        .place
+        .expect_type();
+    let overloads = target.callable_overloads(&db, &env).unwrap();
+    assert_eq!(overloads.len(), 1);
+    assert_eq!(
+        &overloads[0],
+        target.single_callable_signature(&db, &env).unwrap()
+    );
+
+    let overloaded = crate::place::global_symbol(&db, contracts, "overloaded")
+        .place
+        .expect_type();
+    let overloads = overloaded.callable_overloads(&db, &env).unwrap();
+    assert_eq!(overloads.len(), 2);
+    assert_eq!(
+        overloads[0].return_type(),
+        KnownClass::Int.to_instance(&db, &env)
+    );
+    assert_eq!(
+        overloads[1].return_type(),
+        KnownClass::Str.to_instance(&db, &env)
+    );
+    assert!(overloaded.single_callable_signature(&db, &env).is_none());
+
+    for name in ["alternatives", "intersection"] {
         let callable = crate::place::global_symbol(&db, contracts, name)
             .place
             .expect_type();
+        assert!(callable.callable_overloads(&db, &env).is_none());
         assert!(callable.single_callable_signature(&db, &env).is_none());
     }
     Ok(())
