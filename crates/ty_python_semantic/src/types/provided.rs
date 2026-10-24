@@ -714,8 +714,13 @@ impl<'db> Type<'db> {
         let ClassLiteral::Dynamic(class) = class else {
             return None;
         };
-        let source = class.instance_fields_source(db).as_ref()?;
-        match source {
+        class.provided_data(db)
+    }
+}
+
+impl<'db> DynamicClassLiteral<'db> {
+    pub(super) fn provided_data(self, db: &'db dyn Db) -> Option<&'db ProvidedData> {
+        match self.instance_fields_source(db).as_ref()? {
             ProvidedInstanceFieldsSource::Eager(fields) => fields.data.as_ref(),
             ProvidedInstanceFieldsSource::Deferred(data) => Some(data),
         }

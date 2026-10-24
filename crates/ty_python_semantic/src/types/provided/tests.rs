@@ -2356,6 +2356,127 @@ crate::declare_lint! {
 }
 
 #[test]
+fn supplied_call_target_uses_ordinary_binding_without_changing_other_uses() -> anyhow::Result<()> {
+    let source = "\
+from native import Ordinary, make
+proxy = make()
+read = proxy
+valid: int = proxy(checked=1)
+invalid = proxy(checked='bad')
+ordinary: object = proxy(unchecked='ok')
+proxy(rejected=True)
+proxy(rejected=True)  # ty: ignore[invalid-argument-type]
+Ordinary()(checked='not a proxy')
+if False:
+    proxy(unreachable=True)
+";
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "class Ordinary:\n    def __call__(self, **kwargs: object) -> object: ...\ndef make() -> Ordinary: ...\n",
+        )
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(|db, call| {
+            let Some(declaration) = call.declaration() else {
+                return ProvidedCallResult::default();
+            };
+            if declaration.name(db).as_deref() != Some("make") {
+                return ProvidedCallResult::default();
+            }
+            let env = ProgramEnvironment::from_file(call.file());
+            let base = crate::place::global_symbol(db, declaration.program_file(db), "Ordinary")
+                .place
+                .expect_type();
+            let class = call.class_type(
+                db,
+                ProvidedClass {
+                    name: Name::new_static("Proxy"),
+                    bases: Box::from([base]),
+                    class_members: Box::default(),
+                    instance_fields: ProvidedInstanceFields {
+                        fields: Box::default(),
+                        has_dynamic_fields: false,
+                        implications: Box::default(),
+                        data: Some(ProvidedData::new(Name::new_static("proxy"))),
+                    }
+                    .into(),
+                },
+            );
+            class.to_instance_approximation(db, &env).into()
+        })
+        .with_call_target_provider(|db, file, call, class, data| {
+            assert_eq!(data.downcast_ref::<Name>().map(Name::as_str), Some("proxy"));
+            let [keyword] = call.arguments.keywords.as_ref() else {
+                return Ok(None);
+            };
+            match keyword.arg.as_ref().map(|name| name.as_str()) {
+                Some("unchecked") => return Ok(None),
+                Some("rejected") => {
+                    let mut diagnostic = Diagnostic::new(
+                        DiagnosticId::lint("invalid-argument-type"),
+                        Severity::Error,
+                        "Rejected by the application",
+                    );
+                    diagnostic.annotate(Annotation::primary(
+                        Span::from(file.file(db)).with_range(call.range()),
+                    ));
+                    return Err(diagnostic);
+                }
+                Some("checked") => {}
+                other => panic!("unexpected call target: {other:?}"),
+            }
+            let env = ProgramEnvironment::from_file(file);
+            let int = KnownClass::Int.to_instance(db, &env);
+            let callable = Type::function_like_callable(
+                db,
+                Signature::new(
+                    Parameters::standard([
+                        Parameter::positional_only(Some(Name::new_static("self"))),
+                        Parameter::keyword_only(Name::new_static("checked"))
+                            .with_annotated_type(int),
+                    ]),
+                    int,
+                ),
+            );
+            let class = ProvidedClass {
+                name: Name::new_static("Proxy"),
+                bases: Box::from([class]),
+                class_members: Box::from([(Name::new_static("__call__"), callable)]),
+                instance_fields: ProvidedInstanceFields::default().into(),
+            }
+            .into_type_at_expression(db, file, ast::ExprRef::Call(call))
+            .unwrap();
+            Ok(class.to_instance_approximation(db, &env))
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| &source[diagnostic.range().unwrap()])
+            .collect::<Vec<_>>(),
+        ["checked='bad'", "proxy(rejected=True)"],
+        "{diagnostics:#?}",
+    );
+    let file = db.program_file(file);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type()
+    };
+    assert_eq!(symbol("proxy"), symbol("read"));
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let valid = module.suite()[3].as_ann_assign_stmt().unwrap();
+    let call = valid.value.as_deref().unwrap().as_call_expr().unwrap();
+    let model = SemanticModel::new(&db, file);
+    let target = call.func.inferred_type(&model).unwrap();
+    assert_ne!(target, symbol("proxy"));
+    assert!(target.is_assignable_to(&db, &model.program_environment(), symbol("proxy")));
+    Ok(())
+}
+
+#[test]
 fn supplied_call_diagnostics_follow_native_policy() -> anyhow::Result<()> {
     fn check<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
         if call

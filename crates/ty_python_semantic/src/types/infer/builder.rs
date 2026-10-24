@@ -10151,6 +10151,30 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             Argument(usize),
         }
 
+        if let Type::NominalInstance(instance) = callable_type
+            && let Some((class, data)) = instance.provided_class_data(self.db())
+            && self.context.is_range_reachable(call_expression.range())
+        {
+            match self.db().provided_call_target(
+                self.scope().program_file(self.db()),
+                call_expression,
+                Type::ClassLiteral(class),
+                data,
+            ) {
+                Ok(Some(refined)) => {
+                    self.expressions
+                        .insert(call_expression.func.as_ref().into(), refined);
+                    callable_type = refined;
+                }
+                Ok(None) => {}
+                Err(diagnostic) => {
+                    if self.context.should_collect_diagnostics() {
+                        self.context.extend_provided_diagnostics(vec![diagnostic]);
+                    }
+                }
+            }
+        }
+
         // Structural value checking follows fresh literal children, not arguments
         // passed through calls (including builtin constructor inference shortcuts).
         let call_expression_tcx = TypeContext::new(call_expression_tcx.annotation);

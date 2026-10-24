@@ -9,7 +9,7 @@ use crate::types::CheckedCall;
 use crate::{AnalysisSettings, PythonVersionWithSource};
 use ruff_db::diagnostic::Diagnostic;
 use ruff_db::files::File;
-use ruff_python_ast::{Expr, name::Name};
+use ruff_python_ast::{Expr, ExprCall, name::Name};
 use ty_python_core::definition::Definition;
 use ty_python_core::scope::ScopeId;
 use ty_python_core::{Db as PythonCoreDb, ProgramFile};
@@ -163,6 +163,23 @@ pub trait Db: PythonCoreDb {
         _source: &ProvidedData,
     ) -> Option<ProvidedInstanceFields<'db>> {
         None
+    }
+
+    /// Refines an application-created nominal instance for one call before argument matching.
+    ///
+    /// `class` is the instance's nongeneric dynamic class, which carries the application data.
+    /// The returned type must describe the same runtime value at this use; other uses retain their
+    /// own inferred types. Implementations must read tracked inputs and must not request completed
+    /// inference of the calling scope. An error retains ordinary argument checking and follows
+    /// current lint rules and source suppressions. Unreachable calls are not refined.
+    fn provided_call_target<'db>(
+        &'db self,
+        _file: ProgramFile<'db>,
+        _call: &ExprCall,
+        _class: crate::types::Type<'db>,
+        _data: &ProvidedData,
+    ) -> Result<Option<crate::types::Type<'db>>, Diagnostic> {
+        Ok(None)
     }
 
     /// Supplies result refinements and diagnostics after ordinary argument checking.
@@ -398,6 +415,14 @@ pub(crate) mod tests {
     }
 
     type Events = Arc<Mutex<Vec<salsa::Event>>>;
+    type CallTargetProvider = for<'db> fn(
+        &'db TestDb,
+        ProgramFile<'db>,
+        &ExprCall,
+        crate::types::Type<'db>,
+        &ProvidedData,
+    )
+        -> Result<Option<crate::types::Type<'db>>, Diagnostic>;
     type CallResultProvider =
         for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> crate::provided::ProvidedCallResult<'db>;
     type ContextualParametersProvider = for<'db> fn(&'db TestDb, Definition<'db>) -> Box<[Name]>;
@@ -447,6 +472,7 @@ pub(crate) mod tests {
         analysis_settings: Arc<AnalysisSettings>,
         open_files: rustc_hash::FxHashSet<File>,
         program_settings: ProgramSettings,
+        call_target_provider: Option<CallTargetProvider>,
         call_result_provider: Option<CallResultProvider>,
         contextual_parameters_provider: Option<ContextualParametersProvider>,
         call_argument_context_provider: Option<CallArgumentContextProvider>,
@@ -484,6 +510,7 @@ pub(crate) mod tests {
                 analysis_settings: AnalysisSettings::default().into(),
                 open_files: rustc_hash::FxHashSet::default(),
                 program_settings,
+                call_target_provider: None,
                 call_result_provider: None,
                 contextual_parameters_provider: None,
                 call_argument_context_provider: None,
@@ -653,6 +680,17 @@ pub(crate) mod tests {
                 .and_then(|provider| provider.builtin(self, file, name, usage))
         }
 
+        fn provided_call_target<'db>(
+            &'db self,
+            file: ProgramFile<'db>,
+            call: &ExprCall,
+            class: crate::types::Type<'db>,
+            data: &ProvidedData,
+        ) -> Result<Option<crate::types::Type<'db>>, Diagnostic> {
+            self.call_target_provider
+                .map_or(Ok(None), |provider| provider(self, file, call, class, data))
+        }
+
         fn provided_call_result<'db>(
             &'db self,
             call: &CheckedCall<'_, 'db>,
@@ -818,6 +856,7 @@ pub(crate) mod tests {
         rule_selection: Option<RuleSelection>,
         lint_registry: Option<LintRegistry>,
         analysis_settings: Option<AnalysisSettings>,
+        call_target_provider: Option<CallTargetProvider>,
         call_result_provider: Option<CallResultProvider>,
         contextual_parameters_provider: Option<ContextualParametersProvider>,
         call_argument_context_provider: Option<CallArgumentContextProvider>,
@@ -845,6 +884,7 @@ pub(crate) mod tests {
                 rule_selection: None,
                 lint_registry: None,
                 analysis_settings: None,
+                call_target_provider: None,
                 call_result_provider: None,
                 contextual_parameters_provider: None,
                 call_argument_context_provider: None,
@@ -906,6 +946,11 @@ pub(crate) mod tests {
 
         pub(crate) fn without_runtime_type_aliases(mut self) -> Self {
             self.type_aliases_bind_runtime_names = false;
+            self
+        }
+
+        pub(crate) fn with_call_target_provider(mut self, provider: CallTargetProvider) -> Self {
+            self.call_target_provider = Some(provider);
             self
         }
 
@@ -999,6 +1044,7 @@ pub(crate) mod tests {
 
         pub(crate) fn build(self) -> anyhow::Result<TestDb> {
             let mut db = TestDb::new(self.vendored);
+            db.call_target_provider = self.call_target_provider;
             db.call_result_provider = self.call_result_provider;
             db.contextual_parameters_provider = self.contextual_parameters_provider;
             db.call_argument_context_provider = self.call_argument_context_provider;

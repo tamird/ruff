@@ -14,7 +14,7 @@ use super::{
     MaterializationKind, SubclassOfType, Type, TypeAliasType,
 };
 use crate::place::{Place, PlaceAndQualifiers};
-use crate::provided::{ProvidedField, ProvidedInstanceDisplay};
+use crate::provided::{ProvidedData, ProvidedField, ProvidedInstanceDisplay};
 use crate::types::constraints::{
     ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, OwnedConstraintSet,
 };
@@ -307,6 +307,26 @@ pub(super) fn walk_nominal_instance_type<'db, V: super::visitor::TypeVisitor<'db
 }
 
 impl<'db> NominalInstanceType<'db> {
+    pub(super) fn provided_class_data(
+        self,
+        db: &'db dyn Db,
+    ) -> Option<(ClassLiteral<'db>, &'db ProvidedData)> {
+        let NominalInstanceInner::NonTuple(class) = self.0 else {
+            return None;
+        };
+        let NominalInstanceClass::Plain(class) = class else {
+            return None;
+        };
+        let ClassType::NonGeneric(class) = class else {
+            return None;
+        };
+        let ClassLiteral::Dynamic(dynamic) = class else {
+            return None;
+        };
+        let data = dynamic.provided_data(db)?;
+        Some((class, data))
+    }
+
     pub(super) fn provided_instance(self) -> Option<ProvidedNominalInstance<'db>> {
         match self.0 {
             NominalInstanceInner::NonTuple(NominalInstanceClass::WithFields(provided)) => {
