@@ -2479,6 +2479,31 @@ fn frozen_exports_observe_completed_mapping_contents() -> anyhow::Result<()> {
                 "attrs = {'name': 1}\nattrs = {'name': 2}\n",
                 Some("Literal[2]"),
             ),
+            (
+                "original = {'name': 1}\nattrs = original | {'name': 2}\n",
+                Some("Literal[2]"),
+            ),
+            (
+                "original = {'name': 1}\noverwrite = {'name': 3}\nattrs = (original | {'name': 2}) | overwrite\n",
+                Some("Literal[3]"),
+            ),
+            (
+                "original = {'name': 1}\nattrs = original | {}\noriginal.clear()\n",
+                Some("Literal[1]"),
+            ),
+            ("original = {'name': 1}\nattrs = original\n", None),
+            (
+                "original = {'name': 1}\nattrs = original | {}\nalias = attrs\nalias['name'] = 2\n",
+                None,
+            ),
+            (
+                "original = {'name': 1}\nclass Custom(dict):\n    def __ror__(self, other): return original\nattrs = {'name': 0} | Custom()\noriginal['name'] = 2\n",
+                None,
+            ),
+            (
+                "class Custom(dict):\n    def __or__(self, other): return {'name': 3}\nattrs = Custom() | {'name': 1}\n",
+                None,
+            ),
             ("attrs = {'name': 1}\nattrs.pop('name')\n", None),
             (
                 "attrs = {'name': 1}\nalias = attrs\nalias['name'] = 2\n",
@@ -2577,6 +2602,25 @@ fn frozen_exports_observe_completed_mapping_contents() -> anyhow::Result<()> {
                 "{item:?}"
             );
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn non_dictionary_unions_do_not_seed_contents() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/main.py", "alias = int | str\nflags = 1 | 2\n")
+        .build()?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let index = semantic_index(&db, file);
+    let scope = ty_python_core::global_scope(&db, file);
+    let table = index.place_table(scope.file_scope_id(&db));
+    for name in ["alias", "flags"] {
+        assert!(
+            table
+                .contents_place(table.symbol_id(name).unwrap().into())
+                .is_none()
+        );
     }
     Ok(())
 }

@@ -759,15 +759,7 @@ impl<'ast> Candidates<'ast, '_> {
         } else {
             CandidateAssignment::Other
         };
-        let mapping_syntax = match value {
-            ast::Expr::Dict(_) => true,
-            ast::Expr::DictComp(_) => true,
-            ast::Expr::Call(call) => {
-                matches!(call.func.as_ref(), ast::Expr::Name(name) if name.id == "dict")
-            }
-            _ => false,
-        };
-        if mapping_syntax {
+        if has_dictionary_syntax(value) {
             self.nodes[index].observed = true;
         }
         self.source_dependencies(index, value);
@@ -926,6 +918,21 @@ impl<'ast> Candidates<'ast, '_> {
             field_sources,
             unpacked_values,
         }
+    }
+}
+
+/// Record contents history for mapping-shaped assignments even if only another module
+/// observes their value. Inference still verifies whether `|` uses builtin dispatch.
+fn has_dictionary_syntax(value: &ast::Expr) -> bool {
+    match value {
+        ast::Expr::Dict(_) | ast::Expr::DictComp(_) => true,
+        ast::Expr::Call(call) => {
+            matches!(call.func.as_ref(), ast::Expr::Name(name) if name.id == "dict")
+        }
+        ast::Expr::BinOp(binary) if binary.op == ast::Operator::BitOr => {
+            has_dictionary_syntax(&binary.left) || has_dictionary_syntax(&binary.right)
+        }
+        _ => false,
     }
 }
 
