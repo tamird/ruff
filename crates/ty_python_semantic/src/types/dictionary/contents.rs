@@ -2607,13 +2607,20 @@ pub(crate) fn needs_call_snapshot<'db>(
     };
     // A builtin union copies the slots of both operands before the next argument runs.
     // An overloaded operator could return an existing mapping instead.
-    let builtin = |operand: &ast::Expr| {
+    let env = ProgramEnvironment::from_file(scope.program_file(db));
+    let mut expression_type = expression_type;
+    let mut builtin = |operand: &ast::Expr| {
         is_builtin_allocation(db, operand, &expression_type)
-            || expression_type(operand).is_some_and(|ty| {
-                snapshot_contents(db, scope, operand, operand.into(), ty, reachability)
-                    .builtin_items()
-                    .is_ok()
-            })
+            || DictionaryItems::union_operand(
+                db,
+                &env,
+                scope,
+                operand.into(),
+                operand,
+                reachability.body_domain(),
+                &mut expression_type,
+            )
+            .is_ok()
     };
     Some(!builtin(left) || !builtin(right))
 }

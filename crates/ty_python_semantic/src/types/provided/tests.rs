@@ -3936,6 +3936,14 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
             "first: Literal[2]",
         ),
         (
+            "left = {'first': 1}\nright = {'first': 2}\nresult = observe((left | {}) | right, other=right.clear())",
+            "first: Literal[2]",
+        ),
+        (
+            "from typing_extensions import TypedDict\nclass Fields(TypedDict, closed=True):\n    other: int\ndef fields() -> Fields: return {'other': 2}\nleft = {'first': 1}\nresult = observe(left | fields(), other=left.clear())",
+            "first: Literal[1]",
+        ),
+        (
             "shared = {'first': 2}\nclass Alias(dict[str, int]):\n    def __ror__(self, other: object) -> dict[str, int]: return shared\nresult = observe({'first': 1} | Alias(), other=shared.clear())",
             "unavailable",
         ),

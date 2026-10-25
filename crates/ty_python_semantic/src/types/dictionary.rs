@@ -917,7 +917,7 @@ impl<'db> DictionaryItems<'db> {
         }
         let mut dictionary = DictionaryItemsBuilder::default();
         for operand in [left.as_ref(), right.as_ref()] {
-            let source = Self::builtin_source(
+            let source = Self::union_operand(
                 db,
                 env,
                 scope,
@@ -925,8 +925,24 @@ impl<'db> DictionaryItems<'db> {
                 operand,
                 domain,
                 expression_type,
-            )
-            .or_else(|fallback| match fallback {
+            )?;
+            dictionary.overlay(db, env, source);
+        }
+        Ok(dictionary.finish())
+    }
+
+    /// Observe an operand for which `|` has builtin dictionary semantics.
+    fn union_operand(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
+        snapshot: ast::ExprRef<'_>,
+        operand: &ast::Expr,
+        domain: Option<FunctionBodyDomain<'db>>,
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+    ) -> DictionaryObservation<'db> {
+        Self::builtin_source(db, env, scope, snapshot, operand, domain, expression_type).or_else(
+            |fallback| match fallback {
                 DictionaryFallback::Unavailable => {
                     let ty = expression_type(operand).ok_or(fallback)?;
                     let unpacked =
@@ -940,10 +956,8 @@ impl<'db> DictionaryItems<'db> {
                     Ok(source)
                 }
                 DictionaryFallback::Unreachable => Err(fallback),
-            })?;
-            dictionary.overlay(db, env, source);
-        }
-        Ok(dictionary.finish())
+            },
+        )
     }
 
     /// Union dispatch requires a builtin allocation, not just a nominal dictionary type.
