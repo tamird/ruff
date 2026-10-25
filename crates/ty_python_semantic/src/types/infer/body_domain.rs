@@ -1190,6 +1190,84 @@ mod tests {
     }
 
     #[test]
+    fn complete_domains_preserve_authored_return_contracts() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import Literal, overload
+            @overload
+            def f(mode: Literal["hex"]) -> str: ...
+            @overload
+            def f(mode: Literal["int"]) -> int: ...
+            def f(mode: str) -> str | int:
+                if mode == "hex":
+                    return "value"
+                if mode == "int":
+                    return 1
+                RETURN
+        "#};
+        for (tail, expected) in [
+            ("return []", Some("invalid-return-type")),
+            ("pass", Some("invalid-return-type")),
+            ("return []  # ty: ignore[invalid-return-type]", None),
+        ] {
+            db.write_file("/src/body.py", source.replace("RETURN", tail))?;
+            let f = function(&db);
+            let file = f.program_file(&db);
+            let ordinary = crate::types::check_types(&db, file);
+            assert_eq!(
+                ordinary
+                    .iter()
+                    .map(|diagnostic| diagnostic.id().as_str())
+                    .collect::<Vec<_>>(),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{tail}: {ordinary:#?}",
+            );
+            let analysis = OverloadBodyAnalysis::new(&db, f);
+            assert!(analysis.is_complete(), "{tail}");
+            let selected =
+                crate::types::check_types_with_overload_analysis(&db, file, [], [analysis]);
+            assert_eq!(ordinary, selected, "{tail}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_authored_and_overload_fallthrough_share_one_diagnostic() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_file(
+            "/src/body.py",
+            indoc::indoc! {r#"
+                from typing import Literal, overload
+                @overload
+                def f(flag: Literal[True]) -> str: ...
+                @overload
+                def f(flag: Literal[False]) -> int: ...
+                def f(flag: bool) -> str | int:
+                    if flag:
+                        return "ok"
+            "#},
+        )?;
+        let f = function(&db);
+        let file = f.program_file(&db);
+        let ordinary = crate::types::check_types(&db, file);
+        assert_eq!(ordinary.len(), 1, "{ordinary:#?}");
+        let selected = check_types_with_overload_bodies(&db, file, [], [f]);
+        assert_eq!(selected.len(), 1, "{selected:#?}");
+        assert_eq!(selected[0].primary_span(), ordinary[0].primary_span());
+        assert_eq!(
+            selected[0].headline_message(),
+            ordinary[0].headline_message()
+        );
+        assert!(
+            selected[0]
+                .sub_diagnostics()
+                .iter()
+                .any(|detail| detail.headline_message().contains("return type `int`"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn complete_domains_own_correlated_body_facts() -> anyhow::Result<()> {
         let mut db = setup_db();
         let source = indoc::indoc! {"

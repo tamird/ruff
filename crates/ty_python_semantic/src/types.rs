@@ -301,7 +301,9 @@ pub fn check_types_with_overload_analysis<'db>(
 
         if let Some(scope_diagnostics) = result.diagnostics() {
             if body.as_ref().is_some_and(OverloadBodyAnalysis::is_complete) {
-                diagnostics.extend_shared_body(scope_diagnostics);
+                // Group shared source obligations with the overloads so a failure at the same
+                // operation retains both the source and overload explanations.
+                body_diagnostics.extend_shared_body(scope_diagnostics);
             } else {
                 diagnostics.extend(scope_diagnostics);
             }

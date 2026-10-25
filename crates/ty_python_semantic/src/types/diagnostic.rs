@@ -3,7 +3,7 @@
 #![expect(clippy::doc_link_with_quotes, clippy::doc_overindented_list_items)]
 
 use super::call::CallErrorKind;
-use super::context::InferContext;
+use super::context::{InferContext, LintDiagnosticGuardBuilder};
 use super::mro::DuplicateBaseError;
 use super::{
     CallArguments, CallDunderError, ClassBase, ClassLiteral, GenericAlias, KnownClass,
@@ -12,7 +12,7 @@ use super::{
 use crate::dependency::is_direct_dependency;
 use crate::diagnostic::{did_you_mean, format_enumeration};
 use crate::importer::{ImportAction, ImportRequest, MembersInScope};
-use crate::lint::{Level, LintId, LintRegistryBuilder, LintSource, LintStatus};
+use crate::lint::{Level, LintId, LintMetadata, LintRegistryBuilder, LintSource, LintStatus};
 use crate::place::{DefinedPlace, Place, imported_symbol, place_from_bindings};
 use crate::suppression::{FileSuppressionId, suppressions};
 use crate::types::abstract_methods::AbstractMethods;
@@ -28,7 +28,7 @@ use crate::types::protocol_class::ProtocolMember;
 use crate::types::special_form::TypeQualifier;
 use crate::types::string_annotation::{
     ESCAPE_CHARACTER_IN_FORWARD_ANNOTATION, IMPLICIT_CONCATENATED_STRING_TYPE_ANNOTATION,
-    INVALID_SYNTAX_IN_FORWARD_ANNOTATION, RAW_STRING_TYPE_ANNOTATION,
+    INVALID_SYNTAX_IN_FORWARD_ANNOTATION, RAW_STRING_TYPE_ANNOTATION, SourceAnnotation,
 };
 use crate::types::tuple::TupleSpec;
 use crate::types::typed_dict::TypedDictSchema;
@@ -2926,15 +2926,39 @@ pub(super) fn report_dynamic_function_decorator_return<'db>(
     }
 }
 
+/// An implementation's authored return annotation remains an independent obligation when
+/// overloads supply narrower body domains. Externally supplied annotations do not.
+fn report_return_type_lint<'ctx, 'db>(
+    context: &'ctx InferContext<'db, '_>,
+    source_annotation: Option<&SourceAnnotation<'_, '_>>,
+    lint: &'static LintMetadata,
+    range: impl Ranged,
+) -> Option<LintDiagnosticGuardBuilder<'ctx, 'db>> {
+    if source_annotation
+        .and_then(SourceAnnotation::expression)
+        .is_some()
+    {
+        context.report_shared_body_lint(lint, range)
+    } else {
+        context.report_lint(lint, range)
+    }
+}
+
 pub(super) fn report_invalid_return_type(
     context: &InferContext,
     object_range: impl Ranged,
     return_type_range: FileRange,
+    source_annotation: Option<&SourceAnnotation<'_, '_>>,
     expected_ty: Type,
     actual_ty: Type,
 ) {
     let db = context.db();
-    let Some(builder) = context.report_lint(&INVALID_RETURN_TYPE, object_range) else {
+    let Some(builder) = report_return_type_lint(
+        context,
+        source_annotation,
+        &INVALID_RETURN_TYPE,
+        object_range,
+    ) else {
         return;
     };
 
@@ -2965,11 +2989,17 @@ pub(super) fn report_unsound_return_statement(
     context: &InferContext,
     object_range: impl Ranged,
     return_type_range: FileRange,
+    source_annotation: Option<&SourceAnnotation<'_, '_>>,
     expected_ty: Type,
     actual_ty: Type,
 ) {
     let db = context.db();
-    let Some(builder) = context.report_lint(&UNSOUND_RETURN_STATEMENT, object_range) else {
+    let Some(builder) = report_return_type_lint(
+        context,
+        source_annotation,
+        &UNSOUND_RETURN_STATEMENT,
+        object_range,
+    ) else {
         return;
     };
 
@@ -3191,6 +3221,7 @@ impl std::fmt::Display for YieldKind {
 pub(super) fn report_implicit_return_type(
     context: &InferContext,
     range: impl Ranged,
+    source_annotation: Option<&SourceAnnotation<'_, '_>>,
     expected_ty: Type,
     has_empty_body: bool,
     enclosing_class_of_method: Option<ClassType>,
@@ -3205,7 +3236,8 @@ pub(super) fn report_implicit_return_type(
         &INVALID_RETURN_TYPE
     };
 
-    let Some(builder) = context.report_lint(lint_to_use, range) else {
+    let Some(builder) = report_return_type_lint(context, source_annotation, lint_to_use, range)
+    else {
         return;
     };
     let env = &context.program_environment();

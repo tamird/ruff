@@ -417,10 +417,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .node(db)
                 .expect_function()
                 .node(&module);
-            SourceAnnotation::function_return(db, file, declaration).map(|returns| {
-                // The expected annotation belongs to the donor, but an implicit-return error
-                // and its reachability are located at the actual source implementation.
-                (returns.source(file.file(db)), function.name.range())
+            SourceAnnotation::function_return(db, file, declaration).map(|overload_return| {
+                // Attribute fallthrough to the implementation's authored annotation when
+                // present so its source and overload obligations share one location.
+                let source_range = returns
+                    .as_ref()
+                    .filter(|returns| returns.expression().is_some())
+                    .map_or(function.name.range(), Ranged::range);
+                (overload_return.source(file.file(db)), source_range)
             })
         } else {
             returns
@@ -538,6 +542,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 &self.context,
                                 return_statement.range,
                                 return_source,
+                                returns.as_ref(),
                                 expected_return_ty,
                                 return_statement.ty,
                             );
@@ -548,6 +553,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 &self.context,
                                 return_statement.range,
                                 return_source,
+                                returns.as_ref(),
                                 expected_return_ty,
                                 return_statement.ty,
                             );
@@ -564,6 +570,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         report_implicit_return_type(
                             &self.context,
                             return_range,
+                            returns.as_ref(),
                             expected_return_ty,
                             false,
                             None,
@@ -619,6 +626,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         &self.context,
                         return_statement.range,
                         return_source,
+                        returns.as_ref(),
                         declared_ty,
                         return_statement.ty,
                     );
@@ -629,6 +637,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         &self.context,
                         return_statement.range,
                         return_source,
+                        returns.as_ref(),
                         declared_ty,
                         return_statement.ty,
                     );
@@ -642,6 +651,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 report_implicit_return_type(
                     &self.context,
                     return_range,
+                    returns.as_ref(),
                     declared_ty,
                     has_empty_body,
                     enclosing_class_context,
