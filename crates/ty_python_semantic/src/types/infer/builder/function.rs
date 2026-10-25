@@ -41,7 +41,10 @@ use crate::{
         infer_definition_types,
         list_members::all_members,
         relation::TypeRelation,
-        signatures::{Parameter, Parameters, ReturnCallableTypeVarScope, keyword_arguments_type},
+        signatures::{
+            Parameter, Parameters, ReturnCallableTypeVarScope, keyword_arguments_type,
+            parameter_default_expression_type,
+        },
         tuple::{TupleSpec, TupleSpecBuilder, TupleType},
         typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation,
         typevar::TypeVarSet,
@@ -1434,7 +1437,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let mut entry_ty = declared_ty;
             if let Some(default_expr) = default_expr {
                 let default_expr = default_expr.as_ref();
-                let default_ty = self.file_expression_type(default_expr);
+                let default_ty = parameter_default_expression_type(db, definition, default_expr);
 
                 if matches!(
                     annotation,
@@ -1478,7 +1481,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.add_parameter_binding(parameter, definition, entry_ty);
         } else {
             let ty = if let Some(default_expr) = default_expr {
-                let default_ty = self.file_expression_type(default_expr);
+                let default_ty = parameter_default_expression_type(db, definition, default_expr);
                 let supplied_ty = if self
                     .special_first_method_parameter_type(parameter)
                     .is_none()

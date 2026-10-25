@@ -7705,20 +7705,27 @@ fn parameter_default_type<'db>(db: &'db dyn Db, parameter: Definition<'db>) -> T
     else {
         return Type::unknown();
     };
-    let Some(function) = parameter.scope(db).node(db).as_function() else {
-        return Type::unknown();
-    };
-    let program_file = parameter.program_file(db);
-    let function = semantic_index(db, program_file).expect_single_definition(function);
-    let module = parsed_module(db, program_file.python_file(db)).load(db);
+    let module = parsed_module(db, parameter.python_file(db)).load(db);
     let Some(default) = node.node(&module).default() else {
         return Type::unknown();
     };
-    // Use the function's default inference so the default retains its annotation context.
-    // Nested callable defaults still need the existing cycle-breaking normalization.
-    infer_function_default_types(db, function)
-        .expression_type(default)
-        .replace_parameter_defaults(db, &ProgramEnvironment::from_definition(function))
+    // Nested callable defaults in signatures still need cycle-breaking normalization.
+    parameter_default_expression_type(db, parameter, default)
+        .replace_parameter_defaults(db, &ProgramEnvironment::from_definition(parameter))
+}
+
+/// Infer a named function parameter's default in its declaration context.
+pub(super) fn parameter_default_expression_type<'db>(
+    db: &'db dyn Db,
+    parameter: Definition<'db>,
+    default: &ast::Expr,
+) -> Type<'db> {
+    let Some(function) = parameter.scope(db).node(db).as_function() else {
+        return Type::unknown();
+    };
+    let function =
+        semantic_index(db, parameter.program_file(db)).expect_single_definition(function);
+    infer_function_default_types(db, function).expression_type(default)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
