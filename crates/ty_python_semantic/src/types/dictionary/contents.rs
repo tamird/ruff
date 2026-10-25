@@ -13,6 +13,7 @@ use ty_python_core::definition::{
     DictionaryContentsEffect, DictionaryContentsInferenceOwner, LambdaParameterDefinitionNodeKind,
     NestedBindingExecution, ParameterDefinitionNodeKind,
 };
+use ty_python_core::expression::is_inert_argument;
 use ty_python_core::place::ScopedPlaceId;
 use ty_python_core::place::{PlaceExpr, PlaceTable};
 use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, ScopeId};
@@ -1175,7 +1176,7 @@ fn frozen_exported_field_contents<'db>(
             }
             if std::iter::once(keyword)
                 .chain(keywords)
-                .any(|keyword| keyword.arg.is_none() || !inert_field_argument(&keyword.value))
+                .any(|keyword| !is_inert_argument(ast::ArgOrKeyword::Keyword(keyword)))
             {
                 return None;
             }
@@ -1227,21 +1228,6 @@ fn frozen_exported_field_contents<'db>(
         retained_source_contents(db, scope, call, source, &inference, &reachability, None)
     })();
     observed.unwrap_or(ContentsValue::Unavailable)
-}
-
-/// Expressions that cannot call user code while evaluating a factory argument. Dictionary keys
-/// are limited to string literals because hashing other objects can execute user code.
-fn inert_field_argument(expression: &ast::Expr) -> bool {
-    !any_over_expr(expression, |expression| match expression {
-        ast::Expr::Name(_) | ast::Expr::List(_) | ast::Expr::Tuple(_) => false,
-        ast::Expr::Dict(dictionary) => dictionary.items.iter().any(|item| {
-            !item
-                .key
-                .as_ref()
-                .is_some_and(ast::Expr::is_string_literal_expr)
-        }),
-        expression => !expression.is_literal_expr(),
-    })
 }
 
 fn is_builtin_allocation<'db>(
@@ -2591,8 +2577,7 @@ pub(crate) fn needs_call_snapshot<'db>(
                 .map(ast::ArgOrKeyword::Keyword),
         );
     arguments.find(|argument| std::ptr::eq(argument.value(), expression))?;
-    if !arguments.any(|argument| argument.is_variadic() || !inert_field_argument(argument.value()))
-    {
+    if arguments.all(is_inert_argument) {
         return Some(false);
     }
     let ast::Expr::BinOp(ast::ExprBinOp {
@@ -3107,16 +3092,25 @@ pub(super) fn snapshot_contents<'db>(
             .place_id(&place)?;
         let use_id = index.try_expression_use_id(snapshot)?;
         let use_def = index.use_def_map(scope.file_scope_id(db));
+        let table = index.place_table(scope.file_scope_id(db));
+        let receiver = table.place_id(&PlaceExpr::try_from_expr(expression)?)?;
+        if let Some(current) = use_def.multi_bindings_at_use(use_id, receiver) {
+            let original_use = index.try_expression_use_id(expression.into())?;
+            let original = use_def.bindings_at_use(original_use);
+            if !original
+                .map(|binding| binding.binding)
+                .eq(current.map(|binding| binding.binding))
+            {
+                return None;
+            }
+        }
+
         // A nested scope can replace a captured binding with another dictionary. Its
         // alternative type survives ordinary inference but has no local contents seed.
         if !explicit_typed_dict
             && argument_type.as_nominal_instance().is_none()
             && super::records::for_binding(db, scope, expression).is_none()
         {
-            let receiver = PlaceExpr::try_from_expr(expression)?;
-            let receiver = index
-                .place_table(scope.file_scope_id(db))
-                .place_id(&receiver)?;
             if use_def.reachable_bindings(receiver).any(|binding| {
                 let DefinitionState::Defined(definition) = binding.binding else {
                     return false;

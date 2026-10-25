@@ -13,6 +13,7 @@ use crate::definition::{
     Definition, DefinitionKind, DefinitionNodeKey, DictionaryContentsDefinitionKind,
     DictionaryContentsEffect, DictionaryContentsInferenceOwner, NestedBindingExecution,
 };
+use crate::expression::is_inert_argument;
 use crate::member::MemberExprBuilder;
 use crate::place::{
     DictionaryFirstValueRead, PlaceExpr, PlaceExprRef, PlaceTableBuilder, ScopedPlaceId,
@@ -378,6 +379,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         include_values: bool,
     ) {
         let mut places: SmallVec<[_; 2]> = SmallVec::new();
+        let mut rebound: SmallVec<[_; 1]> = SmallVec::new();
         for &source in sources {
             let Some(contents) = self.contents_place(source) else {
                 continue;
@@ -403,7 +405,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 .current_bindings(receiver)
                 .map(|binding| binding.binding())
                 .collect();
-            if original != current || places.iter().any(|(recorded, _)| *recorded == receiver) {
+            if original != current {
+                rebound.push(receiver);
+                continue;
+            }
+            if places.iter().any(|(recorded, _)| *recorded == receiver) {
                 continue;
             }
             if include_values {
@@ -422,7 +428,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 places.push((receiver, contents));
             }
         }
-        let Some((receiver, _)) = places.first() else {
+        let Some(receiver) = places
+            .first()
+            .map(|(receiver, _)| receiver)
+            .or(rebound.first())
+        else {
             return;
         };
         // Each use has one indexed primary binding; contents observations read the separate
@@ -439,6 +449,18 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             self.current_use_def_map_mut().record_use(*receiver, use_id);
             use_id
         };
+        // Two operands named `x` may denote different objects. Save the new binding so
+        // a contents observation recorded for the later `x` cannot be read for the first.
+        for receiver in rebound {
+            if self
+                .current_use_def_map()
+                .multi_binding_ids_at_use(use_id, receiver)
+                .is_empty()
+            {
+                self.current_use_def_map_mut()
+                    .record_binding_snapshot(receiver, use_id);
+            }
+        }
         let mut places = places.into_iter().map(|(_, contents)| contents).collect();
         self.add_contents_sources(&mut places);
         self.current_use_def_map_mut()
@@ -459,6 +481,36 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .collect();
         if !unpacked.is_empty() {
             self.record_contents_snapshot_for_sources(expression, &unpacked, true);
+        }
+        // An earlier argument's dictionary may change while a later argument runs.
+        // Only inspect later expressions once we have a tracked dictionary to observe.
+        let mut sources = SmallVec::<[_; 2]>::new();
+        let mut snapshot_len = 0;
+        let mut arguments = call
+            .arguments
+            .args
+            .iter()
+            .map(ast::ArgOrKeyword::Arg)
+            .chain(
+                call.arguments
+                    .keywords
+                    .iter()
+                    .map(ast::ArgOrKeyword::Keyword),
+            )
+            .peekable();
+        while let Some(argument) = arguments.next() {
+            if snapshot_len < sources.len() && !is_inert_argument(argument) {
+                snapshot_len = sources.len();
+            }
+            if arguments.peek().is_some()
+                && !argument.is_variadic()
+                && self.contents_place(argument.value()).is_some()
+            {
+                sources.push(argument.value());
+            }
+        }
+        if snapshot_len > 0 {
+            self.record_contents_snapshot(expression, &sources[..snapshot_len]);
         }
         // A positional mapping is copied after every argument has evaluated.
         if let [source] = call.arguments.args.as_ref() {

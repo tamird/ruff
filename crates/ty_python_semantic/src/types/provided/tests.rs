@@ -3892,7 +3892,7 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file(
             "/src/native.pyi",
-            "def observe(value: object, other: object = ...) -> str: ...\ndef observe_child(value: object, other: object = ...) -> str: ...\ndef expose(value: object) -> None: ...\ndef preserve(data: object, other: object = ...) -> object: ...\nflag: bool\nkey: str\n",
+            "def observe(value: object, other: object = ..., *, again: object = ..., tail: object = ...) -> str: ...\ndef observe_child(value: object, other: object = ...) -> str: ...\ndef expose(value: object) -> None: ...\ndef preserve(data: object, other: object = ...) -> object: ...\nflag: bool\nkey: str\n",
         )
         .with_file("/src/main.py", "")
 .with_call_result_provider(|db, call| observe(db, call).into())
@@ -3924,8 +3924,24 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
             "first: Literal[1]",
         ),
         (
-            "values = {'first': 1}\nresult = observe(value=values, other=values.clear())",
+            "values = {'first': 1}\nresult = observe(value=values, other=[1] + [2])",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(value=values, other=(values := {'new': 2}))",
             "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(value=values, other=(values := {'new': 2}), again=values, tail=[1] + [2])",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(again=values, other=(values := {'new': 2}), value=values, tail=[1] + [2])",
+            "new: Literal[2]",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(value=values, other=values.clear())",
+            "empty",
         ),
         (
             "values = {'first': 1}\nresult = observe(values, other=values.clear())",
@@ -3957,7 +3973,7 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
         ),
         (
             "values = {'first': 1}\nresult = observe(values, values.update({'first': 2}))",
-            "unavailable",
+            "first: Literal[2]",
         ),
         (
             "values = {'first': 1}\nresult = observe(values, other=values.update({'first': 2}))",

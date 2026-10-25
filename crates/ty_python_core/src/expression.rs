@@ -7,6 +7,22 @@ use ruff_db::files::File;
 use ruff_python_ast as ast;
 use salsa;
 
+/// An inert argument only reads names or constructs literals. In particular, unpacking can
+/// call user code, as can hashing a dictionary key that isn't a string literal.
+pub fn is_inert_argument(argument: ast::ArgOrKeyword<'_>) -> bool {
+    !argument.is_variadic()
+        && !ast::helpers::any_over_expr(argument.value(), |expression| match expression {
+            ast::Expr::Name(_) | ast::Expr::List(_) | ast::Expr::Tuple(_) => false,
+            ast::Expr::Dict(dictionary) => dictionary.items.iter().any(|item| {
+                !item
+                    .key
+                    .as_ref()
+                    .is_some_and(ast::Expr::is_string_literal_expr)
+            }),
+            expression => !expression.is_literal_expr(),
+        })
+}
+
 /// Whether evaluation produces a result object or chooses a control-flow path.
 ///
 /// The semantic-index builder uses this context when creating reachability predicates. The
