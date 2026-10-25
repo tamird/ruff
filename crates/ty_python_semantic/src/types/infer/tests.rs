@@ -1279,6 +1279,40 @@ fn function_inference_regions_are_disjoint() -> anyhow::Result<()> {
 }
 
 #[test]
+fn parameter_default_dependency_scope() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    let path = "/src/main.py";
+    db.write_files([
+        ("/src/values.py", "value = 1"),
+        (
+            path,
+            "from values import value\n\ndef f(x=value): pass\n\nunrelated = 1",
+        ),
+    ])?;
+    let source = system_path_to_file(&db, path)?;
+    let parameter_type = |db: &TestDb| {
+        get_symbol(db, path, &["f"], "x")
+            .expect_type()
+            .display(db, &db.program_environment())
+            .to_string()
+    };
+
+    db.clear_salsa_events();
+    assert_eq!(parameter_type(&db), "Unknown | Literal[1]");
+    let events = db.take_salsa_events();
+    assert_function_query_was_not_run(
+        &db,
+        infer_definition_types,
+        first_public_binding(&db, source, "unrelated"),
+        &events,
+    );
+
+    db.write_file("/src/values.py", "value = 'changed'")?;
+    assert_eq!(parameter_type(&db), r#"Unknown | Literal["changed"]"#);
+    Ok(())
+}
+
+#[test]
 fn lazy_parameter_defaults() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_files([

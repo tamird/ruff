@@ -44,7 +44,10 @@ use crate::{
         infer_definition_types,
         list_members::all_members,
         relation::TypeRelation,
-        signatures::{ReturnCallableTypeVarScope, function_signature_expression_type},
+        signatures::{
+            ReturnCallableTypeVarScope, function_signature_expression_type,
+            parameter_default_expression_type,
+        },
         tuple::{TupleSpec, TupleSpecBuilder, TupleType},
         typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation,
         typevar::TypeVarSet,
@@ -1157,7 +1160,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             if let Some(default_expr) = default_expr {
                 let default_expr = default_expr.as_ref();
-                let default_ty = self.file_expression_type(default_expr);
+                let default_ty = parameter_default_expression_type(db, definition, default_expr);
 
                 // Avoid duplicate diagnostics: invalid TypedDict literals already emit specific errors.
                 let suppress_invalid_default =
@@ -1195,7 +1198,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             );
         } else {
             let ty = if let Some(default_expr) = default_expr {
-                let default_ty = self.file_expression_type(default_expr);
+                let default_ty = parameter_default_expression_type(db, definition, default_expr);
                 UnionType::from_two_elements(db, env, Type::unknown(), default_ty)
             } else if let Some(ty) = self.special_first_method_parameter_type(parameter) {
                 ty
