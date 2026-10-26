@@ -688,18 +688,23 @@ def capture_before_assignment():
     remove()
     empty(**values)
 
-def readonly_capture():
+def readonly_capture(check_keys: bool):
     def inspect():
-        for _ in values.keys():
-            pass
+        if check_keys:
+            for key in values.keys():
+                pass
+        else:
+            for _ in range(2):
+                [i for i in range(2)]
     values = {"extra": 1}
     inspect()
     empty(**values)  # error: [unknown-argument]
 
 def captured_alias():
     def inspect():
-        saved = values
-        saved.clear()
+        for _ in range(2):
+            saved = values
+            saved.clear()
         return values.keys()
     values = {"extra": 1}
     inspect()

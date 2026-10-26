@@ -768,6 +768,21 @@ fn capture_preserves_contents<'db>(
     if bindings.next().map(|binding| binding.binding) != Some(DefinitionState::Undefined) {
         return false;
     }
+    // Loop headers and their capture markers only carry effects from other bindings.
+    // The reachable inventory includes each operation inside the loop separately.
+    let preserves = |definition: Definition<'db>| match definition.kind(db) {
+        DefinitionKind::LoopHeader(_) => true,
+        DefinitionKind::DictionaryContents(contents) => {
+            matches!(
+                contents.as_ref(),
+                DictionaryContentsDefinitionKind::LoopCapture {
+                    header: _,
+                    range: _,
+                }
+            ) || preserves(definition)
+        }
+        _ => false,
+    };
     bindings.all(|binding| {
         binding.binding.definition().is_some_and(&preserves)
             || evaluate_reachability_with_cache(
