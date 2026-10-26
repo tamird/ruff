@@ -2021,12 +2021,9 @@ fn mapping_transfer<'db>(
                             if *retained {
                                 return MappingTransfer::Expose;
                             }
-                            let Some(Type::TypedDict(_)) = inference
-                                .try_expression_type(receiver)
-                                .map(|ty| ty.resolve_type_alias(db))
-                            else {
+                            if !db.provided_dict_pop_keyword_default(env.program(db)) {
                                 return unavailable();
-                            };
+                            }
                             let (Some(callee), Some(key_ty), Some(default_ty)) = (
                                 inference.try_expression_type(&call.func),
                                 inference.try_expression_type(key),
