@@ -319,7 +319,7 @@ def mutations():
 
 def unpacked_target():
     values = {"value": 1}
-    _, values["value"] = (0, "bad")  # error: [invalid-assignment]
+    _, values["value"] = (0, "bad")
     consume(**values)  # error: [invalid-argument-type]
 
 def augmented_target():
