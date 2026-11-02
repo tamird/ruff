@@ -118,6 +118,16 @@ pub type ModuleParser = fn(
     ruff_python_parser::ParseOptions,
 ) -> ruff_python_parser::Parsed<ruff_python_ast::ModModule>;
 
+/// Parses a detached annotation. Expression and error ranges must address the original source.
+pub type AnnotationParser = fn(
+    &str,
+    ruff_text_size::TextRange,
+    ruff_python_parser::ParseOptions,
+) -> Result<
+    ruff_python_parser::Parsed<ruff_python_ast::ModExpression>,
+    ruff_python_parser::ParseError,
+>;
+
 /// Most basic database that gives access to files, the host system, source code, and parsed AST.
 #[salsa::db]
 pub trait Db: salsa::Database {
@@ -135,6 +145,12 @@ pub trait Db: salsa::Database {
 
     /// A registered name must resolve to the same parser for the lifetime of the database.
     fn module_parser(&self, _namespace: &'static str) -> Option<ModuleParser> {
+        None
+    }
+
+    /// Selects how to parse detached type expressions for this module parser namespace.
+    /// Returning `None` uses the ordinary Python expression parser.
+    fn annotation_parser(&self, _namespace: &'static str) -> Option<AnnotationParser> {
         None
     }
 }
@@ -269,6 +285,16 @@ mod tests {
                 let range =
                     ruff_text_size::TextRange::new(1.into(), ruff_text_size::TextSize::of(source));
                 ruff_python_parser::parse_cells_unchecked(source, [range], &options)
+            })
+        }
+
+        fn annotation_parser(&self, namespace: &'static str) -> Option<super::AnnotationParser> {
+            (namespace == "test:skip-marker").then_some(|source, range, options| {
+                let contents = ruff_text_size::TextRange::new(
+                    range.start() + ruff_text_size::TextSize::new(1),
+                    range.end(),
+                );
+                ruff_python_parser::parse_expression_range_with_options(source, contents, options)
             })
         }
     }
