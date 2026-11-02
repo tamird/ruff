@@ -2563,6 +2563,62 @@ fn supplied_call_diagnostics_follow_native_policy() -> anyhow::Result<()> {
 }
 
 #[test]
+fn supplied_call_result_infers_an_annotation_in_the_callers_scope() -> anyhow::Result<()> {
+    let source = r#"
+from native import decode_a, decode_b
+from typing_extensions import assert_type
+
+def parse(flag: bool):
+    Local = str
+    decode = decode_a if flag else decode_b
+    assert_type(decode("list[Local]"), list[str])
+    decode("Missing")
+    decode("list[")
+    decode("Silenced")  # ty: ignore[unresolved-reference]
+"#;
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "def decode_a(schema: str) -> object: ...\ndef decode_b(schema: str) -> object: ...\n",
+        )
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(|_, call| {
+            let CheckedArgument::Value {
+                expression: Some(owner),
+                ty: _,
+            } = call.argument("schema")
+            else {
+                return ProvidedCallResult::default();
+            };
+            let literal = owner
+                .as_string_literal_expr()
+                .unwrap()
+                .as_single_part_string()
+                .unwrap();
+            call.infer_annotation_at(owner, literal.content_range())
+                .into()
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.id().as_str(),
+                &source[diagnostic.range().unwrap()]
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("unresolved-reference", "Missing"),
+            ("invalid-type-form", "")
+        ],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn supplied_call_results_follow_selected_overloads() -> anyhow::Result<()> {
     fn result<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
         let name = call

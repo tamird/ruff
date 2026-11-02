@@ -182,13 +182,21 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
                 return Self::external(db, file, owner, foreign_file, foreign_owner);
             }
         };
-        let parsed =
-            parsed_annotation_range(db, file.python_file(db), range, owner.node_index().load());
-        Some(Self::Detached {
-            owner: NodeKey::from_node(owner),
+        Some(Self::detached(db, file, owner, range))
+    }
+
+    pub(super) fn detached(
+        db: &'db dyn Db,
+        file: ProgramFile<'db>,
+        owner: impl HasNodeIndex,
+        range: TextRange,
+    ) -> Self {
+        let owner = NodeKey::from_node(owner);
+        Self::Detached {
+            owner,
             range,
-            parsed,
-        })
+            parsed: parsed_annotation_range(db, file.python_file(db), range, owner.index()),
+        }
     }
 
     fn external(
