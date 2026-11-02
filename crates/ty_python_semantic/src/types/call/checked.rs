@@ -1,5 +1,5 @@
 use ruff_python_ast::{self as ast, name::Name};
-use ruff_text_size::Ranged;
+use ruff_text_size::{Ranged, TextRange};
 use ty_python_core::ProgramFile;
 use ty_python_core::definition::Definition;
 
@@ -58,6 +58,7 @@ pub struct CheckedCall<'a, 'db> {
     pub(crate) file: ProgramFile<'db>,
     pub(crate) call: &'a ast::ExprCall,
     pub(crate) expression_type: &'a dyn Fn(&ast::Expr) -> Option<Type<'db>>,
+    pub(crate) annotation_type: Option<&'a dyn Fn(&ast::Expr, TextRange) -> Type<'db>>,
     pub(crate) dictionary_items:
         &'a dyn Fn(&ast::Expr, Type<'db>, DictionaryAccess<'_>) -> Option<DictionaryItems<'db>>,
     pub(crate) class_anchor: &'a dyn Fn(Box<[Type<'db>]>) -> DynamicClassAnchor<'db>,
@@ -99,6 +100,14 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
 
     pub fn expression_type(&self, expression: &ast::Expr) -> Option<Type<'db>> {
         (self.expression_type)(expression)
+    }
+
+    /// Infers a detached type expression during result refinement, reporting errors in
+    /// the current check. The owner must be a canonical child expression in the call's
+    /// lexical scope, with at most one detached annotation range in the same file.
+    /// Provisional argument checks return `None`.
+    pub fn infer_annotation_at(&self, owner: &ast::Expr, range: TextRange) -> Option<Type<'db>> {
+        Some(self.annotation_type?(owner, range))
     }
 
     pub fn argument(&self, name: &str) -> CheckedArgument<'a, 'db> {

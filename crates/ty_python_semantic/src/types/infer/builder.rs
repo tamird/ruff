@@ -10787,6 +10787,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     file: self.scope().program_file(db),
                     call: call_expression,
                     expression_type: &expression_type,
+                    annotation_type: None,
                     dictionary_items: &dictionary_items,
                     class_anchor: &class_anchor,
                     has_binding_errors: false,
@@ -11070,6 +11071,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             file: self.scope().program_file(self.db()),
             call,
             expression_type: &expression_type,
+            annotation_type: None,
             dictionary_items: &dictionary_items,
             class_anchor: &class_anchor,
             has_binding_errors,
@@ -11096,13 +11098,37 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         bindings: &mut Bindings<'db>,
         has_binding_errors: bool,
     ) {
-        let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
+        let db = self.db();
+        let file = self.program_file();
+        let env = self.program_environment();
+        let scope = self.scope();
+        let builder = RefCell::new(&mut *self);
+        let expression_type =
+            |expression: &ast::Expr| builder.borrow().try_expression_type(expression);
+        // A call can have several bindings, all referring to the same annotations.
+        let annotations = RefCell::new(FxHashMap::default());
+        let annotation_type = |owner: &ast::Expr, range| {
+            *annotations
+                .borrow_mut()
+                .entry(owner.node_index().load())
+                .or_insert_with(|| {
+                    let annotation = SourceAnnotation::detached(db, file, owner, range);
+                    let mut builder = builder.borrow_mut();
+                    let Some((expression, state)) = builder.annotation_expression(&annotation)
+                    else {
+                        return Type::unknown();
+                    };
+                    builder.infer_type_expression_with_state(expression, state)
+                })
+        };
         let dictionary_items = |expression: &ast::Expr, ty, access: DictionaryAccess<'_>| {
-            self.call_dictionary_items(call, expression, ty, access)
+            builder
+                .borrow()
+                .call_dictionary_items(call, expression, ty, access)
         };
         let class_anchor = |explicit_bases| crate::types::class::DynamicClassAnchor::ScopeOffset {
-            scope: self.scope(),
-            offset: self.dynamic_class_scope_offset(call),
+            scope,
+            offset: builder.borrow().dynamic_class_scope_offset(call),
             explicit_bases,
         };
         let mut diagnostics = Vec::new();
@@ -11115,9 +11141,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     binding,
                     arguments,
                     bound_receiver,
-                    file: self.scope().program_file(self.db()),
+                    file,
                     call,
                     expression_type: &expression_type,
+                    annotation_type: Some(&annotation_type),
                     dictionary_items: &dictionary_items,
                     class_anchor: &class_anchor,
                     has_binding_errors,
@@ -11125,7 +11152,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let crate::provided::ProvidedCallResult {
                     return_type,
                     diagnostics: supplied_diagnostics,
-                } = self.db().provided_call_result(&context);
+                } = db.provided_call_result(&context);
                 diagnostics.extend(supplied_diagnostics);
                 all_results_refined &= return_type.is_some();
                 if let Some(result) = return_type {
@@ -11134,11 +11161,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             }
             if any_result_refined {
-                callable.resolve_provided_return(
-                    self.db(),
-                    self.program_environment(),
-                    all_results_refined,
-                );
+                callable.resolve_provided_return(db, env, all_results_refined);
             }
         }
         if !diagnostics.is_empty()
