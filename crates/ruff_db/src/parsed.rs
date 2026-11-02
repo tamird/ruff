@@ -38,6 +38,7 @@ pub fn parsed_module(db: &dyn Db, file: PythonFile<'_>) -> ParsedModule {
     let python_version = file.python_version(db);
     let source_type = file.source_type(db);
     let literal_namespace = file.literal_namespace(db);
+    let module_namespace = file.module_namespace(db);
     let _span = tracing::trace_span!("parsed_module", ?source_file, %python_version, ?source_type)
         .entered();
 
@@ -47,6 +48,7 @@ pub fn parsed_module(db: &dyn Db, file: PythonFile<'_>) -> ParsedModule {
         python_version,
         source_type,
         literal_namespace,
+        module_namespace,
     );
 
     ParsedModule::new(
@@ -54,6 +56,7 @@ pub fn parsed_module(db: &dyn Db, file: PythonFile<'_>) -> ParsedModule {
         python_version,
         source_type,
         literal_namespace,
+        module_namespace,
         parsed,
     )
 }
@@ -68,6 +71,7 @@ fn parsed_module_impl(
     target_version: PythonVersion,
     source_type: PySourceType,
     literal_namespace: Option<&'static str>,
+    module_namespace: Option<&'static str>,
 ) -> Parsed<ModModule> {
     let source = source_text(db, file);
     let options = with_literal_namespace(
@@ -81,6 +85,11 @@ fn parsed_module_impl(
     // single-parse path.
     if let Some(notebook) = source.as_notebook() {
         parse_cells_unchecked(&source, notebook.cell_offsets().content_ranges(), &options)
+    } else if let Some(namespace) = module_namespace {
+        let parser = db
+            .module_parser(namespace)
+            .expect("a module parser namespace must have a registered parser");
+        parser(&source, options)
     } else {
         parse_unchecked(&source, options)
             .try_into_module()
@@ -184,6 +193,7 @@ pub struct ParsedModule {
     python_version: PythonVersion,
     source_type: PySourceType,
     literal_namespace: Option<&'static str>,
+    module_namespace: Option<&'static str>,
     #[get_size(size_fn = arc_swap_size)]
     inner: Arc<ArcSwapOption<indexed::IndexedModule>>,
 }
@@ -194,6 +204,7 @@ impl ParsedModule {
         python_version: PythonVersion,
         source_type: PySourceType,
         literal_namespace: Option<&'static str>,
+        module_namespace: Option<&'static str>,
         parsed: Parsed<ModModule>,
     ) -> Self {
         Self {
@@ -201,6 +212,7 @@ impl ParsedModule {
             python_version,
             source_type,
             literal_namespace,
+            module_namespace,
             inner: Arc::new(ArcSwapOption::new(Some(indexed::IndexedModule::new(
                 parsed,
             )))),
@@ -221,6 +233,7 @@ impl ParsedModule {
                     self.python_version,
                     self.source_type,
                     self.literal_namespace,
+                    self.module_namespace,
                 ));
                 tracing::debug!(
                     "File `{}` was reparsed after being collected in the current Salsa revision",
@@ -1177,6 +1190,29 @@ else:
         // Parser configuration does not change the file's source representation.
         assert!(!crate::source::source_text(&db, file).is_notebook());
         assert_eq!(file.source_type(&db), PySourceType::Python);
+        Ok(())
+    }
+
+    #[test]
+    fn module_parser_is_part_of_the_parse_identity() -> crate::system::Result<()> {
+        let mut db = TestDb::new();
+        db.write_file("test.py", "#first\nsecond")?;
+        let file = system_path_to_file(&db, "test.py").unwrap();
+        let python = PythonFile::new(&db, file, PythonVersion::latest_ty());
+        let embedded = PythonFile::new_with_module_parser(
+            &db,
+            file,
+            PythonVersion::latest_ty(),
+            PySourceType::Python,
+            None,
+            Some("test:skip-marker"),
+        );
+        for (file, statements) in [(python, 1), (embedded, 2)] {
+            let module = parsed_module(&db, file);
+            assert_eq!(module.load(&db).suite().len(), statements);
+            module.clear();
+            assert_eq!(module.load(&db).suite().len(), statements);
+        }
         Ok(())
     }
 

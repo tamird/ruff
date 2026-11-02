@@ -33,7 +33,7 @@ pub mod vendored;
 /// Salsa revision without sharing an incompatible AST or syntax diagnostics.
 #[salsa::interned(
     debug,
-    constructor = new_with_parse_options,
+    constructor = new_with_module_parser,
     heap_size = ruff_memory_usage::heap_size
 )]
 pub struct PythonFile<'db> {
@@ -48,9 +48,22 @@ pub struct PythonFile<'db> {
     /// present, [`Db::string_literal_decoder`] must resolve it for the database's lifetime.
     #[returns(copy)]
     pub literal_namespace: Option<&'static str>,
+    /// An optional parser for modules, independent of expression and string-literal parsing.
+    #[returns(copy)]
+    pub module_namespace: Option<&'static str>,
 }
 
 impl<'db> PythonFile<'db> {
+    pub fn new_with_parse_options(
+        db: &'db dyn Db,
+        file: File,
+        version: PythonVersion,
+        source_type: PySourceType,
+        literal_namespace: Option<&'static str>,
+    ) -> Self {
+        Self::new_with_module_parser(db, file, version, source_type, literal_namespace, None)
+    }
+
     /// Selects the default parser grammar using [`File::source_type`].
     pub fn new(db: &'db dyn Db, file: File, python_version: PythonVersion) -> Self {
         Self::new_with_source_type(db, file, python_version, file.source_type(db))
@@ -99,6 +112,12 @@ pub fn disable_lru(db: &mut dyn Db) {
     parsed::disable_lru(db);
 }
 
+/// Parses a regular module. Node, token, and error ranges must address the original source.
+pub type ModuleParser = fn(
+    &str,
+    ruff_python_parser::ParseOptions,
+) -> ruff_python_parser::Parsed<ruff_python_ast::ModModule>;
+
 /// Most basic database that gives access to files, the host system, source code, and parsed AST.
 #[salsa::db]
 pub trait Db: salsa::Database {
@@ -111,6 +130,11 @@ pub trait Db: salsa::Database {
     /// A namespace must resolve to the same deterministic decoder for the lifetime of the
     /// database. Changing interpretation requires a new namespace.
     fn string_literal_decoder(&self, _namespace: &'static str) -> Option<StringLiteralDecoder> {
+        None
+    }
+
+    /// A registered name must resolve to the same parser for the lifetime of the database.
+    fn module_parser(&self, _namespace: &'static str) -> Option<ModuleParser> {
         None
     }
 }
@@ -238,6 +262,14 @@ mod tests {
         ) -> Option<ruff_python_parser::StringLiteralDecoder> {
             (namespace == "test:uppercase")
                 .then_some(|source| Some(source.to_ascii_uppercase().into_boxed_str()))
+        }
+
+        fn module_parser(&self, namespace: &'static str) -> Option<super::ModuleParser> {
+            (namespace == "test:skip-marker").then_some(|source, options| {
+                let range =
+                    ruff_text_size::TextRange::new(1.into(), ruff_text_size::TextSize::of(source));
+                ruff_python_parser::parse_cells_unchecked(source, [range], &options)
+            })
         }
     }
 
