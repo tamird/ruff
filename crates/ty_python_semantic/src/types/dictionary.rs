@@ -434,8 +434,8 @@ impl<'db> DictionaryExtraItems<'db> {
     }
 }
 
-/// A direct field read keyed by the same local name as the comprehension's output key.
-fn comprehension_field_source<'db>(
+/// A direct field read keyed by the same name as the destination key.
+pub(super) fn copied_field_source<'db>(
     db: &'db dyn Db,
     key: &ast::Expr,
     value: &ast::Expr,
@@ -673,7 +673,7 @@ impl<'db> DictionaryItems<'db> {
                     return Err(DictionaryFallback::Unavailable);
                 }
                 let key_ty = UnionBuilder::new(db, env).add(key_ty).build();
-                let source = comprehension_field_source(db, key, value, expression_type);
+                let source = copied_field_source(db, key, value, expression_type);
                 if let Some(source) = source
                     && key_ty == KnownClass::Str.to_instance(db, env)
                 {

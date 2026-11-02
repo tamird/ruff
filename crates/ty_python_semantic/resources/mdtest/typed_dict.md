@@ -1125,6 +1125,63 @@ def missing_name() -> Empty | Value:
     return dict(kind="value", value=unknown)  # error: [unresolved-reference]
 ```
 
+## Copying fields under the same key
+
+Copying a field from one typed dictionary into another preserves the value type for that key,
+including when the source has additional fields of a broader type.
+
+```py
+from typing import Literal
+from typing_extensions import TypedDict
+
+Key = Literal["color", "weight"]
+
+class Inputs(TypedDict, total=False, extra_items=object):
+    color: str
+    weight: int
+
+class Options(TypedDict, total=False, closed=True):
+    color: str
+    weight: int
+
+def take(source: Inputs, keys: list[Key], take_values: bool) -> Options:
+    dest: Options = {}
+    for key in keys:
+        if key in source:
+            if take_values:
+                dest[key] = source.pop(key)
+            else:
+                dest[key] = source[key]
+    return dest
+
+class Wrong(TypedDict, total=False):
+    color: int
+    weight: int
+
+def incompatible(dest: Wrong, source: Inputs, key: Key):
+    dest[key] = source[key]  # error: [invalid-assignment] "with declared type `int`"
+
+def unrelated(dest: Options, source: Inputs, key: Key, other: Key):
+    # error: [invalid-assignment] "with declared type `str`"
+    # error: [invalid-assignment] "with declared type `int`"
+    dest[key] = source[other]
+    # error: [invalid-assignment] "with declared type `str`"
+    # error: [invalid-assignment] "with declared type `int`"
+    dest[key] = source.pop(key, "missing")
+
+def arbitrary(dest: Options, source: Inputs, key: str):
+    dest[key] = source[key]  # error: [invalid-key]
+
+class Singleton(TypedDict):
+    color: tuple[int]
+
+def unpacked(dest: Options, source: Singleton, key: Literal["color"]):
+    (dest[key],) = source[key]  # error: [invalid-assignment]
+
+def augmented(dest: Options, key: Literal["weight"]):
+    dest[key] /= 2  # error: [invalid-assignment]
+```
+
 ## Contextual built-in dictionary copies
 
 ```toml

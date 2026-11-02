@@ -20,12 +20,15 @@ use crate::types::dict::dict_literal_key_value_types;
 use crate::types::generics::{GenericContext, bind_typevar};
 use crate::types::infer::builder::annotation_expression::PEP613Policy;
 use crate::types::infer::builder::{ArgExpr, ArgumentsIter, MultiInferenceGuard};
-use crate::types::infer::{CollectionUseConstraintKind, InferenceFlags, TypeExpressionFlags};
+use crate::types::infer::{
+    CollectionUseConstraintKind, InferenceFlags, TypeExpressionFlags,
+    infer_expression_with_body_domain,
+};
 use crate::types::special_form::AliasSpec;
 use crate::types::subscript::{LegacyGenericOrigin, SubscriptError, SubscriptErrorKind};
 use crate::types::tuple::{Tuple, TupleSpecBuilder, TupleType, VariableSegment};
 use crate::types::typed_dict::{
-    TypedDictAssignmentKind, TypedDictExtraItems, TypedDictKeyAssignment,
+    TypedDictAssignmentKind, TypedDictExtraItems, TypedDictKeyAssignment, TypedDictType,
 };
 use crate::types::typevar::{BindingContext, TypeVarSet};
 use crate::types::{
@@ -1746,6 +1749,44 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         is_valid_assignment
     }
 
+    /// In `dest[key] = source[key]`, both subscripts select the same field.
+    fn copied_assignment_source(
+        &self,
+        target: &ast::ExprSubscript,
+        value: &ast::Expr,
+    ) -> Option<TypedDictType<'db>> {
+        let db = self.db();
+        let key = target.slice.as_name_expr()?;
+        // A computed receiver or a nonlocal key could change the binding between reads.
+        self.current_function_definition()?;
+        let table = self.index.place_table(self.scope().file_scope_id(db));
+        if !target.value.is_name_expr() || !table.symbol(table.symbol_id(&key.id)?).is_local() {
+            return None;
+        }
+
+        // In destructuring, augmented assignment, and iteration the assigned value
+        // is not the result of evaluating this expression.
+        let expression = self.index.try_expression(value)?;
+        let assignment = expression.assigned_to(db)?;
+        let [ast::Expr::Subscript(direct)] = assignment.node(self.module()).targets.as_slice()
+        else {
+            return None;
+        };
+        if !std::ptr::eq(direct, target) {
+            return None;
+        }
+
+        crate::types::dictionary::copied_field_source(db, &target.slice, value, &mut |expr| {
+            infer_expression_with_body_domain(
+                db,
+                expression,
+                TypeContext::default(),
+                self.context.body_domain,
+            )
+            .try_expression_type(expr)
+        })
+    }
+
     #[expect(clippy::too_many_arguments)]
     fn validate_subscript_assignment_impl(
         &mut self,
@@ -1933,6 +1974,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // We may need to infer the value multiple times for distinct keys.
                 let mut key_count = 0;
                 let mut infer_rhs_value = MultiInferenceGuard::new(infer_rhs_value);
+                let source_fields = self
+                    .copied_assignment_source(target, rhs_value_node)
+                    .map(|source| source.items(db));
 
                 for key in keys {
                     // Infer the value with type context.
@@ -1942,6 +1986,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         TypeContext::new(item.as_ref().map(|item| item.declared_ty)),
                     );
 
+                    let value_ty = if let Some(source_item) =
+                        source_fields.and_then(|fields| fields.get(key))
+                    {
+                        IntersectionType::from_two_elements(
+                            db,
+                            env,
+                            value_ty,
+                            source_item.declared_type(),
+                        )
+                    } else {
+                        value_ty
+                    };
                     if item.is_some() {
                         key_count += 1;
                     }
