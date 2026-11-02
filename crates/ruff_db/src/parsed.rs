@@ -131,8 +131,11 @@ pub fn parsed_annotation_range(
     owner: NodeIndex,
 ) -> Result<Parsed<ModExpression>, ParseError> {
     let source = source_text(db, file.file(db));
-    let expr =
-        parse_expression_range_with_options(&source, range, annotation_parse_options(db, file))?;
+    let parser = file
+        .module_namespace(db)
+        .and_then(|namespace| db.annotation_parser(namespace))
+        .unwrap_or(parse_expression_range_with_options);
+    let expr = parser(&source, range, annotation_parse_options(db, file))?;
     index_annotation(expr, owner, range)
 }
 
@@ -1041,7 +1044,7 @@ mod tests {
     use crate::tests::TestDb;
     use crate::vendored::{VendoredFileSystemBuilder, VendoredPath};
     use ruff_python_ast::{Expr, HasNodeIndex, PySourceType, PythonVersion, Stmt};
-    use ruff_text_size::TextRange;
+    use ruff_text_size::{Ranged, TextRange};
     use zip::CompressionMethod;
 
     const NOTEBOOK: &str = r#"{
@@ -1209,7 +1212,19 @@ else:
         );
         for (file, statements) in [(python, 1), (embedded, 2)] {
             let module = parsed_module(&db, file);
-            assert_eq!(module.load(&db).suite().len(), statements);
+            let parsed = module.load(&db);
+            assert_eq!(parsed.suite().len(), statements);
+            let owner = parsed.suite().last().unwrap().node_index().load();
+            let annotation =
+                parsed_annotation_range(&db, file, TextRange::new(0.into(), 6.into()), owner);
+            if file == embedded {
+                assert_eq!(
+                    annotation.unwrap().expr().range(),
+                    TextRange::new(1.into(), 6.into())
+                );
+            } else {
+                assert!(annotation.is_err());
+            }
             module.clear();
             assert_eq!(module.load(&db).suite().len(), statements);
         }
