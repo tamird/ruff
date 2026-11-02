@@ -5523,48 +5523,43 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
+    fn return_context(&self) -> Option<Type<'db>> {
+        let db = self.db();
+        if let Some(domain) = self.context.body_domain {
+            return Some(domain.return_type(db));
+        }
+        let function = nearest_enclosing_function(db, self.index, self.scope())?;
+        // In a function body its type parameters are fixed, and an async function
+        // returns its declared type before it is wrapped in a coroutine.
+        let ty = provided_function_return_type(db, function).map_or_else(
+            || {
+                same_module_uncached_raw_signature(
+                    db,
+                    function,
+                    ReturnCallableTypeVarScope::Lexical,
+                )
+                .return_ty
+            },
+            |annotation| annotation.ty,
+        );
+        if self
+            .scope()
+            .file_scope_id(db)
+            .is_generator_function(self.index)
+        {
+            Some(
+                ty.generator_return_type(db, self.program_environment())
+                    .unwrap_or(ty),
+            )
+        } else {
+            Some(ty)
+        }
+    }
+
     fn infer_return_statement(&mut self, ret: &ast::StmtReturn) {
         let db = self.db();
         let env = self.program_environment();
-        let tcx = if let Some(domain) = self.context.body_domain {
-            TypeContext::new(Some(domain.return_type(db)))
-        } else if ret.value.is_some() {
-            nearest_enclosing_function(db, self.index, self.scope())
-                .map(|func| {
-                    // When inferring expressions within a function body,
-                    // the expected type passed should be the "raw" type,
-                    // i.e. type variables in the return type are non-inferable,
-                    // and the return types of async functions are not wrapped in `CoroutineType[...]`.
-                    let return_ty = provided_function_return_type(db, func).map_or_else(
-                        || {
-                            same_module_uncached_raw_signature(
-                                db,
-                                func,
-                                ReturnCallableTypeVarScope::Lexical,
-                            )
-                            .return_ty
-                        },
-                        |returns| returns.ty,
-                    );
-
-                    // For generator functions, the declared return type is e.g.
-                    // `Generator[YieldType, SendType, ReturnType]`. The type context
-                    // for a `return` statement should be the `ReturnType` type parameter
-                    let file_scope_id = self.scope().file_scope_id(self.db());
-                    let context_ty = if file_scope_id.is_generator_function(self.index) {
-                        return_ty
-                            .generator_return_type(db, env)
-                            .unwrap_or(return_ty)
-                    } else {
-                        return_ty
-                    };
-
-                    TypeContext::new(Some(context_ty))
-                })
-                .unwrap_or_default()
-        } else {
-            TypeContext::default()
-        };
+        let tcx = TypeContext::new(ret.value.as_ref().and_then(|_| self.return_context()));
         if let Some(ty) = self.infer_optional_expression(ret.value.as_deref(), tcx) {
             let range = ret
                 .value
@@ -7956,6 +7951,55 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         )
     }
 
+    /// An empty dictionary returned by name can use the same context as a directly returned
+    /// literal. Typing the allocation itself keeps all mutations, including aliased writes,
+    /// subject to the declared schema.
+    fn returned_dict_context(&self, dict: &ast::ExprDict) -> Option<Type<'db>> {
+        let db = self.db();
+        let InferenceRegion::Expression(expression, _) = self.region else {
+            return None;
+        };
+        if expression.node_ref(db).index() != dict.node_index
+            || self.current_function_definition().is_none()
+        {
+            return None;
+        }
+        let assignment = expression.assigned_to(db)?.node(self.module());
+        let [ast::Expr::Name(name)] = assignment.targets.as_slice() else {
+            return None;
+        };
+        let definition = self.index.try_definition(name)?;
+        let returned =
+            self.index
+                .constraining_collection_uses(definition)
+                .any(|(statement, usage)| {
+                    let Statement::Other(statement) = statement else {
+                        return false;
+                    };
+                    if statement.scope(db) != self.scope() {
+                        return false;
+                    }
+                    let ast::Stmt::Return(ret) = statement.node_ref(db).node(self.module()) else {
+                        return false;
+                    };
+                    ret.value.as_deref().is_some_and(|value| {
+                        value.is_name_expr() && ExpressionNodeKey::from(value) == usage
+                    })
+                });
+        if !returned {
+            return None;
+        }
+        let ty = self.return_context()?;
+        let typed_dict = ty
+            .expand_top_level_aliases(db, self.program_environment())
+            .as_typed_dict()?;
+        typed_dict
+            .items(db)
+            .values()
+            .all(|field| !field.is_required())
+            .then_some(ty)
+    }
+
     fn infer_dict_expression(&mut self, dict: &ast::ExprDict, tcx: TypeContext<'db>) -> Type<'db> {
         let db = self.db();
         let env = self.program_environment();
@@ -7965,6 +8009,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             items,
         } = dict;
 
+        let tcx = if tcx.annotation.is_none() && items.is_empty() {
+            TypeContext::new(self.returned_dict_context(dict))
+        } else {
+            tcx
+        };
         let mut item_types = FxHashMap::default();
 
         // Validate `TypedDict` dictionary literal assignments.

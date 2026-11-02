@@ -4576,3 +4576,64 @@ def unrelated[T: str](value: Unrelated[T]) -> T:
 
 reveal_type(unrelated({}))  # revealed: Unknown
 ```
+
+## Returning an empty dictionary populated by the function
+
+A function can assemble a dictionary with optional keys before returning it. The return annotation
+supplies the type of the local dictionary, so writes through aliases use the same schema.
+
+```py
+from typing import TypedDict
+
+class Options(TypedDict, total=False):
+    color: str
+    weight: int
+
+def make(early: bool) -> Options:
+    if early:
+        first = {}
+        first["color"] = "green"
+        return first
+    later = {}
+    later["weight"] = 3
+    return later
+
+def mutate(value: dict[str, object]) -> None:
+    value["weight"] = "heavy"
+
+def escape() -> Options:
+    result = {}
+    alias = result
+    alias["weight"] = "heavy"  # error: [invalid-assignment]
+    mutate(result)  # error: [invalid-argument-type]
+    return result
+
+def cleanup() -> Options:
+    result = {}
+    try:
+        return result
+    finally:
+        result["weight"] = "heavy"  # error: [invalid-assignment]
+
+class Required(TypedDict):
+    weight: int
+
+def missing(flag: bool) -> Required:
+    result = {}
+    if flag:
+        result["weight"] = 3
+    return result  # error: [invalid-return-type]
+
+def explicit() -> Options:
+    result: dict[str, int] = {"color": 3}
+    return result  # error: [invalid-return-type]
+
+def enclosing() -> dict[str, int]:
+    result = {}
+    result["color"] = 3
+
+    def closure() -> Options:
+        return result  # error: [invalid-return-type]
+
+    return result
+```
