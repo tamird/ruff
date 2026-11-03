@@ -5102,7 +5102,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                     let value_type = lookup_inference.expression_type(&*subscript.value);
                     let slice_type = lookup_inference.expression_type(&*subscript.slice);
                     let constraint = self
-                        .narrow_typeddict_subscript(
+                        .narrow_tagged_mapping_subscript(
                             value_type,
                             &subscript.value,
                             slice_type,
@@ -5906,7 +5906,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         // Like in the `if` statement case, we're constraining `union` itself, not `union["tag"]`.
         if let ast::Expr::Subscript(subscript) = subject_node {
             let inference = infer_expression_types(db, subject, TypeContext::default());
-            if let Some((place, constraint)) = self.narrow_typeddict_subscript(
+            if let Some((place, constraint)) = self.narrow_tagged_mapping_subscript(
                 inference.expression_type(&*subscript.value),
                 &subscript.value,
                 inference.expression_type(&*subscript.slice),
@@ -6001,14 +6001,9 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         }
     }
 
-    /// Narrow tagged unions of `TypedDict`s with `Literal` keys.
-    ///
-    /// Given a subscript expression like `union["tag"]` where `union` is a `TypedDict` (or union
-    /// containing `TypedDict`s), and a comparison value like `"foo"`, this method creates a
-    /// constraint on `union` (not `union["tag"]`) that narrows it based on the tag value.
-    ///
-    /// Returns `Some((place, constraint))` if narrowing is possible, `None` otherwise.
-    fn narrow_typeddict_subscript(
+    /// Narrow the mapping in `mapping["tag"] == value` using the read type of its tag.
+    /// Ordinary `TypedDict`s and application-supplied nominal mappings can both supply tags.
+    fn narrow_tagged_mapping_subscript(
         &self,
         subscript_value_type: Type<'db>,
         subscript_value_expr: &ast::Expr,
@@ -6018,24 +6013,21 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         is_positive: bool,
     ) -> Option<(ScopedPlaceId, NarrowingConstraint<'db>)> {
         let db = self.db;
-        // Check preconditions: we need a TypedDict and a string key.
-        if !is_or_contains_typeddict(db, subscript_value_type) {
-            return None;
-        }
-        let subscript_place_expr = PlaceExpr::try_from_expr(subscript_value_expr)?;
         let key_literal = subscript_key_type.as_string_literal()?;
+        let subscript_place_expr = PlaceExpr::try_from_expr(subscript_value_expr)?;
 
         // Compare each field before combining tag types: `str | Literal["b"]` simplifies to
         // `str`, but a field declared as `Literal["b"]` can still be ruled out by `== "a"`.
         // Use conservative semantics when constraining the containing dictionary, since a broad
         // tag can contain subclasses with arbitrary comparison methods.
         let mut excluded_tags = UnionBuilder::new(db, &self.env);
-        visit_matching_typeddict_field_types(
+        let mut excluded_views = FxHashSet::default();
+        visit_mapping_field_types(
             db,
             &self.env,
             subscript_value_type,
             key_literal.value(db),
-            &mut |tag_type| {
+            &mut |mapping, tag_type| {
                 if let Some(constraint) = self.evaluate_expr_compare_op(
                     tag_type,
                     rhs_type,
@@ -6043,6 +6035,14 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                     is_positive,
                     ComparisonSoundnessPolicy::CONSERVATIVE,
                 ) {
+                    if !mapping.is_typed_dict() {
+                        // A read schema doesn't make its mapping a structural TypedDict. Exclude
+                        // the nominal alternative itself only if the comparison rules it out.
+                        if tag_type.is_disjoint_from(db, &self.env, constraint) {
+                            excluded_views.insert(mapping);
+                        }
+                        return;
+                    }
                     // A constraint can be relative to this field's type, so its complement need
                     // not describe other possible tags. Exclude only values from this domain.
                     excluded_tags.add_in_place(
@@ -6054,24 +6054,39 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 }
             },
         );
-        let excluded_tags = excluded_tags.build();
-        if excluded_tags.is_never() {
-            return None;
-        }
-
-        let field_name = Name::from(key_literal.value(db));
-        // Create a synthesized `TypedDict` describing the excluded tags. We don't
-        // want to constrain the mutability or required-ness of the field, so the most
-        // compatible form is not-required and read-only.
-        let field = TypedDictFieldBuilder::new(excluded_tags)
-            .required(false)
-            .read_only(true)
-            .build();
-        let schema = TypedDictSchema::from_iter([(field_name, field)]);
-        let synthesized_typeddict = TypedDictType::from_schema_items(db, schema);
-        // Negating the synthesized `TypedDict` excludes alternatives whose tags cannot match,
-        // without excluding non-`TypedDict` alternatives.
-        let intersection = Type::TypedDict(synthesized_typeddict).negate(db, &self.env);
+        let excluded_dict = excluded_tags.try_build().map(|tags| {
+            // Don't constrain the mutability or requiredness of an ordinary TypedDict field.
+            let field = TypedDictFieldBuilder::new(tags)
+                .required(false)
+                .read_only(true)
+                .build();
+            let schema = TypedDictSchema::from_iter([(Name::from(key_literal.value(db)), field)]);
+            Type::TypedDict(TypedDictType::from_schema_items(db, schema))
+        });
+        let kept_views = (!excluded_views.is_empty()).then(|| {
+            // Other classes can overlap an excluded specialization through a common subclass.
+            // Remove only alternatives whose own tag ruled them out.
+            let keep = |ty: &Type<'db>| {
+                let ty = ty.resolve_type_alias(db);
+                !excluded_views.contains(&ty)
+                    && !matches!(ty, Type::Intersection(intersection) if intersection.positive(db)
+                        .iter().any(|part| excluded_views.contains(&part.resolve_type_alias(db))))
+            };
+            if keep(&subscript_value_type) {
+                subscript_value_type.filter_union(db, &self.env, keep)
+            } else {
+                Type::Never
+            }
+        });
+        let intersection = match (excluded_dict, kept_views) {
+            (Some(dict), Some(views)) => IntersectionBuilder::new(db, &self.env)
+                .add_positive(views)
+                .add_negative(dict)
+                .build(),
+            (Some(dict), None) => dict.negate(db, &self.env),
+            (None, Some(views)) => views,
+            (None, None) => return None,
+        };
         let place = self.expect_place(&subscript_place_expr);
         Some((place, NarrowingConstraint::intersection(intersection)))
     }
@@ -6522,13 +6537,13 @@ fn key_membership_contains_protocol<'db>(
     )
 }
 
-/// Visit matching `TypedDict` field types, ignoring other alternatives and missing fields.
-fn visit_matching_typeddict_field_types<'db>(
+/// Visit each mapping with a known read type for this key.
+fn visit_mapping_field_types<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
     field_name: &str,
-    visit: &mut impl FnMut(Type<'db>),
+    visit: &mut impl FnMut(Type<'db>, Type<'db>),
 ) {
     let elements = match ty {
         Type::RecursiveVar(_) => {
@@ -6536,22 +6551,24 @@ fn visit_matching_typeddict_field_types<'db>(
         }
         Type::TypedDict(td) => {
             if let Some(field) = td.items(db).get(field_name) {
-                visit(field.declared_ty);
+                visit(ty, field.declared_ty);
+            }
+            return;
+        }
+        Type::NominalInstance(_) => {
+            if let Some(schema) = ty.provided_mapping_read_schema(db, env)
+                && let Some(field) = schema.items(db).get(field_name)
+            {
+                visit(ty, field.declared_ty);
             }
             return;
         }
         Type::TypeAlias(alias) => {
-            return visit_matching_typeddict_field_types(
-                db,
-                env,
-                alias.value_type(db),
-                field_name,
-                visit,
-            );
+            return visit_mapping_field_types(db, env, alias.value_type(db), field_name, visit);
         }
         Type::Recursive(recursive) => {
             if let UnfoldResult::Unfolded(unfolded) = recursive.unfold(db, env) {
-                visit_matching_typeddict_field_types(db, env, unfolded, field_name, visit);
+                visit_mapping_field_types(db, env, unfolded, field_name, visit);
             }
             return;
         }
@@ -6561,7 +6578,7 @@ fn visit_matching_typeddict_field_types<'db>(
     };
 
     for element in elements {
-        visit_matching_typeddict_field_types(db, env, *element, field_name, visit);
+        visit_mapping_field_types(db, env, *element, field_name, visit);
     }
 }
 

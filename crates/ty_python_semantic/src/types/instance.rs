@@ -46,6 +46,20 @@ pub(super) use synthesized_protocol::SynthesizedProtocolType;
 use ty_python_core::definition::Definition;
 
 impl<'db> Type<'db> {
+    pub(super) fn provided_mapping_read_schema(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<super::TypedDictType<'db>> {
+        let Self::NominalInstance(NominalInstanceType(NominalInstanceInner::NonTuple(
+            NominalInstanceClass::Plain(ClassType::Generic(_)),
+        ))) = self
+        else {
+            return None;
+        };
+        db.provided_mapping_read_schema(env, self)
+    }
+
     /// Returns storage attached by [`Type::with_provided_instance_fields`].
     ///
     /// Fields reflect specialization already applied to this instance.

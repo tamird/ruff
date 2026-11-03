@@ -25,6 +25,88 @@ use crate::types::{
 use crate::{HasType, SemanticModel};
 
 #[test]
+fn supplied_mapping_read_schema() -> anyhow::Result<()> {
+    let source = r#"
+from typing import Generic, Literal, TypeVar
+from typing_extensions import TypedDict, assert_type
+from ty_extensions._internal import Unknown
+
+S = TypeVar("S")
+class View(Generic[S]):
+    def __getitem__(self, key: str) -> Unknown:
+        return object()
+
+class Text(TypedDict, extra_items=Literal["other"]):
+    kind: Literal["output"]
+    value: str
+
+class Count(TypedDict):
+    kind: Literal["output"]
+    value: int
+
+class Other(TypedDict):
+    kind: Literal["other"]
+    value: bytes
+
+def check(row: View[Text] | View[Count] | View[Other]):
+    if row["kind"] == "output":
+        assert_type(row["value"], str | int)
+    if row["kind"] != "output":
+        assert_type(row["value"], bytes)
+
+def unmodeled(row: View[Text] | View[Other] | View[int]):
+    if row["kind"] == "output":
+        assert_type(row, View[Text] | View[int])
+    if row["undeclared"] == "output":
+        assert_type(row, View[Text] | View[Other] | View[int])
+
+def mixed(row: Text | View[Count] | View[Other] | dict[str, object]):
+    if row["kind"] == "output":
+        assert_type(row, Text | View[Count] | dict[str, object])
+
+def operations(row: View[Text]):
+    assert_type(row["undeclared"], Unknown)
+    row[42]
+    row["value"] = "wrong"
+    row.update({})
+"#;
+    let db = TestDbBuilder::new()
+        .with_mapping_read_schema(|db, env, ty| {
+            let Type::NominalInstance(instance) = ty else {
+                return None;
+            };
+            let alias = instance.class(db, env).into_generic_alias()?;
+            if alias.origin(db).name(db) != "View" {
+                return None;
+            }
+            let [Type::TypedDict(schema)] = alias.specialization(db).types(db) else {
+                return None;
+            };
+            Some(*schema)
+        })
+        .with_file("/src/main.py", source)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let range = diagnostic.range().unwrap();
+                (diagnostic.id().as_str(), &source[range])
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("invalid-argument-type", "row"),
+            ("invalid-assignment", "row[\"value\"]"),
+            ("unresolved-attribute", "row.update"),
+        ],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn supplied_builtin_function_retains_signature_and_runtime_class() -> anyhow::Result<()> {
     let source = "\
 from native import native, native2

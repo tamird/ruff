@@ -151,6 +151,20 @@ pub trait Db: PythonCoreDb {
         None
     }
 
+    /// Describes string-key reads of a specialized nominal mapping supplied by the application.
+    ///
+    /// The class must accept reads of each declared key, and the returned value must always
+    /// have its field type, including after mutation through any alias. Unlisted keys and
+    /// methods retain their declared behavior. Implementations must identify the resolved
+    /// class and read tracked inputs.
+    fn provided_mapping_read_schema<'db>(
+        &'db self,
+        _env: &crate::ProgramEnvironment<'db>,
+        _instance: crate::types::Type<'db>,
+    ) -> Option<crate::types::TypedDictType<'db>> {
+        None
+    }
+
     /// Resolves the immutable instance fields of a supplied nominal class.
     ///
     /// `file` owns the class's source anchor. The metadata identifies the field declaration;
@@ -439,6 +453,11 @@ pub(crate) mod tests {
         crate::types::Type<'db>,
         Option<Definition<'db>>,
     ) -> Option<crate::types::Type<'db>>;
+    type MappingReadSchemaProvider = for<'db> fn(
+        &'db TestDb,
+        &crate::ProgramEnvironment<'db>,
+        crate::types::Type<'db>,
+    ) -> Option<crate::types::TypedDictType<'db>>;
     type InstanceFieldsProvider = for<'db> fn(
         &'db TestDb,
         ProgramFile<'db>,
@@ -478,6 +497,7 @@ pub(crate) mod tests {
         call_argument_context_provider: Option<CallArgumentContextProvider>,
         type_application_provider: Option<TypeApplicationProvider>,
         type_reference_provider: Option<TypeReferenceProvider>,
+        mapping_read_schema: Option<MappingReadSchemaProvider>,
         instance_fields_provider: Option<InstanceFieldsProvider>,
         type_test_provider: Option<TypeTestProvider>,
         getattr_result_provider: Option<GetattrResultProvider>,
@@ -516,6 +536,7 @@ pub(crate) mod tests {
                 call_argument_context_provider: None,
                 type_application_provider: None,
                 type_reference_provider: None,
+                mapping_read_schema: None,
                 instance_fields_provider: None,
                 type_test_provider: None,
                 getattr_result_provider: None,
@@ -734,6 +755,15 @@ pub(crate) mod tests {
                 .and_then(|provider| provider(self, file, value_type, definition))
         }
 
+        fn provided_mapping_read_schema<'db>(
+            &'db self,
+            env: &crate::ProgramEnvironment<'db>,
+            instance: crate::types::Type<'db>,
+        ) -> Option<crate::types::TypedDictType<'db>> {
+            self.mapping_read_schema
+                .and_then(|provide| provide(self, env, instance))
+        }
+
         fn provided_instance_fields<'db>(
             &'db self,
             file: ProgramFile<'db>,
@@ -862,6 +892,7 @@ pub(crate) mod tests {
         call_argument_context_provider: Option<CallArgumentContextProvider>,
         type_application_provider: Option<TypeApplicationProvider>,
         type_reference_provider: Option<TypeReferenceProvider>,
+        mapping_read_schema: Option<MappingReadSchemaProvider>,
         instance_fields_provider: Option<InstanceFieldsProvider>,
         type_test_provider: Option<TypeTestProvider>,
         getattr_result_provider: Option<GetattrResultProvider>,
@@ -890,6 +921,7 @@ pub(crate) mod tests {
                 call_argument_context_provider: None,
                 type_application_provider: None,
                 type_reference_provider: None,
+                mapping_read_schema: None,
                 instance_fields_provider: None,
                 type_test_provider: None,
                 getattr_result_provider: None,
@@ -985,6 +1017,14 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_mapping_read_schema(
+            mut self,
+            provider: MappingReadSchemaProvider,
+        ) -> Self {
+            self.mapping_read_schema = Some(provider);
+            self
+        }
+
         pub(crate) fn with_instance_fields_provider(
             mut self,
             provider: InstanceFieldsProvider,
@@ -1050,6 +1090,7 @@ pub(crate) mod tests {
             db.call_argument_context_provider = self.call_argument_context_provider;
             db.type_application_provider = self.type_application_provider;
             db.type_reference_provider = self.type_reference_provider;
+            db.mapping_read_schema = self.mapping_read_schema;
             db.instance_fields_provider = self.instance_fields_provider;
             db.type_test_provider = self.type_test_provider;
             db.getattr_result_provider = self.getattr_result_provider;

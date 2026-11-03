@@ -995,6 +995,13 @@ impl<'db> Type<'db> {
         // See: https://docs.python.org/3/reference/datamodel.html#class-getitem-versus-getitem
         match value_ty.subscript_getitem(db, env, slice_ty) {
             Ok(outcome) => {
+                if expr_context == ast::ExprContext::Load
+                    && let Some(key) = slice_ty.as_string_literal()
+                    && let Some(schema) = value_ty.provided_mapping_read_schema(db, env)
+                    && let Some(field) = schema.items(db).get(key.value(db))
+                {
+                    return Ok(field.declared_ty);
+                }
                 return Ok(outcome);
             }
             Err(CallDunderError::PossiblyUnbound { bindings, .. }) => {
