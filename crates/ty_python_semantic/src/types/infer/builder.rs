@@ -9791,6 +9791,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 {
                     return items;
                 }
+                if matches!(access, DictionaryAccess::Argument)
+                    && !self.in_detached_annotation()
+                    && let Some(fresh) = crate::types::dictionary::contents::fresh_argument_items(
+                        self.db(),
+                        self.scope(),
+                        call,
+                        expression,
+                        ty,
+                        self.reachability_cache(),
+                    )
+                {
+                    return Some(fresh);
+                }
                 crate::types::dictionary::contents::retained_argument_items(
                     self.db(),
                     self.scope(),

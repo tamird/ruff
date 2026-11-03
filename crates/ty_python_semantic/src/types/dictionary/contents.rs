@@ -1,6 +1,6 @@
 //! Mapping contents at a use, inferred from the ordinary reaching-definition graph.
 
-use ruff_db::parsed::parsed_module;
+use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast as ast;
 use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::helpers::any_over_expr;
@@ -2914,6 +2914,85 @@ fn checked_keyword_field_factory<'db>(
     binding.errors().is_empty().then_some(declaration)
 }
 
+/// A callback can capture the name of a dictionary before the dictionary exists. When a call
+/// immediately follows the allocation, it can observe the initial entries if evaluating the
+/// callee and its arguments cannot invoke the callback. Later observations still see the capture.
+pub(crate) fn fresh_argument_items<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    call: &ast::ExprCall,
+    expression: &ast::Expr,
+    ty: Type<'db>,
+    reachability: &ReachabilityEvaluationCache<'db>,
+) -> Option<DictionaryItems<'db>> {
+    let name = expression.as_name_expr()?;
+    if !call.func.is_name_expr()
+        || call
+            .arguments
+            .iter_source_order()
+            .any(|argument| argument.is_variadic() || !inert_field_argument(argument.value()))
+    {
+        return None;
+    }
+    let file = scope.program_file(db);
+    let index = semantic_index(db, file);
+    let module = parsed_module(db, file.python_file(db)).load(db);
+    let [ast::Stmt::Assign(allocation), observation] =
+        statements_at_call(db, scope, &module, call)?
+    else {
+        return None;
+    };
+    let value = match observation {
+        ast::Stmt::Assign(assignment) => &assignment.value,
+        ast::Stmt::Expr(statement) => &statement.value,
+        _ => return None,
+    };
+    if !value
+        .as_call_expr()
+        .is_some_and(|value| std::ptr::eq(value, call))
+        || !allocation.value.is_dict_expr()
+    {
+        return None;
+    }
+    let [ast::Expr::Name(target)] = allocation.targets.as_slice() else {
+        return None;
+    };
+    let table = index.place_table(scope.file_scope_id(db));
+    let symbol = table.symbol(table.symbol_id(&target.id)?);
+    if target.id != name.id || !symbol.is_local() || symbol.is_reassigned() {
+        return None;
+    }
+    let [definition] = index.try_definitions(target.into())? else {
+        return None;
+    };
+    let ContentsValue::Mapping(mut mapping) =
+        initial_contents(db, *definition, ty, reachability.body_domain())
+    else {
+        return None;
+    };
+    mapping.localize(file, expression.range());
+    mapping
+        .dictionary
+        .is_complete()
+        .then_some(mapping.dictionary)
+}
+
+/// The predecessor and current statement in a module or function body.
+fn statements_at_call<'ast>(
+    db: &dyn Db,
+    scope: ScopeId<'_>,
+    module: &'ast ParsedModuleRef,
+    call: &ast::ExprCall,
+) -> Option<&'ast [ast::Stmt; 2]> {
+    let body = match scope.node(db) {
+        NodeWithScopeKind::Module => module.suite(),
+        NodeWithScopeKind::Function(function) => &function.node(module).body,
+        _ => return None,
+    };
+    let end = body.partition_point(|statement| statement.start() <= call.start());
+    body.get(end.checked_sub(2)?..end)?.try_into().ok()
+}
+
 /// Recover a retained dictionary only for the next checked call. The ordinary contents state
 /// remains exposed: the returned holder is another path to the mutable dictionary.
 pub(crate) fn retained_argument_items<'db>(
@@ -2973,13 +3052,8 @@ pub(crate) fn retained_argument_items<'db>(
     {
         return None;
     }
-    let body = match scope.node(db) {
-        NodeWithScopeKind::Module => module.suite(),
-        NodeWithScopeKind::Function(function) => &function.node(&module).body,
-        _ => return None,
-    };
-    let end = body.partition_point(|statement| statement.start() < observed.start());
-    let [previous, ast::Stmt::Assign(observing_assignment)] = body.get(end.checked_sub(2)?..end)?
+    let [previous, ast::Stmt::Assign(observing_assignment)] =
+        statements_at_call(db, scope, &module, observed)?
     else {
         return None;
     };

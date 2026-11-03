@@ -4052,6 +4052,30 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
             "first: Literal[1]",
         ),
         (
+            "def clear(): expose(values)\nvalues = {'first': 1}\nresult = observe(values, other=[clear])\nclear()",
+            "first: Literal[1]",
+        ),
+        (
+            "def clear(): expose(values)\nvalues = {'first': 1}\nclear()\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "def clear(): expose(values)\ndef run(callback): callback()\nvalues = {'first': 1}\nrun(clear)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "def clear(): expose(values)\nvalues = {'first': 1}\nresult = observe(values, other=clear())",
+            "unknown",
+        ),
+        (
+            "def clear(): values.clear()\nvalues = {'first': 1}\nresult = observe(other=clear(), value=values)",
+            "unknown",
+        ),
+        (
+            "def clear(): values.clear()\nvalues = {'first': 1}\nalias = values\nalias.clear()\nresult = observe(values)",
+            "unknown",
+        ),
+        (
             "values = {'first': 1}\npreserve(values)\npreserve(data=values)\nresult = observe(values)",
             "first: Literal[1]",
         ),
