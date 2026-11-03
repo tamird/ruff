@@ -74,7 +74,7 @@ use crate::parser::Parser;
 use ruff_python_ast::token::{Token, TokenFlags, TokenKind, Tokens};
 use ruff_python_ast::{
     AtomicNodeIndex, Expr, Mod, ModExpression, ModModule, PySourceType, StringFlags, StringLiteral,
-    Suite,
+    Suite, TypeParams,
 };
 use ruff_text_size::{Ranged, TextRange};
 
@@ -171,6 +171,29 @@ pub fn parse_expression_range_with_options(
 ) -> Result<Parsed<ModExpression>, ParseError> {
     options.mode = Mode::Expression;
     parse_expression_range_impl(source, range, options)
+}
+
+/// Parse a bracketed type parameter list, preserving offsets into the enclosing source.
+///
+/// ```
+/// use ruff_python_parser::{Mode, ParseOptions, parse_type_params_range};
+/// use ruff_text_size::{Ranged, TextRange};
+///
+/// let source = "# [T: str] trailing";
+/// let options = ParseOptions::from(Mode::Module);
+/// let list = parse_type_params_range(source, TextRange::new(2.into(), 10.into()), options.clone())?;
+/// assert_eq!(&source[list.syntax()[0].range()], "T: str");
+/// assert!(parse_type_params_range(source, TextRange::new(2.into(), 19.into()), options).is_err());
+/// # Ok::<(), ruff_python_parser::ParseError>(())
+/// ```
+pub fn parse_type_params_range(
+    source: &str,
+    range: TextRange,
+    mut options: ParseOptions,
+) -> Result<Parsed<TypeParams>, ParseError> {
+    options.mode = Mode::Expression;
+    Parser::new_starts_at(&source[..range.end().to_usize()], range.start(), options)
+        .parse_type_param_list()
 }
 
 fn parse_expression_range_impl(
@@ -559,6 +582,19 @@ impl Parsed<Mod> {
 }
 
 impl Parsed<ModModule> {
+    /// Attach syntax from trivia before assigning node indices. New nodes and
+    /// errors must use offsets in the original source.
+    pub fn transform_suite(
+        &mut self,
+        transform: impl FnOnce(&mut Suite, &Tokens) -> Vec<ParseError>,
+    ) {
+        let errors = transform(&mut self.syntax.body, &self.tokens);
+        if !errors.is_empty() {
+            self.errors.extend(errors);
+            self.errors.sort_by_key(|error| error.location.start());
+        }
+    }
+
     /// Returns the module body contained in this parsed output as a [`Suite`].
     pub fn suite(&self) -> &Suite {
         &self.syntax.body

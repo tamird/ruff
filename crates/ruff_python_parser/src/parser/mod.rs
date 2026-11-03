@@ -246,7 +246,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn finish(self, syntax: Mod) -> Parsed<Mod> {
+    fn finish<T>(self, syntax: T) -> Parsed<T> {
         assert_eq!(
             self.current_token_kind(),
             TokenKind::EndOfFile,

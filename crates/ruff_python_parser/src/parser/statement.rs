@@ -3596,6 +3596,27 @@ impl<'src> Parser<'src> {
         self.at(TokenKind::Lsqb).then(|| self.parse_type_params())
     }
 
+    pub(crate) fn parse_type_param_list(
+        mut self,
+    ) -> Result<crate::Parsed<ast::TypeParams>, crate::ParseError> {
+        let expected = |parser: &Self, expected| crate::ParseError {
+            error: ParseErrorType::ExpectedToken {
+                expected,
+                found: parser.current_token_kind(),
+            },
+            location: parser.current_token_range(),
+        };
+        let parameters = self
+            .try_parse_type_params()
+            .ok_or_else(|| expected(&self, TokenKind::Lsqb))?;
+        self.eat(TokenKind::Newline);
+        if !self.at(TokenKind::EndOfFile) {
+            return Err(expected(&self, TokenKind::EndOfFile));
+        }
+        self.bump(TokenKind::EndOfFile);
+        self.finish(parameters).into_result()
+    }
+
     /// Parses a type parameter list.
     ///
     /// # Panics
