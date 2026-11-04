@@ -2333,6 +2333,16 @@ def optional(values: Exact[str, int | None] | None) -> None:
     assert_type(observed(values), Literal[True])
     assert_type(list(values.values())[0], int | None)
 
+def apply(*, tags: list[str], testonly: bool = False) -> None: ...
+
+def augment(testonly: bool) -> None:
+    options = {"tags": ["manual"]}
+    if testonly:
+        options["testonly"] = testonly
+    options["tags"] += ["local"]
+    assert_type(options["tags"], list[str])
+    apply(**options)
+
 def nominal(values: dict[str, object]) -> None:
     values.values()
     assert_type(observed(values), Literal[False])

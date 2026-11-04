@@ -14814,6 +14814,14 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
                         .zip(safe_mutable_class.generic_origin(db, env))
                         .is_some_and(|(l, r)| l == r)
             })
+            || ty.as_nominal_instance().is_some_and(|instance| {
+                let class = instance.class_literal(db, env);
+                // A provided allocation class inherits the builtin's item access
+                // and assignment unchanged.
+                [KnownClass::Dict, KnownClass::List]
+                    .into_iter()
+                    .any(|builtin| builtin.provided_allocation_class(db, env) == Some(class))
+            })
     }
 }
 
