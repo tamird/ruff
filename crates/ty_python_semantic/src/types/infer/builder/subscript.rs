@@ -1597,10 +1597,69 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => value_ty.subscript(db, env, slice_ty, expr_context),
         };
 
-        subscript_result.map_err(|error| {
-            error.report_diagnostics(&self.context, subscript);
-            error.result_type()
-        })
+        match subscript_result {
+            Err(error)
+                if expr_context == ExprContext::Load
+                    && error.is_key_type_mismatch()
+                    && self.membership_guard(subscript).is_some()
+                    && slice_ty.is_assignable_to(
+                        db,
+                        env,
+                        KnownClass::Hashable.to_instance(db, env),
+                    )
+                    && crate::types::dictionary::has_builtin_key_lookup(db, env, value_ty) =>
+            {
+                Ok(error.result_type())
+            }
+            Ok(value) => Ok(value),
+            Err(error) => {
+                error.report_diagnostics(&self.context, subscript);
+                Err(error.result_type())
+            }
+        }
+    }
+
+    /// In `{k: d[k] for k in keys if k in d}`, membership validates this read, not the type
+    /// of `k`: differently typed keys can compare equal. Only use an immediately preceding
+    /// guard; a later filter or an arbitrary result-key expression can mutate the dictionary.
+    /// Dynamic subscripts are not indexed places, so ordinary narrowing constraints cannot
+    /// record this relationship or invalidate it when the key or dictionary changes.
+    fn membership_guard(&self, subscript: &ast::ExprSubscript) -> Option<()> {
+        use ty_python_core::scope::NodeWithScopeKind;
+
+        let (dict, key) = (
+            subscript.value.as_name_expr()?,
+            subscript.slice.as_name_expr()?,
+        );
+        let (generators, result): (&[ast::Comprehension], &ast::Expr) =
+            match self.scope().node(self.db()) {
+                NodeWithScopeKind::DictComprehension(node) => {
+                    let node = node.node(self.module());
+                    if node.key.as_ref()?.as_name_expr()?.id != key.id {
+                        return None;
+                    }
+                    (&node.generators, node.value.as_ref())
+                }
+                NodeWithScopeKind::ListComprehension(node) => {
+                    let node = node.node(self.module());
+                    (&node.generators, node.elt.as_ref())
+                }
+                _ => return None,
+            };
+        if result.range() != subscript.range() {
+            return None;
+        }
+        let (candidate, ast::CmpOp::In, container) = generators
+            .last()?
+            .ifs
+            .last()?
+            .as_compare_expr()?
+            .as_single()?
+        else {
+            return None;
+        };
+        (candidate.as_name_expr()?.id == key.id && container.as_name_expr()?.id == dict.id)
+            .then_some(())
     }
 
     pub(super) fn infer_slice_expression(&mut self, slice: &ast::ExprSlice) -> Type<'db> {

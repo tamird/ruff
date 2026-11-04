@@ -7,14 +7,15 @@ use ty_python_core::semantic_index;
 
 use crate::reachability::ReachabilityEvaluationCache;
 use crate::types::call::collect_keyword_items;
+use crate::types::function::FunctionDecorators;
 use crate::types::infer::FunctionBodyDomain;
 use crate::types::set_theoretic::UnionBuilder;
 use crate::types::typed_dict::{
     UnpackedTypedDict, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
 };
 use crate::types::{
-    BoundTypeVarInstance, IntersectionType, KnownClass, MemberLookupPolicy, ProgramEnvironment,
-    Truthiness, Type, TypedDictOpenness, TypedDictType, UnionType,
+    BoundTypeVarInstance, FunctionType, IntersectionType, KnownClass, MemberLookupPolicy,
+    ProgramEnvironment, Truthiness, Type, TypedDictOpenness, TypedDictType, UnionType,
 };
 use crate::{Db, FxIndexMap};
 
@@ -49,15 +50,8 @@ pub(crate) fn first_value<'db>(
     let Type::BoundMethod(method) = expression_type(&read.values.func)? else {
         return None;
     };
-    let declared = KnownClass::Dict
-        .to_instance(db, env)
-        .member_lookup_with_policy(db, env, "values", MemberLookupPolicy::NO_INSTANCE_FALLBACK)
-        .place
-        .ignore_possibly_undefined()?;
-    let Type::BoundMethod(declared) = declared else {
-        return None;
-    };
-    if method.function(db)?.definition(db) != declared.function(db)?.definition(db) {
+    let declared = bound_method(db, env, KnownClass::Dict.to_instance(db, env), "values")?;
+    if method.function(db)?.definition(db) != declared.definition(db) {
         return None;
     }
     let receiver_type = expression_type(read.receiver)?;
@@ -98,6 +92,45 @@ pub(crate) fn has_dict_type<'db>(
         Type::Union(union) => union.elements(db).iter().copied().all(is_instance),
         _ => is_instance(ty),
     }
+}
+
+fn bound_method<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    name: &str,
+) -> Option<FunctionType<'db>> {
+    let member =
+        ty.member_lookup_with_policy(db, env, name, MemberLookupPolicy::NO_INSTANCE_FALLBACK);
+    let Type::BoundMethod(method) = member.place.ignore_possibly_undefined()? else {
+        return None;
+    };
+    method.function(db)
+}
+
+/// A dict subclass can override either operation independently.
+pub(super) fn has_builtin_key_lookup<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    receiver: Type<'db>,
+) -> bool {
+    let Some(class) = receiver.nominal_class(db, env) else {
+        return false;
+    };
+    let Some(builtin) = KnownClass::Dict.try_to_class_literal(db, env) else {
+        return false;
+    };
+    class.is_subtype_of_class_literal(db, builtin.into())
+        && ["__contains__", "__getitem__"].into_iter().all(|name| {
+            let declared = bound_method(db, env, KnownClass::Dict.to_instance(db, env), name);
+            declared
+                .zip(bound_method(db, env, receiver, name))
+                .is_some_and(|(declared, actual)| {
+                    actual.definition(db) == declared.definition(db)
+                        && (class.is_final(db)
+                            || declared.has_known_decorator(db, FunctionDecorators::FINAL))
+                })
+        })
 }
 
 /// Observe one key through builtin dictionary history. Writable receiver types remain

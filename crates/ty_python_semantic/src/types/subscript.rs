@@ -178,6 +178,29 @@ impl<'db> SubscriptError<'db> {
         self.result_ty
     }
 
+    /// Only the key-type mismatch is discharged by an established membership test.
+    pub(super) fn is_key_type_mismatch(&self) -> bool {
+        let [
+            SubscriptErrorKind::DunderCallError {
+                method: DunderMethod::GetItem,
+                kind: CallErrorKind::BindingError,
+                bindings,
+                ..
+            },
+        ] = self.errors.as_slice()
+        else {
+            return false;
+        };
+        let mut errors = bindings
+            .iter_flat()
+            .flatten()
+            .flat_map(super::call::bind::Binding::errors);
+        matches!(
+            errors.next(),
+            Some(super::call::bind::BindingError::InvalidArgumentType { .. })
+        ) && errors.next().is_none()
+    }
+
     fn into_errors(self) -> Vec<SubscriptErrorKind<'db>> {
         self.errors
     }
