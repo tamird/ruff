@@ -507,7 +507,13 @@ impl<'db> CallableSignature<'db> {
                 if let Some((prefix, paramspec)) =
                     signature.parameters.forwarded_paramspec_with_prefix(db)
                     && let Some(value) = specialization.get_parameter_list(db, paramspec)
-                    && let Some(value) = value.as_paramspec_value(db)
+                    && let Some(value) = value.as_paramspec_value(db).filter(|value| match value {
+                        // An unchanged pack keeps its authored parameter definitions. The
+                        // ordinary signature mapping still specializes captured outer types.
+                        ParamSpecValue::ParamSpec(mapped) => *mapped != paramspec,
+                        ParamSpecValue::Callable(_) => true,
+                        ParamSpecValue::Intersection(_) => true,
+                    })
                     && let Some(result) = try_apply_type_mapping_for_paramspec(
                         db,
                         signature,

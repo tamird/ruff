@@ -6156,6 +6156,77 @@ def ordinary_calls(value: Callable[[int], int], instance: PythonMethod):
 reveal_type("value".__len__())  # revealed: Literal[5]
 ```
 
+## Typing-only equality and implicit hashing
+
+Typing-only equality declarations do not create a runtime hash attribute. Internal operation
+checks still use typing-only hash declarations.
+
+`equality.pyi`:
+
+```pyi
+from typing import TYPE_CHECKING, Literal, type_check_only
+
+flag: bool
+
+class RuntimeHash:
+    def __hash__(self) -> Literal[7]: ...
+
+class TypingEquality(RuntimeHash):
+    @type_check_only
+    def __eq__(self, other: object, /) -> bool: ...
+
+class RuntimeEquality(RuntimeHash):
+    def __eq__(self, other: object, /) -> bool: ...
+
+class NativeHash(TypingEquality):
+    @type_check_only
+    def __hash__(self) -> Literal[7]: ...
+
+class RuntimeEqualityWithNativeHash(RuntimeHash):
+    def __eq__(self, other: object, /) -> bool: ...
+    @type_check_only
+    def __hash__(self) -> Literal[7]: ...
+
+class GuardedEquality(RuntimeHash):
+    if TYPE_CHECKING:
+        def __eq__(self, other: object, /) -> bool: ...
+
+class ConditionalEquality(RuntimeHash):
+    if flag:
+        @type_check_only
+        def __eq__(self, other: object, /) -> bool: ...
+    else:
+        def __eq__(self, other: object, /) -> bool: ...
+```
+
+`main.py`:
+
+```py
+from equality import (
+    ConditionalEquality,
+    GuardedEquality,
+    NativeHash,
+    RuntimeEquality,
+    RuntimeEqualityWithNativeHash,
+    TypingEquality,
+)
+
+reveal_type(RuntimeEquality().__hash__)  # revealed: None
+reveal_type(RuntimeEquality.__hash__)  # revealed: None
+reveal_type(TypingEquality().__hash__())  # revealed: Literal[7]
+reveal_type(TypingEquality.__hash__(TypingEquality()))  # revealed: Literal[7]
+reveal_type(NativeHash().__hash__())  # revealed: Literal[7]
+reveal_type(hash(NativeHash()))  # revealed: int
+reveal_type(RuntimeEqualityWithNativeHash().__hash__)  # revealed: None
+reveal_type(hash(RuntimeEqualityWithNativeHash()))  # revealed: int
+reveal_type(GuardedEquality().__hash__())  # revealed: Literal[7]
+
+def conditional(value: ConditionalEquality):
+    reveal_type(value.__hash__ is None)  # revealed: bool
+    if value.__hash__ is not None:
+        reveal_type(value.__hash__())  # revealed: Literal[7]
+```
+
 ## References
 
 Some of the tests in the *Class and instance variables* section draw inspiration from
