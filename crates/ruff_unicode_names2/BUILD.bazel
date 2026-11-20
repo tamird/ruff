@@ -1,0 +1,9 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ruff_unicode_names2",
+    build_deps = [
+        "//crates/ruff_unicode_names2_generator:ruff_unicode_names2_generator",
+    ],
+    build_compile_data = glob(["data/*.txt"]),
+)

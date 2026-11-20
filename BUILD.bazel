@@ -1,0 +1,47 @@
+load("@ruff_workspace_metadata//:crates.bzl", "WORKSPACE_MEMBERS")
+load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rustfmt_test")
+
+exports_files(["Cargo.toml", "Cargo.lock", "clippy.toml", "rustfmt.toml", "MODULE.bazel.lock"])
+
+test_suite(
+    name = "ty_tests",
+    tests = [
+        "//crates/ty_python_core:unit_tests",
+        "//crates/ty_python_semantic:unit_tests",
+        "//crates/ty_python_semantic:mdtest",
+        "//crates/ty_ide:unit_tests",
+    ],
+)
+
+
+rustfmt_test(
+    name = "ty_format",
+    targets = [
+        "//crates/ty_python_core:unit_tests",
+        "//crates/ty_python_semantic:unit_tests",
+        "//crates/ty_python_semantic:mdtest",
+        "//crates/ty_ide:unit_tests",
+    ],
+    transitive = True,
+)
+
+rust_clippy_test(
+    name = "ty_clippy",
+    targets = [
+        "//crates/ty_python_core:unit_tests",
+        "//crates/ty_python_semantic:unit_tests",
+        "//crates/ty_python_semantic:mdtest",
+        "//crates/ty_ide:unit_tests",
+    ],
+    transitive = True,
+)
+
+# Cargo's no-deps metadata query still reads all workspace member manifests.
+filegroup(
+    name = "cargo_workspace_metadata",
+    srcs = ["Cargo.toml", "Cargo.lock"] + glob([".cargo/*.toml"], allow_empty = True) + [
+        "//" + package + ":cargo_metadata_files"
+        for package in WORKSPACE_MEMBERS
+    ],
+    visibility = ["//visibility:public"],
+)
