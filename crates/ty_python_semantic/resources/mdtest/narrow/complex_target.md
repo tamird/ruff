@@ -298,7 +298,7 @@ and its payload. Reassigning either target must not restore the original relatio
 
 ```py
 from collections.abc import AsyncIterable
-from typing import Literal
+from typing import Literal, assert_type
 
 def unpacked(item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], str]):
     flag, payload = item
@@ -315,6 +315,12 @@ def aliased(item: Tagged):
         reveal_type(payload)  # revealed: dict[str, int]
     else:
         reveal_type(payload)  # revealed: str
+
+type RecursivePayload = int | list[RecursivePayload]
+
+def recursive_payload(item: tuple[bool, RecursivePayload]):
+    flag, payload = item
+    assert_type(payload if flag else None, RecursivePayload | None)
 
 def for_targets(items: list[Tagged]):
     for flag, payload in items:
