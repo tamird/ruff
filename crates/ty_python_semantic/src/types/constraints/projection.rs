@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 
 use super::{
     ALWAYS_FALSE, ALWAYS_TRUE, BoundedSolutionLimits, CandidateSearch, CandidateSolutions, CandidateTypeVarSolution,
-    ConstraintId, ConstraintSet, PathBoundSolution, ReportDiagnostics, SolutionLimits, Solutions,
+    ConstraintId, ConstraintProvenance, ConstraintSet, PathBoundSolution, ReportDiagnostics, SolutionLimits, Solutions,
     TypeVarSolution,
 };
 use crate::types::typevar::TypeVarSet;
@@ -46,10 +46,22 @@ pub(crate) struct ProjectionBudget {
 }
 
 impl ProjectionBudget {
+    #[cfg(test)]
+    pub(crate) fn remaining_visits(&self) -> usize {
+        self.limits.remaining_visits
+    }
+
     pub(crate) fn new(budget: SolutionBudget) -> Self {
-        let SolutionBudget { paths, visits, type_terms } = budget;
+        let SolutionBudget {
+            paths,
+            visits,
+            type_terms,
+        } = budget;
         Self {
-            limits: BoundedSolutionLimits { remaining_paths: paths, remaining_visits: visits },
+            limits: BoundedSolutionLimits {
+                remaining_paths: paths,
+                remaining_visits: visits,
+            },
             types: ProjectionTypeBudget::new(type_terms),
         }
     }
@@ -208,7 +220,8 @@ impl<'db> ConstraintSet<'db, '_> {
             remaining_paths: budget.paths,
             remaining_visits: budget.visits,
         };
-        let paths = self.path_bounds_with_limits(db, env, inferable, &mut limits, search)?;
+        let paths =
+            self.path_bounds_with_limits(db, env, inferable, &mut limits, search)?;
         Ok((paths, limits))
     }
 
@@ -248,14 +261,36 @@ impl<'db> ConstraintSet<'db, '_> {
         env: &ProgramEnvironment<'db>,
         inferable: TypeVarSet<'db>,
         resources: &mut ProjectionBudget,
+        fixed: &[TypeVarSolution<'db>],
         mut project: impl FnMut(
             &[TypeVarSolution<'db>],
             &mut ProjectionTypeBudget,
         ) -> Result<Option<Vec<TypeVarSolution<'db>>>, ProjectionError>,
         fallback: Vec<TypeVarSolution<'db>>,
     ) -> Result<Option<Vec<TypeVarSolution<'db>>>, ProjectionError> {
-        let ProjectionBudget { limits, types: type_budget } = resources;
-        let path_bounds = self.path_bounds_with_limits(db, env, inferable, limits, CandidateSearch::All(ReportDiagnostics::No))?;
+        let ProjectionBudget {
+            limits,
+            types: type_budget,
+        } = resources;
+        // Selected caller bindings constrain discovery as well as the final proof.
+        // Without these bounds, dropping a selected variable from `inferable` would
+        // make its original relation rigid before its selected value was applied.
+        let mut selected = self;
+        for binding in fixed {
+            type_budget.charge_type(db, binding.solution)?;
+            match limits.visit_node() {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(error) => return Err(error),
+            }
+            selected.intersect(db, self.builder, Self::constrain_typevar_equivalence_bound(
+                db, env, self.builder, ConstraintProvenance::INFERRED,
+                binding.bound_typevar, binding.solution,
+            ));
+        }
+        let inferable = inferable.merge(db, TypeVarSet::from_typevars(
+            db, fixed.iter().map(|binding| binding.bound_typevar),
+        ));
+        let path_bounds = selected.path_bounds_with_limits(db, env, inferable, limits, CandidateSearch::All(ReportDiagnostics::No))?;
         let (inferable, paths, incomplete) = match path_bounds {
             CandidateSolutions::Unsatisfiable => return Ok(None),
             CandidateSolutions::Unconstrained => return Err(ProjectionError::IncompleteSolution),
@@ -422,7 +457,12 @@ impl<'db> ConstraintSet<'db, '_> {
         choose: impl FnMut(TypeVarVariance, &CandidateTypeVarSolution<'db>) -> PathBoundSolution<'db>,
     ) -> Result<Solutions<'db>, ProjectionError> {
         self.solutions_with_shared_budget(
-            db, env, inferable, &mut ProjectionBudget::new(budget), report_diagnostics, choose,
+            db,
+            env,
+            inferable,
+            &mut ProjectionBudget::new(budget),
+            report_diagnostics,
+            choose,
         )
     }
 
@@ -442,46 +482,6 @@ impl<'db> ConstraintSet<'db, '_> {
         path_bounds.solve_with_limits(db, env, limits, type_budget, choose)
     }
 
-    /// Reconstructs independent bound hints only to diagnose an already rejected full call.
-    /// These choices do not establish a joint witness and are always marked incomplete.
-    pub(crate) fn diagnostic_solutions(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        inferable: TypeVarSet<'db>,
-    ) -> Result<Solutions<'db>, ProjectionError> {
-        let budget = SolutionBudget::default();
-        let (candidates, mut limits) =
-            self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(ReportDiagnostics::No))?;
-        let mut type_budget = ProjectionTypeBudget::new(budget.type_terms);
-        match candidates.try_collect_solutions(
-            &mut type_budget,
-            |inferable, candidate, _budget| {
-                let selected = CandidateSolutions::select_bindings(
-                    db,
-                    env,
-                    inferable,
-                    candidate,
-                    &mut limits,
-                    &mut |_, bound| {
-                        CandidateSolutions::preliminary_solve(db, env, self.builder, bound)
-                    },
-                )?;
-                ControlFlow::Continue(selected.map(|(solution, _)| (solution, true)))
-            },
-            |solution, type_budget| {
-                for binding in &solution.solved_typevars {
-                    if let Err(error) = type_budget.charge_type(db, binding.solution) {
-                        return ControlFlow::Break(error);
-                    }
-                }
-                ControlFlow::Continue(())
-            },
-        ) {
-            ControlFlow::Continue(solutions) => Ok(solutions),
-            ControlFlow::Break(error) => Err(error),
-        }
-    }
 
     /// Folds complete, correlated solutions without first allocating every solved path.
     ///

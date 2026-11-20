@@ -6687,7 +6687,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut next_bindings = bindings.clone();
         let mut prev_argument_types = argument_types.clone();
 
-        let (mut converged_builder, converged_argument_types) = loop {
+        let (converged_builder, converged_argument_types) = loop {
             let mut next_argument_types = argument_types.clone();
 
             // Infer the argument types for the current iteration.
@@ -9889,48 +9889,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } = if_expression;
 
         let test_ty = self.infer_maybe_standalone_expression(test, TypeContext::default());
-        // An empty literal cannot provide element types for its nonempty peer. Infer the
-        // nonempty branch first so the empty branch can use those types as context.
-        let nonempty_body_with_empty_peer = match &**body {
-            ast::Expr::List(body) => {
-                let ast::ExprList {
-                    node_index: _,
-                    range: _,
-                    elts,
-                    ctx: _,
-                } = body;
-                !elts.is_empty()
-                    && orelse.as_list_expr().is_some_and(|orelse| {
-                        let ast::ExprList {
-                            node_index: _,
-                            range: _,
-                            elts,
-                            ctx: _,
-                        } = orelse;
-                        elts.is_empty()
-                    })
-            }
-            ast::Expr::Dict(body) => {
-                let ast::ExprDict {
-                    node_index: _,
-                    range: _,
-                    items,
-                } = body;
-                !items.is_empty()
-                    && orelse.as_dict_expr().is_some_and(|orelse| {
-                        let ast::ExprDict {
-                            node_index: _,
-                            range: _,
-                            items,
-                        } = orelse;
-                        items.is_empty()
-                    })
-            }
-            _ => false,
-        };
         let (body_ty, orelse_ty) = if can_use_collection_peer_context(body)
             && prefer_collection_literal_peer_context(db, env, tcx)
-            && !nonempty_body_with_empty_peer
+            && !is_nonempty_collection_literal_with_empty_peer(body, orelse)
         {
             // Infer the peer branch first so the body can use its type as context.
             let orelse_ty = self.infer_expression(orelse, tcx);

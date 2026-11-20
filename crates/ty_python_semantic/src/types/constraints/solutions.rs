@@ -3308,9 +3308,9 @@ mod tests {
     use crate::types::constraints::{SolutionPaths, Solutions, UnboundedSolutionLimits};
     use ruff_python_ast::name::Name;
 
+    use crate::place::global_symbol;
     use ruff_db::files::system_path_to_file;
     use ruff_db::system::DbWithWritableSystem;
-    use crate::place::global_symbol;
     use ty_python_core::ProgramFile;
 
     #[test]
@@ -3338,7 +3338,8 @@ mod tests {
         let lower = Type::single_callable(db, signature.clone());
         let bound = global_symbol(db, file, "bound").place.expect_type();
         let bindings = bound.bindings(db, &env);
-        let callable = bindings.single_element()
+        let callable = bindings
+            .single_element()
             .ok_or_else(|| anyhow::anyhow!("expected one bound callable"))?;
         let [binding] = callable.overloads() else {
             anyhow::bail!("expected one bound overload");
@@ -3348,34 +3349,57 @@ mod tests {
         };
         let upper = parameter.annotated_type();
         let target = BoundTypeVarInstance::synthetic(
-            db, &env, Name::new_static("Target"), TypeVarVariance::Invariant,
-        ).map_bound_or_constraints(db, |_| Some(TypeVarBoundOrConstraints::UpperBound(upper)));
+            db,
+            &env,
+            Name::new_static("Target"),
+            TypeVarVariance::Invariant,
+        )
+        .map_bound_or_constraints(db, |_| Some(TypeVarBoundOrConstraints::UpperBound(upper)));
         let inferable = TypeVarSet::from_typevars(db, [target]);
         let builder = ConstraintSetBuilder::new();
         let relation = ConstraintSet::constrain_typevar_lower_bound(
-            db, &env, &builder, ConstraintProvenance::INFERRED, target, lower,
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            target,
+            lower,
         );
         let mut storage = builder.storage.borrow_mut();
         let root = storage.interior_node_data(relation.node);
-        let lower_atom = root.constraint.as_atomic(&storage)
+        let lower_atom = root
+            .constraint
+            .as_atomic(&storage)
             .ok_or_else(|| anyhow::anyhow!("expected actual lower-bound evidence"))?;
 
         // The real callable comparison quantifies Local in str <= Local <= Free. Exhaust
         // witness work rather than fabricating a proof outcome. First assert that this
         // fixture reaches the fixed-upper-bound query itself, so another incomplete path
         // cannot make the caller assertions pass accidentally.
-        let mut path = relation.node.path_assignments(db, &env, &mut storage, relation.source_order);
-        assert!(path.assume(db, &env, &mut storage, lower_atom.when_true(),
-            UnspecializedTypeVarPolicy::Ignore));
+        let mut path =
+            relation
+                .node
+                .path_assignments(db, &env, &mut storage, relation.source_order);
+        assert!(path.assume(
+            db,
+            &env,
+            &mut storage,
+            lower_atom.when_true(),
+            UnspecializedTypeVarPolicy::Ignore
+        ));
         let source_orders = storage.calculate_source_orders(relation.source_order);
         let mut walker = SolutionWalker::new(
-            db, &mut storage, source_orders, inferable, UnboundedSolutionLimits,
+            db,
+            &mut storage,
+            source_orders,
+            inferable,
+            UnboundedSolutionLimits,
             (relation.node, relation.source_order),
         );
         walker.witness_budget = ProjectionTypeBudget::new(0);
-        let ControlFlow::Continue(result) = walker.inferred_lower_satisfies_upper_bound(
-            db, &env, &mut storage, &mut path, target,
-        ) else {
+        let ControlFlow::Continue(result) =
+            walker.inferred_lower_satisfies_upper_bound(db, &env, &mut storage, &mut path, target)
+        else {
             anyhow::bail!("unbounded traversal unexpectedly stopped");
         };
         assert_eq!(result, None);
@@ -3385,18 +3409,39 @@ mod tests {
         // performs upper-bound validation, then failure attribution when no path was certified.
         let source_orders = storage.calculate_source_orders(relation.source_order);
         let mut walker = SolutionWalker::new(
-            db, &mut storage, source_orders, inferable, UnboundedSolutionLimits,
+            db,
+            &mut storage,
+            source_orders,
+            inferable,
+            UnboundedSolutionLimits,
             (relation.node, relation.source_order),
         );
         walker.witness_budget = ProjectionTypeBudget::new(0);
-        let mut path = relation.node.path_assignments(db, &env, &mut storage, relation.source_order);
+        let mut path =
+            relation
+                .node
+                .path_assignments(db, &env, &mut storage, relation.source_order);
         let support = storage.node_support(relation.node).cloned();
         let ControlFlow::Continue(()) = walker.visit_node(
-            db, &env, &mut storage, &mut path, support.as_ref(), Polarity::Positive, relation.node,
+            db,
+            &env,
+            &mut storage,
+            &mut path,
+            support.as_ref(),
+            Polarity::Positive,
+            relation.node,
         );
         assert!(walker.incomplete);
-        assert!(walker.pending.is_empty(), "incomplete proof fabricated a candidate or violation");
-        let CandidateSolutions::Constrained { inferable: _, paths, incomplete } = walker.finish() else {
+        assert!(
+            walker.pending.is_empty(),
+            "incomplete proof fabricated a candidate or violation"
+        );
+        let CandidateSolutions::Constrained {
+            inferable: _,
+            paths,
+            incomplete,
+        } = walker.finish()
+        else {
             anyhow::bail!("incomplete bound proof must remain constrained");
         };
         assert!(incomplete);
@@ -3422,6 +3467,7 @@ mod tests {
             db,
             &env,
             &builder,
+            ConstraintProvenance::INFERRED,
             local,
             Type::TypeVar(free),
         );

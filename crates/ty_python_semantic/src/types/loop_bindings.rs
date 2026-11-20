@@ -470,7 +470,7 @@ def select(rows: list[tuple[bool, list[str], str]]) -> str:
                 let [diagnostic] = diagnostics.as_slice() else {
                     panic!("expected retained return error: {diagnostics:?}");
                 };
-                assert_eq!(diagnostic.id().as_str(), "invalid-return-type");
+                assert_eq!(diagnostic.id().as_str(), "invalid-explicit-return");
                 let range = diagnostic
                     .primary_span()
                     .expect("return diagnostic")
