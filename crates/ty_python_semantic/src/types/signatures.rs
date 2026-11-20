@@ -8401,7 +8401,8 @@ mod tests {
             def nullable[T](value: T | None = None) -> T | None: ...
             def nullable_none[T](value: T | None = None) -> None: ...
             def nullable_default[T = int](value: T | None = None) -> None: ...
-            def return_only[T]() -> T: ...
+            def return_only[T](value: object) -> T: ...
+            def default_only[T = int](value: object) -> T: ...
             def bounded[T: int](value: T) -> T: ...
             def variadic[T](*values: T) -> T: ...
             def gradual(value: Any) -> Any: ...
@@ -8467,14 +8468,25 @@ mod tests {
                 panic!("expected nullable implementation result to cover the overload")
             }
         }
-        for name in [
-            "nullable_none",
-            "nullable_default",
-            "return_only",
-            "bounded",
-            "variadic",
-            "method",
-        ] {
+        // Admission is based on inputs, even when the result comparison rejects the promise.
+        for name in ["nullable_none", "nullable_default"] {
+            let prepared = signature(name)
+                .specialize_for_overload_implementation(&db, &env, generic)
+                .expect("nullable inputs admit specialization independently of the result");
+            match prepared.implementation_parameters_consistency_with(&db, &env, generic) {
+                ParameterConsistency::Consistent => {}
+                ParameterConsistency::Inconsistent(_) => {
+                    panic!("expected {name} inputs to cover the generic overload")
+                }
+            }
+            match prepared.implementation_return_type_consistency_with(&db, &env, generic) {
+                ReturnTypeConsistency::Consistent => {
+                    panic!("expected {name} result to reject the generic overload")
+                }
+                ReturnTypeConsistency::Inconsistent(_) => {}
+            }
+        }
+        for name in ["return_only", "default_only", "bounded", "variadic", "method"] {
             assert!(
                 !signature(name).supports_overload_implementation_consistency_with(
                     &db,

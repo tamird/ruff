@@ -3769,7 +3769,8 @@ target: Target | None
             "",
             "attrs = record({'dep': target})\n    def reset():\n        nonlocal ctx\n        ctx = record({'attr': record({'dep': None})})",
             "    reset()\n",
-            vec!["missing-attribute"],
+            // Nested writes retain both bindings; call order does not narrow `ctx`.
+            vec!["missing-union-attribute"],
         ),
     ] {
         let source = format!(
