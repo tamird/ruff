@@ -9636,7 +9636,9 @@ fn select_paramspec_arguments<'a, 'db>(
         let mut argument = argument.clone();
         match &mut argument {
             CallArgument::Keywords(argument) => {
-                has_forwarded_argument |= consumed == 0 || argument.is_complete();
+                has_forwarded_argument |= consumed == 0
+                    || matches!(argument, KeywordArgument::Known { types: _, keywords: _ }
+                        | KeywordArgument::Observed { types: _, keywords: _ });
                 argument.remove_prefix_keywords(prefix);
             }
             _ if consumed == 0 => has_forwarded_argument = true,
@@ -13062,8 +13064,90 @@ mod tests {
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::global_symbol;
     use crate::types::ApplyTypeMappingVisitor;
+    use crate::types::call::arguments::{CallArgumentTypes, KnownKeywords};
+    use crate::types::dictionary::{DictionaryExtraItems, DictionaryItem};
     use crate::types::constraints::resolution::SolutionType::Resolved;
     use crate::types::generics::TypeVarInferenceSolutions;
+
+    #[test]
+    fn paramspec_projection_excludes_prefix_bound_by_another_argument() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/forward.py",
+            "def wrapper(prefix: int, **kwargs: object) -> None: ...",
+        )?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/forward.py")?;
+        let file = ProgramFile::new(&db, file, env.program(&db));
+        let wrapper = global_symbol(&db, file, "wrapper").place.expect_type();
+        let forwarded = Type::string_literal(&db, "forwarded");
+        let mut arguments = CallArguments::positional([Type::int_literal(1)]);
+        arguments.push(CallArgument::Keywords(KeywordArgument::Observed {
+            types: CallArgumentTypes::new(Some(Type::unknown())),
+            keywords: KnownKeywords {
+                items: [
+                    DictionaryItem {
+                        name: Name::new_static("prefix"),
+                        ty: Type::int_literal(1),
+                        kind: DictionaryItemKind::Residual,
+                        source: TextRange::default(),
+                    },
+                    DictionaryItem {
+                        name: Name::new_static("value"),
+                        ty: forwarded,
+                        kind: DictionaryItemKind::Residual,
+                        source: TextRange::default(),
+                    },
+                ]
+                .into(),
+                extra_items: DictionaryExtraItems::Closed,
+                excluded_names: Vec::new(),
+            },
+        }));
+        let bindings = wrapper
+            .bindings(&db, &env)
+            .match_parameters(&db, &env, &arguments);
+        let Some(item) = bindings.single_item() else {
+            anyhow::bail!("expected one wrapper binding");
+        };
+        let [binding] = item.callable().overloads() else {
+            anyhow::bail!("expected one wrapper signature");
+        };
+        let [prefix_match, keywords_match] = binding.argument_matches() else {
+            anyhow::bail!("expected both source arguments to be matched");
+        };
+        assert_eq!(
+            prefix_match.iter().map(|parameter| parameter.index).collect::<Vec<_>>(),
+            [0],
+        );
+        assert_eq!(
+            keywords_match.iter().map(|parameter| parameter.index).collect::<Vec<_>>(),
+            [1],
+            "The explicit positional argument already supplied the wrapper prefix",
+        );
+        let (projected, sources) = select_paramspec_arguments(
+            &db,
+            &env,
+            &arguments,
+            binding.argument_matches(),
+            &binding.signature.parameters().as_slice()[..1],
+        );
+        let [source] = sources.as_slice() else {
+            anyhow::bail!("expected one forwarded source");
+        };
+        assert_eq!((source.argument_index, source.parameter_index), (1, 1));
+        let Some(CallArgument::Keywords(KeywordArgument::Observed { types: _, keywords })) =
+            projected.get(0)
+        else {
+            anyhow::bail!("expected the observed keyword source to be forwarded");
+        };
+        assert_eq!(projected.len(), 1);
+        let values = keywords.residual_values(&db, &env);
+        assert_eq!(values, forwarded);
+        assert_eq!(keywords.residual_value(&db, Some("prefix"), values), None);
+        assert_eq!(keywords.residual_value(&db, Some("value"), values), Some(forwarded));
+        Ok(())
+    }
 
     #[test]
     fn constant_predicate_arms_require_complete_bounded_proofs() -> anyhow::Result<()> {
