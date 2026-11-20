@@ -940,8 +940,8 @@ mod tests {
     use ruff_db::system::{
         DbWithTestSystem, DbWithWritableSystem, SystemPathBuf, SystemVirtualPath,
     };
-    use ty_project::metadata::options::{AnalysisOptions, Options};
     use ty_project::ProjectMetadata;
+    use ty_project::metadata::options::{AnalysisOptions, Options};
     use ty_python_core::semantic_index;
     use ty_python_semantic::ReturnTypeInference;
 
