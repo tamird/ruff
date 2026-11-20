@@ -2046,7 +2046,11 @@ impl<'db> ClassType<'db> {
         name: &str,
     ) -> Member<'db> {
         self.own_class_member_with_policy(
-            db, env, inherited_generic_context, name, MemberLookupPolicy::default(),
+            db,
+            env,
+            inherited_generic_context,
+            name,
+            MemberLookupPolicy::default(),
         )
     }
 
@@ -2090,7 +2094,14 @@ impl<'db> ClassType<'db> {
             let specialization = specialization
                 .map(|specialization| specialization.tuple_runtime_element_specialization(db));
             class_literal
-                .own_class_member_with_policy(db, env, inherited_generic_context, specialization, name, policy)
+                .own_class_member_with_policy(
+                    db,
+                    env,
+                    inherited_generic_context,
+                    specialization,
+                    name,
+                    policy,
+                )
                 .map_type(|ty| ty.apply_optional_specialization(db, specialization))
         };
 
@@ -3206,8 +3217,13 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                         continue;
                     }
 
-                    let member =
-                        class.own_class_member_with_policy(db, &self.env, inherited_generic_context, name, policy);
+                    let member = class.own_class_member_with_policy(
+                        db,
+                        &self.env,
+                        inherited_generic_context,
+                        name,
+                        policy,
+                    );
                     let member = if policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE) {
                         class.runtime_member(db, &self.env, name, member)
                     } else {

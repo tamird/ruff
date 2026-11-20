@@ -1632,7 +1632,12 @@ impl<'db> StaticClassLiteral<'db> {
         name: &str,
     ) -> Member<'db> {
         self.own_class_member_with_policy(
-            db, env, inherited_generic_context, specialization, name, MemberLookupPolicy::default(),
+            db,
+            env,
+            inherited_generic_context,
+            specialization,
+            name,
+            MemberLookupPolicy::default(),
         )
     }
 
@@ -1743,8 +1748,7 @@ impl<'db> StaticClassLiteral<'db> {
 
         // A typing-only hash declaration does not prevent a runtime equality method
         // from creating `__hash__ = None` when the class has no other runtime hash.
-        let member = if name == "__hash__"
-            && policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE)
+        let member = if name == "__hash__" && policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE)
         {
             ClassType::NonGeneric(self.into()).runtime_member(db, env, name, member)
         } else {
@@ -1885,7 +1889,12 @@ impl<'db> StaticClassLiteral<'db> {
         name: &str,
     ) -> Option<Type<'db>> {
         self.own_synthesized_member_with_policy(
-            db, env, specialization, inherited_generic_context, name, MemberLookupPolicy::default(),
+            db,
+            env,
+            specialization,
+            inherited_generic_context,
+            name,
+            MemberLookupPolicy::default(),
         )
     }
 

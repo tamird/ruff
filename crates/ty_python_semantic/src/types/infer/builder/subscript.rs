@@ -168,14 +168,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let result = self.infer_subscript_load_impl(value_ty, subscript)?;
-        if let ast::Expr::Dict(dict) = subscript.value.as_ref()
+        let result = if let ast::Expr::Dict(dict) = subscript.value.as_ref()
             && let Some((_, values)) =
                 dict_literal_key_value_types(self.db(), self.program_environment(), dict, |expr| {
                     self.expression_type(expr)
                 })
         {
-            return Ok(values);
-        }
+            values
+        } else {
+            result
+        };
+        let db = self.db();
+        let result = db
+            .provided_subscript_result_bound(self.program_file(), value_ty)
+            .map_or(result, |bound| {
+                IntersectionType::from_two_elements(db, self.program_environment(), result, bound)
+            });
         Ok(result)
     }
 
