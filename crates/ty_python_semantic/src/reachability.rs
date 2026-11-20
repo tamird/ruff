@@ -1014,33 +1014,32 @@ fn evaluate_reachability_path<'db>(
                     id,
                     mask: mask << CHECKPOINT_MASK_SHIFT,
                 };
-            } else {
-                let truthiness = match evaluate_atom(node.atom()) {
-                    ReachabilityAtom::Known(truthiness) => truthiness,
-                    ReachabilityAtom::Symbolic {
-                        key: _,
-                        is_positive: _,
-                    } => {
-                        // Keep identities correlated across every queued bypass branch.
-                        return ReachabilitySegment::Complete(
-                            constraints.project(original_root, evaluate_atom),
-                        );
-                    }
-                };
-                id = match truthiness {
-                    Truthiness::AlwaysTrue => node.if_true(),
-                    Truthiness::Ambiguous => node.if_ambiguous(),
-                    Truthiness::AlwaysFalse => node.if_false(),
-                    Truthiness::Uninhabited => {
-                        // An uninhabited condition cannot take either branch. Retain only paths
-                        // that bypass the condition, which are represented in both branches.
-                        pending.push(node.if_false());
-                        seen.get_or_insert_with(FxHashSet::default);
-                        node.if_true()
-                    }
-                };
-                continue;
             }
+            let truthiness = match evaluate_atom(node.atom()) {
+                ReachabilityAtom::Known(truthiness) => truthiness,
+                ReachabilityAtom::Symbolic {
+                    key: _,
+                    is_positive: _,
+                } => {
+                    // Keep identities correlated across every queued bypass branch.
+                    return ReachabilitySegment::Complete(
+                        constraints.project(original_root, evaluate_atom),
+                    );
+                }
+            };
+            id = match truthiness {
+                Truthiness::AlwaysTrue => node.if_true(),
+                Truthiness::Ambiguous => node.if_ambiguous(),
+                Truthiness::AlwaysFalse => node.if_false(),
+                Truthiness::Uninhabited => {
+                    // An uninhabited condition cannot take either branch. Retain only paths
+                    // that bypass the condition, which are represented in both branches.
+                    pending.push(node.if_false());
+                    seen.get_or_insert_with(FxHashSet::default);
+                    node.if_true()
+                }
+            };
+            continue;
         };
 
         result = result.and(reachability);
