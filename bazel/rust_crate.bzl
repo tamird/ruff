@@ -3,7 +3,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@ruff_workspace_metadata//:crates.bzl", "CRATES")
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script", "cargo_toml_env_vars", "extract_cargo_lints")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_proc_macro", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
 
 load(":cargo_metadata.bzl", "cargo_metadata_files")
 load(":mdtest.bzl", "mdtest_suite")
@@ -41,8 +41,9 @@ def rust_crate(
         build_compile_data = [],
         unit_test = False,
         test_deps = [],
-        test_data = []):
-    """Declare a workspace crate and optionally its Cargo unit-test harness."""
+        test_data = [],
+        binaries = {}):
+    """Declare a workspace library, selected binaries, and an optional unit-test harness."""
     cargo_metadata_files()
     package = native.package_name()
     crate = CRATES[package]
@@ -72,8 +73,7 @@ def rust_crate(
             rustc_env_files = [":cargo_env"],
         )
     rule = rust_proc_macro if crate["proc_macro"] else rust_library
-    rule(
-        name = name,
+    attributes = dict(
         crate_name = crate["crate_name"],
         srcs = native.glob(["src/**/*.rs"]),
         crate_root = crate["crate_root"],
@@ -90,6 +90,16 @@ def rust_crate(
         lint_config = ":cargo_lints",
         visibility = ["//visibility:public"],
     )
+    rule(name = name, **attributes)
+    for binary, crate_root in binaries.items():
+        rust_binary(
+            name = binary,
+            **(attributes | {
+                "crate_name": binary.replace("-", "_"),
+                "crate_root": crate_root,
+                "deps": attributes["deps"] + [":" + name],
+            })
+        )
     if unit_test:
         rust_test(
             name = "unit_tests",
