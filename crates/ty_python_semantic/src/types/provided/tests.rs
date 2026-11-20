@@ -3194,6 +3194,115 @@ fn runtime_type_test<'db>(
 }
 
 #[test]
+fn supplied_type_tests_prove_only_disjoint_native_tag_comparisons() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_file("/src/native.pyi", "from typing import LiteralString\ndef category(value: object, /) -> LiteralString: ...\n")
+        .with_file("/src/main.py", "")
+        .with_type_test_provider(runtime_type_test)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let mut failures = Vec::new();
+    for (source, expected) in [
+        (
+            "def check(value: dict[str, object]) -> dict[str, object]:\n    if category(value) == 'str':\n        return 'wrong'\n    if 'str' == category(value):\n        return 'wrong'\n    if category(value) == 'list':\n        return ['wrong']\n    if category(value) != 'str':\n        return value\n    return 'wrong'\n",
+            vec![],
+        ),
+        (
+            "type Alias = dict[str, object]\ndef check(value: Alias) -> Alias:\n    if 'str' != category(value):\n        return value\n    return 'wrong'\n",
+            vec![],
+        ),
+        (
+            "def check(value: dict[str, object] | str) -> Literal[False]:\n    return category(value) == 'str'\n",
+            vec!["invalid-explicit-return"],
+        ),
+        (
+            "@final\nclass Closed[K, V]: pass\ndef check[K, V](value: Closed[K, V]) -> Closed[K, V]:\n    if category(value) == 'str':\n        return 'wrong'\n    return value\n",
+            vec![],
+        ),
+        (
+            "@final\nclass Closed: pass\ndef check[T: Closed](value: T) -> T:\n    if category(value) == 'str':\n        return 'wrong'\n    return value\n",
+            vec![],
+        ),
+        (
+            "@final\nclass Closed: pass\ndef check[T: Closed | str](value: T) -> Literal[False]:\n    return category(value) == 'str'\n",
+            vec!["invalid-explicit-return"],
+        ),
+        (
+            "def check(value: object) -> Literal[False]:\n    return category(value) == 'str'\n",
+            vec!["invalid-explicit-return"],
+        ),
+        (
+            "def check(value) -> Literal[False]:\n    return category(value) == 'str'\n",
+            vec!["invalid-explicit-return"],
+        ),
+        (
+            "def check(value: str) -> Literal[False]:\n    return category(*[value]) == 'str'\n",
+            vec!["invalid-explicit-return"],
+        ),
+        (
+            "def check[T](value: T) -> Literal[False]:\n    return category(value) == 'str'\n",
+            vec!["invalid-explicit-return"],
+        ),
+        (
+            "def category(value: object) -> LiteralString:\n    return 'str'\ndef check(value: dict[str, object]) -> dict[str, object]:\n    if category(value) == 'str':\n        return 'wrong'\n    return value\n",
+            vec!["invalid-explicit-return"],
+        ),
+        (
+            "class Text(str):\n    def __eq__(self, other: object) -> bool:\n        return True\ndef check(value: dict[str, object]) -> dict[str, object]:\n    if Text('str') == category(value):\n        return 'wrong'\n    return value\n",
+            vec!["invalid-explicit-return"],
+        ),
+        (
+            "class Meta(type):\n    def __eq__(cls, other: object) -> bool:\n        return True\nclass Tag(metaclass=Meta): pass\ndef check(value: int) -> int:\n    if type(value) == Tag:\n        return 'wrong'\n    return value\n",
+            vec!["invalid-explicit-return"],
+        ),
+    ] {
+        db.write_file("/src/main.py", format!("from typing import Literal, LiteralString, final\nfrom native import category\n{source}"))?;
+        let diagnostics = db.check_file(file);
+        let observed = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>();
+        if observed != expected {
+            failures.push(format!(
+                "{source}: expected {expected:?}, observed {diagnostics:#?}"
+            ));
+        }
+    }
+    // A native category function whose result declaration permits string subclasses is not folded.
+    db.write_file(
+        "/src/native.pyi",
+        "def category(value: object, /) -> str: ...\n",
+    )?;
+    db.write_file("/src/main.py", "from native import category\ndef check(value: dict[str, object]) -> dict[str, object]:\n    if category(value) == 'str':\n        return 'wrong'\n    return value\n")?;
+    let diagnostics = db.check_file(file);
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("{diagnostics:#?}");
+    };
+    assert_eq!(diagnostic.id().as_str(), "invalid-explicit-return");
+    // A matching name and result annotation cannot replace the registered native contract.
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_file(
+            "/src/native.pyi",
+            "from typing import LiteralString\ndef category(value: object, /) -> LiteralString: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import category\ndef check(value: dict[str, object]) -> dict[str, object]:\n    if category(value) == 'str':\n        return 'wrong'\n    return value\n",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("{diagnostics:#?}");
+    };
+    assert_eq!(diagnostic.id().as_str(), "invalid-explicit-return");
+    assert!(failures.is_empty(), "{failures:#?}");
+    Ok(())
+}
+
+#[test]
 fn supplied_type_tests_share_flow_narrowing() -> anyhow::Result<()> {
     let mut db = TestDbBuilder::new()
         .with_file(
