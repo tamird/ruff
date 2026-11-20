@@ -5,7 +5,9 @@ exports_files([
     "cargo-bazel.json",
     "cargo_metadata.bzl",
     "datatest-stable-file-symlinks.patch",
+    "mdtest.bzl",
     "mdtest_external.sh",
+    "mdtest_fixture.sh",
     "rust_crate.bzl",
     "workspace_metadata.bzl",
 ])

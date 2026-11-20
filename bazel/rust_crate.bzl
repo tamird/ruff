@@ -6,6 +6,7 @@ load("@rules_rust//cargo:defs.bzl", "cargo_build_script", "cargo_toml_env_vars",
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_proc_macro", "rust_test")
 
 load(":cargo_metadata.bzl", "cargo_metadata_files")
+load(":mdtest.bzl", "mdtest_suite")
 
 # Match harness concurrency to the CPU reservation instead of host CPU discovery.
 RUST_TEST_CPUS = 8
@@ -107,8 +108,13 @@ def rust_crate(
         )
 
 
-def rust_mdtest(name, deps, data):
-    """Build the native datatest harness with runfiles-relative fixture roots."""
+def rust_mdtest(name, deps, data, fixture_roots, suite_name):
+    """Build one native harness and distribute its declared fixtures as tests."""
+    test_options = {
+        "env": RUST_TEST_ENV,
+        "exec_properties": {"test.EstimatedComputeUnits": str(RUST_TEST_CPUS), "test.EstimatedMemory": "16GB"},
+        "timeout": "long",
+    }
     rust_test(
         name = name,
         srcs = ["tests/mdtest.rs"],
@@ -124,8 +130,15 @@ def rust_mdtest(name, deps, data):
         rustc_env = {"CARGO_MANIFEST_DIR": native.package_name()},
         rustc_env_files = [":cargo_env"],
         data = data,
-        env = RUST_TEST_ENV,
-        exec_properties = {"test.EstimatedComputeUnits": str(RUST_TEST_CPUS), "test.EstimatedMemory": "16GB"},
-        timeout = "long",
+        tags = ["manual"],
         visibility = ["//visibility:public"],
+        **test_options
+    )
+    mdtest_suite(
+        name = suite_name,
+        harness = ":" + name,
+        data = data,
+        fixture_roots = fixture_roots,
+        test_cpus = RUST_TEST_CPUS,
+        test_options = test_options,
     )
