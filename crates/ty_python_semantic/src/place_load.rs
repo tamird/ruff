@@ -23,16 +23,16 @@ use ty_python_core::{
 };
 
 use crate::Db;
-use crate::provided::BuiltinUsage;
 use crate::place::{
     ConsideredDefinitions, Definedness, Place, PlaceAndQualifiers, RequiresExplicitReExport,
     builtins_module_scope, class_body_implicit_symbol, explicit_global_symbol, has_bound_prefix,
     implicit_builtins_symbol, module_type_implicit_global_symbol, place_by_id, place_from_bindings,
     place_from_bindings_with_reachability_cache, typing_extensions_symbol,
 };
+use crate::provided::BuiltinUsage;
 use crate::reachability::ReachabilityEvaluationCache;
-use crate::types::{ProgramEnvironment, Type, binding_type, original_class_type};
 use crate::types::external_function_type_parameter;
+use crate::types::{ProgramEnvironment, Type, binding_type, original_class_type};
 
 /// Evaluates the possible sources of a place load's value.
 ///
@@ -236,7 +236,13 @@ impl<'db, 'a> PlaceLoadResolver<'db, 'a> {
     fn resolve_bindings(&self, bindings: BindingWithConstraintsIterator<'_, 'db>) -> Place<'db> {
         let db = self.procedure.context.db;
         let resolved = if let Some(cache) = self.reachability_cache {
-            place_from_bindings_with_reachability_cache(db, self.env, bindings, cache, cache.body_domain())
+            place_from_bindings_with_reachability_cache(
+                db,
+                self.env,
+                bindings,
+                cache,
+                cache.body_domain(),
+            )
         } else {
             place_from_bindings(db, self.env, bindings)
         };
@@ -415,9 +421,7 @@ impl<'db> Iterator for PlaceLoadResolutionProcedure<'db, '_> {
                     self.next_node =
                         Some(PlaceLoadResolutionNode::AskConsumerWhetherToContinueForMember);
 
-                    if let Some(source) = self
-                        .type_only_alias_source(self.context.scope)
-                    {
+                    if let Some(source) = self.type_only_alias_source(self.context.scope) {
                         return Some(PlaceLoadResolutionStep::Source(source));
                     }
                     if let Some((kind, exit_constraint)) =
@@ -459,7 +463,9 @@ impl<'db> Iterator for PlaceLoadResolutionProcedure<'db, '_> {
                 }
                 PlaceLoadResolutionNode::ExternalTypeParameterSource => {
                     if let Some(source) = self.external_type_parameter_source(
-                        self.context.scope.to_scope_id(self.context.db, self.context.file),
+                        self.context
+                            .scope
+                            .to_scope_id(self.context.db, self.context.file),
                     ) {
                         self.next_node = Some(PlaceLoadResolutionNode::Failure(
                             PlaceLoadFailure::UnboundFree,
@@ -943,7 +949,7 @@ impl<'db, 'ast> PlaceLoadResolutionProcedure<'db, 'ast> {
         }
     }
 
-    fn narrowing_constraints_for(
+    pub(crate) fn narrowing_constraints_for(
         &self,
         source: &PlaceLoadSource<'_>,
     ) -> &[(FileScopeId, ConstraintKey)] {

@@ -9,9 +9,9 @@ use smallvec::SmallVec;
 
 use crate::types::constraints::PathBoundSolution;
 use crate::types::constraints::paths::PathAssignments;
-use crate::types::constraints::sequents::SequentMap;
 use crate::types::constraints::projection::{ProjectionTypeBudget, SolutionBudget};
 use crate::types::constraints::resolution::{SolutionType, resolve_solution};
+use crate::types::constraints::sequents::SequentMap;
 use crate::types::constraints::support::Support;
 use crate::types::constraints::variables::{
     AtomicConstraint, Constraint, ConstraintProvenance, UnsatisfiableBound,
@@ -21,10 +21,9 @@ use crate::types::constraints::{
     ALWAYS_FALSE, ALWAYS_TRUE, Assignment, AtomicConstraintId, BoundedSolutionLimits,
     CandidateSearch, CandidateResidual, CandidateSolution, CandidateSolutions, CandidateTypeVarSolution,
     CandidateTypeVarSolver, ConstraintFailureEvidence, ConstraintId, ConstraintSet,
-    ConstraintSetBuilder, ConstraintSetStorage, EvidenceSource, InteriorNodeData, Node,
-    NodeId, OwnedConstraintSet, OwnedConstraintSetBuilder, SolutionLimits, SolutionValidity,
+    ConstraintSetBuilder, ConstraintSetStorage, EvidenceSource, InteriorNodeData, Node, NodeId,
+    OwnedConstraintSet, OwnedConstraintSetBuilder, SolutionLimits, SolutionValidity,
     SolutionViolation, SolutionViolationKind, SourceOrderId, TypeVarId, TypeVarSolution,
-    UnboundedSolutionLimits,
 };
 use crate::types::typevar::{TypeVarBoundOrConstraints, TypeVarConstraints, TypeVarSet};
 use crate::types::visitor::any_over_type_expanding_aliases;
@@ -335,7 +334,15 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 self.unspecialized_type_var_policy,
             )
         }) && self
-            .pending_candidate_solution(db, env, storage, path, self.inferable, &Support::default(), None)
+            .pending_candidate_solution(
+                db,
+                env,
+                storage,
+                path,
+                self.inferable,
+                &Support::default(),
+                None,
+            )
             .is_some()
     }
 
@@ -715,11 +722,24 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         process_satisfied: &ProcessSatisfied<'_, 'db, L, Break<L::Break>>,
     ) -> ControlFlow<Break<L::Break>> {
         self.visit_atomic_constraint_and_then(
-            db, env, storage, path, polarity, interior, constraint,
+            db,
+            env,
+            storage,
+            path,
+            polarity,
+            interior,
+            constraint,
             &|this, storage, path, polarity, child| {
                 this.visit_node_and_then(
-                    db, env, storage, path, polarity, child,
-                    check_cache, prune_path, process_satisfied,
+                    db,
+                    env,
+                    storage,
+                    path,
+                    polarity,
+                    child,
+                    check_cache,
+                    prune_path,
+                    process_satisfied,
                 )
             },
         )
@@ -750,7 +770,14 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         let previous_proving = std::mem::replace(&mut self.proving_satisfiability, true);
         let previous_incomplete = std::mem::take(&mut self.incomplete);
         let result = self.node_is_satisfiable_on_path_inner(
-            db, env, storage, path, polarity, node, validations, context,
+            db,
+            env,
+            storage,
+            path,
+            polarity,
+            node,
+            validations,
+            context,
         );
         self.proving_satisfiability = previous_proving;
         self.finish_satisfiability_query(previous_incomplete, result)
@@ -769,7 +796,11 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             validation_support: self.validation_support.clone(),
             validations: validations.cloned(),
         };
-        if let Some(index) = self.ordinary_proof_contexts.iter().position(|existing| *existing == context) {
+        if let Some(index) = self
+            .ordinary_proof_contexts
+            .iter()
+            .position(|existing| *existing == context)
+        {
             return Some(index);
         }
         let index = self.ordinary_proof_contexts.len();
@@ -851,12 +882,21 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         context: Option<usize>,
     ) -> ControlFlow<Break<L::Break>, ()> {
         if !self.can_memoize_proof(path)
-            || (!node.is_terminal() && matches!(
-                storage.constraint_data(storage.interior_node_data(node).constraint),
-                Constraint::Existential(_)
-            ))
+            || (!node.is_terminal()
+                && matches!(
+                    storage.constraint_data(storage.interior_node_data(node).constraint),
+                    Constraint::Existential(_)
+                ))
         {
-            return self.visit_satisfiable_subtree(db, env, storage, path, polarity, node, validations);
+            return self.visit_satisfiable_subtree(
+                db,
+                env,
+                storage,
+                path,
+                polarity,
+                node,
+                validations,
+            );
         }
         self.limits.visit_node().map_break(Break::Limits)?;
         let break_into_bool = |result: &ControlFlow<Break<L::Break>, ()>| match result {
@@ -879,8 +919,16 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             return ControlFlow::Continue(());
         }
 
-        let key = context.map(|context| (context, self.explored_node_key(storage, path, polarity, node, validations)));
-        if let Some(result) = key.as_ref().and_then(|key| self.node_is_satisfiable_on_path_cache.get(key)) {
+        let key = context.map(|context| {
+            (
+                context,
+                self.explored_node_key(storage, path, polarity, node, validations),
+            )
+        });
+        if let Some(result) = key
+            .as_ref()
+            .and_then(|key| self.node_is_satisfiable_on_path_cache.get(key))
+        {
             return bool_into_break(*result);
         }
         let result = if let (Polarity::Positive, ALWAYS_TRUE) | (Polarity::Negative, ALWAYS_FALSE) =
@@ -894,7 +942,15 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 validations,
                 &|this, storage, path| {
                     let has_solution = this
-                        .pending_candidate_solution(db, env, storage, path, this.inferable, &path.quantified_typevars, None)
+                        .pending_candidate_solution(
+                            db,
+                            env,
+                            storage,
+                            path,
+                            this.inferable,
+                            &path.quantified_typevars,
+                            None,
+                        )
                         .is_some();
                     bool_into_break(has_solution)
                 },
@@ -1436,7 +1492,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                                 // Signature and tuple packs need a witness in their own domain.
                                 has_type_endpoint(bound.bound_typevar).then(|| TypeVarSolution {
                                     bound_typevar: bound.bound_typevar,
-                                    solution: bound.effective_lower(db, env),
+                                    solution: bound.effective_lower(db, env, super::EvidenceSource::All),
                                 })
                             }
                             PathBoundSolution::Unsatisfiable => None,
@@ -1550,7 +1606,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             if bound.selected_declared_constraint.is_some() {
                 return None;
             }
-            binding.solution = bound.effective_lower(db, env);
+            binding.solution = bound.effective_lower(db, env, super::EvidenceSource::All);
             changed = true;
         }
         changed.then_some(alternate)
@@ -1685,12 +1741,12 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         storage: &mut ConstraintSetStorage<'db>,
         path: &mut PathAssignments,
         bound_typevar: BoundTypeVarInstance<'db>,
-    ) -> ControlFlow<Break<L::Break>, bool> {
+    ) -> ControlFlow<Break<L::Break>, Option<bool>> {
         if !bound_typevar.is_inferable(db, self.inferable) {
-            return ControlFlow::Continue(true);
+            return ControlFlow::Continue(Some(true));
         }
         let Some(bound) = bound_typevar.typevar(db).upper_bound(db, env) else {
-            return ControlFlow::Continue(true);
+            return ControlFlow::Continue(Some(true));
         };
         // TODO: ParamSpecs can capture generic callables whose type variables need to be solved
         // together with the forwarded arguments and return type. Until then, this check can reject
@@ -1701,7 +1757,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             .iter(db)
             .any(|typevar| typevar.is_paramspec(db))
         {
-            return ControlFlow::Continue(true);
+            return ControlFlow::Continue(Some(true));
         }
         let mut lower_bounds = SmallVec::<[(usize, Type<'db>); 4]>::new();
         let mut has_lower_inference = false;
@@ -1727,13 +1783,13 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             }
         }
         if !has_lower_inference || !has_symbolic_lower {
-            return ControlFlow::Continue(true);
+            return ControlFlow::Continue(Some(true));
         }
         lower_bounds.sort_by_key(|(source_order, _)| *source_order);
         let lower = UnionType::from_elements(db, env, lower_bounds.into_iter().map(|(_, ty)| ty));
         // Normalization can remove all type variables, as in `S | object`.
         if !any_over_type_expanding_aliases(db, env, lower, Type::is_type_var) {
-            return ControlFlow::Continue(true);
+            return ControlFlow::Continue(Some(true));
         }
 
         // Leave relationships involving variables still being inferred to the path walk, which
@@ -1746,16 +1802,16 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         if any_over_type_expanding_aliases(db, env, lower, has_inferable)
             || any_over_type_expanding_aliases(db, env, bound, has_inferable)
         {
-            return ControlFlow::Continue(true);
+            return ControlFlow::Continue(Some(true));
         }
 
         let relation = lower.when_assignable_to_owned(db, env, bound, self.inferable);
         let (node, source_order) = storage.load(db, env, &relation);
         if node == ALWAYS_TRUE {
-            return ControlFlow::Continue(true);
+            return ControlFlow::Continue(Some(true));
         }
         if node == ALWAYS_FALSE {
-            return ControlFlow::Continue(false);
+            return ControlFlow::Continue(Some(false));
         }
         self.source_orders
             .extend(storage.calculate_source_orders(source_order));
@@ -1764,7 +1820,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         let validations = storage
             .node_support(node)
             .cloned()
-            .map(|support| Validations::from_support(db, env, storage, &support));
+            .map(|support| Validations::from_support(db, env, storage, &support, self.inferable));
         let mut relation_path = node.path_assignments(db, env, storage, source_order);
         let has_counterexample = self
             .node_is_satisfiable_on_path(
@@ -1777,7 +1833,15 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 validations.as_ref(),
             )
             .map_break(Break::Limits)?;
-        ControlFlow::Continue(!has_counterexample)
+        let satisfied = match has_counterexample {
+            Satisfiability::Unsatisfiable => Some(true),
+            Satisfiability::Satisfiable => Some(false),
+            Satisfiability::Incomplete => {
+                self.incomplete = true;
+                None
+            }
+        };
+        ControlFlow::Continue(satisfied)
     }
 
     fn evidence_satisfies_declared_constraint(
@@ -1996,7 +2060,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             return ControlFlow::Continue(());
         };
 
-        if !self.inferred_lower_satisfies_upper_bound(db, env, storage, path, bound_typevar)? {
+        if self.inferred_lower_satisfies_upper_bound(db, env, storage, path, bound_typevar)? != Some(true) {
             return ControlFlow::Continue(());
         }
 
@@ -2478,21 +2542,27 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     if lower.typevar.is_inferable(db, inferable)
                         && is_useful_bound(constraint, lower.bound) =>
                 {
-                    let solver = mappings.entry(storage.typevar_id(db, lower.typevar)).or_default();
+                    let solver = mappings
+                        .entry(storage.typevar_id(db, lower.typevar))
+                        .or_default();
                     solver.add_constraint(db, lower.typevar, constraint);
                 }
                 AtomicConstraint::ConcreteUpper(upper)
                     if upper.typevar.is_inferable(db, inferable)
                         && is_useful_bound(constraint, upper.bound) =>
                 {
-                    let solver = mappings.entry(storage.typevar_id(db, upper.typevar)).or_default();
+                    let solver = mappings
+                        .entry(storage.typevar_id(db, upper.typevar))
+                        .or_default();
                     solver.add_constraint(db, upper.typevar, constraint);
                 }
                 AtomicConstraint::ConcreteEquivalence(equivalence)
                     if equivalence.typevar.is_inferable(db, inferable)
                         && is_useful_bound(constraint, equivalence.bound) =>
                 {
-                    let solver = mappings.entry(storage.typevar_id(db, equivalence.typevar)).or_default();
+                    let solver = mappings
+                        .entry(storage.typevar_id(db, equivalence.typevar))
+                        .or_default();
                     solver.add_constraint(db, equivalence.typevar, constraint);
                 }
                 AtomicConstraint::TypeVarRange(bound) => {
@@ -2505,11 +2575,15 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                         continue;
                     }
                     if is_useful_bound(constraint, Type::TypeVar(bound.right)) {
-                        let solver = mappings.entry(storage.typevar_id(db, bound.left)).or_default();
+                        let solver = mappings
+                            .entry(storage.typevar_id(db, bound.left))
+                            .or_default();
                         solver.add_constraint(db, bound.left, constraint);
                     }
                     if is_useful_bound(constraint, Type::TypeVar(bound.left)) {
-                        let solver = mappings.entry(storage.typevar_id(db, bound.right)).or_default();
+                        let solver = mappings
+                            .entry(storage.typevar_id(db, bound.right))
+                            .or_default();
                         solver.add_constraint(db, bound.right, constraint);
                     }
                 }
@@ -2518,9 +2592,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     // contribute bounds for both endpoints. Contextual inference relies on the
                     // reverse, non-inferable binding to preserve relationships to outer typevars.
                     let (left, right) = bound.in_builder(db, storage);
-                    if !left.is_inferable(db, inferable)
-                        && !right.is_inferable(db, inferable)
-                    {
+                    if !left.is_inferable(db, inferable) && !right.is_inferable(db, inferable) {
                         continue;
                     }
                     if is_useful_bound(constraint, Type::TypeVar(right)) {
@@ -2727,10 +2799,13 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
 
         for (bound_typevar, upper_bound) in upper_bounds {
             let satisfied = Cell::new(false);
-            if self
-                .inferred_lower_satisfies_upper_bound(db, env, storage, path, *bound_typevar)
-?
-                && let Some(constraints) = upper_bound.constraints.as_deref()
+            let Some(lower_satisfied) = self.inferred_lower_satisfies_upper_bound(
+                db, env, storage, path, *bound_typevar,
+            )? else {
+                // An incomplete proof cannot justify attributing an upper-bound violation.
+                return ControlFlow::Continue(());
+            };
+            if lower_satisfied && let Some(constraints) = upper_bound.constraints.as_deref()
             {
                 self.visit_constraints_and_then(
                     db,
@@ -3225,7 +3300,7 @@ mod tests {
     use crate::db::tests::setup_db;
     use crate::types::TypeVarVariance;
     use crate::types::constraints::tests::quantify_constraint;
-    use crate::types::constraints::{SolutionPaths, Solutions};
+    use crate::types::constraints::{SolutionPaths, Solutions, UnboundedSolutionLimits};
     use ruff_python_ast::name::Name;
 
     #[test]

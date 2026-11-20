@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 use ty_python_core::definition::Definition;
 
 use crate::types::{
-    BoundMethodType, BoundSuperType, BoundTypeVarInstance, CallableType, DynamicType,
+    BoundMethodType, BoundSuperType, BoundTypeVarInstance, CallableType,
     EnumComplementType, GenericAlias, IntersectionType, KnownBoundMethodType, KnownInstanceType,
     NominalInstanceType, PropertyInstanceType, ProtocolInstanceType, RecursiveType, Signature,
     SlotDescriptorType, StaticClassLiteral, SubclassOfType, Type, TypeAliasType, TypeFormType,
@@ -71,10 +71,6 @@ pub(crate) trait TypeVisitor<'db> {
 
     fn visit_callable_type(&self, db: &'db dyn Db, callable: CallableType<'db>) {
         walk_callable_type(db, callable, self);
-    }
-
-    fn visit_signature(&self, db: &'db dyn Db, signature: &super::Signature<'db>) {
-        super::walk_signature(db, signature, self);
     }
 
     fn visit_property_instance_type(&self, db: &'db dyn Db, property: PropertyInstanceType<'db>) {
@@ -1148,10 +1144,7 @@ pub(super) fn has_indeterminate_inference<'db>(
     ty: Type<'db>,
 ) -> bool {
     any_over_type_expanding_aliases_impl(db, env, ty, false, |ty| {
-        ty.is_divergent()
-            || ty
-                .as_dynamic()
-                .is_some_and(DynamicType::is_provisional_marker)
+        ty.is_divergent() || ty.is_provisional_marker()
     })
 }
 

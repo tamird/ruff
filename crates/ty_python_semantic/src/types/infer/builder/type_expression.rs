@@ -36,8 +36,8 @@ use crate::types::{
     BindingContext, CallableType, DynamicType, GenericContext, IntersectionBuilder,
     IntersectionType, InvalidTypeExpression, KnownClass, KnownInstanceType, LintDiagnosticGuard,
     Parameter, Parameters, SpecialFormType, SubclassOfType, Type, TypeCheckDiagnostics,
-    TypeContext, TypeFormType, TypeGuardType, TypeIsType, TypeMapping, TypeQualifiers, TypeVarKind, UnionBuilder,
-    UnionType, any_over_type, binding_type, todo_type,
+    TypeContext, TypeFormType, TypeGuardType, TypeIsType, TypeMapping, TypeQualifiers, TypeVarKind,
+    UnionBuilder, UnionType, any_over_type, binding_type, todo_type,
 };
 use crate::{FxOrderSet, SemanticModel, add_inferred_python_version_hint_to_diagnostic};
 
@@ -126,7 +126,7 @@ impl<'db> TypeExpressionContext<'db> for TypeInferenceBuilder<'db, '_> {
             GenericContext::from_typevar_instances(db, self.program_environment(), [])
         });
         let value_ty = Type::single_callable(db, signature.clone());
-        self.infer_explicit_callable_specialization(subscript, value_ty, context, &|arguments| {
+        self.infer_explicit_callable_specialization(subscript, value_ty, Some(context), &|arguments| {
             signature.return_type().apply_specialization(
                 db,
                 context.specialize_partial(db, arguments.iter().copied()),
@@ -1417,8 +1417,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             && !binary.left.is_dict_expr()
             && !binary.right.is_dict_expr()
         {
-            let value =
-                speculative.infer_binary_expression_from_types(binary, left_value, right_value, TypeContext::default());
+            let value = speculative.infer_binary_expression_from_types(
+                binary,
+                left_value,
+                right_value,
+                TypeContext::default(),
+            );
             speculative.cycle_recovery.is_none().then_some(value)
         } else {
             None
@@ -1635,7 +1639,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         if matches!(alias_reference, LegacyTypeAliasReference::Invalid)
             || self.reject_non_alias_reference(value_ty, definition, &subscript.value)
         {
-            if !self.in_string_annotation() {
+            if !self.in_detached_annotation() {
                 self.infer_expression(slice, TypeContext::default());
             }
             return Type::unknown();

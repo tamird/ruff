@@ -22,10 +22,11 @@ use crate::types::tuple::TupleType;
 use crate::types::typevar::TypeVarDomain;
 use crate::types::visitor::any_over_type_expanding_aliases;
 use crate::types::{
-    ApplyTypeMappingVisitor, BoundTypeVarInstance, CallableType, ClassBase, ClassLiteral, ClassType, CycleDetector,
-    IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType, LiteralValueTypeKind,
-    MaterializationKind, MemberLookupPolicy, PropertyInstanceType, ProtocolInstanceType,
-    SubclassOfInner, SubclassOfType, TypeVarBoundOrConstraints, UnionType, UpcastPolicy,
+    ApplyTypeMappingVisitor, BoundTypeVarInstance, CallableType, ClassBase, ClassLiteral,
+    ClassType, CycleDetector, IntersectionType, KnownBoundMethodType, KnownClass,
+    KnownInstanceType, LiteralValueTypeKind, MaterializationKind, MemberLookupPolicy,
+    PropertyInstanceType, ProtocolInstanceType, SubclassOfInner, SubclassOfType,
+    TypeVarBoundOrConstraints, UnionType, UpcastPolicy,
 };
 use crate::{
     Db, Program,
@@ -1441,6 +1442,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             perform_expensive_checks: true,
             relation_visitor,
             disjointness_visitor,
+            protocol_comparison: None,
             signature_relation_visitor,
             materialization_visitor,
         }
@@ -2869,7 +2871,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                     let through_bound = self.without_context_collection(|| {
                         self.check_source_typevar_bounds(db, bound_or_constraints, target)
                     });
-                    if through_bound.is_never_satisfied(db, env) {
+                    if through_bound.is_never_satisfied(db, env, self.inferable) {
                         self.with_recursion_guard(db, source, target, || {
                             self.check_type_satisfies_protocol(db, source, protocol)
                         })

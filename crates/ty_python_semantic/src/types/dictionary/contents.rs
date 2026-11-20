@@ -1645,7 +1645,7 @@ fn call_preserves_contents<'db>(
         return false;
     }
     let arguments = CallArguments::from_arguments_typed(&call.arguments, |expression| {
-        expression_type(expression).unwrap_or(Type::unknown())
+        expression_type(expression)
     });
     let bindings = bindings.match_parameters(db, env, &arguments);
     let Some(callable) = bindings.single_element() else {
@@ -2903,9 +2903,7 @@ fn checked_keyword_field_factory<'db>(
         return None;
     }
     let arguments = CallArguments::from_arguments_typed(&call.arguments, |expression| {
-        inference
-            .try_expression_type(expression)
-            .unwrap_or(Type::unknown())
+        inference.try_expression_type(expression)
     });
     let matched = bindings.match_parameters(db, &env, &arguments);
     let [binding] = matched.single_element()?.overloads() else {

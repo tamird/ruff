@@ -17,7 +17,7 @@ use crate::{
         ApplySpecialization, ApplyTypeMappingVisitor, ClassLiteral, CycleDetector, DynamicType,
         GenericAlias, GenericContext, InstanceProjection, IntersectionType, KnownClass,
         KnownInstanceType, MaterializationKind, Parameter, Parameters, RecursiveType, Signature,
-        Specialization, Type, TypeAliasType, TypeContext, TypeMapping, TypeVarVariance,
+        Type, TypeAliasType, TypeContext, TypeMapping, TypeVarVariance,
         UnionBuilder, UnionType, any_over_type, any_over_type_including_alias_arguments,
         binding_type,
         cyclic::TypeIdentity,
@@ -918,7 +918,7 @@ impl TypeVarNonce {
         self.0
     }
 
-    fn increment(self) -> Self {
+    pub(super) fn increment(self) -> Self {
         Self(
             self.0
                 .checked_add(1)
@@ -1681,7 +1681,12 @@ impl<'db> BoundTypeVarInstance<'db> {
                     self.freshness(db)
                 };
                 let freshened = self.freshen_with_mapping(db, nonce, type_mapping, visitor);
-                Type::TypeVar(self.update_domain_after_mapping(db, freshened, type_mapping, visitor))
+                Type::TypeVar(self.update_domain_after_mapping(
+                    db,
+                    freshened,
+                    type_mapping,
+                    visitor,
+                ))
             }),
             TypeMapping::Promote(..)
             | TypeMapping::ReplaceParameterDefaults
@@ -2215,7 +2220,7 @@ impl<'db> Type<'db> {
                         .extend(candidates.into_iter().filter(|variable| {
                             let mut identity = variable.identity(db);
                             if variable.paramspec_attr(db).is_some() {
-                                identity = identity.without_paramspec_attr(db);
+                                identity = identity.paramspec_base(db);
                             }
                             !identity.is_inferable(db, locals)
                         }));
@@ -2271,7 +2276,7 @@ impl<'db> Type<'db> {
                 // projections also depend on P itself.
                 let unprojected = variable
                     .paramspec_attr(db)
-                    .map(|_| variable.without_paramspec_attr(db));
+                    .map(|_| variable.paramspec_base(db));
                 (
                     TypeVarSet::from_typevars(db, std::iter::once(variable).chain(unprojected)),
                     false,

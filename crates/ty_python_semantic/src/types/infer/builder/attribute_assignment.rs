@@ -15,8 +15,8 @@ use crate::types::call::{Bindings, CallArguments, CallDiagnosticOverride, CallEr
 use crate::types::class::FrozenDataclassDispatch;
 use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
-    DEPRECATED, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS, MISSING_ATTRIBUTE, POSSIBLY_MISSING_ATTRIBUTE, MISSING_SLOT,
-    report_bad_dunder_set_call, report_invalid_attribute_assignment,
+    DEPRECATED, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS, MISSING_ATTRIBUTE, MISSING_SLOT,
+    POSSIBLY_MISSING_ATTRIBUTE, report_bad_dunder_set_call, report_invalid_attribute_assignment,
     report_possibly_missing_attribute,
 };
 use crate::types::{

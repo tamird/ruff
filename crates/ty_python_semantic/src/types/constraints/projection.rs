@@ -5,7 +5,8 @@ use std::ops::ControlFlow;
 
 use super::{
     ALWAYS_FALSE, ALWAYS_TRUE, BoundedSolutionLimits, CandidateSearch, CandidateSolutions, CandidateTypeVarSolution,
-    ConstraintId, ConstraintSet, PathBoundSolution, ReportDiagnostics, SolutionLimits, Solutions, TypeVarSolution,
+    ConstraintId, ConstraintSet, PathBoundSolution, ReportDiagnostics, SolutionLimits, Solutions,
+    TypeVarSolution,
 };
 use crate::types::typevar::TypeVarSet;
 use crate::types::{
@@ -226,7 +227,8 @@ impl<'db> ConstraintSet<'db, '_> {
         ) -> Result<Option<Vec<TypeVarSolution<'db>>>, ProjectionError>,
         fallback: Vec<TypeVarSolution<'db>>,
     ) -> Result<Option<Vec<TypeVarSolution<'db>>>, ProjectionError> {
-        let (path_bounds, mut limits) = self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(ReportDiagnostics::No))?;
+        let (path_bounds, mut limits) =
+            self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(ReportDiagnostics::No))?;
         let (inferable, paths, incomplete) = match path_bounds {
             CandidateSolutions::Unsatisfiable => return Ok(None),
             CandidateSolutions::Unconstrained => return Err(ProjectionError::IncompleteSolution),
@@ -311,7 +313,6 @@ impl<'db> ConstraintSet<'db, '_> {
         let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Partial {
             generic_context: context,
             types: &types,
-            skip: None,
         });
         let visitor = ApplyTypeMappingVisitor::new(env);
         let mut proven = FxHashMap::from_iter([(ALWAYS_TRUE, true), (ALWAYS_FALSE, false)]);
@@ -407,7 +408,8 @@ impl<'db> ConstraintSet<'db, '_> {
         inferable: TypeVarSet<'db>,
     ) -> Result<Solutions<'db>, ProjectionError> {
         let budget = SolutionBudget::default();
-        let (candidates, mut limits) = self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(ReportDiagnostics::No))?;
+        let (candidates, mut limits) =
+            self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(ReportDiagnostics::No))?;
         let mut type_budget = ProjectionTypeBudget::new(budget.type_terms);
         match candidates.try_collect_solutions(
             &mut type_budget,
@@ -467,7 +469,8 @@ impl<'db> ConstraintSet<'db, '_> {
             &mut ProjectionTypeBudget,
         ) -> Result<T, ProjectionError>,
     ) -> Result<SolutionProjection<T>, ProjectionError> {
-        let (path_bounds, mut limits) = self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(ReportDiagnostics::Yes))?;
+        let (path_bounds, mut limits) =
+            self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(ReportDiagnostics::Yes))?;
 
         path_bounds.try_fold_with(
             db,

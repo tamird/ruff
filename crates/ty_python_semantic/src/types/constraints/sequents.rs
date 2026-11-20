@@ -195,8 +195,8 @@ impl<'db> SequentMap<'db> {
                         write!(
                             f,
                             "{} ⇔ {}",
-                            left.constraint(db).display(db, env, Some(true)),
-                            right.constraint(db).display(db, env, Some(true))
+                            left.display(db, env, Some(true)),
+                            right.display(db, env, Some(true))
                         )?;
                     }
                     Sequent::PairRelation {
