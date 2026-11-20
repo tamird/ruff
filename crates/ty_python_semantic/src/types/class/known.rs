@@ -315,9 +315,9 @@ impl KnownClass {
         matches!(self, Self::SpecialForm)
     }
 
-    /// Whether an exact builtin instance cannot change its truth value.
+    /// Whether `bool(x)` always returns the same result for an instance of this builtin.
     ///
-    /// Subclasses can override truthiness; callers must prove the exact runtime class.
+    /// A subclass may override `__bool__` or `__len__`, so this does not apply to subclasses.
     pub(crate) const fn has_stable_truthiness(self) -> bool {
         matches!(
             self,
