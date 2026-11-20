@@ -56,18 +56,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 - anchor_u32
         };
 
-        if let DeferredExpressionState::InStringAnnotation(enclosing_node_key) = self.deferred_state
+        if let DeferredExpressionState::InDetachedAnnotation(enclosing_node_key) =
+            self.deferred_state
         {
             let enclosing_index = enclosing_node_key.index();
-            let string: &ast::ExprStringLiteral = self
-                .module()
-                .get_by_index(enclosing_index)
-                .try_into()
-                .expect("string annotation key should point to ExprStringLiteral");
+            let owner = self.module().get_by_index(enclosing_index);
 
-            DynamicClassScopeOffset::StringAnnotation {
+            DynamicClassScopeOffset::DetachedAnnotation {
                 offset: relative_index(enclosing_index),
-                range: call.range() - string.start(),
+                range: call.range() - owner.start(),
             }
         } else {
             DynamicClassScopeOffset::Node(relative_index(call.node_index().load()))

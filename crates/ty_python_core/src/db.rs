@@ -1,5 +1,29 @@
+use crate::ProgramFile;
+use crate::definition::ProvidedStatement;
 use ruff_db::files::File;
 use ty_module_resolver::Db as ModuleResolverDb;
+
+/// An annotation supplied outside a declaration's ordinary AST slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvidedAnnotation<'db> {
+    /// One type expression in the declaration's physical source file.
+    Range(ruff_text_size::TextRange),
+    /// Supplies an annotation from another canonical source tree. The foreign owner
+    /// is a function, parameter, or module-level simple-name annotated assignment. Both
+    /// owners must describe the same kind of annotation. Parameter annotations describe
+    /// the callable's input domain and the implementation's initial binding, allowing
+    /// subsequent local assignments to infer their own types. Source-authored parameter
+    /// annotations retain precedence and declare the local variable's type. Assignment
+    /// annotations retain their declarations and qualifiers; `TypeAlias` declarations
+    /// are excluded. Names and type parameters retain their declaring scope. The provider
+    /// owns the correspondence between the two declarations. A function without local type
+    /// parameters borrows the donor's type parameter list when its return and every effective
+    /// parameter annotation come from that same function.
+    External {
+        file: ProgramFile<'db>,
+        owner: ruff_python_ast::NodeIndex,
+    },
+}
 
 #[cfg(any(test, feature = "testing"))]
 use crate::program::{Program, ProgramSettings};
@@ -9,6 +33,42 @@ use crate::program::{Program, ProgramSettings};
 pub trait Db: ModuleResolverDb {
     /// Returns `true` if the file should be checked.
     fn should_check_file(&self, file: File) -> bool;
+
+    /// Supplies a type annotation outside its ordinary AST slot.
+    /// `owner` is a function node for a return annotation, a parameter node for its type,
+    /// or a simple name assignment target for that target's declared type.
+    /// Implementations must read tracked syntax inputs without requesting this file's index.
+    fn provided_annotation<'db>(
+        &'db self,
+        _file: ProgramFile<'db>,
+        _owner: ruff_python_ast::NodeIndex,
+    ) -> Option<ProvidedAnnotation<'db>> {
+        None
+    }
+
+    /// Excludes source subtrees that have no semantics in the requesting frontend.
+    /// Implementations read tracked syntax inputs only, without requesting the semantic index.
+    /// Returned ranges belong to this file's canonical parse and include all descendants.
+    fn source_exclusions(&self, _file: ProgramFile<'_>) -> crate::SourceExclusions {
+        crate::SourceExclusions::default()
+    }
+
+    /// Projects application-defined expression statements into ordinary name bindings.
+    ///
+    /// Called while constructing the semantic index. Implementations must read tracked inputs
+    /// and must not infer types or recursively request this file's semantic index.
+    fn provided_statements(&self, _file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
+        Vec::new()
+    }
+
+    /// Whether a `type` statement binds its name in ordinary control flow.
+    ///
+    /// Python aliases have runtime values. A frontend that returns `false` places aliases in a
+    /// separate annotation namespace for their lexical scope.
+    /// Implementations must read tracked inputs without requesting the file's semantic index.
+    fn type_aliases_bind_runtime_names(&self, _file: ProgramFile<'_>) -> bool {
+        true
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]

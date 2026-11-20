@@ -42,10 +42,11 @@ pub use call_hierarchy::outgoing_calls::{OutgoingCall, outgoing_calls};
 pub use call_hierarchy::{CallHierarchyItem, prepare_call_hierarchy};
 pub use code_action::{QuickFix, code_actions};
 pub use completion::{
-    Completion, CompletionCapabilities, CompletionCommand, CompletionInsertTextFormat,
-    CompletionKind, CompletionSettings, completion,
+    Completion, CompletionCapabilities, CompletionCommand, CompletionCursor,
+    CompletionInsertTextFormat, CompletionKind, CompletionSettings, CompletionTarget, completion,
 };
 pub use doc_highlights::document_highlights;
+pub use docstring::{Docstring, DocstringFragment};
 pub use document_symbols::document_symbols;
 pub use find_references::find_references;
 pub use folding_range::{FoldingRange, FoldingRangeKind, folding_ranges};
@@ -54,16 +55,20 @@ pub use goto_implementation::goto_implementation;
 pub use hints::{Hint, HintKind, hints};
 pub use hover::hover;
 pub use inlay_hints::{
-    InlayHintKind, InlayHintLabel, InlayHintSettings, InlayHintTextEdit, inlay_hints,
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintSettings, InlayHintTextEdit, inlay_hints,
+    inlay_hints_for_model,
 };
 pub use markup::MarkupKind;
-pub use references::ReferencesMode;
+pub use references::{ReferencesMode, references_in_file};
 pub use rename::{can_rename, rename};
 pub use selection_range::selection_range;
 pub use semantic_tokens::{
     SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, semantic_tokens,
+    semantic_tokens_for_model,
 };
-pub use signature_help::{ParameterDetails, SignatureDetails, SignatureHelpInfo, signature_help};
+pub use signature_help::{
+    ParameterDetails, SignatureDetails, SignatureHelpInfo, call_at_offset, signature_help,
+};
 pub use symbols::{FlatSymbols, HierarchicalSymbols, SymbolId, SymbolInfo, SymbolKind};
 pub use type_hierarchy::{
     TypeHierarchyItem, prepare_type_hierarchy, type_hierarchy_subtypes, type_hierarchy_supertypes,
@@ -80,8 +85,8 @@ use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxBuildHasher, FxHashSet};
 use std::ops::{Deref, DerefMut};
 use ty_project::Db;
-use ty_python_semantic::ProgramEnvironment;
 use ty_python_semantic::types::{Type, TypeDefinition};
+use ty_python_semantic::{Db as SemanticDb, ProgramEnvironment};
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
 
@@ -287,11 +292,19 @@ impl FromIterator<NavigationTarget> for NavigationTargets {
 }
 
 pub trait HasNavigationTargets {
-    fn navigation_targets(&self, db: &dyn Db, env: &ProgramEnvironment<'_>) -> NavigationTargets;
+    fn navigation_targets(
+        &self,
+        db: &dyn SemanticDb,
+        env: &ProgramEnvironment<'_>,
+    ) -> NavigationTargets;
 }
 
 impl HasNavigationTargets for Type<'_> {
-    fn navigation_targets(&self, db: &dyn Db, env: &ProgramEnvironment<'_>) -> NavigationTargets {
+    fn navigation_targets(
+        &self,
+        db: &dyn SemanticDb,
+        env: &ProgramEnvironment<'_>,
+    ) -> NavigationTargets {
         match self {
             Type::Union(union) => union
                 .elements(db)
@@ -339,7 +352,11 @@ impl HasNavigationTargets for Type<'_> {
 }
 
 impl HasNavigationTargets for TypeDefinition<'_> {
-    fn navigation_targets(&self, db: &dyn Db, _: &ProgramEnvironment<'_>) -> NavigationTargets {
+    fn navigation_targets(
+        &self,
+        db: &dyn SemanticDb,
+        _: &ProgramEnvironment<'_>,
+    ) -> NavigationTargets {
         let Some(full_range) = self.full_range(db) else {
             return NavigationTargets::empty();
         };

@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use itertools::Itertools;
 use ruff_db::files::system_path_to_file;
 use ruff_db::system::DbWithWritableSystem;
@@ -9,13 +11,16 @@ use super::{ProjectionError, ProjectionTypeBudget, SolutionBudget, SolutionProje
 use crate::db::tests::{TestDb, setup_db};
 use crate::place::global_symbol;
 use crate::types::constraints::{
-    CandidateSolution, CandidateSolutions, CandidateTypeVarSolution, ConstraintFailureEvidence,
-    ConstraintProvenance, ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension,
-    PathBoundSolution, ReportDiagnostics, Solution, SolutionPaths, SolutionValidity,
-    SolutionViolationKind, Solutions, TypeVarSolution, UnspecializedTypeVarPolicy,
+    BoundedSolutionLimits, CandidateSolution, CandidateSolutions, CandidateTypeVarSolution,
+    ConstraintFailureEvidence, ConstraintProvenance, ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension,
+    PathBoundSolution, ReportDiagnostics, Solution, SolutionPaths, SolutionValidity, SolutionViolationKind, Solutions,
+    TypeVarSolution, UnspecializedTypeVarPolicy,
 };
 use crate::types::signatures::{Parameter, Parameters, Signature};
-use crate::types::typevar::{TypeVarBoundOrConstraints, TypeVarConstraints, TypeVarSet};
+use crate::types::typevar::{
+    BindingContext, TypeVarBoundOrConstraints, TypeVarConstraints, TypeVarIdentity,
+    TypeVarInstance, TypeVarKind, TypeVarNonce, TypeVarSet,
+};
 use crate::types::{
     BoundTypeVarInstance, DynamicType, IntersectionType, KnownClass, Type, TypeVarVariance,
     UnionType,
@@ -121,6 +126,79 @@ fn collect_paths<'db, 'c>(
             Ok(paths)
         },
     )
+}
+
+#[test]
+fn specialization_proof_preserves_original_graph() {
+    let db = setup_db();
+    let db = &db;
+    let env = db.program_environment();
+    let variable = create_typevar(db, "T");
+    let builder = ConstraintSetBuilder::new();
+    let integer = known_instance(db, KnownClass::Int);
+    let relation = exact(db, &builder, variable, integer);
+    let tautology =
+        ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, variable, Type::Never);
+    assert!(!tautology.node.is_terminal());
+    assert!(
+        tautology
+            .node
+            .proves_value_from_root(db, &builder.storage.borrow(), true)
+    );
+    assert!(
+        !relation
+            .node
+            .proves_value_from_root(db, &builder.storage.borrow(), true)
+    );
+    assert!(
+        !relation
+            .node
+            .proves_value_from_root(db, &builder.storage.borrow(), false)
+    );
+    let original_nodes = builder.storage.borrow().nodes.len();
+    let prove = |solution, remaining_visits| {
+        relation.prove_specialization(
+            db,
+            &env,
+            &[binding(variable, solution)],
+            &mut BoundedSolutionLimits {
+                remaining_paths: 0,
+                remaining_visits,
+            },
+            &mut ProjectionTypeBudget::new(64),
+        )
+    };
+    assert_eq!(
+        prove(integer, 0),
+        ControlFlow::Break(ProjectionError::TraversalBudgetExceeded)
+    );
+    assert_eq!(builder.storage.borrow().nodes.len(), original_nodes);
+    assert_eq!(prove(integer, 64), ControlFlow::Continue(true));
+    assert_eq!(
+        prove(known_instance(db, KnownClass::Str), 64),
+        ControlFlow::Continue(false)
+    );
+
+    let list = |element| KnownClass::List.to_specialized_instance(db, &env, &[element]);
+    let relation = exact(db, &builder, variable, list(integer));
+    let original_nodes = builder.storage.borrow().nodes.len();
+    assert_eq!(
+        relation.prove_specialization(
+            db,
+            &env,
+            &[binding(
+                variable,
+                list(Type::TypeVar(create_typevar(db, "U")))
+            )],
+            &mut BoundedSolutionLimits {
+                remaining_paths: 0,
+                remaining_visits: 64,
+            },
+            &mut ProjectionTypeBudget::new(64),
+        ),
+        ControlFlow::Continue(false)
+    );
+    assert_eq!(builder.storage.borrow().nodes.len(), original_nodes);
 }
 
 #[test]
@@ -801,7 +879,7 @@ fn incomplete_solution_discards_the_projection() {
 
         assert_eq!(
             set.solutions_with(db, &env, inferable, budget, ReportDiagnostics::Yes, choose),
-            Ok(Solutions::Constrained(SolutionPaths::BudgetExceeded(
+            Ok(Solutions::Constrained(SolutionPaths::Incomplete(
                 alternatives.map(|ty| solution([binding(t, ty)])).into()
             )))
         );
@@ -918,7 +996,7 @@ fn valid_unsolved_path_is_not_unconstrained() {
         ),
         (
             PathBoundSolution::BudgetExceeded { fallback: None },
-            Solutions::Constrained(SolutionPaths::BudgetExceeded(vec![solution([])])),
+            Solutions::Constrained(SolutionPaths::Incomplete(vec![solution([])])),
             Err(ProjectionError::IncompleteSolution),
         ),
         (
@@ -1113,19 +1191,28 @@ class E: ...
     // Charging the input alone does not prevent that expansion; the fold also needs a bounded
     // intersection constructor.
     for alternatives in [[left, right], [right, left]] {
-        let paths = CandidateSolutions::Constrained(
-            alternatives
+        let paths = CandidateSolutions::Constrained {
+            incomplete: false,
+            inferable: TypeVarSet::from_typevars(db, [t]),
+            paths: alternatives
                 .map(|ty| CandidateSolution {
                     typevars: Box::new([CandidateTypeVarSolution::from_equivalence(
                         t, ty, inferable,
                     )]) as Box<[_]>,
                     validity: SolutionValidity::Valid,
+                    residual: None,
                 })
                 .into(),
-        );
+        };
 
         assert_eq!(
             paths.try_fold_with(
+                db,
+                &env,
+                &mut BoundedSolutionLimits {
+                    remaining_paths: usize::MAX,
+                    remaining_visits: usize::MAX,
+                },
                 |_, bound| CandidateSolutions::default_solve(db, &env, &builder, bound),
                 Type::object(),
                 &mut ProjectionTypeBudget::new(7),
@@ -1141,4 +1228,83 @@ class E: ...
         );
     }
     Ok(())
+}
+
+#[test]
+fn validation_shares_the_projection_visit_budget() {
+    let db = setup_db();
+    let db = &db;
+    let env = db.program_environment();
+    let s = create_typevar(db, "S");
+    let int = known_instance(db, KnownClass::Int);
+    let str = known_instance(db, KnownClass::Str);
+
+    // Binding an explicitly annotated receiver retains the condition `int <= S` in the
+    // signature. The assignment to the declared callable bound therefore remains nonterminal.
+    let bound = Type::single_callable(db, Signature::new(Parameters::empty(), Type::object()));
+    let selected = Type::single_callable(
+        db,
+        Signature::new(
+            Parameters::from_annotation(
+                db,
+                [Parameter::positional_only(None).with_annotated_type(Type::TypeVar(s))],
+            ),
+            Type::TypeVar(s),
+        )
+        .bind_self_with_receiver(db, &env, Some(int), None),
+    );
+    let t = create_typevar(db, "T")
+        .map_bound_or_constraints(db, |_| Some(TypeVarBoundOrConstraints::UpperBound(bound)));
+    let u = create_typevar(db, "U");
+    let inferable = TypeVarSet::from_typevars(db, [t, u]);
+    let builder = ConstraintSetBuilder::new();
+    let set = exact(db, &builder, t, bound)
+        .and(db, &builder, || binary_choice(db, &builder, u, [int, str]));
+    let default_budget = SolutionBudget::default();
+    let (_, remaining) = set
+        .bounded_path_bounds(db, &env, inferable, default_budget, ReportDiagnostics::Yes)
+        .unwrap();
+    let budget = SolutionBudget {
+        visits: default_budget.visits - remaining.remaining_visits,
+        ..default_budget
+    };
+
+    // The first alternative is retained. The second requires validation, but collection has
+    // consumed the visit budget, so neither API may return the prefix as a complete result.
+    let mut selected_paths = 0;
+    let result = set.solutions_with(db, &env, inferable, budget, ReportDiagnostics::Yes, |_, candidate| {
+        if candidate.bound_typevar == t {
+            selected_paths += 1;
+            PathBoundSolution::Solved(if selected_paths == 1 { bound } else { selected })
+        } else {
+            CandidateSolutions::default_solve(db, &env, &builder, candidate)
+        }
+    });
+    assert_eq!(selected_paths, 2);
+    assert_eq!(result, Err(ProjectionError::TraversalBudgetExceeded));
+
+    let mut selected_paths = 0;
+    let mut folded_paths = 0;
+    let result = set.try_fold_solutions(
+        db,
+        &env,
+        inferable,
+        budget,
+        |_, candidate| {
+            if candidate.bound_typevar == t {
+                selected_paths += 1;
+                PathBoundSolution::Solved(if selected_paths == 1 { bound } else { selected })
+            } else {
+                CandidateSolutions::default_solve(db, &env, &builder, candidate)
+            }
+        },
+        0,
+        |count, _, _| {
+            folded_paths += 1;
+            Ok(count + 1)
+        },
+    );
+    assert_eq!(selected_paths, 2);
+    assert_eq!(folded_paths, 1);
+    assert_eq!(result, Err(ProjectionError::TraversalBudgetExceeded));
 }

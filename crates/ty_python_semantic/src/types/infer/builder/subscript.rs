@@ -1,4 +1,4 @@
-use itertools::{Either, EitherOrBoth, Itertools};
+use itertools::{EitherOrBoth, Itertools};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span};
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::helpers::is_dotted_name;
@@ -21,48 +21,28 @@ use crate::types::diagnostic::{
 use crate::types::dict::dict_literal_key_value_types;
 use crate::types::generics::{GenericContext, bind_typevar};
 use crate::types::infer::builder::{ArgExpr, ArgumentsIter, MultiInferenceGuard};
-use crate::types::infer::{InferenceFlags, TypeExpressionFlags};
+use crate::types::infer::{
+    CollectionUseConstraintKind, InferenceFlags, TypeExpressionFlags,
+    infer_expression_with_body_domain,
+};
 use crate::types::special_form::AliasSpec;
 use crate::types::subscript::{LegacyGenericOrigin, SubscriptError, SubscriptErrorKind};
 use crate::types::tuple::{Tuple, TupleSpecBuilder, TupleType, VariableSegment};
 use crate::types::typed_dict::{
-    TypedDictAssignmentKind, TypedDictExtraItems, TypedDictField, TypedDictKeyAssignment,
+    TypedDictAssignmentKind, TypedDictExtraItems, TypedDictField, TypedDictKeyAssignment, TypedDictType,
 };
 use crate::types::typevar::{BindingContext, TypeVarKind, TypeVarSet};
 use crate::types::{
-    BoundTypeVarInstance, CallArguments, CallDunderError, CallableBinding, ClassType,
-    CycleDetector, DisplaySettings, DynamicType, InternedType, KnownClass, KnownInstanceType,
+    BoundTypeVarInstance, CallArguments, CallDunderError, CallableBinding, ClassType, DeclaredType,
+    CycleDetector, DisplaySettings, DynamicType, InternedType, IntersectionType, KnownClass, KnownInstanceType,
     LintDiagnosticGuard, MemberLookupPolicy, Parameter, Parameters, SpecialFormType,
     StaticClassLiteral, Type, TypeAliasType, TypeContext, TypeMapping, TypeVarBoundOrConstraints,
-    UnionType, UnionTypeInstance,
+    UnionType, UnionTypeInstance, any_over_type, todo_type,
 };
 use crate::{Db, FxOrderSet, ProgramEnvironment};
 use ty_python_core::definition::Definition;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::{SemanticIndex, place_table};
-
-/// Given a string literal or a union of string literals, return an iterator over the contained
-/// strings, or `None` if the type is neither.
-fn string_literal_values<'db>(
-    db: &'db dyn Db,
-    ty: Type<'db>,
-) -> Option<impl Iterator<Item = &'db str> + 'db> {
-    if let Some(literal) = ty.as_string_literal() {
-        Some(Either::Left(std::iter::once(literal.value(db))))
-    } else {
-        let elements = ty.as_union()?.elements(db);
-        elements
-            .iter()
-            .all(|ty| ty.as_string_literal().is_some())
-            .then(|| {
-                Either::Right(
-                    elements
-                        .iter()
-                        .filter_map(|ty| ty.as_string_literal().map(|lit| lit.value(db))),
-                )
-            })
-    }
-}
 
 impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     pub(super) fn typed_dict_key_expected_type(&self, ty: Type<'db>) -> Option<Type<'db>> {
@@ -175,11 +155,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         &mut self,
         subscript: &ast::ExprSubscript,
     ) -> Result<Type<'db>, Type<'db>> {
-        let value_ty = self.infer_expression(&subscript.value, TypeContext::default());
+        let value_ty =
+            self.infer_maybe_standalone_expression(&subscript.value, TypeContext::default());
 
         // If we have an implicit type alias like `MyList = list[T]`, and if `MyList` is being
         // used in another implicit type alias like `Numbers = MyList[int]`, then we infer the
         // right hand side as a value expression, and need to handle the specialization here.
+
         if value_ty.is_generic_alias() {
             return Ok(self.infer_explicit_type_alias_specialization(subscript, value_ty, false));
         }
@@ -232,7 +214,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 {
                     // Even if we can obtain the subscript type based on the assignments, we still perform default type inference
                     // (to store the expression type and to report errors).
-                    let slice_ty = self.infer_expression(slice, TypeContext::default());
+                    let slice_ty =
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
+                    let observed = crate::types::dictionary::item_type_at_use(
+                        db,
+                        self.scope(),
+                        subscript,
+                        value_ty,
+                        slice_ty,
+                        self.reachability_cache(),
+                    );
+                    let ty = observed.map_or(ty, |observed| {
+                        IntersectionType::from_two_elements(db, env, ty, observed)
+                    });
                     return self
                         .infer_subscript_expression_types(
                             subscript,
@@ -375,7 +369,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         return Ok(union_type);
                     }
                     _ => {
-                        return Ok(self.infer_expression(slice, TypeContext::default()));
+                        return Ok(
+                            self.infer_maybe_standalone_expression(slice, TypeContext::default())
+                        );
                     }
                 },
                 SpecialFormType::Type => {
@@ -476,7 +472,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
             }
             Type::Dynamic(DynamicType::Unknown) => {
-                let slice_ty = self.infer_expression(slice, TypeContext::default());
+                let slice_ty =
+                    self.infer_maybe_standalone_expression(slice, TypeContext::default());
                 let mut variables = FxOrderSet::default();
                 slice_ty.bind_and_find_all_legacy_typevars(
                     db,
@@ -494,9 +491,37 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => {}
         }
 
-        let slice_ty = self.infer_expression(slice, TypeContext::default());
-        self.infer_subscript_expression_types(subscript, value_ty, slice_ty, ExprContext::Load)
-            .map(|ty| self.narrow_source_place(source_place.as_ref(), ty, &constraint_keys))
+        let slice_ty = self.infer_maybe_standalone_expression(slice, TypeContext::default());
+        let checked =
+            self.infer_subscript_expression_types(subscript, value_ty, slice_ty, ExprContext::Load);
+        let observed = crate::types::dictionary::item_type_at_use(
+            db,
+            self.scope(),
+            subscript,
+            value_ty,
+            slice_ty,
+            self.reachability_cache(),
+        )
+        .or_else(|| {
+            crate::types::dictionary::first_value(
+                db,
+                env,
+                self.scope(),
+                subscript,
+                self.reachability_cache(),
+                |expression| self.try_expression_type(expression),
+            )
+        });
+        checked
+            .map(|result| {
+                self.narrow_expr_with_applicable_constraints(
+                    subscript,
+                    observed.map_or(result, |observed| {
+                        IntersectionType::from_two_elements(db, env, result, observed)
+                    }),
+                    &constraint_keys,
+                )
+            })
             .map_err(|recovery_ty| {
                 self.narrow_source_place(source_place.as_ref(), recovery_ty, &constraint_keys)
             })
@@ -573,8 +598,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Type<'db> {
         let db = self.db();
         if generic_type_alias.specialization(db).is_some() {
-            if !self.in_string_annotation() {
-                self.infer_expression(&subscript.slice, TypeContext::default());
+            if !self.in_detached_annotation() {
+                self.infer_maybe_standalone_expression(&subscript.slice, TypeContext::default());
             }
             if let Some(builder) = self.context.report_lint(&NOT_SUBSCRIPTABLE, subscript) {
                 let mut diagnostic =
@@ -769,7 +794,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // If there are no typevars at all, this is not a generic type,
                 // so we should not infer excess arguments as type expressions.
                 // For example, `list[int][0]` — the `0` is not a type expression.
-                self.infer_expression(expr, TypeContext::default())
+                self.infer_maybe_standalone_expression(expr, TypeContext::default())
             } else {
                 let previously_in_valid_unpack_context = self
                     .context
@@ -1379,7 +1404,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
 
             ast::Expr::Subscript(subscript) if inferred_type.is_none() => {
-                let value_ty = self.infer_expression(&subscript.value, TypeContext::default());
+                let value_ty = self.infer_maybe_standalone_expression(&subscript.value, TypeContext::default());
 
                 if matches!(value_ty, Type::SpecialForm(SpecialFormType::Concatenate)) {
                     return Ok(Type::paramspec_value_callable(
@@ -1678,10 +1703,69 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             );
         }
 
-        subscript_result.map_err(|error| {
-            error.report_diagnostics(&self.context, subscript);
-            error.result_type()
-        })
+        match subscript_result {
+            Err(error)
+                if expr_context == ExprContext::Load
+                    && error.is_key_type_mismatch()
+                    && self.membership_guard(subscript).is_some()
+                    && slice_ty.is_assignable_to(
+                        db,
+                        env,
+                        KnownClass::Hashable.to_instance(db, env),
+                    )
+                    && crate::types::dictionary::has_builtin_key_lookup(db, env, value_ty) =>
+            {
+                Ok(error.result_type())
+            }
+            Ok(value) => Ok(value),
+            Err(error) => {
+                error.report_diagnostics(&self.context, subscript);
+                Err(error.result_type())
+            }
+        }
+    }
+
+    /// In `{k: d[k] for k in keys if k in d}`, membership validates this read, not the type
+    /// of `k`: differently typed keys can compare equal. Only use an immediately preceding
+    /// guard; a later filter or an arbitrary result-key expression can mutate the dictionary.
+    /// Dynamic subscripts are not indexed places, so ordinary narrowing constraints cannot
+    /// record this relationship or invalidate it when the key or dictionary changes.
+    fn membership_guard(&self, subscript: &ast::ExprSubscript) -> Option<()> {
+        use ty_python_core::scope::NodeWithScopeKind;
+
+        let (dict, key) = (
+            subscript.value.as_name_expr()?,
+            subscript.slice.as_name_expr()?,
+        );
+        let (generators, result): (&[ast::Comprehension], &ast::Expr) =
+            match self.scope().node(self.db()) {
+                NodeWithScopeKind::DictComprehension(node) => {
+                    let node = node.node(self.module());
+                    if node.key.as_ref()?.as_name_expr()?.id != key.id {
+                        return None;
+                    }
+                    (&node.generators, node.value.as_ref())
+                }
+                NodeWithScopeKind::ListComprehension(node) => {
+                    let node = node.node(self.module());
+                    (&node.generators, node.elt.as_ref())
+                }
+                _ => return None,
+            };
+        if result.range() != subscript.range() {
+            return None;
+        }
+        let (candidate, ast::CmpOp::In, container) = generators
+            .last()?
+            .ifs
+            .last()?
+            .as_compare_expr()?
+            .as_single()?
+        else {
+            return None;
+        };
+        (candidate.as_name_expr()?.id == key.id && container.as_name_expr()?.id == dict.id)
+            .then_some(())
     }
 
     pub(super) fn infer_slice_expression(&mut self, slice: &ast::ExprSlice) -> Type<'db> {
@@ -1732,6 +1816,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         self.store_typed_dict_key_expected_type(slice, object_ty);
 
+        let mut checked_arguments = None;
         let is_valid_assignment = self.validate_subscript_assignment_impl(
             target,
             None,
@@ -1740,24 +1825,34 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             rhs_value,
             infer_rhs_value,
             true,
+            &mut checked_arguments,
         );
 
         // Record the constraints for the object of the subscript assignment, if the object is an
-        // unannotated collection initializer.
+        // unannotated collection initializer. A pending value query can supply concrete evidence
+        // in a later cycle iteration. Keep that dependency, but do not feed the receiver's own
+        // provisional slot back into its initializer as independent evidence.
         if is_valid_assignment
             && let Some(collection_def) = self.index.unannotated_collection_initializer(object)
             && let Some((class_literal, _)) = object_ty.class_specialization(db, env)
+            && let Some([checked_slice_ty, checked_value_ty]) = checked_arguments
+            && let inferred_value_ty =
+                checked_value_ty.filter_union(db, env, |ty| !ty.is_divergent())
+            && (!inferred_value_ty.is_never() || checked_value_ty.is_never())
+            && ((inferred_value_ty.is_recursive_divergent()
+                && !any_over_type(db, env, object_ty, false, |ty| {
+                    ty.same_divergent_marker(inferred_value_ty)
+                }))
+                || !any_over_type(db, env, inferred_value_ty, false, |ty| ty.is_divergent()))
         {
             let identity_instance =
                 Type::instance(db, env, class_literal.identity_specialization(db));
             let collection_generic_context = class_literal.generic_context(db);
 
-            let ast_arguments = [
-                ArgOrKeyword::Arg(&target.slice),
-                ArgOrKeyword::Arg(rhs_value),
-            ];
-
-            let mut call_arguments = CallArguments::positional([Type::unknown(), Type::unknown()]);
+            // Use the checked argument types so fresh empty values retain the receiver's
+            // context. Concrete union arms can constrain a self-referential write while the
+            // other arm is still provisional. Nested provisional elements need more context.
+            let call_arguments = CallArguments::positional([checked_slice_ty, inferred_value_ty]);
 
             if let Place::Defined(DefinedPlace {
                 ty: dunder_callable,
@@ -1810,6 +1905,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         // Record the constraints on the receiver's generic context formed by
                         // the arguments to this dunder call.
                         let Some(constraints) = self.collection_use_constraint_from_specialization(
+                            collection_def.file_scope(db),
                             identity_instance,
                             collection_generic_context,
                             call_specialization,
@@ -1820,13 +1916,52 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         self.collection_use_constraints
                             .entry(collection_def)
                             .or_default()
-                            .insert(constraints);
+                            .entry(constraints)
+                            .or_insert(CollectionUseConstraintKind::Inferred);
                     }
                 }
             }
         }
 
         is_valid_assignment
+    }
+
+    /// In `dest[key] = source[key]`, both subscripts select the same field.
+    fn copied_assignment_source(
+        &self,
+        target: &ast::ExprSubscript,
+        value: &ast::Expr,
+    ) -> Option<TypedDictType<'db>> {
+        let db = self.db();
+        let key = target.slice.as_name_expr()?;
+        // A computed receiver or a nonlocal key could change the binding between reads.
+        self.current_function_definition()?;
+        let table = self.index.place_table(self.scope().file_scope_id(db));
+        if !target.value.is_name_expr() || !table.symbol(table.symbol_id(&key.id)?).is_local() {
+            return None;
+        }
+
+        // In destructuring, augmented assignment, and iteration the assigned value
+        // is not the result of evaluating this expression.
+        let expression = self.index.try_expression(value)?;
+        let assignment = expression.assigned_to(db)?;
+        let [ast::Expr::Subscript(direct)] = assignment.node(self.module()).targets.as_slice()
+        else {
+            return None;
+        };
+        if !std::ptr::eq(direct, target) {
+            return None;
+        }
+
+        crate::types::dictionary::copied_field_source(db, &target.slice, value, &mut |expr| {
+            infer_expression_with_body_domain(
+                db,
+                expression,
+                TypeContext::default(),
+                self.context.body_domain,
+            )
+            .try_expression_type(expr)
+        })
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1839,6 +1974,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         rhs_value_node: &ast::Expr,
         infer_rhs_value: &mut dyn FnMut(&mut Self, TypeContext<'db>) -> Type<'db>,
         emit_diagnostic: bool,
+        checked_arguments: &mut Option<[Type<'db>; 2]>,
     ) -> bool {
         let env = self.program_environment();
         let db = self.db();
@@ -1875,6 +2011,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         rhs_value_node,
                         &mut |builder, tcx| infer_rhs_value.infer_silent(builder, tcx),
                         emit_diagnostic,
+                        checked_arguments,
                     );
                 }
 
@@ -1886,9 +2023,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let mut infer_rhs_value = MultiInferenceGuard::new(infer_rhs_value);
 
                 let mut check_positive_elements = |emit_diagnostic_and_short_circuit| {
-                    let mut valid = false;
+                    let mut outcome = false;
                     for element_ty in intersection.positive(db) {
-                        valid |= self.validate_subscript_assignment_impl(
+                        outcome = self.validate_subscript_assignment_impl(
                             target,
                             full_object_ty.or(Some(object_ty)),
                             *element_ty,
@@ -1896,29 +2033,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             rhs_value_node,
                             &mut |builder, tcx| infer_rhs_value.infer_silent(builder, tcx),
                             emit_diagnostic_and_short_circuit,
+                            checked_arguments,
                         );
 
-                        if valid || emit_diagnostic_and_short_circuit {
-                            // Otherwise, perform loud inference with the narrowed type context, or the
-                            // type context of the first failing element.
+                        if outcome || emit_diagnostic_and_short_circuit {
                             infer_slice_ty.infer_loud(self, infer_slice_ty.last_tcx());
                             infer_rhs_value.infer_loud(self, infer_rhs_value.last_tcx());
                             break;
                         }
                     }
 
-                    valid
+                    outcome
                 };
 
-                // Perform an initial check of all elements. If the assignment is valid
-                // for at least one element, we do not emit any diagnostics. Otherwise,
-                // we re-run the check and emit a diagnostic on the first failing element.
-                let valid = check_positive_elements(false);
-                if !valid {
+                let outcome = check_positive_elements(false);
+                if !outcome {
                     check_positive_elements(true);
                 }
 
-                valid
+                outcome
             }
 
             Type::EnumComplement(complement) => self.validate_subscript_assignment_impl(
@@ -1929,6 +2062,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 rhs_value_node,
                 infer_rhs_value,
                 emit_diagnostic,
+                checked_arguments,
             ),
 
             Type::TypedDict(typed_dict) => {
@@ -1937,7 +2071,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 let mut valid = true;
                 let slice_ty = infer_slice_ty(self, TypeContext::default());
-                let Some(keys) = string_literal_values(db, slice_ty) else {
+                let Some(keys) = slice_ty.string_literal_values(db) else {
                     // Check if the key has a valid type. We only allow string literals, a union of string literals,
                     // or a dynamic type like `Any`. We can do this by checking assignability to `LiteralString`,
                     // but we need to exclude `LiteralString` itself. This check would technically allow weird key
@@ -1948,7 +2082,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         return true;
                     }
 
-                    if slice_ty.is_assignable_to(db, env, KnownClass::Str.to_instance(db, env))
+                    let string_ty = KnownClass::Str.to_instance(db, env);
+                    if slice_ty.is_assignable_to(db, env, string_ty)
                         && let Some(expected_ty) = typed_dict.arbitrary_key_mutation_type(db, env)
                     {
                         let rhs_value_ty =
@@ -2028,6 +2163,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // We may need to infer the value multiple times for distinct keys.
                 let mut key_count = 0;
                 let mut infer_rhs_value = MultiInferenceGuard::new(infer_rhs_value);
+                let source_fields = self
+                    .copied_assignment_source(target, rhs_value_node)
+                    .map(|source| source.items(db));
 
                 for key in keys {
                     // Infer the value with type context.
@@ -2037,6 +2175,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         TypeContext::preference(item.as_ref().map(|item| item.declared_ty)),
                     );
 
+                    let value_ty = if let Some(source_item) =
+                        source_fields.and_then(|fields| fields.get(key))
+                    {
+                        IntersectionType::from_two_elements(
+                            db,
+                            env,
+                            value_ty,
+                            source_item.declared_type(),
+                        )
+                    } else {
+                        value_ty
+                    };
                     if item.is_some() {
                         key_count += 1;
                     }
@@ -2057,10 +2207,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 // Perform loud inference with type context if there is a single key.
                 if key_count == 1 {
-                    infer_rhs_value.infer_loud(self, infer_rhs_value.last_tcx());
+                    infer_rhs_value.infer_loud(self, infer_rhs_value.last_tcx())
                 } else {
-                    infer_rhs_value.infer_loud(self, TypeContext::default());
-                }
+                    infer_rhs_value.infer_loud(self, TypeContext::default())
+                };
 
                 valid
             }
@@ -2083,7 +2233,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         }
                     };
 
-                let Err(call_dunder_err) = self.infer_and_try_call_dunder(
+                let call_result = self.infer_and_try_call_dunder(
                     object_ty,
                     "__setitem__",
                     MemberLookupPolicy::NO_INSTANCE_FALLBACK,
@@ -2091,8 +2241,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     &mut call_arguments,
                     &mut infer_argument_ty,
                     TypeContext::default(),
-                ) else {
-                    return true;
+                );
+                let call_dunder_err = match call_result {
+                    Ok(bindings) => {
+                        *checked_arguments = Some([
+                            bindings.type_for_argument(&call_arguments, 0),
+                            bindings.type_for_argument(&call_arguments, 1),
+                        ]);
+                        return true;
+                    }
+                    Err(error) => error,
                 };
 
                 match call_dunder_err {
@@ -2350,9 +2508,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     let can_delete_extra_literals = typed_dict
                         .explicit_extra_items(db)
                         .is_some_and(|extra_items| !extra_items.is_read_only())
-                        && string_literal_values(db, slice_ty).is_some_and(|mut literals| {
-                            literals.all(|literal| !typed_dict.items(db).contains_key(literal))
-                        });
+                        && slice_ty
+                            .string_literal_values(db)
+                            .is_some_and(|mut literals| {
+                                literals.all(|literal| !typed_dict.items(db).contains_key(literal))
+                            });
                     let can_delete_arbitrary_key =
                         slice_ty.is_assignable_to(db, env, KnownClass::Str.to_instance(db, env))
                             && typed_dict.supports_arbitrary_key_deletion(db);

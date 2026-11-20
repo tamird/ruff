@@ -258,7 +258,6 @@ When the other operand is not compatible with the `TypedDict`, the result falls 
 ```py
 # Incompatible value type for a key
 reveal_type(bob | {"name": 42})  # revealed: dict[str, object]
-reveal_type({"name": 42} | bob)  # revealed: dict[str, object]
 
 # Key not present in the TypedDict
 reveal_type(bob | {"unknown_key": 1})  # revealed: dict[str, object]
@@ -266,6 +265,21 @@ reveal_type({"unknown_key": 1} | bob)  # revealed: dict[str, object]
 
 # error: [unsupported-operator] "Operator `|=` is not supported between objects of type `Person` and `dict[str, int]`"
 bob |= {"unknown_key": 1}
+```
+
+A required field on the right replaces the corresponding value on the left. Expressions producing
+replaced values still execute and are checked:
+
+```py
+reveal_type({"name": 42} | bob)  # revealed: Person
+
+def make_name(value: str) -> str:
+    return value
+
+# error: [invalid-argument-type]
+reveal_type(bob | {"name": make_name(42)})  # revealed: Person
+# error: [invalid-argument-type]
+reveal_type({"name": make_name(42)} | bob)  # revealed: Person
 ```
 
 `TypedDict` keys do not have to be string literals, as long as they can be statically determined
@@ -426,6 +440,126 @@ alice["extra"] = True
 
 # error: [invalid-typed-dict-key] "Unknown key "extra" for TypedDict `Person`"
 bob["extra"] = True
+```
+
+## Merging with built-in dictionaries
+
+A merge can preserve the value types from both dictionaries when the `TypedDict` bounds all of its
+values. An implicitly open `TypedDict` can contain hidden values of any type.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Any
+from typing_extensions import TypedDict
+
+class Closed(TypedDict, closed=True):
+    count: int
+
+class Extra(TypedDict, extra_items=str):
+    count: int
+
+class Open(TypedDict):
+    count: int
+
+class Other(TypedDict, closed=True):
+    name: str
+
+def accept_ints(values: dict[str, int]) -> None: ...
+def merge(closed: Closed, extra: Extra, open_: Open, other: dict[str, str], record: Other) -> None:
+    reveal_type(closed | other)  # revealed: dict[str, int | str]
+    reveal_type(other | closed)  # revealed: dict[str, int | str]
+    reveal_type(closed.__or__(other))  # revealed: dict[str, int | str]
+    reveal_type(extra | other)  # revealed: dict[str, int | str]
+    reveal_type(open_ | other)  # revealed: dict[str, object]
+    reveal_type(closed | record)  # revealed: dict[str, int | str]
+    # error: [invalid-argument-type]
+    accept_ints(closed | other)
+
+def merge_generic[T](closed: Closed, other: dict[str, T]) -> dict[str, int | T]:
+    return closed | other  # no diagnostic
+
+def merge_alternatives(closed: Closed, other: dict[str, str] | Other, gradual: dict[str, Any]) -> None:
+    reveal_type(closed | other)  # revealed: dict[str, int | str]
+    reveal_type(closed | gradual)  # revealed: dict[str, int | Any]
+
+class Recursive(TypedDict, closed=True):
+    child: "Recursive | None"
+
+def merge_recursive(record: Recursive, other: dict[str, int], closed: Closed) -> None:
+    record | other  # no diagnostic
+    record | closed  # no diagnostic
+```
+
+## Merging with empty built-in dictionaries
+
+An empty built-in dictionary leaves the `TypedDict` unchanged in either operand position:
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Never
+from typing_extensions import TypedDict
+
+class Record(TypedDict, closed=True):
+    value: int
+
+def merge(record: Record):
+    empty = {}
+    reveal_type(record | empty)  # revealed: Record
+    reveal_type(empty | record)  # revealed: Record
+    # error: [invalid-argument-type]
+    reveal_type(Record(value="bad") | empty)  # revealed: Record
+
+def extract_absent_keys(record: Record):
+    empty = {key: record.pop(key) for key in ("testonly", "features") if key in record}
+    reveal_type(record | empty)  # revealed: Record
+    reveal_type(empty | record)  # revealed: Record
+    reveal_type(empty)  # revealed: dict[Never, Never]
+```
+
+A nominal dictionary annotation can contain a subclass that overrides the merge operation. Its empty
+key and value types alone do not establish that the result preserves required fields:
+
+```py
+class DropsKeys(dict[Never, Never]):
+    def __ror__[K, V](self, other: dict[K, V], /) -> dict[K, V]:
+        return {}
+
+def nominal_empty(record: Record, empty: dict[Never, Never]):
+    # error: [unsupported-operator]
+    reveal_type(record | empty)  # revealed: Unknown
+
+def overridden(record: Record):
+    # error: [unsupported-operator]
+    reveal_type(record | DropsKeys())  # revealed: Unknown
+```
+
+The contents at the merge must still be empty after intervening writes:
+
+```py
+def mutated(record: Record):
+    empty = {}
+    empty["value"] = "wrong"
+    reveal_type(record | empty)  # revealed: dict[str, int | str]
+```
+
+Evaluating the other operand can also change the dictionary before the merge:
+
+```py
+def populate(record: Record, empty: dict[str, str]) -> Record:
+    empty["other"] = "value"
+    return record
+
+def operand_effect(record: Record):
+    empty = {}
+    reveal_type(empty | populate(record, empty))  # revealed: dict[str, int | str]
 ```
 
 ## Unpacked assignments to `TypedDict` variables
@@ -940,6 +1074,541 @@ def return_invalid_literal() -> TD:
 def return_invalid_dict() -> TD:
     # error: [missing-typed-dict-key] "Missing required key 'x' in TypedDict `TD` constructor"
     return dict()
+```
+
+## Built-in `dict` constructors in a union context
+
+```py
+from collections.abc import Callable
+from typing import Literal, TypedDict
+
+class Empty(TypedDict):
+    kind: Literal["empty"]
+
+class Value(TypedDict):
+    kind: Literal["value"]
+    value: int
+
+empty: Empty | Value = dict(kind="empty")  # no diagnostic
+value: Empty | Value = dict(kind="value", value=1)  # no diagnostic
+invalid: Empty | Value = dict(kind="value")  # error: [invalid-assignment]
+
+reveal_type(empty)  # revealed: Empty
+reveal_type(value)  # revealed: Value
+
+class Callback(TypedDict):
+    kind: Literal["callback"]
+    callback: Callable[[int], int]
+
+callback: Empty | Callback = dict(kind="callback", callback=lambda x: reveal_type(x))  # revealed: int
+
+class StringCallback(TypedDict):
+    kind: Literal["callback"]
+    callback: Callable[[str], str]
+
+ambiguous_callback: Callback | StringCallback = dict(kind="callback", callback=lambda x: reveal_type(x))  # revealed: Unknown
+reveal_type(ambiguous_callback)  # revealed: Callback | StringCallback
+
+class OtherValue(TypedDict):
+    kind: Literal["value"]
+    value: int
+
+ambiguous: Value | OtherValue = dict(kind="value", value=1)
+reveal_type(ambiguous)  # revealed: Value | OtherValue
+
+plain: Empty | Value | dict[str, int] = dict(other=1)
+reveal_type(plain)  # revealed: dict[str, int]
+
+def unpack(payload: Value) -> Empty | Value:
+    return dict(**payload)
+
+invalid_value: Empty | Value = dict(kind="value", value="wrong")  # error: [invalid-assignment]
+
+def missing_name() -> Empty | Value:
+    return dict(kind="value", value=unknown)  # error: [unresolved-reference]
+```
+
+## Copying fields under the same key
+
+Copying a field from one typed dictionary into another preserves the value type for that key,
+including when the source has additional fields of a broader type.
+
+```py
+from typing import Literal
+from typing_extensions import TypedDict
+
+Key = Literal["color", "weight"]
+
+class Inputs(TypedDict, total=False, extra_items=object):
+    color: str
+    weight: int
+
+class Options(TypedDict, total=False, closed=True):
+    color: str
+    weight: int
+
+def take(source: Inputs, keys: list[Key], take_values: bool) -> Options:
+    dest: Options = {}
+    for key in keys:
+        if key in source:
+            if take_values:
+                dest[key] = source.pop(key)
+            else:
+                dest[key] = source[key]
+    return dest
+
+class Wrong(TypedDict, total=False):
+    color: int
+    weight: int
+
+def incompatible(dest: Wrong, source: Inputs, key: Key):
+    dest[key] = source[key]  # error: [invalid-assignment] "with declared type `int`"
+
+def unrelated(dest: Options, source: Inputs, key: Key, other: Key):
+    # error: [invalid-assignment] "with declared type `str`"
+    # error: [invalid-assignment] "with declared type `int`"
+    dest[key] = source[other]
+    # error: [invalid-assignment] "with declared type `str`"
+    # error: [invalid-assignment] "with declared type `int`"
+    dest[key] = source.pop(key, "missing")
+
+def arbitrary(dest: Options, source: Inputs, key: str):
+    dest[key] = source[key]  # error: [invalid-typed-dict-key]
+
+class Singleton(TypedDict):
+    color: tuple[int]
+
+def unpacked(dest: Options, source: Singleton, key: Literal["color"]):
+    (dest[key],) = source[key]  # error: [invalid-assignment]
+
+def augmented(dest: Options, key: Literal["weight"]):
+    dest[key] /= 2  # error: [invalid-assignment]
+```
+
+## Contextual built-in dictionary copies
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+A `dict` call in a `TypedDict` context checks a positional `TypedDict` source and its keyword
+overrides using the same field rules as the target's constructor. Without that context, the call
+continues to infer an ordinary dictionary.
+
+```py
+from typing import TypedDict
+from typing_extensions import NotRequired
+
+class Source(TypedDict):
+    name: str
+
+class OldSource(TypedDict):
+    name: int
+
+class Target(TypedDict):
+    name: str
+    enabled: bool
+
+class MaybeName(TypedDict):
+    name: NotRequired[str]
+
+def copies(source: Source, old: OldSource, maybe: MaybeName, rows: list[Source]):
+    copied: Source = dict(source)
+    changed: Target = dict(source, enabled=True)
+    repaired: Target = dict(old, name="new", enabled=True)
+    required: Target = dict(maybe, name="new", enabled=True)
+    reveal_type(copied)  # revealed: Source
+    reveal_type(changed)  # revealed: Target
+    reveal_type(dict(source, enabled=True))  # revealed: dict[str, object]
+
+    # error: [invalid-argument-type]
+    wrong_source: Target = dict(old, enabled=True)
+    # error: [invalid-argument-type]
+    wrong_override: Target = dict(source, enabled="bad")
+    # error: [invalid-argument-type]
+    missing: Target = dict(source)
+    # An optional override cannot replace every possible old value.
+    # error: [invalid-argument-type]
+    optional_override: Target = dict(old, enabled=True, **maybe)
+
+    result: list[Target] = [dict(row, enabled=True) for row in rows]
+    reveal_type(result[0]["enabled"])  # revealed: bool
+
+    constructor = dict
+    alias: Target = constructor(source, enabled=True)
+```
+
+Keyword values receive their field's type as context, including nested containers and callables.
+
+```py
+from typing import Callable
+
+class Configured(TypedDict):
+    name: str
+    values: list[int]
+    render: Callable[[int], str]
+
+def configure(source: Source):
+    configured: Configured = dict(source, values=[], render=lambda n: str(reveal_type(n)))  # revealed: int
+    reveal_type(configured["values"])  # revealed: list[int]
+```
+
+Named aliases preserve the same contextual constructor checks and keyword inference.
+
+```py
+type SourceAlias = Source
+type TargetAlias = Target
+type NestedTargetAlias = TargetAlias
+type ConfiguredAlias = Configured
+
+def return_alias(source: SourceAlias) -> NestedTargetAlias:
+    return dict(source, enabled=True)
+
+def alias_overrides(source: SourceAlias, old: OldSource, maybe: MaybeName):
+    required: TargetAlias = dict(maybe, name="new", enabled=True)
+    # error: [invalid-argument-type]
+    wrong_source: TargetAlias = dict(old, enabled=True)
+    # error: [invalid-argument-type]
+    wrong_override: TargetAlias = dict(source, enabled="bad")
+    # error: [invalid-argument-type]
+    missing: TargetAlias = dict(source)
+
+def configure_alias(source: SourceAlias) -> ConfiguredAlias:
+    return dict(source, values=[], render=lambda n: str(reveal_type(n)))  # revealed: int
+```
+
+Copying creates a fresh outer dictionary; the nested values remain shared. A readonly source field
+can become writable in the copy, but a mutable list cannot acquire a wider element type.
+
+```py
+from typing_extensions import ReadOnly
+
+class ReadonlySource(TypedDict):
+    name: ReadOnly[str]
+    values: ReadOnly[list[int]]
+
+class MutableTarget(TypedDict):
+    name: str
+    values: list[int]
+
+class WiderTarget(TypedDict):
+    name: str
+    values: list[int | str]
+
+def shallow(source: ReadonlySource):
+    copied: MutableTarget = dict(source, name="new")
+    # error: [invalid-argument-type]
+    unsafe: WiderTarget = dict(source, name="new")
+```
+
+Unsupported positional sources retain ordinary constructor inference. Speculating about the source
+shape preserves diagnostics from the actual arguments, and a shadowed `dict` uses its own signature.
+
+```py
+from collections.abc import Mapping
+from typing import Any
+
+def unsupported(mapping: Mapping[str, object], dynamic: Any, source: Source):
+    # error: [invalid-assignment]
+    ordinary: Source = dict(mapping, name="new")
+    # error: [invalid-assignment]
+    gradual: Source = dict(dynamic)
+    # error: [invalid-assignment]
+    starred: Source = dict(*[source])
+    # error: [unresolved-reference]
+    # error: [invalid-assignment]
+    unresolved: Source = dict(mapping, name=missing)
+
+def shadowed(source: Source):
+    def dict(value: Source) -> int:
+        return 1
+
+    # error: [invalid-assignment]
+    copied: Source = dict(source)
+```
+
+## Contextual dictionary unions
+
+The result of a dictionary union can satisfy a `TypedDict` whose fields come from both operands. The
+operands keep their own types. When neither operand describes the combined result, a union without a
+result annotation produces an ordinary dictionary.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing_extensions import NotRequired, ReadOnly, TypedDict
+
+class A(TypedDict, closed=True):
+    a: int
+
+class B(TypedDict, closed=True):
+    b: str
+
+class C(TypedDict, closed=True):
+    c: bool
+
+class AB(TypedDict, closed=True):
+    a: int
+    b: str
+
+class ABC(TypedDict, closed=True):
+    a: int
+    b: str
+    c: bool
+
+def consume(value: AB) -> None: ...
+def merge(a: A, b: B, c: C) -> AB:
+    ab: AB = a | b  # no diagnostic
+    consume(a | b)  # no diagnostic
+    reveal_type(a | b)  # revealed: dict[str, int | str]
+    reveal_type(a.__or__(b))  # revealed: dict[str, int | str]
+    abc: ABC = a | b | c  # no diagnostic
+    return a | b  # no diagnostic
+
+type AliasA = A
+type AliasB = B
+type AliasAB = AB
+
+def aliased(a: AliasA, b: AliasB) -> AliasAB:
+    return a | b  # no diagnostic
+
+def make_a() -> A:
+    return {"a": 1}
+
+def called(b: B) -> AB:
+    return make_a() | b  # no diagnostic
+```
+
+Without a result schema, the fresh dictionary retains the possible value types from both bounded
+operands. The result can be mutated independently of either input.
+
+```py
+from collections.abc import Mapping
+
+class Reflected:
+    def __ror__(self, other: object) -> bytes:
+        return b""
+
+def bounded(a: A, b: B, mapping: Mapping[str, int], reflected: Reflected):
+    reveal_type(b | a)  # revealed: dict[str, str | int]
+    reveal_type(a.__ror__(b))  # revealed: dict[str, int | str]
+    merged = a | b
+    merged["new"] = 1  # no diagnostic
+    merged["new"] = []  # error: [invalid-assignment]
+    a | mapping  # error: [unsupported-operator]
+    reveal_type(a | reflected)  # revealed: bytes
+```
+
+A required right-hand field replaces the old value. An optional field preserves both possible values
+and cannot establish a missing required key.
+
+```py
+class Text(TypedDict, closed=True):
+    a: str
+
+class MaybeText(TypedDict, closed=True):
+    a: NotRequired[str]
+
+class Either(TypedDict, closed=True):
+    a: int | str
+
+class Empty(TypedDict, closed=True): ...
+
+def overwrite(a: A, text: Text, maybe: MaybeText, empty: Empty):
+    reveal_type(a | maybe)  # revealed: dict[str, int | str]
+    reveal_type(empty | text)  # revealed: dict[str, str]
+    replaced: Text = a | text  # no diagnostic
+    # error: [invalid-argument-type]
+    wrong_order: Text = text | a
+    preserved: Either = a | maybe  # no diagnostic
+    # error: [invalid-argument-type]
+    possibly_old: Text = a | maybe
+    # error: [missing-typed-dict-key]
+    possibly_missing: Text = empty | maybe
+```
+
+Open operands can contain hidden fields. A hidden right-hand field can overwrite a known left-hand
+field, and hidden left-hand fields survive the copy.
+
+```py
+class OpenB(TypedDict):
+    b: str
+
+class OpenAB(TypedDict, extra_items=ReadOnly[object]):
+    a: int
+    b: str
+
+def same(a: OpenB, b: OpenB) -> OpenB:
+    same: OpenB = a | b  # no diagnostic
+    updated: OpenB = a | {"b": "updated"}  # no diagnostic
+    return same
+
+def hidden(a: A, b: OpenB):
+    reveal_type(a | b)  # revealed: dict[str, object]
+    # error: [invalid-argument-type]
+    # error: [invalid-typed-dict-key]
+    unsafe_override: AB = a | b
+    # error: [invalid-typed-dict-key]
+    hidden_left: AB = b | a
+    # error: [invalid-argument-type]
+    allowed_extra_keys: OpenAB = a | b
+```
+
+The outer dictionary is fresh, but nested mutable values remain shared.
+
+```py
+class Readonly(TypedDict, closed=True):
+    values: ReadOnly[list[int]]
+
+class Mutable(TypedDict, closed=True):
+    values: list[int]
+    b: str
+
+class Wider(TypedDict, closed=True):
+    values: list[int | str]
+    b: str
+
+def shallow(source: Readonly, b: B):
+    mutable: Mutable = source | b  # no diagnostic
+    fresh = source | b
+    fresh["other"] = [1]  # no diagnostic
+    # error: [invalid-argument-type]
+    widened: Wider = source | b
+```
+
+Explicit extra items contribute their declared value type, including gradual types.
+
+```py
+from typing import Any
+
+class Extra(TypedDict, extra_items=ReadOnly[bytes]):
+    b: str
+
+class Gradual(TypedDict, closed=True):
+    b: Any
+
+def extra_items(a: A, extra: Extra, gradual: Gradual):
+    reveal_type(a | extra)  # revealed: dict[str, int | bytes | str]
+    reveal_type(a | gradual)  # revealed: dict[str, int | Any]
+```
+
+Fresh literal values still receive contextual types for mutable containers and lambda parameters.
+
+```py
+from collections.abc import Callable
+
+class Config(TypedDict, closed=True):
+    values: list[object]
+
+class Callback(TypedDict, closed=True):
+    callback: Callable[[int], int]
+
+config: Config = {} | {"values": [1]}  # no diagnostic
+chain: Config = {"values": [1]} | {"values": [2]} | {"values": [3]}  # no diagnostic
+balanced: Config = ({} | {"values": [1]}) | ({} | {"values": [2]})  # no diagnostic
+callback: Callback = {} | {"callback": lambda value: reveal_type(value)}  # revealed: int
+```
+
+A dictionary literal on the right can supply fields missing from a `TypedDict` on the left. Fresh
+nested values receive the result schema's field types, and the combined result must satisfy the
+entire schema.
+
+```py
+from typing import overload
+
+class WithValues(TypedDict, closed=True):
+    a: int
+    values: list[object]
+
+@overload
+def consume_shape(value: WithValues) -> int: ...
+@overload
+def consume_shape(value: str) -> str: ...
+def consume_shape(value: WithValues | str) -> int | str:
+    return 1
+
+class Custom:
+    def keys(self) -> list[str]:
+        return []
+
+    def __getitem__(self, key: str) -> int:
+        return 0
+
+    def __or__(self, other: object) -> int:
+        return 1
+
+def literal_operand(a: A):
+    combined: AB = a | {"b": "value"}  # no diagnostic
+    contextual: WithValues = a | {"values": [1]}  # no diagnostic
+    reveal_type(consume_shape(a | {"values": [1]}))  # revealed: int
+    wrong: AB = a | {"a": "wrong", "b": "value"}  # error: [invalid-argument-type]
+    missing: ABC = a | {"b": "value"}  # error: [missing-typed-dict-key]
+    custom: AB = Custom() | {"a": 1, "b": "value"}  # error: [invalid-assignment]
+```
+
+Replacing a mutable field can require a different element type from the left operand. An empty
+literal receives the result schema's element type.
+
+```py
+class Integers(TypedDict, closed=True):
+    values: list[int]
+
+class Strings(TypedDict, closed=True):
+    values: list[str]
+
+def replace_values(source: Integers) -> Strings:
+    replaced: Strings = source | {"values": []}  # no diagnostic
+    reveal_type(replaced["values"])  # revealed: list[str]
+    wrong: Strings = source | {"values": [42]}  # error: [invalid-argument-type]
+    return replaced
+```
+
+## Copying observed dictionary contents
+
+A fresh dictionary can be checked against a `TypedDict` using the source's known entries and
+excluded keys. The source keeps its original mutable dictionary type.
+
+```py
+from typing_extensions import Never, NotRequired, TypedDict
+
+class Residual(TypedDict, extra_items=object):
+    name: NotRequired[Never]
+
+def consume(value: Residual) -> None: ...
+def forward(name: str, **kwargs: object):
+    consume({**kwargs})  # no diagnostic
+    consume(dict(kwargs))  # no diagnostic
+    # error: [invalid-argument-type]
+    consume(kwargs)
+    kwargs["name"] = "changed"
+    # error: [invalid-argument-type]
+    consume({**kwargs})
+```
+
+Required fields still need known entries. Copying does not copy nested mutable values or grant them
+a wider element type.
+
+```py
+class Field(TypedDict):
+    field: str
+
+class Nested(TypedDict):
+    values: list[object]
+
+def copies(values: list[int]):
+    source = {"field": "hello"}
+    copied: Field = dict(source)
+    reveal_type(copied)  # revealed: Field
+    empty = {}
+    # error: [missing-typed-dict-key]
+    missing: Field = dict(empty)
+    nested = {"values": values}
+    # error: [invalid-argument-type]
+    wider: Nested = dict(nested)
 ```
 
 ## Mixed positional and unpacked keyword constructors
@@ -3081,6 +3750,77 @@ def _(destination: Named, patch: AbsentCountPatch):
     destination.update(patch)
 ```
 
+## Updating a dictionary from a closed `TypedDict`
+
+A closed `TypedDict` contributes only its declared value types when consumed through a mapping
+protocol, including by `dict.update()`.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from collections.abc import Mapping
+from typing import Generic, TypeVar
+from typing_extensions import TypedDict
+
+T_co = TypeVar("T_co", covariant=True)
+
+class Descriptor(Generic[T_co]): ...
+
+class Closed(TypedDict, closed=True):
+    item: Descriptor[str]
+
+def accept[V: Descriptor[object]](values: Mapping[str, V]) -> None: ...
+def check(source: Closed, initial: Descriptor[bool]) -> None:
+    accept(source)  # no diagnostic
+    values = {"existing": initial}
+    values.update(source)
+    reveal_type(values)  # revealed: dict[str, Descriptor[str] | Descriptor[bool]]
+    accept(values)  # no diagnostic
+```
+
+Other values may enter through the source mapping or another mutable reference:
+
+```py
+class Open(TypedDict):
+    item: Descriptor[str]
+
+class Mixed(TypedDict, closed=True):
+    item: Descriptor[str]
+    other: int
+
+def reject(source: Closed, initial: Descriptor[bool], opened: Open, mixed: Mixed) -> None:
+    from_open = {"existing": initial}
+    from_open.update(opened)
+    accept(from_open)  # error: [invalid-argument-type]
+    from_mixed = {"existing": initial}
+    from_mixed.update(mixed)
+    accept(from_mixed)  # error: [invalid-argument-type]
+
+    exposed = {"existing": initial}
+    alias: dict[str, object] = exposed
+    alias["other"] = 42
+    exposed.update(source)
+    accept(exposed)  # error: [invalid-argument-type]
+```
+
+Calling `__getitem__` directly exposes the same value type as indexing. An empty closed schema has
+no readable values.
+
+```py
+def read(source: Closed, key: str) -> None:
+    # error: [invalid-typed-dict-key]
+    reveal_type(source[key])  # revealed: Descriptor[str]
+    reveal_type(source.__getitem__(key))  # revealed: Descriptor[str]
+
+class Empty(TypedDict, closed=True): ...
+
+def read_empty(source: Empty, key: str) -> None:
+    reveal_type(source.__getitem__(key))  # revealed: Never
+```
+
 ## Methods on `TypedDict`
 
 ```py
@@ -3125,6 +3865,7 @@ def _(p: Person) -> None:
     # `pop()` only works on non-required fields
     reveal_type(p.pop("extra"))  # revealed: str
     reveal_type(p.pop("extra", "fallback"))  # revealed: str
+    p.pop("extra", default="fallback")  # error: [no-matching-overload]
     # error: [invalid-argument-type] "Cannot pop required field 'name' from TypedDict `Person`"
     reveal_type(p.pop("name"))  # revealed: Unknown
 
@@ -3245,6 +3986,79 @@ class StrX(TypedDict):
 def _(u: IntX | StrX) -> None:
     # error: [invalid-argument-type]
     reveal_type(u.setdefault("x", 1))  # revealed: int | str
+```
+
+## `get()` with literal union keys
+
+Keys with the same value type and requiredness share a `get()` overload. A union of those keys
+therefore preserves their value type, including through a saved method reference. Read-only fields
+can share an overload with writable fields:
+
+```py
+from typing import Any, Literal
+from typing_extensions import NotRequired, ReadOnly, TypedDict
+
+class RequiredValues(TypedDict):
+    left: int
+    right: ReadOnly[int]
+    other: str
+
+def required(values: RequiredValues, key: Literal["left", "right"]) -> None:
+    reveal_type(values.get(key))  # revealed: int
+    reveal_type(values.get(key, "missing"))  # revealed: int
+    get = values.get
+    reveal_type(get(key))  # revealed: int
+    reveal_type(RequiredValues.get(values, key))  # revealed: int
+```
+
+For optional keys, empty container defaults receive the shared field type as context. An
+incompatible default remains part of the result:
+
+```py
+class OptionalValues(TypedDict):
+    deps: NotRequired[list[str]]
+    dev_deps: NotRequired[list[str]]
+    by_platform: NotRequired[dict[str, list[str]]]
+    dev_by_platform: ReadOnly[NotRequired[dict[str, list[str]]]]
+
+def optional(
+    values: OptionalValues,
+    key: Literal["deps", "dev_deps"],
+    platform_key: Literal["by_platform", "dev_by_platform"],
+    default: Any,
+) -> None:
+    reveal_type(values.get(key))  # revealed: list[str] | None
+    reveal_type(values.get(key, []))  # revealed: list[str]
+    reveal_type(values.get(platform_key, {}))  # revealed: dict[str, list[str]]
+    reveal_type(values.get(key, "missing"))  # revealed: list[str] | Literal["missing"]
+    reveal_type(values.get(key, default))  # revealed: Unknown
+    wrong: int = values.get(key, [])  # error: [invalid-assignment]
+```
+
+A key union that includes an undeclared key still uses the broad string fallback:
+
+```py
+def unknown_key(values: OptionalValues, key: Literal["deps", "missing"], broad: str) -> None:
+    reveal_type(values.get(key))  # revealed: Unknown | None
+    reveal_type(values.get(broad))  # revealed: Unknown | None
+```
+
+Keys with different value types or requiredness currently also use that fallback:
+
+```py
+class MixedValues(TypedDict):
+    required: int
+    optional: NotRequired[int]
+    text: str
+
+def mixed(
+    values: MixedValues,
+    presence: Literal["required", "optional"],
+    kinds: Literal["required", "text"],
+) -> None:
+    # TODO: These results should preserve the selected field types.
+    reveal_type(values.get(presence, "missing"))  # revealed: Unknown | Literal["missing"]
+    reveal_type(values.get(kinds))  # revealed: Unknown | None
 ```
 
 ## `get()` with literal union defaults
@@ -4282,6 +5096,133 @@ static_assert(is_assignable_to(Items[Any], Items[int]))
 static_assert(not is_subtype_of(Items[Any], Items[int]))
 ```
 
+### Inferring nested schemas
+
+Generic inference collects constraints from a `TypedDict` schema nested inside another generic
+argument, including read-only optional fields. The enclosing generic's variance still determines the
+direction of the schema relation.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Generic, NotRequired, TypeVar
+from typing_extensions import ReadOnly, TypedDict
+
+S_co = TypeVar("S_co", covariant=True)
+S_contra = TypeVar("S_contra", contravariant=True)
+S = TypeVar("S")
+
+class Read(Generic[S_co]): ...
+class Write(Generic[S_contra]): ...
+class Cell(Generic[S]): ...
+
+class Present(TypedDict):
+    item: ReadOnly[str]
+
+class Optional[T](TypedDict):
+    item: ReadOnly[NotRequired[T]]
+
+class Mutable[T](TypedDict):
+    item: T
+
+class Empty(TypedDict, closed=True): ...
+
+def read[T](value: Read[Optional[T]]) -> T | None: ...
+def write[T](value: Write[Optional[T]], item: T) -> None: ...
+def exchange[T](value: Cell[Mutable[T]], item: T) -> T:
+    raise NotImplementedError
+
+def check(
+    present: Read[Present],
+    optional: Read[Optional[str]],
+    empty: Read[Empty],
+    gradual: Read[Optional[Any]],
+    output: Write[Optional[str]],
+    cell: Cell[Mutable[str]],
+) -> None:
+    reveal_type(read(present))  # revealed: str | None
+    reveal_type(read(optional))  # revealed: str | None
+    reveal_type(read(empty))  # revealed: Unknown | None
+    reveal_type(read(gradual))  # revealed: Any | None
+    write(output, "text")
+    write(output, 42)  # error: [invalid-argument-type]
+    reveal_type(exchange(cell, "text"))  # revealed: str
+    exchange(cell, 42)  # error: [invalid-argument-type]
+    wrong: int | None = read(present)  # error: [invalid-assignment]
+```
+
+### Inferring mapping views
+
+A typed dictionary contributes its canonical mapping view when inferring generic arguments. Closed
+schemas preserve their value types, while implicitly open schemas include possible extra values.
+Mutable dictionary compatibility still requires the schema's ordinary write guarantees.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Generic, Mapping, NotRequired, TypeVar
+from typing_extensions import TypedDict
+
+class Environment(TypedDict, closed=True):
+    MODE: str
+
+class Mixed(TypedDict, closed=True):
+    name: str
+    count: int
+
+class Open(TypedDict):
+    MODE: str
+
+class Gradual(TypedDict, closed=True):
+    value: Any
+
+class Mutable(TypedDict, extra_items=int):
+    value: NotRequired[int]
+
+S = TypeVar("S")
+S_contra = TypeVar("S_contra", contravariant=True)
+
+class Cell(Generic[S]): ...
+class Write(Generic[S_contra]): ...
+
+def mapping[K, V](value: Mapping[K, V]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def bounded[K: str, V: str](value: Mapping[K, V]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def mutable[K, V](value: dict[K, V]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def invariant[K, V](value: Cell[Mapping[K, V]]) -> None: ...
+def contravariant[K, V](value: Write[Mapping[K, V]]) -> None: ...
+def check(
+    environment: Environment,
+    mixed: Mixed,
+    opened: Open,
+    gradual: Gradual,
+    writable: Mutable,
+    cell: Cell[Environment],
+    writer: Write[Environment],
+) -> None:
+    reveal_type(bounded(environment))  # revealed: tuple[str, str]
+    reveal_type(mapping(mixed))  # revealed: tuple[str, int | str]
+    reveal_type(mapping(opened))  # revealed: tuple[str, object]
+    reveal_type(mapping(gradual))  # revealed: tuple[str, Any]
+    reveal_type(mutable(writable))  # revealed: tuple[str, int]
+    wrong: tuple[str, int] = bounded(environment)  # error: [invalid-assignment]
+    bounded(mixed)  # error: [invalid-argument-type]
+    mutable(environment)  # error: [invalid-argument-type]
+    invariant(cell)  # error: [invalid-argument-type]
+    contravariant(writer)  # error: [invalid-argument-type]
+```
+
 ### Inherited methods
 
 Methods on a generic `TypedDict` subclass use the subclass's type arguments when checking the
@@ -4851,6 +5792,7 @@ def accepts_one(value: Literal[1]) -> None: ...
 
 box = Box(value=1, callback=accepts_one)
 reveal_type(box)  # revealed: Box[Literal[1]]
+Box(value=2, callback=accepts_one)  # error: [invalid-argument-type]
 ```
 
 ### Constructor inference with an expected type
@@ -4957,6 +5899,10 @@ error.
 # error: [invalid-assignment]
 animal_consumer: Consumer[Animal] = Consumer(
     callback=accepts_dog,
+)
+
+explicit_consumer = Consumer[Animal](
+    callback=accepts_dog,  # error: [invalid-argument-type]
 )
 ```
 
@@ -7730,6 +8676,46 @@ def test_nested_in(x: OuterWithBaz):
         reveal_type(x)  # revealed: (Foo & <TypedDict with items 'baz'>) | Baz
 ```
 
+## Traversing a recursive tagged union
+
+A comparison guard narrows the loop-carried value before a variant-specific field is read. An access
+that remains invalid after narrowing still reports an error.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Literal, TypedDict, assert_type
+
+class Leaf(TypedDict):
+    kind: Literal["leaf"]
+
+class Branch(TypedDict):
+    kind: Literal["branch"]
+    children: dict[str, "Node"]
+
+type Node = Leaf | Branch
+
+def traverse(initial: Node, keys: list[str]) -> Node:
+    node = initial
+    for key in keys:
+        if node["kind"] != "branch":
+            return node
+        assert_type(node, Branch)
+        node = node["children"][key]
+    assert_type(node, Node)
+    return node
+
+def invalid_traverse(node: Node, keys: list[str]) -> Node:
+    for key in keys:
+        if node["kind"] == "branch":
+            return node
+        node = node["children"][key]  # error: [invalid-typed-dict-key]
+    return node
+```
+
 ## Only annotated declarations are allowed in the class body
 
 <!-- snapshot-diagnostics -->
@@ -8787,6 +9773,7 @@ types and the default:
 def _(person: Person, key: str) -> None:
     reveal_type(person.get(key))  # revealed: int | str | None
     reveal_type(person.get(key, b"missing"))  # revealed: int | str | Literal[b"missing"]
+    reveal_type(person.get(key, False))  # revealed: int | str
 ```
 
 If every key in a union of string literals is absent, only the default can be returned:

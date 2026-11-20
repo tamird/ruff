@@ -1,0 +1,23 @@
+---
+source: crates/ty_python_semantic/src/types/ide_support.rs
+expression: "call_inputs(r#\"\nfrom typing import Any, Callable, overload\n\n@overload\ndef choose(value: int) -> int: ...\n@overload\ndef choose(value: str) -> str: ...\ndef choose(value): ...\ndef union() -> int | str: ...\ndef dynamic() -> Any: ...\ndef gradual() -> Callable[..., None]: ...\n\nchoose(dynamic())\nchoose(union())\ngradual()()\ndynamic()()\n\"#,)?"
+---
+[
+    Ok(
+        [
+            [
+                "Any <: int: false",
+                "Any <: str: false",
+            ],
+        ],
+    ),
+    Err(
+        Incomplete,
+    ),
+    Err(
+        Incomplete,
+    ),
+    Err(
+        Incomplete,
+    ),
+]

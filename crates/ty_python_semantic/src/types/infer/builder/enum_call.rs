@@ -763,7 +763,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             } else {
                 value
             };
-            last_int_value = value.as_int_like_literal();
+            last_int_value = value.as_int_like_literal(db, self.program_environment());
             members.push((name, value));
         }
         EnumMembersArgParseResult::Known(KnownEnumMembers {
@@ -808,7 +808,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             } else {
                 raw_value
             };
-            last_int_value = value.as_int_like_literal();
+            last_int_value = value.as_int_like_literal(db, env);
             members.push((name, value));
         }
         if has_opaque_keys {

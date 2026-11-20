@@ -28,6 +28,7 @@ use expression::Expression;
 use narrowing_constraints::ScopedNarrowingConstraint;
 pub use place::{PlaceExprRef, PlaceTable};
 pub use reachability_constraints::ReachabilityConstraintsBuilder;
+use reachability_constraints::ScopedReachabilityConstraintId;
 pub use scope::FileScopeId;
 use scope::{NodeWithScopeKey, NodeWithScopeRef, Scope, ScopeId, ScopeKind, ScopeLaziness};
 use symbol::ScopedSymbolId;
@@ -55,6 +56,8 @@ pub mod platform;
 pub mod predicate;
 pub mod rank;
 mod re_exports;
+mod source_exclusions;
+pub use source_exclusions::SourceExclusions;
 pub mod reachability_constraints;
 pub mod scope;
 pub mod statement;
@@ -62,13 +65,13 @@ pub mod static_dunder_all;
 pub mod symbol;
 pub mod unpack;
 mod use_def;
-pub use db::Db;
 #[cfg(any(test, feature = "testing"))]
 pub use db::TestProgramDb;
+pub use db::{Db, ProvidedAnnotation};
 pub mod program;
 pub mod program_file;
 pub use program::Program;
-pub use program_file::ProgramFile;
+pub use program_file::{ProgramFile, ProgramFileKind};
 
 /// Returns the semantic index for `file`.
 ///
@@ -145,7 +148,22 @@ pub fn use_def_map<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> Arc<UseDefMap<'
 /// in the scope's [`UseDefMap`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, get_size2::GetSize)]
 pub struct LoopHeader {
-    bindings: FxHashMap<ScopedPlaceId, SmallVec<[LiveBinding; 1]>>,
+    bindings: FxHashMap<ScopedPlaceId, LoopBindings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, get_size2::GetSize)]
+struct LoopBindings {
+    generated: SmallVec<[LiveBinding; 1]>,
+    incoming: ScopedReachabilityConstraintId,
+}
+
+impl Default for LoopBindings {
+    fn default() -> Self {
+        Self {
+            generated: SmallVec::new(),
+            incoming: ScopedReachabilityConstraintId::ALWAYS_FALSE,
+        }
+    }
 }
 
 impl LoopHeader {
@@ -156,16 +174,53 @@ impl LoopHeader {
     }
 
     fn add_binding(&mut self, place: ScopedPlaceId, binding: LiveBinding) {
-        self.bindings.entry(place).or_default().push(binding);
+        let Self { bindings } = self;
+        let LoopBindings {
+            generated,
+            incoming: _,
+        } = bindings.entry(place).or_default();
+        generated.push(binding);
+    }
+
+    fn set_incoming(&mut self, place: ScopedPlaceId, incoming: ScopedReachabilityConstraintId) {
+        let Self { bindings } = self;
+        let LoopBindings {
+            generated: _,
+            incoming: current,
+        } = bindings.entry(place).or_default();
+        *current = incoming;
+    }
+
+    /// Conditions under which this iteration preserves the place's incoming value.
+    ///
+    /// This is the surviving synthesized header binding, separate from the generated bindings
+    /// used by ordinary loop inference. Its predicates describe one iteration's transfer.
+    pub fn incoming_for_place(
+        &self,
+        place: ScopedPlaceId,
+    ) -> Option<ScopedReachabilityConstraintId> {
+        let Self { bindings } = self;
+        bindings.get(&place).map(
+            |LoopBindings {
+                 generated: _,
+                 incoming,
+             }| *incoming,
+        )
     }
 
     pub fn bindings_for_place(
         &self,
         place: ScopedPlaceId,
     ) -> impl Iterator<Item = LiveBinding> + '_ {
-        self.bindings
+        let Self { bindings } = self;
+        bindings
             .get(&place)
-            .map(|v: &SmallVec<[LiveBinding; 1]>| v.iter().copied())
+            .map(
+                |LoopBindings {
+                     generated,
+                     incoming: _,
+                 }| generated.iter().copied(),
+            )
             .into_iter()
             .flatten()
     }
@@ -282,9 +337,38 @@ impl<'db> DefinitionsByNode<'db> {
     }
 }
 
+fn captured_binding_scope<'a, 'scopes>(
+    ancestors: impl Iterator<Item = (FileScopeId, &'scopes Scope)>,
+    resolution: definition::CaptureResolution,
+    symbol_at: impl Fn(FileScopeId) -> Option<&'a symbol::Symbol>,
+) -> Option<FileScopeId> {
+    if resolution == definition::CaptureResolution::ClassLocalFallback {
+        let global = FileScopeId::global();
+        return symbol_at(global)
+            .is_some_and(symbol::Symbol::is_local)
+            .then_some(global);
+    }
+    for (scope, _) in ancestors {
+        let Some(symbol) = symbol_at(scope) else {
+            continue;
+        };
+        if symbol.is_global() {
+            let global = FileScopeId::global();
+            return symbol_at(global)
+                .is_some_and(symbol::Symbol::is_local)
+                .then_some(global);
+        }
+        if symbol.is_local() {
+            return Some(scope);
+        }
+    }
+    None
+}
+
 /// The place tables and use-def maps for all scopes in a file.
 #[derive(Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub struct SemanticIndex<'db> {
+    source_exclusions: SourceExclusions,
     /// List of all place tables in this file, indexed by scope.
     place_tables: FrozenIndexVec<FileScopeId, Arc<PlaceTable>>,
 
@@ -293,6 +377,9 @@ pub struct SemanticIndex<'db> {
 
     /// Map from a node creating a definition to its definition.
     definitions_by_node: DefinitionsByNode<'db>,
+
+    /// Aliases in a separate annotation namespace. Absent in ordinary Python files.
+    type_only_aliases: Option<Box<FrozenMap<(FileScopeId, ScopedSymbolId), Definition<'db>>>>,
 
     /// Map from a standalone expression to its [`Expression`] ingredient.
     expressions_by_node: FxHashMap<ExpressionNodeKey, Expression<'db>>,
@@ -377,6 +464,28 @@ impl<'db> SemanticIndex<'db> {
     /// Returns the [`PlaceUse`](ast_ids::PlaceUse) for an expression that reads an indexed place.
     pub fn expression_place_use(&self, expr: ast::ExprRef<'_>) -> Option<ast_ids::PlaceUse> {
         self.ast_ids.place_use(expr)
+    }
+
+    /// Iterates over indexed place-expression uses in this file.
+    ///
+    /// `module` must be from the same revision as this index. Synthetic function-identifier
+    /// reads used to collect overloads are omitted. Real deletion and augmented-assignment
+    /// reads are included regardless of the expression's AST context.
+    pub fn expression_uses<'ast>(
+        &'ast self,
+        module: &'ast ParsedModuleRef,
+    ) -> impl Iterator<Item = (FileScopeId, ast::ExprRef<'ast>, ast_ids::ScopedUseId)> + 'ast {
+        self.ast_ids
+            .uses()
+            .filter_map(|(node, use_id)| match module.get_by_index(node) {
+                ast::AnyRootNodeRef::Expr(expression) => Some((
+                    self.expression_scope_id(expression),
+                    expression.into(),
+                    use_id,
+                )),
+                ast::AnyRootNodeRef::Identifier(_) => None,
+                _ => unreachable!("place uses have expression or identifier keys"),
+            })
     }
 
     /// Returns the place table for a specific scope.
@@ -682,6 +791,24 @@ impl<'db> SemanticIndex<'db> {
         self.ancestor_scopes(scope).visible()
     }
 
+    /// Resolve a nested reference against the completed lexical bindings, including explicit
+    /// global forwarding and the visibility of class scopes.
+    pub fn captured_binding_scope(
+        &self,
+        nested_scope: FileScopeId,
+        name: &str,
+        resolution: definition::CaptureResolution,
+    ) -> Option<FileScopeId> {
+        captured_binding_scope(
+            self.visible_ancestor_scopes(nested_scope),
+            resolution,
+            |scope| {
+                let table = self.place_table(scope);
+                table.symbol_id(name).map(|symbol| table.symbol(symbol))
+            },
+        )
+    }
+
     /// Returns the [`definition::Definition`] salsa ingredient(s) for `definition_key`.
     ///
     /// There will only ever be >1 `Definition` associated with a `definition_key`
@@ -691,6 +818,24 @@ impl<'db> SemanticIndex<'db> {
         self.definitions_by_node
             .get(definition_key.into())
             .expect("definition should be present in the semantic index")
+    }
+
+    /// Whether this canonical source subtree is opaque to semantic analysis.
+    pub fn is_excluded(&self, range: TextRange) -> bool {
+        self.source_exclusions.contains(range)
+    }
+
+    /// Returns the bindings of an application-defined expression statement.
+    /// `Some([])` means that the statement is supplied but does not bind any names.
+    pub fn provided_statement_definitions(
+        &self,
+        statement: &ast::Stmt,
+    ) -> Option<&[Definition<'db>]> {
+        if !matches!(statement, ast::Stmt::Expr(_)) {
+            return None;
+        }
+        self.definitions_by_node
+            .get(DefinitionNodeKey::from_node_ref(statement.into()))
     }
 
     /// Returns the [`definition::Definition`] salsa ingredient(s) for `definition_node`, if any.
@@ -736,6 +881,13 @@ impl<'db> SemanticIndex<'db> {
             .single
             .get(&definition_key.into())
             .copied()
+    }
+
+    /// Resolves an alias in the annotation namespace of `scope`.
+    pub fn type_only_alias(&self, scope: FileScopeId, name: &str) -> Option<Definition<'db>> {
+        let aliases = self.type_only_aliases.as_deref()?;
+        let symbol = self.place_table(scope).symbol_id(name)?;
+        aliases.get(&(scope, symbol)).copied()
     }
 
     /// Returns the [`Expression`] ingredient for an expression node.
@@ -1611,7 +1763,7 @@ def f(a: str, /, b: str, c: int = 1, *args, d: int = 2, **kwargs):
                 assert!(!used);
                 let place = definition.place(&db);
                 reference.add_place(place);
-                let category = definition.kind(&db).category(false, &module);
+                let category = definition.category(&db, &module);
                 if category.is_declaration() {
                     reference.record_combined_definition(place, definition, category);
                 } else {

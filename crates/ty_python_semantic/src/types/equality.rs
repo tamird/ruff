@@ -334,21 +334,19 @@ impl<'db> ContainerElementEqualityEvaluator<'db> {
         if !truthiness.is_ambiguous() {
             return Ok(truthiness);
         }
-
+        let env = &self.evaluator.env;
         let Some(result) = Type::try_call_rich_comparison_dunder(
             db,
-            &self.evaluator.env,
+            env,
             left,
             right,
-            "__eq__",
-            "__eq__",
+            ("__eq__", "__eq__"),
             MemberLookupPolicy::default(),
         ) else {
-            return Ok(Truthiness::Ambiguous);
+            return Ok(truthiness);
         };
-
         // Identity can turn a false equality result true, but cannot turn a true result false.
-        Ok(match result.try_bool(db, &self.evaluator.env)? {
+        Ok(match result.try_bool(db, env)? {
             Truthiness::AlwaysTrue => Truthiness::AlwaysTrue,
             // If equality cannot return, shared identity is the only completing path.
             Truthiness::Uninhabited => Truthiness::AlwaysTrue,
@@ -964,7 +962,7 @@ fn all_values_compare_equal<'db>(
 ///
 /// This includes `int`, `bool`, `str`, and `bytes` literals, along with `bool` itself because its
 /// only possible values are `Literal[True]` and `Literal[False]`.
-fn is_builtin_literal_type(db: &dyn Db, ty: Type) -> bool {
+pub(super) fn is_builtin_literal_type(db: &dyn Db, ty: Type) -> bool {
     match ty.resolve_type_alias(db) {
         Type::LiteralValue(literal) => matches!(
             literal.kind(),
@@ -1009,6 +1007,11 @@ fn builtin_literal_constraint<'db>(
     let Type::LiteralValue(right) = right.resolve_type_alias(db) else {
         return None;
     };
+    // Numeric literal constraints assume that bool and int share equality semantics. Without
+    // that ancestry, let the ordinary evaluator establish which finite alternatives can narrow.
+    if (right.is_int() || right.is_bool()) && !KnownClass::bool_is_subclass_of_int(db, env) {
+        return None;
+    }
 
     let equal_to_right =
         builtin_literals_equal_to(db, env, Type::LiteralValue(right), right.kind())?;
@@ -1894,6 +1897,7 @@ enum KnownComparisonSemantics {
     Str,
     Bytes,
     Tuple,
+    List,
     Dict,
 }
 
@@ -2005,7 +2009,10 @@ impl KnownComparisonSemantics {
         operator: ComparisonOperator,
     ) -> Option<Self> {
         match literal {
-            LiteralValueTypeKind::Int(_) | LiteralValueTypeKind::Bool(_) => Some(Self::Int),
+            LiteralValueTypeKind::Int(_) => Some(Self::Int),
+            LiteralValueTypeKind::Bool(_) => {
+                KnownClass::bool_is_subclass_of_int(db, env).then_some(Self::Int)
+            }
             LiteralValueTypeKind::String(_) | LiteralValueTypeKind::LiteralString => {
                 Some(Self::Str)
             }
@@ -2049,15 +2056,15 @@ fn class_comparison_semantics<'db>(
     if dunder.place.is_undefined() {
         if operator == ComparisonOperator::Inequality {
             let equality = lookup_dunder(db, env, class, "__eq__")?;
-            // `tuple.__ne__` delegates to its builtin equality implementation.
-            let tuple_equality = lookup_dunder(
-                db,
-                env,
-                KnownClass::Tuple.to_class_literal(db, env),
-                "__eq__",
-            )?;
-            if same_member_implementation(db, equality, tuple_equality) {
-                return Some(KnownComparisonSemantics::Tuple);
+            // List and tuple inequality delegate to their builtin equality implementations.
+            for (known_class, semantics) in [
+                (KnownClass::Tuple, KnownComparisonSemantics::Tuple),
+                (KnownClass::List, KnownComparisonSemantics::List),
+            ] {
+                let known_equality = lookup_dunder(db, env, known_class.to_class_literal(db, env), "__eq__")?;
+                if !equality.place.is_undefined() && same_member_implementation(db, equality, known_equality) {
+                    return Some(semantics);
+                }
             }
             if !equality.place.is_undefined() {
                 return None;
@@ -2071,6 +2078,7 @@ fn class_comparison_semantics<'db>(
         (KnownClass::Str, KnownComparisonSemantics::Str),
         (KnownClass::Bytes, KnownComparisonSemantics::Bytes),
         (KnownClass::Tuple, KnownComparisonSemantics::Tuple),
+        (KnownClass::List, KnownComparisonSemantics::List),
         (KnownClass::Dict, KnownComparisonSemantics::Dict),
     ] {
         if same_member_implementation(
@@ -2206,7 +2214,8 @@ fn known_literal_equality<'db>(
         }
         (LiteralValueTypeKind::Int(left), LiteralValueTypeKind::Bool(right))
         | (LiteralValueTypeKind::Bool(right), LiteralValueTypeKind::Int(left)) => {
-            Some(left.as_i64() == i64::from(right))
+            KnownClass::bool_is_subclass_of_int(db, env)
+                .then_some(left.as_i64() == i64::from(right))
         }
         (LiteralValueTypeKind::String(left), LiteralValueTypeKind::String(right)) => {
             Some(left.value(db) == right.value(db))

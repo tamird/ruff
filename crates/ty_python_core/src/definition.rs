@@ -6,12 +6,13 @@ use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::find_node::covering_node;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::traversal::suite;
-use ruff_python_ast::{self as ast, AnyNodeRef, Expr};
+use ruff_python_ast::{self as ast, AnyNodeRef, Expr, HasNodeIndex, NodeIndex};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use smallvec::SmallVec;
 
 use crate::LoopHeaderId;
 use crate::ProgramFile;
+use crate::ProvidedAnnotation;
 use crate::ast_node_ref::AstNodeRef;
 use crate::member::ScopedMemberId;
 use crate::node_key::NodeKey;
@@ -62,6 +63,50 @@ pub struct Definition<'db> {
 impl get_size2::GetSize for Definition<'_> {}
 
 impl<'db> Definition<'db> {
+    /// Returns whether this definition binds a value, declares a type, or does both.
+    pub fn category(self, db: &'db dyn Db, module: &ParsedModuleRef) -> DefinitionCategory {
+        let kind = self.kind(db);
+        let annotation_owner = match kind {
+            DefinitionKind::Parameter(parameter) => Some(match parameter {
+                ParameterDefinitionNodeKind::Parameter(parameter) => {
+                    parameter.node(module).parameter.node_index().load()
+                }
+                ParameterDefinitionNodeKind::VariadicPositionalParameter(parameter) => {
+                    parameter.node(module).node_index().load()
+                }
+                ParameterDefinitionNodeKind::VariadicKeywordParameter(parameter) => {
+                    parameter.node(module).node_index().load()
+                }
+            }),
+            DefinitionKind::Assignment(assignment) => {
+                if assignment.unpack().is_none() {
+                    assignment
+                        .target(module)
+                        .as_name_expr()
+                        .map(|target| target.node_index().load())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(owner) = annotation_owner
+            && let Some(annotation) = db.provided_annotation(self.program_file(db), owner)
+            && !matches!(
+                (kind, annotation),
+                (
+                    DefinitionKind::Parameter(_),
+                    ProvidedAnnotation::External { file: _, owner: _ }
+                )
+            )
+        {
+            return DefinitionCategory::DeclarationAndBinding;
+        }
+        // External parameter contracts describe entry values. The ordinary category
+        // still preserves any annotation written on the parameter itself.
+        kind.category(self.program_file(db).is_stub(db), module)
+    }
+
     pub(crate) fn new(
         db: &'db dyn Db,
         scope_id: ScopeId<'db>,
@@ -526,7 +571,7 @@ pub(crate) struct ImportFromSubmoduleDefinitionNodeRef<'ast> {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct AssignmentDefinitionNodeRef<'ast, 'db> {
     pub(crate) unpack: Option<Unpack<'db>>,
-    pub(crate) value: &'ast ast::Expr,
+    pub(crate) node: &'ast ast::StmtAssign,
     pub(crate) target: &'ast ast::Expr,
     pub(crate) owner: BindingsOwner,
 }
@@ -538,9 +583,27 @@ pub(crate) struct AnnotatedAssignmentDefinitionNodeRef<'ast> {
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct DictKeyAssignmentNodeRef<'ast, 'db> {
-    pub(crate) key: &'ast ast::Expr,
+    pub(crate) key: DictKeyAssignmentKeyRef<'ast>,
     pub(crate) value: &'ast ast::Expr,
     pub(crate) assignment: Definition<'db>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum DictKeyAssignmentKeyRef<'ast> {
+    Expression(&'ast ast::Expr),
+    Keyword {
+        name: &'ast ast::Identifier,
+        call: &'ast ast::ExprCall,
+    },
+}
+
+impl<'ast> DictKeyAssignmentKeyRef<'ast> {
+    fn node(self) -> AnyNodeRef<'ast> {
+        match self {
+            Self::Expression(key) => key.into(),
+            Self::Keyword { name, call: _ } => name.into(),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -698,12 +761,12 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
             }
             DefinitionNodeRef::Assignment(AssignmentDefinitionNodeRef {
                 unpack,
-                value,
+                node,
                 target,
                 owner,
             }) => DefinitionKind::Assignment(AssignmentDefinitionKind {
                 unpack,
-                value: AstNodeRef::new(parsed, value),
+                node: AstNodeRef::new(parsed, node),
                 target: AstNodeRef::new(parsed, target),
                 owner,
             }),
@@ -721,7 +784,17 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
                 value,
                 assignment,
             }) => DefinitionKind::DictKeyAssignment(DictKeyAssignmentKind {
-                key: AstNodeRef::new(parsed, key),
+                key: match key {
+                    DictKeyAssignmentKeyRef::Expression(key) => {
+                        DictKeyAssignmentKey::Expression(AstNodeRef::new(parsed, key))
+                    }
+                    DictKeyAssignmentKeyRef::Keyword { name, call } => {
+                        DictKeyAssignmentKey::Keyword {
+                            name: AstNodeRef::new(parsed, name),
+                            call: AstNodeRef::new(parsed, call),
+                        }
+                    }
+                },
                 value: AstNodeRef::new(parsed, value),
                 assignment,
             }),
@@ -847,14 +920,14 @@ impl<'db> DefinitionNodeRef<'_, 'db> {
             Self::TypeAlias(node) => node.into(),
             Self::NamedExpression(node) => node.into(),
             Self::Assignment(AssignmentDefinitionNodeRef {
-                value: _,
+                node: _,
                 unpack: _,
                 target,
                 owner: _,
             }) => DefinitionNodeKey(NodeKey::from_node(target)),
             Self::AnnotatedAssignment(ann_assign) => ann_assign.node.into(),
             Self::AugmentedAssignment(node) => node.into(),
-            Self::DictKeyAssignment(node) => DefinitionNodeKey(NodeKey::from_node(node.key)),
+            Self::DictKeyAssignment(node) => DefinitionNodeKey(NodeKey::from_node(node.key.node())),
             Self::For(ForStmtDefinitionNodeRef {
                 target,
                 node: _,
@@ -932,6 +1005,7 @@ impl DefinitionCategory {
 /// for an in-depth explanation of why this is necessary.
 #[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub enum DefinitionKind<'db> {
+    ProvidedBinding(Box<ProvidedBindingDefinitionKind>),
     Import(ImportDefinitionKind),
     ImportFrom(ImportFromDefinitionKind),
     ImportFromSubmodule(ImportFromSubmoduleDefinitionKind),
@@ -944,6 +1018,8 @@ pub enum DefinitionKind<'db> {
     AnnotatedAssignment(AnnotatedAssignmentDefinitionKind),
     AugmentedAssignment(AstNodeRef<ast::StmtAugAssign>),
     DictKeyAssignment(DictKeyAssignmentKind<'db>),
+    /// An internal transfer of a mapping's contents, with the ordinary value definition retained.
+    DictionaryContents(Box<DictionaryContentsDefinitionKind<'db>>),
     For(ForStmtDefinitionKind<'db>),
     Comprehension(ComprehensionDefinitionKind<'db>),
     Parameter(ParameterDefinitionNodeKind),
@@ -986,7 +1062,8 @@ impl<'db> DefinitionKind<'db> {
     pub fn is_import(&self) -> bool {
         matches!(
             self,
-            DefinitionKind::Import(_)
+            DefinitionKind::ProvidedBinding(_)
+                | DefinitionKind::Import(_)
                 | DefinitionKind::ImportFrom(_)
                 | DefinitionKind::StarImport(_)
                 | DefinitionKind::ImportFromSubmodule(_)
@@ -1016,12 +1093,18 @@ impl<'db> DefinitionKind<'db> {
         matches!(self, DefinitionKind::LoopHeader(_))
     }
 
+    pub const fn is_dictionary_contents(&self) -> bool {
+        matches!(self, DefinitionKind::DictionaryContents(_))
+    }
+
     /// Returns `true` if this definition is user-visible (i.e., not an internal
     /// synthetic definition like a loop header or nested bindings definition).
     pub const fn is_user_visible(&self) -> bool {
         !matches!(
             self,
-            DefinitionKind::LoopHeader(_) | DefinitionKind::NestedBindings(_)
+            DefinitionKind::LoopHeader(_)
+                | DefinitionKind::NestedBindings(_)
+                | DefinitionKind::DictionaryContents(_)
         )
     }
 
@@ -1031,6 +1114,8 @@ impl<'db> DefinitionKind<'db> {
     /// [`ast::ExprName`], [`ast::Identifier`], [`ast::ExprAttribute`] or [`ast::ExprSubscript`] but could also be other nodes.
     pub fn target_range(&self, module: &ParsedModuleRef) -> TextRange {
         match self {
+            DefinitionKind::DictionaryContents(contents) => contents.range(module),
+            DefinitionKind::ProvidedBinding(binding) => binding.binding.range,
             DefinitionKind::Import(import) => import.alias(module).range(),
             DefinitionKind::ImportFrom(import) => import.alias(module).range(),
             DefinitionKind::ImportFromSubmodule(import) => import.target_range(module),
@@ -1045,7 +1130,7 @@ impl<'db> DefinitionKind<'db> {
                 aug_assign.node(module).target.range()
             }
             DefinitionKind::DictKeyAssignment(dict_key_assignment) => {
-                dict_key_assignment.key.node(module).range()
+                dict_key_assignment.key(module).range()
             }
             DefinitionKind::For(for_stmt) => for_stmt.target(module).range(),
             DefinitionKind::Comprehension(comp) => comp.target(module).range(),
@@ -1081,6 +1166,8 @@ impl<'db> DefinitionKind<'db> {
     /// Returns the [`TextRange`] of the entire definition.
     pub fn full_range(&self, module: &ParsedModuleRef) -> TextRange {
         match self {
+            DefinitionKind::DictionaryContents(contents) => contents.range(module),
+            DefinitionKind::ProvidedBinding(binding) => binding.statement.node(module).range(),
             DefinitionKind::Import(import) => import.alias(module).range(),
             DefinitionKind::ImportFrom(import) => import.alias(module).range(),
             DefinitionKind::ImportFromSubmodule(import) => import.module(module).range(),
@@ -1106,7 +1193,7 @@ impl<'db> DefinitionKind<'db> {
             }
             DefinitionKind::AugmentedAssignment(aug_assign) => aug_assign.node(module).range(),
             DefinitionKind::DictKeyAssignment(dict_key_assignment) => {
-                dict_key_assignment.key.node(module).range()
+                dict_key_assignment.key(module).range()
             }
             DefinitionKind::For(for_stmt) => for_stmt.target(module).range(),
             DefinitionKind::Comprehension(comp) => comp.target(module).range(),
@@ -1133,7 +1220,7 @@ impl<'db> DefinitionKind<'db> {
         }
     }
 
-    pub fn category(&self, in_stub: bool, module: &ParsedModuleRef) -> DefinitionCategory {
+    fn category(&self, in_stub: bool, module: &ParsedModuleRef) -> DefinitionCategory {
         match self {
             // Functions and classes always bind, and we consider them declarations.
             DefinitionKind::Function(_)
@@ -1157,7 +1244,9 @@ impl<'db> DefinitionKind<'db> {
                 }
             }
             // all of these bind values without declaring a type
-            DefinitionKind::DictKeyAssignment(_)
+            DefinitionKind::ProvidedBinding(_)
+            | DefinitionKind::DictKeyAssignment(_)
+            | DefinitionKind::DictionaryContents(_)
             | DefinitionKind::NamedExpression(_)
             | DefinitionKind::Assignment(_)
             | DefinitionKind::AugmentedAssignment(_)
@@ -1185,6 +1274,38 @@ impl<'db> DefinitionKind<'db> {
             DefinitionKind::AnnotatedAssignment(assignment) => assignment.value(module),
             _ => None,
         }
+    }
+}
+
+/// An expression statement whose bindings are supplied by an embedding application.
+///
+/// The application owns validation of this statement's syntax. The statement and targets must
+/// belong to the current parsed module; their indices cannot be reused across source revisions.
+/// An empty binding list still replaces ordinary expression-statement inference.
+#[derive(Clone, Debug)]
+pub struct ProvidedStatement {
+    pub statement: NodeIndex,
+    pub bindings: Box<[ProvidedBinding]>,
+}
+
+/// A name introduced by a supplied statement, anchored to its original source target.
+#[derive(Clone, Debug, get_size2::GetSize)]
+pub struct ProvidedBinding {
+    pub target: NodeIndex,
+    pub name: Name,
+    /// The identifier's range within the target node, excluding surrounding syntax.
+    pub range: TextRange,
+}
+
+#[derive(Clone, Debug, get_size2::GetSize)]
+pub struct ProvidedBindingDefinitionKind {
+    pub(crate) statement: AstNodeRef<ast::StmtExpr>,
+    pub binding: ProvidedBinding,
+}
+
+impl ProvidedBindingDefinitionKind {
+    pub fn statement<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::StmtExpr {
+        self.statement.node(module)
     }
 }
 
@@ -1467,6 +1588,110 @@ impl ImportFromSubmoduleDefinitionKind {
     }
 }
 
+/// A source-ordered operation on a mapping receiver.
+///
+/// These definitions belong to the receiver's internal contents place. They are retrieved from
+/// reaching bindings, not from the ordinary AST definition table. Value inference continues to
+/// use the original assignment or expression owner.
+#[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
+pub enum DictionaryContentsDefinitionKind<'db> {
+    /// A value assigned to the receiver, including parameters and nested literal values.
+    Initialize {
+        definition: Definition<'db>,
+        range: TextRange,
+    },
+    /// Only the persistent capture modifier from the previous iteration, not its old contents.
+    LoopCapture {
+        header: Definition<'db>,
+        range: TextRange,
+    },
+    Operation {
+        receiver: AstNodeRef<ast::Expr>,
+        effect: DictionaryContentsEffect<'db>,
+    },
+    /// Captures have no receiver expression in the enclosing scope. Lazy captures modify every
+    /// later object assigned to the binding; eager captures expose only its current value.
+    Capture {
+        nested_scope: FileScopeId,
+        name: Name,
+        range: TextRange,
+        execution: NestedBindingExecution,
+        resolution: CaptureResolution,
+    },
+}
+
+impl DictionaryContentsDefinitionKind<'_> {
+    fn range(&self, module: &ParsedModuleRef) -> TextRange {
+        match self {
+            Self::Initialize {
+                definition: _,
+                range,
+            } => *range,
+            Self::LoopCapture { header: _, range } => *range,
+            Self::Operation {
+                receiver,
+                effect: _,
+            } => receiver.node(module).range(),
+            Self::Capture {
+                nested_scope: _,
+                name: _,
+                range,
+                execution: _,
+                resolution: _,
+            } => *range,
+        }
+    }
+}
+
+/// Lexical capture resolution, including a class-local read before its first binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
+pub enum CaptureResolution {
+    Lexical,
+    ClassLocalFallback,
+}
+
+#[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
+pub enum DictionaryContentsInferenceOwner {
+    Expression(AstNodeRef<ast::Expr>),
+    Statement(AstNodeRef<ast::Stmt>),
+}
+
+#[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
+pub enum DictionaryContentsEffect<'db> {
+    AugmentItem(Definition<'db>),
+    /// A mutation whose result has no ordinary inference owner available.
+    UnknownMutation,
+    /// A subscript assignment. Computed keys need not have an ordinary scalar place definition.
+    SetItem {
+        subscript: AstNodeRef<ast::ExprSubscript>,
+        owner: Option<DictionaryContentsInferenceOwner>,
+    },
+    DeleteItem {
+        subscript: AstNodeRef<ast::ExprSubscript>,
+        owner: Option<DictionaryContentsInferenceOwner>,
+    },
+    /// Invocation can either transfer known mapping contents or expose the receiver.
+    Call {
+        call: AstNodeRef<ast::ExprCall>,
+        owner: Option<DictionaryContentsInferenceOwner>,
+        /// A nested or named argument can retain the mapping instead of copying its entries.
+        retained: bool,
+    },
+    /// Project an actual receiver's call onto a related contents place.
+    /// The original call owns builtin admission and semantic classification.
+    ProjectedCall(Definition<'db>),
+    /// An alias, stored value, return, or escaped bound method can outlive this evaluation.
+    Expose,
+}
+
+impl DictionaryContentsEffect<'_> {
+    /// A syntactic hint for builtin dictionary methods that take no arguments and preserve the
+    /// receiver's entries. Semantic consumers must independently establish builtin identity.
+    pub fn is_zero_argument_readonly_method(name: &str) -> bool {
+        matches!(name, "copy" | "keys" | "items" | "values")
+    }
+}
+
 /// The inference region that owns bindings created while evaluating an assignment's value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub enum BindingsOwner {
@@ -1479,7 +1704,7 @@ pub enum BindingsOwner {
 #[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub struct AssignmentDefinitionKind<'db> {
     unpack: Option<Unpack<'db>>,
-    value: AstNodeRef<ast::Expr>,
+    node: AstNodeRef<ast::StmtAssign>,
     target: AstNodeRef<ast::Expr>,
     owner: BindingsOwner,
 }
@@ -1489,8 +1714,19 @@ impl<'db> AssignmentDefinitionKind<'db> {
         self.unpack
     }
 
+    /// Whether this assignment binds one target without unpacking.
+    pub fn is_single_target(&self, module: &ParsedModuleRef) -> bool {
+        if self.unpack.is_some() {
+            return false;
+        }
+        let [target] = self.node.node(module).targets.as_slice() else {
+            return false;
+        };
+        NodeKey::from_node(target) == NodeKey::from_node_ref(&self.target)
+    }
+
     pub fn value<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::Expr {
-        self.value.node(module)
+        &self.node.node(module).value
     }
 
     pub fn target<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::Expr {
@@ -1533,14 +1769,24 @@ impl AnnotatedAssignmentDefinitionKind {
 
 #[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub struct DictKeyAssignmentKind<'db> {
-    key: AstNodeRef<ast::Expr>,
+    key: DictKeyAssignmentKey,
     value: AstNodeRef<ast::Expr>,
     assignment: Definition<'db>,
 }
 
 impl<'db> DictKeyAssignmentKind<'db> {
-    pub fn key<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::Expr {
-        self.key.node(module)
+    pub fn key<'ast>(&self, module: &'ast ParsedModuleRef) -> AnyNodeRef<'ast> {
+        match &self.key {
+            DictKeyAssignmentKey::Expression(key) => key.node(module).into(),
+            DictKeyAssignmentKey::Keyword { name, call: _ } => name.node(module).into(),
+        }
+    }
+
+    pub fn constructor(&self) -> Option<&AstNodeRef<ast::ExprCall>> {
+        match &self.key {
+            DictKeyAssignmentKey::Expression(_) => None,
+            DictKeyAssignmentKey::Keyword { name: _, call } => Some(call),
+        }
     }
 
     pub fn value<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::Expr {
@@ -1550,6 +1796,15 @@ impl<'db> DictKeyAssignmentKind<'db> {
     pub fn assignment(&self) -> Definition<'db> {
         self.assignment
     }
+}
+
+#[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
+enum DictKeyAssignmentKey {
+    Expression(AstNodeRef<ast::Expr>),
+    Keyword {
+        name: AstNodeRef<ast::Identifier>,
+        call: AstNodeRef<ast::ExprCall>,
+    },
 }
 
 #[derive(Clone, Debug, get_size2::GetSize, salsa::SalsaValue)]
@@ -1589,6 +1844,10 @@ pub struct ForStmtDefinitionKind<'db> {
 }
 
 impl<'db> ForStmtDefinitionKind<'db> {
+    pub fn node<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::StmtFor {
+        self.node.node(module)
+    }
+
     pub fn iterable<'ast>(&self, module: &'ast ParsedModuleRef) -> &'ast ast::Expr {
         &self.node.node(module).iter
     }
@@ -1648,6 +1907,18 @@ pub(crate) enum LoopStmtKind {
 }
 
 impl LoopHeaderDefinitionKind {
+    pub fn for_stmt<'ast>(&self, module: &'ast ParsedModuleRef) -> Option<&'ast ast::StmtFor> {
+        let Self {
+            loop_header_id: _,
+            loop_stmt,
+            place: _,
+        } = self;
+        match loop_stmt {
+            LoopStmtKind::For(stmt) => Some(stmt.node(module)),
+            LoopStmtKind::While(_) => None,
+        }
+    }
+
     pub fn loop_header_id(&self) -> LoopHeaderId {
         self.loop_header_id
     }
@@ -1759,6 +2030,9 @@ pub enum NestedBindingExecution {
 pub struct DefinitionNodeKey(NodeKey);
 
 impl DefinitionNodeKey {
+    pub(crate) fn from_root_node(node: ast::AnyRootNodeRef<'_>) -> Self {
+        Self(NodeKey::from_node(node))
+    }
     pub(crate) fn from_node_ref(node: ast::AnyNodeRef<'_>) -> Self {
         match node {
             ast::AnyNodeRef::ParameterWithDefault(parameter) => parameter.into(),
