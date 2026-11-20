@@ -35,6 +35,11 @@ rust_mdtest(
     name = "mdtest",
     deps = [":ty_python_semantic", "//crates/ty_test:ty_test"],
     data = glob(["resources/mdtest/**", "resources/lint_docs/**"]),
+    fixture_roots = {
+        "lint_doc": "resources/lint_docs",
+        "mdtest": "resources/mdtest",
+    },
+    suite_name = "mdtests",
 )
 
 
