@@ -201,3 +201,20 @@ def vars_namespace_mutation() -> None:
     for entry in entries:
         text(entry["name"])  # error: [invalid-argument-type]
 ```
+
+## Context from later uses
+
+### Invalid writes and aliases
+
+```py
+def consume(values: list[str]) -> None: ...
+def later() -> list[str]:
+    result = []
+    result.append(42)  # error: [invalid-argument-type]
+    consume(result)
+    return result
+
+def alias(values: list[str]) -> None:
+    saved = values
+    saved.append(42)  # error: [invalid-argument-type]
+```
