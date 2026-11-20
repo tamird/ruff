@@ -38,15 +38,15 @@ use super::{
 };
 use crate::diagnostic::format_enumeration;
 use crate::place::{
-    DefinedPlace, Definedness, LookupError, Place, PlaceAndQualifiers,
-    TypeOrigin, loop_header_reachability, module_type_implicit_global_declaration,
+    DefinedPlace, Definedness, LookupError, Place, PlaceAndQualifiers, TypeOrigin,
+    loop_header_reachability, module_type_implicit_global_declaration,
     module_type_implicit_global_symbol, place_from_bindings_assuming_boolean,
     place_from_bindings_with_reachability_cache, place_from_bindings_with_replacement,
     place_from_declarations_with_reachability_cache,
 };
 use crate::place_load::{
-    ImplicitPlaceLoad, PlaceLoadMode, PlaceLoadResolutionProcedure, PlaceLoadResolutionStep, PlaceLoadResolver, PlaceLoadSourceKind,
-    ResolvedPlaceLoadSource,
+    ImplicitPlaceLoad, PlaceLoadMode, PlaceLoadResolutionProcedure, PlaceLoadResolutionStep,
+    PlaceLoadResolver, PlaceLoadSourceKind, ResolvedPlaceLoadSource,
 };
 use crate::reachability::{
     BooleanIdentity, ReachabilityEvaluationCache, evaluate_reachability_with_cache,
@@ -116,8 +116,8 @@ use crate::types::infer::builder::named_tuple::NamedTupleKind;
 use crate::types::infer::builder::paramspec_validation::validate_paramspec_components;
 use crate::types::infer::{
     StatementInference, StatementInferenceInner, StatementInferenceInnerExtra, TruthinessAnalyzer,
-    TypeAndRange, TypeExpressionFlags, nearest_enclosing_class,
-    nearest_enclosing_function, original_class_type,
+    TypeAndRange, TypeExpressionFlags, nearest_enclosing_class, nearest_enclosing_function,
+    original_class_type,
 };
 use crate::types::iteration::{precise_iterable_element_type, refine_dict_snapshot_element_type};
 use crate::types::match_pattern::{ClassPatternPositionalResult, class_pattern_positional_result};
@@ -152,14 +152,14 @@ use crate::types::visitor::{TypeKind, TypeVisitor, walk_non_atomic_type};
 use crate::types::{
     BindingContext, BoundTypeVarInstance, CallDunderError, CallableBinding, CallableType,
     ClassType, DeclaredType, DictionaryItems, DynamicType, GeneratorTypeMode, InferenceFlags,
-    InternedConstraintSet, InternedType, IntersectionBuilder, KnownBoundMethodType, KnownClass, KnownInstanceType, KnownUnion, LiteralValueType,
-    LiteralValueTypeKind, MemberLookupPolicy, ParamSpecAttrKind, Parameter, Parameters,
-    ProgramEnvironment, PropertyDeprecations, SentinelInstance, Signature, SpecialFormType,
-    SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext, TypeQualifiers,
-    TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypingModule, UnionAccumulator,
-    UnionBuilder, UnionType, any_over_type, binding_type,
-    infer_complete_scope_types, infer_scope_types,
-    is_discarded_dict_key_assignment, todo_type,
+    InternedConstraintSet, InternedType, IntersectionBuilder, KnownBoundMethodType, KnownClass,
+    KnownInstanceType, KnownUnion, LiteralValueType, LiteralValueTypeKind, MemberLookupPolicy,
+    ParamSpecAttrKind, Parameter, Parameters, ProgramEnvironment, PropertyDeprecations,
+    SentinelInstance, Signature, SpecialFormType, SubclassOfType, Type, TypeAliasType,
+    TypeAndQualifiers, TypeContext, TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind,
+    TypeVarVariance, TypingModule, UnionAccumulator, UnionBuilder, UnionType, any_over_type,
+    binding_type, infer_complete_scope_types, infer_scope_types, is_discarded_dict_key_assignment,
+    todo_type,
 };
 use crate::{AnalysisSettings, Db, DisplaySettings, FxIndexSet, FxOrderSet, SemanticModel};
 use ty_python_core::ast_ids::PlaceUse;
@@ -1167,7 +1167,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             InferenceRegion::Scope(scope, _) if scope == expr_scope => {
                 self.type_expression_flags(expression)
             }
-            _ => infer_complete_scope_types(self.db(), expr_scope).type_expression_flags(expression),
+            _ => {
+                infer_complete_scope_types(self.db(), expr_scope).type_expression_flags(expression)
+            }
         }
     }
 
@@ -15220,9 +15222,7 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
             has_final_declaration,
         } = self;
         let env = builder.program_environment();
-        let declared_ty = type_context
-            .expected_type()
-            .unwrap_or_else(Type::unknown);
+        let declared_ty = type_context.expected_type().unwrap_or_else(Type::unknown);
 
         let db = builder.db();
         let file_scope_id = binding.file_scope(db);

@@ -35,10 +35,11 @@ use crate::types::typed_dict::{
 use crate::types::typevar::{BindingContext, TypeVarKind, TypeVarSet};
 use crate::types::{
     BoundTypeVarInstance, CallArguments, CallDunderError, CallableBinding, ClassType,
-    CycleDetector, DisplaySettings, DynamicType, InternedType, IntersectionType,
-    KnownClass, KnownInstanceType, LintDiagnosticGuard, MemberLookupPolicy, Parameter, Parameters,
+    CycleDetector, DisplaySettings, DynamicType, InternedType, IntersectionType, KnownClass,
+    KnownInstanceType, LintDiagnosticGuard, MemberLookupPolicy, Parameter, Parameters,
     SpecialFormType, StaticClassLiteral, Type, TypeAliasType, TypeContext, TypeMapping,
-    TypeVarBoundOrConstraints, UnionType, UnionTypeInstance, any_over_type, };
+    TypeVarBoundOrConstraints, UnionType, UnionTypeInstance, any_over_type,
+};
 use crate::{Db, FxOrderSet, ProgramEnvironment};
 use ty_python_core::definition::Definition;
 use ty_python_core::scope::FileScopeId;
@@ -1853,8 +1854,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // Use the checked argument types so fresh empty values retain the receiver's
             // context. Concrete union arms can constrain a self-referential write while the
             // other arm is still provisional. Nested provisional elements need more context.
-            let ast_arguments = [ArgOrKeyword::Arg(&target.slice), ArgOrKeyword::Arg(rhs_value)];
-            let mut call_arguments = CallArguments::positional([checked_slice_ty, inferred_value_ty]);
+            let ast_arguments = [
+                ArgOrKeyword::Arg(&target.slice),
+                ArgOrKeyword::Arg(rhs_value),
+            ];
+            let mut call_arguments =
+                CallArguments::positional([checked_slice_ty, inferred_value_ty]);
 
             if let Place::Defined(DefinedPlace {
                 ty: dunder_callable,

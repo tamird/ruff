@@ -975,8 +975,8 @@ pub(crate) fn has_bound_prefix<'db>(
             replacement: None,
         },
     )
-        .place
-        .is_undefined()
+    .place
+    .is_undefined()
 }
 
 /// Build a declared type from a [`DeclarationsIterator`].
