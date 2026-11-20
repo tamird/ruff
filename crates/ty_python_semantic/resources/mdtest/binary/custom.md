@@ -447,3 +447,191 @@ error[unsupported-operator]: Unsupported `+` operation
   | |     Has type `mod1.A`
   | Has type `mod2.A`
 ```
+
+## Generic operator result context
+
+Binary dunder calls use their expression's expected result type, just like explicit method calls.
+The context participates in cached resolution and is shared by normal and reflected dispatch.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+`tagged.pyi`:
+
+```pyi
+from typing import Generic, Literal, Mapping, Sequence, TypeVar
+
+V = TypeVar("V", covariant=True)
+K = TypeVar("K", covariant=True, default=object)
+L = TypeVar("L")
+R = TypeVar("R")
+
+class Tagged(Generic[V, K]):
+    def __add__(self: Tagged[Sequence[L], Literal["list"]], other: list[R] | tuple[R, ...], /) -> Tagged[list[L | R], K]: ...
+    def __radd__(self: Tagged[Sequence[L], Literal["list"]], other: list[R] | tuple[R, ...], /) -> Tagged[list[L | R], K]: ...
+
+def choose(values: Mapping[str, V]) -> Tagged[V, Literal["list"]]: ...
+```
+
+```py
+from typing import Any
+from tagged import Tagged, choose
+
+left = choose({"condition": ["a"], "default": [42]})
+normal: Tagged[list[str | int]] = left + []
+reveal_type(normal)  # revealed: Tagged[list[str | int], Literal["list"]]
+reflected: Tagged[list[str | int]] = [] + left
+reveal_type(reflected)  # revealed: Tagged[list[str | int], Literal["list"]]
+wrong: Tagged[list[str]] = normal  # error: [invalid-assignment]
+
+# Different contexts for the same operands must not reuse the first result.
+strings = choose({"condition": ["text"]})
+narrow: Tagged[list[str]] = strings + []
+broad: Tagged[list[str | int]] = strings + []
+reveal_type(narrow)  # revealed: Tagged[list[str], Literal["list"]]
+reveal_type(broad)  # revealed: Tagged[list[str | int], Literal["list"]]
+
+# The context does not override concrete argument evidence.
+bad: Tagged[list[str]] = strings + [42]  # error: [invalid-assignment]
+
+def check(gradual: list[Any]) -> None:
+    result: Tagged[list[str]] = strings + gradual
+    reveal_type(result)  # revealed: Tagged[list[str], Literal["list"]]
+    explicit: Tagged[list[str]] = strings.__add__(gradual)
+    reveal_type(explicit)  # revealed: Tagged[list[str], Literal["list"]]
+    reveal_type(strings + gradual)  # revealed: Tagged[list[str | Any], Literal["list"]]
+
+# An empty operand without result context remains unconstrained.
+reveal_type(strings + [])  # revealed: Tagged[list[str | Unknown], Literal["list"]]
+```
+
+## Result context with invariant operands
+
+Binary operators receive already inferred operand types. Contextual return inference must respect
+the operand's invariant element type, just as a direct method call with a prebound argument does.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Mapping
+
+class MappingValue[V]:
+    @property
+    def value(self) -> V:
+        raise NotImplementedError
+
+    def __or__[KL, L, KR, R](self: "MappingValue[Mapping[KL, L]]", other: dict[KR, R], /) -> "MappingValue[dict[KL | KR, L | R]]":
+        raise NotImplementedError
+
+def check(left: MappingValue[dict[str, int]], right: dict[str, str]) -> None:
+    combined: MappingValue[dict[str, int | str]] = left | right
+    direct: MappingValue[dict[str, int | str]] = left.__or__(right)
+    reveal_type(combined)  # revealed: MappingValue[dict[str, int | str]]
+    reveal_type(direct)  # revealed: MappingValue[dict[str, int | str]]
+    wrong: MappingValue[dict[str, int]] = left | right  # error: [invalid-assignment]
+```
+
+## Empty collection arguments
+
+Empty displays adopt an operator overload's element types as they do in an explicit method call.
+Preexisting gradual containers still leave the overload ambiguous.
+
+```py
+from typing import Any, overload
+from ty_extensions._internal import Unknown
+
+class Choice:
+    @overload
+    def __add__(self, other: list[str], /) -> str: ...
+    @overload
+    def __add__(self, other: list[int], /) -> int: ...
+    def __add__(self, other):
+        raise NotImplementedError
+
+    __radd__ = __add__
+
+    @overload
+    def __or__(self, other: dict[str, str], /) -> str: ...
+    @overload
+    def __or__(self, other: dict[str, int], /) -> int: ...
+    def __or__(self, other):
+        raise NotImplementedError
+
+    __ror__ = __or__
+
+def probe(choice: Choice, gradual: list[Any], unknown: list[Unknown]):
+    reveal_type(choice + [])  # revealed: str
+    reveal_type(choice.__add__([]))  # revealed: str
+    reveal_type([] + choice)  # revealed: str
+    reveal_type(choice | {})  # revealed: str
+    reveal_type(choice.__or__({}))  # revealed: str
+    reveal_type({} | choice)  # revealed: str
+    reveal_type(choice + [42])  # revealed: int
+    reveal_type(choice + ["x"])  # revealed: str
+    reveal_type(choice + gradual)  # revealed: (Unknown & str) | (Unknown & int)
+    reveal_type(choice + unknown)  # revealed: (Unknown & str) | (Unknown & int)
+    prebound: list[Any] = []
+    reveal_type(choice + prebound)  # revealed: (Unknown & str) | (Unknown & int)
+    wrong: int = choice + []  # error: [invalid-assignment]
+    choice + [b"x"]  # error: [unsupported-operator]
+    choice | {"x": b"x"}  # error: [unsupported-operator]
+```
+
+Possible reflected-method priority retains both successful dispatch results.
+
+```py
+class Reflected(list[int]):
+    @overload
+    def __radd__(self, other: list[str], /) -> str: ...
+    @overload
+    def __radd__(self, other: list[int], /) -> int: ...
+    def __radd__(self, other):
+        raise NotImplementedError
+
+def reflected(value: Reflected, gradual: list[Any], unknown: list[Unknown]):
+    reveal_type([] + value)  # revealed: str | list[Unknown]
+    result = [] + value
+    reveal_type(result)  # revealed: str | list[Unknown]
+    reveal_type(([] + value, 42))  # revealed: tuple[str | list[Unknown], Literal[42]]
+    reveal_type(gradual + value)  # revealed: (Unknown & str) | (Unknown & int) | list[Any]
+    reveal_type(unknown + value)  # revealed: (Unknown & str) | (Unknown & int) | list[Unknown]
+    wrong: str = [] + value  # error: [invalid-assignment]
+```
+
+Intersection receivers retain their existing constituent-by-constituent dunder dispatch.
+
+```py
+from typing import TypedDict
+from ty_extensions import Intersection
+
+class Other:
+    def __add__(self, other: list[str] | list[int], /) -> object:
+        raise NotImplementedError
+
+def intersections(value: Intersection[Choice, Other], gradual: Intersection[Choice, Unknown], argument: list[Unknown]):
+    empty = value + []
+    prebound = value + argument
+    gradual_empty = gradual + []
+    reveal_type(empty)  # revealed: (Unknown & str) | (Unknown & int)
+    reveal_type(prebound)  # revealed: (Unknown & str) | (Unknown & int)
+    reveal_type(gradual_empty)  # revealed: (Unknown & str) | (Unknown & int)
+```
+
+Contextual inference still rejects an empty dictionary when the operator requires fields.
+
+```py
+class Fields(TypedDict):
+    required: int
+
+class RequiresFields:
+    def __or__(self, other: Fields, /) -> str:
+        raise NotImplementedError
+
+def required_fields(value: RequiresFields):
+    value | {}  # error: [unsupported-operator]
+```

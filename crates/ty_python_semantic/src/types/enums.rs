@@ -1297,7 +1297,7 @@ pub(crate) fn enum_metadata<'db>(
 
             // Track whether this member's value is a non-literal `int`, so a
             // following `auto()` knows to widen its result to `int`.
-            prev_value_was_non_literal_int = value_ty.as_int_like_literal().is_none()
+            prev_value_was_non_literal_int = value_ty.as_int_like_literal(db, &env).is_none()
                 && value_ty.is_assignable_to(db, &env, KnownClass::Int.to_instance(db, &env));
             prev_bool_literal =
                 value_ty
@@ -1589,7 +1589,7 @@ fn inherited_user_defined_mixin_new<'db>(
             };
             Some(
                 match Type::FunctionLiteral(function)
-                    .apply_optional_owner_specialization_to_member(db, specialization)
+                    .apply_optional_specialization(db, specialization)
                 {
                     Type::FunctionLiteral(function) => EnumMethodBinding::Function(function),
                     _ => EnumMethodBinding::Opaque,

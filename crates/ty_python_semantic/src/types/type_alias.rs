@@ -843,7 +843,7 @@ impl<'db> TypeAliasType<'db> {
                         .apply_specialization_impl(
                             db,
                             current_specialization,
-                            specialization.specialize_self_domain(),
+                            specialization.specializes_typevar_domains(),
                             visitor,
                         )
                 }))

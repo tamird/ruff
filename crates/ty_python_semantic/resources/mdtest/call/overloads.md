@@ -1445,6 +1445,63 @@ def _(values: tuple[int] | tuple[str, str]):
     reveal_type(n(lambda value: value, *values))  # revealed: int | str
 ```
 
+### Optimization: Preserve generic callbacks before expansion
+
+A callback can become compatible with an overload when another argument is expanded and its type
+variables are inferred.
+
+`overloaded.pyi`:
+
+```pyi
+from collections.abc import Callable
+from typing import Concatenate, ParamSpec, TypeVar, overload
+
+T = TypeVar("T")
+P = ParamSpec("P")
+
+@overload
+def transform(value: list[T], /, *, render: Callable[Concatenate[T, P], str]) -> str: ...
+@overload
+def transform(prefix: str, value: list[T], /, *, render: Callable[Concatenate[T, P], str]) -> bytes: ...
+```
+
+```py
+from overloaded import transform
+
+def render(value: int) -> str:
+    return str(value)
+
+def wrong(value: int) -> int:
+    return value
+
+def check(arguments: tuple[list[int]] | tuple[str, list[int]]) -> None:
+    reveal_type(transform(*arguments, render=render))  # revealed: str | bytes
+    transform(*arguments, render=wrong)  # error: [no-matching-overload]
+```
+
+### Shared argument context after type expansion
+
+Overloads selected for different expansions can agree on another argument's type context.
+
+```py
+from typing import Protocol, overload
+
+class Callback(Protocol):
+    def __call__(self, *, name: str) -> object: ...
+
+@overload
+def invoke(value: str, callback: Callback) -> str: ...
+@overload
+def invoke(value: list[str], callback: Callback) -> list[str]: ...
+def invoke(value: str | list[str], callback: Callback) -> str | list[str]:
+    return value
+
+def caller(value: str | list[str]) -> None:
+    invoke(value, lambda *, name: reveal_type(name))  # revealed: str
+    # error: [unsupported-operator]
+    invoke(value, lambda *, name: name + 1)
+```
+
 ## Filtering based on variadic arguments
 
 This is step 4 of the overload call evaluation algorithm which specifies that:
@@ -2632,6 +2689,64 @@ result = choose(reveal_type(first()), 1)  # revealed: int
 reveal_type(result)  # revealed: int
 
 choose(reveal_type(first()), "x")  # revealed: Never
+```
+
+### Ambiguous predicate calls
+
+An ambiguous predicate call still returns a boolean. Its gradual result can be assigned to either
+candidate return type. The candidates share the dictionary predicate relationship, while the result
+remains uncertain.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+`predicate.pyi`:
+
+```pyi
+from typing import Any, Literal, overload
+from typing_extensions import TypeIs
+
+@overload
+def is_dictionary[K, V](value: dict[K, V]) -> Literal[True]: ...
+@overload
+def is_dictionary(value: object) -> TypeIs[dict[Any, Any]]: ...
+```
+
+```py
+from typing import Any, Literal
+from typing_extensions import TypeIs
+from ty_extensions import static_assert
+from ty_extensions._internal import TypeOf, is_assignable_to, is_subtype_of
+from predicate import is_dictionary
+
+def check(known: dict[str, int], dynamic: Any, unknown, broad: object, mixed: dict[str, int] | str):
+    reveal_type(is_dictionary(known))  # revealed: Literal[True]
+    # revealed: Unknown & TypeIs[dict[Any, Any] @ dynamic]
+    dynamic_result = reveal_type(is_dictionary(dynamic))
+    # revealed: Unknown & TypeIs[dict[Any, Any] @ unknown]
+    unknown_result = reveal_type(is_dictionary(unknown))
+    static_assert(is_subtype_of(TypeOf[dynamic_result], bool))
+    static_assert(is_subtype_of(TypeOf[unknown_result], bool))
+    static_assert(not is_subtype_of(TypeOf[dynamic_result], Literal[True]))
+    static_assert(not is_subtype_of(TypeOf[unknown_result], Literal[True]))
+    static_assert(is_assignable_to(TypeOf[dynamic_result], Literal[True]))
+    static_assert(is_assignable_to(TypeOf[dynamic_result], TypeIs[dict[Any, Any]]))
+    if dynamic_result:
+        reveal_type(dynamic)  # revealed: Any & dict[Any, Any]
+    else:
+        reveal_type(dynamic)  # revealed: Any & ~Top[dict[Any, Any]]
+    if unknown_result:
+        reveal_type(unknown)  # revealed: Unknown & dict[Any, Any]
+    else:
+        reveal_type(unknown)  # revealed: Unknown & ~Top[dict[Any, Any]]
+    reveal_type(is_dictionary(broad))  # revealed: TypeIs[dict[Any, Any] @ broad]
+    reveal_type(is_dictionary(mixed))  # revealed: TypeIs[dict[Any, Any] @ mixed]
+    if is_dictionary(mixed):
+        reveal_type(mixed)  # revealed: dict[str, int]
+    else:
+        reveal_type(mixed)  # revealed: str
 ```
 
 ## Bidirectional Type Inference

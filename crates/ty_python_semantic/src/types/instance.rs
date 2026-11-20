@@ -7,14 +7,15 @@ use std::cell::Cell;
 use std::debug_assert_matches;
 use std::marker::PhantomData;
 
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 
 use super::protocol_class::{ProtocolInterface, ProtocolInterfaceView, StructuralMemberPriority};
 use super::{
     BoundTypeVarIdentity, BoundTypeVarInstance, ClassType, DivergentType, KnownClass,
     MaterializationKind, SubclassOfType, Type, TypeAliasType, TypeVarVariance,
 };
-use crate::place::PlaceAndQualifiers;
+use crate::place::{Place, PlaceAndQualifiers};
+use crate::provided::{ProvidedData, ProvidedField, ProvidedInstanceDisplay};
 use crate::types::constraints::{
     ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, OwnedConstraintSet,
 };
@@ -38,14 +39,96 @@ use crate::types::visitor::{
 };
 use crate::types::{
     ApplyTypeMappingVisitor, CallableType, ClassBase, ClassLiteral, ErrorContext,
-    FindLegacyTypeVarsVisitor, LiteralValueTypeKind, TypeContext, TypeMapping, VarianceInferable,
-    VarianceTerm,
+    FindLegacyTypeVarsVisitor, IntersectionBuilder, TypeContext, TypeMapping, TypeQualifiers,
+    VarianceInferable, VarianceTerm,
 };
 use crate::{Db, FxOrderSet};
 pub(super) use synthesized_protocol::SynthesizedProtocolType;
 use ty_python_core::definition::Definition;
 
 impl<'db> Type<'db> {
+    pub(super) fn provided_mapping_read_schema(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<super::TypedDictType<'db>> {
+        let Self::NominalInstance(NominalInstanceType(NominalInstanceInner::NonTuple(
+            NominalInstanceClass::Plain(ClassType::Generic(_)),
+        ))) = self
+        else {
+            return None;
+        };
+        db.provided_mapping_read_schema(env, self)
+    }
+
+    /// Returns storage attached by [`Type::with_provided_instance_fields`].
+    ///
+    /// Fields reflect specialization already applied to this instance.
+    /// Class declarations and deferred class fields are not resolved by this accessor.
+    /// An instance without attached storage returns `None`; explicitly empty storage
+    /// returns `Some(&[])`.
+    pub fn provided_instance_fields(self, db: &'db dyn Db) -> Option<&'db [ProvidedField<'db>]> {
+        let Self::NominalInstance(instance) = self else {
+            return None;
+        };
+        let provided = instance.provided_instance()?;
+        Some(provided.fields(db))
+    }
+
+    /// Refines an instance with immutable storage supplied by an embedding application.
+    ///
+    /// The runtime class is unchanged. Present fields reside in instance storage,
+    /// and callable field values do not bind as methods. Field names must be unique. Returns
+    /// `None` for instances whose class has special semantics, including tuple and `Any` bases.
+    /// Field source locations and display style affect presentation only; relations ignore them.
+    /// Simplifying a union may discard presentation metadata from an equivalent type.
+    pub fn with_provided_instance_fields(
+        self,
+        db: &'db dyn Db,
+        mut fields: Box<[ProvidedField<'db>]>,
+        display: ProvidedInstanceDisplay,
+    ) -> Option<Self> {
+        let Self::NominalInstance(NominalInstanceType(NominalInstanceInner::NonTuple(
+            NominalInstanceClass::Plain(class),
+        ))) = self
+        else {
+            return None;
+        };
+        fields.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        if fields
+            .windows(2)
+            .any(|pair| matches!(pair, [left, right] if left.name == right.name))
+        {
+            return None;
+        }
+        Some(Self::NominalInstance(NominalInstanceType(
+            NominalInstanceInner::NonTuple(NominalInstanceClass::WithFields(
+                ProvidedNominalInstance::new(db, class, fields, display),
+            )),
+        )))
+    }
+
+    /// Infer protocol member constraints from a bounded type variable. Comparing the variable
+    /// directly would produce one opaque constraint, while replacing it with its bound would
+    /// lose the original receiver for `Self`-returning members.
+    pub(super) fn when_constraint_set_satisfied_by_typevar<'c>(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        candidate: BoundTypeVarInstance<'db>,
+        constraints: &'c ConstraintSetBuilder<'db>,
+    ) -> Option<ConstraintSet<'db, 'c>> {
+        TypeRelationChecker::constraint_set_assignability(
+            env,
+            constraints,
+            &HasRelationToVisitor::default(constraints),
+            &IsDisjointVisitor::default(constraints),
+            &SignatureRelationVisitor::default(),
+            &ApplyTypeMappingVisitor::new(env),
+        )
+        .check_bounded_typevar_protocol_target(db, candidate, self)
+    }
+
     pub(crate) const fn object() -> Self {
         Type::NominalInstance(NominalInstanceType(NominalInstanceInner::Object))
     }
@@ -107,7 +190,7 @@ impl<'db> Type<'db> {
         Type::tuple(TupleType::homogeneous(db, env, element))
     }
 
-    pub(crate) fn heterogeneous_tuple<I, T>(
+    pub fn heterogeneous_tuple<I, T>(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         elements: I,
@@ -154,7 +237,7 @@ impl<'db> Type<'db> {
     }
 
     /// Synthesize a protocol instance type with a given set of read-only property members.
-    pub(super) fn protocol_with_readonly_members<'a, M>(
+    pub fn protocol_with_readonly_members<'a, M>(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         members: M,
@@ -218,6 +301,11 @@ pub(super) fn walk_nominal_instance_type<'db, V: super::visitor::TypeVisitor<'db
         NominalInstanceInner::Object => {}
         NominalInstanceInner::NonTuple(class) => {
             visitor.visit_type(db, class.class(db).into());
+            if let NominalInstanceClass::WithFields(provided) = class {
+                for field in provided.fields(db) {
+                    visitor.visit_type(db, field.ty);
+                }
+            }
         }
         NominalInstanceInner::SysVersionInfo => {}
     }
@@ -242,6 +330,35 @@ fn excludes_ancestor<'db>(
 }
 
 impl<'db> NominalInstanceType<'db> {
+    pub(super) fn provided_class_data(
+        self,
+        db: &'db dyn Db,
+    ) -> Option<(ClassLiteral<'db>, &'db ProvidedData)> {
+        let NominalInstanceInner::NonTuple(class) = self.0 else {
+            return None;
+        };
+        let NominalInstanceClass::Plain(class) = class else {
+            return None;
+        };
+        let ClassType::NonGeneric(class) = class else {
+            return None;
+        };
+        let ClassLiteral::Dynamic(dynamic) = class else {
+            return None;
+        };
+        let data = dynamic.provided_data(db)?;
+        Some((class, data))
+    }
+
+    pub(super) fn provided_instance(self) -> Option<ProvidedNominalInstance<'db>> {
+        match self.0 {
+            NominalInstanceInner::NonTuple(NominalInstanceClass::WithFields(provided)) => {
+                Some(provided)
+            }
+            _ => None,
+        }
+    }
+
     fn from_class(db: &'db dyn Db, class: ClassType<'db>) -> Self {
         Self(NominalInstanceInner::NonTuple(
             NominalInstanceClass::from_class(db, class),
@@ -373,6 +490,12 @@ impl<'db> NominalInstanceType<'db> {
         }
     }
 
+    /// Supplied fields may contain type variables or gradual types even when the class is
+    /// nongeneric.
+    pub(super) fn may_have_nested_types(self, db: &'db dyn Db) -> bool {
+        self.provided_instance().is_some() || self.is_definition_generic(db)
+    }
+
     /// If this type is an *exact* tuple type (*not* a subclass of `tuple`), returns the
     /// tuple spec.
     ///
@@ -397,7 +520,11 @@ impl<'db> NominalInstanceType<'db> {
     ///
     /// The specialization must be one in which the typevars are solved as being statically known
     /// integers or `None`.
-    pub(crate) fn slice_literal(self, db: &'db dyn Db) -> Option<SliceLiteral> {
+    pub(crate) fn slice_literal(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<SliceLiteral> {
         let class = match self.0 {
             NominalInstanceInner::NonTuple(class) => class.class(db),
             NominalInstanceInner::ExactTuple(_)
@@ -414,11 +541,10 @@ impl<'db> NominalInstanceType<'db> {
         };
 
         let to_u32 = |ty: &Type<'db>| match ty {
-            Type::LiteralValue(literal) => match literal.kind() {
-                LiteralValueTypeKind::Int(n) => i32::try_from(n.as_i64()).map(Some).ok(),
-                LiteralValueTypeKind::Bool(b) => Some(Some(i32::from(b))),
-                _ => None,
-            },
+            Type::LiteralValue(_) => {
+                let value = ty.as_int_like_literal(db, env)?;
+                i32::try_from(value).map(Some).ok()
+            }
             Type::NominalInstance(instance)
                 if instance.has_known_class(db, KnownClass::NoneType) =>
             {
@@ -455,7 +581,16 @@ impl<'db> NominalInstanceType<'db> {
                     .class(db)
                     .recursive_type_normalized_impl(db, env, div, nested)?;
                 Some(Self(NominalInstanceInner::NonTuple(
-                    class.with_class(db, transformed),
+                    class
+                        .try_with_class_and_mapped_fields(db, transformed, |ty| {
+                            let ty = ty.recursive_type_normalized_impl(db, env, div, true);
+                            if nested {
+                                ty.ok_or(())
+                            } else {
+                                Ok(ty.unwrap_or(div))
+                            }
+                        })
+                        .ok()?,
                 )))
             }
         }
@@ -501,7 +636,11 @@ impl<'db> NominalInstanceType<'db> {
                         .class(db)
                         .apply_type_mapping_impl(db, type_mapping, tcx, visitor);
                 Type::NominalInstance(Self(NominalInstanceInner::NonTuple(
-                    class.with_class(db, transformed),
+                    class
+                        .try_with_class_and_mapped_fields(db, transformed, |ty| {
+                            Ok(ty.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
+                        })
+                        .unwrap_or_else(|never: std::convert::Infallible| match never {}),
                 )))
             }
         }
@@ -528,6 +667,17 @@ impl<'db> NominalInstanceType<'db> {
                     typevars,
                     visitor,
                 );
+                if let NominalInstanceClass::WithFields(provided) = class {
+                    for field in provided.fields(db) {
+                        field.ty.find_legacy_typevars_impl(
+                            db,
+                            env,
+                            binding_context,
+                            typevars,
+                            visitor,
+                        );
+                    }
+                }
             }
         }
     }
@@ -869,6 +1019,17 @@ fn specialization_argument_is_static<'db>(
 impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
     /// Return `true` if `ty` conforms to the interface described by `protocol`.
     pub(super) fn check_type_satisfies_protocol(
+        &self,
+        db: &'db dyn Db,
+        ty: Type<'db>,
+        protocol: ProtocolInstanceType<'db>,
+    ) -> ConstraintSet<'db, 'c> {
+        let mut checker = self.clone();
+        checker.protocol_comparison = Some((ty, Type::ProtocolInstance(protocol)));
+        checker.check_type_satisfies_protocol_inner(db, ty, protocol)
+    }
+
+    fn check_type_satisfies_protocol_inner(
         &self,
         db: &'db dyn Db,
         ty: Type<'db>,
@@ -1449,6 +1610,126 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             }
         }
     }
+
+    pub(super) fn check_provided_instance_fields(
+        &self,
+        db: &'db dyn Db,
+        source: Type<'db>,
+        target: Type<'db>,
+        provided: ProvidedNominalInstance<'db>,
+    ) -> ConstraintSet<'db, 'c> {
+        let env = self.env;
+        provided
+            .fields(db)
+            .iter()
+            .when_all(db, self.constraints, |field| {
+                let Some(storage) = provided_field_storage(db, env, source, field) else {
+                    return self.never();
+                };
+                if field.is_required && !storage.is_definitely_bound() {
+                    return self.never();
+                }
+                self.check_type_pair(
+                    db,
+                    storage.ignore_possibly_undefined().unwrap_or(Type::Never),
+                    field.ty,
+                )
+                .and(db, self.constraints, || {
+                    let source = source.member(db, env, field.name.as_str());
+                    let target = target.member(db, env, field.name.as_str());
+                    match (source.place, target.place) {
+                        (Place::Defined(source), Place::Defined(target)) => {
+                            if target.is_definitely_defined() && !source.is_definitely_defined() {
+                                return self.never();
+                            }
+                            self.check_type_pair(db, source.ty, target.ty)
+                        }
+                        (Place::Undefined, Place::Defined(target)) => {
+                            if !target.is_definitely_defined()
+                                && source.qualifiers.contains(TypeQualifiers::KNOWN_ABSENT)
+                            {
+                                self.always()
+                            } else {
+                                self.never()
+                            }
+                        }
+                        _ => self.never(),
+                    }
+                })
+            })
+    }
+}
+
+/// Returns physical storage, including its presence, when the receiver supplies evidence for it.
+fn provided_field_storage<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    receiver: Type<'db>,
+    field: &ProvidedField<'db>,
+) -> Option<Place<'db>> {
+    if receiver.has_immutable_field_path(db, env, std::slice::from_ref(&field.name)) {
+        let Place::Defined(member) = receiver.member(db, env, field.name.as_str()).place else {
+            return None;
+        };
+        return member
+            .is_definitely_defined()
+            .then_some(Place::Defined(member));
+    }
+
+    // When a data descriptor masks instance storage, a protocol can narrow what is read without
+    // narrowing the stored value. Combine only physical storage from nominal constituents.
+    let constituents = match receiver {
+        Type::NominalInstance(_) => Either::Left(std::iter::once(receiver)),
+        Type::Intersection(intersection) => {
+            Either::Right(intersection.positive(db).iter().copied())
+        }
+        _ => return None,
+    };
+    let mut absence_candidates = constituents.clone();
+    let mut storage = constituents.filter_map(|constituent| {
+        if !matches!(constituent, Type::NominalInstance(_)) {
+            return None;
+        }
+        let member = constituent.instance_member(db, env, field.name.as_str());
+        let Place::Defined(place) = member.place else {
+            return None;
+        };
+        member
+            .qualifiers
+            .contains(TypeQualifiers::FINAL | TypeQualifiers::GUARANTEED_INSTANCE_STORAGE)
+            .then_some(place)
+    });
+    let Some(mut combined) = storage.next() else {
+        // A getter's absence contract describes physical storage only when ordinary lookup
+        // would expose that storage. Descriptors, interception, and recovery cannot prove it.
+        if !absence_candidates.all(|constituent| match constituent {
+            Type::NominalInstance(_) => {
+                constituent
+                    .instance_member(db, env, field.name.as_str())
+                    .place
+                    .is_undefined()
+                    && constituent.permits_instance_storage(db, env, &field.name, false)
+            }
+            Type::ProtocolInstance(_) => true,
+            _ => false,
+        }) {
+            return None;
+        }
+        let member = receiver
+            .try_member_lookup(db, env, field.name.as_str())
+            .ok()?;
+        let member = member.member(db);
+        return (member.place.is_undefined()
+            && member.qualifiers.contains(TypeQualifiers::KNOWN_ABSENT))
+        .then_some(Place::Undefined);
+    };
+    for next in storage {
+        combined.ty = IntersectionBuilder::new(db, env)
+            .positive_elements([combined.ty, next.ty])
+            .build();
+        combined.definedness = combined.definedness.max(next.definedness);
+    }
+    Some(Place::Defined(combined))
 }
 
 /// Returns the finite members of a protocol interface, omitting members that refer back to its
@@ -1629,6 +1910,35 @@ struct ExplicitAnyInstanceClass<'db> {
 // The Salsa heap is tracked separately.
 impl get_size2::GetSize for ExplicitAnyInstanceClass<'_> {}
 
+/// A nominal instance refined with immutable, application-supplied storage.
+#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
+pub(super) struct ProvidedNominalInstance<'db> {
+    #[returns(copy)]
+    class: ClassType<'db>,
+    #[returns(deref)]
+    pub(super) fields: Box<[ProvidedField<'db>]>,
+    #[returns(copy)]
+    pub(super) display: ProvidedInstanceDisplay,
+}
+
+impl get_size2::GetSize for ProvidedNominalInstance<'_> {}
+
+impl<'db> ProvidedNominalInstance<'db> {
+    pub(super) fn base_instance(self, db: &'db dyn Db) -> Type<'db> {
+        Type::NominalInstance(NominalInstanceType(NominalInstanceInner::NonTuple(
+            NominalInstanceClass::Plain(self.class(db)),
+        )))
+    }
+
+    pub(super) fn field(self, db: &'db dyn Db, name: &str) -> Option<&'db ProvidedField<'db>> {
+        let fields = self.fields(db);
+        let index = fields
+            .binary_search_by(|field| field.name.as_str().cmp(name))
+            .ok()?;
+        Some(&fields[index])
+    }
+}
+
 /// The class stored by a non-tuple nominal instance.
 ///
 /// Interning the uncommon explicit-`Any` case lets this type store the additional semantic bit
@@ -1637,6 +1947,7 @@ impl get_size2::GetSize for ExplicitAnyInstanceClass<'_> {}
 enum NominalInstanceClass<'db> {
     Plain(ClassType<'db>),
     InheritsFromExplicitAny(ExplicitAnyInstanceClass<'db>),
+    WithFields(ProvidedNominalInstance<'db>),
 }
 
 impl<'db> NominalInstanceClass<'db> {
@@ -1658,16 +1969,50 @@ impl<'db> NominalInstanceClass<'db> {
         match self {
             Self::Plain(class) => class,
             Self::InheritsFromExplicitAny(class) => class.class(db),
+            Self::WithFields(provided) => provided.class(db),
         }
     }
 
-    fn with_class(self, db: &'db dyn Db, class: ClassType<'db>) -> Self {
-        match self {
+    fn try_with_class_and_mapped_fields<E>(
+        self,
+        db: &'db dyn Db,
+        class: ClassType<'db>,
+        mut map: impl FnMut(Type<'db>) -> Result<Type<'db>, E>,
+    ) -> Result<Self, E> {
+        Ok(match self {
             Self::Plain(_) => Self::Plain(class),
             Self::InheritsFromExplicitAny(_) => {
                 Self::InheritsFromExplicitAny(ExplicitAnyInstanceClass::new(db, class))
             }
-        }
+            Self::WithFields(provided) => {
+                let fields = provided
+                    .fields(db)
+                    .iter()
+                    .map(
+                        |ProvidedField {
+                             name,
+                             ty,
+                             is_required,
+                             source,
+                         }| {
+                            let ty = map(*ty)?;
+                            Ok(ProvidedField {
+                                name: name.clone(),
+                                ty,
+                                is_required: *is_required,
+                                source: *source,
+                            })
+                        },
+                    )
+                    .collect::<Result<Box<_>, E>>()?;
+                Self::WithFields(ProvidedNominalInstance::new(
+                    db,
+                    class,
+                    fields,
+                    provided.display(db),
+                ))
+            }
+        })
     }
 }
 
@@ -1719,7 +2064,19 @@ impl<'db> VarianceInferable<'db> for NominalInstanceType<'db> {
         env: &ProgramEnvironment<'db>,
         typevar: BoundTypeVarIdentity<'db>,
     ) -> VarianceTerm<'db> {
-        self.class(db, env).variance_of(db, env, typevar)
+        let class = self.class(db, env).variance_of(db, env, typevar);
+        let Some(provided) = self.provided_instance() else {
+            return class;
+        };
+        VarianceTerm::join(
+            db,
+            std::iter::once(class).chain(
+                provided
+                    .fields(db)
+                    .iter()
+                    .map(|field| field.ty.variance_of(db, env, typevar)),
+            ),
+        )
     }
 }
 
@@ -2016,27 +2373,29 @@ impl<'db> ProtocolInstanceType<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
+        policy: super::MemberLookupPolicy,
     ) -> Option<PlaceAndQualifiers<'db>> {
         self.materialization_kind(db)?;
         let interface = self.interface(db);
         interface
             .includes_member(db, name)
-            .then(|| interface.instance_member(db, env, name))
+            .then(|| interface.instance_member_with_policy(db, env, name, policy))
     }
 
-    pub(crate) fn instance_member(
+    pub(crate) fn instance_member_with_policy(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
+        policy: super::MemberLookupPolicy,
     ) -> PlaceAndQualifiers<'db> {
         match self.inner {
             Protocol::FromClass(class) => class.instance_member(db, env, name),
-            Protocol::Synthesized(synthesized) => {
-                synthesized.interface().instance_member(db, env, name)
-            }
+            Protocol::Synthesized(synthesized) => synthesized
+                .interface()
+                .instance_member_with_policy(db, env, name, policy),
             Protocol::Materialized(materialized) => self
-                .materialized_interface_member(db, env, name)
+                .materialized_interface_member(db, env, name, policy)
                 .unwrap_or_else(|| materialized.origin(db).instance_member(db, env, name)),
         }
     }

@@ -627,6 +627,7 @@ impl<'db> UnionType<'db> {
         let mut qualifiers = TypeQualifiers::empty();
 
         let mut all_unbound = true;
+        let mut all_known_absent = true;
         let mut possibly_unbound = false;
         let mut origin = TypeOrigin::Declared;
         let mut provenance = Provenance::Unknown;
@@ -636,6 +637,7 @@ impl<'db> UnionType<'db> {
                 qualifiers: new_qualifiers,
             } = transform_fn(ty);
             qualifiers |= new_qualifiers;
+            all_known_absent &= new_qualifiers.contains(TypeQualifiers::KNOWN_ABSENT);
             match ty_member {
                 Place::Undefined => {
                     possibly_unbound = true;
@@ -658,6 +660,10 @@ impl<'db> UnionType<'db> {
                 }
             }
         }
+        qualifiers.set(
+            TypeQualifiers::KNOWN_ABSENT,
+            all_unbound && all_known_absent,
+        );
         PlaceAndQualifiers {
             place: if all_unbound {
                 Place::Undefined
@@ -1107,7 +1113,7 @@ impl<'db> IntersectionType<'db> {
     ///
     /// For performance reasons, consider using [`IntersectionType::from_two_elements`] if
     /// the intersection is constructed from exactly two elements.
-    pub(crate) fn from_elements<I, T>(
+    pub fn from_elements<I, T>(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         elements: I,
@@ -1157,7 +1163,7 @@ impl<'db> IntersectionType<'db> {
     }
 
     /// Create an intersection type `A & B` from two elements `A` and `B`.
-    pub(crate) fn from_two_elements(
+    pub fn from_two_elements(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         a: Type<'db>,
@@ -1462,6 +1468,9 @@ impl<'db> IntersectionType<'db> {
             }
         }
 
+        if !all_unbound {
+            qualifiers.remove(TypeQualifiers::KNOWN_ABSENT);
+        }
         PlaceAndQualifiers {
             place: if all_unbound {
                 Place::Undefined

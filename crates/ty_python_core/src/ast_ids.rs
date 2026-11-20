@@ -251,6 +251,24 @@ impl AstIds {
         self.use_index(key.into().index())
             .map(|index| self.use_ids.get(index))
     }
+
+    pub(super) fn uses(&self) -> impl Iterator<Item = (ast::NodeIndex, ScopedUseId)> + '_ {
+        self.pages.iter().flat_map(move |page| {
+            let mut remaining = page.mask;
+            let mut use_index = page.first_use as usize;
+            std::iter::from_fn(move || {
+                if remaining == 0 {
+                    return None;
+                }
+                let offset = remaining.trailing_zeros();
+                remaining &= remaining - 1;
+                let node = ast::NodeIndex::from(root_index(page.first_node) as u32 + offset);
+                let use_id = self.use_ids.get(use_index);
+                use_index += 1;
+                Some((node, use_id))
+            })
+        })
+    }
 }
 
 fn ast_ids<'db>(db: &'db dyn Db, file: ProgramFile<'db>) -> &'db AstIds {
@@ -405,5 +423,11 @@ mod tests {
         assert_eq!(lookup(63), Some(2));
         assert_eq!(lookup(64), Some(0));
         assert_eq!(lookup(128), Some(3));
+        assert_eq!(
+            ids.uses()
+                .map(|(node, use_id)| (root_index(node), use_id.as_u32()))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (63, 2), (64, 0), (128, 3)]
+        );
     }
 }

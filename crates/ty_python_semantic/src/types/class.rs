@@ -88,17 +88,17 @@ enum DynamicClassHeaderAnchor<'db> {
     ScopeOffset(DynamicClassScopeOffset),
 }
 
-/// Identifies a dangling dynamic-class call relative to its enclosing scope.
+/// Identifies a source location for a dynamic class relative to its enclosing scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
 pub enum DynamicClassScopeOffset {
-    /// A call in the module AST, identified by its scope-relative node index.
+    /// A node in the module AST, identified by its scope-relative node index.
     Node(u32),
 
-    /// A call in a parsed string annotation, whose nodes are not in the module AST.
+    /// A call in a detached annotation, whose nodes are not in the module AST.
     ///
-    /// `offset` identifies the outermost string expression in the module AST, relative to the
-    /// scope's node index. `range` identifies the call within that string expression.
-    StringAnnotation { offset: u32, range: TextRange },
+    /// `offset` identifies the annotation's owner in the module AST, relative to the
+    /// scope's node index. `range` identifies the call relative to that owner's start.
+    DetachedAnnotation { offset: u32, range: TextRange },
 }
 
 /// Returns the source range of a call that creates a dynamic class.
@@ -122,7 +122,7 @@ fn dynamic_class_header_range<'db>(
         DynamicClassHeaderAnchor::ScopeOffset(offset) => {
             let (offset, relative_range) = match offset {
                 DynamicClassScopeOffset::Node(offset) => (offset, None),
-                DynamicClassScopeOffset::StringAnnotation { offset, range } => {
+                DynamicClassScopeOffset::DetachedAnnotation { offset, range } => {
                     (offset, Some(range))
                 }
             };
@@ -132,17 +132,10 @@ fn dynamic_class_header_range<'db>(
                 .expect("anchor should not be NodeIndex::NONE");
             let absolute_index = NodeIndex::from(anchor_u32 + offset);
             if let Some(relative_range) = relative_range {
-                let string: &ast::ExprStringLiteral = module
-                    .get_by_index(absolute_index)
-                    .try_into()
-                    .expect("string annotation offset should point to ExprStringLiteral");
-                return relative_range + string.start();
+                let owner = module.get_by_index(absolute_index);
+                return relative_range + owner.start();
             }
-            let node: &ast::ExprCall = module
-                .get_by_index(absolute_index)
-                .try_into()
-                .expect("scope offset should point to ExprCall");
-            node.range()
+            module.get_by_index(absolute_index).range()
         }
     }
 }
@@ -1061,7 +1054,7 @@ impl<'db> ClassLiteral<'db> {
     }
 
     /// Apply a specialization to this class.
-    pub(crate) fn apply_specialization(
+    pub fn apply_specialization(
         self,
         db: &'db dyn Db,
         f: impl FnOnce(GenericContext<'db>) -> Specialization<'db>,
@@ -1239,6 +1232,126 @@ impl<'db> ClassType<'db> {
 
     pub(super) fn has_pep_695_type_params(self, db: &'db dyn Db) -> bool {
         self.class_literal(db).has_pep_695_type_params(db)
+    }
+
+    /// Remove typing-only class declarations before descriptor and instance-storage lookup.
+    fn runtime_member(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+        member: Member<'db>,
+    ) -> Member<'db> {
+        let Member { inner } = member;
+        let PlaceAndQualifiers { place, qualifiers } = inner;
+        let Place::Defined(DefinedPlace {
+            ty,
+            origin,
+            definedness,
+            public_type_policy,
+            provenance,
+        }) = place
+        else {
+            return member;
+        };
+
+        let inspect_contributors = match provenance {
+            Provenance::SingleDefinition(definition) => {
+                super::definition_is_in_type_checking_block(db, definition)
+            }
+            Provenance::MultipleDefinitions => true,
+            Provenance::Unknown => false,
+        };
+        let mut possibly_missing = false;
+        if inspect_contributors && let Some(class) = self.class_literal(db).as_static() {
+            let scope = class.body_scope(db);
+            if let Some(symbol) = ty_python_core::place_table(db, scope).symbol_id(name) {
+                let use_def = ty_python_core::use_def_map(db, scope);
+                let mut runtime_binding = false;
+                let mut missing_binding = false;
+                let mut guarded_definition = false;
+                for binding in use_def.end_of_scope_symbol_bindings(symbol) {
+                    if binding.reachability_constraint
+                        == ty_python_core::reachability_constraints::ScopedReachabilityConstraintId::ALWAYS_FALSE
+                    {
+                        continue;
+                    }
+                    if let Some(definition) = binding.binding.definition() {
+                        if super::definition_is_in_type_checking_block(db, definition) {
+                            guarded_definition = true;
+                            missing_binding = true;
+                        } else {
+                            runtime_binding = true;
+                        }
+                    } else {
+                        missing_binding = true;
+                    }
+                }
+                let mut runtime_declaration = false;
+                for declaration in use_def.end_of_scope_declarations(symbol.into()) {
+                    if declaration.reachability_constraint
+                        == ty_python_core::reachability_constraints::ScopedReachabilityConstraintId::ALWAYS_FALSE
+                    {
+                        continue;
+                    }
+                    if let Some(definition) = declaration.declaration.definition() {
+                        if super::definition_is_in_type_checking_block(db, definition) {
+                            guarded_definition = true;
+                        } else {
+                            // A declaration may describe storage initialized outside this file.
+                            runtime_declaration = true;
+                        }
+                    }
+                }
+                if guarded_definition {
+                    if !runtime_binding && !runtime_declaration {
+                        return Member::unbound();
+                    }
+                    possibly_missing = !runtime_declaration && missing_binding;
+                }
+            }
+        }
+
+        // The raw union retains conditional function alternatives even when their source
+        // provenance has been combined. Use those inferred types without querying their bodies.
+        let visible = |ty: &Type<'db>| {
+            if ty.is_type_check_only(db) {
+                Place::Undefined
+            } else {
+                Place::bound(*ty)
+            }
+        };
+        let projected = match ty {
+            Type::Union(union) => union.map_with_boundness(db, env, visible),
+            _ => visible(&ty),
+        };
+        let Place::Defined(DefinedPlace {
+            ty,
+            origin: _,
+            definedness: projected_definedness,
+            public_type_policy: _,
+            provenance: _,
+        }) = projected
+        else {
+            return Member::unbound();
+        };
+        Member {
+            inner: Place::Defined(DefinedPlace {
+                ty,
+                origin,
+                definedness: if possibly_missing
+                    || definedness == Definedness::PossiblyUndefined
+                    || projected_definedness == Definedness::PossiblyUndefined
+                {
+                    Definedness::PossiblyUndefined
+                } else {
+                    Definedness::AlwaysDefined
+                },
+                public_type_policy,
+                provenance,
+            })
+            .with_qualifiers(qualifiers),
+        }
     }
 
     /// Returns the underlying class literal for this class, ignoring any specialization.
@@ -1966,7 +2079,7 @@ impl<'db> ClassType<'db> {
                 .map(|specialization| specialization.tuple_runtime_element_specialization(db));
             class_literal
                 .own_class_member(db, env, inherited_generic_context, specialization, name)
-                .map_type(|ty| ty.apply_optional_owner_specialization_to_member(db, specialization))
+                .map_type(|ty| ty.apply_optional_specialization(db, specialization))
         };
 
         match name {
@@ -3081,9 +3194,16 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                         continue;
                     }
 
+                    let member =
+                        class.own_class_member(db, &self.env, inherited_generic_context, name);
+                    let member = if policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE) {
+                        class.runtime_member(db, &self.env, name, member)
+                    } else {
+                        member
+                    };
                     let implicit = class.member_with_augmented_bindings(
                         db,
-                        class.own_class_member(db, &self.env, inherited_generic_context, name),
+                        member,
                         name,
                         MethodDecorator::ClassMethod,
                     );

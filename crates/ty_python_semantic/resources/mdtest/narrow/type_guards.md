@@ -389,6 +389,230 @@ def _(d: Any, guarded: object, narrowed: object, other: object, mode: bool):
         reveal_type(narrowed)  # revealed: int
 ```
 
+A `TypeIs` call is false when its positive narrowing cannot contain the supplied argument. This also
+excludes assignments guarded by the call.
+
+```py
+from collections.abc import Sequence
+from typing import TypedDict
+from typing_extensions import Never
+
+def is_dictionary(value: object) -> TypeIs[dict[Any, Any]]:
+    return isinstance(value, dict)
+
+class Classifier:
+    def is_dictionary(self, value: object) -> TypeIs[dict[Any, Any]]:
+        return isinstance(value, dict)
+
+class Fields(TypedDict):
+    value: int
+
+def call_results(value: str, dynamic: Any, broad: object, fields: Fields, mode: bool):
+    reveal_type(is_dictionary(value))  # revealed: Literal[False]
+    reveal_type(is_dictionary(value="text"))  # revealed: Literal[False]
+    reveal_type(Classifier().is_dictionary(value))  # revealed: Literal[False]
+    reveal_type(Classifier.is_dictionary(Classifier(), value))  # revealed: Literal[False]
+    reveal_type(overloaded(mode=mode, a=value))  # revealed: Literal[False]
+    reveal_type(is_dictionary(dynamic))  # revealed: TypeIs[dict[Any, Any] @ dynamic]
+    reveal_type(is_dictionary(broad))  # revealed: TypeIs[dict[Any, Any] @ broad]
+    reveal_type(is_dictionary(fields))  # revealed: TypeIs[dict[Any, Any] @ fields]
+    reveal_type(defaulted(other=value))  # revealed: TypeIs[int]
+    reveal_type(g(*dynamic))  # revealed: TypeIs[int]
+    reveal_type(f(1))  # revealed: TypeGuard[str]
+
+Bottom = Never
+
+def uninhabited_alias(value: Bottom):
+    reveal_type(is_dictionary(value))  # revealed: TypeIs[dict[Any, Any] @ value]
+
+def impossible_write(value: str):
+    found = False
+    if is_dictionary(value):
+        found = True
+    reveal_type(found)  # revealed: Literal[False]
+
+def tagged_payloads(
+    items: Sequence[tuple[Literal[True], dict[str, str]] | tuple[Literal[False], str]],
+):
+    found = False
+    for item in items:
+        item_is_select, item_value = item
+        if item_is_select:
+            for value in item_value.values():
+                if is_dictionary(value):
+                    found = True
+        elif is_dictionary(item_value):
+            found = True
+    reveal_type(found)  # revealed: Literal[False]
+```
+
+## Ambiguous predicate overloads
+
+An overload that always returns true for dictionaries agrees with the dictionary predicate when the
+argument leaves both overloads applicable.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Any, Literal, overload
+from typing_extensions import TypeIs
+from ty_extensions import Intersection
+
+@overload
+def is_dictionary[K, V](value: dict[K, V]) -> Literal[True]: ...
+@overload
+def is_dictionary(value: object) -> TypeIs[dict[Any, Any]]: ...
+def is_dictionary(value: object) -> bool:
+    return isinstance(value, dict)
+
+def check(value: Intersection[Any, str | dict[str, object]]):
+    reveal_type(is_dictionary(value))  # revealed: Unknown & TypeIs[dict[Any, Any] @ value]
+    if is_dictionary(value):
+        reveal_type(value)  # revealed: Any & dict[str, object]
+    else:
+        reveal_type(value)  # revealed: Any & str
+
+@overload
+def reversed_overloads(value: dict[Any, Any] | str) -> TypeIs[dict[Any, Any]]: ...
+@overload
+def reversed_overloads[K, V](value: dict[K, V]) -> Literal[True]: ...
+def reversed_overloads(value: object) -> bool:
+    return isinstance(value, dict)
+
+@overload
+def false_alternative(value: str) -> Literal[False]: ...
+@overload
+def false_alternative(value: object) -> TypeIs[dict[Any, Any]]: ...
+def false_alternative(value: object) -> bool:
+    return isinstance(value, dict)
+
+class Classifier:
+    @overload
+    def is_dictionary[K, V](self, value: dict[K, V]) -> Literal[True]: ...
+    @overload
+    def is_dictionary(self, value: object) -> TypeIs[dict[Any, Any]]: ...
+    def is_dictionary(self, value: object) -> bool:
+        return isinstance(value, dict)
+
+def alternatives(value: Intersection[Any, str | dict[str, object]], dynamic: Any):
+    reveal_type(reversed_overloads(dynamic))  # revealed: Unknown & TypeIs[dict[Any, Any] @ dynamic]
+    if reversed_overloads(dynamic):
+        reveal_type(dynamic)  # revealed: Any & dict[Any, Any]
+    if false_alternative(value):
+        reveal_type(value)  # revealed: Any & dict[str, object]
+    if Classifier().is_dictionary(value):
+        reveal_type(value)  # revealed: Any & dict[str, object]
+
+@overload
+def unrelated_true(value: str) -> Literal[True]: ...
+@overload
+def unrelated_true(value: object) -> TypeIs[dict[Any, Any]]: ...
+def unrelated_true(value: object) -> bool:
+    return isinstance(value, (str, dict))
+
+@overload
+def unrelated_false(value: dict[Any, Any]) -> Literal[False]: ...
+@overload
+def unrelated_false(value: object) -> TypeIs[dict[Any, Any]]: ...
+def unrelated_false(value: object) -> bool:
+    return False
+
+@overload
+def unconstrained(value: str) -> bool: ...
+@overload
+def unconstrained(value: object) -> TypeIs[dict[Any, Any]]: ...
+def unconstrained(value: object) -> bool:
+    return isinstance(value, (str, dict))
+
+@overload
+def inferred_domain[T](value: T, anchor: T) -> Literal[True]: ...
+@overload
+def inferred_domain(value: object, anchor: object) -> TypeIs[dict[Any, Any]]: ...
+def inferred_domain(value: object, anchor: object) -> bool:
+    return True
+
+@overload
+def reordered(value: dict[Any, Any], other: object) -> Literal[True]: ...
+@overload
+def reordered(other: object, value: object) -> TypeIs[dict[Any, Any]]: ...
+def reordered(*args: object, **kwargs: object) -> bool:
+    return True
+
+def refusals(value: Any, other: Any, anchor: dict[str, str]):
+    if unrelated_true(value):
+        reveal_type(value)  # revealed: Any
+    if unrelated_false(value):
+        reveal_type(value)  # revealed: Any
+    else:
+        reveal_type(value)  # revealed: Any
+    if unconstrained(value):
+        reveal_type(value)  # revealed: Any
+    if inferred_domain(value, anchor):
+        reveal_type(value)  # revealed: Any
+    if reordered(value=value, other=other):
+        reveal_type(value)  # revealed: Any
+        reveal_type(other)  # revealed: Any
+
+def identity[T](value: T) -> T:
+    return value
+
+def forwarded(value: Intersection[Any, str | dict[str, object]]):
+    if identity(is_dictionary(value)):
+        reveal_type(value)  # revealed: Any & dict[str, object]
+    else:
+        reveal_type(value)  # revealed: Any & str
+
+def unbound(predicate: Intersection[Any, TypeIs[dict[Any, Any]]]):
+    if identity(predicate):
+        reveal_type(predicate)  # revealed: Any & TypeIs[dict[Any, Any]]
+
+from ty_extensions import Bottom, Top
+from ty_extensions._internal import TypeOf
+
+def materialized(predicate: Top[TypeOf[is_dictionary]], value: Intersection[Any, str | dict[str, object]]):
+    if predicate(value):
+        reveal_type(value)  # revealed: Any & dict[str, object]
+    else:
+        reveal_type(value)  # revealed: (Any & str) | (Any & dict[str, object] & ~Bottom[dict[Any, Any]])
+
+def bottom(predicate: Bottom[TypeOf[is_dictionary]], value: Any):
+    if predicate(value):
+        reveal_type(value)  # revealed: Any
+```
+
+## Expanded predicate arguments
+
+A starred argument can supply the predicate's first parameter in one expansion and leave it to the
+next argument in another. The predicate only narrows a source argument when every expansion tests
+that argument.
+
+```py
+from typing import Any, Literal, overload
+from typing_extensions import TypeIs
+
+@overload
+def tagged(value: object, *rest: object, tag: Literal[0]) -> TypeIs[dict[Any, Any]]: ...
+@overload
+def tagged(value: object, *rest: object, tag: Literal[1]) -> TypeIs[dict[Any, Any]]: ...
+def tagged(value: object, *rest: object, tag: int) -> bool:
+    return isinstance(value, dict)
+
+def changing(prefix: tuple[dict[str, int]] | tuple[()], value: Any, tag: Literal[0, 1]):
+    if tagged(*prefix, value, tag=tag):
+        reveal_type(value)  # revealed: Any
+
+def reversed_prefix(prefix: tuple[()] | tuple[dict[str, int]], value: Any, tag: Literal[0, 1]):
+    if tagged(*prefix, value, tag=tag):
+        reveal_type(value)  # revealed: Any
+
+def stable(prefix: tuple[dict[str, int]] | tuple[()], value: Any, tag: Literal[0, 1]):
+    if tagged(value, *prefix, tag=tag):
+        reveal_type(value)  # revealed: Any & dict[Any, Any]
+```
+
 ## Intersections
 
 Guards for overlapping types can share a common subtype. A function returning `TypeGuard[int]`
@@ -606,6 +830,8 @@ def _(a: Foo):
 
     if g(f(a)):
         reveal_type(a)  # revealed: Foo & Bar
+
+    reveal_type(g(f(object())))  # revealed: TypeIs[Bar]
 ```
 
 Type guard narrowing also works when the callee has a `Callable` type:
@@ -1168,6 +1394,32 @@ def _(predicate: Top[Callable[[object], TypeIs[int | Any]]], value: int | str) -
         reveal_type(value)  # revealed: int | str
     else:
         reveal_type(value)  # revealed: str
+```
+
+A top-materialized guard is false when none of its possible positive domains contains the argument.
+The original materialization remains intact when the result is uncertain or the argument cannot
+complete. Bottom-materialized guards can exclude both outcomes and are not classified as ordinary
+false results.
+
+```py
+from typing_extensions import Never
+from ty_extensions import Bottom
+
+def disjoint(predicate: Top[Callable[[object], TypeIs[dict[Any, Any]]]], value: str):
+    reveal_type(predicate(value))  # revealed: Literal[False]
+    found = False
+    if predicate(value):
+        found = True
+    reveal_type(found)  # revealed: Literal[False]
+
+def uncertain(predicate: Top[Callable[[object], TypeIs[Any]]], value: str):
+    reveal_type(predicate(value))  # revealed: Top[TypeIs[Any @ value]]
+
+def bottom(predicate: Bottom[Callable[[object], TypeIs[Any]]], value: str):
+    reveal_type(predicate(value))  # revealed: Bottom[TypeIs[Any @ value]]
+
+def uninhabited(predicate: Top[Callable[[object], TypeIs[dict[Any, Any]]]], value: Never):
+    reveal_type(predicate(value))  # revealed: Top[TypeIs[dict[Any, Any] @ value]]
 ```
 
 ## `TypeIs` narrowing of `NewType` instances

@@ -13,6 +13,7 @@ use ruff_text_size::Ranged;
 use crate::Db;
 use crate::types::dict::dict_literal_key_value_types;
 use crate::types::infer::{ExpressionInference, FrozenMap};
+use crate::types::iteration::{precise_iterable_element_type, refine_dict_snapshot_element_type};
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
 use crate::types::tuple::{
     ResizeTupleError, Tuple, TupleBuilder, TupleElement, TupleLength, TupleSpec,
@@ -21,6 +22,7 @@ use crate::types::tuple::{
 use crate::types::{
     KnownClass, Type, TypeContext, UnionBuilder, UnionType, infer_expression_types,
 };
+use ty_python_core::EvaluationMode;
 use ty_python_core::ExpressionNodeKey;
 use ty_python_core::ProgramFile;
 use ty_python_core::scope::ScopeId;
@@ -33,6 +35,11 @@ use super::diagnostic::INVALID_ASSIGNMENT;
 pub(crate) struct Unpacker<'db, 'ast> {
     context: InferContext<'db, 'ast>,
     targets: FxHashMap<ExpressionNodeKey, Type<'db>>,
+}
+
+pub(super) enum UnpackFilterError {
+    Unsupported,
+    Provisional,
 }
 
 /// Records an `Unknown` type for every expression in a malformed unpack target subtree.
@@ -78,7 +85,6 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
 
     /// Unpack the value to the target expression.
     pub(crate) fn unpack(&mut self, target: &ast::Expr, value: UnpackValue<'db>) {
-        let db = self.db();
         debug_assert_matches!(
             target,
             ast::Expr::List(_) | ast::Expr::Tuple(_),
@@ -90,6 +96,34 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             value.expression(),
             TypeContext::default(),
         );
+        let result = self.unpack_inferred(target, value, value_inference, None);
+        debug_assert!(result.is_ok());
+    }
+
+    /// Project the original unpacking after a constraint rules out some matched rows.
+    /// Only complete, fixed-size rows can contribute to this additional narrowing.
+    pub(super) fn unpack_filtered(
+        mut self,
+        target: &ast::Expr,
+        value: UnpackValue<'db>,
+        value_inference: &ExpressionInference<'db>,
+        tested_index: usize,
+        keep: &dyn Fn(Type<'db>) -> bool,
+    ) -> Result<UnpackResult<'db>, UnpackFilterError> {
+        let result =
+            self.unpack_inferred(target, value, value_inference, Some((tested_index, keep)));
+        let unpacked = self.finish();
+        result.map(|()| unpacked)
+    }
+
+    fn unpack_inferred(
+        &mut self,
+        target: &ast::Expr,
+        value: UnpackValue<'db>,
+        value_inference: &ExpressionInference<'db>,
+        filter: Option<(usize, &dyn Fn(Type<'db>) -> bool)>,
+    ) -> Result<(), UnpackFilterError> {
+        let db = self.db();
         let value_expr = value.expression().node_ref(self.db()).node(self.module());
 
         let value_type = value_inference.expression_type(value_expr);
@@ -104,25 +138,46 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             }
             UnpackKind::Iterable { mode } => {
                 let env = self.context.program_environment();
+                // List and dict types widen literal entries, so recover them from the expressions.
+                // Tuple inference already preserves elements and widens tuples over 64 entries
+                // to bound inference cost; use that inferred type instead of rereading expressions.
                 if !mode.is_async()
-                    && let ast::Expr::Dict(dict) = value_expr
-                    && let Some((keys, _)) = dict_literal_key_value_types(db, env, dict, |expr| {
-                        value_inference.expression_type(expr)
-                    })
+                    && matches!(value_expr, ast::Expr::Dict(_) | ast::Expr::List(_))
+                    && let Some(element) =
+                        precise_iterable_element_type(db, env, value_expr, |expr| {
+                            value_inference.expression_type(expr)
+                        })
                 {
-                    keys
+                    element
                 } else {
-                    value_type
-                        .try_iterate_with_mode(db, env, mode)
-                        .map(|tuple| tuple.homogeneous_element_type(db, env))
-                        .unwrap_or_else(|err| {
+                    match value_type.try_iterate_with_mode(db, env, mode) {
+                        Ok(tuple) => {
+                            let element = tuple.homogeneous_element_type(db, env);
+                            refine_dict_snapshot_element_type(
+                                db,
+                                env,
+                                value.expression().scope(db),
+                                value_expr,
+                                element,
+                                mode,
+                                |expression| Some(value_inference.expression_type(expression)),
+                            )
+                            .unwrap_or(element)
+                        }
+                        Err(err) => {
+                            // Recovery can yield a complete tuple even when iteration failed.
+                            // It cannot establish a relationship between the unpacked targets.
+                            if filter.is_some() {
+                                return Err(UnpackFilterError::Unsupported);
+                            }
                             err.report_diagnostic(
                                 &self.context,
                                 value_type,
                                 value.as_any_node_ref(self.db(), self.module()),
                             );
                             err.fallback_element_type(db, env)
-                        })
+                        }
+                    }
                 }
             }
             UnpackKind::ContextManager { mode } => {
@@ -149,7 +204,8 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                 promote_literals: false,
             },
             value_inference,
-        );
+            filter,
+        )
     }
 
     /// Records `Unknown` for a malformed unpack target and all of its descendant expressions.
@@ -185,17 +241,17 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
         value_expr: AnyNodeRef<'_>,
         value: UnpackElement<'db, 'ast>,
         value_inference: &ExpressionInference<'db>,
-    ) {
+        filter: Option<(usize, &dyn Fn(Type<'db>) -> bool)>,
+    ) -> Result<(), UnpackFilterError> {
         let db = self.db();
         let env = self.context.program_environment();
         let targets = match target {
             ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Subscript(_) => {
                 self.targets.insert(target.into(), value.ty);
-                return;
+                return Ok(());
             }
             ast::Expr::Starred(starred) => {
-                self.unpack_inner(&starred.value, value_expr, value, value_inference);
-                return;
+                return self.unpack_inner(&starred.value, value_expr, value, value_inference, None);
             }
             ast::Expr::List(ast::ExprList { elts, .. })
             | ast::Expr::Tuple(ast::ExprTuple { elts, .. }) => elts,
@@ -204,7 +260,11 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                 // malformed targets. Give the whole subtree an unknown type so later lookups
                 // don't panic.
                 self.record_unknown_target_subtree(target);
-                return;
+                return if filter.is_none() {
+                    Ok(())
+                } else {
+                    Err(UnpackFilterError::Unsupported)
+                };
             }
         };
         let target_len = target_length(targets);
@@ -237,6 +297,7 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             )
         });
 
+        let mut complete = true;
         let sequences = if let Some(literal) = literal {
             vec![literal]
         } else {
@@ -245,21 +306,49 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             // if we manually map over the union and call `try_iterate` on each union element.
             // See <https://github.com/astral-sh/ruff/pull/20377#issuecomment-3401380305>
             // for more discussion.
-            let unpack_types = match value.ty {
+            let unpack_type = value.ty.resolve_type_alias(db);
+            let unpack_types = match unpack_type {
                 Type::Union(union_ty) => union_ty.elements(db),
                 _ => std::slice::from_ref(&value.ty),
             };
             unpack_types
                 .iter()
                 .map(|ty| {
-                    let tuple = ty.try_iterate(db, env).unwrap_or_else(|err| {
-                        err.report_diagnostic(&self.context, *ty, value_expr);
-                        Cow::Owned(TupleSpec::homogeneous(err.fallback_element_type(db, env)))
-                    });
+                    let tuple = ty
+                        .try_iterate_with_mode(db, env, EvaluationMode::Sync)
+                        .unwrap_or_else(|err| {
+                            complete = false;
+                            err.report_diagnostic(&self.context, *ty, value_expr);
+                            Cow::Owned(TupleSpec::homogeneous(err.fallback_element_type(db, env)))
+                        });
                     sequence_from_type(db, &tuple)
                 })
                 .collect()
         };
+        if filter.is_some() {
+            let is_provisional = |element: UnpackElement<'db, 'ast>| {
+                super::visitor::any_over_type_expanding_aliases(db, env, element.ty, |ty| {
+                    matches!(ty, Type::Divergent(_))
+                        || ty
+                            .as_dynamic()
+                            .is_some_and(super::DynamicType::is_provisional_marker)
+                })
+            };
+            if sequences.iter().any(|sequence| {
+                sequence.fixed_elements().copied().any(is_provisional)
+                    || match sequence {
+                        Tuple::Fixed(_) => false,
+                        Tuple::Variable(tuple) => {
+                            tuple.variable_ref().iter().copied().any(is_provisional)
+                        }
+                    }
+            }) {
+                return Err(UnpackFilterError::Provisional);
+            }
+            if !complete {
+                return Err(UnpackFilterError::Unsupported);
+            }
+        }
 
         let mut inferred_targets: Vec<_> = targets
             .iter()
@@ -272,6 +361,9 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             })
             .collect();
         for sequence in sequences {
+            if filter.is_some() && sequence.is_variadic() {
+                return Err(UnpackFilterError::Unsupported);
+            }
             let matched = sequence.unpack(target_len, Clone::clone, |elements| {
                 UnpackElement::from_type(UnionType::from_elements_leave_aliases(
                     db,
@@ -281,6 +373,14 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             });
             match matched {
                 Ok(matched) => {
+                    if let Some((tested_index, keep)) = filter {
+                        let Some(tested) = matched.fixed_elements().nth(tested_index) else {
+                            return Err(UnpackFilterError::Unsupported);
+                        };
+                        if !keep(tested.ty) {
+                            continue;
+                        }
+                    }
                     for ((inferred, expression, promote_literals), element) in inferred_targets
                         .iter_mut()
                         .zip(matched.into_all_elements_with_kind())
@@ -305,6 +405,9 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                     }
                 }
                 Err(err) => {
+                    if filter.is_some() {
+                        return Err(UnpackFilterError::Unsupported);
+                    }
                     // A length mismatch has no valid correspondence, e.g. `a, *b, c = [1]`.
                     // Recover every target at this level, without discarding sibling literals
                     // handled by the enclosing recursive call.
@@ -351,8 +454,10 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                     promote_literals,
                 },
                 value_inference,
-            );
+                None,
+            )?;
         }
+        Ok(())
     }
 
     pub(crate) fn finish(self) -> UnpackResult<'db> {
@@ -610,7 +715,7 @@ pub(super) fn collected_list_type<'db, 'ast>(
     } else {
         elements.build()
     };
-    let ty = ty.promote_collection_element_type(db, env, allow_tuple_size_promotion, true);
+    let ty = ty.promote_collection_element_type(db, env, allow_tuple_size_promotion, true, None);
     KnownClass::List.to_specialized_instance(db, env, &[ty])
 }
 

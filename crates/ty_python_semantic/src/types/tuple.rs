@@ -313,9 +313,11 @@ impl<'db> TupleType<'db> {
                     .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
             );
         }
+        // The tuple's program owns its nominal class. Mapping its elements from another
+        // namespace must not change that identity, including inside a type variable's bound.
         TupleType::new(
             db,
-            visitor.env,
+            &ProgramEnvironment::from_program(self.program(db)),
             &self
                 .tuple(db)
                 .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
@@ -1220,6 +1222,10 @@ impl<T, V> VariableLengthTuple<T, V> {
         V: Copy,
     {
         self.variable_segment
+    }
+
+    pub(super) fn variable_ref(&self) -> &V {
+        &self.variable_segment
     }
 
     pub(crate) fn prefix_elements(&self) -> &[T] {

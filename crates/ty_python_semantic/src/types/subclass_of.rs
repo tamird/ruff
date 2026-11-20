@@ -275,7 +275,7 @@ impl<'db> SubclassOfType<'db> {
     ) -> Option<PlaceAndQualifiers<'db>> {
         if let SubclassOfInner::Protocol(protocol) = self.subclass_of {
             let interface = protocol.interface(db);
-            if let Some(member) = interface.meta_member(db, env, name) {
+            if let Some(member) = interface.meta_member(db, env, name, policy) {
                 return Some(member);
             }
             if name == "__hash__" && interface.includes_member(db, "__eq__") {

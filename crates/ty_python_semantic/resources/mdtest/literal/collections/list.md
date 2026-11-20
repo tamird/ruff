@@ -91,3 +91,113 @@ reveal_type(Foo().mylist)  # revealed: list[None | Unknown]
 ```py
 reveal_type([x for x in range(42)])  # revealed: list[int]
 ```
+
+## Non-generic protocol context
+
+A protocol can provide the element type of a list literal through its method contracts, including
+when the protocol itself has no type parameters.
+
+```py
+from typing import Protocol, TypeAlias, TypedDict
+
+class Row(TypedDict):
+    value: int
+
+class Rows(Protocol):
+    def __getitem__(self, index: int, /) -> Row: ...
+
+typed: list[Row] = [{"value": 1}]
+forwarded: Rows = typed
+literal: Rows = [{"value": 1}]
+
+Alias: TypeAlias = Rows
+aliased: Alias = [{"value": 1}]
+union: Rows | list[str] = [{"value": 1}]
+other_arm: Rows | list[str] = ["value"]
+
+# error: [invalid-assignment]
+# error: [invalid-argument-type]
+wrong: Rows = [{"value": "bad"}]
+# error: [invalid-assignment]
+# error: [missing-typed-dict-key]
+missing: Rows = [{}]
+# error: [invalid-assignment]
+# error: [invalid-key]
+hidden: Rows = [{"value": 1, "hidden": 2}]
+
+class KeywordRows(Protocol):
+    def __getitem__(self, index: int) -> Row: ...
+
+# The list does not accept an index supplied by keyword.
+# error: [invalid-assignment]
+keyword: KeywordRows = typed
+```
+
+## Dictionary fields in confined lists
+
+Fresh dictionaries appended to a local list preserve their individual field types when the list and
+its loop variables are used only for production, iteration, truth tests, and literal-key reads. A
+field with conflicting producer values still reports an error at each incompatible use.
+
+```py
+def text(value: str) -> None: ...
+def number(value: int) -> None: ...
+def conflicting_producers(paths: list[str]) -> None:
+    entries = []
+    for path in paths:
+        entries.append({"name": path, "size": len(path)})
+    entries.append({"name": "wrong", "size": "wrong"})
+    for entry in entries:
+        text(entry["name"])
+        number(entry["size"])  # error: [invalid-argument-type]
+    for entry in entries:
+        text(entry["name"])
+        number(entry["size"])  # error: [invalid-argument-type]
+
+def impossible_guard() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    for entry in entries:
+        if isinstance(entry["name"], int):
+            reveal_type(entry["name"])  # revealed: Never
+            text(entry["name"])
+```
+
+A key absent from one producer uses ordinary dictionary inference. Invalid key types retain ordinary
+subscript diagnostics. Mutating a row prevents field observations in later loops.
+
+```py
+def missing_field() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    entries.append({"size": 1})
+    for entry in entries:
+        text(entry["name"])  # error: [invalid-argument-type]
+
+def wrong_key() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    for entry in entries:
+        entry[0]  # error: [invalid-argument-type]
+
+def mutated_row() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    for entry in entries:
+        entry["name"] = 1
+    for entry in entries:
+        text(entry["name"])  # error: [invalid-argument-type]
+```
+
+Reading the local namespace can expose a row without a direct name reference. Such rows use ordinary
+dictionary inference.
+
+```py
+def local_namespace_mutation() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    locals()["entries"][0]["name"] = 1
+    for entry in entries:
+        text(entry["name"])  # error: [invalid-argument-type]
+
+def vars_namespace_mutation() -> None:
+    entries = [{"name": "ok", "size": 1}]
+    vars(*())["entries"][0]["name"] = 1
+    for entry in entries:
+        text(entry["name"])  # error: [invalid-argument-type]
+```

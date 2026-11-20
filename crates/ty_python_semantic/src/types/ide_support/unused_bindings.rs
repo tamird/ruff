@@ -7,7 +7,7 @@ use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use rustc_hash::FxHashSet;
-use ty_python_core::definition::{DefinitionCategory, DefinitionKind};
+use ty_python_core::definition::{Definition, DefinitionCategory, DefinitionKind};
 use ty_python_core::place::ScopedPlaceId;
 use ty_python_core::scope::{FileScopeId, ScopeKind};
 use ty_python_core::{ProgramFile, SemanticIndex, semantic_index};
@@ -27,7 +27,8 @@ fn should_consider_definition(kind: &DefinitionKind<'_>) -> bool {
         | DefinitionKind::MatchPattern(_)
         | DefinitionKind::ExceptHandler(_) => true,
 
-        DefinitionKind::Import(_)
+        DefinitionKind::ProvidedBinding(_)
+        | DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)
         | DefinitionKind::ImportFromSubmodule(_)
         | DefinitionKind::StarImport(_)
@@ -36,6 +37,7 @@ fn should_consider_definition(kind: &DefinitionKind<'_>) -> bool {
         | DefinitionKind::TypeAlias(_)
         | DefinitionKind::AugmentedAssignment(_)
         | DefinitionKind::DictKeyAssignment(_)
+        | DefinitionKind::DictionaryContents(_)
         | DefinitionKind::TypeVar(_)
         | DefinitionKind::ParamSpec(_)
         | DefinitionKind::TypeVarTuple(_)
@@ -94,18 +96,14 @@ pub struct UnusedBinding {
     pub name: Name,
 }
 
-/// Collects unused local bindings for IDE-facing diagnostics.
+/// Collects source symbol definitions with no recorded uses in this file.
 ///
-/// This intentionally reports only function-, lambda-, and comprehension-scope bindings.
-/// Module- and class-scope bindings can still be observed indirectly (for example via
-/// imports or attribute access), so reporting them here would risk false positives
-/// without broader reference analysis. Bare local annotations (`x: int`) are also
-/// reported, but only if the symbol is neither bound nor used elsewhere in the scope.
-#[salsa::tracked(returns(deref), heap_size=ruff_memory_usage::heap_size)]
-pub fn unused_bindings(db: &dyn Db, file: ProgramFile<'_>) -> Box<[UnusedBinding]> {
-    let source_file = file.file(db);
+/// Uses of synthetic definitions count towards the source definitions they represent.
+/// Bare declarations are included only when their symbol has no binding or use. Export,
+/// naming, and scope policies belong to the caller; an unused definition is not necessarily
+/// a diagnostic, because other files or attribute access may observe it.
+pub fn unused_definitions<'db>(db: &'db dyn Db, file: ProgramFile<'db>) -> Vec<Definition<'db>> {
     let parsed = parsed_module(db, file.python_file(db)).load(db);
-    let is_stub_file = source_file.is_stub(db);
     let index = semantic_index(db, file);
     let mut unused = Vec::new();
     // A used synthetic definition counts as a use of the user-visible definitions it represents.
@@ -119,23 +117,6 @@ pub fn unused_bindings(db: &dyn Db, file: ProgramFile<'_>) -> Box<[UnusedBinding
 
     for scope_id in index.scope_ids() {
         let file_scope_id = scope_id.file_scope_id(db);
-        let scope = index.scope(file_scope_id);
-        let scope_kind = scope.kind();
-
-        if !matches!(
-            scope_kind,
-            ScopeKind::Function | ScopeKind::Lambda | ScopeKind::Comprehension
-        ) {
-            continue;
-        }
-
-        let is_method_scope = index.class_definition_of_method(file_scope_id).is_some();
-        let method_has_stub_body = is_method_scope
-            && scope.node().as_function().is_some_and(|function| {
-                crate::types::function::function_has_stub_body(function.node(&parsed))
-            });
-        let function_is_overload_declaration =
-            function_scope_is_overload_declaration(db, index, file_scope_id);
         let place_table = index.place_table(file_scope_id);
         let use_def_map = index.use_def_map(file_scope_id);
         // Loop headers are synthesized before the loop body definitions they point to;
@@ -165,59 +146,96 @@ pub fn unused_bindings(db: &dyn Db, file: ProgramFile<'_>) -> Box<[UnusedBinding
             }
 
             let kind = definition.kind(db);
-            if !should_consider_definition(kind) {
+            if matches!(
+                kind,
+                DefinitionKind::LoopHeader(_)
+                    | DefinitionKind::NestedBindings(_)
+                    | DefinitionKind::DictKeyAssignment(_)
+            ) {
                 continue;
             }
-
-            let is_parameter = kind.is_parameter_def();
-
-            if is_parameter
-                && (is_stub_file || function_is_overload_declaration || method_has_stub_body)
-            {
-                continue;
-            }
-
             let ScopedPlaceId::Symbol(symbol_id) = definition.place(db) else {
                 continue;
             };
-
             let symbol = place_table.symbol(symbol_id);
-            let name = symbol.name().as_str();
-
-            // Skip conventional method receiver parameters.
-            if is_parameter && is_method_scope && matches!(name, "self" | "cls") {
-                continue;
-            }
-
-            if name.starts_with('_') {
-                continue;
-            }
-
-            // Global and nonlocal assignments target bindings from outer scopes.
-            // Treat them as externally managed to avoid false positives here.
-            let is_local_comprehension_named_expression = scope_kind == ScopeKind::Comprehension
-                && matches!(kind, DefinitionKind::NamedExpression(_))
-                && comprehension_named_expression_is_local(index, file_scope_id, name);
-            if (symbol.is_global() || symbol.is_nonlocal())
-                && !is_local_comprehension_named_expression
-            {
-                continue;
-            }
-
-            let category = kind.category(is_stub_file, &parsed);
+            let category = definition.category(db, &parsed);
             if matches!(category, DefinitionCategory::Declaration)
                 && (symbol.is_bound() || symbol.is_used())
             {
                 continue;
             }
-
-            let range = kind.target_range(&parsed);
-
-            unused.push(UnusedBinding {
-                range,
-                name: symbol.name().clone(),
-            });
+            unused.push(definition);
         }
+    }
+    unused
+}
+
+/// Collects unused local bindings for IDE-facing diagnostics.
+///
+/// This intentionally reports only function-, lambda-, and comprehension-scope bindings.
+/// Module- and class-scope bindings can still be observed indirectly (for example via
+/// imports or attribute access), so reporting them here would risk false positives
+/// without broader reference analysis. Bare local annotations (`x: int`) are also
+/// reported, but only if the symbol is neither bound nor used elsewhere in the scope.
+#[salsa::tracked(returns(deref), heap_size=ruff_memory_usage::heap_size)]
+pub fn unused_bindings(db: &dyn Db, file: ProgramFile<'_>) -> Box<[UnusedBinding]> {
+    let parsed = parsed_module(db, file.python_file(db)).load(db);
+    let is_stub_file = file.is_stub(db);
+    let index = semantic_index(db, file);
+    let mut unused = Vec::new();
+
+    for definition in unused_definitions(db, file) {
+        let file_scope_id = definition.scope(db).file_scope_id(db);
+        let scope = index.scope(file_scope_id);
+        let scope_kind = scope.kind();
+        if !matches!(
+            scope_kind,
+            ScopeKind::Function | ScopeKind::Lambda | ScopeKind::Comprehension
+        ) {
+            continue;
+        }
+        let kind = definition.kind(db);
+        if !should_consider_definition(kind) {
+            continue;
+        }
+        let ScopedPlaceId::Symbol(symbol_id) = definition.place(db) else {
+            continue;
+        };
+        let symbol = index.place_table(file_scope_id).symbol(symbol_id);
+        let name = symbol.name().as_str();
+        if kind.is_parameter_def() {
+            let is_method_scope = index.class_definition_of_method(file_scope_id).is_some();
+            let method_has_stub_body = is_method_scope
+                && scope.node().as_function().is_some_and(|function| {
+                    crate::types::function::function_has_stub_body(function.node(&parsed), index)
+                });
+            if is_stub_file
+                || function_scope_is_overload_declaration(db, index, file_scope_id)
+                || method_has_stub_body
+            {
+                continue;
+            }
+            // Skip conventional method receiver parameters.
+            if is_method_scope && matches!(name, "self" | "cls") {
+                continue;
+            }
+        }
+        if name.starts_with('_') {
+            continue;
+        }
+        // Global and nonlocal assignments target bindings from outer scopes.
+        // Treat them as externally managed to avoid false positives here.
+        let is_local_comprehension_named_expression = scope_kind == ScopeKind::Comprehension
+            && matches!(kind, DefinitionKind::NamedExpression(_))
+            && comprehension_named_expression_is_local(index, file_scope_id, name);
+        if (symbol.is_global() || symbol.is_nonlocal()) && !is_local_comprehension_named_expression
+        {
+            continue;
+        }
+        unused.push(UnusedBinding {
+            range: kind.target_range(&parsed),
+            name: symbol.name().clone(),
+        });
     }
 
     unused.sort_unstable_by_key(|binding| (binding.range.start(), binding.range.end()));
@@ -228,13 +246,56 @@ pub fn unused_bindings(db: &dyn Db, file: ProgramFile<'_>) -> Box<[UnusedBinding
 
 #[cfg(test)]
 mod tests {
-    use super::{UnusedBinding, unused_bindings};
+    use super::{UnusedBinding, unused_bindings, unused_definitions};
     use crate::db::tests::TestDbBuilder;
     use ruff_db::files::system_path_to_file;
     use ruff_python_ast::name::Name;
     use ruff_python_trivia::textwrap::dedent;
     use ruff_text_size::{TextRange, TextSize};
     use ty_python_core::ProgramFile;
+    use ty_python_core::place::ScopedPlaceId;
+    use ty_python_core::semantic_index;
+
+    #[test]
+    fn definition_usage_precedes_scope_and_name_policy() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new()
+            .with_file(
+                "/src/a.py",
+                "\
+_unused = 1
+visible = 2
+def function(parameter):
+    total = 0
+    for item in range(3):
+        total += item
+    return total
+print(visible)
+",
+            )
+            .build()?;
+        let file = system_path_to_file(&db, "/src/a.py")?;
+        let program = db.program_environment().program(&db);
+        let file = ProgramFile::new(&db, file, program);
+        let index = semantic_index(&db, file);
+        let mut names: Vec<_> = unused_definitions(&db, file)
+            .into_iter()
+            .map(|definition| {
+                let ScopedPlaceId::Symbol(symbol) = definition.place(&db) else {
+                    panic!("expected a symbol definition: {definition:?}");
+                };
+                index
+                    .place_table(definition.scope(&db).file_scope_id(&db))
+                    .symbol(symbol)
+                    .name()
+                    .to_string()
+            })
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["_unused", "function", "parameter"]);
+        assert_eq!(unused_bindings(&db, file).len(), 1);
+        assert_eq!(unused_bindings(&db, file)[0].name, "parameter");
+        Ok(())
+    }
 
     fn collect_unused_bindings_in_file(
         path: &str,
@@ -263,6 +324,23 @@ mod tests {
 
     fn collect_unused_names(source: &str) -> anyhow::Result<Vec<String>> {
         collect_unused_names_in_file("/src/main.py", source)
+    }
+
+    #[test]
+    fn saved_type_test_does_not_read_its_subject_again() -> anyhow::Result<()> {
+        let source = dedent(
+            "
+            def f(value: object, repeat: bool):
+                tag = type(value)
+                while repeat:
+                    if tag is str:
+                        break
+                    value = 1
+            ",
+        );
+
+        assert_eq!(collect_unused_names(&source)?, ["value"]);
+        Ok(())
     }
 
     #[test]

@@ -10,11 +10,24 @@ use ruff_python_ast as ast;
 
 mod ambiguous;
 mod arguments;
+mod checked;
+pub(super) use arguments::collect_keyword_items;
+pub(crate) use checked::DictionaryAccess;
+pub use checked::{CheckedArgument, CheckedCall};
 pub(crate) mod bind;
 pub(super) use arguments::{Argument, CallArguments};
 pub(super) use bind::{
     Binding, Bindings, CallDiagnosticOverride, CallableBinding, MatchedArgument,
 };
+
+/// One argument type and the specialized parameter type against which it was checked.
+///
+/// For an unpacked argument, this describes one supplied element rather than its container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallInput<'db> {
+    pub argument_type: Type<'db>,
+    pub parameter_type: Type<'db>,
+}
 
 /// The return type and deprecations retained from operator resolution.
 #[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
@@ -52,11 +65,17 @@ enum ReflectedMethodPriority {
     Definitely,
 }
 
+/// The operator method selected for one side of a binary expression.
+#[derive(Clone, Copy)]
+pub(crate) enum BinaryOperatorMethod {
+    Normal,
+    Reflected,
+}
+
 /// Returns whether every inhabitant of `ty` has the same nominal runtime class.
 ///
-/// This is intentionally conservative: a false negative only widens a binary operation's result,
-/// while a false positive could discard a valid normal-method result.
-fn has_exact_runtime_class<'db>(
+/// A false positive could incorrectly rule out subclass-specific method dispatch.
+pub(super) fn has_exact_runtime_class<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
@@ -158,8 +177,7 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         left: Type<'db>,
         right: Type<'db>,
-        dunder: &'static str,
-        reflected_dunder: &'static str,
+        (dunder, reflected_dunder): (&'static str, &'static str),
         policy: MemberLookupPolicy,
     ) -> Option<Type<'db>> {
         let call_dunder = |name, receiver: Type<'db>, argument: Type<'db>| {
@@ -188,28 +206,25 @@ impl<'db> Type<'db> {
                     TypeContext::default(),
                     policy,
                 )
-                .map(|outcome| outcome.return_type(db, env))
-                .ok()
+                .map(|bindings| bindings.return_type(db, env))
         };
-
         match reflected_method_priority(db, env, left, right) {
             ReflectedMethodPriority::Never => call_dunder(dunder, left, right)
-                .or_else(|| call_dunder(reflected_dunder, right, left)),
-            ReflectedMethodPriority::Possibly => {
-                match (
-                    call_dunder(dunder, left, right),
-                    call_dunder(reflected_dunder, right, left),
-                ) {
-                    (Some(normal), Some(reflected)) => {
-                        Some(UnionType::from_two_elements(db, env, normal, reflected))
-                    }
-                    (Some(result), None) | (None, Some(result)) => Some(result),
-                    (None, None) => None,
+                .or_else(|_| call_dunder(reflected_dunder, right, left)),
+            ReflectedMethodPriority::Possibly => match (
+                call_dunder(dunder, left, right),
+                call_dunder(reflected_dunder, right, left),
+            ) {
+                (Ok(normal), Ok(reflected)) => {
+                    Ok(UnionType::from_two_elements(db, env, normal, reflected))
                 }
-            }
+                (Ok(ty), Err(_)) | (Err(_), Ok(ty)) => Ok(ty),
+                (Err(error), Err(_)) => Err(error),
+            },
             ReflectedMethodPriority::Definitely => call_dunder(reflected_dunder, right, left)
-                .or_else(|| call_dunder(dunder, left, right)),
+                .or_else(|_| call_dunder(dunder, left, right)),
         }
+        .ok()
     }
 
     /// Memoize the return type and deprecations from binary dunder resolution, without retaining
@@ -221,22 +236,27 @@ impl<'db> Type<'db> {
         left_ty: Type<'db>,
         op: ast::Operator,
         right_ty: Type<'db>,
+        policy: MemberLookupPolicy,
+        tcx: TypeContext<'db>,
     ) -> Option<&'db OperatorResult<'db>> {
-        #[salsa::tracked(returns(ref), cycle_initial=|_, _, _, _, _, _| None, heap_size=ruff_memory_usage::heap_size)]
+        #[salsa::tracked(returns(ref), cycle_initial=|_, _, _, _, _, _, _, _| None, heap_size=ruff_memory_usage::heap_size)]
         fn try_call_bin_op_result_impl<'db>(
             db: &'db dyn Db,
             program: Program<'db>,
             left_ty: Type<'db>,
             op: ast::Operator,
             right_ty: Type<'db>,
+            policy: MemberLookupPolicy,
+            tcx: TypeContext<'db>,
         ) -> Option<OperatorResult<'db>> {
             let env = &ProgramEnvironment::from_program(program);
-            Type::try_call_bin_op(db, env, left_ty, op, right_ty)
+            Type::try_call_bin_op_impl(db, env, left_ty, op, right_ty, policy, tcx)
                 .ok()
                 .map(|bindings| OperatorResult::from_bindings(db, env, &bindings))
         }
 
-        try_call_bin_op_result_impl(db, env.program(db), left_ty, op, right_ty).as_ref()
+        try_call_bin_op_result_impl(db, env.program(db), left_ty, op, right_ty, policy, tcx)
+            .as_ref()
     }
 
     pub(crate) fn try_call_bin_op(
@@ -264,6 +284,45 @@ impl<'db> Type<'db> {
         right_ty: Type<'db>,
         policy: MemberLookupPolicy,
     ) -> Result<Bindings<'db>, CallBinOpError> {
+        Self::try_call_bin_op_impl(
+            db,
+            env,
+            left_ty,
+            op,
+            right_ty,
+            policy,
+            TypeContext::default(),
+        )
+    }
+
+    fn try_call_bin_op_impl(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        left_ty: Type<'db>,
+        op: ast::Operator,
+        right_ty: Type<'db>,
+        policy: MemberLookupPolicy,
+        tcx: TypeContext<'db>,
+    ) -> Result<Bindings<'db>, CallBinOpError> {
+        Self::try_call_bin_op_with(db, env, left_ty, op, right_ty, |method| {
+            let (receiver, name, argument) = match method {
+                BinaryOperatorMethod::Normal => (left_ty, op.dunder(), right_ty),
+                BinaryOperatorMethod::Reflected => (right_ty, op.reflected_dunder(), left_ty),
+            };
+            let mut arguments = CallArguments::positional([argument]);
+            receiver.try_call_dunder_with_policy(db, env, name, &mut arguments, tcx, policy)
+        })
+    }
+
+    /// Dispatch a binary operation while letting the caller infer its source argument.
+    pub(crate) fn try_call_bin_op_with(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        left_ty: Type<'db>,
+        op: ast::Operator,
+        right_ty: Type<'db>,
+        mut call_dunder: impl FnMut(BinaryOperatorMethod) -> Result<Bindings<'db>, CallDunderError<'db>>,
+    ) -> Result<Bindings<'db>, CallBinOpError> {
         // We either want to call lhs.__op__ or rhs.__rop__. The full decision tree from
         // the Python spec [1] is:
         //
@@ -278,7 +337,6 @@ impl<'db> Type<'db> {
         // Runtime classes determine reflected priority, but static operand types may only
         // establish that priority conditionally.
         let reflected_priority = reflected_method_priority(db, env, left_ty, right_ty);
-
         let left_class = left_ty.to_meta_type(db, env);
         let right_class = right_ty.to_meta_type(db, env);
         if reflected_priority != ReflectedMethodPriority::Never {
@@ -291,37 +349,13 @@ impl<'db> Type<'db> {
                     left_class.member(db, env, reflected_dunder).place,
                 )
             {
-                let call_on_right_instance = right_ty.try_call_dunder_with_policy(
-                    db,
-                    env,
-                    reflected_dunder,
-                    &mut CallArguments::positional([left_ty]),
-                    TypeContext::default(),
-                    policy,
-                );
-
+                let call_on_right_instance = call_dunder(BinaryOperatorMethod::Reflected);
                 if reflected_priority == ReflectedMethodPriority::Definitely {
-                    return Ok(call_on_right_instance.or_else(|_| {
-                        left_ty.try_call_dunder_with_policy(
-                            db,
-                            env,
-                            op.dunder(),
-                            &mut CallArguments::positional([right_ty]),
-                            TypeContext::default(),
-                            policy,
-                        )
-                    })?);
+                    return Ok(call_on_right_instance
+                        .or_else(|_| call_dunder(BinaryOperatorMethod::Normal))?);
                 }
 
-                let call_on_left_instance = left_ty.try_call_dunder_with_policy(
-                    db,
-                    env,
-                    op.dunder(),
-                    &mut CallArguments::positional([right_ty]),
-                    TypeContext::default(),
-                    policy,
-                );
-
+                let call_on_left_instance = call_dunder(BinaryOperatorMethod::Normal);
                 return match (call_on_right_instance, call_on_left_instance) {
                     (Ok(right_bindings), Ok(left_bindings)) => {
                         let callable_type = UnionType::from_two_elements(
@@ -341,27 +375,11 @@ impl<'db> Type<'db> {
             }
         }
 
-        let call_on_left_instance = left_ty.try_call_dunder_with_policy(
-            db,
-            env,
-            op.dunder(),
-            &mut CallArguments::positional([right_ty]),
-            TypeContext::default(),
-            policy,
-        );
-
-        call_on_left_instance.or_else(|_| {
+        call_dunder(BinaryOperatorMethod::Normal).or_else(|_| {
             if left_ty == right_ty {
                 Err(CallBinOpError::NotSupported)
             } else {
-                Ok(right_ty.try_call_dunder_with_policy(
-                    db,
-                    env,
-                    op.reflected_dunder(),
-                    &mut CallArguments::positional([left_ty]),
-                    TypeContext::default(),
-                    policy,
-                )?)
+                call_dunder(BinaryOperatorMethod::Reflected).map_err(Into::into)
             }
         })
     }
@@ -463,7 +481,7 @@ pub(crate) enum CallErrorKind {
 }
 
 #[derive(Debug)]
-pub(super) enum CallDunderError<'db> {
+pub(crate) enum CallDunderError<'db> {
     /// The dunder attribute exists but it can't be called with the given arguments.
     ///
     /// This includes non-callable dunder attributes that are possibly unbound.
