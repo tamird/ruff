@@ -1358,9 +1358,15 @@ fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Re
     let file = system_path_to_file(&db, "/src/main.py")?;
     let stub = system_path_to_file(&db, "/src/contracts.pyi")?;
     for (scalar, expected) in [
-        ("str", vec!["invalid-explicit-return", "invalid-explicit-return"]),
+        (
+            "str",
+            vec!["invalid-explicit-return", "invalid-explicit-return"],
+        ),
         ("int", vec!["invalid-explicit-return"]),
-        ("str", vec!["invalid-explicit-return", "invalid-explicit-return"]),
+        (
+            "str",
+            vec!["invalid-explicit-return", "invalid-explicit-return"],
+        ),
     ] {
         // Deliberately place the foreign annotations past the end of the implementation.
         db.write_file("/src/contracts.pyi", format!("{}Scalar = {scalar}\ndef compute(value: Scalar = ...) -> Scalar: ...\ndef implicit(value: Scalar) -> Scalar: ...\ndef native(value: str) -> str: ...\n", "# declarations\n".repeat(30)))?;

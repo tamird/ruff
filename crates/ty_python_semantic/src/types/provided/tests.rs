@@ -356,7 +356,9 @@ fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyh
         .infer(generic_storage, string_with_storage)
         .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
     let inferred = inference
-        .build_inference_with(crate::types::constraints::ReportDiagnostics::No, |_, _| None)
+        .build_inference_with(crate::types::constraints::ReportDiagnostics::No, |_, _| {
+            None
+        })
         .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?
         .merged_specialization(&db);
     assert_eq!(inferred.types(&db), [int]);
@@ -395,7 +397,9 @@ fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyh
         .infer(formal, actual)
         .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
     let inferred = inference
-        .build_inference_with(crate::types::constraints::ReportDiagnostics::No, |_, _| None)
+        .build_inference_with(crate::types::constraints::ReportDiagnostics::No, |_, _| {
+            None
+        })
         .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?
         .merged_specialization(&db);
     assert_eq!(inferred.types(&db), expected.types(&db));
@@ -550,7 +554,9 @@ descriptor: Descriptor
         .infer(generic, optional)
         .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
     let inferred = inference
-        .build_inference_with(crate::types::constraints::ReportDiagnostics::No, |_, _| None)
+        .build_inference_with(crate::types::constraints::ReportDiagnostics::No, |_, _| {
+            None
+        })
         .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?;
     let inferred = inferred.merged_specialization(&db);
     assert_eq!(inferred.types(&db), [int]);
