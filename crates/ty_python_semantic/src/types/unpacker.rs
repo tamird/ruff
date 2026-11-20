@@ -324,11 +324,8 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
                 .collect()
         };
         if filter.is_some() {
-            let is_provisional = |element: UnpackElement<'db, 'ast>| {
-                super::visitor::any_over_type_expanding_aliases(db, env, element.ty, |ty| {
-                    ty.is_divergent() || ty.is_provisional_marker()
-                })
-            };
+            let is_provisional =
+                |element: UnpackElement<'db, 'ast>| element.ty.has_indeterminate_inference(db, env);
             if sequences.iter().any(|sequence| {
                 sequence.fixed_elements().copied().any(is_provisional)
                     || match sequence {
