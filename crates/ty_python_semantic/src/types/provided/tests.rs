@@ -2836,26 +2836,12 @@ assert_type(recovered, Literal[-1])
     let actual = crate::place::global_symbol(&db, file, "ambiguous_result")
         .place
         .expect_type();
-    let expected = crate::types::IntersectionType::from_two_elements(
-        &db,
-        &env,
-        Type::Dynamic(crate::types::DynamicType::AmbiguousOverload),
-        crate::types::UnionType::from_elements(
-            &db,
-            &env,
-            [Type::int_literal(1), Type::int_literal(2)],
-        ),
-    );
+    let expected = Type::Dynamic(crate::types::DynamicType::AmbiguousOverload);
     assert_eq!(actual, expected);
     let actual = crate::place::global_symbol(&db, file, "partial_result")
         .place
         .expect_type();
-    let expected = crate::types::IntersectionType::from_two_elements(
-        &db,
-        &env,
-        Type::Dynamic(crate::types::DynamicType::AmbiguousOverload),
-        KnownClass::Str.to_instance(&db, &env),
-    );
+    let expected = KnownClass::Str.to_instance(&db, &env);
     assert_eq!(actual, expected);
     Ok(())
 }
@@ -3632,7 +3618,7 @@ target: Target | None
             "",
             "attrs = record({'dep': target})",
             "    ctx.attr = record({'dep': None})\n",
-            vec!["invalid-assignment", "missing-attribute"],
+            vec!["invalid-assignment", "missing-union-attribute"],
         ),
         (
             "",
@@ -6708,8 +6694,8 @@ def division_default(value: Store[Required]):
         [
             ("required_list", "list[str]".into()),
             ("required_dict", "dict[str, int]".into()),
-            // Existing collection inference selects one compatible arm for the empty literal.
-            ("union_list", "list[str]".into()),
+            // Keep the distinct mutable specializations from both compatible contexts.
+            ("union_list", "list[str] | list[int]".into()),
             ("optional_list", "list[str]".into()),
             ("optional_dict", "dict[str, int]".into()),
             ("optional_iterable", "list[str]".into()),

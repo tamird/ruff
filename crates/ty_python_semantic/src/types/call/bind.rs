@@ -5204,8 +5204,8 @@ impl<'db> CallableBinding<'db> {
     /// For a valid call, this is the return type of either a successful argument type expansion of
     /// an overloaded function, or the return type of the first overload that the arguments matched
     /// against.
-    /// Ambiguous calls retain a gradual bound from all remaining return types unless every
-    /// selected overload has the same complete, static, non-predicate supplied result.
+    /// Ambiguous calls merge the shared structure of the remaining return types. Complete,
+    /// static supplied results can agree even when the declared returns differ.
     ///
     /// For an invalid call to a non-overloaded function, this is the return type of the function.
     ///
