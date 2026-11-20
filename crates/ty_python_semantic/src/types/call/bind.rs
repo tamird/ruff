@@ -9273,6 +9273,21 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         paramspec_component_start: Option<usize>,
     ) {
         let db = self.db;
+        let argument_type = keywords.source_type().unwrap_or(Type::unknown());
+        let key_type_check = validate_keyword_unpack_key_type(
+            db,
+            self.env,
+            constraints,
+            argument_type,
+            self.inferable_typevars,
+        );
+        if let KeywordUnpackKeyTypeCheck::Invalid(provided_ty) = key_type_check {
+            self.errors.push(BindingError::InvalidKeyType {
+                argument_index: adjusted_argument_index,
+                provided_ty,
+            });
+        }
+
         if keywords.unpack(db, self.env).is_some() {
             self.check_variadic_argument_type(
                 argument_index,
@@ -9283,41 +9298,10 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             return;
         }
 
-        let argument_type = keywords.source_type().unwrap_or(Type::unknown());
-        let value_type_paramspec =
-            if let Some(paramspec) = argument_type.as_paramspec_keyword_component(db) {
-                Some(paramspec)
-            } else {
-                match validate_keyword_unpack_key_type(
-                    db,
-                    self.env,
-                    constraints,
-                    argument_type,
-                    self.inferable_typevars,
-                ) {
-                    KeywordUnpackKeyTypeCheck::NotApplicable => return,
-                    KeywordUnpackKeyTypeCheck::Valid => {}
-                    KeywordUnpackKeyTypeCheck::Invalid(provided_ty) => {
-                        self.errors.push(BindingError::InvalidKeyType {
-                            argument_index: adjusted_argument_index,
-                            provided_ty,
-                        });
-                    }
-                }
-                None
-            };
-
-        if let Some(CallArgument::Keywords(KeywordArgument::Observed {
-            types: _,
-            keywords: _,
-        })) = self.arguments.get(argument_index)
+        let value_type_paramspec = argument_type.as_paramspec_keyword_component(db);
+        if value_type_paramspec.is_none()
+            && matches!(key_type_check, KeywordUnpackKeyTypeCheck::NotApplicable)
         {
-            self.check_variadic_argument_type(
-                argument_index,
-                adjusted_argument_index,
-                Argument::Keywords,
-                paramspec_component_start,
-            );
             return;
         }
 
