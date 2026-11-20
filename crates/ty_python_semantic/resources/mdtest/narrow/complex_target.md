@@ -342,7 +342,7 @@ def replaced_for_payload(items: list[Tagged]) -> dict[str, int]:
     for flag, payload in items:
         payload = "replacement"
         if flag:
-            return payload  # error: [invalid-return-type]
+            return payload  # error: [invalid-explicit-return]
     return {}
 
 def deleted_for_payload(items: list[Tagged]):
@@ -377,7 +377,7 @@ def replaced_flag(
     flag, payload = item
     flag = True
     if flag:
-        return payload  # error: [invalid-return-type]
+        return payload  # error: [invalid-explicit-return]
     return {}
 
 def replaced_payload(
@@ -386,7 +386,7 @@ def replaced_payload(
     flag, payload = item
     payload = object()
     if flag:
-        return payload  # error: [invalid-return-type]
+        return payload  # error: [invalid-explicit-return]
     return {}
 
 def duplicate_targets(
@@ -394,7 +394,7 @@ def duplicate_targets(
 ) -> dict[str, int]:
     flag, flag, payload = item
     if flag:
-        return payload  # error: [invalid-return-type]
+        return payload  # error: [invalid-explicit-return]
     return {}
 
 def loop_write(
@@ -403,7 +403,7 @@ def loop_write(
     flag, payload = item
     for index in range(2):
         if index and flag:
-            return payload  # error: [invalid-return-type]
+            return payload  # error: [invalid-explicit-return]
         payload = object()
     return {}
 
@@ -416,7 +416,7 @@ def nested_write(
         payload = object()
     replace()
     if flag:
-        return payload  # error: [invalid-return-type]
+        return payload  # error: [invalid-explicit-return]
     return {}
 ```
 
@@ -1283,7 +1283,7 @@ from typing import Literal
 Tagged = tuple[Literal[True], int] | tuple[Literal[False], str]
 
 def unrelated(flag: bool, payload: int | str) -> Tagged:
-    return flag, payload  # error: [invalid-return-type]
+    return flag, payload  # error: [invalid-explicit-return]
 
 def changed_tag(flag: bool) -> Tagged:
     if flag:
@@ -1291,7 +1291,7 @@ def changed_tag(flag: bool) -> Tagged:
     else:
         payload = "x"
     flag = not flag
-    return flag, payload  # error: [invalid-return-type]
+    return flag, payload  # error: [invalid-explicit-return]
 
 def changed_payload(flag: bool, other: int | str) -> Tagged:
     if flag:
@@ -1299,7 +1299,7 @@ def changed_payload(flag: bool, other: int | str) -> Tagged:
     else:
         payload = "x"
     payload = other
-    return flag, payload  # error: [invalid-return-type]
+    return flag, payload  # error: [invalid-explicit-return]
 
 def captured_payload(flag: bool, other: int | str) -> Tagged:
     if flag:
@@ -1310,7 +1310,7 @@ def captured_payload(flag: bool, other: int | str) -> Tagged:
         nonlocal payload
         payload = other
     replace()
-    return flag, payload  # error: [invalid-return-type]
+    return flag, payload  # error: [invalid-explicit-return]
 
 def missing_payload(flag: bool):
     if flag:

@@ -330,7 +330,7 @@ def identity[T](x: T) -> T:
 def _(value: Nested[T_co]) -> list[T_co]:
     x1 = [value]
     identity(x1)
-    return x1  # error: [invalid-return-type]
+    return x1  # error: [invalid-explicit-return]
 ```
 
 The same restriction applies when the generic parameter is explicitly a collection:
@@ -342,7 +342,7 @@ def list_identity[T](x: list[T]) -> list[T]:
 def _(value: Nested[T_co]) -> list[T_co]:
     x2 = [value]
     list_identity(x2)
-    return x2  # error: [invalid-return-type]
+    return x2  # error: [invalid-explicit-return]
 ```
 
 ## Independently constrained collection arguments
@@ -369,5 +369,5 @@ def append[T](values: list[T], value: T) -> None: ...
 def _(value: Nested[T_co]) -> list[T_co]:
     x1 = [value]
     append(x1, value)
-    return x1  # error: [invalid-return-type]
+    return x1  # error: [invalid-explicit-return]
 ```

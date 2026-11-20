@@ -109,7 +109,7 @@ if has_type_name(alias):
     reveal_type(alias)  # revealed: <special-form 'type[int]'> & TypeName
     reveal_type(alias.__name__)  # revealed: Literal["type"]
     reveal_type(alias.__qualname__)  # revealed: str
-    alias.bit_length  # error: [unresolved-attribute]
+    alias.bit_length  # error: [missing-attribute]
 ```
 
 ## Attributes of arbitrary `GenericAlias` instances
