@@ -1806,7 +1806,7 @@ a = ClassSelector(default=MyClass(), class_=MyClass)
 reveal_type(a)  # revealed: ClassSelector[MyClass]
 
 b = ClassSelector(class_=MyClass)
-reveal_type(b)  # revealed: ClassSelector[MyClass | None]
+reveal_type(b)  # revealed: ClassSelector[None | MyClass]
 
 # Explicit constructor specializations still reject incompatible inferred `self` types.
 ClassSelector[int](class_=MyClass)  # error: [invalid-argument-type]
@@ -1814,7 +1814,7 @@ ClassSelector[int](class_=MyClass)  # error: [invalid-argument-type]
 class RequiredClassSelector(Generic[T]):
     def __init__(self: RequiredClassSelector[CT | None], *, class_: type[CT]) -> None: ...
 
-reveal_type(RequiredClassSelector(class_=MyClass))  # revealed: RequiredClassSelector[MyClass | None]
+reveal_type(RequiredClassSelector(class_=MyClass))  # revealed: RequiredClassSelector[None | MyClass]
 ```
 
 ## Inferring type arguments from a union `self` annotation
@@ -1867,6 +1867,45 @@ reveal_type(Invariant[int | str]())  # revealed: Invariant[int | str]
 Invariant[int]()  # error: [invalid-argument-type]
 Invariant[Never]()  # error: [invalid-argument-type]
 Invariant[object]()  # error: [invalid-argument-type]
+```
+
+## Constructor receiver unions preserve keyword evidence
+
+Both positional and keyword values contribute to the inferred type arguments.
+
+`constructors.pyi`:
+
+```pyi
+from typing import Generic, Iterable, TypeVar, overload
+
+_K = TypeVar("_K")
+_V = TypeVar("_V")
+_T = TypeVar("_T")
+_S = TypeVar("_S")
+
+class D(Generic[_K, _V]):
+    @overload
+    def __init__(self: D[_T, _T], pairs: Iterable[list[_T]], /) -> None: ...
+    @overload
+    def __init__(self: D[_T | str, _T | _S], pairs: Iterable[list[_T]], /, **kwargs: _S) -> None: ...
+
+class E(Generic[_K, _V]):
+    def __init__(self: E[_T | str, _T | _S], pairs: Iterable[list[_T]], /, *, extra: _S) -> None: ...
+```
+
+`main.py`:
+
+```py
+from typing import assert_type
+from constructors import D, E
+
+assert_type(D([["one", 1]]), D[int | str, int | str])
+assert_type(D([["one", 1]], two=2), D[str | int, int | str])
+assert_type(E([["one", 1]], extra=2), E[str | int, int | str])
+
+def distinct_keyword_value(extra: bytes) -> None:
+    assert_type(D([["one", 1]], two=extra), D[str | int, int | str | bytes])
+    assert_type(E([["one", 1]], extra=extra), E[str | int, int | str | bytes])
 ```
 
 ## Constrained type variables in a union `self` annotation
