@@ -9585,8 +9585,16 @@ fn select_paramspec_arguments<'a, 'db>(
         match &mut argument {
             CallArgument::Keywords(argument) => {
                 has_forwarded_argument |= consumed == 0
-                    || matches!(argument, KeywordArgument::Known { types: _, keywords: _ }
-                        | KeywordArgument::Observed { types: _, keywords: _ });
+                    || matches!(
+                        argument,
+                        KeywordArgument::Known {
+                            types: _,
+                            keywords: _
+                        } | KeywordArgument::Observed {
+                            types: _,
+                            keywords: _
+                        }
+                    );
                 argument.remove_prefix_keywords(prefix);
             }
             _ if consumed == 0 => has_forwarded_argument = true,
@@ -13013,8 +13021,8 @@ mod tests {
     use crate::place::global_symbol;
     use crate::types::ApplyTypeMappingVisitor;
     use crate::types::call::arguments::{CallArgumentTypes, KnownKeywords};
-    use crate::types::dictionary::{DictionaryExtraItems, DictionaryItem};
     use crate::types::constraints::resolution::SolutionType::Resolved;
+    use crate::types::dictionary::{DictionaryExtraItems, DictionaryItem};
     use crate::types::generics::TypeVarInferenceSolutions;
 
     #[test]
@@ -13065,11 +13073,17 @@ mod tests {
             anyhow::bail!("expected both source arguments to be matched");
         };
         assert_eq!(
-            prefix_match.iter().map(|parameter| parameter.index).collect::<Vec<_>>(),
+            prefix_match
+                .iter()
+                .map(|parameter| parameter.index)
+                .collect::<Vec<_>>(),
             [0],
         );
         assert_eq!(
-            keywords_match.iter().map(|parameter| parameter.index).collect::<Vec<_>>(),
+            keywords_match
+                .iter()
+                .map(|parameter| parameter.index)
+                .collect::<Vec<_>>(),
             [1],
             "The explicit positional argument already supplied the wrapper prefix",
         );
@@ -13093,7 +13107,10 @@ mod tests {
         let values = keywords.residual_values(&db, &env);
         assert_eq!(values, forwarded);
         assert_eq!(keywords.residual_value(&db, Some("prefix"), values), None);
-        assert_eq!(keywords.residual_value(&db, Some("value"), values), Some(forwarded));
+        assert_eq!(
+            keywords.residual_value(&db, Some("value"), values),
+            Some(forwarded)
+        );
         Ok(())
     }
 
