@@ -1776,6 +1776,10 @@ impl TypeCheckDiagnostics {
             used_suppressions: incoming_suppressions,
             shared_body_diagnostics: incoming_shared,
         } = other;
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "SourceFile excludes its lazy line-index cache from Eq and Hash"
+        )]
         let mut positions: rustc_hash::FxHashMap<Diagnostic, usize> = diagnostics
             .iter()
             .cloned()

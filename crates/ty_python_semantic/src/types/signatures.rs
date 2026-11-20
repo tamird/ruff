@@ -2510,7 +2510,7 @@ impl<'db> Signature<'db> {
             .and_then(|constraints| {
                 constraints.apply_type_mapping(
                     db,
-                    &self_mapping,
+                    self_mapping,
                     TypeContext::default(),
                     &self_visitor,
                     inferable,
@@ -8459,7 +8459,9 @@ mod tests {
             .expect("nullable implementation inputs admit a complete specialization");
         match prepared_nullable.implementation_parameters_consistency_with(&db, &env, generic) {
             ParameterConsistency::Consistent => {}
-            ParameterConsistency::Inconsistent(_) => panic!("expected nullable inputs to cover the generic overload"),
+            ParameterConsistency::Inconsistent(_) => {
+                panic!("expected nullable inputs to cover the generic overload")
+            }
         }
         // Implementation return annotations may be broader than the overload's result.
         match prepared_nullable.implementation_return_type_consistency_with(&db, &env, generic) {
@@ -8486,7 +8488,13 @@ mod tests {
                 ReturnTypeConsistency::Inconsistent(_) => {}
             }
         }
-        for name in ["return_only", "default_only", "bounded", "variadic", "method"] {
+        for name in [
+            "return_only",
+            "default_only",
+            "bounded",
+            "variadic",
+            "method",
+        ] {
             assert!(
                 !signature(name).supports_overload_implementation_consistency_with(
                     &db,
