@@ -1273,7 +1273,11 @@ mod tests {
                 "return use(42)",
                 "invalid-argument-type",
             ),
-            ("return use(override)", "return 42", "invalid-explicit-return"),
+            (
+                "return use(override)",
+                "return 42",
+                "invalid-explicit-return",
+            ),
             (
                 "ctx.value",
                 "ctx.value  # ty: ignore[unresolved-attribute]",
@@ -4218,7 +4222,9 @@ mod tests {
                         diagnostics
                             .diagnostics()
                             .iter()
-                            .filter(|diagnostic| diagnostic.id().as_str() == "invalid-explicit-return")
+                            .filter(
+                                |diagnostic| diagnostic.id().as_str() == "invalid-explicit-return"
+                            )
                             .count(),
                         usize::from(index == 1 && replacement == "42"),
                         "{replacement}; domain {index}: {diagnostics:#?}"
