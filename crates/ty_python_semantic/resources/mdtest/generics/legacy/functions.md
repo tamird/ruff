@@ -4433,6 +4433,33 @@ def forward_nominal_reversed(specific: Callable[[SNominal], None], redundant: Ca
     return result
 ```
 
+Passing `join` to `apply` should preserve the type variable of `compose` in `Selected`.
+
+```py
+from typing import Generic
+
+Result = TypeVar("Result")
+Part = TypeVar("Part")
+Joined = TypeVar("Joined", str, list[str], object)
+Caller = TypeVar("Caller", str, list[str], object)
+
+class Selected(Generic[Result]): ...
+
+def make(value: Part) -> Selected[Part]:
+    return Selected()
+
+def join(result: Selected[Joined], part: Joined | Selected[Joined]) -> Selected[Joined]:
+    return result
+
+def apply(value: Part, make: Callable[[Part], Result], join: Callable[[Result, Part | Result], Result]) -> Result:
+    return make(value)
+
+def compose(value: Caller) -> Selected[Caller]:
+    return apply(value, make, join)
+
+reveal_type(compose("x"))  # revealed: Selected[str]
+```
+
 ## Incompatible constraint sets
 
 But a constrained TypeVar with constraints not satisfied by the formal TypeVar should still error:
