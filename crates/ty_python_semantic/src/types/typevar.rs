@@ -2940,11 +2940,7 @@ mod tests {
         );
         // When an original occurrence does collide, the new nonce must also avoid the
         // existing fresh occurrence, whose domain changed along with its nonce.
-        let delta = freshening_delta(
-            db,
-            [Type::TypeVar(t), Type::TypeVar(fresh_t)],
-            both_context,
-        );
+        let delta = freshening_delta(db, [Type::TypeVar(t), Type::TypeVar(fresh_t)], both_context);
         assert_eq!(delta, Some(TypeVarNonce::FIRST.increment().value()));
         let next_mapping = TypeMapping::FreshenBoundTypeVars {
             generic_context: both_context,

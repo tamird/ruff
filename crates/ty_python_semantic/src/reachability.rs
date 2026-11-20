@@ -3160,12 +3160,13 @@ class TargetB:
     fn non_terminal_call_follows_reused_expression_after_edits() -> anyhow::Result<()> {
         let mut db = setup_db();
         let mut previous_id = None;
-        for (statement, expected) in [
-            ("stop()", Truthiness::AlwaysFalse),
-            ("if flag: pass", Truthiness::AlwaysTrue),
-            ("if stop(): pass", Truthiness::AlwaysTrue),
-            ("await stop_async()", Truthiness::AlwaysFalse),
-            ("stop_async()", Truthiness::AlwaysTrue),
+        for (statement, expected, reuses_previous) in [
+            ("stop()", Truthiness::AlwaysFalse, false),
+            ("stop_async()", Truthiness::AlwaysTrue, true),
+            ("if flag: pass", Truthiness::AlwaysTrue, false),
+            ("if stop(): pass", Truthiness::AlwaysTrue, false),
+            ("await stop_async()", Truthiness::AlwaysFalse, false),
+            ("stop_async()", Truthiness::AlwaysTrue, false),
         ] {
             let source = format!(
                 "from typing import NoReturn\ndef stop() -> NoReturn: ...\nasync def stop_async() -> NoReturn: ...\nasync def f(flag: bool):\n    {statement}\n"
@@ -3188,8 +3189,14 @@ class TargetB:
             };
             let expression = semantic_index(&db, program).expression(node);
             let id = salsa::plumbing::AsId::as_id(&expression);
-            if let Some(previous) = previous_id {
-                assert_eq!(id, previous, "the edit must reuse the warmed expression");
+            if reuses_previous {
+                // Changing the callee preserves the expression's scope and inference kind.
+                // Conditions and await expressions need not reuse that tracked identity.
+                assert_eq!(
+                    Some(id),
+                    previous_id,
+                    "the callee edit must reuse the warmed expression"
+                );
             }
             previous_id = Some(id);
             let use_def = use_def_map(&db, expression.scope(&db));

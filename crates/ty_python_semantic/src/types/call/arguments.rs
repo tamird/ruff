@@ -18,11 +18,11 @@ use crate::FxIndexMap;
 use crate::ProgramEnvironment;
 use crate::subscript::PyIndex;
 use crate::types::tuple::{TupleLength, TupleSpec};
-use crate::types::typevar::ParamSpecAttrKind;
 use crate::types::type_expansion::expand_elements;
 use crate::types::typed_dict::{
     TypedDictOpenness, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
 };
+use crate::types::typevar::ParamSpecAttrKind;
 use crate::types::{Parameter, Type, TypeContext, UnionType, expand_type};
 
 /// Maximum total number of expanded argument type combinations across all arguments
