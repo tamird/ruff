@@ -261,11 +261,7 @@ pub(super) fn attribute_setattr_member<'db>(
             } else {
                 receiver
             };
-            Type::BoundMethod(method.with_receivers(
-                db,
-                receiver,
-                method.signature_receiver(db),
-            ))
+            Type::BoundMethod(method.with_receivers(db, receiver, method.signature_receiver(db)))
         }
         _ => ty,
     };

@@ -441,9 +441,13 @@ impl<'db> ConstructorBinding<'db> {
                 Some(
                     inference.merged_specialization_with(db, |typevar, inferred| {
                         if inferred.is_none()
-                            && class_specialization.types(db).contains(&Type::TypeVar(typevar))
+                            && class_specialization
+                                .types(db)
+                                .contains(&Type::TypeVar(typevar))
                         {
-                            TypeVarProjection::Override(Type::Dynamic(DynamicType::UnspecializedTypeVar))
+                            TypeVarProjection::Override(Type::Dynamic(
+                                DynamicType::UnspecializedTypeVar,
+                            ))
                         } else {
                             TypeVarProjection::Inferred
                         }

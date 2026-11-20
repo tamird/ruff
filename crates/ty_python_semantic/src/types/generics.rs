@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 use crate::types::callable::walk_callable_type;
 use crate::types::class::ClassType;
 use crate::types::class_base::ClassBase;
-use crate::types::constraints::projection::{ProjectionError, SolutionBudget, SolutionProjection};
+use crate::types::constraints::projection::{ProjectionBudget, ProjectionError, SolutionBudget, SolutionProjection};
 use crate::types::constraints::resolution::{
     SolutionType, resolve_merged_solution, resolve_solution,
 };
@@ -3171,12 +3171,13 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     ) -> Result<TypeVarInference<'db>, Vec<SpecializationError<'db>>> {
         let db = self.db;
         let mut specialization_errors = Vec::new();
+        let mut resources = ProjectionBudget::new(budget);
         let mut inference = self.solve_pending_projection(choose, |builder, choose| {
-            let solutions = builder.pending.solutions_with(
+            let solutions = builder.pending.solutions_with_shared_budget(
                 db,
                 builder.env,
                 builder.inferable,
-                budget,
+                &mut resources,
                 report_diagnostics,
                 |_variance, path_bound| {
                     choose(path_bound.bound_typevar, Some(path_bound)).unwrap_or_else(|| {
@@ -3239,23 +3240,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         })
         .map_err(|()| specialization_errors)?;
 
-        if matches!(
-            &inference.solutions,
-            Err(TypeVarInferenceFallback::Variadic)
-        ) && self
-            .generic_context
-            .variables(db)
-            .any(|variable| variable.is_paramspec(db))
-        {
-            match self.infer_keyword_components(&mut inference.merged_types, budget) {
-                Ok(true) => {}
-                Ok(false) => return Err(Vec::new()),
-                Err(_) => {
-                    inference.solutions =
-                        Err(TypeVarInferenceFallback::UnverifiedKeywordProjection);
-                }
-            }
-        }
+        inference = self.complete_keyword_projection_paths(inference, &mut resources)?;
 
         Ok(self.finish_inference(inference, budget))
     }
@@ -3363,21 +3348,159 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         Ok(inference)
     }
 
+    fn complete_keyword_projection_paths(
+        &self,
+        mut inference: PendingInference<'db, SolutionPaths<'db>>,
+        resources: &mut ProjectionBudget,
+    ) -> Result<PendingInference<'db, SolutionPaths<'db>>, Vec<SpecializationError<'db>>> {
+        let db = self.db;
+        if matches!(inference.solutions, Err(TypeVarInferenceFallback::BudgetExceeded))
+            && self.has_missing_keyword_components(&FxHashMap::default())
+        {
+            // Unknown recovery bindings are not complete ParamSpec witnesses. Do not
+            // restart the exhausted search to try to construct one.
+            inference.solutions = Err(TypeVarInferenceFallback::UnverifiedKeywordProjection);
+            return Ok(inference);
+        }
+        let required = match &inference.solutions {
+            Ok(paths) => {
+                if paths.as_slice().is_empty() {
+                    self.has_missing_keyword_components(&inference.merged_types)
+                } else {
+                    paths.as_slice().iter().any(|path| {
+                        let types = path.solved_typevars.iter().map(|binding| {
+                            (binding.bound_typevar.identity(db), binding.solution)
+                        }).collect();
+                        self.has_missing_keyword_components(&types)
+                    })
+                }
+            }
+            Err(_) => self.has_missing_keyword_components(&inference.merged_types),
+        };
+        if !required {
+            return Ok(inference);
+        }
+        match inference.solutions {
+            Ok(paths) => {
+                let (paths, mut incomplete) = match paths {
+                    SolutionPaths::Complete(paths) => (paths, false),
+                    SolutionPaths::Incomplete(paths) => (paths, true),
+                };
+                let mut unverified = incomplete;
+                let mut completed = Vec::with_capacity(paths.len());
+                let mut merged_types = FxHashMap::default();
+                for mut path in paths {
+                    let mut types = path.solved_typevars.iter().map(|binding| {
+                        (binding.bound_typevar.identity(db), binding.solution)
+                    }).collect();
+                    match self.infer_keyword_components(&mut types, &path.solved_typevars, resources) {
+                        Ok(true) => {
+                            for variable in self.generic_context.variables(db) {
+                                if !path.solved_typevars.iter().any(|binding| {
+                                    binding.bound_typevar.identity(db) == variable.identity(db)
+                                }) && let Some(solution) = types.get(&variable.identity(db)) {
+                                    path.solved_typevars.push(TypeVarSolution {
+                                        bound_typevar: variable,
+                                        solution: *solution,
+                                    });
+                                }
+                            }
+                            self.merge_solution(&mut merged_types, &path.solved_typevars);
+                            completed.push(path);
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            // An unverified whole signature cannot certify this path. Keep
+                            // already completed paths, but do not claim they are exhaustive.
+                            incomplete = true;
+                            unverified = true;
+                        }
+                    }
+                }
+                if unverified {
+                    // Unvisited alternatives can contain wider caller bindings than the
+                    // completed witnesses. Keep the family, but do not narrow its projection.
+                    merged_types = self.unknown_type_mappings(self.generic_context);
+                } else {
+                    for (identity, variable) in self.generic_context.variables_inner(db) {
+                        if let Some(ty) = merged_types.get_mut(identity) {
+                            *ty = self.remove_inferable_typevar_artifacts_from_solution(*variable, *ty);
+                        }
+                    }
+                }
+                if completed.is_empty() && unverified {
+                    inference.merged_types = merged_types;
+                    inference.solutions = Err(TypeVarInferenceFallback::UnverifiedKeywordProjection);
+                    return Ok(inference);
+                }
+                if completed.is_empty() && !incomplete {
+                    return Err(Vec::new());
+                }
+                inference.merged_types = merged_types;
+                inference.solutions = Ok(if incomplete {
+                    SolutionPaths::Incomplete(completed)
+                } else {
+                    SolutionPaths::Complete(completed)
+                });
+            }
+            Err(reason) => {
+                // Compatibility mappings have no retained correlation to extend. Preserve
+                // their classification while requiring the same complete-signature proof.
+                if reason == TypeVarInferenceFallback::BudgetExceeded {
+                    if self.has_missing_keyword_components(&inference.merged_types) {
+                        inference.solutions = Err(TypeVarInferenceFallback::UnverifiedKeywordProjection);
+                    } else {
+                        inference.solutions = Err(reason);
+                    }
+                } else {
+                    let mut seen = FxHashSet::default();
+                    let fixed = self.generic_context.variables(db).chain(
+                        self.pending.referenced_typevars(db, |_| true).iter(db),
+                    ).filter_map(|variable| {
+                        inference.merged_types.get(&variable.identity(db)).map(|solution| {
+                            TypeVarSolution { bound_typevar: variable, solution: *solution }
+                        })
+                    }).filter(|binding| seen.insert(binding.bound_typevar.identity(db)))
+                        .collect::<Vec<_>>();
+                    match self.infer_keyword_components(&mut inference.merged_types, &fixed, resources) {
+                        Ok(true) => inference.solutions = Err(reason),
+                        Ok(false) => return Err(Vec::new()),
+                        Err(_) => inference.solutions = Err(TypeVarInferenceFallback::UnverifiedKeywordProjection),
+                    }
+                }
+            }
+        }
+        Ok(inference)
+    }
+
+    fn missing_keyword_components(
+        &self,
+        types: &FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
+    ) -> TypeVarSet<'db> {
+        self.pending.referenced_typevars(self.db, |variable| {
+            variable.is_keyword_parameters(self.db)
+                && variable.paramspec_base(self.db).is_inferable(self.db, self.inferable)
+                && !types.contains_key(&variable.paramspec_base(self.db).identity(self.db))
+        })
+    }
+
+    fn has_missing_keyword_components(
+        &self,
+        types: &FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
+    ) -> bool {
+        self.missing_keyword_components(types) != TypeVarSet::None
+    }
+
     /// Infers complete signatures from keyword-only evidence. `false` proves the call
     /// constraints unsatisfiable; an error leaves their satisfiability unknown.
     fn infer_keyword_components(
         &self,
         types: &mut FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
-        budget: SolutionBudget,
+        fixed: &[TypeVarSolution<'db>],
+        resources: &mut ProjectionBudget,
     ) -> Result<bool, ProjectionError> {
         let db = self.db;
-        let components = self.pending.referenced_typevars(db, |variable| {
-            if !variable.is_keyword_parameters(db) {
-                return false;
-            }
-            let base = variable.paramspec_base(db);
-            base.is_inferable(db, self.inferable) && !types.contains_key(&base.identity(db))
-        });
+        let components = self.missing_keyword_components(types);
         if components == TypeVarSet::None {
             return Ok(true);
         }
@@ -3385,18 +3508,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             .iter(db)
             .map(|component| (component, component.paramspec_base(db)))
             .collect();
-        let fixed: Vec<_> = self
-            .generic_context
-            .variables(db)
-            .filter_map(|bound_typevar| {
-                types
-                    .get(&bound_typevar.identity(db))
-                    .map(|solution| TypeVarSolution {
-                        bound_typevar,
-                        solution: *solution,
-                    })
-            })
-            .collect();
+        let fixed = fixed.to_vec();
         let remaining = TypeVarSet::from_typevars(
             db,
             self.inferable.iter(db).filter(|variable| {
@@ -3424,7 +3536,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             db,
             self.env,
             candidate_variables,
-            budget,
+            resources,
             |solved, type_budget| {
                 let mut bindings = fixed.clone();
                 bindings.extend(
@@ -3434,9 +3546,12 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                         .filter(|binding| binding.bound_typevar.is_inferable(db, remaining)),
                 );
                 for (component, base) in &bases {
-                    let Some(binding) = solved
+                    let Some(binding) = fixed
                         .iter()
-                        .find(|binding| binding.bound_typevar.is_same_typevar_as(db, *component))
+                        .find(|binding| binding.bound_typevar.identity(db) == component.identity(db))
+                        .or_else(|| solved.iter().find(|binding| {
+                            binding.bound_typevar.identity(db) == component.identity(db)
+                        }))
                     else {
                         return Ok(None);
                     };
@@ -4564,7 +4679,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 ty.as_typevar().is_some_and(|typevar| {
                     typevar.is_paramspec(db)
                         && typevar
-                            .without_paramspec_attr(db)
+                            .paramspec_base(db)
                             .is_inferable(db, self.inferable)
                 })
             })
@@ -6072,6 +6187,66 @@ mod tests {
     }
 
     #[test]
+    fn keyword_projection_completion_preserves_native_correlations() -> anyhow::Result<()> {
+        use crate::types::signatures::Parameter;
+        use crate::types::typevar::KeywordProjection;
+
+        let mut db = setup_db();
+        db.write_dedented("/src/a.py", "def f[T, **P](): ...")?;
+        let db = &db;
+        let env = db.program_environment();
+        let context = function_context(db, "f")?;
+        let (value, paramspec) = context.variables(db).collect_tuple()
+            .ok_or_else(|| anyhow::anyhow!("expected T and P"))?;
+        let int = KnownClass::Int.to_instance(db, &env);
+        let string = KnownClass::Str.to_instance(db, &env);
+        let signature = |ty| Type::paramspec_value_callable(db, Parameters::standard([
+            Parameter::keyword_only(Name::new_static("key")).with_annotated_type(ty),
+        ]));
+        let first = signature(int);
+        let second = signature(string);
+        let first_shape = first.keyword_projection(db, &env, KeywordProjection::Parameters)
+            .ok_or_else(|| anyhow::anyhow!("expected first keyword shape"))?;
+        let second_shape = second.keyword_projection(db, &env, KeywordProjection::Parameters)
+            .ok_or_else(|| anyhow::anyhow!("expected second keyword shape"))?;
+        for whole_paramspec in [false, true] {
+            let constraints = ConstraintSetBuilder::new();
+            let arm = |ty, full, shape| {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &constraints, ConstraintProvenance::INFERRED, value, ty,
+                ).and(db, &constraints, || {
+                    ConstraintSet::constrain_typevar_equivalence_bound(
+                        db, &env, &constraints, ConstraintProvenance::INFERRED,
+                        if whole_paramspec { paramspec } else { paramspec.keyword_parameters(db) },
+                        if whole_paramspec { full } else { shape },
+                    )
+                })
+            };
+            let relation = arm(int, first, first_shape).or(db, &constraints, || {
+                arm(string, second, second_shape)
+            });
+            let mut builder = SpecializationBuilder::new(db, &env, &constraints, context);
+            builder.record_constraint_set(relation);
+            let inference = builder.build_inference_with(ReportDiagnostics::No, |_, _| None)
+                .map_err(|_| anyhow::anyhow!("expected both complete alternatives"))?;
+            let TypeVarInferenceSolutions::Alternatives(paths) = inference.solutions(db) else {
+                anyhow::bail!("expected correlated alternatives, got {:?}", inference.solutions(db));
+            };
+            let mut actual = FxHashSet::default();
+            for path in paths {
+                let [Some(SolutionType::Resolved(value)), Some(SolutionType::Resolved(paramspec))] = path.as_ref() else {
+                    anyhow::bail!("expected complete T and P bindings: {path:?}");
+                };
+                let shape = paramspec.keyword_projection(db, &env, KeywordProjection::Parameters)
+                    .ok_or_else(|| anyhow::anyhow!("expected complete ParamSpec witness"))?;
+                actual.insert((*value, shape));
+            }
+            assert_eq!(actual, FxHashSet::from_iter([(int, first_shape), (string, second_shape)]));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn keyword_projection_exhaustion_is_not_a_verified_signature() -> anyhow::Result<()> {
         use crate::types::signatures::Parameter;
         use crate::types::typevar::{KeywordProjection, TypeVarNonce};
@@ -6116,6 +6291,7 @@ mod tests {
                     visits: 0,
                     ..SolutionBudget::default()
                 },
+                ReportDiagnostics::No,
                 &mut |_, _| None,
             )
             .map_err(|_| anyhow::anyhow!("exhaustion must retain an incomplete inference"))?;
@@ -6126,7 +6302,7 @@ mod tests {
             )
         );
         let inferred = builder
-            .build_inference_with(|_, _| None)
+            .build_inference_with(ReportDiagnostics::No, |_, _| None)
             .map_err(|_| anyhow::anyhow!("expected a verified keyword signature"))?;
         assert_eq!(
             inferred.merged_types(db)[0].and_then(|ty| ty.keyword_projection(
@@ -6549,7 +6725,7 @@ mod tests {
                 .variables(db)
                 .map(|variable| Some(Type::TypeVar(variable)))
                 .collect::<Box<[_]>>(),
-            TypeVarInferenceSolutions::Unavailable(TypeVarInferenceFallback::Variadic),
+            TypeVarInferenceSolutions::Unavailable(TypeVarInferenceFallback::TypeVarTuple),
         );
         assert_eq!(
             inference.merged_specialization(db),

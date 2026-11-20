@@ -20,7 +20,7 @@ use crate::types::diagnostic::autofix_with_literal;
 use crate::types::generics::GenericContext;
 use crate::types::infer::{InferenceFlags, TypeExpressionFlags, infer_definition_types};
 use crate::types::signatures::function_signature_annotation_info;
-use crate::types::{Type, DeclaredType};
+use crate::types::{DeclaredType, Type};
 
 use super::context::InferContext;
 
