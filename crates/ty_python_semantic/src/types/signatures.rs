@@ -3762,7 +3762,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             )
             && source.has_supported_declared_domain(db, env)
             && target.supports_specialization(db, |ty| ty.is_fully_static_except_any(db, env))
-            && let Some(proved) = self.check_declared_domain_specialization(db, source, target)
+            && let Some(proved) = self.check_source_specialization(db, source, target)
         {
             return ConstraintSet::from_bool(self.constraints, proved);
         }
@@ -3865,6 +3865,18 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 })
         });
 
+        // LazyStatic cannot compare a source type variable with a caller's bounded or
+        // constrained type variable. Try one source substitution for the whole signature;
+        // it must pass the strict check for every parameter and the return.
+        if self.inferable == TypeVarSet::None
+            && self.typevar_evaluation == TypeVarEvaluation::Eager
+            && checker.typevar_evaluation == TypeVarEvaluation::LazyStatic
+            && when.is_trivially_never_satisfied()
+            && let Some(proved) = self.check_source_specialization(db, source, target)
+        {
+            return ConstraintSet::from_bool(self.constraints, proved);
+        }
+
         // But the caller does not need to consider those extra typevars. Whatever constraint set
         // we produce, we reduce it back down to the inferable set that the caller asked about.
         // If we introduced new inferable typevars, those will be existentially quantified away
@@ -3874,7 +3886,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 
     /// Compare a complete source specialization while preserving rigid target variables.
     /// An unsupported or incomplete search leaves the existing relation path responsible.
-    fn check_declared_domain_specialization(
+    fn check_source_specialization(
         &self,
         db: &'db dyn Db,
         source: &Signature<'db>,
