@@ -1,0 +1,22 @@
+---
+source: crates/ty_python_semantic/src/types/infer/body_domain.rs
+expression: "DisplayDiagnostics::new(&db, &DisplayDiagnosticConfig::new(\"ty\").context(0),\n&diagnostics,)"
+---
+error[invalid-return-type]: Return type does not match returned value
+ --> src/body.py:7:12
+  |
+3 | def f(flag: Literal[True]) -> int: ...
+  |                               --- Expected `int` because of return type
+4 | @overload
+5 | def f(flag: Literal[False]) -> str: ...
+6 | def f(flag: bool) -> int | str | bytes:
+7 |     return b'wrong'
+  |            ^^^^^^^^ expected `int`, found `Literal[b"wrong"]`
+info: Return type does not match returned value
+ --> src/body.py:7:12
+  |
+5 | def f(flag: Literal[False]) -> str: ...
+  |                                --- Expected `str` because of return type
+6 | def f(flag: bool) -> int | str | bytes:
+7 |     return b'wrong'
+  |            ^^^^^^^^ expected `str`, found `Literal[b"wrong"]`

@@ -836,7 +836,10 @@ impl<'db> BoundSuperType<'db> {
             Type::KnownInstance(instance) => {
                 return delegate_to(instance.instance_fallback(db, env));
             }
-            Type::FunctionLiteral(_) | Type::DataclassDecorator(_) => {
+            Type::FunctionLiteral(function) => {
+                return delegate_to(function.runtime_class(db).to_instance(db, env));
+            }
+            Type::DataclassDecorator(_) => {
                 return delegate_to(KnownClass::FunctionType.to_instance(db, env));
             }
             Type::WrapperDescriptor(_) => {
@@ -941,8 +944,11 @@ impl<'db> BoundSuperType<'db> {
         attribute: PlaceAndQualifiers<'db>,
     ) -> Option<MemberLookupResult<'db>> {
         let (instance, owner) = self.owner(db).descriptor_binding(db, env)?;
-        let (member, _, descriptor_error) =
-            Type::try_call_dunder_get_on_attribute(db, env, attribute, instance, owner);
+        let super::DescriptorAttributeOutcome {
+            member,
+            kind: _,
+            error: descriptor_error,
+        } = Type::try_call_dunder_get_on_attribute(db, env, attribute, instance, owner);
         Some(member_lookup_result(
             db,
             member,

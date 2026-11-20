@@ -1,13 +1,17 @@
 //! Bounded projections of correlated constraint solutions.
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::ops::ControlFlow;
 
 use super::{
-    CandidateSearch, CandidateSolutions, CandidateTypeVarSolution, ConstraintSet,
-    PathBoundSolution, ReportDiagnostics, Solutions, TypeVarSolution,
+    ALWAYS_FALSE, ALWAYS_TRUE, BoundedSolutionLimits, CandidateSearch, CandidateSolutions, CandidateTypeVarSolution,
+    ConstraintId, ConstraintSet, PathBoundSolution, ReportDiagnostics, SolutionLimits, Solutions, TypeVarSolution,
 };
 use crate::types::typevar::TypeVarSet;
-use crate::types::{Type, TypeVarVariance};
+use crate::types::{
+    ApplySpecialization, ApplyTypeMappingVisitor, GenericContext, Type, TypeContext, TypeMapping,
+    TypeVarVariance,
+};
 use crate::{Db, ProgramEnvironment};
 
 /// Limits for one projection, including preprocessing, path collection, and its result.
@@ -15,7 +19,7 @@ use crate::{Db, ProgramEnvironment};
 pub(crate) struct SolutionBudget {
     /// Satisfied paths collected before per-variable solution selection can reject them.
     pub(crate) paths: usize,
-    /// Interior and terminal visits, shared by preprocessing and path collection.
+    /// Interior and terminal visits, shared by preprocessing, path collection, and validation.
     pub(crate) visits: usize,
     /// Set-theoretic terms contributed to the result, including terms exposed by aliases.
     /// Also bounds storage when retaining alternatives.
@@ -68,6 +72,14 @@ impl ProjectionTypeBudget {
         Self { remaining }
     }
 
+    pub(crate) fn charge_items(&mut self, count: usize) -> Result<(), ProjectionError> {
+        self.remaining = self
+            .remaining
+            .checked_sub(count)
+            .ok_or(ProjectionError::TypeBudgetExceeded)?;
+        Ok(())
+    }
+
     /// Charges the set-theoretic terms that a type constructor may flatten or inspect. Aliases
     /// are included so a large union cannot evade the limit by being hidden behind a name.
     pub(crate) fn charge_type<'db>(
@@ -84,10 +96,7 @@ impl ProjectionTypeBudget {
         ty: Type<'db>,
         seen_aliases: &mut FxHashSet<Type<'db>>,
     ) -> Result<(), ProjectionError> {
-        self.remaining = self
-            .remaining
-            .checked_sub(1)
-            .ok_or(ProjectionError::TypeBudgetExceeded)?;
+        self.charge_items(1)?;
         match ty {
             Type::Union(union) => {
                 for element in union.elements(db) {
@@ -115,21 +124,39 @@ impl<'db> CandidateSolutions<'db> {
     pub(super) fn solve_with_budget(
         &self,
         db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         budget: SolutionBudget,
+        limits: &mut BoundedSolutionLimits,
         choose: impl FnMut(TypeVarVariance, &CandidateTypeVarSolution<'db>) -> PathBoundSolution<'db>,
     ) -> Result<Solutions<'db>, ProjectionError> {
         let mut type_budget = ProjectionTypeBudget::new(budget.type_terms);
-        self.try_solve_with(choose, |solution| {
-            for violation in solution.violations() {
-                for evidence in violation.evidence_types() {
-                    type_budget.charge_type(db, *evidence)?;
+        match self.try_solve_with(
+            db,
+            env,
+            limits,
+            &mut type_budget,
+            choose,
+            |solution, type_budget| {
+                let mut charge = || {
+                    for violation in solution.violations() {
+                        for evidence in violation.evidence_types() {
+                            type_budget.charge_type(db, *evidence)?;
+                        }
+                    }
+                    for binding in &solution.solved_typevars {
+                        type_budget.charge_type(db, binding.solution)?;
+                    }
+                    Ok(())
+                };
+                match charge() {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(error) => ControlFlow::Break(error),
                 }
-            }
-            for binding in &solution.solved_typevars {
-                type_budget.charge_type(db, binding.solution)?;
-            }
-            Ok(())
-        })
+            },
+        ) {
+            ControlFlow::Continue(solutions) => Ok(solutions),
+            ControlFlow::Break(error) => Err(error),
+        }
     }
 }
 
@@ -153,6 +180,198 @@ impl<'db> ConstraintSet<'db, '_> {
         )
     }
 
+    pub(super) fn bounded_path_bounds(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        inferable: TypeVarSet<'db>,
+        budget: SolutionBudget,
+        search: CandidateSearch,
+    ) -> Result<(CandidateSolutions<'db>, BoundedSolutionLimits), ProjectionError> {
+        let mut limits = BoundedSolutionLimits {
+            remaining_paths: budget.paths,
+            remaining_visits: budget.visits,
+        };
+        let paths = CandidateSolutions::compute_with_limits(
+            db,
+            env,
+            &mut self.builder.storage.borrow_mut(),
+            self.node,
+            inferable,
+            self.source_order,
+            &mut limits,
+            super::variables::UnspecializedTypeVarPolicy::Ignore,
+            search,
+        );
+        match paths {
+            ControlFlow::Continue(paths) => Ok((paths, limits)),
+            ControlFlow::Break(error) => Err(error),
+        }
+    }
+
+    /// Projects a solution into a specialization and proves it against the complete relation.
+    /// Unspecialized variables stay rigid. Path discovery and proof share one traversal budget;
+    /// the projection callback charges its constructed result against the shared type budget.
+    /// An unproved witness or exhausted search is incomplete. `None` proves the relation
+    /// unsatisfiable.
+    pub(crate) fn find_verified_specialization(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        inferable: TypeVarSet<'db>,
+        budget: SolutionBudget,
+        mut project: impl FnMut(
+            &[TypeVarSolution<'db>],
+            &mut ProjectionTypeBudget,
+        ) -> Result<Option<Vec<TypeVarSolution<'db>>>, ProjectionError>,
+        fallback: Vec<TypeVarSolution<'db>>,
+    ) -> Result<Option<Vec<TypeVarSolution<'db>>>, ProjectionError> {
+        let (path_bounds, mut limits) = self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(ReportDiagnostics::No))?;
+        let (inferable, paths, incomplete) = match path_bounds {
+            CandidateSolutions::Unsatisfiable => return Ok(None),
+            CandidateSolutions::Unconstrained => return Err(ProjectionError::IncompleteSolution),
+            CandidateSolutions::Constrained {
+                inferable,
+                paths,
+                incomplete,
+            } => (inferable, paths, incomplete),
+        };
+        if incomplete {
+            return Err(ProjectionError::IncompleteSolution);
+        }
+
+        let mut type_budget = ProjectionTypeBudget::new(budget.type_terms);
+        let verify = |bindings: &[TypeVarSolution<'db>],
+                      limits: &mut BoundedSolutionLimits,
+                      type_budget: &mut ProjectionTypeBudget| {
+            for binding in bindings {
+                if let Err(error) = type_budget.charge_type(db, binding.solution) {
+                    return ControlFlow::Break(error);
+                }
+            }
+            self.prove_specialization(db, env, bindings, limits, type_budget)
+        };
+
+        for path in paths {
+            let solution = CandidateSolutions::solve_path_with(
+                db,
+                env,
+                inferable,
+                &path,
+                &mut limits,
+                &mut type_budget,
+                &mut |_, bound| CandidateSolutions::default_solve(db, env, self.builder, bound),
+            );
+            let Some((solution, incomplete)) = (match solution {
+                ControlFlow::Continue(solution) => solution,
+                ControlFlow::Break(error) => return Err(error),
+            }) else {
+                continue;
+            };
+            if incomplete {
+                return Err(ProjectionError::IncompleteSolution);
+            }
+            if !solution.is_valid() {
+                continue;
+            }
+            let Some(bindings) = project(&solution.solved_typevars, &mut type_budget)? else {
+                continue;
+            };
+            match verify(&bindings, &mut limits, &mut type_budget) {
+                ControlFlow::Continue(true) => return Ok(Some(bindings)),
+                ControlFlow::Continue(false) => {}
+                ControlFlow::Break(error) => return Err(error),
+            }
+        }
+        match verify(&fallback, &mut limits, &mut type_budget) {
+            ControlFlow::Continue(true) => Ok(Some(fallback)),
+            ControlFlow::Continue(false) => Err(ProjectionError::IncompleteSolution),
+            ControlFlow::Break(error) => Err(error),
+        }
+    }
+
+    /// Proves a sufficient condition for a specialization directly on the original decision
+    /// graph. The traversal budget bounds original node visits and the number of mapped atoms.
+    /// Mapping uses ordinary type relation evaluation. Each mapped result is inspected only at
+    /// its root; unresolved correlations and quantified atoms remain unproved.
+    fn prove_specialization(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        bindings: &[TypeVarSolution<'db>],
+        limits: &mut BoundedSolutionLimits,
+        type_budget: &mut ProjectionTypeBudget,
+    ) -> ControlFlow<ProjectionError, bool> {
+        let context = GenericContext::from_typevar_instances(
+            db,
+            env,
+            bindings.iter().map(|binding| binding.bound_typevar),
+        );
+        let types: Vec<_> = bindings.iter().map(|binding| binding.solution).collect();
+        let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Partial {
+            generic_context: context,
+            types: &types,
+            skip: None,
+        });
+        let visitor = ApplyTypeMappingVisitor::new(env);
+        let mut proven = FxHashMap::from_iter([(ALWAYS_TRUE, true), (ALWAYS_FALSE, false)]);
+        let mut atomic_proofs: FxHashMap<(ConstraintId, bool), bool> = FxHashMap::default();
+        let mut pending = vec![(self.node, false)];
+        while let Some((node, expanded)) = pending.pop() {
+            if proven.contains_key(&node) {
+                continue;
+            }
+            let interior = self.builder.storage.borrow().interior_node_data(node);
+            if !expanded {
+                limits.visit_node()?;
+                pending.push((node, true));
+                pending.extend(
+                    [interior.if_false, interior.if_true, interior.if_uncertain]
+                        .into_iter()
+                        .map(|child| (child, false)),
+                );
+                continue;
+            }
+            let holds = if proven[&interior.if_uncertain] {
+                true
+            } else {
+                match (proven[&interior.if_true], proven[&interior.if_false]) {
+                    (true, true) => true,
+                    (false, false) => false,
+                    (true, false) | (false, true) => {
+                        // The chosen child suffices only if the opposite condition is impossible.
+                        let value = proven[&interior.if_true];
+                        match atomic_proofs.entry((interior.constraint, value)) {
+                            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let Some(atomic) = self
+                                    .builder
+                                    .storage
+                                    .borrow()
+                                    .constraint_data(interior.constraint)
+                                    .as_atomic()
+                                else {
+                                    proven.insert(node, false);
+                                    continue;
+                                };
+                                for ty in atomic.types() {
+                                    if let Err(error) = type_budget.charge_type(db, ty) {
+                                        return ControlFlow::Break(error);
+                                    }
+                                }
+                                let mapped =
+                                    atomic.mapped(db, &mapping, TypeContext::default(), &visitor);
+                                *entry.insert(mapped.proves_value_from_root(db, env, value))
+                            }
+                        }
+                    }
+                }
+            };
+            proven.insert(node, holds);
+        }
+        ControlFlow::Continue(proven[&self.node])
+    }
+
     /// Computes solutions using a caller-provided selector within the given projection budget.
     ///
     /// The selector receives the typevar's variance and explicit lower and upper bounds. Its
@@ -162,10 +381,10 @@ impl<'db> ConstraintSet<'db, '_> {
     /// The selector must preserve the typevar's declared bound: path validation does not
     /// revalidate an arbitrary type selected afterward.
     ///
-    /// Per-variable budget exhaustion preserves available fallback bindings and marks the path
-    /// family as [`SolutionPaths::BudgetExceeded`](super::SolutionPaths::BudgetExceeded).
-    /// Exhausting a limit in the supplied [`SolutionBudget`] instead returns an error without a
-    /// partial path family.
+    /// Per-variable or hidden-witness type-budget exhaustion marks the path family as
+    /// [`SolutionPaths::Incomplete`](super::SolutionPaths::Incomplete). Paths with a scoped
+    /// witness discard bindings that could not be validated; other paths retain fallback
+    /// bindings. Exhausting the traversal, path, or exported-type budget returns an error.
     pub(crate) fn solutions_with(
         self,
         db: &'db dyn Db,
@@ -175,15 +394,48 @@ impl<'db> ConstraintSet<'db, '_> {
         report_diagnostics: ReportDiagnostics,
         choose: impl FnMut(TypeVarVariance, &CandidateTypeVarSolution<'db>) -> PathBoundSolution<'db>,
     ) -> Result<Solutions<'db>, ProjectionError> {
-        let path_bounds = CandidateSolutions::compute_bounded(
-            db,
-            env,
-            self,
-            inferable,
-            budget,
-            CandidateSearch::All(report_diagnostics),
-        )?;
-        path_bounds.solve_with_budget(db, budget, choose)
+        let (path_bounds, mut limits) = self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(report_diagnostics))?;
+        path_bounds.solve_with_budget(db, env, budget, &mut limits, choose)
+    }
+
+    /// Reconstructs independent bound hints only to diagnose an already rejected full call.
+    /// These choices do not establish a joint witness and are always marked incomplete.
+    pub(crate) fn diagnostic_solutions(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        inferable: TypeVarSet<'db>,
+    ) -> Result<Solutions<'db>, ProjectionError> {
+        let budget = SolutionBudget::default();
+        let (candidates, mut limits) = self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(ReportDiagnostics::No))?;
+        let mut type_budget = ProjectionTypeBudget::new(budget.type_terms);
+        match candidates.try_collect_solutions(
+            &mut type_budget,
+            |inferable, candidate, _budget| {
+                let selected = CandidateSolutions::select_bindings(
+                    db,
+                    env,
+                    inferable,
+                    candidate,
+                    &mut limits,
+                    &mut |_, bound| {
+                        CandidateSolutions::preliminary_solve(db, env, self.builder, bound)
+                    },
+                )?;
+                ControlFlow::Continue(selected.map(|(solution, _)| (solution, true)))
+            },
+            |solution, type_budget| {
+                for binding in &solution.solved_typevars {
+                    if let Err(error) = type_budget.charge_type(db, binding.solution) {
+                        return ControlFlow::Break(error);
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        ) {
+            ControlFlow::Continue(solutions) => Ok(solutions),
+            ControlFlow::Break(error) => Err(error),
+        }
     }
 
     /// Folds complete, correlated solutions without first allocating every solved path.
@@ -215,16 +467,12 @@ impl<'db> ConstraintSet<'db, '_> {
             &mut ProjectionTypeBudget,
         ) -> Result<T, ProjectionError>,
     ) -> Result<SolutionProjection<T>, ProjectionError> {
-        let path_bounds = CandidateSolutions::compute_bounded(
-            db,
-            env,
-            self,
-            inferable,
-            budget,
-            CandidateSearch::All(ReportDiagnostics::Yes),
-        )?;
+        let (path_bounds, mut limits) = self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::All(ReportDiagnostics::Yes))?;
 
         path_bounds.try_fold_with(
+            db,
+            env,
+            &mut limits,
             choose,
             initial,
             &mut ProjectionTypeBudget::new(budget.type_terms),
@@ -234,8 +482,12 @@ impl<'db> ConstraintSet<'db, '_> {
 }
 
 impl<'db> CandidateSolutions<'db> {
+    #[expect(clippy::too_many_arguments)]
     fn try_fold_with<T>(
         &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        limits: &mut BoundedSolutionLimits,
         mut choose: impl FnMut(
             TypeVarVariance,
             &CandidateTypeVarSolution<'db>,
@@ -248,15 +500,35 @@ impl<'db> CandidateSolutions<'db> {
             &mut ProjectionTypeBudget,
         ) -> Result<T, ProjectionError>,
     ) -> Result<SolutionProjection<T>, ProjectionError> {
-        let candidates = match self {
+        let (inferable, candidates) = match self {
             Self::Unsatisfiable => return Ok(SolutionProjection::Unsatisfiable),
             Self::Unconstrained => return Ok(SolutionProjection::Unconstrained),
-            Self::Constrained(candidates) => candidates,
+            Self::Constrained {
+                inferable,
+                paths,
+                incomplete,
+            } => {
+                if *incomplete {
+                    return Err(ProjectionError::IncompleteSolution);
+                }
+                (*inferable, paths)
+            }
         };
 
         let mut retained = false;
         for candidate in candidates {
-            let Some((solution, incomplete)) = Self::solve_path_with(candidate, &mut choose) else {
+            let Some((solution, incomplete)) = (match Self::solve_path_with(
+                db,
+                env,
+                inferable,
+                candidate,
+                limits,
+                budget,
+                &mut choose,
+            ) {
+                ControlFlow::Continue(solution) => solution,
+                ControlFlow::Break(error) => return Err(error),
+            }) else {
                 continue;
             };
             if !solution.is_valid() {

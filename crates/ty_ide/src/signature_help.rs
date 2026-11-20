@@ -12,11 +12,11 @@ use crate::{Db, FxIndexMap, MarkupKind};
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_python_ast::find_node::covering_node;
-use ruff_python_ast::token::TokenKind;
+use ruff_python_ast::token::{TokenKind, Tokens, parenthesized_range};
 use ruff_python_ast::{self as ast, AnyNodeRef};
 use ruff_python_trivia::PythonWhitespace;
 use ruff_source_file::LineRanges;
-use ruff_text_size::{Ranged, TextSize};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_core::ProgramFile;
 use ty_python_semantic::SemanticModel;
 use ty_python_semantic::types::Type;
@@ -82,9 +82,10 @@ pub fn signature_help<'db>(
     offset: TextSize,
 ) -> Option<SignatureHelpInfo<'db>> {
     let parsed = parsed_module(db, file.python_file(db)).load(db);
+    let source = source_text(db, parsed.module().file());
 
     // Get the call expression at the given position.
-    let (call_expr, current_arg_index) = get_call_expr(db, &parsed, offset)?;
+    let (call_expr, current_arg_index) = call_at_offset(&parsed, &source, offset)?;
 
     let model = SemanticModel::new(db, file);
 
@@ -115,13 +116,19 @@ pub fn signature_help<'db>(
 
 /// Returns the innermost call expression that contains the specified offset
 /// and the index of the argument that the offset maps to.
-fn get_call_expr<'ast>(
-    db: &dyn Db,
+///
+/// `parsed` and `source` must describe the same source revision. Selection
+/// includes the callee and unfinished calls, but ends after a closing
+/// parenthesis. Offsets beyond the source length return `None`.
+pub fn call_at_offset<'ast>(
     parsed: &'ast ruff_db::parsed::ParsedModuleRef,
+    source: &str,
     offset: TextSize,
 ) -> Option<(&'ast ast::ExprCall, usize)> {
+    if offset > TextSize::of(source) {
+        return None;
+    }
     let root_node: AnyNodeRef = parsed.syntax().into();
-    let source = source_text(db, parsed.module().file());
     let line_range = source.line_range(offset);
     let line = &source[line_range];
     let line_end = line_range.start() + TextSize::of(line.trim_whitespace_end());
@@ -176,24 +183,49 @@ fn get_call_expr<'ast>(
     };
 
     // Determine which argument corresponds to the current cursor location.
-    let current_arg_index = get_argument_index(call_expr, offset);
+    let current_arg_index = get_argument_index(call_expr, parsed.tokens(), offset);
 
     Some((call_expr, current_arg_index))
 }
 
-/// Determine which argument is associated with the specified offset.
-/// Returns zero if not within any argument.
-fn get_argument_index(call_expr: &ast::ExprCall, offset: TextSize) -> usize {
-    let mut current_arg = 0;
+/// Determine the source-order argument index by counting separators before the
+/// cursor, including positions where an argument has not been written yet.
+fn get_argument_index(call_expr: &ast::ExprCall, tokens: &Tokens, offset: TextSize) -> usize {
+    let mut arguments = call_expr
+        .arguments
+        .iter_source_order()
+        .map(|arg| match arg {
+            ast::ArgOrKeyword::Arg(expr) => {
+                parenthesized_range(expr.into(), (&call_expr.arguments).into(), tokens)
+                    .unwrap_or_else(|| expr.range())
+            }
+            ast::ArgOrKeyword::Keyword(keyword) => {
+                let value = parenthesized_range((&keyword.value).into(), keyword.into(), tokens)
+                    .unwrap_or_else(|| keyword.value.range());
+                TextRange::new(keyword.start(), value.end())
+            }
+        })
+        .peekable();
 
-    for (i, arg) in call_expr.arguments.iter_source_order().enumerate() {
-        if offset <= arg.end() {
-            return i;
-        }
-        current_arg = i + 1;
-    }
-
-    current_arg
+    // Only argument separators advance the cursor. An argument can contain
+    // unbracketed commas, such as the parameters of a lambda expression.
+    tokens
+        .in_range(call_expr.arguments.range())
+        .iter()
+        .take_while(|token| token.end() <= offset)
+        .filter(|token| token.kind() == TokenKind::Comma)
+        .filter(|token| {
+            while arguments
+                .peek()
+                .is_some_and(|range| range.end() <= token.start())
+            {
+                arguments.next();
+            }
+            !arguments
+                .peek()
+                .is_some_and(|range| range.contains_range(token.range()))
+        })
+        .count()
 }
 
 /// Create signature details from `CallSignatureDetails`.
@@ -206,33 +238,7 @@ fn create_signature_details_from_call_signature_details<'db>(
         .definition
         .and_then(|def| docstring_for_call_definition(db, def));
 
-    // Translate the argument index to parameter index using the mapping.
-    let active_parameter =
-        if details.argument_to_parameter_mapping.is_empty() && current_arg_index == 0 {
-            Some(0)
-        } else {
-            details
-                .argument_to_displayed_parameter_mapping
-                .get(current_arg_index)
-                .copied()
-                .flatten()
-                .or({
-                    // If we can't find a mapping for this argument, fall back to the argument
-                    // index when it still points at a displayed parameter. Otherwise, if the
-                    // last displayed parameter is variadic, keep it active for any later
-                    // positional or keyword arguments that would still bind there. The `- 1`
-                    // converts the parameter count to the zero-based index of that last entry.
-                    if current_arg_index < details.parameters.len() {
-                        Some(current_arg_index)
-                    } else if details.parameters.last().is_some_and(|parameter| {
-                        parameter.is_variadic || parameter.is_keyword_variadic
-                    }) {
-                        Some(details.parameters.len() - 1)
-                    } else {
-                        None
-                    }
-                })
-        };
+    let active_parameter = details.active_parameter(current_arg_index);
 
     let parameters = create_parameters(db, details.parameters, documentation.as_ref());
     let active_parameter = active_parameter.filter(|&index| index < parameters.len());
@@ -790,6 +796,18 @@ def ab(a: str):
     }
 
     #[test]
+    fn signature_help_positional_argument_after_keyword() {
+        let test = CursorTest::builder()
+            .source(
+                "main.py",
+                "def f(x: int, y: int): pass\nf(x=1, 2<CURSOR>)\n",
+            )
+            .build();
+
+        assert_snapshot!(test.signature_help_render());
+    }
+
+    #[test]
     fn signature_help_overload_arity_disambiguated1() {
         let test = CursorTest::builder()
             .source(
@@ -959,9 +977,7 @@ def ab(a: int, *, c: int):
         ---------------------------------------------
         c overload
 
-        -------------- active parameter -------------
-        c: int
-        ---------------------------------------------
+        (no active parameter specified)
         ");
     }
 
@@ -1025,9 +1041,7 @@ def ab(a: int, *, c: int):
         ---------------------------------------------
         b overload
 
-        -------------- active parameter -------------
-        b: int
-        ---------------------------------------------
+        (no active parameter specified)
         ");
     }
 
@@ -1487,6 +1501,30 @@ def ab(a: int, *, c: int):
 
             let result = test.signature_help().expect("Should have signature help");
             assert_eq!(result.signatures[0].active_parameter, Some(1));
+        }
+    }
+
+    #[test]
+    fn signature_help_argument_separators() {
+        for (call, expected) in [
+            ("func((1)<CURSOR> , 2)", 0),
+            ("func((1),<CURSOR> 2)", 1),
+            ("func((1,<CURSOR>), 2)", 0),
+            ("func(lambda x,<CURSOR> y: x, 2)", 0),
+            ("func(first=(1)<CURSOR> , second=2)", 0),
+            ("func(g() <CURSOR>", 0),
+            ("func(g(), <CURSOR>", 1),
+        ] {
+            let source = format!(
+                "def func(first: object, second: object) -> None: ...\ndef g() -> int: ...\n{call}"
+            );
+            let test = cursor_test(&source);
+            let result = test.signature_help().expect(call);
+            assert_eq!(
+                result.signatures[0].active_parameter,
+                Some(expected),
+                "{call}"
+            );
         }
     }
 

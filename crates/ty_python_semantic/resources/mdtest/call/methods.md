@@ -469,6 +469,41 @@ def _(union: E1 | Any, intersection: E1 & Any):
     reveal_type(intersection.f())  # revealed: list[E1 & Any] & Any
 ```
 
+#### Descriptor receivers on a union-bounded type variable
+
+A classmethod captures the class, while a custom descriptor can return a method bound to an
+unrelated object.
+
+```py
+from typing import Self
+
+class Other:
+    def method(self) -> str:
+        return ""
+
+class Descriptor[T]:
+    def __init__(self, value: T) -> None:
+        self.value = value
+
+    def __get__(self, instance: object, owner: type[object]) -> T:
+        return self.value
+
+class Base:
+    descriptor = Descriptor(Other().method)
+
+    @classmethod
+    def make(cls) -> Self:
+        return cls()
+
+class Left(Base): ...
+class Right(Base): ...
+
+def generic_bound[T: Left | Right](value: T) -> T:
+    owner: type[T] = value.make.__self__
+    reveal_type(value.descriptor.__self__)  # revealed: Other
+    return value.make()
+```
+
 ## Stored protocol-bound methods
 
 A protocol-bound method stored alongside another callable must not re-check its already-bound

@@ -3,14 +3,14 @@ use ruff_python_ast::{self as ast, HasNodeIndex};
 use rustc_hash::FxHashMap;
 
 use super::{ArgExpr, TypeInferenceBuilder};
+use crate::types::dictionary::has_dict_type;
 use crate::types::typed_dict::{
     extract_unpacked_typed_dict_keys_from_value_type, infer_unpacked_keyword_types,
-    validate_typed_dict_constructor,
 };
-use crate::types::{KnownClass, Type, TypeContext};
+use crate::types::{KnownClass, Type, TypeContext, UnionType};
 
 impl<'db> TypeInferenceBuilder<'db, '_> {
-    pub(super) fn infer_keyword_only_dict_call(
+    pub(super) fn infer_dict_call(
         &mut self,
         func: &ast::Expr,
         arguments: &ast::Arguments,
@@ -18,20 +18,21 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         call_expression_tcx: TypeContext<'db>,
     ) -> Option<Type<'db>> {
         let db = self.db();
-        if !arguments.args.is_empty() {
-            return None;
-        }
-
+        let env = self.program_environment();
+        let typed_dict_context = call_expression_tcx.expected_type().map(|annotation| {
+            annotation
+                .expand_top_level_aliases(db, env)
+                .filter_union(db, env, Type::is_typed_dict)
+        });
         // Fast-path dict(...) in TypedDict context: infer keyword values against fields,
-        // then validate and return the TypedDict type. This also covers `dict(**src)` when `src`
-        // is `TypedDict`-shaped.
-        if let Some(tcx) = call_expression_tcx.expected_type()
-            && let Some(typed_dict) = tcx
-                .filter_union(db, self.program_environment(), Type::is_typed_dict)
-                .as_typed_dict()
-        {
-            // Only speculate the `**kwargs` applicability check. Assignability handles inputs that
-            // are already valid for the target, including gradual and bottom types. The additional
+        // then validate and return the TypedDict type. A TypedDict-shaped positional source
+        // supplies fields that can be overwritten by keyword arguments.
+        if let Some(typed_dict) = typed_dict_context.and_then(Type::as_typed_dict) {
+            // Only speculate applicability checks. A positional source must expose a TypedDict
+            // shape or observed copy contents without context; the target must not manufacture
+            // its input fields.
+            // For `**kwargs`, assignability handles inputs already valid for the target, including
+            // gradual and bottom types. The additional
             // TypedDict-shape check keeps invalid-but-analyzable unpacks on this path so validation
             // can emit key-level diagnostics instead of falling back to a broad `dict[...]`
             // assignment error. Unsupported unpacks still fall back to ordinary `dict(...)`
@@ -40,43 +41,73 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             // Named keyword values are inferred on the real builder so their diagnostics are either
             // committed with the fast path or left for ordinary `dict(...)` inference when we fall
             // back.
-            let supports_typed_dict_context = {
+            let (supports_typed_dict_context, copy_positional) = {
+                let mut copy_positional = false;
                 let mut speculative_builder = self.speculate_without_diagnostics();
                 let env = speculative_builder.program_environment();
-                infer_unpacked_keyword_types(arguments, |expr, tcx| {
-                    speculative_builder.infer_expression(expr, tcx)
-                })
-                .into_iter()
-                .flatten()
-                .all(|keyword_ty| {
-                    keyword_ty.is_assignable_to(db, env, Type::TypedDict(typed_dict))
-                        || extract_unpacked_typed_dict_keys_from_value_type(db, env, keyword_ty)
-                            .is_some()
-                })
+                let supports_positional = match arguments.args.as_ref() {
+                    [] => true,
+                    [argument] => {
+                        if argument.is_starred_expr() {
+                            false
+                        } else {
+                            let source_ty = speculative_builder
+                                .infer_expression(argument, TypeContext::default());
+                            copy_positional = arguments.keywords.is_empty()
+                                && (has_dict_type(db, env, source_ty)
+                                    || crate::types::dictionary::contents::has_explicit_typed_dict_items(db, source_ty))
+                                && source_ty.unpack_keys_and_items(db, env).is_some()
+                                && speculative_builder
+                                    .dictionary_items(argument, source_ty)
+                                    .is_some();
+                            copy_positional
+                                || extract_unpacked_typed_dict_keys_from_value_type(
+                                    db, env, source_ty,
+                                )
+                                .is_some()
+                        }
+                    }
+                    _ => false,
+                };
+                let supported = supports_positional
+                    && infer_unpacked_keyword_types(arguments, |expr, tcx| {
+                        speculative_builder.infer_expression(expr, tcx)
+                    })
+                    .into_iter()
+                    .flatten()
+                    .all(|keyword_ty| {
+                        keyword_ty.is_assignable_to(db, env, Type::TypedDict(typed_dict))
+                            || extract_unpacked_typed_dict_keys_from_value_type(db, env, keyword_ty)
+                                .is_some()
+                    });
+                (supported, copy_positional)
             };
 
             if supports_typed_dict_context {
-                self.infer_typed_dict_constructor_keyword_values(
-                    typed_dict,
-                    arguments,
-                    call_expression_tcx,
-                );
-                validate_typed_dict_constructor(
-                    &self.context,
-                    typed_dict,
-                    arguments,
-                    func.into(),
-                    |expr, _| self.expression_type(expr),
-                );
+                if copy_positional && let [source] = arguments.args.as_ref() {
+                    let source_ty = self.get_or_infer_expression(source, TypeContext::default());
+                    if let Some(result) = self.infer_typed_dict_copy(typed_dict, source, source_ty)
+                    {
+                        return Some(result);
+                    }
+                }
+
+                self.prepare_typed_dict_constructor(typed_dict, arguments, func.into());
 
                 return Some(Type::TypedDict(typed_dict));
             }
+        } else if let Some(Type::Union(union)) = typed_dict_context
+            && arguments.args.is_empty()
+            && let Some(ty) = self.infer_dict_call_in_typed_dict_union(func, arguments, union)
+        {
+            return Some(ty);
         }
 
-        if arguments
-            .keywords
-            .iter()
-            .any(|keyword| keyword.arg.is_none())
+        if !arguments.args.is_empty()
+            || arguments
+                .keywords
+                .iter()
+                .any(|keyword| keyword.arg.is_none())
         {
             return None;
         }
@@ -132,5 +163,55 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 .is_none()
                 .then(Type::unknown)
         })
+    }
+
+    fn infer_dict_call_in_typed_dict_union(
+        &mut self,
+        func: &ast::Expr,
+        arguments: &ast::Arguments,
+        union: UnionType<'db>,
+    ) -> Option<Type<'db>> {
+        let db = self.db();
+        let env = self.program_environment();
+        let teardown_expression_cache = self.setup_expression_cache();
+        let mut first_match = None;
+        let mut additional_matches = Vec::new();
+
+        for typed_dict in union
+            .elements(db)
+            .iter()
+            .filter_map(|ty| ty.as_typed_dict())
+        {
+            let mut candidate = self.speculate();
+            if candidate.complete_typed_dict_constructor(typed_dict, arguments, func.into()) {
+                if first_match.is_none() {
+                    first_match = Some((Type::TypedDict(typed_dict), candidate));
+                } else {
+                    additional_matches.push(Type::TypedDict(typed_dict));
+                }
+            }
+        }
+
+        let result = first_match.map(|(first_type, candidate)| {
+            if additional_matches.is_empty() {
+                self.extend(candidate);
+                first_type
+            } else {
+                // Multiple schemas accept the call. Infer the arguments once without selecting
+                // one schema's field contexts for all of them.
+                for keyword in &arguments.keywords {
+                    self.infer_expression(&keyword.value, TypeContext::default());
+                }
+                UnionType::from_elements(
+                    db,
+                    env,
+                    std::iter::once(first_type).chain(additional_matches),
+                )
+            }
+        });
+        if teardown_expression_cache {
+            self.teardown_expression_cache();
+        }
+        result
     }
 }

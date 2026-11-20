@@ -7,9 +7,10 @@ use crate::{
     place::Place,
     types::{
         ApplyTypeMappingVisitor, BoundTypeVarInstance, ClassType, FindLegacyTypeVarsVisitor,
-        FunctionType, InternedType, KnownBoundMethodType, KnownClass, KnownInstanceType,
-        LiteralValueTypeKind, MemberLookupPolicy, Parameter, Parameters, Signature,
-        SubclassOfInner, Type, TypeContext, TypeMapping, TypeVarBoundOrConstraints, UnionType,
+        FunctionType, InternedType, IntersectionType, KnownBoundMethodType, KnownClass,
+        KnownInstanceType, LiteralValueTypeKind, MemberLookupPolicy, Parameter, Parameters,
+        Signature, SubclassOfInner, Type, TypeContext, TypeMapping, TypeVarBoundOrConstraints,
+        UnionType,
         constraints::{ConstraintSet, IteratorConstraintsExtension},
         cyclic::ActiveRecursionDetector,
         function::OverloadLiteral,
@@ -24,7 +25,10 @@ use ty_python_core::definition::Definition;
 impl<'db> Type<'db> {
     pub(super) fn function_like_kind(self, db: &'db dyn Db) -> Option<CallableTypeKind> {
         match self {
-            Type::FunctionLiteral(function) => Some(function.callable_type_kind(db)),
+            Type::FunctionLiteral(function) => {
+                let kind = function.callable_type_kind(db);
+                kind.is_method_like().then_some(kind)
+            }
             Type::Callable(callable) if callable.is_method_like(db) => Some(callable.kind(db)),
             Type::KnownInstance(KnownInstanceType::MethodWrapper(wrapper)) => {
                 Some(match wrapper.kind(db) {
@@ -153,14 +157,59 @@ impl<'db> Type<'db> {
     }
 
     /// Create a callable type with a single non-overloaded signature.
-    pub(crate) fn single_callable(db: &'db dyn Db, signature: Signature<'db>) -> Type<'db> {
+    pub fn single_callable(db: &'db dyn Db, signature: Signature<'db>) -> Type<'db> {
         Type::Callable(CallableType::single(db, signature))
+    }
+
+    /// Returns the overloads when this type has exactly one callable alternative.
+    pub fn callable_overloads(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<&'db [Signature<'db>]> {
+        let callables = self.try_upcast_to_callable(db, env)?;
+        let callable = callables.exactly_one()?;
+        Some(callable.signatures(db).overloads.as_slice())
+    }
+
+    /// Returns the signature when this type has exactly one callable alternative and overload.
+    pub fn single_callable_signature(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Option<&'db Signature<'db>> {
+        let [signature] = self.callable_overloads(db, env)? else {
+            return None;
+        };
+        Some(signature)
+    }
+
+    /// Builds a wrapper callable by transforming each signature while retaining unions and
+    /// overloads. Source parameter definitions and generic contexts remain in the signature.
+    pub fn map_callable_signatures(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        kind: CallableTypeKind,
+        mut map: impl FnMut(Signature<'db>) -> Signature<'db>,
+    ) -> Option<Type<'db>> {
+        let callables = self.try_upcast_to_callable(db, env)?;
+        Some(
+            callables
+                .map(|callable| {
+                    let signatures = CallableSignature::from_overloads(
+                        callable.signatures(db).iter().cloned().map(&mut map),
+                    );
+                    callable.with_signatures(db, signatures).with_kind(db, kind)
+                })
+                .to_type(db, env),
+        )
     }
 
     /// Create a non-overloaded, function-like callable type with a single signature.
     ///
     /// A function-like callable will bind `self` when accessed as an attribute on an instance.
-    pub(crate) fn function_like_callable(db: &'db dyn Db, signature: Signature<'db>) -> Type<'db> {
+    pub fn function_like_callable(db: &'db dyn Db, signature: Signature<'db>) -> Type<'db> {
         Type::Callable(CallableType::function_like(db, signature))
     }
 
@@ -322,10 +371,25 @@ impl<'db> Type<'db> {
                 }
             }
             Type::ClassLiteral(class_literal) => {
-                Some(class_literal.identity_specialization(db).into_callable(db))
+                let class = ClassType::NonGeneric(class_literal);
+                let class = class.provided_allocation(db, env).unwrap_or(class);
+                Some(
+                    class
+                        .class_literal(db)
+                        .identity_specialization(db)
+                        .into_callable(db),
+                )
             }
 
-            Type::GenericAlias(alias) => Some(ClassType::Generic(alias).into_callable(db)),
+            Type::GenericAlias(alias) => {
+                let class = ClassType::Generic(alias);
+                Some(
+                    class
+                        .provided_allocation(db, env)
+                        .unwrap_or(class)
+                        .into_callable(db),
+                )
+            }
 
             Type::NewTypeInstance(newtype) => newtype
                 .concrete_base_type(db)
@@ -491,6 +555,32 @@ impl<'db> Type<'db> {
     }
 }
 
+impl<'db> IntersectionType<'db> {
+    /// The nominal function class can describe the same value as an explicit callable
+    /// constituent. Its generic `__call__` contributes no independent signature evidence.
+    pub(crate) fn redundant_function_type_for_callable(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        target: Type<'db>,
+    ) -> Option<Type<'db>> {
+        if !matches!(target, Type::Callable(_))
+            || !self
+                .iter_positive(db)
+                .any(|element| matches!(element, Type::Callable(_)))
+        {
+            return None;
+        }
+        self.iter_positive(db).find(|element| {
+            matches!(element, Type::NominalInstance(instance) if instance.has_known_class(db, KnownClass::FunctionType))
+                && element
+                    .bindings(db, env)
+                    .single_element()
+                    .is_some_and(|binding| binding.is_generic_function_call(db, env))
+        })
+    }
+}
+
 #[derive(Debug, Default)]
 struct CallableUpcastContext<'db> {
     recursive_definition: Option<Definition<'db>>,
@@ -652,6 +742,10 @@ pub enum CallableTypeKind {
     /// [descriptor-protocol]: https://docs.python.org/3/howto/descriptor.html#descriptor-protocol
     FunctionLike,
 
+    /// A native builtin function. It has the runtime class `types.BuiltinFunctionType`
+    /// and does not bind a receiver when accessed through an instance.
+    BuiltinFunctionLike,
+
     /// A `Callable[P, R]`-typed dunder attribute whose parameters come from a `ParamSpec`.
     ///
     /// This has the runtime assumptions of [`Self::Regular`]: truthiness is ambiguous,
@@ -704,6 +798,25 @@ pub enum CallableTypeKind {
     /// materializations from ordinary callable types in type-relation checks. It does not
     /// carry the runtime `typing.ParamSpec` instance behavior of a `ParamSpec` declaration.
     ParamSpecValue,
+}
+
+impl CallableTypeKind {
+    pub(super) const fn runtime_class(self) -> Option<KnownClass> {
+        match self {
+            Self::FunctionLike => Some(KnownClass::FunctionType),
+            Self::BuiltinFunctionLike => Some(KnownClass::BuiltinFunctionType),
+            Self::StaticMethodLike => Some(KnownClass::Staticmethod),
+            Self::ClassMethodLike => Some(KnownClass::Classmethod),
+            Self::Regular | Self::DunderParamSpec | Self::ParamSpecValue => None,
+        }
+    }
+
+    const fn is_method_like(self) -> bool {
+        matches!(
+            self,
+            Self::FunctionLike | Self::StaticMethodLike | Self::ClassMethodLike
+        )
+    }
 }
 
 /// A "policy" enum that describes how `type[]` types should be upcast
@@ -764,6 +877,10 @@ pub struct CallableType<'db> {
     /// for diagnostic names, source annotations, and deduplication, independently of binding kind.
     #[returns(copy)]
     pub(crate) deprecated: Option<OverloadLiteral<'db>>,
+
+    /// Immutable application metadata for synthesized callable values.
+    #[returns(ref)]
+    pub(crate) provided_data: Option<crate::provided::ProvidedData>,
 }
 
 pub(super) fn walk_callable_type<'db, V: visitor::TypeVisitor<'db> + ?Sized>(
@@ -785,11 +902,17 @@ impl<'db> CallableType<'db> {
         S: salsa::Lookup<CallableSignature<'db>> + std::hash::Hash,
         CallableSignature<'db>: salsa::HashEqLike<S>,
     {
-        Self::new_internal(db, signatures, kind, None)
+        Self::new_internal(db, signatures, kind, None, None)
     }
 
     pub(crate) fn with_deprecated(self, db: &'db dyn Db, deprecated: OverloadLiteral<'db>) -> Self {
-        Self::new_internal(db, self.signatures(db), self.kind(db), Some(deprecated))
+        Self::new_internal(
+            db,
+            self.signatures(db),
+            self.kind(db),
+            Some(deprecated),
+            self.provided_data(db).clone(),
+        )
     }
 
     /// Replace the signatures without losing binding behavior or deprecation metadata.
@@ -798,11 +921,37 @@ impl<'db> CallableType<'db> {
         S: salsa::Lookup<CallableSignature<'db>> + std::hash::Hash,
         CallableSignature<'db>: salsa::HashEqLike<S>,
     {
-        Self::new_internal(db, signatures, self.kind(db), self.deprecated(db))
+        Self::new_internal(
+            db,
+            signatures,
+            self.kind(db),
+            self.deprecated(db),
+            self.provided_data(db).clone(),
+        )
     }
 
     pub(crate) fn with_kind(self, db: &'db dyn Db, kind: CallableTypeKind) -> Self {
-        Self::new_internal(db, self.signatures(db), kind, self.deprecated(db))
+        Self::new_internal(
+            db,
+            self.signatures(db),
+            kind,
+            self.deprecated(db),
+            self.provided_data(db).clone(),
+        )
+    }
+
+    pub(crate) fn with_provided_data(
+        self,
+        db: &'db dyn Db,
+        data: crate::provided::ProvidedData,
+    ) -> Self {
+        Self::new_internal(
+            db,
+            self.signatures(db),
+            self.kind(db),
+            self.deprecated(db),
+            Some(data),
+        )
     }
 
     pub(crate) fn single(db: &'db dyn Db, signature: Signature<'db>) -> CallableType<'db> {
@@ -879,12 +1028,7 @@ impl<'db> CallableType<'db> {
     }
 
     pub(super) fn runtime_class(self, db: &'db dyn Db) -> Option<KnownClass> {
-        match self.kind(db) {
-            CallableTypeKind::FunctionLike => Some(KnownClass::FunctionType),
-            CallableTypeKind::StaticMethodLike => Some(KnownClass::Staticmethod),
-            CallableTypeKind::ClassMethodLike => Some(KnownClass::Classmethod),
-            _ => None,
-        }
+        self.kind(db).runtime_class()
     }
 
     pub(super) fn is_dunder_paramspec(self, db: &'db dyn Db) -> bool {
@@ -905,12 +1049,7 @@ impl<'db> CallableType<'db> {
 
     /// Returns `true` if this callable represents a function used as a class member.
     pub fn is_method_like(self, db: &'db dyn Db) -> bool {
-        matches!(
-            self.kind(db),
-            CallableTypeKind::FunctionLike
-                | CallableTypeKind::StaticMethodLike
-                | CallableTypeKind::ClassMethodLike
-        )
+        self.kind(db).is_method_like()
     }
 
     pub(crate) fn into_regular(self, db: &'db dyn Db) -> CallableType<'db> {
@@ -971,6 +1110,7 @@ impl<'db> CallableType<'db> {
                 .bind_method_receiver(db, env, receiver_type, typing_self_type),
             CallableTypeKind::Regular,
             self.deprecated(db),
+            self.provided_data(db).clone(),
         )
     }
 

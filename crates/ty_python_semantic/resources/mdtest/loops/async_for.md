@@ -18,6 +18,34 @@ async def foo():
         reveal_type(x)  # revealed: int
 ```
 
+## Independent synchronous and asynchronous iteration
+
+An empty synchronous iteration protocol does not make an async loop empty, including when the
+factory shadows a builtin iterable constructor.
+
+```py
+from typing import Iterator
+from typing_extensions import Never
+
+class Both:
+    def __iter__(self) -> Iterator[Never]:
+        return iter(())
+
+    def __aiter__(self) -> "Both":
+        return self
+
+    async def __anext__(self) -> int:
+        return 1
+
+def range() -> Both:
+    return Both()
+
+async def check():
+    async for value in range():
+        reveal_type(value)  # revealed: int
+        len(0)  # error: [invalid-argument-type]
+```
+
 ## Async for loop with unpacking
 
 ```py

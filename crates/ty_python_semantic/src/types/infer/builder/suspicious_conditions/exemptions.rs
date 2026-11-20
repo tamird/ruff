@@ -692,7 +692,6 @@ fn definition_contains_special_cased_condition<'db>(
 ) -> bool {
     let module = parsed_module(db, definition.python_file(db)).load(db);
     let definition_kind = definition.kind(db);
-    let file = definition.file(db);
     let program_file = definition.program_file(db);
 
     let in_known_module = |known| {
@@ -701,7 +700,7 @@ fn definition_contains_special_cased_condition<'db>(
     };
 
     if let DefinitionKind::AnnotatedAssignment(annotated_assignment) = definition_kind
-        && file.is_stub(db)
+        && program_file.is_stub(db)
         && let ast::Expr::Name(ast::ExprName { id, .. }) = annotated_assignment.target(&module)
     {
         match &**id {
@@ -764,7 +763,8 @@ fn definition_contains_special_cased_condition<'db>(
             }
             Some(&*assignment.value)
         }
-        DefinitionKind::Import(_)
+        DefinitionKind::ProvidedBinding(_)
+        | DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)
         | DefinitionKind::ImportFromSubmodule(_)
         | DefinitionKind::StarImport(_)
@@ -772,6 +772,7 @@ fn definition_contains_special_cased_condition<'db>(
         | DefinitionKind::Class(_)
         | DefinitionKind::TypeAlias(_)
         | DefinitionKind::DictKeyAssignment(_)
+        | DefinitionKind::DictionaryContents(_)
         | DefinitionKind::Parameter(_)
         | DefinitionKind::LambdaParameter(_)
         | DefinitionKind::ExceptHandler(_)
@@ -881,6 +882,10 @@ fn predicate_contains_special_cased_condition<'db>(
         | PredicateNode::FinallyNormalPathImpossible { .. }
         | PredicateNode::OrPatternAlternative(_)
         | PredicateNode::StarImportPlaceholder(_) => return false,
+        PredicateNode::SuccessfulSubscript {
+            receiver: _,
+            key: _,
+        } => return false,
     };
     let file = expression.program_file(db);
     let module = parsed_module(db, expression.python_file(db)).load(db);

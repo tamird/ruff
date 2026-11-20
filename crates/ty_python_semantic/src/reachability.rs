@@ -196,6 +196,8 @@
 use crate::ProgramEnvironment;
 use std::cell::RefCell;
 
+use crate::types::FunctionBodyDomain;
+use crate::types::infer::TruthinessAnalyzer;
 use crate::{
     Db,
     dunder_all::dunder_all_names,
@@ -205,32 +207,34 @@ use crate::{
         KnownInstanceType, NarrowingConstraint, SpecialFormType, Type, TypeContext, UnionType,
         class_pattern_coverage_target, definite_match_pattern_type,
         definite_match_pattern_type_for_subject, equality_truthiness, expand_type,
-        infer_narrowing_constraints, infer_predicate_truthiness, infer_same_file_expression_type,
+        infer_expression_with_body_domain, infer_narrowing_constraints, infer_predicate_truthiness, infer_same_file_expression_type,
         mapping_pattern_type, pattern_binding_fallthrough_type, same_enum_or_pattern_type,
         sequence_pattern_type_builder, singleton_pattern_type,
     },
 };
 use ruff_index::{Idx, IndexSlice};
 use ruff_python_ast::name::Name;
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use ty_python_core::{
     BindingWithConstraints, DeclarationWithConstraint, DeclarationsIterator, EvaluationMode,
     FileScopeId, NarrowingEvaluator, PredicateNarrowingTargets, ScopedDefinitionId, SemanticIndex,
     Truthiness, UseDefMap,
-    definition::{DefinitionKind, DefinitionState},
-    expression::Expression,
+    ast_ids::HasScopedUseId,
+    definition::{BindingsOwner, Definition, DefinitionKind, DefinitionState},
+    expression::{Expression, ExpressionContext, ExpressionKind},
     narrowing_constraints::{NarrowingConstraints, ScopedNarrowingConstraint},
     place::ScopedPlaceId,
     place_table,
     predicate::{
-        CallableAndCallExpr, PatternPredicate, PatternPredicateKind, Predicate, PredicateNode,
+        BooleanGuard, CallableAndCallExpr, PatternPredicate, PatternPredicateKind, Predicate, PredicateNode,
         ScopedPredicateId,
     },
     reachability_constraints::{
-        InteriorNode, ReachabilityConstraints, ScopedReachabilityConstraintId,
+        ReachabilityAtom, ReachabilityConstraints, ScopedReachabilityConstraintId,
     },
+    reachability_constraints::InteriorNode,
     scope::ScopeId,
     use_def_map,
 };
@@ -315,7 +319,7 @@ fn pattern_guard_allows_all_matches(db: &dyn Db, predicate: PatternPredicate<'_>
     // Condition analysis recovers cycles as ambiguous, so an unresolved guard cannot exclude values.
     predicate
         .guard(db)
-        .is_none_or(|guard| infer_predicate_truthiness(db, guard).is_always_true())
+        .is_none_or(|guard| infer_predicate_truthiness(db, guard, None).is_always_true())
 }
 
 /// Narrow `subject_ty` by a match pattern.
@@ -602,6 +606,7 @@ fn predicate_scope<'db>(db: &'db dyn Db, predicate: &Predicate<'db>) -> ScopeId<
         PredicateNode::Expression(expression)
         | PredicateNode::ContextManagerSuppresses { expression, .. } => expression.scope(db),
         PredicateNode::IsNonTerminalCall(call) => call.callable(db).scope(db),
+        PredicateNode::SuccessfulSubscript { receiver, key: _ } => receiver.scope(db),
         PredicateNode::Pattern(pattern) => pattern.scope(db),
         PredicateNode::FinallyNormalPathImpossible { scope, .. } => scope,
         PredicateNode::OrPatternAlternative(scope) => scope,
@@ -637,6 +642,7 @@ fn analyze_non_terminal_calls_up_to_predicate<'db>(
     db: &'db dyn Db,
     predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
     root: InteriorNode,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) {
     let root_predicate = root.atom();
     if !matches!(
@@ -670,7 +676,7 @@ fn analyze_non_terminal_calls_up_to_predicate<'db>(
     while remaining > 0 {
         let level = remaining.ilog2();
         let length = 1 << level;
-        analyze_non_terminal_call_range(db, scope, level, start >> level);
+        analyze_non_terminal_call_range_in_domain(db, scope, level, start >> level, domain);
         start += length;
         remaining -= length;
     }
@@ -699,9 +705,10 @@ fn analyze_non_terminal_calls<'db>(
     env: &ProgramEnvironment<'db>,
     predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
     call_predicates: &[ScopedPredicateId],
+    domain: Option<FunctionBodyDomain<'db>>,
 ) {
     for id in call_predicates {
-        analyze_single(db, env, &predicates[*id]);
+        analyze_single_in_domain(db, env, &predicates[*id], domain);
     }
 }
 
@@ -726,19 +733,64 @@ fn analyze_non_terminal_call_range<'db>(
     level: u32,
     index: usize,
 ) {
+    analyze_non_terminal_call_range_impl(db, scope, level, index, None);
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _, _, _| (),
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn analyze_body_non_terminal_call_range<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    level: u32,
+    index: usize,
+    domain: FunctionBodyDomain<'db>,
+) {
+    debug_assert_eq!(scope, domain.scope(db));
+    analyze_non_terminal_call_range_impl(db, scope, level, index, Some(domain));
+}
+
+fn analyze_non_terminal_call_range_in_domain<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    level: u32,
+    index: usize,
+    domain: Option<FunctionBodyDomain<'db>>,
+) {
+    match domain {
+        Some(domain) => analyze_body_non_terminal_call_range(db, scope, level, index, domain),
+        None => analyze_non_terminal_call_range(db, scope, level, index),
+    }
+}
+
+fn analyze_non_terminal_call_range_impl<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    level: u32,
+    index: usize,
+    domain: Option<FunctionBodyDomain<'db>>,
+) {
     if level == 0 {
         let env = ProgramEnvironment::from_scope(scope);
         let use_def = use_def_map(db, scope);
         let call_predicates = non_terminal_call_predicates(db, scope);
         let start = index * NON_TERMINAL_CALL_CHUNK_SIZE;
         let end = start + NON_TERMINAL_CALL_CHUNK_SIZE;
-        analyze_non_terminal_calls(db, &env, use_def.predicates(), &call_predicates[start..end]);
+        analyze_non_terminal_calls(
+            db,
+            &env,
+            use_def.predicates(),
+            &call_predicates[start..end],
+            domain,
+        );
         return;
     }
 
     let child_index = index * 2;
-    analyze_non_terminal_call_range(db, scope, level - 1, child_index);
-    analyze_non_terminal_call_range(db, scope, level - 1, child_index + 1);
+    analyze_non_terminal_call_range_in_domain(db, scope, level - 1, child_index, domain);
+    analyze_non_terminal_call_range_in_domain(db, scope, level - 1, child_index + 1, domain);
 }
 
 /// Evaluates a reachability constraint, first caching complete blocks of statement calls up to its
@@ -751,29 +803,32 @@ fn evaluate_reachability_constraint<'db>(
     scope: ScopeId<'db>,
     id: ScopedReachabilityConstraintId,
     predicate_cache: Option<&TruthinessCache>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> Truthiness {
     if let Some(reachability) = terminal_reachability(id) {
         return reachability;
     }
-
     let use_def = use_def_map(db, scope);
     let constraints = use_def.reachability_constraints();
     let predicates = use_def.predicates();
+    let domain = domain.filter(|domain| domain.scope(db) == scope);
     let root = constraints.get_interior_node(id);
-    analyze_non_terminal_calls_up_to_predicate(db, predicates, root);
-
+    analyze_non_terminal_calls_up_to_predicate(db, predicates, root, domain);
     evaluate_reachability_path(
-        db,
-        scope,
-        constraints,
-        PredicateEvaluator {
-            entries: predicates,
-            cache: predicate_cache,
-        },
-        id,
-        INITIAL_CHECKPOINT_MASK,
+        db, scope, constraints,
+        PredicateEvaluator { entries: predicates, cache: predicate_cache, body_domain: domain },
+        id, INITIAL_CHECKPOINT_MASK, None,
     )
-    .resolve(db, scope)
+    .resolve(db, scope, domain)
+}
+
+pub(crate) fn evaluate_reachability_in_domain<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    id: ScopedReachabilityConstraintId,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Truthiness {
+    evaluate_reachability_constraint(db, scope, id, None, domain)
 }
 
 /// Evaluates the normal continuation captured by a deferred `finally` predicate.
@@ -797,7 +852,7 @@ fn evaluate_finally_continuation<'db>(
     scope: ScopeId<'db>,
     continuation: ScopedReachabilityConstraintId,
 ) -> Truthiness {
-    evaluate_reachability_constraint(db, scope, continuation, None)
+    evaluate_reachability_constraint(db, scope, continuation, None, None)
 }
 
 fn terminal_reachability(id: ScopedReachabilityConstraintId) -> Option<Truthiness> {
@@ -844,12 +899,15 @@ enum ReachabilitySegment {
 }
 
 impl ReachabilitySegment {
-    fn resolve<'db>(mut self, db: &'db dyn Db, scope: ScopeId<'db>) -> Truthiness {
+    fn resolve<'db>(mut self, db: &'db dyn Db, scope: ScopeId<'db>, domain: Option<FunctionBodyDomain<'db>>) -> Truthiness {
         loop {
             match self {
                 Self::Complete(result) => return result,
                 Self::Continue { id, mask } => {
-                    self = evaluate_reachability_checkpoint(db, scope, id, mask);
+                    self = domain.map_or_else(
+                        || evaluate_reachability_checkpoint(db, scope, id, mask),
+                        |domain| evaluate_body_reachability_checkpoint(db, scope, id, mask, domain),
+                    );
                 }
             }
         }
@@ -862,13 +920,15 @@ impl ReachabilitySegment {
 struct PredicateEvaluator<'a, 'db> {
     entries: &'a IndexSlice<ScopedPredicateId, Predicate<'db>>,
     cache: Option<&'a TruthinessCache>,
+    body_domain: Option<FunctionBodyDomain<'db>>,
 }
 
 impl<'a, 'db> PredicateEvaluator<'a, 'db> {
-    fn uncached(entries: &'a IndexSlice<ScopedPredicateId, Predicate<'db>>) -> Self {
+    fn uncached(entries: &'a IndexSlice<ScopedPredicateId, Predicate<'db>>, body_domain: Option<FunctionBodyDomain<'db>>) -> Self {
         Self {
             entries,
             cache: None,
+            body_domain,
         }
     }
 
@@ -878,7 +938,7 @@ impl<'a, 'db> PredicateEvaluator<'a, 'db> {
         env: &ProgramEnvironment<'db>,
         id: ScopedPredicateId,
     ) -> Truthiness {
-        let evaluate = || analyze_single(db, env, &self.entries[id]);
+        let evaluate = || analyze_single_in_domain(db, env, &self.entries[id], self.body_domain);
         self.cache.map_or_else(evaluate, |cache| {
             cache.get_or_evaluate(id.index(), evaluate)
         })
@@ -892,6 +952,9 @@ impl<'a, 'db> PredicateEvaluator<'a, 'db> {
 /// occur in both its true and false branches: evaluate both and take the conjunction of their
 /// reachability. A stack holds pending branches, and a set avoids evaluating shared suffixes twice.
 /// Stop as soon as any required branch is unreachable.
+///
+/// Assumptions and uninhabited splits disable checkpoints so symbolic identities remain
+/// correlated across the whole requested graph.
 fn evaluate_reachability_path<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
@@ -899,10 +962,22 @@ fn evaluate_reachability_path<'db>(
     predicates: PredicateEvaluator<'_, 'db>,
     mut id: ScopedReachabilityConstraintId,
     mask: u32,
+    initial_binding: Option<Definition<'db>>,
 ) -> ReachabilitySegment {
     let env = ProgramEnvironment::from_scope(scope);
+    let original_root = id;
+    let use_def = use_def_map(db, scope);
+    let evaluate_atom = |atom| {
+        if let Some(binding) = initial_binding {
+            let predicate = &predicates.entries[atom];
+            if crate::types::initial_binding_fixes_empty_guard(db, binding, predicate) {
+                return ReachabilityAtom::Known(Truthiness::from(predicate.is_positive));
+            }
+        }
+        analyze_reachability_atom(db, &env, use_def, predicates, atom)
+    };
     let mut boundary = CheckpointBoundary::default();
-    let mut pending = SmallVec::<[(_, _); 2]>::new();
+    let mut pending = SmallVec::<[ScopedReachabilityConstraintId; 2]>::new();
     let mut seen: Option<FxHashSet<ScopedReachabilityConstraintId>> = None;
     let mut result = Truthiness::AlwaysTrue;
 
@@ -914,27 +989,29 @@ fn evaluate_reachability_path<'db>(
             reachability
         } else {
             let node = constraints.get_interior_node(id);
-            if boundary.crossed(node.atom(), mask) {
-                // Widen the alignment eightfold at each checkpoint to keep the number of
-                // lookups logarithmic. After ten shifts the mask is zero and the walk finishes
-                // locally. This also bounds nested queries while combining uninhabited branches.
-                let next = ReachabilitySegment::Continue {
+            if initial_binding.is_none() && seen.is_none() && boundary.crossed(node.atom(), mask) {
+                // Only an ordinary single path can yield a continuation. A bypass split or
+                // assumption must retain the original root for correlated symbolic projection.
+                return ReachabilitySegment::Continue {
                     id,
                     mask: mask << CHECKPOINT_MASK_SHIFT,
                 };
-                if pending.is_empty() && result.is_always_true() {
-                    return next;
-                }
-                next.resolve(db, scope)
             } else {
-                id = match predicates.evaluate(db, &env, node.atom()) {
+                let truthiness = match evaluate_atom(node.atom()) {
+                    ReachabilityAtom::Known(truthiness) => truthiness,
+                    ReachabilityAtom::Symbolic { key: _, is_positive: _ } => {
+                        // Keep identities correlated across every queued bypass branch.
+                        return ReachabilitySegment::Complete(constraints.project(original_root, evaluate_atom));
+                    }
+                };
+                id = match truthiness {
                     Truthiness::AlwaysTrue => node.if_true(),
                     Truthiness::Ambiguous => node.if_ambiguous(),
                     Truthiness::AlwaysFalse => node.if_false(),
                     Truthiness::Uninhabited => {
                         // An uninhabited condition cannot take either branch. Retain only paths
                         // that bypass the condition, which are represented in both branches.
-                        pending.push((node.if_false(), boundary));
+                        pending.push(node.if_false());
                         seen.get_or_insert_with(FxHashSet::default);
                         node.if_true()
                     }
@@ -950,7 +1027,7 @@ fn evaluate_reachability_path<'db>(
         let Some(next) = pending.pop() else {
             return ReachabilitySegment::Complete(result);
         };
-        (id, boundary) = next;
+        id = next;
     }
 }
 
@@ -969,15 +1046,41 @@ fn evaluate_reachability_checkpoint<'db>(
     id: ScopedReachabilityConstraintId,
     mask: u32,
 ) -> ReachabilitySegment {
+    reachability_checkpoint(db, scope, id, mask, None)
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _, _, _| ReachabilitySegment::Complete(Truthiness::Ambiguous),
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn evaluate_body_reachability_checkpoint<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    id: ScopedReachabilityConstraintId,
+    mask: u32,
+    domain: FunctionBodyDomain<'db>,
+) -> ReachabilitySegment {
+    reachability_checkpoint(db, scope, id, mask, Some(domain))
+}
+
+fn reachability_checkpoint<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    id: ScopedReachabilityConstraintId,
+    mask: u32,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> ReachabilitySegment {
     let use_def = use_def_map(db, scope);
     let predicates = use_def.predicates();
     evaluate_reachability_path(
         db,
         scope,
         use_def.reachability_constraints(),
-        PredicateEvaluator::uncached(predicates),
+        PredicateEvaluator::uncached(predicates, domain),
         id,
         mask,
+        None,
     )
 }
 
@@ -1004,17 +1107,18 @@ impl<'db> ReachabilityConstraintsExtension<'db> for ReachabilityConstraints {
         }
 
         let root = self.get_interior_node(id);
-        analyze_non_terminal_calls_up_to_predicate(db, predicates, root);
+        analyze_non_terminal_calls_up_to_predicate(db, predicates, root, None);
         let scope = predicate_scope(db, &predicates[root.atom()]);
         evaluate_reachability_path(
             db,
             scope,
             self,
-            PredicateEvaluator::uncached(predicates),
+            PredicateEvaluator::uncached(predicates, None),
             id,
             INITIAL_CHECKPOINT_MASK,
+            None,
         )
-        .resolve(db, scope)
+        .resolve(db, scope, None)
     }
 }
 
@@ -1024,6 +1128,7 @@ pub(crate) fn narrow_type_by_constraint<'db>(
     evaluator: &NarrowingEvaluator<'_, 'db>,
     base_ty: Type<'db>,
     place: ScopedPlaceId,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> Type<'db> {
     let id = evaluator.constraint();
     match id {
@@ -1032,16 +1137,7 @@ pub(crate) fn narrow_type_by_constraint<'db>(
         _ => {}
     }
 
-    NarrowingProjector::new(
-        db,
-        env,
-        evaluator.narrowing_constraints(),
-        evaluator.predicates(),
-        evaluator.predicate_narrowing_targets(),
-        place,
-        base_ty,
-    )
-    .narrow(id, base_ty)
+    NarrowingProjector::new(db, env, evaluator, place, base_ty, domain).narrow(id, base_ty)
 }
 
 fn apply_accumulated_narrowing<'db>(
@@ -1144,6 +1240,26 @@ impl<'db> ProjectedNarrowingCheckpoint<'db> {
             Self::Narrowed(ty) => ty,
         }
     }
+
+    fn cycle_normalized(
+        self,
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        previous: Self,
+        base_ty: Type<'db>,
+        cycle: &salsa::Cycle,
+    ) -> Self {
+        match self {
+            Self::Narrowed(ty) => Self::Narrowed(ty.cycle_normalized(
+                db,
+                &ProgramEnvironment::from_scope(scope),
+                previous.ty(base_ty),
+                cycle,
+            )),
+            Self::Unreachable => self,
+            Self::Unconstrained => self,
+        }
+    }
 }
 
 /// Evaluates a stable suffix with the canonical projected-graph evaluator.
@@ -1155,12 +1271,7 @@ impl<'db> ProjectedNarrowingCheckpoint<'db> {
     returns(copy),
     cycle_initial = |_, id, _, _, _, _| ProjectedNarrowingCheckpoint::Narrowed(Type::divergent(id)),
     cycle_fn = |db: &'db dyn Db, cycle, previous: &ProjectedNarrowingCheckpoint<'db>, result: ProjectedNarrowingCheckpoint<'db>, scope: ScopeId<'db>, _, _, base_ty| {
-        match result {
-            ProjectedNarrowingCheckpoint::Narrowed(ty) => ProjectedNarrowingCheckpoint::Narrowed(
-                ty.cycle_normalized(db, &ProgramEnvironment::from_scope(scope), previous.ty(base_ty), cycle)
-            ),
-            _ => result,
-        }
+        result.cycle_normalized(db, scope, *previous, base_ty, cycle)
     },
     heap_size = get_size2::GetSize::get_heap_size
 )]
@@ -1171,18 +1282,48 @@ fn evaluate_projected_narrowing_checkpoint<'db>(
     constraint: ScopedNarrowingConstraint,
     base_ty: Type<'db>,
 ) -> ProjectedNarrowingCheckpoint<'db> {
+    evaluate_projected_narrowing_checkpoint_impl(db, scope, place, constraint, base_ty, None)
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, id, _, _, _, _, _| ProjectedNarrowingCheckpoint::Narrowed(Type::divergent(id)),
+    cycle_fn = |db: &'db dyn Db, cycle, previous: &ProjectedNarrowingCheckpoint<'db>, result: ProjectedNarrowingCheckpoint<'db>, scope: ScopeId<'db>, _, _, base_ty, _| {
+        result.cycle_normalized(db, scope, *previous, base_ty, cycle)
+    },
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn evaluate_body_projected_narrowing_checkpoint<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    place: ScopedPlaceId,
+    constraint: ScopedNarrowingConstraint,
+    base_ty: Type<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> ProjectedNarrowingCheckpoint<'db> {
+    debug_assert_eq!(scope, domain.scope(db));
+    evaluate_projected_narrowing_checkpoint_impl(
+        db,
+        scope,
+        place,
+        constraint,
+        base_ty,
+        Some(domain),
+    )
+}
+
+fn evaluate_projected_narrowing_checkpoint_impl<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    place: ScopedPlaceId,
+    constraint: ScopedNarrowingConstraint,
+    base_ty: Type<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> ProjectedNarrowingCheckpoint<'db> {
     let env = ProgramEnvironment::from_scope(scope);
     let use_def = use_def_map(db, scope);
     let evaluator = use_def.narrowing_evaluator(constraint);
-    let mut projector = NarrowingProjector::new(
-        db,
-        &env,
-        evaluator.narrowing_constraints(),
-        use_def.predicates(),
-        evaluator.predicate_narrowing_targets(),
-        place,
-        base_ty,
-    );
+    let mut projector = NarrowingProjector::new(db, &env, &evaluator, place, base_ty, domain);
     let root = projector.project(constraint, false);
     match root {
         ProjectedNarrowingNodeId::ALWAYS_FALSE => ProjectedNarrowingCheckpoint::Unreachable,
@@ -1211,18 +1352,17 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
     pub(crate) fn new(
         db: &'db dyn Db,
         env: &'a ProgramEnvironment<'db>,
-        constraints: &'a NarrowingConstraints,
-        predicates: &'a IndexSlice<ScopedPredicateId, Predicate<'db>>,
-        predicate_narrowing_targets: &'a PredicateNarrowingTargets,
+        evaluator: &NarrowingEvaluator<'a, 'db>,
         place: ScopedPlaceId,
         base_ty: Type<'db>,
+        body_domain: Option<FunctionBodyDomain<'db>>,
     ) -> Self {
         Self {
             db,
             env,
-            constraints,
-            predicates: PredicateEvaluator::uncached(predicates),
-            predicate_narrowing_targets,
+            constraints: evaluator.narrowing_constraints(),
+            predicates: PredicateEvaluator::uncached(evaluator.predicates(), body_domain),
+            predicate_narrowing_targets: evaluator.predicate_narrowing_targets(),
             place,
             base_ty,
             project_cache: FxHashMap::default(),
@@ -1237,7 +1377,10 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         constraints: &ReachabilityConstraints,
     ) -> Self {
         self.predicates.cache = cache
-            .filter(|cache| cache.primary_constraints == std::ptr::from_ref(constraints).addr())
+            .filter(|cache| cache.primary_constraints == std::ptr::from_ref(constraints).addr()
+                && cache.body_domain == self.predicates.body_domain
+                && self.predicates.entries.first().is_some_and(|predicate|
+                    predicate_scope(self.db, predicate) == cache.primary_scope))
             .map(|cache| &cache.primary_predicates);
         self
     }
@@ -1319,7 +1462,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         }
 
         let constraints =
-            infer_narrowing_constraints(db, self.predicates.entries[predicate_id], self.place);
+            infer_narrowing_constraints(db, self.predicates.entries[predicate_id], self.place, self.predicates.body_domain);
         self.graph
             .predicate_constraints_cache
             .insert(predicate_id, constraints.clone());
@@ -1526,13 +1669,31 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                                     | PredicateNode::FinallyNormalPathImpossible { .. }
                             ))
                     {
-                        let checkpoint = evaluate_projected_narrowing_checkpoint(
-                            db,
-                            predicate_scope(db, &predicate),
-                            self.place,
-                            id,
-                            self.base_ty,
-                        );
+                        let scope = predicate_scope(db, &predicate);
+                        let checkpoint = self.predicates
+                            .body_domain
+                            .filter(|domain| domain.scope(db) == scope)
+                            .map_or_else(
+                                || {
+                                    evaluate_projected_narrowing_checkpoint(
+                                        db,
+                                        scope,
+                                        self.place,
+                                        id,
+                                        self.base_ty,
+                                    )
+                                },
+                                |domain| {
+                                    evaluate_body_projected_narrowing_checkpoint(
+                                        db,
+                                        scope,
+                                        self.place,
+                                        id,
+                                        self.base_ty,
+                                        domain,
+                                    )
+                                },
+                            );
                         let projected = match checkpoint {
                             ProjectedNarrowingCheckpoint::Unreachable => {
                                 ProjectedNarrowingNodeId::ALWAYS_FALSE
@@ -1922,31 +2083,60 @@ fn analyze_single_pattern_predicate_kind<'db>(
     returns(copy),
     cycle_initial = |_, _, _| Truthiness::AlwaysTrue,
     cycle_fn = |_, cycle: &salsa::Cycle, previous: &Truthiness, result: Truthiness, _| {
-        // A call can determine whether its own target is reachable, as with `sys.exit()` before
-        // `import sys` in a loop. Expression inference can lose its previous result when it stops
-        // being a cycle head, so widen the predicate itself to ensure convergence. Delay widening
-        // to allow the optimistic initial value to resolve to a terminal call.
-        if cycle.iteration() > crate::TAINTED_CYCLES {
-            previous.or(result)
-        } else {
-            result
-        }
+        normalize_non_terminal_call_cycle(cycle, *previous, result)
     },
     heap_size = get_size2::GetSize::get_heap_size
 )]
-fn analyze_non_terminal_call<'db>(db: &'db dyn Db, call: CallableAndCallExpr<'db>) -> Truthiness {
+fn analyze_non_terminal_call<'db>(db: &'db dyn Db, call_expr: CallableAndCallExpr<'db>) -> Truthiness {
+    analyze_non_terminal_call_impl(db, call_expr, None)
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _| Truthiness::AlwaysTrue,
+    cycle_fn = |_, cycle: &salsa::Cycle, previous: &Truthiness, result: Truthiness, _, _| {
+        normalize_non_terminal_call_cycle(cycle, *previous, result)
+    },
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn analyze_body_non_terminal_call<'db>(
+    db: &'db dyn Db,
+    call_expr: CallableAndCallExpr<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> Truthiness {
+    debug_assert_eq!(call_expr.call_expr(db).scope(db), domain.scope(db));
+    analyze_non_terminal_call_impl(db, call_expr, Some(domain))
+}
+
+fn normalize_non_terminal_call_cycle(
+    cycle: &salsa::Cycle,
+    previous: Truthiness,
+    result: Truthiness,
+) -> Truthiness {
+    // A call can determine whether its own target is reachable, as with `sys.exit()` before
+    // `import sys` in a loop. Expression inference can lose its previous result when it stops
+    // being a cycle head, so widen the predicate itself to ensure convergence. Delay widening
+    // to allow the optimistic initial value to resolve to a terminal call.
+    if cycle.iteration() > crate::TAINTED_CYCLES {
+        previous.or(result)
+    } else {
+        result
+    }
+}
+
+fn analyze_non_terminal_call_impl<'db>(
+    db: &'db dyn Db,
+    call: CallableAndCallExpr<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Truthiness {
     let callable = call.callable(db);
     let env = ProgramEnvironment::from_scope(callable.scope(db));
-    // We first infer just the type of the callable. In the most likely case that the function is
-    // not marked with `NoReturn`, or that it always returns `NoReturn`, doing so allows us to avoid
-    // the more expensive work of inferring the entire call expression (which could involve
-    // inferring argument types to possibly run the overload selection algorithm). Avoiding this on
-    // the happy path is important because these constraints can be very large in number, since we
-    // add them on all statement-level function calls.
-    let ty = infer_same_file_expression_type(db, callable, TypeContext::default());
-
+    let ty = infer_expression_with_body_domain(db, callable, TypeContext::default(), domain)
+        .expression_type(callable.node_ref(db));
     is_non_terminal_call(db, &env, ty, call.is_await(db), || {
-        infer_same_file_expression_type(db, call.call_expr(db), TypeContext::default())
+        let expression = call.call_expr(db);
+        infer_expression_with_body_domain(db, expression, TypeContext::default(), domain)
+            .expression_type(expression.node_ref(db))
     })
 }
 
@@ -1993,11 +2183,22 @@ pub(crate) fn is_non_terminal_call<'db>(
 }
 
 fn analyze_non_empty_iterable(db: &dyn Db, iterable: Expression) -> Truthiness {
-    match infer_same_file_expression_type(db, iterable, TypeContext::default()) {
-        Type::KnownInstance(KnownInstanceType::Range { is_non_empty }) => {
-            Truthiness::from(is_non_empty)
-        }
-        _ => Truthiness::Ambiguous,
+    let iterable_ty = infer_same_file_expression_type(db, iterable, TypeContext::default());
+    if let Type::KnownInstance(KnownInstanceType::Range { is_non_empty }) = iterable_ty {
+        return Truthiness::from(is_non_empty);
+    }
+    let env = ProgramEnvironment::from_scope(iterable.scope(db));
+    if iterable_ty.has_provisional_marker(db, &env) {
+        return Truthiness::Ambiguous;
+    }
+    let Ok(iteration) = iterable_ty.try_iterate(db, &env) else {
+        return Truthiness::Ambiguous;
+    };
+    let element = iteration.homogeneous_element_type(db, &env);
+    if element.is_never() {
+        Truthiness::AlwaysFalse
+    } else {
+        Truthiness::Ambiguous
     }
 }
 
@@ -2041,11 +2242,92 @@ fn context_manager_suppresses<'db>(
 /// In particular, treating `Never` as ambiguous can introduce loop bindings that then exclude each
 /// other, causing inference to settle on different types depending on file-checking order.
 fn analyze_single(db: &dyn Db, env: &ProgramEnvironment<'_>, predicate: &Predicate) -> Truthiness {
+    analyze_single_in_domain(db, env, predicate, None)
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _| false,
+    cycle_fn = |_, cycle: &salsa::Cycle, previous: &bool, result: bool, _, _| {
+        // Once the tainted iterations have resolved, losing a proof restores occurrence-local
+        // reachability permanently for this cycle. Type widening alone cannot ensure convergence.
+        if cycle.iteration() > crate::TAINTED_CYCLES {
+            *previous && result
+        } else {
+            result
+        }
+    },
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn analyze_stable_boolean_guard<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    expression: Expression<'db>,
+) -> bool {
+    crate::types::narrow::is_stable_boolean_guard(db, definition, expression, None)
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial = |_, _, _, _, _| false,
+    cycle_fn = |_, cycle: &salsa::Cycle, previous: &bool, result: bool, _, _, _| {
+        if cycle.iteration() > crate::TAINTED_CYCLES {
+            *previous && result
+        } else {
+            result
+        }
+    },
+    heap_size = get_size2::GetSize::get_heap_size
+)]
+fn analyze_body_boolean_guard<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    expression: Expression<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> bool {
+    crate::types::narrow::is_stable_boolean_guard(db, definition, expression, Some(domain))
+}
+
+fn analyze_reachability_atom<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    use_def: &UseDefMap<'db>,
+    predicates: PredicateEvaluator<'_, 'db>,
+    id: ScopedPredicateId,
+) -> ReachabilityAtom<Definition<'db>> {
+    let predicate = &predicates.entries[id];
+    let domain = predicates.body_domain;
+    if let Some(guard) = use_def.boolean_guard(id) {
+        let BooleanGuard {
+            definition,
+            expression,
+            is_positive,
+        } = guard;
+        if domain.map_or_else(
+            || analyze_stable_boolean_guard(db, definition, expression),
+            |domain| analyze_body_boolean_guard(db, definition, expression, domain),
+        ) {
+            return ReachabilityAtom::Symbolic {
+                key: definition,
+                is_positive: is_positive == predicate.is_positive,
+            };
+        }
+    }
+    ReachabilityAtom::Known(predicates.evaluate(db, env, id))
+}
+
+fn analyze_single_in_domain<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    predicate: &Predicate<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Truthiness {
     let _span = tracing::trace_span!("analyze_single", ?predicate).entered();
+    let domain = domain.filter(|domain| domain.scope(db) == predicate_scope(db, predicate));
 
     match predicate.node {
         PredicateNode::Expression(expression) => {
-            infer_predicate_truthiness(db, expression).negate_if(!predicate.is_positive)
+            infer_predicate_truthiness(db, expression, domain).negate_if(!predicate.is_positive)
         }
         PredicateNode::ContextManagerSuppresses {
             expression,
@@ -2063,9 +2345,16 @@ fn analyze_single(db: &dyn Db, env: &ProgramEnvironment<'_>, predicate: &Predica
             evaluate_finally_continuation(db, scope, continuation).is_always_false(),
         )
         .negate_if(!predicate.is_positive),
-        PredicateNode::IsNonTerminalCall(call) => {
-            analyze_non_terminal_call(db, call).negate_if(!predicate.is_positive)
-        }
+        PredicateNode::IsNonTerminalCall(call) => domain
+            .map_or_else(
+                || analyze_non_terminal_call(db, call),
+                |domain| analyze_body_non_terminal_call(db, call, domain),
+            )
+            .negate_if(!predicate.is_positive),
+        PredicateNode::SuccessfulSubscript {
+            receiver: _,
+            key: _,
+        } => Truthiness::Ambiguous,
         PredicateNode::Pattern(inner) => analyze_pattern_predicate(db, inner),
         PredicateNode::OrPatternAlternative(_) => Truthiness::Ambiguous,
         PredicateNode::SubjectElementPattern(subject_element) => {
@@ -2125,12 +2414,39 @@ pub(crate) fn is_range_reachable<'db>(
     scope_id: FileScopeId,
     range: TextRange,
 ) -> bool {
+    is_range_reachable_in_domain(db, index, scope_id, range, None)
+}
+
+pub(crate) fn is_range_reachable_in_domain<'db>(
+    db: &'db dyn Db,
+    index: &SemanticIndex<'db>,
+    scope_id: FileScopeId,
+    range: TextRange,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> bool {
     index.ancestor_scopes(scope_id).all(|(scope_id, _)| {
         let use_def = index.use_def_map(scope_id);
         !use_def
             .range_reachability()
             .any(|(entry_range, constraint)| {
-                entry_range.contains_range(range) && !is_reachable(db, use_def, constraint)
+                entry_range.contains_range(range)
+                    && !domain
+                        .map_or_else(
+                            || evaluate_reachability(db, use_def, constraint),
+                            |domain| {
+                                if domain.scope(db).file_scope_id(db) == scope_id {
+                                    evaluate_reachability_in_domain(
+                                        db,
+                                        domain.scope(db),
+                                        constraint,
+                                        Some(domain),
+                                    )
+                                } else {
+                                    evaluate_reachability(db, use_def, constraint)
+                                }
+                            },
+                        )
+                        .may_be_true()
             })
     })
 }
@@ -2141,6 +2457,24 @@ pub(crate) fn is_range_reachable<'db>(
 pub(crate) fn is_end_of_scope_reachable<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> bool {
     let use_def = use_def_map(db, scope);
     is_reachable(db, use_def, use_def.end_of_scope_reachability())
+}
+
+pub(crate) fn is_end_of_scope_reachable_in_domain<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> bool {
+    let Some(domain) = domain else {
+        return is_end_of_scope_reachable(db, scope);
+    };
+    let use_def = use_def_map(db, scope);
+    evaluate_reachability_in_domain(
+        db,
+        domain.scope(db),
+        use_def.end_of_scope_reachability(),
+        Some(domain),
+    )
+    .may_be_true()
 }
 
 pub(crate) fn is_reachable<'db>(
@@ -2187,6 +2521,215 @@ impl TruthinessCache {
     }
 }
 
+/// A Boolean identity used only while projecting the bindings of one tuple expression.
+#[derive(Clone, Copy)]
+pub(crate) struct BooleanIdentity<'ast, 'db> {
+    scope: ScopeId<'db>,
+    name: &'ast ast::ExprName,
+    loop_body: Option<TextRange>,
+    stable_definition: Option<Definition<'db>>,
+}
+
+impl<'ast, 'db> BooleanIdentity<'ast, 'db> {
+    /// Admit a passive local read without identifying values across loop backedges.
+    /// The caller checks its committed Boolean type and all current binding results. An optional
+    /// stable definition retains the earlier proof for a sole binding with no loop or captured writes.
+    pub(crate) fn at_use(
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        name: &'ast ast::ExprName,
+        stable_definition: Option<Definition<'db>>,
+    ) -> Option<Self> {
+        let mut loop_body: Option<TextRange> = None;
+        if stable_definition.is_none() {
+            let places = place_table(db, scope);
+            let symbol = places.symbol_id(&name.id)?;
+            let use_def = use_def_map(db, scope);
+            let module = parsed_module(db, scope.python_file(db)).load(db);
+            // This history retains even headers shadowed at the current use. Every loop that can
+            // write the tag must contain both reads in its body, excluding its iterator and else suite.
+            for binding in use_def.reachable_symbol_bindings(symbol) {
+                let Some(definition) = binding.binding.definition() else {
+                    continue;
+                };
+                match definition.kind(db) {
+                    DefinitionKind::LoopHeader(header) => {
+                        let body = &header.for_stmt(&module)?.body;
+                        let range = TextRange::new(body.first()?.start(), body.last()?.end());
+                        if !range.contains_range(name.range()) {
+                            return None;
+                        }
+                        loop_body = Some(match loop_body {
+                            Some(previous) => previous.intersect(range)?,
+                            None => range,
+                        });
+                    }
+                    DefinitionKind::NestedBindings(_) => return None,
+                    _ => {}
+                }
+            }
+        }
+        Some(Self {
+            scope,
+            name,
+            loop_body,
+            stable_definition,
+        })
+    }
+}
+
+/// Project a path under one Boolean value without reusing ordinary checkpoints.
+pub(crate) fn evaluate_reachability_assuming_boolean<'db>(
+    db: &'db dyn Db,
+    constraints: &ReachabilityConstraints,
+    predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
+    reachability: ScopedReachabilityConstraintId,
+    identity: BooleanIdentity<'_, 'db>,
+    value: bool,
+) -> Truthiness {
+    let BooleanIdentity {
+        scope,
+        name,
+        loop_body,
+        stable_definition,
+    } = identity;
+    let env = ProgramEnvironment::from_scope(scope);
+    let use_def = use_def_map(db, scope);
+    constraints.project(reachability, |atom| {
+        let predicate = &predicates[atom];
+        let expression = match predicate.node {
+            PredicateNode::Expression(expression) => Some(expression),
+            _ => None,
+        };
+        if let Some(expression) = expression
+            && expression.scope(db) == scope
+        {
+            let module = parsed_module(db, expression.python_file(db)).load(db);
+            let current_use = name.scoped_use_id(db, scope.program_file(db));
+            let leaf_type = |leaf: &ast::Expr| {
+                    let ast::Expr::Name(guard) = leaf else {
+                        return Type::unknown();
+                    };
+                    if guard.id != name.id
+                        || guard.end() > name.start()
+                        || loop_body.is_some_and(|body| !body.contains_range(guard.range()))
+                    {
+                        return Type::unknown();
+                    }
+                    let guard_use = guard.scoped_use_id(db, scope.program_file(db));
+                    let record = |BindingWithConstraints {
+                                      binding,
+                                      binding_order,
+                                      narrowing_constraint,
+                                      reachability_constraint,
+                                  }| {
+                        (
+                            binding,
+                            binding_order,
+                            narrowing_constraint.constraint(),
+                            reachability_constraint,
+                        )
+                    };
+                    // Equality is useful only within the region above: the same static records
+                    // may otherwise denote values produced by different loop iterations.
+                    let same_value = use_def
+                        .bindings_at_use(current_use)
+                        .map(record)
+                        .eq(use_def.bindings_at_use(guard_use).map(record));
+                    if same_value {
+                        Type::bool_literal(value)
+                    } else {
+                        Type::unknown()
+                    }
+            };
+            let truthiness = TruthinessAnalyzer::new(db, &env, leaf_type, |_| None)
+                .truthiness(expression.node_ref(db).node(&module), ExpressionContext::Condition);
+            if !truthiness.is_ambiguous() {
+                return ReachabilityAtom::Known(truthiness.negate_if(!predicate.is_positive));
+            }
+        }
+        match analyze_reachability_atom(db, &env, use_def, PredicateEvaluator::uncached(predicates, None), atom) {
+            ReachabilityAtom::Symbolic { key, is_positive } => {
+                if stable_definition == Some(key) {
+                    ReachabilityAtom::Known(Truthiness::from(value == is_positive))
+                } else {
+                    ReachabilityAtom::Symbolic { key, is_positive }
+                }
+            }
+            ReachabilityAtom::Known(truthiness) => ReachabilityAtom::Known(truthiness),
+        }
+    })
+}
+
+/// Exclude an exact initial binding when its survival fixes a later loop guard.
+/// The evaluation is local to this assumption; ordinary checkpoint results carry no binding key.
+pub(crate) fn refine_initial_binding_reachability<'db>(
+    db: &'db dyn Db,
+    binding: Definition<'db>,
+    constraints: &ReachabilityConstraints,
+    predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
+    id: ScopedReachabilityConstraintId,
+    ordinary: Truthiness,
+) -> Truthiness {
+    if !ordinary.is_ambiguous() || terminal_reachability(id).is_some() {
+        return ordinary;
+    }
+    let DefinitionKind::Assignment(assignment) = binding.kind(db) else {
+        return ordinary;
+    };
+    if assignment.owner() != BindingsOwner::Definition {
+        return ordinary;
+    }
+    let ScopedPlaceId::Symbol(symbol) = binding.place(db) else {
+        return ordinary;
+    };
+    let scope = binding.scope(db);
+    if predicate_scope(db, &predicates[constraints.get_interior_node(id).atom()]) != scope
+        || scope.node(db).as_function().is_none()
+    {
+        return ordinary;
+    }
+    let module = parsed_module(db, scope.python_file(db)).load(db);
+    if !assignment.value(&module).is_none_literal_expr() {
+        return ordinary;
+    }
+    let use_def = use_def_map(db, scope);
+    if constraints.used_interiors().len() > crate::place::MAX_EXACT_LOOP_HEADER_REACHABILITY_NODES
+        || !use_def
+            .reachable_symbol_bindings(symbol)
+            .any(|alternative| {
+                let Some(definition) = alternative.binding.definition() else {
+                    return false;
+                };
+                if !definition.kind(db).is_loop_header() {
+                    return false;
+                }
+                let mut incoming = use_def.bindings_at_definition(definition);
+                incoming
+                    .next()
+                    .is_some_and(|entry| entry.binding == DefinitionState::Defined(binding))
+                    && incoming.next().is_none()
+            })
+    {
+        return ordinary;
+    }
+    let result = evaluate_reachability_path(
+        db,
+        scope,
+        constraints,
+        PredicateEvaluator::uncached(predicates, None),
+        id,
+        INITIAL_CHECKPOINT_MASK,
+        Some(binding),
+    )
+    .resolve(db, scope, None);
+    if result.is_always_false() {
+        result
+    } else {
+        ordinary
+    }
+}
+
 /// Inference-local cache for static reachability evaluations.
 ///
 /// Place lookup may evaluate the same reachability constraint many times while inferring a single
@@ -2207,6 +2750,7 @@ pub(crate) struct ReachabilityEvaluationCache<'db> {
     primary_entries: TruthinessCache,
     primary_predicates: TruthinessCache,
     other_entries: RefCell<FxHashMap<(usize, ScopedReachabilityConstraintId), Truthiness>>,
+    body_domain: Option<FunctionBodyDomain<'db>>,
 }
 
 impl<'db> ReachabilityEvaluationCache<'db> {
@@ -2225,7 +2769,22 @@ impl<'db> ReachabilityEvaluationCache<'db> {
             primary_entries: TruthinessCache::default(),
             primary_predicates: TruthinessCache::default(),
             other_entries: RefCell::new(FxHashMap::default()),
+            body_domain: None,
         }
+    }
+
+    /// Set the immutable inference context before populating this cache. Each entry is specific
+    /// to this domain as well as its scope and constraint identity.
+    pub(crate) fn with_body_domain(mut self, domain: Option<FunctionBodyDomain<'db>>) -> Self {
+        debug_assert!(self.primary_entries.0.borrow().is_empty());
+        debug_assert!(self.primary_predicates.0.borrow().is_empty());
+        debug_assert!(self.other_entries.borrow().is_empty());
+        self.body_domain = domain;
+        self
+    }
+
+    pub(crate) fn body_domain(&self) -> Option<FunctionBodyDomain<'db>> {
+        self.body_domain
     }
 
     /// Evaluates `id`, reusing a cached result when possible.
@@ -2258,7 +2817,7 @@ impl<'db> ReachabilityEvaluationCache<'db> {
                 return result;
             }
 
-            let result = evaluate_reachability_constraint(db, scope, id, None);
+            let result = evaluate_reachability_in_domain(db, scope, id, self.body_domain);
             self.other_entries.borrow_mut().insert(key, result);
             return result;
         }
@@ -2269,6 +2828,7 @@ impl<'db> ReachabilityEvaluationCache<'db> {
                 self.primary_scope,
                 id,
                 Some(&self.primary_predicates),
+                self.body_domain,
             )
         })
     }
@@ -2369,8 +2929,10 @@ impl<'db> DeclarationsIteratorExtension<'db> for DeclarationsIterator<'_, 'db> {
 mod tests {
     use super::*;
     use crate::db::tests::setup_db;
-    use ruff_db::files::system_path_to_file;
-    use ruff_db::system::DbWithWritableSystem as _;
+    use ruff_db::Db as _;
+    use ruff_db::files::{FileRootKind, system_path_to_file};
+    use ruff_db::system::{DbWithWritableSystem as _, SystemPath};
+    use salsa::Database as _;
     use ty_python_core::ProgramFile;
     use ty_python_core::narrowing_constraints::InteriorNode;
     use ty_python_core::predicate::Predicates;
@@ -2410,6 +2972,59 @@ mod tests {
         // Sharing aligned segments should keep the average work to a short walk per level.
         let interval = REACHABILITY_CHECKPOINT_INTERVAL as usize;
         assert!(visits <= LENGTH * interval * levels);
+    }
+
+    #[test]
+    fn stable_boolean_guard_collection_cycle() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = "def f():\n    values = [False]\n    flag = values[0]\n    if flag:\n        extra = True\n    else:\n        extra = False\n    values.append(extra)\n    if flag:\n        value: int = 'bad'\n";
+        db.write_file("/src/test.py", source)?;
+        let file = system_path_to_file(&db, "/src/test.py")?;
+        let program_file = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        let index = semantic_index(&db, program_file);
+        let scope = index
+            .child_scopes(FileScopeId::global())
+            .next()
+            .expect("the fixture defines one function")
+            .0;
+        let use_def = index.use_def_map(scope);
+        let BooleanGuard {
+            definition,
+            expression,
+            is_positive: _,
+        } = use_def
+            .predicates()
+            .iter_enumerated()
+            .find_map(|(id, _)| use_def.boolean_guard(id))
+            .expect("the scalar assignment is an admitted candidate");
+        let result = analyze_stable_boolean_guard(&db, definition, expression);
+        let diagnostics = crate::check_file_unwrap(&db, program_file);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = diagnostics.first().expect("one diagnostic was checked");
+        assert_eq!(diagnostic.id().as_str(), "invalid-assignment");
+        let range = diagnostic.primary_span().unwrap().range().unwrap();
+        assert_eq!(&source[range], "'bad'");
+        let events = db.take_salsa_events();
+        let cycles: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                salsa::EventKind::WillIterateCycle {
+                    database_key,
+                    iteration,
+                } => Some((
+                    db.ingredient_debug_name(database_key.ingredient_index()),
+                    iteration,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            cycles
+                .iter()
+                .any(|(name, _)| *name == "analyze_stable_boolean_guard"),
+            "proof={result}, cycles={cycles:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2490,6 +3105,7 @@ class TargetB:
                     &db,
                     scope,
                     use_def.end_of_scope_reachability(),
+                    None,
                     None
                 )
                 .may_be_true()
@@ -2505,9 +3121,108 @@ class TargetB:
         let scope = function_scope.to_scope_id(&db, program_file);
         let use_def = use_def_map(&db, scope);
         assert!(
-            evaluate_reachability_constraint(&db, scope, use_def.end_of_scope_reachability(), None)
+            evaluate_reachability_constraint(&db, scope, use_def.end_of_scope_reachability(), None, None)
                 .is_always_false()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn non_terminal_call_follows_reused_expression_after_edits() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let mut previous_id = None;
+        for (statement, expected) in [
+            ("stop()", Truthiness::AlwaysFalse),
+            ("if flag: pass", Truthiness::AlwaysTrue),
+            ("if stop(): pass", Truthiness::AlwaysTrue),
+            ("await stop_async()", Truthiness::AlwaysFalse),
+            ("stop_async()", Truthiness::AlwaysTrue),
+        ] {
+            let source = format!(
+                "from typing import NoReturn\ndef stop() -> NoReturn: ...\nasync def stop_async() -> NoReturn: ...\nasync def f(flag: bool):\n    {statement}\n"
+            );
+            db.write_file("/src/test.py", source)?;
+            let file = system_path_to_file(&db, "/src/test.py")?;
+            let program = ProgramFile::new(&db, file, db.program_environment().program(&db));
+            let parsed = parsed_module(&db, program.python_file(&db)).load(&db);
+            let function = parsed
+                .syntax()
+                .body
+                .last()
+                .unwrap()
+                .as_function_def_stmt()
+                .unwrap();
+            let node = match &function.body[0] {
+                ast::Stmt::Expr(statement) => statement.value.as_ref(),
+                ast::Stmt::If(statement) => statement.test.as_ref(),
+                statement => panic!("unexpected fixture statement: {statement:?}"),
+            };
+            let expression = semantic_index(&db, program).expression(node);
+            let id = salsa::plumbing::AsId::as_id(&expression);
+            if let Some(previous) = previous_id {
+                assert_eq!(id, previous, "the edit must reuse the warmed expression");
+            }
+            previous_id = Some(id);
+            assert_eq!(
+                analyze_non_terminal_call(&db, expression),
+                expected,
+                "{statement}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn statement_call_index_survives_unrelated_revisions() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        // Project files have LOW durability, so their interned call keys can be reclaimed.
+        let root =
+            db.files()
+                .try_add_root(&db, SystemPath::new("/src/project"), FileRootKind::Project);
+        assert_eq!(root.kind_at_time_of_creation(&db), FileRootKind::Project);
+        let source = format!("def run(callback):\n{}", "    callback()\n".repeat(64));
+        db.write_file("/src/project/target.py", &source)?;
+        let file = system_path_to_file(&db, "/src/project/target.py")?;
+        // Register these files before editing them so each write advances a revision.
+        let mut others = Vec::new();
+        for revision in 0..8 {
+            let path = format!("/src/project/other_{revision}.py");
+            db.write_file(&path, "")?;
+            let file = system_path_to_file(&db, &path)?;
+            others.push((path, file));
+        }
+        let program = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        let original_id = salsa::plumbing::AsId::as_id(&program);
+        semantic_index(&db, program);
+        for (path, other_file) in others {
+            let other = format!("def run(callback):\n{}", "    callback()\n".repeat(256));
+            let revision = salsa::plumbing::current_revision(&db);
+            db.write_file(&path, other)?;
+            assert!(salsa::plumbing::current_revision(&db) > revision);
+            let other_program =
+                ProgramFile::new(&db, other_file, db.program_environment().program(&db));
+            semantic_index(&db, other_program);
+        }
+        db.clear_salsa_events();
+        let program = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        assert_eq!(salsa::plumbing::AsId::as_id(&program), original_id);
+        semantic_index(&db, program);
+        let events = db.take_salsa_events();
+        assert!(
+            !events.iter().any(|event| matches!(event.kind,
+                salsa::EventKind::WillExecute { database_key }
+                if db.ingredient_debug_name(database_key.ingredient_index()) == "semantic_index"
+            )),
+            "{events:?}"
+        );
+        db.write_file("/src/project/target.py", format!("{source}changed = 1\n"))?;
+        let program = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        semantic_index(&db, program);
+        let events = db.take_salsa_events();
+        assert!(events.iter().any(|event| matches!(event.kind,
+            salsa::EventKind::WillExecute { database_key }
+            if db.ingredient_debug_name(database_key.ingredient_index()) == "semantic_index"
+        )));
         Ok(())
     }
 
@@ -2563,12 +3278,13 @@ class TargetB:
                 let mut projector = NarrowingProjector::new(
                     &db,
                     &env,
-                    &constraints,
-                    &predicates,
-                    evaluator.predicate_narrowing_targets(),
+                    &evaluator,
                     ScopedPlaceId::Symbol(x),
                     Type::unknown(),
+                    None,
                 );
+                projector.constraints = &constraints;
+                projector.predicates = &predicates;
 
                 assert_eq!(
                     projector.project(ScopedNarrowingConstraint::new(DEPTH - 1), false),

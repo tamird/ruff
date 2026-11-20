@@ -5,13 +5,14 @@ use ty_module_resolver::{
     resolve_module, search_paths,
 };
 
+use crate::provided::ProvidedBindingResolution;
 use crate::{
     TypeQualifiers, add_inferred_python_version_hint_to_diagnostic,
     dependency::{DependencyProjectKind, missing_direct_dependency},
     place::{DefinedPlace, Definedness, Place, PlaceAndQualifiers, Provenance, TypeOrigin},
     reachability::evaluate_reachability_with_cache,
     types::{
-        DeclaredType, ModuleLiteralType, Type,
+        DeclaredType, MemberLookupPolicy, ModuleLiteralType, Type,
         diagnostic::{
             IMPORT_NOT_FOUND, MISSING_DIRECT_DEPENDENCY, MISSING_MODULE_MEMBER,
             POSSIBLY_MISSING_IMPORT, hint_if_stdlib_attribute_exists_on_other_versions,
@@ -21,7 +22,7 @@ use crate::{
         infer_definition_types,
     },
 };
-use ty_python_core::definition::Definition;
+use ty_python_core::definition::{Definition, ProvidedBindingDefinitionKind};
 
 impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Binds an imported value without declaring its type, while preserving inherited `Final`
@@ -42,7 +43,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// ```
     fn add_imported_binding(
         &mut self,
-        alias: &'ast ast::Alias,
+        target: ast::AnyNodeRef<'ast>,
         definition: Definition<'db>,
         ty: Type<'db>,
         qualifiers: TypeQualifiers,
@@ -50,10 +51,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) {
         // Check the imported value before assignment recovery can replace its type.
         if definition.kind(self.db()).as_star_import().is_none() {
-            self.check_deprecated(alias, ty);
+            self.check_deprecated(target, ty);
         }
 
-        self.add_binding(alias.into(), definition).insert(self, ty);
+        self.add_binding(target, definition).insert(self, ty);
 
         if qualifiers.contains(TypeQualifiers::FINAL) {
             self.declarations.insert(
@@ -61,6 +62,54 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 DeclaredType::new(Some(ty), TypeOrigin::Declared, qualifiers)
                     .with_provenance(provenance),
             );
+        }
+    }
+
+    pub(super) fn infer_provided_binding(
+        &mut self,
+        binding: &ProvidedBindingDefinitionKind,
+        definition: Definition<'db>,
+    ) {
+        let db = self.db();
+        let ProvidedBindingResolution { value, diagnostics } = db.provided_binding(definition);
+        let has_diagnostics = !diagnostics.is_empty();
+        self.context.extend_provided_diagnostics(diagnostics);
+        let resolved = crate::place::provided_binding_value(db, value);
+        let target = binding.statement(self.module());
+        match resolved.place {
+            Place::Defined(defined) => {
+                if defined.definedness == Definedness::PossiblyUndefined
+                    && let Some(builder) = self
+                        .context
+                        .report_lint(&POSSIBLY_MISSING_IMPORT, binding.binding.range)
+                {
+                    builder.into_diagnostic(format_args!(
+                        "Imported name `{}` may be missing",
+                        binding.binding.name
+                    ));
+                }
+                self.add_imported_binding(
+                    target.into(),
+                    definition,
+                    defined.ty,
+                    resolved.qualifiers,
+                    defined.provenance,
+                );
+            }
+            Place::Undefined => {
+                self.add_binding(target.into(), definition)
+                    .insert(self, Type::unknown());
+                if !has_diagnostics
+                    && let Some(builder) = self
+                        .context
+                        .report_lint(&UNRESOLVED_IMPORT, binding.binding.range)
+                {
+                    builder.into_diagnostic(format_args!(
+                        "Cannot resolve imported name `{}`",
+                        binding.binding.name
+                    ));
+                }
+            }
         }
     }
 
@@ -535,7 +584,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // First try loading the requested attribute from the module.
         if !skip_self_referential_member_lookup {
-            let result = module_literal.static_member(db, self.program_environment(), name);
+            let result = module_literal.static_member(
+                db,
+                self.program_environment(),
+                name,
+                MemberLookupPolicy::default(),
+            );
             let error = result.err();
             if let PlaceAndQualifiers {
                 place:
@@ -565,7 +619,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 if qualifiers.contains(TypeQualifiers::FROM_MODULE_GETATTR) {
                     from_module_getattr = Some((ty, qualifiers, source_provenance, error));
                 } else {
-                    self.add_imported_binding(alias, definition, ty, qualifiers, source_provenance);
+                    self.add_imported_binding(
+                        alias.into(),
+                        definition,
+                        ty,
+                        qualifiers,
+                        source_provenance,
+                    );
                     return;
                 }
             }
@@ -615,7 +675,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     name,
                 );
             }
-            self.add_imported_binding(alias, definition, ty, qualifiers, source_provenance);
+            self.add_imported_binding(alias.into(), definition, ty, qualifiers, source_provenance);
             return;
         }
 

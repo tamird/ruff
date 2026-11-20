@@ -23,6 +23,7 @@ use ty_python_core::{
 };
 
 use crate::Db;
+use crate::provided::BuiltinUsage;
 use crate::place::{
     ConsideredDefinitions, Definedness, Place, PlaceAndQualifiers, RequiresExplicitReExport,
     builtins_module_scope, class_body_implicit_symbol, explicit_global_symbol, has_bound_prefix,
@@ -30,7 +31,8 @@ use crate::place::{
     place_from_bindings_with_reachability_cache, typing_extensions_symbol,
 };
 use crate::reachability::ReachabilityEvaluationCache;
-use crate::types::{ProgramEnvironment, Type, original_class_type};
+use crate::types::{ProgramEnvironment, Type, binding_type, original_class_type};
+use crate::types::external_function_type_parameter;
 
 /// Evaluates the possible sources of a place load's value.
 ///
@@ -40,6 +42,7 @@ pub(crate) struct PlaceLoadResolver<'db, 'a> {
     procedure: PlaceLoadResolutionProcedure<'db, 'a>,
     env: &'a ProgramEnvironment<'db>,
     reachability_cache: Option<&'a ReachabilityEvaluationCache<'db>>,
+    builtin_usage: BuiltinUsage,
 }
 
 impl<'db, 'a> PlaceLoadResolver<'db, 'a> {
@@ -57,6 +60,7 @@ impl<'db, 'a> PlaceLoadResolver<'db, 'a> {
             procedure: PlaceLoadResolutionProcedure::new(db, index, scope, place_expr, mode),
             env,
             reachability_cache,
+            builtin_usage: BuiltinUsage::Runtime,
         }
     }
 
@@ -84,7 +88,20 @@ impl<'db, 'a> PlaceLoadResolver<'db, 'a> {
             ),
             env,
             reachability_cache,
+            builtin_usage: BuiltinUsage::Runtime,
         }
+    }
+
+    /// Selects the embedding application's builtin namespace for this load.
+    pub(crate) fn with_builtin_usage(mut self, usage: BuiltinUsage) -> Self {
+        self.builtin_usage = usage;
+        self
+    }
+
+    /// Includes annotation-only aliases and adopted type parameters.
+    pub(crate) fn with_annotation_sources(mut self) -> Self {
+        self.procedure = self.procedure.with_annotation_sources();
+        self
     }
 
     /// Resolves the loaded value, calling `visit` once per source as it is evaluated.
@@ -175,6 +192,11 @@ impl<'db, 'a> PlaceLoadResolver<'db, 'a> {
                 ConsideredDefinitions::AllReachable,
             ),
             PlaceLoadSourceKind::Implicit(implicit) => match implicit {
+                ImplicitPlaceLoad::TypeOnlyAlias(definition) => {
+                    Place::bound(binding_type(db, *definition))
+                        .with_definition(*definition)
+                        .into()
+                }
                 ImplicitPlaceLoad::DunderClass(definition) => original_class_type(db, *definition)
                     .map_or_else(
                         || Place::Undefined.into(),
@@ -201,7 +223,7 @@ impl<'db, 'a> PlaceLoadResolver<'db, 'a> {
                     {
                         Place::Undefined.into()
                     } else {
-                        implicit_builtins_symbol(db, self.env, name)
+                        implicit_builtins_symbol(db, self.env, name, self.builtin_usage)
                     }
                 }
                 ImplicitPlaceLoad::UnimportedRevealType => {
@@ -214,7 +236,7 @@ impl<'db, 'a> PlaceLoadResolver<'db, 'a> {
     fn resolve_bindings(&self, bindings: BindingWithConstraintsIterator<'_, 'db>) -> Place<'db> {
         let db = self.procedure.context.db;
         let resolved = if let Some(cache) = self.reachability_cache {
-            place_from_bindings_with_reachability_cache(db, self.env, bindings, cache)
+            place_from_bindings_with_reachability_cache(db, self.env, bindings, cache, cache.body_domain())
         } else {
             place_from_bindings(db, self.env, bindings)
         };
@@ -393,6 +415,11 @@ impl<'db> Iterator for PlaceLoadResolutionProcedure<'db, '_> {
                     self.next_node =
                         Some(PlaceLoadResolutionNode::AskConsumerWhetherToContinueForMember);
 
+                    if let Some(source) = self
+                        .type_only_alias_source(self.context.scope)
+                    {
+                        return Some(PlaceLoadResolutionStep::Source(source));
+                    }
                     if let Some((kind, exit_constraint)) =
                         self.context.local_source(self.place_expr())
                     {
@@ -429,6 +456,17 @@ impl<'db> Iterator for PlaceLoadResolutionProcedure<'db, '_> {
                             PlaceLoadSourceRole::Ordinary,
                         ),
                     ));
+                }
+                PlaceLoadResolutionNode::ExternalTypeParameterSource => {
+                    if let Some(source) = self.external_type_parameter_source(
+                        self.context.scope.to_scope_id(self.context.db, self.context.file),
+                    ) {
+                        self.next_node = Some(PlaceLoadResolutionNode::Failure(
+                            PlaceLoadFailure::UnboundFree,
+                        ));
+                        return Some(PlaceLoadResolutionStep::Source(source));
+                    }
+                    self.next_node = Some(PlaceLoadResolutionNode::EnclosingScopeSource);
                 }
                 PlaceLoadResolutionNode::EnclosingScopeSource => {
                     let (next_node, source) = self.resolve_enclosing_scopes();
@@ -580,6 +618,7 @@ impl<'db, 'ast> PlaceLoadResolutionProcedure<'db, 'ast> {
             file,
             mode,
             local_operand,
+            annotation_sources: false,
         };
         let crosses_scope_declaration = context.symbol_has_scope_declaration(scope, place_expr);
         Self {
@@ -589,6 +628,41 @@ impl<'db, 'ast> PlaceLoadResolutionProcedure<'db, 'ast> {
             constraints: PlaceLoadConstraints::default(),
             crosses_scope_declaration,
         }
+    }
+
+    /// Include annotation-only names while resolving a type expression.
+    pub(crate) fn with_annotation_sources(mut self) -> Self {
+        self.context.annotation_sources = true;
+        self
+    }
+
+    fn type_only_alias_source(&self, scope: FileScopeId) -> Option<PlaceLoadSource<'db>> {
+        if !self.context.annotation_sources {
+            return None;
+        }
+        let alias = self
+            .context
+            .index
+            .type_only_alias(scope, self.loaded_symbol_name()?.as_str())?;
+        Some(PlaceLoadConstraints::unnarrowed_source(
+            PlaceLoadSourceKind::Implicit(ImplicitPlaceLoad::TypeOnlyAlias(alias)),
+            PlaceLoadSourceRole::Ordinary,
+        ))
+    }
+
+    fn external_type_parameter_source(&self, scope: ScopeId<'db>) -> Option<PlaceLoadSource<'db>> {
+        if !self.context.annotation_sources {
+            return None;
+        }
+        let name = self.loaded_symbol_name()?;
+        let definition = external_function_type_parameter(self.context.db, scope, name.as_str())?;
+        Some(PlaceLoadConstraints::unnarrowed_source(
+            PlaceLoadSourceKind::DefinitionsFromOwningScope {
+                scope: definition.scope(self.context.db),
+                id: definition.place(self.context.db),
+            },
+            PlaceLoadSourceRole::Ordinary,
+        ))
     }
 
     fn decide_resolution_path(&mut self) -> PlaceLoadResolutionNode<'db> {
@@ -602,6 +676,10 @@ impl<'db, 'ast> PlaceLoadResolutionProcedure<'db, 'ast> {
         {
             let indexed_symbol = place_table.symbol(symbol_id);
             symbol_is_local = indexed_symbol.is_local();
+            if indexed_symbol.is_nonlocal() {
+                // A nonlocal declaration refers to a source binding, not an adopted annotation.
+                self.context.annotation_sources = false;
+            }
 
             let class_body_global_fallback = self.context.is_class_body_scope() && symbol_is_local;
             if self.context.skips_non_global_scopes(symbol_id) || class_body_global_fallback {
@@ -628,6 +706,8 @@ impl<'db, 'ast> PlaceLoadResolutionProcedure<'db, 'ast> {
             && let Some(definition) = self.context.dunder_class_cell_definition()
         {
             PlaceLoadResolutionNode::DunderClassSource(definition)
+        } else if self.context.annotation_sources {
+            PlaceLoadResolutionNode::ExternalTypeParameterSource
         } else {
             PlaceLoadResolutionNode::EnclosingScopeSource
         }
@@ -651,6 +731,23 @@ impl<'db, 'ast> PlaceLoadResolutionProcedure<'db, 'ast> {
         {
             if enclosing_file_scope.is_global() {
                 break;
+            }
+
+            if let Some(source) = self.external_type_parameter_source(
+                enclosing_file_scope.to_scope_id(self.context.db, self.context.file),
+            ) {
+                return (
+                    PlaceLoadResolutionNode::Failure(PlaceLoadFailure::UnboundFree),
+                    Some(source),
+                );
+            }
+            if is_lexically_visible
+                && let Some(source) = self.type_only_alias_source(enclosing_file_scope)
+            {
+                return (
+                    Self::node_after_enclosing_scope(enclosing_scope.kind()),
+                    Some(source),
+                );
             }
 
             let enclosing_place_table = self.context.index.place_table(enclosing_file_scope);
@@ -759,6 +856,7 @@ impl<'db, 'ast> PlaceLoadResolutionProcedure<'db, 'ast> {
             }
             // Keep walking across `nonlocal` declarations until reaching the owning scope.
             if forwards_to_nonlocal {
+                self.context.annotation_sources = false;
                 continue;
             }
             if !(enclosing_place.is_bound() || enclosing_place.is_declared()) {
@@ -793,6 +891,9 @@ impl<'db, 'ast> PlaceLoadResolutionProcedure<'db, 'ast> {
         let current_scope = self.context.scope;
         if current_scope.is_global() {
             return None;
+        }
+        if let Some(source) = self.type_only_alias_source(FileScopeId::global()) {
+            return Some(source);
         }
 
         if self.context.uses_enclosing_snapshots() {
@@ -1007,6 +1108,8 @@ pub(crate) enum PlaceLoadSourceKind<'db> {
 
 /// A source that consumers evaluate using a specialized query or rule.
 pub(crate) enum ImplicitPlaceLoad<'db> {
+    /// An alias that binds a name only in its scope's annotation namespace.
+    TypeOnlyAlias(Definition<'db>),
     /// The implicit `__class__` cell for a method, lambda, or generator expression defined directly
     /// in a class body, e.g.:
     ///
@@ -1147,6 +1250,7 @@ struct PlaceLoadResolutionContext<'db, 'ast> {
     file: ProgramFile<'db>,
     mode: PlaceLoadMode<'ast>,
     local_operand: Option<PlaceUse>,
+    annotation_sources: bool,
 }
 
 impl<'db> PlaceLoadResolutionContext<'db, '_> {
@@ -1344,6 +1448,8 @@ enum PlaceLoadResolutionNode<'db> {
     DecideResolutionPath,
     /// The implicit `__class__` source, followed by enclosing scopes.
     DunderClassSource(Definition<'db>),
+    /// An adopted type parameter after local ownership checks, followed by enclosing scopes.
+    ExternalTypeParameterSource,
     /// A source from the remaining enclosing scopes, if one exists.
     EnclosingScopeSource,
     /// The implicit class-body source, followed by the applicable global source.

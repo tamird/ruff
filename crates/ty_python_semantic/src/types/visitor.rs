@@ -8,11 +8,11 @@ use smallvec::SmallVec;
 use ty_python_core::definition::Definition;
 
 use crate::types::{
-    BoundMethodType, BoundSuperType, BoundTypeVarInstance, CallableType, EnumComplementType,
-    GenericAlias, IntersectionType, KnownBoundMethodType, KnownInstanceType, NominalInstanceType,
-    PropertyInstanceType, ProtocolInstanceType, RecursiveType, SlotDescriptorType,
-    StaticClassLiteral, SubclassOfType, Type, TypeAliasType, TypeFormType, TypeGuardType,
-    TypeIsType, TypedDictType, UnionType,
+    BoundMethodType, BoundSuperType, BoundTypeVarInstance, CallableType, DynamicType,
+    EnumComplementType, GenericAlias, IntersectionType, KnownBoundMethodType, KnownInstanceType,
+    NominalInstanceType, PropertyInstanceType, ProtocolInstanceType, RecursiveType, Signature,
+    SlotDescriptorType, StaticClassLiteral, SubclassOfType, Type, TypeAliasType, TypeFormType,
+    TypeGuardType, TypeIsType, TypedDictType, UnionType,
     bound_super::walk_bound_super_type,
     callable::walk_callable_type,
     class::walk_generic_alias,
@@ -32,7 +32,7 @@ use crate::types::{
     typevar::{
         TypeVarInstance, walk_bound_type_var_type, walk_type_var_attributes, walk_type_var_type,
     },
-    walk_property_instance_type, walk_typeguard_type, walk_typeis_type,
+    walk_property_instance_type, walk_signature, walk_typeguard_type, walk_typeis_type,
 };
 
 /// A visitor trait that recurses into nested types.
@@ -63,6 +63,10 @@ pub(crate) trait TypeVisitor<'db> {
         for rest in complement.rest(db) {
             self.visit_type(db, *rest);
         }
+    }
+
+    fn visit_signature(&self, db: &'db dyn Db, signature: &Signature<'db>) {
+        walk_signature(db, signature, self);
     }
 
     fn visit_callable_type(&self, db: &'db dyn Db, callable: CallableType<'db>) {
@@ -541,7 +545,7 @@ pub(super) fn dynamic_content_impl<'db>(
                 return;
             }
 
-            if matches!(self.mode, DynamicContentMode::Materialization) && ty.is_divergent() {
+            if !matches!(self.mode, DynamicContentMode::All) && ty.is_divergent() {
                 self.record(DynamicContent::Indeterminate);
                 return;
             }
@@ -555,6 +559,17 @@ pub(super) fn dynamic_content_impl<'db>(
             }
 
             walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
+        }
+
+        fn visit_signature(&self, db: &'db dyn Db, signature: &Signature<'db>) {
+            if !self.content.get().is_absent() {
+                return;
+            }
+            if signature.parameters().is_incomplete() {
+                self.record(DynamicContent::Present);
+            } else {
+                walk_signature(db, signature, self);
+            }
         }
 
         fn visit_function_type(&self, db: &'db dyn Db, function: FunctionType<'db>) {
@@ -586,11 +601,25 @@ pub(super) fn dynamic_content_impl<'db>(
         }
 
         fn visit_generic_alias_type(&self, db: &'db dyn Db, alias: GenericAlias<'db>) {
+            let specialization = alias.specialization(db);
+            if specialization.materialization_kind(db).is_some() {
+                // Invariant materializations retain their original arguments, but those
+                // arguments no longer denote gradual types. Provisional inference still
+                // prevents proving that the materialization is complete.
+                if specialization
+                    .types(db)
+                    .iter()
+                    .any(|ty| ty.has_indeterminate_inference(db, self.env))
+                {
+                    self.record(DynamicContent::Indeterminate);
+                }
+                return;
+            }
             // Use `walk_specialization_types` rather than `walk_specialization` to avoid walking
             // the bounds/constraints/defaults of the generic context.
             // Only the types the class was actually specialized with are relevant to whether
             // the `GenericAlias` contains a dynamic type.
-            walk_specialization_types(db, alias.specialization(db), self);
+            walk_specialization_types(db, specialization, self);
         }
 
         fn visit_typeis_type(&self, db: &'db dyn Db, type_is: TypeIsType<'db>) {
@@ -1071,7 +1100,7 @@ where
 /// The `should_visit_lazy_type_attributes` parameter controls whether deferred type attributes
 /// (value of a type alias, attributes of a class-based protocol, bounds/constraints of a typevar)
 /// are visited or not.
-pub(super) fn any_over_type<'db>(
+pub fn any_over_type<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
@@ -1101,13 +1130,36 @@ pub(super) fn any_over_type_including_alias_arguments<'db>(
 
 /// Searches through type aliases without forcing other lazily inferred type attributes.
 ///
-/// Revisiting a recursive alias counts as a match because its specialization can grow on each
-/// visit. Distinct specializations of a nonrecursive alias remain separate, so nested uses such as
-/// `Identity[Identity[int]]` are still considered finite.
+/// A recursive revisit counts as a match. Existing eligibility checks use this conservative
+/// result to decline recursive aliases. Distinct nonrecursive specializations remain separate.
 pub(super) fn any_over_type_expanding_aliases<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
+    query: impl Fn(Type<'db>) -> bool,
+) -> bool {
+    any_over_type_expanding_aliases_impl(db, env, ty, true, query)
+}
+
+/// Inspect completed recursive types for inference markers, declining potentially growing aliases.
+pub(super) fn has_indeterminate_inference<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
+    any_over_type_expanding_aliases_impl(db, env, ty, false, |ty| {
+        ty.is_divergent()
+            || ty
+                .as_dynamic()
+                .is_some_and(DynamicType::is_provisional_marker)
+    })
+}
+
+fn any_over_type_expanding_aliases_impl<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    match_exact_cycles: bool,
     query: impl Fn(Type<'db>) -> bool,
 ) -> bool {
     fn search<'db>(
@@ -1115,35 +1167,59 @@ pub(super) fn any_over_type_expanding_aliases<'db>(
         env: &ProgramEnvironment<'db>,
         ty: Type<'db>,
         query: &impl Fn(Type<'db>) -> bool,
+        match_exact_cycles: bool,
         active_aliases: &ActiveRecursionDetector<TypeIdentity<'db>>,
     ) -> bool {
         any_over_type(db, env, ty, false, |nested| {
             query(nested)
                 || match nested {
-                    Type::TypeAlias(alias) => active_aliases.visit(
-                        &nested.to_type_identity(db),
-                        || true,
-                        || search(db, env, alias.value_type(db), query, active_aliases),
-                    ),
-                    Type::Recursive(recursive) => active_aliases.visit(
-                        &nested.to_type_identity(db),
-                        || true,
-                        || {
-                            search(
-                                db,
-                                env,
-                                recursive.unfold(db, env).into_type(),
-                                query,
-                                active_aliases,
-                            )
-                        },
-                    ),
+                    Type::TypeAlias(alias) => {
+                        let identity = nested.to_type_identity(db);
+                        active_aliases.visit(
+                            &identity,
+                            || match_exact_cycles || !matches!(identity, TypeIdentity::Other(_)),
+                            || {
+                                search(
+                                    db,
+                                    env,
+                                    alias.value_type(db),
+                                    query,
+                                    match_exact_cycles,
+                                    active_aliases,
+                                )
+                            },
+                        )
+                    }
+                    Type::Recursive(recursive) => {
+                        let identity = nested.to_type_identity(db);
+                        active_aliases.visit(
+                            &identity,
+                            || match_exact_cycles || !matches!(identity, TypeIdentity::Other(_)),
+                            || {
+                                search(
+                                    db,
+                                    env,
+                                    recursive.unfold(db, env).into_type(),
+                                    query,
+                                    match_exact_cycles,
+                                    active_aliases,
+                                )
+                            },
+                        )
+                    }
                     _ => false,
                 }
         })
     }
 
-    search(db, env, ty, &query, &ActiveRecursionDetector::default())
+    search(
+        db,
+        env,
+        ty,
+        &query,
+        match_exact_cycles,
+        &ActiveRecursionDetector::default(),
+    )
 }
 
 /// Recurse into a type and calls the passed-in closure on every nested type
@@ -1185,7 +1261,7 @@ mod tests {
 
     use crate::db::tests::setup_db;
     use crate::place::global_symbol;
-    use crate::types::{DynamicType, Parameter, Parameters, SpecialFormType, Type};
+    use crate::types::{DynamicType, KnownClass, Parameter, Parameters, SpecialFormType, Type};
 
     use super::{CollectedTypes, DynamicContentMode, dynamic_content, dynamic_content_impl};
 
@@ -1200,6 +1276,55 @@ mod tests {
             ]),
         );
         assert!(dynamic_content(&db, &env, paramspec_value).is_absent());
+    }
+
+    #[test]
+    fn materialized_specializations_have_no_dynamic_content() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+            from typing import Any, Callable
+            from ty_extensions import Bottom, Top, Unknown
+            from ty_extensions._internal import RegularCallableTypeOf
+
+            def factory[**P, R](init: Callable[P, R] | None = None) -> None: ...
+
+            upper: Top[dict[str, Any]]
+            lower: Bottom[dict[str, Any]]
+            missing_upper: Top[dict[str, Unknown]]
+            callback: RegularCallableTypeOf[factory]
+            gradual: dict[str, Any]
+            missing: dict[str, Unknown]
+            nested_gradual: tuple[Top[dict[str, Any]], Any]
+            gradual_callback: Callable[..., Any]
+            missing_callback: Callable[[Unknown], None]
+            "#,
+        )?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/a.py")?;
+        let module = ProgramFile::new(&db, file, env.program(&db));
+        for (name, expected) in [
+            ("upper", true),
+            ("lower", true),
+            ("missing_upper", true),
+            ("callback", true),
+            ("gradual", false),
+            ("missing", false),
+            ("nested_gradual", false),
+            ("gradual_callback", false),
+            ("missing_callback", false),
+        ] {
+            let ty = global_symbol(&db, module, name).place.expect_type();
+            assert_eq!(ty.is_fully_static(&db, &env), expected, "{name}");
+            assert_eq!(
+                dynamic_content_impl(&db, &env, ty, DynamicContentMode::Materialization)
+                    .is_absent(),
+                expected,
+                "{name}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -1272,6 +1397,84 @@ mod tests {
                     .is_absent()
             );
         }
+        let list = KnownClass::List.to_specialized_instance(&db, &env, &[divergent]);
+        for ty in [
+            list.top_materialization(&db, &env),
+            list.bottom_materialization(&db, &env),
+        ] {
+            assert!(!ty.is_fully_static(&db, &env));
+            assert!(
+                !dynamic_content_impl(&db, &env, ty, DynamicContentMode::Materialization)
+                    .is_absent()
+            );
+        }
+    }
+
+    #[test]
+    fn static_except_any_preserves_unresolved_content() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+            from __future__ import annotations
+            from typing import Any, Callable, Protocol
+            from ty_extensions import Unknown
+
+            class Recursive[T](Protocol):
+                @property
+                def value(self) -> T: ...
+                @property
+                def child(self) -> Recursive[T]: ...
+
+            class Growing[T](Protocol):
+                @property
+                def child(self) -> Growing[list[T]]: ...
+
+            explicit: list[Any]
+            missing: list[Unknown]
+            callback: Callable[..., Any]
+            unresolved_callback: Callable[[Unknown], int]
+            exact: Recursive[Any]
+            unresolved: Recursive[Unknown]
+            growing: Growing[Any]
+            "#,
+        )?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/a.py")?;
+        let module = ProgramFile::new(&db, file, env.program(&db));
+        for (name, expected) in [
+            ("explicit", true),
+            ("missing", false),
+            ("callback", true),
+            ("unresolved_callback", false),
+            ("exact", true),
+            ("unresolved", false),
+            ("growing", false),
+        ] {
+            let ty = global_symbol(&db, module, name).place.expect_type();
+            assert_eq!(
+                ty.is_fully_static_except_any(&db, &env),
+                expected,
+                "{name}: {:?} in {}",
+                super::non_any_dynamic_content(&db, &env, ty),
+                ty.display(&db, &env)
+            );
+        }
+        let divergent = Type::divergent(salsa::plumbing::Id::from_bits(1));
+        for ty in [
+            divergent,
+            divergent.top_materialization(&db, &env),
+            divergent.bottom_materialization(&db, &env),
+            Type::pending_narrowing(),
+        ] {
+            assert!(!ty.is_fully_static_except_any(&db, &env));
+            let callback = Type::paramspec_value_callable(
+                &db,
+                Parameters::standard([Parameter::positional_only(None).with_annotated_type(ty)]),
+            );
+            assert!(!callback.is_fully_static_except_any(&db, &env));
+        }
+        Ok(())
     }
 
     #[test]

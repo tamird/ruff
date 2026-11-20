@@ -104,9 +104,9 @@ valid_constraints: Callable[[], None] = ValidConstrainedReceiver().method
 
 invalid_aliased_bound: Callable[[], None] = InvalidAliasedBoundedReceiver().method  # error: [invalid-assignment]
 
-# TODO: Enforce valid specializations for TypeVars nested inside receiver annotations.
-invalid_nested_bound: Callable[[], None] = InvalidNestedBoundedReceiver().method  # TODO: error: [invalid-assignment]
-invalid_union_constraints: Callable[[], None] = InvalidUnionConstrainedReceiver().method  # TODO: error: [invalid-assignment]
+# Nested receiver annotations must also satisfy the declared type-variable domain.
+invalid_nested_bound: Callable[[], None] = InvalidNestedBoundedReceiver().method  # error: [invalid-assignment]
+invalid_union_constraints: Callable[[], None] = InvalidUnionConstrainedReceiver().method  # error: [invalid-assignment]
 ```
 
 When we coerce a generic callable into a `Callable` type, it remembers that it is generic:
@@ -1855,4 +1855,479 @@ def make_growing[T](value: Growing[T]) -> Callable[[T], T]:
 callback_growing = make_growing((1, None))
 reveal_type(callback_growing)  # revealed: (int, /) -> int
 callback_growing("bad")  # error: [invalid-argument-type]
+```
+
+## Generic callbacks in inferred collections
+
+A collection can contain a generic callback alongside other values. The callback's type parameter
+belongs to its signature, including compound result types.
+
+```py
+def wrap[T](value: T) -> list[T]:
+    return [value]
+
+def seed() -> int:
+    return 1
+
+def callbacks() -> None:
+    values = {"seed": seed}
+    values.update(empty=None, wrap=wrap)
+```
+
+## Returning an unbound method of a specialized class
+
+The returned method's `Self` is bounded by the specialized class. Specializing the enclosing
+function also specializes that bound, including when the method passes through another function.
+
+```py
+from typing import Self
+from ty_extensions._internal import TypeOf
+
+class Box[T]:
+    value: T
+
+    def pair(self) -> tuple[Self, T]:
+        return self, self.value
+
+def method[T](box: Box[T]) -> TypeOf[Box[T].pair]:
+    return Box[T].pair
+
+def forward[T](box: Box[list[T]]) -> TypeOf[Box[list[T]].pair]:
+    return method(box)
+
+def check(box: Box[int], other: Box[str], nested: Box[list[int]]) -> None:
+    pair = method(box)
+    reveal_type(pair(box))  # revealed: tuple[Box[int], int]
+    pair(other)  # error: [invalid-argument-type] "does not satisfy upper bound `Box[int]`"
+    reveal_type(forward(nested)(nested))  # revealed: tuple[Box[list[int]], list[int]]
+```
+
+The same relationship holds when a function recursively returns the method.
+
+```py
+def recursive[T](box: Box[T], n: int) -> TypeOf[Box[T].pair]:
+    if n:
+        pair = recursive(box, n - 1)
+        reveal_type(pair(box))  # revealed: tuple[Box[T@recursive], T@recursive]
+        return pair
+    return Box[T].pair
+
+def check_recursive(box: Box[int]) -> None:
+    reveal_type(recursive(box, 1)(box))  # revealed: tuple[Box[int], int]
+```
+
+## Returning an unbound method with a ParamSpec
+
+Specialization of the returned method applies to both its `Self` bound and its parameter list.
+
+```py
+from typing import Self
+from ty_extensions._internal import TypeOf
+
+class Box[T, **P]:
+    value: T
+
+    def pair(self, *args: P.args, **kwargs: P.kwargs) -> tuple[Self, T]:
+        return self, self.value
+
+def method[T, **P](box: Box[T, P]) -> TypeOf[Box[T, P].pair]:
+    return Box[T, P].pair
+
+def check(box: Box[int, [str]]) -> None:
+    pair = method(box)
+    reveal_type(pair(box, "value"))  # revealed: tuple[Box[int, (str, /)], int]
+    pair(box, 1)  # error: [invalid-argument-type] "Expected `str`, found `Literal[1]`"
+```
+
+## A constructor accepting a generic method and capturing `Self`
+
+The constructor receives an unbound method whose `Self` is bounded by `Box[T]`. Its `owner` type
+argument is a different `Self`, captured from the calling method. A recursive call to the
+constructor similarly captures its caller's `Self`.
+
+```py
+from typing import Self
+from ty_extensions._internal import TypeOf
+
+class Box[T]:
+    value: T
+
+    def pair(self) -> tuple[Self, T]:
+        return self, self.value
+
+class Wrapper[T, U]:
+    def __init__(self, value: T, owner: U, pair: TypeOf[Box[T].pair]) -> None:
+        reveal_type(Wrapper[T, Self](value, self, pair))  # revealed: Wrapper[T@Wrapper, Self@__init__]
+        self.owner = owner
+        self.pair = pair
+
+class Caller[T]:
+    def wrap(self, value: T, box: Box[T]) -> Wrapper[T, Self]:
+        result = Wrapper[T, Self](value, self, Box[T].pair)
+        reveal_type(result.owner)  # revealed: Self@wrap
+        reveal_type(result.pair(box))  # revealed: tuple[Box[T@Caller], T@Caller]
+        return result
+
+def check(caller: Caller[int], box: Box[int]) -> None:
+    result = caller.wrap(1, box)
+    reveal_type(result.owner)  # revealed: Caller[int]
+    reveal_type(result.pair(box))  # revealed: tuple[Box[int], int]
+```
+
+## Calling generic bound methods from generic methods
+
+The receiver retains the calling method's `Self` while the called method infers its own type
+variable. This also applies to recursive calls to the same method.
+
+```py
+from typing import Self
+
+class Box[T]:
+    def pair[U](self, value: U, again: bool = False) -> tuple[Self, U]:
+        if again:
+            reveal_type(self.pair(value))  # revealed: tuple[Self@pair, U@pair]
+        return self, value
+
+    def forward[U](self, value: U) -> tuple[Self, U]:
+        reveal_type(self.pair(value))  # revealed: tuple[Self@forward, U@forward]
+        return self.pair(value)
+
+def check(box: Box[int]) -> None:
+    reveal_type(box.pair("value"))  # revealed: tuple[Box[int], Literal["value"]]
+    box.pair("value", "wrong")  # error: [invalid-argument-type]
+```
+
+## Recursive calls with class and method type variables
+
+A recursive call infers the method's type variable while preserving the class's type argument and
+the calling method's own type variable.
+
+```py
+class Box[T]:
+    def pair[U](self, value: U, stored: T, recurse: bool) -> tuple[U, T]:
+        if recurse:
+            reveal_type(self.pair(123, stored, False))  # revealed: tuple[Literal[123], T@Box]
+            reveal_type(self.pair(value, stored, False))  # revealed: tuple[U@pair, T@Box]
+        return value, stored
+```
+
+## Contextual lambdas in generic method calls
+
+The callback receives the class's type argument as context, and the method infers its return type
+from the callback.
+
+```py
+from typing import Callable
+
+class Box[T]:
+    def apply[U](self, value: T, transform: Callable[[T], U]) -> U:
+        return transform(value)
+
+    def contextual(self, value: T) -> T:
+        self.apply(value, lambda item: reveal_type(item))  # revealed: T@Box
+        reveal_type(self.apply(value, lambda item: item))  # revealed: T@Box
+        return self.apply(value, lambda item: item)
+```
+
+## Contextual variadic calls with `Self`
+
+A variadic superclass method preserves the caller's `Self` in the inferred tuple.
+
+```py
+from typing import Self
+
+class Base[T]:
+    def collect[*Ts](self, *args: *Ts) -> tuple[*Ts]:
+        return args
+
+class Child[T](Base[T]):
+    def collect_self(self) -> tuple[Self]:
+        result: tuple[Self] = super().collect(self)
+        reveal_type(result)  # revealed: tuple[Self@collect_self]
+        return result
+```
+
+## Specializing a type alias for a generic method
+
+Specializing the alias also specializes the returned method's `Self` bound, including through a
+nested alias.
+
+```py
+from typing_extensions import Self
+from ty_extensions._internal import TypeOf
+
+class Box[T]:
+    value: T
+
+    def pair(self) -> tuple[Self, T]:
+        return self, self.value
+
+type Pair[T] = TypeOf[Box[T].pair]
+type Nested[U] = Pair[list[U]]
+
+def check(pair: Pair[int], box: Box[int], other: Box[str], nested: Nested[int], lists: Box[list[int]]) -> None:
+    reveal_type(pair(box))  # revealed: tuple[Box[int], int]
+    pair(other)  # error: [invalid-argument-type]
+    reveal_type(nested(lists))  # revealed: tuple[Box[list[int]], list[int]]
+```
+
+## Receiver-derived invariant results
+
+Receiver specialization and protocol return inference share one choice of element type. The result
+retains that choice inside an invariant list. A second argument can require a wider element type,
+while an incompatible invariant result is rejected.
+
+```py
+from _typeshed import SupportsRAdd
+from collections.abc import Sequence
+
+class Receiver[V]:
+    def __radd__[L, R](self: "Receiver[Sequence[L]]", other: list[R], /) -> list[L | R]:
+        raise NotImplementedError
+
+def reflected[Result](other: SupportsRAdd[list[str], Result]) -> Result:
+    return other.__radd__(["x"])
+
+def objects(other: SupportsRAdd[list[str], list[object]]) -> None:
+    pass
+
+def integers(other: SupportsRAdd[list[str], list[int]]) -> None:
+    pass
+
+def correlated[Result](other: SupportsRAdd[list[str], Result], expected: Result) -> Result:
+    return other.__radd__(["x"])
+
+def check(value: Receiver[list[str]]):
+    reveal_type(reflected(value))  # revealed: list[str]
+    reveal_type(value.__radd__(["x"]))  # revealed: list[str]
+    objects(value)  # no diagnostic
+    integers(value)  # error: [invalid-argument-type]
+    reveal_type(correlated(value, [object()]))  # revealed: list[object]
+    correlated(value, 1)  # no diagnostic: both list[str] and int fit the result
+    result: int = correlated(value, 1)  # error: [invalid-assignment]
+```
+
+## Shared specialization for invariant results
+
+Both output lists use the same specialization of the callback's type variable.
+
+```py
+from typing import Callable
+
+def make[T](value: T, /) -> tuple[list[T], list[T]]:
+    return [value], [value]
+
+def combine[A, B](callback: Callable[[str], tuple[A, B]], sink: Callable[[A, B], None]) -> None:
+    pass
+
+def strings(left: list[str], right: list[str]) -> None:
+    pass
+
+def objects(left: list[object], right: list[object]) -> None:
+    pass
+
+def mixed(left: list[str], right: list[object]) -> None:
+    pass
+
+combine(make, strings)  # no diagnostic
+combine(make, objects)  # no diagnostic
+combine(make, mixed)  # error: [invalid-argument-type]
+```
+
+## Generic callable subtyping
+
+A generic source can satisfy a fixed callback type by choosing one specialization shared by its
+parameters and return type. Caller-owned variables stay fixed, and strict subtyping cannot use `Any`
+to supply missing evidence.
+
+```py
+from typing import Any, Callable
+from ty_extensions import static_assert
+from ty_extensions._internal import TypeOf, is_subtype_of
+
+def identity[T](value: T) -> T:
+    return value
+
+def pair[T](left: list[T], right: list[T]) -> list[T]:
+    return left
+
+def key[T](value: tuple[T, dict[T, bool]]) -> int:
+    return len(value[1])
+
+def gradual[T](value: T) -> Any:
+    return value
+
+static_assert(is_subtype_of(TypeOf[identity], Callable[[int], int]))
+static_assert(not is_subtype_of(TypeOf[identity], Callable[[int], str]))
+static_assert(is_subtype_of(TypeOf[pair], Callable[[list[int], list[int]], list[int]]))
+static_assert(not is_subtype_of(TypeOf[pair], Callable[[list[int], list[str]], list[int]]))
+static_assert(not is_subtype_of(TypeOf[gradual], Callable[[int], int]))
+static_assert(not is_subtype_of(TypeOf[identity], Callable[[Any], int]))
+
+def caller[U](value: U) -> None:
+    static_assert(is_subtype_of(TypeOf[identity], Callable[[U], U]))
+    static_assert(is_subtype_of(TypeOf[key], Callable[[tuple[U, dict[U, bool]]], int]))
+    static_assert(not is_subtype_of(TypeOf[identity], Callable[[U], str]))
+
+def bounded[T: str](value: T) -> T:
+    return value
+
+def constrained[T: (int, str)](value: T) -> T:
+    return value
+
+static_assert(is_subtype_of(TypeOf[bounded], Callable[[str], str]))
+static_assert(not is_subtype_of(TypeOf[bounded], Callable[[int], int]))
+static_assert(is_subtype_of(TypeOf[constrained], Callable[[int], int]))
+static_assert(not is_subtype_of(TypeOf[constrained], Callable[[bytes], bytes]))
+```
+
+## Optional generic callable parameters
+
+A source's unused optional parameters need no inferred type argument. Their type variables remain
+rigid during the final subtype check. A generic target's variables also stay rigid: a source
+specialization must work for every permitted target specialization.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from collections.abc import Mapping
+from typing import Any, Callable, Protocol, Unpack
+from typing_extensions import TypedDict
+from ty_extensions import static_assert
+from ty_extensions._internal import TypeOf, Unknown, is_subtype_of
+
+class Environment(Protocol):
+    def __call__(self, *, env: dict[str, str] | None = ...) -> None: ...
+
+class Resources(Protocol):
+    def __call__[K: str, N: float](
+        self, *, env: dict[str, str] | None = ..., resource_set: dict[K, N] | Callable[[str, int], dict[K, N]] | None = ...
+    ) -> None: ...
+
+def environment[K: str](*, env: Mapping[K, str] | None = None) -> None:
+    pass
+
+def unrelated[K: str, V: float](*, env: Mapping[K, str] | None = None, resource: V | None = None) -> None:
+    pass
+
+def action[E: str, K: str, N: float](
+    *, env: Mapping[E, str] | None = None, resource_set: dict[K, N] | Callable[[str, int], dict[K, N]] | None = None
+) -> None:
+    pass
+
+static_assert(is_subtype_of(TypeOf[environment], Environment))
+static_assert(is_subtype_of(TypeOf[unrelated], Environment))
+static_assert(is_subtype_of(TypeOf[action], Environment))
+static_assert(is_subtype_of(TypeOf[action], Resources))
+
+class ResourceArguments[K: str, N: float](TypedDict, total=False, closed=True):
+    env: dict[str, str] | None
+    resource_set: dict[K, N] | Callable[[str, int], dict[K, N]] | None
+
+class UnpackedResources(Protocol):
+    def __call__[K: str, N: float](self, **kwargs: Unpack[ResourceArguments[K, N]]) -> None: ...
+
+class OpenResourceArguments(TypedDict, total=False):
+    env: dict[str, str] | None
+
+class OpenEnvironment(Protocol):
+    def __call__(self, **kwargs: Unpack[OpenResourceArguments]) -> None: ...
+
+class BroadResources(Protocol):
+    def __call__[K, N: complex](self, *, env: dict[str, str] | None = ..., resource_set: dict[K, N] | None = ...) -> None: ...
+
+class ExposedResource(Protocol):
+    def __call__(self, *, env: dict[str, str] | None = ..., resource: str | None = ...) -> None: ...
+
+class GradualEnvironment(Protocol):
+    def __call__(self, *, env: dict[str, Any] | None = ...) -> None: ...
+
+class UnknownEnvironment(Protocol):
+    def __call__(self, *, env: dict[str, Unknown] | None = ...) -> None: ...
+
+def required[K: str, V: float](*, env: Mapping[K, str] | None = None, resource: V) -> None:
+    pass
+
+def returned[K: str, V: (int, float)](*, env: Mapping[K, str] | None = None) -> V:
+    raise NotImplementedError
+
+def gradual[K: str, V: float](*, env: Mapping[K, Any] | None = None, resource: V | None = None) -> None:
+    pass
+
+def unknown[K: str, V: float](*, env: Mapping[K, Unknown] | None = None, resource: V | None = None) -> None:
+    pass
+
+def defaulted[K: str, V: float = Any](*, env: Mapping[K, str] | None = None, resource: V | None = None) -> None:
+    pass
+
+static_assert(is_subtype_of(TypeOf[action], UnpackedResources))
+static_assert(not is_subtype_of(TypeOf[action], OpenEnvironment))
+static_assert(not is_subtype_of(TypeOf[action], BroadResources))
+static_assert(not is_subtype_of(TypeOf[unrelated], ExposedResource))
+static_assert(not is_subtype_of(TypeOf[required], Environment))
+static_assert(not is_subtype_of(TypeOf[returned], Environment))
+static_assert(not is_subtype_of(TypeOf[gradual], Environment))
+static_assert(not is_subtype_of(TypeOf[unknown], Environment))
+static_assert(not is_subtype_of(TypeOf[unrelated], GradualEnvironment))
+static_assert(not is_subtype_of(TypeOf[unrelated], UnknownEnvironment))
+static_assert(is_subtype_of(TypeOf[defaulted], Environment))
+static_assert(not is_subtype_of(TypeOf[defaulted], ExposedResource))
+
+class Correlated(Protocol):
+    def __call__[T: str](self, value: T) -> tuple[T, T]: ...
+
+class Broader(Protocol):
+    def __call__[T](self, value: T) -> tuple[T, T]: ...
+
+def correlated[T: str, V: float](value: T, *, unused: V | None = None) -> tuple[T, T]:
+    return value, value
+
+def mismatched[T: str, V: float](value: T, *, unused: V | None = None) -> tuple[T, str]:
+    return value, "extra"
+
+static_assert(is_subtype_of(TypeOf[correlated], Correlated))
+# The source's str bound cannot cover every specialization of the target.
+static_assert(not is_subtype_of(TypeOf[correlated], Broader))
+static_assert(not is_subtype_of(TypeOf[mismatched], Correlated))
+
+def unconstrained[T: str](*, unused: T | None = None) -> None:
+    pass
+
+# No source specialization is needed for an omitted optional parameter.
+static_assert(is_subtype_of(TypeOf[unconstrained], Callable[[], None]))
+```
+
+## Empty operands in overloaded operators
+
+An operator's expected result supplies context to its empty operand, including when a later overload
+preserves an arbitrary compatible payload. The direct method call and operator spelling agree.
+
+```py
+from __future__ import annotations
+from collections.abc import Sequence
+from typing import overload
+from ty_extensions import Intersection
+
+class Selected[T]:
+    def payload(self) -> T:
+        raise NotImplementedError
+
+    @overload
+    def __add__[L, R](self: Selected[Sequence[L]], other: Sequence[R], /) -> Selected[list[L | R]]: ...
+    @overload
+    def __add__[R, P](self, other: Intersection[Sequence[R], P], /) -> Selected[T | P]: ...
+    def __add__(self, other):
+        raise NotImplementedError
+
+    __radd__ = __add__
+
+def probe(value: Selected[list[str] | list[int]]):
+    result: Selected[list[str | int]] = reveal_type(value + [])  # revealed: Selected[list[str | int]]
+    direct: Selected[list[str | int]] = reveal_type(value.__add__([]))  # revealed: Selected[list[str | int]]
+    reflected: Selected[list[str | int]] = reveal_type([] + value)  # revealed: Selected[list[str | int]]
+    wrong: Selected[list[bytes]] = value + []  # error: [invalid-assignment]
+    value + {}  # error: [unsupported-operator]
 ```

@@ -64,10 +64,17 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
         }
 
-        Some(TypeFormType::from_type_expression(
-            self.db(),
-            self.infer_type_expression_no_store(expression),
-        ))
+        let annotation = self.infer_type_expression_no_store(expression);
+        Some(self.type_form_for_annotation(annotation))
+    }
+
+    fn type_form_for_annotation(&self, annotation: Type<'db>) -> Type<'db> {
+        let db = self.db();
+        let annotation = self
+            .context
+            .body_domain
+            .map_or(annotation, |domain| domain.specialize_type(db, annotation));
+        TypeFormType::from_type_expression(db, annotation)
     }
 
     fn contains_type_form_value(&self, expression: &ast::Expr, ty: Type<'db>) -> bool {
@@ -142,10 +149,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             && arguments.keywords.is_empty()
             && !matches!(argument, ast::Expr::Starred(_))
         {
-            return TypeFormType::from_type_expression(
-                self.db(),
-                self.infer_type_expression(argument),
-            );
+            let annotation = self.infer_type_expression(argument);
+            return self.type_form_for_annotation(annotation);
         }
 
         for argument in &*arguments.args {

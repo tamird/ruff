@@ -140,7 +140,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let has_exec_body = exec_body_arg.is_some_and(|arg| !arg.is_none_literal_expr());
         let members: Box<[(ast::name::Name, Type<'db>)]> = Box::new([]);
         let dynamic_class =
-            DynamicClassLiteral::new(db, name, anchor, members, has_exec_body, None);
+            DynamicClassLiteral::new(db, name, anchor, members, has_exec_body, None, None);
 
         // For dangling calls, validate bases eagerly. For assigned calls, validation is
         // deferred along with bases inference.
@@ -260,6 +260,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             .match_parameters(db, env, &call_arguments);
         let bindings_result = self.infer_and_check_argument_types(
             ArgumentsIter::from_ast(&call_expr.arguments),
+            &[],
             &mut call_arguments,
             &mut |builder, (_, expr, tcx)| {
                 if name_node.is_some_and(|name| std::ptr::eq(expr, name)) {

@@ -75,7 +75,7 @@ declare_lint! {
 declare_lint! {
     #[doc = include_str!("../resources/lint_docs/blanket-ignore-comment.md")]
     pub(crate) static BLANKET_IGNORE_COMMENT = {
-        summary: "detects blanket `ty: ignore` comments",
+        summary: "detects blanket ignore comments",
         status: LintStatus::stable("0.0.57"),
         default_level: Level::Ignore,
     }
@@ -169,18 +169,49 @@ fn check_blanket_suppressions(context: &mut CheckSuppressionsContext) {
         return;
     }
 
-    for suppression in context.suppressions.iter().filter(|suppression| {
-        suppression.kind == SuppressionKind::Ty && suppression.target == SuppressionTarget::All
-    }) {
+    if context.require_valid_suppressions {
+        for group in context
+            .suppressions
+            .file
+            .chunk_by(|left, right| left.comment_range == right.comment_range)
+        {
+            let suppression = &group[0];
+            if group
+                .iter()
+                .any(|suppression| context.is_suppression_used(suppression.id()))
+                && let Some(diag) =
+                    context.report_unchecked(&BLANKET_IGNORE_COMMENT, suppression.comment_range)
+            {
+                diag.into_diagnostic(format_args!(
+                    "Use a rule-specific `{}` comment on the line it suppresses",
+                    suppression.kind
+                ));
+            }
+        }
+    }
+
+    let candidates = context.suppression_diagnostic_candidates();
+    for suppression in context
+        .suppressions
+        .file
+        .iter()
+        .filter(|_| !context.require_valid_suppressions)
+        .chain(context.suppressions.inline.iter())
+        .filter(|suppression| {
+            suppression.target == SuppressionTarget::All
+                && (suppression.kind == SuppressionKind::Ty || context.require_valid_suppressions)
+        })
+    {
         // A blanket suppression cannot suppress its own diagnostic, but a lint-specific
         // suppression can.
-        if let Some(lint_suppression) = select_preferred_suppression(
-            context
-                .suppressions
-                .lint_suppressions(suppression.range, LintId::of(&BLANKET_IGNORE_COMMENT))
-                .filter(|candidate| candidate.target.is_lint()),
-            suppression.range,
-        ) {
+        if let Some(lint_suppression) = candidates.and_then(|candidates| {
+            select_preferred_suppression(
+                candidates
+                    .lint_suppressions(suppression.range, LintId::of(&BLANKET_IGNORE_COMMENT))
+                    .filter(|candidate| candidate.target.is_lint()),
+                suppression.range,
+            )
+        }) {
             context
                 .diagnostics
                 .borrow_mut()
@@ -188,7 +219,10 @@ fn check_blanket_suppressions(context: &mut CheckSuppressionsContext) {
         } else if let Some(diag) =
             context.report_unchecked(&BLANKET_IGNORE_COMMENT, suppression.range)
         {
-            diag.into_diagnostic("Use specific rule codes in `ty: ignore`");
+            diag.into_diagnostic(format_args!(
+                "Use specific rule codes in `{}`",
+                suppression.kind
+            ));
         }
     }
 }
@@ -264,6 +298,7 @@ struct CheckSuppressionsContext<'a> {
     python_file: PythonFile<'a>,
     suppressions: &'a Suppressions,
     diagnostics: std::cell::RefCell<TypeCheckDiagnostics>,
+    require_valid_suppressions: bool,
 }
 
 impl<'a> CheckSuppressionsContext<'a> {
@@ -273,6 +308,7 @@ impl<'a> CheckSuppressionsContext<'a> {
             python_file,
             suppressions: suppressions(db, python_file),
             diagnostics: diagnostics.into(),
+            require_valid_suppressions: db.rule_selection(python_file.file(db)).requires_valid_suppressions(),
         }
     }
 
@@ -281,7 +317,8 @@ impl<'a> CheckSuppressionsContext<'a> {
     }
 
     fn is_lint_disabled(&self, lint: &'static LintMetadata) -> bool {
-        !self
+        !self.require_valid_suppressions
+            && !self
             .db
             .rule_selection(self.file())
             .is_enabled(LintId::of(lint))
@@ -291,12 +328,19 @@ impl<'a> CheckSuppressionsContext<'a> {
         self.diagnostics.borrow().is_used(id)
     }
 
+    fn suppression_diagnostic_candidates(&self) -> Option<&'a Suppressions> {
+        (!self.require_valid_suppressions).then_some(self.suppressions)
+    }
+
     fn report_lint<'ctx>(
         &'ctx self,
         lint: &'static LintMetadata,
         range: TextRange,
     ) -> Option<SuppressionDiagnosticGuardBuilder<'ctx, 'a>> {
-        if let Some(suppression) = self.suppressions.find_suppression(range, LintId::of(lint)) {
+        if let Some(suppression) = self
+            .suppression_diagnostic_candidates()
+            .and_then(|candidates| candidates.find_suppression(range, LintId::of(lint)))
+        {
             self.diagnostics.borrow_mut().mark_used(suppression.id());
             return None;
         }
@@ -332,10 +376,11 @@ impl<'ctx, 'db> SuppressionDiagnosticGuardBuilder<'ctx, 'db> {
         lint: &'static LintMetadata,
         range: TextRange,
     ) -> Option<Self> {
-        let severity = ctx
-            .db
-            .rule_selection(ctx.file())
-            .severity(LintId::of(lint))?;
+        let severity = if ctx.require_valid_suppressions {
+            Severity::Error
+        } else {
+            ctx.db.rule_selection(ctx.file()).severity(LintId::of(lint))?
+        };
 
         Some(Self {
             ctx,
@@ -971,12 +1016,291 @@ impl IntervalIndex {
 
 #[cfg(test)]
 mod tests {
+    use ruff_db::diagnostic::{
+        Annotation, Diagnostic, DiagnosticId, DiagnosticTag, Severity, Span,
+    };
+    use ruff_db::files::File;
     use ruff_db::{PythonFile, files::system_path_to_file};
     use ruff_text_size::{TextLen as _, TextRange};
 
     use super::suppressions;
     use crate::Db as _;
     use crate::db::tests::TestDbBuilder;
+    use crate::lint::{
+        Level, LintId, LintRegistry, LintRegistryBuilder, LintSource, LintStatus, RuleSelection,
+    };
+    use crate::types::{check_types, check_types_with_diagnostics};
+
+    crate::declare_lint! {
+        /// A diagnostic supplied by an embedding application.
+        static PROVIDED_CHECK = {
+            summary: "reports an application-specific check",
+            status: LintStatus::stable("0.0.0"),
+            default_level: Level::Warn,
+        }
+    }
+
+    fn provided_registry() -> LintRegistry {
+        let mut builder = LintRegistryBuilder::from(crate::default_lint_registry().clone());
+        builder.register_lint(&PROVIDED_CHECK);
+        builder.build()
+    }
+
+    fn provided_diagnostic(file: File, range: TextRange) -> Diagnostic {
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticId::Lint(PROVIDED_CHECK.name()),
+            Severity::Info,
+            "Application-specific diagnostic",
+        );
+        let mut primary = Annotation::primary(Span::from(file).with_range(range));
+        primary.push_tag(DiagnosticTag::Unnecessary);
+        diagnostic.annotate(primary);
+        diagnostic.info("Additional application context");
+        diagnostic
+    }
+
+    #[test]
+    fn suppression_diagnostics_can_be_required() -> anyhow::Result<()> {
+        for (source, required_diagnostic) in [
+            (
+                "value = 1 # ty: ignore[division-by-zero, unused-ignore-comment]\n",
+                "unused-ignore-comment",
+            ),
+            (
+                "value = 1 # type: ignore # ty: ignore[unused-ignore-comment]\n",
+                "unused-type-ignore-comment",
+            ),
+            (
+                "value = 1 # ty: ignore[ignore-comment-unknown-rule, missing-rule]\n",
+                "ignore-comment-unknown-rule",
+            ),
+            (
+                "value = 1 # ty: ignore[invalid-ignore-comment] # ty: ignore[\n",
+                "invalid-ignore-comment",
+            ),
+            (
+                "value = missing # ty: ignore[blanket-ignore-comment] # ty: ignore\n",
+                "blanket-ignore-comment",
+            ),
+            (
+                "# type: ignore\nvalue = missing\n",
+                "blanket-ignore-comment",
+            ),
+            (
+                "# ty: ignore[unresolved-reference, division-by-zero]\nvalue = missing\nquotient = 1 / 0\n",
+                "blanket-ignore-comment",
+            ),
+            (
+                "# type: ignore[ty:unresolved-reference]\nvalue = missing\n",
+                "blanket-ignore-comment",
+            ),
+        ] {
+            for require in [false, true] {
+                let registry = crate::default_lint_registry();
+                let mut selection = RuleSelection::from_registry(registry);
+                selection.set_require_valid_suppressions(require);
+                let db = TestDbBuilder::new()
+                    .with_rule_selection(selection)
+                    .with_file("/src/main.py", source)
+                    .build()?;
+                let file = system_path_to_file(&db, "/src/main.py")?;
+                let diagnostics = check_types(&db, db.program_file(file));
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.id().as_str() == required_diagnostic)
+                        .map(Diagnostic::severity)
+                        .collect::<Vec<_>>(),
+                    require
+                        .then_some(Severity::Error)
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    "{source}: {diagnostics:?}",
+                );
+            }
+        }
+
+        for (source, expected) in [
+            ("value = missing # ty: ignore[unresolved-reference]\n", None),
+            (
+                "value = missing # type: ignore[ty:unresolved-reference]\n",
+                None,
+            ),
+            (
+                "# ty: ignore[division-by-zero]\nvalue = 1\n",
+                Some(("unused-ignore-comment", Severity::Error)),
+            ),
+        ] {
+            let mut selection = RuleSelection::from_registry(crate::default_lint_registry());
+            selection.set_require_valid_suppressions(true);
+            let db = TestDbBuilder::new()
+                .with_rule_selection(selection)
+                .with_file("/src/main.py", source)
+                .build()?;
+            let file = system_path_to_file(&db, "/src/main.py")?;
+            let diagnostics = check_types(&db, db.program_file(file));
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| (diagnostic.id().as_str(), diagnostic.severity()))
+                    .collect::<Vec<_>>(),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{source}: {diagnostics:?}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn file_check_preserves_used_suppressions() -> anyhow::Result<()> {
+        for (source, diagnostic) in [
+            ("value = 1\n", None),
+            (
+                "def make(): return 1\nif make: # ty: ignore[redundant-condition]\n    pass\n",
+                None,
+            ),
+            ("len(1) # ty: ignore[invalid-argument-type]\n", None),
+            ("value = missing # ty: ignore[unresolved-reference]\n", None),
+            (
+                "if False:\n    value = missing # ty: ignore[unresolved-reference]\n",
+                None,
+            ),
+            (
+                "value = 1 # ty: ignore[unresolved-reference]\n",
+                Some("unused-ignore-comment"),
+            ),
+        ] {
+            let db = TestDbBuilder::new()
+                .with_file("/src/main.py", source)
+                .build()?;
+            let file = system_path_to_file(&db, "/src/main.py")?;
+            let result = check_types_with_diagnostics(&db, db.program_file(file), []);
+            let actual: Vec<_> = result
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            assert_eq!(actual, diagnostic.into_iter().collect::<Vec<_>>());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supplied_diagnostics_use_registered_suppressions_before_validation() -> anyhow::Result<()> {
+        for source in [
+            "pass # type: ignore\n",
+            "pass # ty: ignore[provided-check]\n",
+            "value = (\n    1\n) # type: ignore\n",
+        ] {
+            let registry = provided_registry();
+            let mut selection = RuleSelection::from_registry(&registry);
+            selection.enable(
+                LintId::of(&super::UNUSED_TYPE_IGNORE_COMMENT),
+                Severity::Warning,
+                LintSource::Editor,
+            );
+            let db = TestDbBuilder::new()
+                .with_lint_registry(registry)
+                .with_rule_selection(selection)
+                .with_file("/src/main.py", source)
+                .build()?;
+            let file = system_path_to_file(&db, "/src/main.py")?;
+            let program_file = db.program_file(file);
+            let without_supplied = check_types(&db, program_file);
+            assert!(
+                without_supplied.iter().any(|diagnostic| {
+                    matches!(
+                        diagnostic.id().as_str(),
+                        "unused-ignore-comment" | "unused-type-ignore-comment"
+                    )
+                }),
+                "{source}: {without_supplied:?}",
+            );
+            let range = if source.starts_with("value") {
+                TextRange::new(0.into(), (source.find(')').unwrap() + 1).try_into()?)
+            } else {
+                TextRange::new(0.into(), 4.into())
+            };
+            let result =
+                check_types_with_diagnostics(&db, program_file, [provided_diagnostic(file, range)]);
+            assert!(result.is_empty(), "{source}: {result:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supplied_diagnostics_keep_details_and_respect_rule_selection() -> anyhow::Result<()> {
+        for setting in [Some(LintSource::Default), Some(LintSource::Editor), None] {
+            let registry = provided_registry();
+            let mut selection = RuleSelection::from_registry(&registry);
+            match setting {
+                Some(source) => {
+                    selection.enable(LintId::of(&PROVIDED_CHECK), Severity::Error, source);
+                }
+                None => selection.disable(LintId::of(&PROVIDED_CHECK)),
+            }
+            // The supplemental diagnostic deliberately describes unreachable code.
+            let source = "def f():\n    return\n    pass\n";
+            let db = TestDbBuilder::new()
+                .with_lint_registry(registry)
+                .with_rule_selection(selection)
+                .with_file("/src/main.py", source)
+                .build()?;
+            let file = system_path_to_file(&db, "/src/main.py")?;
+            let range = TextRange::at(source.find("pass").unwrap().try_into()?, 4.into());
+            let mut expected = provided_diagnostic(file, range);
+            let diagnostics =
+                check_types_with_diagnostics(&db, db.program_file(file), [expected.clone()]);
+            match setting {
+                Some(source) => {
+                    if source != LintSource::Default {
+                        expected.set_severity(Severity::Error);
+                    }
+                    assert_eq!(diagnostics, [expected]);
+                }
+                None => assert!(diagnostics.is_empty(), "{diagnostics:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supplied_diagnostics_outside_the_registered_local_lint_contract_are_preserved()
+    -> anyhow::Result<()> {
+        let registry = provided_registry();
+        let mut selection = RuleSelection::from_registry(&registry);
+        selection.disable(LintId::of(&PROVIDED_CHECK));
+        let db = TestDbBuilder::new()
+            .with_lint_registry(registry)
+            .with_rule_selection(selection)
+            .with_file("/src/main.py", "pass\n")
+            .with_file("/src/other.py", "pass\n")
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let other = system_path_to_file(&db, "/src/other.py")?;
+        let diagnostics = [
+            provided_diagnostic(other, TextRange::new(0.into(), 4.into())),
+            Diagnostic::new(
+                DiagnosticId::Lint(PROVIDED_CHECK.name()),
+                Severity::Info,
+                "No source span",
+            ),
+            Diagnostic::new(
+                DiagnosticId::lint("unregistered"),
+                Severity::Warning,
+                "Unregistered diagnostic",
+            ),
+            Diagnostic::new(
+                DiagnosticId::Io,
+                Severity::Error,
+                "External input unavailable",
+            ),
+        ];
+        assert_eq!(
+            check_types_with_diagnostics(&db, db.program_file(file), diagnostics.clone()),
+            diagnostics
+        );
+        Ok(())
+    }
 
     #[test]
     fn nested_suppressions_for_other_lints_do_not_match() {

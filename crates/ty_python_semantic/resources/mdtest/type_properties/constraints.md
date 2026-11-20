@@ -279,6 +279,106 @@ def _[T]() -> None:
     static_assert(negated_type != negated_constraint)
 ```
 
+## Solving declared upper bounds
+
+### Unrestricted caller-fixed type variables
+
+An inferred type variable must satisfy its declared upper bound for every specialization of a
+caller-fixed type variable. The solver cannot narrow the caller's variable to make the bound hold.
+
+```py
+from typing import TypeVar
+from ty_extensions._internal import ConstraintSet
+
+def unrestricted[S, T: str]() -> None:
+    constraints = ConstraintSet.lower_bound(S, T)
+    reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: None
+
+S = TypeVar("S")
+T = TypeVar("T", bound=str)
+
+def legacy_unrestricted(source: S, target: T) -> None:
+    constraints = ConstraintSet.lower_bound(S, T)
+    reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: None
+```
+
+### Bounded caller-fixed type variables
+
+A caller-fixed variable whose upper bound satisfies the inferred variable's bound is a valid
+solution.
+
+```py
+from typing import TypeVar
+from ty_extensions._internal import ConstraintSet
+
+def bounded[S: str, T: str]() -> None:
+    constraints = ConstraintSet.lower_bound(S, T)
+    reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: tuple[Solution[T=S@bounded]]
+
+BoundedS = TypeVar("BoundedS", bound=str)
+T = TypeVar("T", bound=str)
+
+def legacy_bounded(source: BoundedS, target: T) -> None:
+    constraints = ConstraintSet.lower_bound(BoundedS, T)
+    reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: tuple[Solution[T=BoundedS@legacy_bounded]]
+```
+
+### Alternative solutions
+
+The solver keeps valid alternatives while rejecting an invalid caller-fixed solution.
+
+```py
+from typing import TypeVar
+from ty_extensions._internal import ConstraintSet
+
+def alternatives[S, T: str]() -> None:
+    constraints = ConstraintSet.lower_bound(S, T) | ConstraintSet.equality(T, str)
+    reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: tuple[Solution[T=str]]
+
+S = TypeVar("S")
+T = TypeVar("T", bound=str)
+
+def legacy_alternatives(source: S, target: T) -> None:
+    constraints = ConstraintSet.lower_bound(S, T) | ConstraintSet.equality(T, str)
+    reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: tuple[Solution[T=str]]
+```
+
+### Nested caller-fixed type variables
+
+The same check applies when a fixed variable appears inside the selected type.
+
+```py
+from ty_extensions._internal import ConstraintSet
+
+class Source[T]:
+    def get(self) -> T:
+        raise NotImplementedError
+
+def unrestricted[S, T: Source[str]]() -> None:
+    constraints = ConstraintSet.lower_bound(Source[S], T)
+    reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: None
+
+def bounded[S: str, T: Source[str]]() -> None:
+    constraints = ConstraintSet.lower_bound(Source[S], T)
+    reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: tuple[Solution[T=Source[S@bounded]]]
+```
+
+```py
+from typing import TypeVar
+
+S = TypeVar("S")
+BoundedS = TypeVar("BoundedS", bound=str)
+T = TypeVar("T", bound=Source[str])
+
+def legacy_unrestricted(source: S, target: T) -> None:
+    constraints = ConstraintSet.lower_bound(Source[S], T)
+    reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: None
+
+def legacy_bounded(source: BoundedS, target: T) -> None:
+    constraints = ConstraintSet.lower_bound(Source[BoundedS], T)
+    reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: tuple[Solution[T=Source[BoundedS@legacy_bounded]]]
+```
+
 ## Constraints from bound methods
 
 A bound method's captured receiver and specialized signature both constrain generic target types.
@@ -294,6 +394,21 @@ class Box[T]:
 def inspect[T](integer: Box[int], generic: Box[T]):
     constraints = is_constraint_set_assignable_to(TypeOf[integer.get], TypeOf[generic.get])
     reveal_type(constraints.solutions_for(T, inferable=tuple[T]))  # revealed: tuple[Solution[T=int]]
+```
+
+## Quantified local aliases preserve caller bounds
+
+Inference may select each local variable in terms of the other. The scoped relation still permits
+concrete witnesses, so the caller retains its inferred bound.
+
+```py
+from ty_extensions._internal import ConstraintSet
+
+def local_aliases[T, S1, S2]():
+    lower = ConstraintSet.lower_bound(int, T)
+    local = ConstraintSet.upper_bound(S1, S2)
+    relation = (local & lower).exists(tuple[S1, S2]) & lower
+    reveal_type(relation.solutions_for(T, inferable=tuple[T]))  # revealed: tuple[Solution[T=int]]
 ```
 
 ## Constraints from materialized types
@@ -1828,8 +1943,8 @@ def invariant_unfixed_declared_upper[I, N: int]() -> None:
 ### Declared non-inferable domains
 
 A positive constraint on a non-inferable variable must be compatible with its declared upper bound
-or finite domain, even though that variable is not returned. Complete reasoning about combinations
-of negative non-inferable constraints is intentionally deferred.
+or finite domain, even though that variable is not returned. Excluding every member of a declared
+finite domain also makes the constraint set unsatisfiable.
 
 ```py
 from ty_extensions._internal import ConstraintSet
@@ -1846,9 +1961,7 @@ def incompatible_bounded_noninferable[I, N: str]() -> None:
 
 def negative_finite_noninferable[I, N: (int, str)]() -> None:
     constraints = ~ConstraintSet.range(int, N, int) & ~ConstraintSet.range(str, N, str)
-    # TODO: Complete reasoning about negative non-inferable constraints would reject this path.
-    # TODO: revealed: None
-    reveal_type(constraints.solutions(inferable=tuple[I]))  # revealed: tuple[()]
+    reveal_type(constraints.solutions(inferable=tuple[I]))  # revealed: None
 ```
 
 ### Alternatives with different declared-domain validity

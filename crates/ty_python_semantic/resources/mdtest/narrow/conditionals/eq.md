@@ -36,6 +36,138 @@ def _(x: None | Literal[1]):
         reveal_type(x)  # revealed: Literal[1]
 ```
 
+## Lists and `None` with non-strict equality semantics
+
+The default equality policy treats a broad `list` annotation as using builtin list comparison. Lists
+cannot equal `None`, so either operand order separates the alternatives of an optional list.
+
+```toml
+[analysis]
+strict-equality-semantics = false
+```
+
+```py
+def optional_list(value: list[str] | None):
+    if value == None:
+        reveal_type(value)  # revealed: None
+    else:
+        reveal_type(value)  # revealed: list[str]
+
+    if None == value:
+        reveal_type(value)  # revealed: None
+    else:
+        reveal_type(value)  # revealed: list[str]
+
+    if value != None:
+        reveal_type(value)  # revealed: list[str]
+    else:
+        reveal_type(value)  # revealed: None
+
+    if None != value:
+        reveal_type(value)  # revealed: list[str]
+    else:
+        reveal_type(value)  # revealed: None
+
+def list_results(value: list[str], other: list[int]):
+    reveal_type(value == None)  # revealed: Literal[False]
+    reveal_type(None == value)  # revealed: Literal[False]
+    reveal_type(value != None)  # revealed: Literal[True]
+    reveal_type(None != value)  # revealed: Literal[True]
+
+    # Distinct lists can be empty, regardless of their element annotations.
+    reveal_type(value == other)  # revealed: bool
+    reveal_type(value != other)  # revealed: bool
+```
+
+## Lists and `None` with strict equality semantics
+
+Strict equality accounts for subclasses that override list comparison. A final subclass with
+inherited comparison methods has known behavior, while explicit overrides remain authoritative.
+
+```toml
+[analysis]
+strict-equality-semantics = true
+```
+
+```py
+from typing import final
+
+@final
+class FinalList(list[str]): ...
+
+@final
+class CustomEq(list[str]):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+@final
+class CustomNe(list[str]):
+    def __ne__(self, other: object) -> bool:
+        return False
+
+def broad(value: list[str] | None):
+    if value == None:
+        reveal_type(value)  # revealed: list[str] | None
+    else:
+        reveal_type(value)  # revealed: list[str]
+
+    if None != value:
+        reveal_type(value)  # revealed: list[str]
+    else:
+        reveal_type(value)  # revealed: list[str] | None
+
+def inherited(value: FinalList | None):
+    if value == None:
+        reveal_type(value)  # revealed: None
+    else:
+        reveal_type(value)  # revealed: FinalList
+
+    if None == value:
+        reveal_type(value)  # revealed: None
+    else:
+        reveal_type(value)  # revealed: FinalList
+
+    if value != None:
+        reveal_type(value)  # revealed: FinalList
+    else:
+        reveal_type(value)  # revealed: None
+
+    if None != value:
+        reveal_type(value)  # revealed: FinalList
+    else:
+        reveal_type(value)  # revealed: None
+
+def overridden(eq: CustomEq | None, ne: CustomNe | None):
+    if eq == None:
+        reveal_type(eq)  # revealed: CustomEq | None
+    if None != eq:
+        reveal_type(eq)  # revealed: CustomEq
+    else:
+        reveal_type(eq)  # revealed: CustomEq | None
+
+    if ne == None:
+        reveal_type(ne)  # revealed: None
+    if None != ne:
+        reveal_type(ne)  # revealed: CustomNe
+    else:
+        reveal_type(ne)  # revealed: CustomNe | None
+
+def results(broad: list[str], inherited: FinalList, eq: CustomEq, ne: CustomNe):
+    reveal_type(broad == None)  # revealed: bool
+    reveal_type(None != broad)  # revealed: bool
+    reveal_type(inherited == None)  # revealed: Literal[False]
+    reveal_type(None == inherited)  # revealed: Literal[False]
+    reveal_type(inherited != None)  # revealed: Literal[True]
+    reveal_type(None != inherited)  # revealed: Literal[True]
+    reveal_type(eq == None)  # revealed: bool
+    reveal_type(None == eq)  # revealed: bool
+    reveal_type(eq != None)  # revealed: bool
+    reveal_type(None != eq)  # revealed: bool
+    reveal_type(ne == None)  # revealed: Literal[False]
+    reveal_type(ne != None)  # revealed: bool
+    reveal_type(None != ne)  # revealed: bool
+```
+
 ## `!=` for other singleton types
 
 ### Bool
@@ -3462,4 +3594,109 @@ def union(value: Foo | None, other: Foo):
 def literal(value: str):
     if value == "a":
         reveal_type(value)  # revealed: str
+```
+
+## Narrowing nested attribute tags
+
+A tag can identify the outer object even when it belongs to a nested attribute.
+
+```py
+from typing import Any, Literal
+
+class TextOptions:
+    kind: Literal["text"]
+    enabled: Literal[True]
+
+class BinaryOptions:
+    kind: Literal["binary"]
+    enabled: Literal[False]
+
+class Text:
+    options: TextOptions
+    text: str
+
+class Binary:
+    options: BinaryOptions
+    data: bytes
+
+def nested_tag(value: Text | Binary):
+    if value.options.kind == "text":
+        reveal_type(value)  # revealed: Text
+        reveal_type(value.text)  # revealed: str
+    else:
+        reveal_type(value)  # revealed: Binary
+        reveal_type(value.data)  # revealed: bytes
+
+    if "text" != value.options.kind:
+        reveal_type(value)  # revealed: Binary
+    else:
+        reveal_type(value)  # revealed: Text
+
+    if value.options.enabled is True:
+        reveal_type(value)  # revealed: Text
+    else:
+        reveal_type(value)  # revealed: Binary
+
+def nested_truthiness(value: Text | Binary):
+    if value.options.enabled:
+        reveal_type(value)  # revealed: Text
+    else:
+        reveal_type(value)  # revealed: Binary
+
+def nested_match(value: Text | Binary):
+    match value.options.kind:
+        case "text":
+            reveal_type(value)  # revealed: Text
+        case "binary":
+            reveal_type(value)  # revealed: Binary
+```
+
+An intermediate union stays possible if either alternative permits the tag. A gradual intermediate
+type also stays possible in both branches.
+
+```py
+class Mixed:
+    options: TextOptions | BinaryOptions
+
+class Dynamic:
+    options: Any
+
+def ambiguous_path(value: Text | Binary | Mixed | Dynamic):
+    if value.options.kind == "text":
+        reveal_type(value)  # revealed: Text | Mixed | Dynamic
+    else:
+        reveal_type(value)  # revealed: Binary | Mixed | Dynamic
+```
+
+An incomplete intermediate type reports its missing member and keeps the outer alternative.
+
+```py
+class EmptyOptions: ...
+
+class Incomplete:
+    options: TextOptions | EmptyOptions
+
+def missing_member(value: Binary | Incomplete):
+    # error: [unresolved-attribute]
+    if value.options.kind == "text":
+        reveal_type(value)  # revealed: Incomplete
+    else:
+        reveal_type(value)  # revealed: Binary | Incomplete
+```
+
+Rebinding an ancestor invalidates the relationship with its former tag.
+
+```py
+def rebind_in_comparison(value: Text | Binary | str):
+    if isinstance(value, (Text, Binary)):
+        if value.options.kind == (value := "text"):
+            reveal_type(value)  # revealed: Literal["text"]
+        else:
+            reveal_type(value)  # revealed: Literal["text"]
+
+def rebind_after_predicate(value: Text | Binary, other: Text | Binary):
+    is_text = value.options.kind == "text"
+    value = other
+    if is_text:
+        reveal_type(value)  # revealed: Text | Binary
 ```
