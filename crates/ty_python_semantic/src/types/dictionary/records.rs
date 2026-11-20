@@ -177,9 +177,8 @@ fn producers<'db, 'ast>(
     // `not` produces a bool even in value context. A bare Name predicate alone can
     // also occur in `alias = entries or []`, so only actual Boolean roots admit it.
     for predicate in use_def.predicates().iter() {
-        let expression = match predicate.node {
-            PredicateNode::Expression(expression) => expression,
-            _ => continue,
+        let PredicateNode::Expression(expression) = predicate.node else {
+            continue;
         };
         let ast::Expr::UnaryOp(unary) = expression.node_ref(db).node(module) else {
             continue;

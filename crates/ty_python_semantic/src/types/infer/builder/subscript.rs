@@ -172,8 +172,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             && let Some((_, values)) =
                 dict_literal_key_value_types(self.db(), self.program_environment(), dict, |expr| {
                     self.expression_type(expr)
-                })
-        {
+                }) {
             values
         } else {
             result
@@ -1894,14 +1893,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         ArgumentsIter::synthesized(&ast_arguments),
                         &[],
                         &mut call_arguments,
-                        &mut |builder, (_, expr, tcx)| {
-                            // TODO: The argument types have already been inferred and stored in `call_arguments`.
-                            // However, `object` would have been inferred to a be a collection with `Divergent`
-                            // element types, meaning the type context for a given argument, by which the inferred
-                            // type is keyed, may not be the same as the type context we get here. It is not immediately
-                            // clear how to retrieve those types, and so we just re-infer the argument expressions
-                            // for simplicity.
-                            builder.infer_maybe_standalone_expression(expr, tcx)
+                        // Keep the checked key and filtered value. Reinferring the value would
+                        // restore the cycle markers removed above.
+                        &mut |_builder, (argument_index, _expr, _tcx)| {
+                            if argument_index == 0 {
+                                checked_slice_ty
+                            } else {
+                                inferred_value_ty
+                            }
                         },
                         identity_bindings,
                         TypeContext::default(),

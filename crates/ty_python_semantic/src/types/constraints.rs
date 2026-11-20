@@ -6885,7 +6885,12 @@ mod tests {
                 .iter()
                 .map(|id| storage.typevar_data(id))
                 .collect();
-            assert_matches!(variables.as_slice(), [fresh_args]);
+            let [fresh_args] = variables.as_slice() else {
+                panic!(
+                    "expected one scoped positional component, found {}",
+                    variables.len()
+                );
+            };
             assert_eq!(fresh_args.paramspec_attr(db), Some(ParamSpecAttrKind::Args));
             assert_ne!(fresh_args.identity(db), args.identity(db));
             assert!(

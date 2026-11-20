@@ -12,7 +12,7 @@ use crate::types::callable::walk_callable_type;
 use crate::types::class::ClassType;
 use crate::types::class_base::ClassBase;
 use crate::types::constraints::projection::{
-    ProjectionBudget, ProjectionError, SolutionBudget, SolutionProjection,
+    ProjectionBudget, ProjectionError, SolutionBudget, SolutionProjection, SpecializationCandidates,
 };
 use crate::types::constraints::resolution::{
     SolutionType, resolve_merged_solution, resolve_solution,
@@ -3536,7 +3536,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                         Ok(false) => return Err(Vec::new()),
                         Err(_) => {
                             inference.solutions =
-                                Err(TypeVarInferenceFallback::UnverifiedKeywordProjection)
+                                Err(TypeVarInferenceFallback::UnverifiedKeywordProjection);
                         }
                     }
                 }
@@ -3609,9 +3609,12 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         let Some(bindings) = self.pending.find_verified_specialization(
             db,
             self.env,
-            candidate_variables,
+            SpecializationCandidates {
+                inferable: candidate_variables,
+                fixed: &fixed,
+                fallback,
+            },
             resources,
-            &fixed,
             |solved, type_budget| {
                 let mut bindings = fixed.clone();
                 bindings.extend(
@@ -3649,7 +3652,6 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 }
                 Ok(Some(bindings))
             },
-            fallback,
         )?
         else {
             return Ok(false);

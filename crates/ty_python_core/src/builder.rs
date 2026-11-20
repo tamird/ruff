@@ -2639,9 +2639,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             let PredicateOrLiteral::Predicate(predicate) = predicate else {
                 return None;
             };
-            let expression = match predicate.node {
-                PredicateNode::Expression(expression) => expression,
-                _ => return None,
+            let PredicateNode::Expression(expression) = predicate.node else {
+                return None;
             };
             Some((definition, expression, is_positive))
         };

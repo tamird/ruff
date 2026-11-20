@@ -3255,18 +3255,39 @@ Scalar(None)
     let env = model.program_environment();
     let string = KnownClass::Str.to_instance(&db, &env);
     let integer = KnownClass::Int.to_instance(&db, &env);
-    let [supplied_absent, native_absent,
-         supplied_value, supplied_positional, supplied_keywords, supplied_invalid,
-         native_value, native_positional, native_keywords, native_invalid,
-         gradual_overload, gradual, dynamic, reachable, empty_positional, empty_keywords, invalid]
-        = calls.types.as_slice()
+    let [
+        supplied_absent,
+        native_absent,
+        supplied_value,
+        supplied_positional,
+        supplied_keywords,
+        supplied_invalid,
+        native_value,
+        native_positional,
+        native_keywords,
+        native_invalid,
+        gradual_overload,
+        gradual,
+        dynamic,
+        reachable,
+        empty_positional,
+        empty_keywords,
+        invalid,
+    ] = calls.types.as_slice()
     else {
-        panic!("expected every supplied and native call control: {:?}", calls.types);
+        panic!(
+            "expected every supplied and native call control: {:?}",
+            calls.types
+        );
     };
     for (kind, supplied, native) in [
         ("impossible branch", supplied_absent, native_absent),
         ("positional value", supplied_value, native_value),
-        ("positional unpacking", supplied_positional, native_positional),
+        (
+            "positional unpacking",
+            supplied_positional,
+            native_positional,
+        ),
         ("keyword unpacking", supplied_keywords, native_keywords),
         ("invalid argument count", supplied_invalid, native_invalid),
     ] {

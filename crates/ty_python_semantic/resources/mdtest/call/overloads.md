@@ -2912,3 +2912,123 @@ def takes_str_or_float(x: float | str): ...
 
 takes_str_or_float(round(1.0))
 ```
+
+## Shared overload argument contexts
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+### Different raw annotations with the same callback context
+
+`callbacks.pyi`:
+
+```pyi
+from collections.abc import Callable
+from typing import Literal, overload
+
+@overload
+def invoke[T](tag: Literal["generic"], seed: T, callback: Callable[[T], T], /) -> T: ...
+@overload
+def invoke(tag: Literal["concrete"], seed: int, callback: Callable[[int], int], /) -> int: ...
+@overload
+def reversed_invoke(tag: Literal["concrete"], seed: int, callback: Callable[[int], int], /) -> int: ...
+@overload
+def reversed_invoke[T](tag: Literal["generic"], seed: T, callback: Callable[[T], T], /) -> T: ...
+```
+
+```py
+from callbacks import invoke, reversed_invoke
+from typing import Literal
+
+def check(tag: Literal["generic", "concrete"], seed: int) -> None:
+    invoke(tag, seed, lambda value: reveal_type(value))  # revealed: int
+    reveal_type(invoke(tag, seed, lambda value: value + 1))  # revealed: int
+    reversed_invoke(tag, seed, lambda value: reveal_type(value))  # revealed: int
+    reveal_type(reversed_invoke(tag, seed, lambda value: value + 1))  # revealed: int
+
+    # error: [unsupported-operator]
+    invoke(tag, seed, lambda value: (value + "bad", value)[1])
+    # error: [unsupported-operator]
+    reversed_invoke(tag, seed, lambda value: (value + "bad", value)[1])
+```
+
+### Forwarded and ordinary callback parameters
+
+`callbacks.pyi`:
+
+```pyi
+from collections.abc import Callable
+from typing import Literal, overload
+
+@overload
+def forward[**P, R](tag: Literal["forwarded"], func: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> R: ...
+@overload
+def forward(tag: Literal["ordinary"], func: Callable[[Callable[[int], int]], int], callback: Callable[[int], int], /) -> int: ...
+@overload
+def reversed_forward(
+    tag: Literal["ordinary"], func: Callable[[Callable[[int], int]], int], callback: Callable[[int], int], /
+) -> int: ...
+@overload
+def reversed_forward[**P, R](tag: Literal["forwarded"], func: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> R: ...
+```
+
+```py
+from callbacks import forward, reversed_forward
+from collections.abc import Callable
+from typing import Literal
+
+def consume(callback: Callable[[int], int]) -> int:
+    return callback(1)
+
+def check(tag: Literal["forwarded", "ordinary"]) -> None:
+    forward(tag, consume, lambda value: reveal_type(value))  # revealed: int
+    reveal_type(forward(tag, consume, lambda value: value + 1))  # revealed: int
+    reversed_forward(tag, consume, lambda value: reveal_type(value))  # revealed: int
+    reveal_type(reversed_forward(tag, consume, lambda value: value + 1))  # revealed: int
+
+    # error: [unsupported-operator]
+    forward(tag, consume, lambda value: (value + "bad", value)[1])
+    # error: [unsupported-operator]
+    reversed_forward(tag, consume, lambda value: (value + "bad", value)[1])
+```
+
+### Different callback contexts retain default inference
+
+`callbacks.pyi`:
+
+```pyi
+from collections.abc import Callable
+from typing import Literal, overload
+
+@overload
+def invoke(tag: Literal["int"], callback: Callable[[int], object], /) -> None: ...
+@overload
+def invoke(tag: Literal["str"], callback: Callable[[str], object], /) -> None: ...
+@overload
+def reversed_invoke(tag: Literal["str"], callback: Callable[[str], object], /) -> None: ...
+@overload
+def reversed_invoke(tag: Literal["int"], callback: Callable[[int], object], /) -> None: ...
+@overload
+def optional_context(tag: Literal["typed"], callback: Callable[[int], object], /) -> None: ...
+@overload
+def optional_context(tag: Literal["untyped"], callback, /) -> None: ...
+@overload
+def reversed_optional_context(tag: Literal["untyped"], callback, /) -> None: ...
+@overload
+def reversed_optional_context(tag: Literal["typed"], callback: Callable[[int], object], /) -> None: ...
+```
+
+```py
+from callbacks import invoke, optional_context, reversed_invoke, reversed_optional_context
+from typing import Literal
+
+def different(tag: Literal["int", "str"]) -> None:
+    invoke(tag, lambda value: reveal_type(value))  # revealed: Unknown
+    reversed_invoke(tag, lambda value: reveal_type(value))  # revealed: Unknown
+
+def absent(tag: Literal["typed", "untyped"]) -> None:
+    optional_context(tag, lambda value: reveal_type(value))  # revealed: Unknown
+    reversed_optional_context(tag, lambda value: reveal_type(value))  # revealed: Unknown
+```

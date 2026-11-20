@@ -74,7 +74,6 @@ use crate::types::infer::{TypeContextKind, original_class_type};
 use crate::types::known_instance::{
     FieldInstance, InternedConstraintSetSolution, MethodWrapper, MethodWrapperKind,
 };
-use crate::types::narrow::NarrowingConstraint;
 use crate::types::signatures::{
     CallableSignature, Parameter, ParameterDisplayName, ParameterKind, Parameters, ParametersKind,
     PartialApplication,
@@ -96,11 +95,12 @@ use crate::types::visitor::{
 use crate::types::{
     BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
     DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType, GenericAlias,
-    InternedConstraintSet, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
-    LiteralValueTypeKind, MaterializationKind, MemberLookupPolicy, NominalInstanceType, ParamSpecValue, PropertyInstanceType, RecursiveType,
-    StringLiteralType, TypeAliasType, TypeContext, TypeIdentity, TypeMapping,
-    TypeVarBoundOrConstraints, TypeVarVariance, UnionAccumulator, UnionBuilder, UnionType,
-    WrapperDescriptorKind, enums, factory_name_literal, is_known_class_method, is_property_method, list_members,
+    InternedConstraintSet, IntersectionBuilder, IntersectionType, KnownBoundMethodType, KnownClass,
+    KnownInstanceType, LiteralValueTypeKind, MaterializationKind, MemberLookupPolicy,
+    NominalInstanceType, ParamSpecValue, PropertyInstanceType, RecursiveType, StringLiteralType,
+    TypeAliasType, TypeContext, TypeIdentity, TypeMapping, TypeVarBoundOrConstraints,
+    TypeVarVariance, UnionAccumulator, UnionBuilder, UnionType, WrapperDescriptorKind, enums,
+    factory_name_literal, is_known_class_method, is_property_method, list_members,
 };
 use crate::{DisplaySettings, FxOrderSet};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
@@ -4553,15 +4553,18 @@ impl<'db> CallableBinding<'db> {
                         .matched_type(declared_type, matched_parameter.argument_type)
                         .unwrap_or(Type::unknown());
 
+                    // Expansion can bind a ParamSpec to the callback's remaining parameters.
+                    // Collect those constraints before deciding this argument rules out a call.
+                    // An inconclusive feasibility check must leave full expansion available.
                     !argument_type
-                        .when_assignable_to(
+                        .when_constraint_set_assignable_to(
                             db,
                             env,
                             declared_type.unwrap_or_else(|| parameter.annotated_type()),
                             constraints,
-                            inferable,
                         )
-                        .is_never_satisfied(db, env, inferable)
+                        .is_never_satisfied_bounded(db, env, inferable)
+                        .unwrap_or(false)
                 })
             });
             if !is_argument_assignable_to_any_overload {
@@ -4976,7 +4979,13 @@ impl<'db> CallableBinding<'db> {
             .matching_overloads()
             .map(|(_, overload)| overload.return_type())
             .collect();
-        merge_ambiguous_returns(db, env, &return_types)
+        let merged = merge_ambiguous_returns(db, env, &return_types);
+        if let Some(predicate) = self.common_type_is_return(db, env) {
+            // Keep the certified predicate alongside the ambiguous return type.
+            IntersectionType::from_elements(db, env, [merged, predicate])
+        } else {
+            merged
+        }
     }
 
     fn as_result(&self) -> Result<(), CallErrorKind> {
@@ -5399,7 +5408,10 @@ impl<'db> CallableBinding<'db> {
         ) {
             return None;
         }
+        let mut budget = ProjectionTypeBudget::new(SolutionBudget::default().type_terms);
+        budget.charge_type(db, guard.return_type(db)).ok()?;
         for (_, overload) in overloads {
+            budget.charge_items(1).ok()?;
             let declared_return = overload.signature.return_type();
             if let Type::TypeIs(declared) = declared_return {
                 if declared.is_bound(db) || overload.return_type() != Type::TypeIs(guard) {
@@ -5409,10 +5421,9 @@ impl<'db> CallableBinding<'db> {
             }
             let truth = declared_return.as_bool_literal()?;
             let parameter = overload.signature.parameters().get(parameter_index)?;
-            let domain =
-                parameter
-                    .annotated_type()
-                    .materialization(db, env, MaterializationKind::Top);
+            let declared_domain = parameter.annotated_type();
+            budget.charge_type(db, declared_domain).ok()?;
+            let domain = declared_domain.materialization(db, env, MaterializationKind::Top);
             let target = match guard.materialization_kind(db) {
                 Some(kind) => guard.return_type(db).materialization(
                     db,
@@ -5421,17 +5432,45 @@ impl<'db> CallableBinding<'db> {
                 ),
                 None => guard.return_type(db),
             };
-            // Constant-return arms must exclude the opposite outcome. Certification uses
-            // strict intersection semantics, independently of ordinary narrowing preferences.
-            let excluded = NarrowingConstraint::type_test(db, env, target, !truth, true);
-            let remaining = NarrowingConstraint::intersection(domain)
-                .merge_constraint_and(excluded)
-                .evaluate_constraint_type(db, env);
-            if !remaining.is_never() {
+            budget.charge_type(db, target).ok()?;
+            let target = target.top_materialization(db, env);
+            let consistent = Self::constant_type_is_arm_is_consistent(
+                db,
+                env,
+                domain,
+                target,
+                truth,
+                &mut budget,
+            )?;
+            if !consistent {
                 return None;
             }
         }
         Some(Type::TypeIs(guard))
+    }
+
+    /// Prove a literal arm against the already materialized runtime domain and target.
+    fn constant_type_is_arm_is_consistent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        domain: Type<'db>,
+        target: Type<'db>,
+        truth: bool,
+        budget: &mut ProjectionTypeBudget,
+    ) -> Option<bool> {
+        budget.charge_type(db, domain).ok()?;
+        budget.charge_type(db, target).ok()?;
+        // A true arm must lie inside the target; a false arm must be disjoint from it.
+        // Bound complement distribution before constructing the strict intersection.
+        let remaining = if truth {
+            let builder = IntersectionBuilder::new(db, env).positive_elements([domain]);
+            let builder = builder.bounded_add_negative(target)?;
+            builder.build()
+        } else {
+            IntersectionType::bounded_from_elements(db, env, [domain, target])?
+        };
+        budget.charge_type(db, remaining).ok()?;
+        Some(remaining.is_never())
     }
 
     fn report_diagnostics(
@@ -8076,7 +8115,6 @@ impl<'db> CallInference<'_, 'db> {
 
         let inference = self.solve_legacy(
             constraints,
-            generic_context,
             builder,
             &preferred_type_mappings,
             preferred_solutions_incomplete,
@@ -8242,7 +8280,6 @@ impl<'db> CallInference<'_, 'db> {
     fn solve_legacy<'c>(
         &'c self,
         constraints: &'c ConstraintSetBuilder<'db>,
-        generic_context: GenericContext<'db>,
         mut builder: SpecializationBuilder<'db, 'c>,
         preferred_type_mappings: &FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
         preferred_solutions_incomplete: bool,
@@ -8250,6 +8287,10 @@ impl<'db> CallInference<'_, 'db> {
         constraint_set_errors: &mut [bool],
     ) -> TypeVarInference<'db> {
         let db = self.db;
+        let generic_context = self
+            .signature
+            .generic_context
+            .expect("legacy inference requires a generic signature");
 
         let preferred_specialization = (!preferred_type_mappings.is_empty()).then(|| {
             generic_context.specialize(
@@ -10122,11 +10163,10 @@ impl<'db> Binding<'db> {
                     .argument_context_type()?;
                 // Preserve gradual context such as `Callable[[int], Any]`, while marking unsolved
                 // type variables in the same way as for arguments to an ordinary generic call.
-                if let Some(generic) = specialized_overload.signature.generic_context {
+                if specialized_overload.signature.generic_context.is_some() {
                     let context = specialized_overload.argument_type_context_specialization(
                         db,
                         env,
-                        generic,
                         specialized_overload.inference,
                         constraints,
                         call_expression_tcx,
@@ -10318,7 +10358,7 @@ impl<'db> Binding<'db> {
         let mut tcx_kind = TypeContextKind::preference();
 
         // If this is a generic call, specialize the parameter type using the computed constraints.
-        if let Some(generic_context) = self.signature.generic_context {
+        if self.signature.generic_context.is_some() {
             let inference = match source {
                 ArgumentTypeContextSource::All => self.inference,
                 ArgumentTypeContextSource::WithoutArguments => None,
@@ -10329,7 +10369,6 @@ impl<'db> Binding<'db> {
                     self.argument_type_context_specialization(
                         db,
                         env,
-                        generic_context,
                         inference,
                         constraints,
                         call_expression_tcx,
@@ -10473,7 +10512,7 @@ impl<'db> Binding<'db> {
         arguments: &CallArguments<'_, 'db>,
         tcx: TypeContext<'db>,
     ) -> Option<Specialization<'db>> {
-        let generic = self.signature.generic_context?;
+        self.signature.generic_context?;
         let constraints = &ConstraintSetBuilder::new();
         let arguments = arguments.with_self(binding.bound_type);
         let mut restricted = None;
@@ -10538,7 +10577,6 @@ impl<'db> Binding<'db> {
             self.argument_type_context_specialization(
                 db,
                 env,
-                generic,
                 Some(inference),
                 constraints,
                 tcx,
@@ -10554,22 +10592,26 @@ impl<'db> Binding<'db> {
     /// Parameter types are specialized based on the constraints from the declared type of the
     /// call expression, as well as the argument types inferred from the previous round of
     /// fixpoint iteration.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "Salsa supplies None while the inferred parameter context is resolving a cycle"
-    )]
     fn argument_type_context_specialization(
         &self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
-        generic_context: GenericContext<'db>,
         inference: Option<TypeVarInference<'db>>,
         constraints: &ConstraintSetBuilder<'db>,
         call_expression_tcx: TypeContext<'db>,
         mode: CheckTypesMode,
     ) -> Cow<'db, ArgumentContextSpecialization<'db>> {
+        let generic_context = self
+            .signature
+            .generic_context
+            .expect("parameter context specialization requires a generic signature");
+
         /// With no evidence from the expected return type, every call in this program
         /// with the same generic context and inferred arguments has the same parameter context.
+        #[allow(
+            clippy::unnecessary_wraps,
+            reason = "Salsa supplies None while the inferred parameter context is resolving a cycle"
+        )]
         #[salsa::tracked(
             returns(as_ref),
             cycle_initial = |_, _, _| None,
@@ -13040,6 +13082,96 @@ mod tests {
     use crate::types::generics::TypeVarInferenceSolutions;
 
     #[test]
+    fn constant_predicate_arms_require_complete_bounded_proofs() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/predicate.py",
+            "
+            class A0: ...
+            class B0: ...
+            class A1: ...
+            class B1: ...
+            class A2: ...
+            class B2: ...
+            class A3: ...
+            class B3: ...
+            class A4: ...
+            class B4: ...
+            class A5: ...
+            class B5: ...
+        ",
+        )?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/predicate.py")?;
+        let file = ProgramFile::new(&db, file, env.program(&db));
+        let instance = |name: &str| -> anyhow::Result<_> {
+            let class = global_symbol(&db, file, name)
+                .place
+                .expect_type()
+                .as_class_literal()
+                .ok_or_else(|| anyhow::anyhow!("expected class {name}"))?;
+            Ok(Type::instance(
+                &db,
+                &env,
+                class.identity_specialization(&db),
+            ))
+        };
+        let mut pairs = Vec::new();
+        for index in 0..6 {
+            let left = instance(&format!("A{index}"))?;
+            let right = instance(&format!("B{index}"))?;
+            pairs.push(IntersectionType::from_elements(&db, &env, [left, right]));
+        }
+        let target = UnionType::from_elements(&db, &env, pairs);
+        let mut budget = ProjectionTypeBudget::new(SolutionBudget::default().type_terms);
+        assert_eq!(
+            CallableBinding::constant_type_is_arm_is_consistent(
+                &db,
+                &env,
+                Type::object(),
+                target,
+                true,
+                &mut budget,
+            ),
+            None
+        );
+
+        let int = KnownClass::Int.to_instance(&db, &env);
+        let str = KnownClass::Str.to_instance(&db, &env);
+        for (domain, target, truth, expected) in [
+            (int, int, true, true),
+            (str, int, false, true),
+            (int, int, false, false),
+            (str, int, true, false),
+        ] {
+            let mut budget = ProjectionTypeBudget::new(SolutionBudget::default().type_terms);
+            assert_eq!(
+                CallableBinding::constant_type_is_arm_is_consistent(
+                    &db,
+                    &env,
+                    domain,
+                    target,
+                    truth,
+                    &mut budget,
+                ),
+                Some(expected)
+            );
+            assert_eq!(
+                CallableBinding::constant_type_is_arm_is_consistent(
+                    &db,
+                    &env,
+                    domain,
+                    target,
+                    truth,
+                    &mut ProjectionTypeBudget::new(0),
+                ),
+                None
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn bool_constructor_accepts_object() -> anyhow::Result<()> {
         let db = setup_db();
         let env = db.program_environment();
@@ -13103,7 +13235,6 @@ mod tests {
             let specialization = binding.argument_type_context_specialization(
                 &db,
                 &env,
-                context,
                 binding.inference,
                 &ConstraintSetBuilder::new(),
                 TypeContext::default(),

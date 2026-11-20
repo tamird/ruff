@@ -2532,6 +2532,65 @@ def remove_argument(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs)
     return callback(*args, **copied)  # error: [invalid-argument-type]
 ```
 
+## Iterating captured keyword keys alongside other arguments
+
+Unpacking a captured keyword dictionary positionally passes its string keys. Unrelated arguments
+leave the dictionary available for forwarding. Passing the dictionary itself can expose it to
+mutation, including through an alias.
+
+```py
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def inspect_keys(*values: object, **options: object) -> None: ...
+def named_options(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    inspect_keys(*kwargs, enabled=True)
+    return callback(*args, **kwargs)  # ok
+
+def unpacked_options(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    options: dict[str, object] = {}
+    inspect_keys("prefix", *kwargs, *kwargs, **options)
+    return callback(*args, **kwargs)  # ok
+
+def exposed_positionally(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    inspect_keys(*kwargs, kwargs)
+    return callback(*args, **kwargs)  # error: [invalid-argument-type]
+
+def exposed_by_name(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    inspect_keys(*kwargs, original=kwargs)
+    return callback(*args, **kwargs)  # error: [invalid-argument-type]
+
+def exposed_in_container(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    inspect_keys(*kwargs, original=[kwargs])
+    return callback(*args, **kwargs)  # error: [invalid-argument-type]
+
+def exposed_through_alias(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    alias = kwargs
+    inspect_keys(*kwargs, original=alias)
+    return callback(*args, **kwargs)  # error: [invalid-argument-type]
+
+def choose_sink(value: object) -> Callable[..., None]:
+    return inspect_keys
+
+def exposed_in_callee(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    choose_sink(kwargs)(*kwargs)
+    return callback(*args, **kwargs)  # error: [invalid-argument-type]
+
+def mutated_in_argument(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    inspect_keys(*kwargs, changed=kwargs.clear())
+    return callback(*args, **kwargs)  # error: [invalid-argument-type]
+
+def mutated_by_capture(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    def mutate() -> None:
+        kwargs.clear()
+
+    inspect_keys(*kwargs, changed=mutate())
+    return callback(*args, **kwargs)  # error: [invalid-argument-type]
+```
+
 ## Calling methods on a union of `ParamSpec` specializations
 
 A caller's parameter list can be shared by the receivers while the return type preserves the

@@ -188,6 +188,13 @@ impl<'db> CandidateSolutions<'db> {
     }
 }
 
+/// The variable domain and candidate bindings for one specialization search.
+pub(crate) struct SpecializationCandidates<'a, 'db> {
+    pub(crate) inferable: TypeVarSet<'db>,
+    pub(crate) fixed: &'a [TypeVarSolution<'db>],
+    pub(crate) fallback: Vec<TypeVarSolution<'db>>,
+}
+
 impl<'db> ConstraintSet<'db, '_> {
     /// Computes default solutions for each BDD path within the default projection budget.
     /// Constraints on non-inferable typevars are not necessarily retained in the solutions.
@@ -259,15 +266,18 @@ impl<'db> ConstraintSet<'db, '_> {
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
-        inferable: TypeVarSet<'db>,
+        candidates: SpecializationCandidates<'_, 'db>,
         resources: &mut ProjectionBudget,
-        fixed: &[TypeVarSolution<'db>],
         mut project: impl FnMut(
             &[TypeVarSolution<'db>],
             &mut ProjectionTypeBudget,
         ) -> Result<Option<Vec<TypeVarSolution<'db>>>, ProjectionError>,
-        fallback: Vec<TypeVarSolution<'db>>,
     ) -> Result<Option<Vec<TypeVarSolution<'db>>>, ProjectionError> {
+        let SpecializationCandidates {
+            inferable,
+            fixed,
+            fallback,
+        } = candidates;
         let ProjectionBudget {
             limits,
             types: type_budget,

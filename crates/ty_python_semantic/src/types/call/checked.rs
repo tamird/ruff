@@ -42,6 +42,8 @@ enum ArgumentAbsence {
     Indeterminate,
 }
 
+type AnnotationType<'a, 'db> = &'a dyn Fn(&ast::Expr, TextRange) -> Type<'db>;
+
 /// A call after ordinary argument matching and type checking.
 ///
 /// Argument-context providers receive a provisional check during sibling inference; its child
@@ -58,7 +60,7 @@ pub struct CheckedCall<'a, 'db> {
     pub(crate) file: ProgramFile<'db>,
     pub(crate) call: &'a ast::ExprCall,
     pub(crate) expression_type: &'a dyn Fn(&ast::Expr) -> Option<Type<'db>>,
-    pub(crate) annotation_type: Option<&'a dyn Fn(&ast::Expr, TextRange) -> Type<'db>>,
+    pub(crate) annotation_type: Option<AnnotationType<'a, 'db>>,
     pub(crate) dictionary_items:
         &'a dyn Fn(&ast::Expr, Type<'db>, DictionaryAccess<'_>) -> Option<DictionaryItems<'db>>,
     pub(crate) class_anchor: &'a dyn Fn(Box<[Type<'db>]>) -> DynamicClassAnchor<'db>,

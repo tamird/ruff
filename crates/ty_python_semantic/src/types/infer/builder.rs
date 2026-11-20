@@ -7032,6 +7032,38 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
 
                 MatchingArgumentTypeContext::Many(argument_tcx) => {
+                    let shared_context = argument_tcx
+                        .first()
+                        .map(|context| context.map_or_default(ArgumentTypeContext::type_context))
+                        .filter(|context| {
+                            argument_tcx.iter().all(|candidate| {
+                                candidate.map_or_default(ArgumentTypeContext::type_context)
+                                    == *context
+                            })
+                        });
+                    if mode.requires_default_inference()
+                        && let Some(tcx) = shared_context
+                    {
+                        // Matching overloads agree on this argument's context. Commit its
+                        // inferred types and diagnostics instead of discarding a speculative pass.
+                        let inferred_ty =
+                            infer_argument_ty(self, (argument_index, ast_argument, tcx));
+                        argument_types.insert_type(
+                            argument_index,
+                            TypeContext::default(),
+                            inferred_ty,
+                        );
+                        for context in argument_tcx {
+                            insert_argument_ty(
+                                argument_index,
+                                inferred_ty,
+                                context,
+                                argument_types,
+                            );
+                        }
+                        continue;
+                    }
+
                     // TODO: Preserve failed-call information for each inferred argument type so
                     // union narrowing and overload resolution can reject candidates that depend
                     // on error recovery.
@@ -11760,6 +11792,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         {
             if diagnostics.len() > 1 {
                 // Different bindings can report the same failure for one call.
+                #[expect(
+                    clippy::mutable_key_type,
+                    reason = "SourceFile excludes its lazy line-index cache from Eq and Hash"
+                )]
                 let mut seen = FxHashSet::default();
                 diagnostics.retain(|diagnostic| seen.insert(diagnostic.clone()));
             }

@@ -569,6 +569,57 @@ def unbound(predicate: Intersection[Any, TypeIs[dict[Any, Any]]]):
     if identity(predicate):
         reveal_type(predicate)  # revealed: Any & TypeIs[dict[Any, Any]]
 
+@overload
+def omitted_target(value: dict[Any, Any] = ..., *, selector: int) -> Literal[True]: ...
+@overload
+def omitted_target(value: object = ..., *, selector: str) -> TypeIs[dict[Any, Any]]: ...
+def omitted_target(value: object = None, *, selector: int | str) -> bool:
+    return isinstance(value, dict)
+
+def missing_target(selector: Any):
+    reveal_type(omitted_target(selector=selector))  # revealed: Unknown
+    if omitted_target(selector=selector):
+        reveal_type(selector)  # revealed: Any
+    else:
+        reveal_type(selector)  # revealed: Any
+
+class Left1: ...
+class Right1: ...
+class Left2: ...
+class Right2: ...
+class Left3: ...
+class Right3: ...
+class Left4: ...
+class Right4: ...
+class Left5: ...
+class Right5: ...
+class Left6: ...
+class Right6: ...
+
+type CompositeTarget = (
+    Intersection[Left1, Right1]
+    | Intersection[Left2, Right2]
+    | Intersection[Left3, Right3]
+    | Intersection[Left4, Right4]
+    | Intersection[Left5, Right5]
+    | Intersection[Left6, Right6]
+)
+
+@overload
+def composite_target(value: str) -> Literal[True]: ...
+@overload
+def composite_target(value: object) -> TypeIs[CompositeTarget]: ...
+def composite_target(value: object) -> bool:
+    return True
+
+def composite_refusal(value: Any):
+    # Negating the target distributes six independent intersection arms.
+    reveal_type(composite_target(value))  # revealed: Unknown
+    if composite_target(value):
+        reveal_type(value)  # revealed: Any
+    else:
+        reveal_type(value)  # revealed: Any
+
 from ty_extensions import Bottom, Top
 from ty_extensions._internal import TypeOf
 
