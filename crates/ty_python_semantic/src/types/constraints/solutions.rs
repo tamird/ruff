@@ -1657,6 +1657,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
         process_satisfied: &ProcessSatisfied<'_, 'db, L, Break<L::Break>>,
     ) -> ControlFlow<Break<L::Break>> {
         let Some((constraint, constraints)) = constraints.split_first() else {
+            if path.pending_relation().is_none() {
+                return process_satisfied(self, storage, path);
+            }
             return self.visit_node_and_then(
                 db,
                 env,

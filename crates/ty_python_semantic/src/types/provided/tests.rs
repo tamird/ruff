@@ -3733,7 +3733,7 @@ target: Target | None
             "class Mutable:\n    dep: Target | None = target\n",
             "attrs = Mutable()",
             "",
-            vec!["missing-attribute"],
+            vec!["missing-union-attribute"],
         ),
         (
             "class Base:\n    @property\n    def dep(self) -> Target | None: return target\n",

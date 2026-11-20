@@ -6889,7 +6889,13 @@ fn inferred_parameter_specialization<'db>(
                             && !ty.has_unspecialized_type_var(db, env)
                     })
                 else {
-                    return Some(unsolved);
+                    // Missing argument evidence must not erase context from the expected result.
+                    return Some(
+                        return_type_solutions
+                            .get(&typevar.identity(db))
+                            .copied()
+                            .unwrap_or(unsolved),
+                    );
                 };
                 let promoted = ty.promote(db, env);
                 // Context for other arguments must still satisfy the type variable's
