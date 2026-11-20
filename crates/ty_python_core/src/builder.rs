@@ -4522,7 +4522,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         // without a named expression, so retain their operand effects when paths rejoin.
         let entry = (!has_named_expression
             && !values.iter().any(|value| {
-                any_over_expr(value, |expression| self.contents_place(expression).is_some())
+                any_over_expr(value, |expression| {
+                    self.contents_place(expression).is_some()
+                })
             })
             && !self
                 .exception_context_stack_manager

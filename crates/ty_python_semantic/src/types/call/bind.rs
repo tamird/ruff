@@ -6217,12 +6217,16 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 is_known,
             );
         } else {
-            let matching_capture = self.parameters.as_keyword_paramspec_with_prefix(db)
+            let matching_capture = self
+                .parameters
+                .as_keyword_paramspec_with_prefix(db)
                 .is_some_and(|(_, captured)| {
-                    argument_type.and_then(Type::as_typevar).is_some_and(|argument| {
-                        argument.is_captured_keyword_arguments(db)
-                            && argument.paramspec_base(db).is_same_typevar_as(db, captured)
-                    })
+                    argument_type
+                        .and_then(Type::as_typevar)
+                        .is_some_and(|argument| {
+                            argument.is_captured_keyword_arguments(db)
+                                && argument.paramspec_base(db).is_same_typevar_as(db, captured)
+                        })
                 });
             self.match_mapping_keywords(argument_index, |parameter_name| {
                 if matching_capture && parameter_name.is_some() {
@@ -9008,10 +9012,16 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             .merged_specialization()
             .and_then(|specialization| specialization.get(db, paramspec))
             .and_then(|value| value.as_paramspec_value(db))
-            .and_then(|value| value.to_callable_type(
-                db, self.env,
-                self.signature.parameters().keyword_paramspec_capture().map(|(capture, _)| capture),
-            ))
+            .and_then(|value| {
+                value.to_callable_type(
+                    db,
+                    self.env,
+                    self.signature
+                        .parameters()
+                        .keyword_paramspec_capture()
+                        .map(|(capture, _)| capture),
+                )
+            })
         else {
             return false;
         };
@@ -10014,8 +10024,12 @@ impl<'db> Binding<'db> {
             mode,
         } = *context;
         let callable = paramspec_value.to_callable_type(
-            db, env,
-            self.signature.parameters().keyword_paramspec_capture().map(|(capture, _)| capture),
+            db,
+            env,
+            self.signature
+                .parameters()
+                .keyword_paramspec_capture()
+                .map(|(capture, _)| capture),
         )?;
 
         let (prefix, _) = self
