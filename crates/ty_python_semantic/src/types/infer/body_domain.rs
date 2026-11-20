@@ -4314,7 +4314,9 @@ mod tests {
             "#,
         )?;
         let function = function(&db);
-        let diagnostics = check_overload_body(&db, function, 0).unwrap().into_diagnostics();
+        let diagnostics = check_overload_body(&db, function, 0)
+            .unwrap()
+            .into_diagnostics();
         let [diagnostic] = diagnostics.as_slice() else {
             anyhow::bail!("expected one invalid integer-domain return: {diagnostics:#?}");
         };
