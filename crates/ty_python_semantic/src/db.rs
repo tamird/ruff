@@ -217,6 +217,25 @@ pub trait Db: PythonCoreDb {
         ProvidedCallResult::default()
     }
 
+    /// An upper bound for values returned by successful subscriptions of a native receiver.
+    ///
+    /// Successful runtime subscription results are intersected with this bound, preserving
+    /// exact results and `Never`. Runtime dispatch errors bypass refinement and retain their
+    /// diagnostics and recovery types. The bound must hold whenever an index returns a value.
+    /// The selector can also observe class/type-form operands from legacy type-application
+    /// recovery paths. Implementations must return `None` for those operands: only identified
+    /// native runtime instances are eligible. Type-application behavior is not refined here.
+    /// Implementations must read tracked inputs without requesting completed inference of the
+    /// current scope. The bound must also hold during provisional inference and cycle recovery;
+    /// it cannot depend on a selected call attempt.
+    fn provided_subscript_result_bound<'db>(
+        &'db self,
+        _file: ProgramFile<'db>,
+        _receiver: crate::types::Type<'db>,
+    ) -> Option<crate::types::Type<'db>> {
+        None
+    }
+
     /// Parameters whose argument context depends on other arguments of a supplied call.
     ///
     /// This declaration fact opts a single-signature call into sibling argument inference,
@@ -439,6 +458,11 @@ pub(crate) mod tests {
         -> Result<Option<crate::types::Type<'db>>, Diagnostic>;
     type CallResultProvider =
         for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>) -> crate::provided::ProvidedCallResult<'db>;
+    type SubscriptResultBoundProvider = for<'db> fn(
+        &'db TestDb,
+        ProgramFile<'db>,
+        crate::types::Type<'db>,
+    ) -> Option<crate::types::Type<'db>>;
     type ContextualParametersProvider = for<'db> fn(&'db TestDb, Definition<'db>) -> Box<[Name]>;
     type CallArgumentContextProvider =
         for<'db> fn(&'db TestDb, &CheckedCall<'_, 'db>, &str) -> Option<crate::types::Type<'db>>;
@@ -493,6 +517,7 @@ pub(crate) mod tests {
         program_settings: ProgramSettings,
         call_target_provider: Option<CallTargetProvider>,
         call_result_provider: Option<CallResultProvider>,
+        subscript_result_bound_provider: Option<SubscriptResultBoundProvider>,
         contextual_parameters_provider: Option<ContextualParametersProvider>,
         call_argument_context_provider: Option<CallArgumentContextProvider>,
         type_application_provider: Option<TypeApplicationProvider>,
@@ -532,6 +557,7 @@ pub(crate) mod tests {
                 program_settings,
                 call_target_provider: None,
                 call_result_provider: None,
+                subscript_result_bound_provider: None,
                 contextual_parameters_provider: None,
                 call_argument_context_provider: None,
                 type_application_provider: None,
@@ -722,6 +748,15 @@ pub(crate) mod tests {
                 })
         }
 
+        fn provided_subscript_result_bound<'db>(
+            &'db self,
+            file: ProgramFile<'db>,
+            receiver: crate::types::Type<'db>,
+        ) -> Option<crate::types::Type<'db>> {
+            self.subscript_result_bound_provider
+                .and_then(|provider| provider(self, file, receiver))
+        }
+
         fn provided_contextual_parameters(&self, definition: Definition<'_>) -> Box<[Name]> {
             self.contextual_parameters_provider
                 .map_or_else(Box::default, |provider| provider(self, definition))
@@ -888,6 +923,7 @@ pub(crate) mod tests {
         analysis_settings: Option<AnalysisSettings>,
         call_target_provider: Option<CallTargetProvider>,
         call_result_provider: Option<CallResultProvider>,
+        subscript_result_bound_provider: Option<SubscriptResultBoundProvider>,
         contextual_parameters_provider: Option<ContextualParametersProvider>,
         call_argument_context_provider: Option<CallArgumentContextProvider>,
         type_application_provider: Option<TypeApplicationProvider>,
@@ -917,6 +953,7 @@ pub(crate) mod tests {
                 analysis_settings: None,
                 call_target_provider: None,
                 call_result_provider: None,
+                subscript_result_bound_provider: None,
                 contextual_parameters_provider: None,
                 call_argument_context_provider: None,
                 type_application_provider: None,
@@ -988,6 +1025,14 @@ pub(crate) mod tests {
 
         pub(crate) fn with_call_result_provider(mut self, provider: CallResultProvider) -> Self {
             self.call_result_provider = Some(provider);
+            self
+        }
+
+        pub(crate) fn with_subscript_result_bound_provider(
+            mut self,
+            provider: SubscriptResultBoundProvider,
+        ) -> Self {
+            self.subscript_result_bound_provider = Some(provider);
             self
         }
 
@@ -1086,6 +1131,7 @@ pub(crate) mod tests {
             let mut db = TestDb::new(self.vendored);
             db.call_target_provider = self.call_target_provider;
             db.call_result_provider = self.call_result_provider;
+            db.subscript_result_bound_provider = self.subscript_result_bound_provider;
             db.contextual_parameters_provider = self.contextual_parameters_provider;
             db.call_argument_context_provider = self.call_argument_context_provider;
             db.type_application_provider = self.type_application_provider;
