@@ -2169,6 +2169,12 @@ def caller[U](value: U) -> None:
     static_assert(is_subtype_of(TypeOf[key], Callable[[tuple[U, dict[U, bool]]], int]))
     static_assert(not is_subtype_of(TypeOf[identity], Callable[[U], str]))
 
+def declared_caller[B: str, C: (int, str, object)](bounded: B, constrained: C) -> None:
+    static_assert(is_subtype_of(TypeOf[identity], Callable[[B], B]))
+    static_assert(is_subtype_of(TypeOf[key], Callable[[tuple[C, dict[C, bool]]], int]))
+    static_assert(not is_subtype_of(TypeOf[identity], Callable[[C], str]))
+    static_assert(not is_subtype_of(TypeOf[pair], Callable[[list[B], list[str]], list[B]]))
+
 def bounded[T: str](value: T) -> T:
     return value
 
