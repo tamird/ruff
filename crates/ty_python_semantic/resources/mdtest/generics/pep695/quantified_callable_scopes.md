@@ -54,7 +54,7 @@ result: tuple[str, bytes] = infer(identity)
 A single callback comparison keeps its scalar and list element specialization together.
 
 ```py
-from typing import Callable
+from typing import Any, Callable
 
 def make[T: (int, str)]() -> tuple[T, list[T]]:
     raise NotImplementedError
@@ -74,4 +74,9 @@ def mixed(value: int, values: list[str]) -> None:
 combine(make, integers)
 combine(make, strings)
 combine(make, mixed)  # error: [invalid-argument-type]
+
+integer_result: Callable[[], tuple[int, list[int]]] = make
+string_result: Callable[[], tuple[str, list[str]]] = make
+mixed_result: Callable[[], tuple[int, list[str]]] = make  # error: [invalid-assignment]
+gradual_result: Callable[[], tuple[Any, list[Any]]] = make
 ```
