@@ -1,8 +1,10 @@
 use ruff_python_ast as ast;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 
-use crate::place::PlaceExpr;
+use crate::SourceExclusions;
+use crate::place::{PlaceExpr, PlaceExprRef, PlaceTableBuilder};
 use crate::symbol::Symbol;
+use ruff_text_size::Ranged;
 
 /// Do a pre-walk of a `while` loop to collect all the places that are bound, prior to visiting the
 /// loop with `SemanticIndexBuilder`. This walk includes bindings in nested loops, but not in
@@ -10,16 +12,32 @@ use crate::symbol::Symbol;
 /// pre-walk so that we can synthesize "loop header definitions" that are visible to the loop body
 /// (and condition). See `LoopHeader`.
 /// TODO: Handle `nonlocal` bindings from nested scopes somehow.
-pub(crate) fn collect_while_loop_bindings(while_stmt: &ast::StmtWhile) -> Vec<PlaceExpr> {
-    let mut collector = LoopBindingsVisitor::default();
+pub(crate) fn collect_while_loop_bindings(
+    while_stmt: &ast::StmtWhile,
+    exclusions: &SourceExclusions,
+    contents: Option<&PlaceTableBuilder>,
+) -> Vec<PlaceExpr> {
+    let mut collector = LoopBindingsVisitor {
+        exclusions,
+        contents,
+        bound_places: Vec::new(),
+    };
     collector.visit_expr(&while_stmt.test);
     collector.visit_body(&while_stmt.body);
     collector.bound_places
 }
 
 /// Like `collect_while_loop_bindings` above, but for `for` loops.
-pub(crate) fn collect_for_loop_bindings(for_stmt: &ast::StmtFor) -> Vec<PlaceExpr> {
-    let mut collector = LoopBindingsVisitor::default();
+pub(crate) fn collect_for_loop_bindings(
+    for_stmt: &ast::StmtFor,
+    exclusions: &SourceExclusions,
+    contents: Option<&PlaceTableBuilder>,
+) -> Vec<PlaceExpr> {
+    let mut collector = LoopBindingsVisitor {
+        exclusions,
+        contents,
+        bound_places: Vec::new(),
+    };
     collector.add_place_from_target(&for_stmt.target);
     collector.visit_body(&for_stmt.body);
     collector.bound_places
@@ -28,13 +46,64 @@ pub(crate) fn collect_for_loop_bindings(for_stmt: &ast::StmtFor) -> Vec<PlaceExp
 /// The visitor that powers `collect_while_loop_bindings` and `collect_for_loop_bindings`.
 ///
 /// This visitor doesn't walk nested function/class definitions since those are different scopes.
-#[derive(Debug, Default)]
-pub(crate) struct LoopBindingsVisitor {
+pub(crate) struct LoopBindingsVisitor<'a> {
+    exclusions: &'a SourceExclusions,
+    contents: Option<&'a PlaceTableBuilder>,
     bound_places: Vec<PlaceExpr>,
 }
 
-impl LoopBindingsVisitor {
+impl LoopBindingsVisitor<'_> {
+    fn add_contents(&mut self, receiver: &ast::Expr) {
+        if let Some(place) = PlaceExpr::contents(receiver)
+            && self
+                .contents
+                .is_some_and(|table| table.place_id((&place).into()).is_some())
+        {
+            self.bound_places.push(place);
+        }
+    }
+
+    fn expose(&mut self, value: &ast::Expr) {
+        let mut receivers = Vec::new();
+        super::dictionary_contents::value_receivers(value, &mut receivers);
+        for &receiver in &receivers {
+            self.add_contents(receiver);
+            self.add_nested_contents(receiver, None);
+        }
+    }
+
+    fn add_nested_contents(&mut self, receiver: &ast::Expr, direct_receiver: Option<&ast::Expr>) {
+        let Some(table) = self.contents else {
+            return;
+        };
+        for place in
+            super::dictionary_contents::nested_contents_places(table, receiver, direct_receiver)
+        {
+            if let PlaceExprRef::Member(member) = table.place(place) {
+                self.bound_places.push(PlaceExpr::Member(member.clone()));
+            }
+        }
+    }
+
+    fn nested_scope(&mut self) {
+        if let Some(table) = self.contents {
+            // Lazy captures resolve only after their enclosing scopes finish. These headers
+            // reserve existing candidates; actual capture definitions decide which are affected.
+            self.bound_places.extend(table.iter().filter_map(|place| {
+                match place {
+                    PlaceExprRef::Member(member) => member
+                        .is_contents()
+                        .then(|| PlaceExpr::Member(member.clone())),
+                    PlaceExprRef::Symbol(_) => None,
+                }
+            }));
+        }
+    }
+
     fn add_place_from_target(&mut self, target: &ast::Expr) {
+        if let ast::Expr::Subscript(subscript) = target {
+            self.add_contents(&subscript.value);
+        }
         match target {
             ast::Expr::Name(name) => {
                 self.bound_places.push(PlaceExpr::from_expr_name(name));
@@ -62,10 +131,14 @@ impl LoopBindingsVisitor {
     }
 }
 
-impl<'ast> Visitor<'ast> for LoopBindingsVisitor {
+impl<'ast> Visitor<'ast> for LoopBindingsVisitor<'_> {
     fn visit_stmt(&mut self, stmt: &'ast ast::Stmt) {
+        if self.exclusions.contains(stmt.range()) {
+            return;
+        }
         match stmt {
             ast::Stmt::Assign(node) => {
+                self.expose(&node.value);
                 for target in &node.targets {
                     self.add_place_from_target(target);
                 }
@@ -78,6 +151,7 @@ impl<'ast> Visitor<'ast> for LoopBindingsVisitor {
             }
             ast::Stmt::AnnAssign(node) => {
                 if let Some(value) = &node.value {
+                    self.expose(value);
                     self.add_place_from_target(&node.target);
                     self.visit_expr(value);
                 }
@@ -132,11 +206,13 @@ impl<'ast> Visitor<'ast> for LoopBindingsVisitor {
                 }
             }
             ast::Stmt::FunctionDef(node) => {
+                self.nested_scope();
                 self.bound_places
                     .push(PlaceExpr::Symbol(Symbol::new(node.name.id.clone())));
                 // Don't descend into function bodies - they're different scopes.
             }
             ast::Stmt::ClassDef(node) => {
+                self.nested_scope();
                 self.bound_places
                     .push(PlaceExpr::Symbol(Symbol::new(node.name.id.clone())));
                 // Don't descend into class bodies - they're different scopes.
@@ -156,14 +232,61 @@ impl<'ast> Visitor<'ast> for LoopBindingsVisitor {
                     self.add_place_from_target(target);
                 }
             }
+            ast::Stmt::Return(node) => {
+                if let Some(value) = &node.value {
+                    self.expose(value);
+                }
+                walk_stmt(self, stmt);
+            }
             _ => walk_stmt(self, stmt),
         }
     }
 
     fn visit_expr(&mut self, expr: &'ast ast::Expr) {
+        match expr {
+            ast::Expr::Yield(node) => {
+                if let Some(value) = &node.value {
+                    self.expose(value);
+                }
+            }
+            ast::Expr::YieldFrom(node) => self.expose(&node.value),
+            _ => {}
+        }
         // the walrus operator
         if let ast::Expr::Named(node) = expr {
             self.add_place_from_target(&node.target);
+            self.expose(&node.value);
+        }
+        if let ast::Expr::Call(call) = expr {
+            let receivers = super::dictionary_contents::call_receivers(call);
+            for &(receiver, _) in &receivers {
+                self.add_contents(receiver);
+                let source = super::dictionary_contents::outermost_receiver(
+                    receiver,
+                    receivers.iter().map(|(value, _)| *value),
+                );
+                self.add_nested_contents(receiver, Some(source));
+            }
+        }
+        if let ast::Expr::Lambda(lambda) = expr {
+            self.nested_scope();
+            if let Some(parameters) = &lambda.parameters {
+                for parameter in parameters.iter_non_variadic_params() {
+                    if let Some(default) = &parameter.default {
+                        self.visit_expr(default);
+                    }
+                }
+            }
+            return;
+        }
+        if matches!(
+            expr,
+            ast::Expr::ListComp(_)
+                | ast::Expr::SetComp(_)
+                | ast::Expr::DictComp(_)
+                | ast::Expr::Generator(_)
+        ) {
+            self.nested_scope();
         }
         walk_expr(self, expr);
     }
@@ -208,7 +331,7 @@ mod tests {
         let ast::Stmt::While(while_stmt) = stmt else {
             panic!("Expected a while statement");
         };
-        collect_while_loop_bindings(while_stmt)
+        collect_while_loop_bindings(while_stmt, &SourceExclusions::default(), None)
             .into_iter()
             .map(|place| match place {
                 PlaceExpr::Symbol(sym) => sym.name().to_string(),
@@ -272,7 +395,7 @@ mod tests {
         let ast::Stmt::For(for_stmt) = stmt else {
             panic!("Expected a for statement");
         };
-        collect_for_loop_bindings(for_stmt)
+        collect_for_loop_bindings(for_stmt, &SourceExclusions::default(), None)
             .into_iter()
             .map(|place| match place {
                 PlaceExpr::Symbol(sym) => sym.name().to_string(),

@@ -1,0 +1,5 @@
+---
+source: crates/ty_python_semantic/src/types/infer/body_domain.rs
+expression: "DisplayDiagnostics::new(&db,\n&DisplayDiagnosticConfig::new(\"ty\").format(DiagnosticFormat::Concise),\n&diagnostics,)"
+---
+src/body.py:7:12: error[invalid-return-type] Return type does not match returned value: expected `int`, found `Literal[b"wrong"]`

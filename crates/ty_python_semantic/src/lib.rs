@@ -20,7 +20,8 @@ use ruff_db::parsed::parsed_module;
 use ruff_db::source::{SourceTextError, source_text};
 use rustc_hash::FxHasher;
 pub use semantic_model::{
-    Completion, ExpectedStringLiteralCompletion, HasDefinition, HasType, NameKind, SemanticModel,
+    Completion, ExpectedStringLiteralCompletion, HasDefinition, HasType, NameKind, ObjectMembers,
+    SemanticModel,
 };
 use std::hash::BuildHasherDefault;
 pub use suppression::suppress_single;
@@ -62,6 +63,7 @@ mod lexical_name_path;
 pub mod lint;
 pub(crate) mod place;
 pub(crate) mod place_load;
+pub use types::provided;
 mod reachability;
 mod semantic_model;
 mod subscript;
@@ -110,6 +112,12 @@ pub struct AnalysisSettings {
     /// Whether ty should use conservative equality and inequality semantics.
     pub strict_equality_semantics: bool,
 
+    /// Whether to widen singleton elements of mutable collections with `Unknown`.
+    ///
+    /// Widening permits later mutations when a singleton, such as `None`, is used as a
+    /// placeholder. Disabling it preserves the inferred element type instead.
+    pub widen_singleton_collection_elements: bool,
+
     /// Whether errors can be suppressed with `type: ignore` comments.
     ///
     /// If set to false, ty won't:
@@ -130,6 +138,7 @@ impl Default for AnalysisSettings {
             return_type_inference: ReturnTypeInference::default(),
             strict_generic_narrowing: false,
             strict_equality_semantics: false,
+            widen_singleton_collection_elements: true,
             respect_type_ignore_comments: true,
             allowed_unresolved_imports: ModuleGlobSet::empty(),
             replace_imports_with_any: ModuleGlobSet::empty(),

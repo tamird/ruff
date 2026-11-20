@@ -4862,6 +4862,7 @@ name = "ty_python_semantic"
 version = "0.0.23"
 dependencies = [
  "anyhow",
+ "arrayvec",
  "bitflags 2.13.2",
  "camino",
  "char_str",
@@ -4913,6 +4914,7 @@ dependencies = [
  "ty_static",
  "ty_test",
  "ty_vendored",
+ "zip",
 ]
 
 [[package]]

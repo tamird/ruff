@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::FxIndexSet;
-use crate::place::implicit_builtins_symbol_scope;
+use crate::place::implicit_builtins_symbol_source;
 use crate::reachability::is_range_reachable;
+pub use crate::types::call::CallInput;
 use crate::types::call::bind::CheckTypesMode;
 use crate::types::call::{CallArguments, CallError, MatchedArgument};
 use crate::types::class::{DynamicClassAnchor, DynamicEnumAnchor, DynamicNamedTupleAnchor};
@@ -31,10 +32,12 @@ mod unreachable_code;
 mod unused_binding_support;
 
 use crate::types::definition_resolution::{self, user_visible_definitions};
-pub use crate::types::definition_resolution::{ImportAliasResolution, ResolvedDefinition};
+pub use crate::types::definition_resolution::{
+    ImportAliasResolution, ResolvedDefinition, resolve_definition,
+};
 pub use stub_mapping::map_stub_definition;
 pub use unreachable_code::{UnreachableKind, UnreachableRange, unreachable_ranges};
-pub use unused_binding_support::{UnusedBinding, unused_bindings};
+pub use unused_binding_support::{UnusedBinding, unused_bindings, unused_definitions};
 
 static CLASS_MATCHER: LazyLock<NameMatcher<'static>> =
     LazyLock::new(|| NameMatcher::keyword("class"));
@@ -52,6 +55,13 @@ pub fn inlay_hint_return_type<'db>(
     let db = model.db();
     let definition = function.definition(model);
     let function_type = infer_definition_types(db, definition).function_type(definition)?;
+    if function_type
+        .literal(db)
+        .last_definition
+        .has_explicit_return_annotation(db)
+    {
+        return None;
+    }
     let signature = function_type.signature_with_inferred_return_type(db);
     let [overload] = signature.overloads.as_slice() else {
         return None;
@@ -94,14 +104,21 @@ pub fn definitions_for_name<'db>(
         return vec![];
     };
     let scope = scope.to_scope_id(db, model.program_file());
-    let definitions =
-        definition_resolution::scoped_definitions_for_name(db, scope, name_str, alias_resolution);
+    let definitions = definition_resolution::scoped_definitions_for_name(
+        db,
+        scope,
+        name_str,
+        alias_resolution,
+        model.builtin_usage(node) == crate::provided::BuiltinUsage::Annotation,
+    );
     if !definitions.is_empty() {
         return definitions;
     }
 
     // If we didn't find any definitions in scopes, fallback to builtins
-    let Some(builtins_scope) = implicit_builtins_symbol_scope(db, &env, name_str) else {
+    let Some(builtins_source) =
+        implicit_builtins_symbol_source(db, &env, name_str, model.builtin_usage(node))
+    else {
         return vec![];
     };
     // Special cases for `float` and `complex` in type annotation positions.
@@ -136,7 +153,11 @@ pub fn definitions_for_name<'db>(
             .collect();
     }
 
-    definition_resolution::definitions_for_builtin(db, builtins_scope, name_str)
+    definition_resolution::definitions_for_builtin(
+        db,
+        builtins_source.scope,
+        builtins_source.name.as_deref().unwrap_or(name_str),
+    )
 }
 
 /// Returns definitions for an attribute expression, inferring its receiver through the IDE model.
@@ -711,7 +732,7 @@ fn member_implementation_definition<'db>(
     }
 
     // Stub overload declarations can still map to a real source implementation later.
-    if definition.file(db).is_stub(db) {
+    if definition.program_file(db).is_stub(db) {
         return Some(ResolvedDefinition::Definition(definition));
     }
 
@@ -891,9 +912,12 @@ pub fn definitions_for_keyword_argument<'db>(
         for signature in callables.signatures(db) {
             if let Some((_param_index, param)) =
                 signature.parameters().keyword_by_name(keyword_name_str)
-                && let Some(definition) = param.definition()
             {
-                resolved_definitions.push(ResolvedDefinition::Definition(definition));
+                if let Some(definition) = param.definition() {
+                    resolved_definitions.push(ResolvedDefinition::Definition(definition));
+                } else if let Some(source) = param.source_range() {
+                    resolved_definitions.push(ResolvedDefinition::FileWithRange(source));
+                }
             }
         }
     }
@@ -999,7 +1023,38 @@ pub struct CallSignatureParameter<'db> {
     pub is_keyword_variadic: bool,
 }
 
+impl CallSignatureParameter<'_> {
+    /// Whether this parameter can be suggested as a direct keyword argument.
+    ///
+    /// A callable can accept names that cannot appear directly in an argument list, such as a
+    /// key from an unpacked `TypedDict` containing a hyphen.
+    pub fn can_complete_as_keyword(&self) -> bool {
+        !self.is_positional_only
+            && !self.is_variadic
+            && !self.is_keyword_variadic
+            && ruff_python_stdlib::identifiers::is_identifier(&self.name)
+    }
+}
+
 impl<'db> CallSignatureDetails<'db> {
+    /// Selects the displayed parameter for an argument, including an unfinished argument.
+    pub fn active_parameter(&self, argument_index: usize) -> Option<usize> {
+        if let Some(parameter) = self
+            .argument_to_displayed_parameter_mapping
+            .get(argument_index)
+        {
+            return *parameter;
+        }
+        if argument_index < self.parameters.len() {
+            Some(argument_index)
+        } else {
+            self.parameters.last().and_then(|parameter| {
+                (parameter.is_variadic || parameter.is_keyword_variadic)
+                    .then(|| self.parameters.len() - 1)
+            })
+        }
+    }
+
     fn from_binding(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -1008,7 +1063,10 @@ impl<'db> CallSignatureDetails<'db> {
         let argument_to_parameter_mapping = binding.argument_matches().to_vec();
         let specialization = binding.merged_specialization(db);
         let signature = binding.signature.clone();
-        let display_details = signature.display(db, env).to_string_parts();
+        let display_details = signature
+            .display(db, env)
+            .hide_implicit_parameters()
+            .to_string_parts();
         let (parameters, parameter_to_displayed_parameter_mapping) =
             displayed_parameters_for_signature(db, &signature, &display_details, specialization);
         let argument_to_displayed_parameter_mapping = argument_to_parameter_mapping
@@ -1047,31 +1105,27 @@ fn displayed_parameters_for_signature<'db>(
     display_details: &crate::types::display::SignatureDisplayDetails,
     specialization: Option<crate::types::generics::Specialization<'db>>,
 ) -> (Vec<CallSignatureParameter<'db>>, Vec<Option<usize>>) {
-    // Apply any inferred specialization to displayed parameter types so
-    // call-site substitutions are reflected in the rendered signature. For
-    // example, if `_KT` was inferred as `str`, display `str` instead of `_KT`.
-    let apply_specialization =
-        |ty: Type<'db>| specialization.map_or(ty, |spec| ty.apply_specialization(db, spec));
     let parameters = signature.parameters();
 
     match parameters.kind() {
-        ParametersKind::Standard | ParametersKind::Gradual | ParametersKind::Concatenate(_) => {
+        ParametersKind::Standard
+        | ParametersKind::Incomplete
+        | ParametersKind::Gradual
+        | ParametersKind::Concatenate(_) => {
             let mut displayed_parameters = Vec::new();
             let mut parameter_to_displayed_parameter_mapping = vec![None; parameters.len()];
 
-            for (parameter_index, parameter) in parameters.iter().enumerate() {
-                let Some(range) = display_details
-                    .parameter_ranges
-                    .get(parameter_index)
-                    .copied()
+            for (display_index, (parameter_index, parameter)) in parameters
+                .iter()
+                .enumerate()
+                .filter(|(_, parameter)| !parameter.is_implicit())
+                .enumerate()
+            {
+                let Some(range) = display_details.parameter_ranges.get(display_index).copied()
                 else {
                     continue;
                 };
-                let Some(name) = display_details
-                    .parameter_names
-                    .get(parameter_index)
-                    .cloned()
-                else {
+                let Some(name) = display_details.parameter_names.get(display_index).cloned() else {
                     continue;
                 };
                 let Some(label) = display_details
@@ -1088,7 +1142,9 @@ fn displayed_parameters_for_signature<'db>(
                     definition: parameter.definition(),
                     label,
                     name,
-                    ty: apply_specialization(parameter.annotated_type()),
+                    ty: parameter
+                        .annotated_type()
+                        .apply_optional_specialization(db, specialization),
                     is_positional_only: parameter.is_positional_only(),
                     is_variadic: parameter.is_variadic(),
                     is_keyword_variadic: parameter.is_keyword_variadic(),
@@ -1157,9 +1213,14 @@ pub fn call_signature_details<'db>(
         // Use from_arguments_typed so that check_types can infer TypeVar
         // specializations from the actual argument types at this call site.
         let call_arguments =
-            CallArguments::from_arguments_typed(&call_expr.arguments, |expression| {
-                expression.inferred_type(model)
-            });
+            CallArguments::from_arguments_typed(&call_expr.arguments, |splatted_value| {
+                splatted_value.inferred_type(model)
+            })
+            .with_observed_unpacking(
+                &call_expr.arguments,
+                |expression| expression.inferred_type(model),
+                |expression| model.dictionary_observation(expression),
+            );
         let mut bindings =
             callable_type
                 .bindings(db, env)
@@ -1180,11 +1241,41 @@ pub fn call_signature_details<'db>(
             CheckTypesMode::SignatureDetails,
         );
 
-        // Extract signature details from all callable bindings
+        // Argument-order errors survive parser recovery as ordinary AST arguments. Keep their
+        // types for diagnostics, but do not highlight a parameter for an invalid source position.
+        let parsed = parsed_module(db, model.program_file().python_file(db)).load(db);
+        let invalid_arguments: Vec<_> = call_expr
+            .arguments
+            .iter_source_order()
+            .map(|argument| {
+                parsed.errors().iter().any(|error| {
+                    matches!(
+                        error.error,
+                        ruff_python_parser::ParseErrorType::PositionalAfterKeywordArgument
+                            | ruff_python_parser::ParseErrorType::PositionalAfterKeywordUnpacking
+                    ) && call_expr.arguments.range().contains_range(error.location)
+                        && error.location.contains_range(argument.range())
+                })
+            })
+            .collect();
+
+        // Extract signature details from all callable bindings.
         bindings
             .iter_flat()
             .flatten()
-            .map(|binding| CallSignatureDetails::from_binding(db, env, binding))
+            .map(|binding| {
+                let mut details = CallSignatureDetails::from_binding(db, env, binding);
+                for (mapped, invalid) in details
+                    .argument_to_displayed_parameter_mapping
+                    .iter_mut()
+                    .zip(&invalid_arguments)
+                {
+                    if *invalid {
+                        *mapped = None;
+                    }
+                }
+                details
+            })
             .collect()
     } else {
         // Type is not callable, return empty signatures
@@ -1203,9 +1294,14 @@ fn resolve_single_overload<'db>(
     let env = &model.program_environment();
     let bindings = callable_type.bindings(db, env);
 
-    let args = CallArguments::from_arguments_typed(&call_expr.arguments, |expression| {
-        expression.inferred_type(model)
-    });
+    let args = CallArguments::from_arguments_typed(&call_expr.arguments, |splatted_value| {
+        splatted_value.inferred_type(model)
+    })
+    .with_observed_unpacking(
+        &call_expr.arguments,
+        |expression| expression.inferred_type(model),
+        |expression| model.dictionary_observation(expression),
+    );
 
     let constraints = ConstraintSetBuilder::new();
     let mut resolved: Vec<_> = bindings
@@ -1245,25 +1341,117 @@ fn full_type_bindings_for_call<'db>(
     func_type: Type<'db>,
     call_expr: &ast::ExprCall,
 ) -> crate::types::call::Bindings<'db> {
-    let db = model.db();
-    let env = &model.program_environment();
-    let call_arguments = CallArguments::from_arguments_typed(&call_expr.arguments, |expression| {
-        expression.inferred_type(model)
-    });
+    let call_arguments = inferred_call_arguments(model, call_expr);
+    bind_inferred_call(
+        model.db(),
+        &model.program_environment(),
+        func_type,
+        &call_arguments,
+    )
+    .unwrap_or_else(|CallError(_, bindings)| *bindings)
+}
+
+fn inferred_call_arguments<'a, 'db>(
+    model: &SemanticModel<'db>,
+    call_expr: &'a ast::ExprCall,
+) -> CallArguments<'a, 'db> {
+    inferred_call_arguments_with_context(model, call_expr, &|_| None)
+}
+
+fn inferred_call_arguments_with_context<'a, 'db>(
+    model: &SemanticModel<'db>,
+    call_expr: &'a ast::ExprCall,
+    context: &impl Fn(&ast::Expr) -> Option<Type<'db>>,
+) -> CallArguments<'a, 'db> {
+    let expression_type =
+        |expression: &ast::Expr| context(expression).or_else(|| expression.inferred_type(model));
+    CallArguments::from_arguments_typed(&call_expr.arguments, |expression| {
+        expression_type(expression)
+    })
+    .with_observed_unpacking(&call_expr.arguments, expression_type, |expression| {
+        model.dictionary_observation(expression)
+    })
+}
+
+fn bind_inferred_call<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    func_type: Type<'db>,
+    call_arguments: &CallArguments<'_, 'db>,
+) -> Result<crate::types::call::Bindings<'db>, CallError<'db>> {
     let constraints = ConstraintSetBuilder::new();
 
     func_type
         .bindings(db, env)
-        .match_parameters(db, env, &call_arguments)
+        .match_parameters(db, env, call_arguments)
         .check_types(
             db,
             env,
             &constraints,
-            &call_arguments,
+            call_arguments,
             TypeContext::default(),
             &[],
         )
-        .unwrap_or_else(|CallError(_, bindings)| *bindings)
+}
+
+/// Why the input contracts of a call cannot be resolved completely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallInputError {
+    /// Ordinary argument matching or type checking rejected the call.
+    Invalid,
+    /// A gradual signature or argument expansion leaves some input contracts unknown.
+    Incomplete,
+}
+
+/// Returns the selected, specialized input contracts for each source argument.
+///
+/// The outer vector follows source argument order. Unpacked arguments can match several
+/// parameters, and ambiguous calls can retain several contracts for one argument. Those types
+/// remain separate so that a gradual alternative is not lost through union simplification.
+/// Omitted parameters and synthetic receivers are excluded. The call's result and each argument
+/// expression's complete type can be obtained independently from the semantic model.
+pub fn call_input_types<'db>(
+    model: &SemanticModel<'db>,
+    call_expr: &ast::ExprCall,
+) -> Result<Vec<Vec<CallInput<'db>>>, CallInputError> {
+    call_input_types_with_context(model, call_expr, |_| None)
+}
+
+/// Rechecks selected input contracts using established contextual argument types.
+///
+/// Applications must establish each replacement's contract at this particular argument use.
+/// The original expression and declaration types remain unchanged. Ordinary argument matching,
+/// specialization, and selection are repeated with the contextual values; returning `None` from
+/// `context` uses the expression's inferred type.
+pub fn call_input_types_with_context<'db>(
+    model: &SemanticModel<'db>,
+    call_expr: &ast::ExprCall,
+    context: impl Fn(&ast::Expr) -> Option<Type<'db>>,
+) -> Result<Vec<Vec<CallInput<'db>>>, CallInputError> {
+    let func_type = call_expr
+        .func
+        .inferred_type(model)
+        .ok_or(CallInputError::Incomplete)?;
+    let arguments = inferred_call_arguments_with_context(model, call_expr, &context);
+    bound_call_input_types(
+        model.db(),
+        &model.program_environment(),
+        func_type,
+        &arguments,
+    )
+}
+
+pub(crate) fn bound_call_input_types<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    func_type: Type<'db>,
+    arguments: &CallArguments<'_, 'db>,
+) -> Result<Vec<Vec<CallInput<'db>>>, CallInputError> {
+    let bindings =
+        bind_inferred_call(db, env, func_type, arguments).map_err(|_| CallInputError::Invalid)?;
+    bindings
+        .input_types(db, env, arguments)
+        .ok_or(CallInputError::Incomplete)
 }
 
 // These are the callables whose arguments were historically classified as type expressions.
@@ -1587,9 +1775,14 @@ pub fn resolved_call_signature<'db>(
     let env = &model.program_environment();
     let callable_type = func_type.try_upcast_to_callable(db, env)?.to_type(db, env);
 
-    let args = CallArguments::from_arguments_typed(&call_expr.arguments, |expression| {
-        expression.inferred_type(model)
-    });
+    let args = CallArguments::from_arguments_typed(&call_expr.arguments, |splatted_value| {
+        splatted_value.inferred_type(model)
+    })
+    .with_observed_unpacking(
+        &call_expr.arguments,
+        |expression| expression.inferred_type(model),
+        |expression| model.dictionary_observation(expression),
+    );
 
     // Extract the `Bindings` regardless of whether type checking succeeded or failed.
     let constraints = ConstraintSetBuilder::new();
@@ -1668,10 +1861,13 @@ pub fn inlay_hint_call_argument_details<'db>(
             continue;
         };
 
-        let parameter_label_offset = param.definition().map(|definition| {
-            let module = parsed_module(db, definition.python_file(db)).load(db);
-            definition.focus_range(db, &module)
-        });
+        let parameter_label_offset = param
+            .definition()
+            .map(|definition| {
+                let module = parsed_module(db, definition.python_file(db)).load(db);
+                definition.focus_range(db, &module)
+            })
+            .or_else(|| param.source_range());
 
         // Only add hints for parameters that can be specified by name
         if !param.is_positional_only() && !param.is_variadic() && !param.is_keyword_variadic() {
@@ -1717,8 +1913,10 @@ mod stub_mapping {
         // If the file isn't a stub, this is presumably the real definition
         let stub_file = stub_program_file.file(db);
         trace!("Stub mapping definition in: {}", stub_file.path(db));
-        if !stub_file.is_stub(db) {
-            trace!("File isn't a stub, no stub mapping to do");
+        // Python module pairing requires a physical stub; other declaration-file formats
+        // supply their own source mapping.
+        if !stub_program_file.is_stub(db) || !stub_file.is_stub(db) {
+            trace!("File isn't a Python stub, no stub mapping to do");
             return None;
         }
 
@@ -2209,7 +2407,8 @@ pub fn constructor_signature(model: &SemanticModel, call_expr: &ast::ExprCall) -
 #[cfg(test)]
 mod tests {
     use super::{
-        CallArgumentForm, ImportAliasResolution, call_argument_forms, definitions_for_name,
+        CallArgumentForm, CallInputError, ImportAliasResolution, call_argument_forms,
+        call_input_types, definitions_for_name,
     };
     use crate::SemanticModel;
     use crate::db::tests::TestDbBuilder;
@@ -2219,6 +2418,197 @@ mod tests {
     use ruff_db::testing::assert_function_query_was_not_run_by_name;
     use ruff_python_ast as ast;
     use ty_python_core::ProgramFile;
+
+    fn call_inputs(source: &str) -> anyhow::Result<Vec<Result<Vec<Vec<String>>, CallInputError>>> {
+        let db = TestDbBuilder::new()
+            .with_python_version(ast::PythonVersion::PY314)
+            .with_file("/src/foo.py", source)
+            .build()?;
+        let file = system_path_to_file(&db, "/src/foo.py")?;
+        let file = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, file);
+        let env = model.program_environment();
+        Ok(parsed
+            .suite()
+            .iter()
+            .filter_map(|statement| {
+                if let Some(expression) = statement.as_expr_stmt() {
+                    return expression.value.as_call_expr();
+                }
+                let function = statement.as_function_def_stmt()?;
+                let returned = function.body.last()?.as_return_stmt()?;
+                returned.value.as_ref()?.as_call_expr()
+            })
+            .map(|call| {
+                call_input_types(&model, call).map(|arguments| {
+                    arguments
+                        .into_iter()
+                        .map(|types| {
+                            types
+                                .into_iter()
+                                .map(|input| {
+                                    format!(
+                                        "{} <: {}: {}",
+                                        input.argument_type.display(&db, &env),
+                                        input.parameter_type.display(&db, &env),
+                                        input.argument_type.is_subtype_of(
+                                            &db,
+                                            &env,
+                                            input.parameter_type
+                                        ),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect()
+                })
+            })
+            .collect())
+    }
+
+    #[test]
+    fn call_inputs_select_supplied_parameters() -> anyhow::Result<()> {
+        insta::assert_debug_snapshot!(call_inputs(
+            r#"
+from typing import Any, Callable, overload
+
+@overload
+def choose(value: int) -> int: ...
+@overload
+def choose(value: str, other: Any) -> str: ...
+def choose(value, other=None): ...
+
+def optional(value: int = 1, *, other: Any = None) -> None: ...
+def generic[T](value: T) -> T: ...
+class C:
+    def method(self, value: str) -> None: ...
+class Construct:
+    def __new__(cls, value: int) -> Construct: ...
+    def __init__(self, value: object) -> None: ...
+def unsafe(value: Any) -> None: ...
+
+choose(1)
+optional()
+optional(other=1, value=2)
+generic(1)
+C().method("x")
+Construct(1)
+unsafe(1)
+choose(None)
+def caller[T](value: T) -> T:
+    return generic(value)
+"#,
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn call_inputs_preserve_nominal_union_arguments() -> anyhow::Result<()> {
+        insta::assert_debug_snapshot!(call_inputs(
+            r#"
+from typing import Any, Callable, Generic, Mapping, TypeVar
+
+V_co = TypeVar("V_co", covariant=True)
+class Attr(Generic[V_co]): ...
+def defaulted[T: Attr[object] = Attr[Any]](attrs: Mapping[str, T]) -> T: ...
+def required[T: Attr[object]](attrs: Mapping[str, T]) -> T: ...
+def register[**P, R, K: str, T: Attr[object] = Attr[Any]](
+    implementation: Callable[P, R], attrs: Mapping[K, T],
+) -> T: ...
+def implementation(context: object) -> list[object]: ...
+
+def first(attrs: Mapping[str, Attr[bool]]):
+    return defaulted(attrs)
+def second(attrs: Mapping[str, Attr[str]]):
+    return required(attrs)
+def both_defaulted(attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]]):
+    return defaulted(attrs)
+def both_required(attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]]):
+    return required(attrs)
+def gradual(attrs: Mapping[str, Attr[Any]] | Mapping[str, Attr[str]]):
+    return required(attrs)
+def with_callback(attrs: Mapping[str, Attr[bool]] | Mapping[str, Attr[str]]):
+    return register(implementation, attrs)
+def gradual_callback(attrs: Mapping[str, Attr[Any]] | Mapping[str, Attr[str]]):
+    return register(implementation, attrs)
+"#,
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn call_inputs_preserve_unpacked_and_forwarded_parameters() -> anyhow::Result<()> {
+        insta::assert_debug_snapshot!(call_inputs(
+            r#"
+from typing import Callable, TypedDict, Unpack
+
+class Options(TypedDict):
+    count: int
+    name: str
+def target(count: int, *, name: str) -> None: ...
+def invoke[**P, R](f: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R: ...
+def fields(**kwargs: Unpack[Options]) -> None: ...
+def pair(first: int, second: str) -> None: ...
+options: Options = {"count": 1, "name": "x"}
+pair(*(1, "x"))
+fields(**options)
+invoke(target, 1, name="x")
+"#,
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn call_inputs_report_incomplete_signatures_and_expansion() -> anyhow::Result<()> {
+        insta::assert_debug_snapshot!(call_inputs(
+            r#"
+from typing import Any, Callable, overload
+
+@overload
+def choose(value: int) -> int: ...
+@overload
+def choose(value: str) -> str: ...
+def choose(value): ...
+def union() -> int | str: ...
+def dynamic() -> Any: ...
+def gradual() -> Callable[..., None]: ...
+
+choose(dynamic())
+choose(union())
+gradual()()
+dynamic()()
+"#,
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn call_inputs_specialize_optional_generics_and_bound_methods() -> anyhow::Result<()> {
+        insta::assert_debug_snapshot!(call_inputs(
+            r#"
+from typing import Callable
+from _typeshed import SupportsRichComparisonT
+
+def factory[**P, R](init: Callable[P, R] | None = None) -> None: ...
+def optional_key[T](key: Callable[[str], T] | None = None) -> None: ...
+def by_key[T, K: SupportsRichComparisonT](values: list[T], key: Callable[[T], K] | None = None) -> list[T]: ...
+values: dict[str, int] = {}
+other: dict[str, int] = {}
+
+factory()
+factory(init=None)
+optional_key(key=None)
+values.update(other)
+dict(other)
+sorted(["x"])
+sorted(["x"], key=None)
+sorted(["x"], key=len)
+by_key(["x"], key=len)
+"#,
+        )?);
+        Ok(())
+    }
 
     #[test]
     fn builtin_definition_lookup_does_not_infer_scope() -> anyhow::Result<()> {

@@ -5,12 +5,13 @@ use arc_swap::ArcSwapOption;
 use get_size2::GetSize;
 use ruff_python_ast::{
     AnyRootNodeRef, HasNodeIndex, ModExpression, ModModule, NodeIndex, NodeIndexError,
-    PythonVersion, StringLiteral,
+    PySourceType, PythonVersion, StringLiteral,
 };
 use ruff_python_parser::{
-    ParseError, ParseErrorType, ParseOptions, Parsed, parse_cells_unchecked,
-    parse_string_annotation, parse_unchecked,
+    Mode, ParseError, ParseErrorType, ParseOptions, Parsed, parse_cells_unchecked,
+    parse_expression_range_with_options, parse_string_annotation_with_options, parse_unchecked,
 };
+use ruff_text_size::TextRange;
 
 use crate::files::File;
 use crate::source::{read_source_text, source_text};
@@ -35,18 +36,43 @@ use crate::{Db, PythonFile};
 pub fn parsed_module(db: &dyn Db, file: PythonFile<'_>) -> ParsedModule {
     let source_file = file.file(db);
     let python_version = file.python_version(db);
-    let _span = tracing::trace_span!("parsed_module", ?source_file, %python_version).entered();
+    let source_type = file.source_type(db);
+    let literal_namespace = file.literal_namespace(db);
+    let module_namespace = file.module_namespace(db);
+    let _span = tracing::trace_span!("parsed_module", ?source_file, %python_version, ?source_type)
+        .entered();
 
-    let parsed = parsed_module_impl(db, source_file, python_version);
+    let parsed = parsed_module_impl(
+        db,
+        source_file,
+        python_version,
+        source_type,
+        literal_namespace,
+        module_namespace,
+    );
 
-    ParsedModule::new(source_file, python_version, parsed)
+    ParsedModule::new(
+        source_file,
+        python_version,
+        source_type,
+        literal_namespace,
+        module_namespace,
+        parsed,
+    )
 }
 
 pub(super) fn disable_lru(db: &mut dyn Db) {
     parsed_module::set_lru_capacity(db, 0);
 }
 
-fn parsed_module_impl(db: &dyn Db, file: File, target_version: PythonVersion) -> Parsed<ModModule> {
+fn parsed_module_impl(
+    db: &dyn Db,
+    file: File,
+    target_version: PythonVersion,
+    source_type: PySourceType,
+    literal_namespace: Option<&'static str>,
+    module_namespace: Option<&'static str>,
+) -> Parsed<ModModule> {
     // A bundled stub's AST is often enough for type inference. Only cache its decompressed
     // source if a caller asks for the text itself.
     let source = if file.path(db).is_vendored_path() {
@@ -54,15 +80,22 @@ fn parsed_module_impl(db: &dyn Db, file: File, target_version: PythonVersion) ->
     } else {
         source_text(db, file)
     };
-    let ty = file.source_type(db);
-
-    let options = ParseOptions::from(ty).with_target_version(target_version);
+    let options = with_literal_namespace(
+        db,
+        ParseOptions::from(source_type).with_target_version(target_version),
+        literal_namespace,
+    );
 
     // Notebooks parse each cell as an independent module so a syntax error confined to one cell is
     // surfaced instead of being masked by a later cell's content. Regular files take the existing
     // single-parse path.
     if let Some(notebook) = source.as_notebook() {
         parse_cells_unchecked(&source, notebook.cell_offsets().content_ranges(), &options)
+    } else if let Some(namespace) = module_namespace {
+        let parser = db
+            .module_parser(namespace)
+            .expect("a module parser namespace must have a registered parser");
+        parser(&source, options)
     } else {
         parse_unchecked(&source, options)
             .try_into_module()
@@ -70,14 +103,63 @@ fn parsed_module_impl(db: &dyn Db, file: File, target_version: PythonVersion) ->
     }
 }
 
+fn with_literal_namespace(
+    db: &dyn Db,
+    options: ParseOptions,
+    literal_namespace: Option<&'static str>,
+) -> ParseOptions {
+    match literal_namespace {
+        Some(namespace) => options.with_string_literal_decoder(
+            db.string_literal_decoder(namespace)
+                .expect("a literal namespace must have a registered decoder"),
+        ),
+        None => options,
+    }
+}
+
 pub fn parsed_string_annotation(
-    source: &str,
+    db: &dyn Db,
+    file: PythonFile<'_>,
     string: &StringLiteral,
 ) -> Result<Parsed<ModExpression>, ParseError> {
-    let expr = parse_string_annotation(source, string)?;
+    let source = source_text(db, file.file(db));
+    let expr =
+        parse_string_annotation_with_options(&source, string, annotation_parse_options(db, file))?;
+    index_annotation(expr, string.node_index().load(), string.range)
+}
 
+/// Parses a source annotation outside the module AST, preserving its source offsets.
+/// The owner must be a canonical node in the same module, with at most one detached annotation.
+pub fn parsed_annotation_range(
+    db: &dyn Db,
+    file: PythonFile<'_>,
+    range: TextRange,
+    owner: NodeIndex,
+) -> Result<Parsed<ModExpression>, ParseError> {
+    let source = source_text(db, file.file(db));
+    let parser = file
+        .module_namespace(db)
+        .and_then(|namespace| db.annotation_parser(namespace))
+        .unwrap_or(parse_expression_range_with_options);
+    let expr = parser(&source, range, annotation_parse_options(db, file))?;
+    index_annotation(expr, owner, range)
+}
+
+fn annotation_parse_options(db: &dyn Db, file: PythonFile<'_>) -> ParseOptions {
+    with_literal_namespace(
+        db,
+        ParseOptions::from(Mode::Expression),
+        file.literal_namespace(db),
+    )
+}
+
+fn index_annotation(
+    expr: Parsed<ModExpression>,
+    owner: NodeIndex,
+    range: TextRange,
+) -> Result<Parsed<ModExpression>, ParseError> {
     // We need the sub-ast of the string annotation to be indexed
-    indexed::ensure_indexed(&expr, string.node_index().load()).map_err(|err| {
+    indexed::ensure_indexed(&expr, owner).map_err(|err| {
         let message = match err {
             NodeIndexError::NoParent => {
                 "Internal error: string annotation's parent had no NodeIndex"
@@ -103,7 +185,7 @@ pub fn parsed_string_annotation(
 
         ParseError {
             error: ParseErrorType::StringAnnotationError(message),
-            location: string.range,
+            location: range,
         }
     })?;
 
@@ -118,15 +200,28 @@ pub fn parsed_string_annotation(
 pub struct ParsedModule {
     file: File,
     python_version: PythonVersion,
+    source_type: PySourceType,
+    literal_namespace: Option<&'static str>,
+    module_namespace: Option<&'static str>,
     #[get_size(size_fn = arc_swap_size)]
     inner: Arc<ArcSwapOption<indexed::IndexedModule>>,
 }
 
 impl ParsedModule {
-    fn new(file: File, python_version: PythonVersion, parsed: Parsed<ModModule>) -> Self {
+    fn new(
+        file: File,
+        python_version: PythonVersion,
+        source_type: PySourceType,
+        literal_namespace: Option<&'static str>,
+        module_namespace: Option<&'static str>,
+        parsed: Parsed<ModModule>,
+    ) -> Self {
         Self {
             file,
             python_version,
+            source_type,
+            literal_namespace,
+            module_namespace,
             inner: Arc::new(ArcSwapOption::new(Some(indexed::IndexedModule::new(
                 parsed,
             )))),
@@ -145,6 +240,9 @@ impl ParsedModule {
                     db,
                     self.file,
                     self.python_version,
+                    self.source_type,
+                    self.literal_namespace,
+                    self.module_namespace,
                 ));
                 tracing::debug!(
                     "File `{}` was reparsed after being collected in the current Salsa revision",
@@ -991,16 +1089,30 @@ mod tests {
     use crate::Db;
     use crate::PythonFile;
     use crate::files::{system_path_to_file, vendored_path_to_file};
-    use crate::parsed::parsed_module;
+    use crate::parsed::{parsed_annotation_range, parsed_module, parsed_string_annotation};
     use crate::source::source_text;
     use crate::system::{
         DbWithTestSystem, DbWithWritableSystem as _, SystemPath, SystemVirtualPath,
     };
     use crate::tests::TestDb;
     use crate::vendored::{VendoredFileSystemBuilder, VendoredPath};
-    use ruff_python_ast::PythonVersion;
+    use ruff_python_ast::{Expr, HasNodeIndex, PySourceType, PythonVersion, Stmt};
+    use ruff_text_size::{Ranged, TextRange};
     use salsa::EventKind;
     use zip::CompressionMethod;
+
+    const NOTEBOOK: &str = r#"{
+        "cells": [{
+            "cell_type": "code",
+            "execution_count": null,
+            "metadata": {},
+            "outputs": [],
+            "source": ["%timeit a = b"]
+        }],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }"#;
 
     #[test]
     fn python_file() -> crate::system::Result<()> {
@@ -1024,14 +1136,16 @@ mod tests {
         let mut db = TestDb::new();
         let path = SystemPath::new("test.ipynb");
 
-        db.write_file(path, "%timeit a = b")?;
+        db.write_file(path, NOTEBOOK)?;
 
         let file = system_path_to_file(&db, path).unwrap();
 
+        assert!(crate::source::source_text(&db, file).read_error().is_none());
         let file = PythonFile::new(&db, file, PythonVersion::latest_ty());
         let parsed = parsed_module(&db, file).load(&db);
 
         assert!(parsed.has_valid_syntax());
+        assert!(!parsed.syntax().body.is_empty());
 
         Ok(())
     }
@@ -1058,14 +1172,20 @@ mod tests {
         let mut db = TestDb::new();
         let path = SystemVirtualPath::new("untitled:Untitled-1.ipynb");
 
-        db.write_virtual_file(path, "%timeit a = b");
+        db.write_virtual_file(path, NOTEBOOK);
 
         let virtual_file = db.files().virtual_file(&db, path);
 
+        assert!(
+            crate::source::source_text(&db, virtual_file.file())
+                .read_error()
+                .is_none()
+        );
         let file = PythonFile::new(&db, virtual_file.file(), PythonVersion::latest_ty());
         let parsed = parsed_module(&db, file).load(&db);
 
         assert!(parsed.has_valid_syntax());
+        assert!(!parsed.syntax().body.is_empty());
 
         Ok(())
     }
@@ -1107,6 +1227,153 @@ else:
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::WillExecute { .. }))
         );
+    }
+
+    #[test]
+    fn same_file_with_different_parser_grammars() -> crate::system::Result<()> {
+        let mut db = TestDb::new();
+        db.write_file("test.py", "%timeit a = b")?;
+        let file = system_path_to_file(&db, "test.py").unwrap();
+
+        let python = PythonFile::new(&db, file, PythonVersion::latest_ty());
+        let ipython = PythonFile::new_with_source_type(
+            &db,
+            file,
+            PythonVersion::latest_ty(),
+            PySourceType::Ipynb,
+        );
+        let parsed_python = parsed_module(&db, python);
+        let parsed_ipython = parsed_module(&db, ipython);
+
+        for _ in 0..2 {
+            assert!(!parsed_python.load(&db).has_valid_syntax());
+            assert!(parsed_ipython.load(&db).has_valid_syntax());
+            // Eviction must preserve each query's grammar when it reparses.
+            parsed_python.clear();
+            parsed_ipython.clear();
+        }
+
+        // Parser configuration does not change the file's source representation.
+        assert!(!crate::source::source_text(&db, file).is_notebook());
+        assert_eq!(file.source_type(&db), PySourceType::Python);
+        Ok(())
+    }
+
+    #[test]
+    fn module_parser_is_part_of_the_parse_identity() -> crate::system::Result<()> {
+        let mut db = TestDb::new();
+        db.write_file("test.py", "#first\nsecond")?;
+        let file = system_path_to_file(&db, "test.py").unwrap();
+        let python = PythonFile::new(&db, file, PythonVersion::latest_ty());
+        let embedded = PythonFile::new_with_module_parser(
+            &db,
+            file,
+            PythonVersion::latest_ty(),
+            PySourceType::Python,
+            None,
+            Some("test:skip-marker"),
+        );
+        for (file, statements) in [(python, 1), (embedded, 2)] {
+            let module = parsed_module(&db, file);
+            let parsed = module.load(&db);
+            assert_eq!(parsed.suite().len(), statements);
+            let owner = parsed.suite().last().unwrap().node_index().load();
+            let annotation =
+                parsed_annotation_range(&db, file, TextRange::new(0.into(), 6.into()), owner);
+            if file == embedded {
+                assert_eq!(
+                    annotation.unwrap().expr().range(),
+                    TextRange::new(1.into(), 6.into())
+                );
+            } else {
+                assert!(annotation.is_err());
+            }
+            module.clear();
+            assert_eq!(module.load(&db).suite().len(), statements);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn literal_interpretation_is_part_of_the_parse_identity() -> crate::system::Result<()> {
+        let mut db = TestDb::new();
+        db.write_file("test.py", r"'a' '\142' # 'c'")?;
+        let file = system_path_to_file(&db, "test.py").unwrap();
+        let python = PythonFile::new(&db, file, PythonVersion::latest_ty());
+        let embedded = PythonFile::new_with_parse_options(
+            &db,
+            file,
+            PythonVersion::latest_ty(),
+            PySourceType::Python,
+            Some("test:uppercase"),
+        );
+        for _ in 0..2 {
+            for (parse_file, expected, annotation_value) in
+                [(python, "ab", "c"), (embedded, "Ab", "C")]
+            {
+                let module = parsed_module(&db, parse_file);
+                let parsed = module.load(&db);
+                let Stmt::Expr(statement) = &parsed.suite()[0] else {
+                    panic!("expected an expression statement");
+                };
+                let Expr::StringLiteral(literal) = statement.value.as_ref() else {
+                    panic!("expected a string literal");
+                };
+                assert_eq!(literal.value.to_str(), expected);
+                assert_eq!(literal.range, TextRange::new(0.into(), 10.into()));
+                let annotation = parsed_annotation_range(
+                    &db,
+                    parse_file,
+                    TextRange::new(13.into(), 16.into()),
+                    literal.node_index().load(),
+                )
+                .unwrap();
+                let Expr::StringLiteral(annotation) = annotation.expr() else {
+                    panic!("expected an annotation literal");
+                };
+                assert_eq!(annotation.value.to_str(), annotation_value);
+                module.clear();
+            }
+        }
+        db.write_file("test.py", "'d'")?;
+        let embedded = PythonFile::new_with_parse_options(
+            &db,
+            file,
+            PythonVersion::latest_ty(),
+            PySourceType::Python,
+            Some("test:uppercase"),
+        );
+        let parsed = parsed_module(&db, embedded).load(&db);
+        let Stmt::Expr(statement) = &parsed.suite()[0] else {
+            panic!("expected an expression statement");
+        };
+        let Expr::StringLiteral(literal) = statement.value.as_ref() else {
+            panic!("expected a string literal");
+        };
+        assert_eq!(literal.value.to_str(), "D");
+        let error =
+            parsed_string_annotation(&db, embedded, literal.as_single_part_string().unwrap())
+                .unwrap_err();
+        assert!(matches!(
+            error.error,
+            ruff_python_parser::ParseErrorType::StringAnnotationError(_)
+        ));
+        let python = PythonFile::new(&db, file, PythonVersion::latest_ty());
+        let parsed = parsed_module(&db, python).load(&db);
+        let Stmt::Expr(statement) = &parsed.suite()[0] else {
+            panic!("expected an expression statement");
+        };
+        let Expr::StringLiteral(literal) = statement.value.as_ref() else {
+            panic!("expected a string literal");
+        };
+        let annotation =
+            parsed_string_annotation(&db, python, literal.as_single_part_string().unwrap())
+                .unwrap();
+        let Expr::Name(name) = annotation.expr() else {
+            panic!("expected the Python annotation to resolve its source identifier");
+        };
+        assert_eq!(name.id.as_str(), "d");
+        Ok(())
     }
 
     #[test]

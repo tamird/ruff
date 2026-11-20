@@ -9,12 +9,372 @@ use crate::{Db, ProgramEnvironment};
 use ruff_db::files::system_path_to_file;
 use ruff_db::system::DbWithWritableSystem as _;
 use ruff_db::testing::assert_function_query_was_not_run_by_name;
+use ruff_db::vendored::{VendoredFileSystemBuilder, VendoredPathBuf};
 use ruff_python_ast as ast;
 use ruff_python_ast::PythonVersion;
 use salsa::plumbing::AsId;
 use test_case::test_case;
 use ty_python_core::program::Program;
 use ty_python_core::{ProgramFile, TestProgramDb as _};
+use zip::CompressionMethod;
+
+/// Replace one declaration while retaining the support types from the standard typeshed.
+fn with_builtin_declaration<'a>(
+    name: &str,
+    declaration: &str,
+) -> anyhow::Result<TestDbBuilder<'a>> {
+    let vendored = ty_vendored::file_system();
+    let mut builtins = vendored.read_to_string("stdlib/builtins.pyi")?;
+    let parsed = ruff_python_parser::parse_module(&builtins)?;
+    let class = parsed
+        .suite()
+        .iter()
+        .filter_map(ast::Stmt::as_class_def_stmt)
+        .find(|class| class.name.as_str() == name)
+        .expect("typeshed defines the requested class");
+    let start = class
+        .decorator_list
+        .first()
+        .map_or(class.start(), Ranged::start);
+    builtins.replace_range(usize::from(start)..usize::from(class.end()), declaration);
+    let mut archive = VendoredFileSystemBuilder::new(CompressionMethod::Stored);
+    let mut directories = vec![VendoredPathBuf::from("")];
+    while let Some(directory) = directories.pop() {
+        for entry in vendored.read_directory(&directory) {
+            let path = entry.path();
+            if entry.file_type().is_directory() {
+                archive.add_directory(path)?;
+                directories.push(path.to_owned());
+            } else {
+                let content = if path.as_str() == "stdlib/builtins.pyi" {
+                    builtins.clone()
+                } else {
+                    vendored.read_to_string(path)?
+                };
+                archive.add_file(path, &content)?;
+            }
+        }
+    }
+    Ok(TestDbBuilder::new().with_vendored(archive.finish()?))
+}
+
+#[test]
+fn typed_dict_views_use_dictionary_declarations() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration(
+        "dict",
+        "class dict[K, V]:
+    def items(self) -> list[tuple[K, V]]: ...
+    def keys(self) -> list[K]: ...
+    def values(self) -> list[V]: ...",
+    )?;
+    let source = r#"
+from typing_extensions import Literal, Never, NotRequired, ReadOnly, TypedDict, assert_type
+
+class Closed(TypedDict, closed=True):
+    name: str
+
+class Extra(TypedDict, extra_items=int):
+    name: str
+
+class Open(TypedDict):
+    name: str
+
+class Empty(TypedDict, closed=True):
+    pass
+
+class ReadOnlyFields(TypedDict, closed=True):
+    name: ReadOnly[str]
+
+class Recursive(TypedDict, closed=True):
+    child: NotRequired["Recursive"]
+
+def check(
+    closed: Closed,
+    extra: Extra,
+    opened: Open,
+    empty: Empty,
+    readonly: ReadOnlyFields,
+    recursive: Recursive,
+):
+    assert_type(closed.items(), list[tuple[Literal["name"], str]])
+    assert_type(closed.keys(), list[Literal["name"]])
+    assert_type(closed.values(), list[str])
+    assert_type(extra.items(), list[tuple[str, str | int]])
+    assert_type(extra.keys(), list[str])
+    assert_type(extra.values(), list[str | int])
+    assert_type(opened.items(), list[tuple[str, object]])
+    assert_type(opened.keys(), list[str])
+    assert_type(opened.values(), list[object])
+    assert_type(empty.items(), list[tuple[Never, Never]])
+    assert_type(empty.keys(), list[Never])
+    assert_type(empty.values(), list[Never])
+    assert_type(readonly.items(), list[tuple[Literal["name"], str]])
+    assert_type(readonly.keys(), list[Literal["name"]])
+    assert_type(readonly.values(), list[str])
+    assert_type(recursive.items(), list[tuple[Literal["child"], Recursive]])
+    assert_type(recursive.keys(), list[Literal["child"]])
+    assert_type(recursive.values(), list[Recursive])
+    wrong_items: list[tuple[str, int]] = closed.items()
+    wrong_keys: list[int] = closed.keys()
+    wrong_values: list[int] = closed.values()
+"#;
+    let db = builder.with_file("/src/check.py", source).build()?;
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let file = db.program_file(file);
+    let diagnostics = crate::check_file_unwrap(&db, file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.id().as_str(),
+                &source[diagnostic.range().unwrap()],
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("invalid-assignment", "closed.items()"),
+            ("invalid-assignment", "closed.keys()"),
+            ("invalid-assignment", "closed.values()"),
+        ],
+        "{diagnostics:#?}",
+    );
+    Ok(())
+}
+
+#[test_case("class str"; "without_sequence_base")]
+#[test_case("class str(Sequence[str])"; "with_sequence_base")]
+fn string_iteration_respects_disabled_dunder(class_header: &str) -> anyhow::Result<()> {
+    let declaration = format!(
+        "{class_header}:\n    __iter__: None\n    def __getitem__(self, index: int) -> str: ..."
+    );
+    let builder = with_builtin_declaration("str", &declaration)?;
+    let db = builder
+        .with_file(
+            "/src/check.py",
+            "from typing_extensions import LiteralString
+def check(value: str, literal: LiteralString):
+    for item in value: pass
+    for item in literal: pass
+    for item in 'ab': pass
+    first, second = 'ab'
+",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let diagnostics = crate::check_file_unwrap(&db, db.program_file(file));
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["not-iterable"; 4],
+        "{diagnostics:#?}",
+    );
+    Ok(())
+}
+
+#[test]
+fn string_literals_use_declared_base_and_iterator() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration(
+        "str",
+        "class StringBase: ...
+class str(StringBase):
+    def __iter__(self) -> Iterator[int]: ...",
+    )?;
+    let db = builder.build()?;
+    let env = db.program_environment();
+    let str_instance = KnownClass::Str.to_instance(&db, &env);
+    let integer = KnownClass::Int.to_instance(&db, &env);
+    for ty in [Type::string_literal(&db, "ab"), Type::literal_string()] {
+        let elements = ty.try_iterate(&db, &env).unwrap();
+        assert_eq!(elements.homogeneous_element_type(&db, &env), integer);
+    }
+    let base = crate::place::builtins_symbol(&db, &env, "StringBase")
+        .place
+        .expect_type()
+        .to_instance_approximation(&db, &env)
+        .expect("StringBase is a class");
+    let sequence = KnownClass::Sequence.to_specialized_instance(&db, &env, &[str_instance]);
+    let literal = Type::string_literal(&db, "ab");
+    assert!(literal.is_assignable_to(&db, &env, base));
+    assert!(!literal.is_assignable_to(&db, &env, sequence));
+    Ok(())
+}
+
+#[test]
+fn string_literals_retain_additional_declared_bases() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration(
+        "str",
+        "class ExtraBase: ...\nclass str(Sequence[str], ExtraBase): ...",
+    )?;
+    let db = builder.build()?;
+    let env = db.program_environment();
+    let base = crate::place::builtins_symbol(&db, &env, "ExtraBase")
+        .place
+        .expect_type()
+        .to_instance_approximation(&db, &env)
+        .expect("ExtraBase is a class");
+    assert!(Type::string_literal(&db, "ab").is_assignable_to(&db, &env, base));
+    Ok(())
+}
+
+#[test]
+fn string_literal_precision_requires_string_sequence_elements() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration(
+        "str",
+        "class str(Sequence[int]):\n    def __iter__(self) -> Iterator[int]: ...",
+    )?;
+    let db = builder.build()?;
+    let env = db.program_environment();
+    let integer = KnownClass::Int.to_instance(&db, &env);
+    let literal = Type::string_literal(&db, "ab");
+    let elements = literal.try_iterate(&db, &env).unwrap();
+    assert_eq!(elements.homogeneous_element_type(&db, &env), integer);
+    let integers = KnownClass::Sequence.to_specialized_instance(&db, &env, &[integer]);
+    let characters =
+        KnownClass::Sequence.to_specialized_instance(&db, &env, &[Type::string_literal(&db, "a")]);
+    assert!(literal.is_assignable_to(&db, &env, integers));
+    assert!(!literal.is_assignable_to(&db, &env, characters));
+    Ok(())
+}
+
+#[test_case("+True"; "unary_plus")]
+#[test_case("-False"; "unary_minus")]
+#[test_case("~True"; "unary_invert")]
+#[test_case("True + 1"; "addition")]
+#[test_case("1 + True"; "reflected_addition")]
+#[test_case("True - 1"; "subtraction")]
+#[test_case("True * 1"; "multiplication")]
+#[test_case("True | False"; "bitwise_or")]
+#[test_case("True & False"; "bitwise_and")]
+#[test_case("True ^ False"; "bitwise_xor")]
+#[test_case("True << 1"; "shift")]
+#[test_case("True / 0"; "zero_division_numerator")]
+#[test_case("1 / False"; "zero_division_denominator")]
+#[test_case("False % 0"; "zero_modulus")]
+#[test_case("True < 1"; "ordering")]
+#[test_case("1 < True"; "reflected_ordering")]
+#[test_case("True < False"; "boolean_ordering")]
+fn boolean_literals_without_numeric_methods_reject_operators(
+    expression: &str,
+) -> anyhow::Result<()> {
+    let builder = with_builtin_declaration("bool", "class bool: ...")?;
+    let db = builder.with_file("/src/check.py", expression).build()?;
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let diagnostics = crate::check_file_unwrap(&db, db.program_file(file));
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("Expected one unsupported operation for {expression}, got {diagnostics:#?}");
+    };
+    assert_eq!(
+        diagnostic.id().as_str(),
+        "unsupported-operator",
+        "{diagnostic:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn boolean_literals_use_declared_operators() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration(
+        "bool",
+        "class bool:
+    def __add__(self, other: int) -> str: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __ne__(self, other: object) -> bool: ...",
+    )?;
+    let db = builder
+        .with_file(
+            "/src/check.py",
+            "added = True + 1
+cross_kind = True == 1
+same_kind = True == True
+different = True != False
+negated = not True
+interval = slice(False, True)",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let file = db.program_file(file);
+    let diagnostics = crate::check_file_unwrap(&db, file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let env = ProgramEnvironment::from_file(file);
+    for (name, expected) in [
+        ("added", KnownClass::Str.to_instance(&db, &env)),
+        ("cross_kind", KnownClass::Bool.to_instance(&db, &env)),
+        ("same_kind", Type::bool_literal(true)),
+        ("different", Type::bool_literal(true)),
+        ("negated", Type::bool_literal(false)),
+    ] {
+        let actual = global_symbol(&db, file, name).place.expect_type();
+        assert_eq!(actual, expected, "{name}");
+    }
+    let interval = global_symbol(&db, file, "interval")
+        .place
+        .expect_type()
+        .as_nominal_instance()
+        .expect("slice constructor returns a nominal instance");
+    assert!(interval.slice_literal(&db, &env).is_none());
+    Ok(())
+}
+
+#[test]
+fn boolean_numeric_narrowing_requires_integer_base() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration(
+        "bool",
+        "class bool:\n    def __eq__(self, other: object) -> bool: ...",
+    )?;
+    let db = builder.build()?;
+    let env = db.program_environment();
+    let policy = equality::ComparisonSoundnessPolicy::CONSERVATIVE;
+    for (boolean, integer) in [(false, 0), (true, 1)] {
+        let boolean = Type::bool_literal(boolean);
+        let integer = Type::int_literal(integer);
+        assert_eq!(boolean.as_int_like_literal(&db, &env), None);
+        for (left, right) in [(boolean, integer), (integer, boolean)] {
+            for positive in [true, false] {
+                assert_eq!(
+                    equality::evaluate_type_equality(&db, &env, left, right, positive, policy),
+                    None,
+                );
+            }
+        }
+    }
+    assert_eq!(
+        equality::evaluate_type_equality(
+            &db,
+            &env,
+            KnownClass::Bool.to_instance(&db, &env),
+            Type::bool_literal(true),
+            true,
+            policy,
+        ),
+        Some(Type::bool_literal(true)),
+    );
+    Ok(())
+}
+
+#[test]
+fn literal_string_index_requires_integer_base() -> anyhow::Result<()> {
+    let builder = with_builtin_declaration("bool", "class bool: ...")?;
+    let db = builder
+        .with_file(
+            "/src/check.py",
+            "from typing_extensions import LiteralString
+def index(value: LiteralString):
+    return value[True]",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let diagnostics = crate::check_file_unwrap(&db, db.program_file(file));
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("Expected an invalid index, got {diagnostics:#?}");
+    };
+    assert_eq!(
+        diagnostic.id().as_str(),
+        "invalid-argument-type",
+        "{diagnostic:#?}"
+    );
+    Ok(())
+}
 
 #[test]
 fn member_lookup_result_size() {
@@ -47,6 +407,107 @@ fn sparse_and_shadowed_inherited_names_skip_base_pair_queries() -> anyhow::Resul
     assert!(check_types(&db, file).is_empty());
     let events = db.take_salsa_events();
     assert_function_query_was_not_run_by_name(&db, "shared_inherited_names", None, &events);
+    Ok(())
+}
+
+#[test]
+fn concrete_member_lookup_dynamic_instances() {
+    let db = setup_db();
+    let env = db.program_environment();
+    for bound in [
+        Type::any(),
+        Type::unknown(),
+        Type::divergent(salsa::plumbing::Id::from_bits(1)),
+    ] {
+        let typevar = BoundTypeVarInstance::synthetic_self(
+            &db,
+            bound,
+            BindingContext::Synthetic(env.program(&db)),
+        );
+        for ty in [bound, Type::TypeVar(typevar)] {
+            assert_eq!(
+                ty.instance_member(&db, &env, "field").place.expect_type(),
+                bound
+            );
+            assert!(
+                ty.instance_member_with_policy(
+                    &db,
+                    &env,
+                    "field",
+                    MemberLookupPolicy::REQUIRE_CONCRETE,
+                )
+                .is_undefined()
+            );
+        }
+    }
+}
+
+#[test]
+fn concrete_member_lookup_dynamic_class_objects() {
+    let db = setup_db();
+    let env = db.program_environment();
+    for (class, expected) in [
+        (SubclassOfType::subclass_of_any(), Type::any()),
+        (SubclassOfType::subclass_of_unknown(), Type::unknown()),
+    ] {
+        assert_eq!(
+            class
+                .class_object_member(&db, &env, "field", MemberLookupPolicy::default())
+                .place
+                .expect_type(),
+            expected,
+        );
+        assert!(
+            class
+                .class_object_member(&db, &env, "field", MemberLookupPolicy::REQUIRE_CONCRETE)
+                .is_undefined()
+        );
+    }
+}
+
+#[test]
+fn concrete_member_lookup_declared_storage() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/check.py",
+        r#"
+        class Declared:
+            class_field: int = 1
+            instance_field: int
+
+        class Meta(type):
+            generated: int
+
+        class Constructed(metaclass=Meta): ...
+        "#,
+    )?;
+    let env = db.program_environment();
+    let file = system_path_to_file(&db, "/src/check.py")?;
+    let file = db.program_file(file);
+    let class = global_symbol(&db, file, "Declared").place.expect_type();
+    let constructed = global_symbol(&db, file, "Constructed").place.expect_type();
+    let instance = class.to_instance_approximation(&db, &env).unwrap();
+    let typevar = Type::TypeVar(BoundTypeVarInstance::synthetic_self(
+        &db,
+        instance,
+        BindingContext::Synthetic(env.program(&db)),
+    ));
+    let int = KnownClass::Int.to_instance(&db, &env);
+    for policy in [
+        MemberLookupPolicy::default(),
+        MemberLookupPolicy::REQUIRE_CONCRETE,
+    ] {
+        for (class, field) in [(class, "class_field"), (constructed, "generated")] {
+            let member = class.class_object_member(&db, &env, field, policy);
+            assert!(member.place.is_definitely_bound());
+            assert_eq!(member.place.expect_type(), int);
+        }
+        for ty in [instance, typevar] {
+            let member = ty.instance_member_with_policy(&db, &env, "instance_field", policy);
+            assert!(member.place.is_definitely_bound());
+            assert_eq!(member.place.expect_type(), int);
+        }
+    }
     Ok(())
 }
 

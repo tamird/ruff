@@ -1,0 +1,70 @@
+---
+source: crates/ty_python_semantic/src/types/ide_support.rs
+expression: "call_inputs(r#\"\nfrom typing import Callable\nfrom _typeshed import SupportsRichComparisonT\n\ndef factory[**P, R](init: Callable[P, R] | None = None) -> None: ...\ndef optional_key[T](key: Callable[[str], T] | None = None) -> None: ...\ndef by_key[T, K: SupportsRichComparisonT](values: list[T], key: Callable[[T], K] | None = None) -> list[T]: ...\nvalues: dict[str, int] = {}\nother: dict[str, int] = {}\n\nfactory()\nfactory(init=None)\noptional_key(key=None)\nvalues.update(other)\ndict(other)\nsorted([\"x\"])\nsorted([\"x\"], key=None)\nsorted([\"x\"], key=len)\nby_key([\"x\"], key=len)\n\"#,)?"
+---
+[
+    Ok(
+        [],
+    ),
+    Ok(
+        [
+            [
+                "None <: ((...) -> Unknown) | None: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "None <: ((str, /) -> Unknown) | None: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "dict[str, int] <: SupportsKeysAndGetItem[str, int]: true",
+            ],
+        ],
+    ),
+    Err(
+        Incomplete,
+    ),
+    Ok(
+        [
+            [
+                "list[str] <: Iterable[str]: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "list[str] <: Iterable[str]: true",
+            ],
+            [
+                "None <: None: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "list[str] <: Iterable[str]: true",
+            ],
+            [
+                "def len(obj: Sized, /) -> int <: (str, /) -> SupportsDunderLT[Any] | SupportsDunderGT[Any]: false",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "list[str] <: list[str]: true",
+            ],
+            [
+                "def len(obj: Sized, /) -> int <: ((str, /) -> int) | None: true",
+            ],
+        ],
+    ),
+]

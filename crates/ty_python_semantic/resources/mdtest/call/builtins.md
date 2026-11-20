@@ -414,9 +414,7 @@ def _(xs: Unknown):
 
     reveal_type(map("{}".format, xs))  # revealed: map[str]
 
-    # TODO: This should reveal `str`. See https://github.com/astral-sh/ty/issues/4536.
-    # The lack of gradual constraints allows the `LiteralString` overload to be selected.
-    reveal_type("".join(map("{}".format, xs)))  # revealed: LiteralString
+    reveal_type("".join(map("{}".format, xs)))  # revealed: str
 ```
 
 ## Mapping methods accept arbitrary object types

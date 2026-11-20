@@ -1,0 +1,7530 @@
+use std::fmt::Write;
+
+use anyhow::Context;
+use ruff_db::diagnostic::{Annotation, DiagnosticId, Severity, Span};
+use ruff_db::files::{File, system_path_to_file};
+use ruff_db::parsed::parsed_module;
+use ruff_db::source::source_text;
+use ruff_db::system::DbWithWritableSystem as _;
+use ruff_db::testing::assert_function_query_was_not_run_by_name;
+use ruff_text_size::{Ranged, TextLen, TextRange};
+
+use super::*;
+use crate::db::tests::{SourceProvider, TestDb, TestDbBuilder};
+use crate::types::constraints::ConstraintSetBuilder;
+use crate::types::definition_resolution::definitions_for_attribute;
+use crate::types::generics::SpecializationBuilder;
+use crate::types::ide_support::{
+    call_signature_details, definitions_for_keyword_argument, inlay_hint_call_argument_details,
+};
+use crate::types::{
+    CheckedArgument, CheckedCall, DictionaryFirstEntry, DictionaryItem, DictionaryItemKind,
+    DictionaryItems, KnownClass, Parameter, Parameters, Signature, TypedDictFieldBuilder,
+    TypedDictOpenness, TypedDictSchema, TypedDictType,
+};
+use crate::{HasType, SemanticModel};
+
+#[test]
+fn supplied_mapping_read_schema() -> anyhow::Result<()> {
+    let source = r#"
+from typing import Generic, Literal, TypeVar
+from typing_extensions import TypedDict, assert_type
+from ty_extensions._internal import Unknown
+
+S = TypeVar("S")
+class View(Generic[S]):
+    def __getitem__(self, key: str) -> Unknown:
+        return object()
+
+class Text(TypedDict, extra_items=Literal["other"]):
+    kind: Literal["output"]
+    value: str
+
+class Count(TypedDict):
+    kind: Literal["output"]
+    value: int
+
+class Other(TypedDict):
+    kind: Literal["other"]
+    value: bytes
+
+def check(row: View[Text] | View[Count] | View[Other]):
+    if row["kind"] == "output":
+        assert_type(row["value"], str | int)
+    if row["kind"] != "output":
+        assert_type(row["value"], bytes)
+
+def unmodeled(row: View[Text] | View[Other] | View[int]):
+    if row["kind"] == "output":
+        assert_type(row, View[Text] | View[int])
+    if row["undeclared"] == "output":
+        assert_type(row, View[Text] | View[Other] | View[int])
+
+def mixed(row: Text | View[Count] | View[Other] | dict[str, object]):
+    if row["kind"] == "output":
+        assert_type(row, Text | View[Count] | dict[str, object])
+
+def operations(row: View[Text]):
+    assert_type(row["undeclared"], Unknown)
+    row[42]
+    row["value"] = "wrong"
+    row.update({})
+"#;
+    let db = TestDbBuilder::new()
+        .with_mapping_read_schema(|db, env, ty| {
+            let Type::NominalInstance(instance) = ty else {
+                return None;
+            };
+            let alias = instance.class(db, env).into_generic_alias()?;
+            if alias.origin(db).name(db) != "View" {
+                return None;
+            }
+            let [Type::TypedDict(schema)] = alias.specialization(db).types(db) else {
+                return None;
+            };
+            Some(*schema)
+        })
+        .with_file("/src/main.py", source)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let range = diagnostic.range().unwrap();
+                (diagnostic.id().as_str(), &source[range])
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("invalid-argument-type", "row"),
+            ("invalid-assignment", "row[\"value\"]"),
+            ("unresolved-attribute", "row.update"),
+        ],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_builtin_function_retains_signature_and_runtime_class() -> anyhow::Result<()> {
+    let source = "\
+from native import native, native2
+from types import BuiltinFunctionType, FunctionType
+
+def source(value: int) -> str:
+    return str(value)
+
+native_ok: BuiltinFunctionType = native
+source_ok: FunctionType = source
+bad_direct: FunctionType = native
+items = [native]
+promoted_ok: BuiltinFunctionType = items[0]
+bad_promoted: FunctionType = items[0]
+
+class Container:
+    operation = native
+
+result: str = Container().operation(1)
+Container.operation = native2
+bad_call = native('bad')
+wrapped: BuiltinFunctionType = staticmethod(native).__func__
+";
+    let db = TestDbBuilder::new()
+        .with_builtin_function(|db, definition| {
+            matches!(definition.name(db).as_deref(), Some("native" | "native2"))
+        })
+        .with_file(
+            "/src/native.pyi",
+            "def native(value: int) -> str: ...\ndef native2(value: int) -> str: ...\n",
+        )
+        .with_file("/src/main.py", source)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let range = diagnostic.range().unwrap();
+                (diagnostic.id().as_str(), &source[range])
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("invalid-assignment", "native"),
+            ("invalid-assignment", "items[0]"),
+            ("invalid-argument-type", "'bad'")
+        ],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_builtin_declaration_does_not_supply_an_implementation_return_type() -> anyhow::Result<()>
+{
+    let db = TestDbBuilder::new()
+        .with_analysis_settings(crate::AnalysisSettings {
+            return_type_inference: crate::ReturnTypeInference::Always,
+            ..crate::AnalysisSettings::default()
+        })
+        .with_builtin_function(|db, definition| definition.name(db).as_deref() == Some("native"))
+        .with_file(
+            "/src/main.py",
+            "def native(): pass\ndef ordinary(): pass\nnative_result = native()\nordinary_result = ordinary()\n",
+        )
+        .build()?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let env = ProgramEnvironment::from_file(file);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type()
+    };
+    assert_eq!(symbol("native_result"), Type::unknown());
+    assert_eq!(symbol("ordinary_result"), Type::none(&db, &env));
+    Ok(())
+}
+
+#[test]
+fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyhow::Result<()> {
+    fn refine<'db>(
+        db: &'db TestDb,
+        receiver: Type<'db>,
+        ty: Type<'db>,
+        source: Option<FileRange>,
+        display: ProvidedInstanceDisplay,
+    ) -> Type<'db> {
+        receiver
+            .with_provided_instance_fields(
+                db,
+                Box::from([ProvidedField {
+                    name: Name::new_static("value"),
+                    ty,
+                    is_required: true,
+                    source,
+                }]),
+                display,
+            )
+            .expect("nominal instance")
+    }
+
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.pyi",
+            "from collections.abc import Callable\nfrom typing import type_check_only\nclass Box[T]:\n    @type_check_only\n    def value(self) -> str: ...\nclass Child(Box[int]):\n    @property\n    def value(self) -> object: ...\nclass Handler[**P]:\n    callback: Callable[P, int]\nbox: Box[int]\nchild: Child\nhandler: Handler[[int]]\n",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.pyi")?;
+    let program_file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program_file);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, program_file, name)
+            .place
+            .expect_type()
+    };
+    let int = KnownClass::Int.to_instance(&db, &env);
+    let str = KnownClass::Str.to_instance(&db, &env);
+    let origin = FileRange::new(file, TextRange::new(0.into(), 4.into()));
+    let boxed = refine(
+        &db,
+        symbol("box"),
+        int,
+        Some(origin),
+        ProvidedInstanceDisplay::Full,
+    );
+    let equivalent = refine(
+        &db,
+        symbol("box"),
+        int,
+        None,
+        ProvidedInstanceDisplay::ClassName,
+    );
+    let incompatible = refine(&db, symbol("box"), str, None, ProvidedInstanceDisplay::Full);
+    let descriptor = refine(
+        &db,
+        symbol("child"),
+        int,
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+
+    assert!(boxed.is_assignable_to(&db, &env, equivalent));
+    assert!(!symbol("box").is_assignable_to(&db, &env, boxed));
+    assert!(!incompatible.is_assignable_to(&db, &env, boxed));
+    assert!(!descriptor.is_assignable_to(&db, &env, boxed));
+    assert_eq!(boxed.member(&db, &env, "value").place.expect_type(), int);
+    assert_eq!(
+        descriptor.member(&db, &env, "value").place.expect_type(),
+        Type::object()
+    );
+    assert_eq!(boxed.display(&db, &env).to_string(), "Box[int]");
+    assert_eq!(equivalent.display(&db, &env).to_string(), "Box");
+    assert_eq!(
+        definitions_for_attribute(&db, &env, boxed, "value"),
+        [crate::types::ide_support::ResolvedDefinition::FileWithRange(origin)]
+    );
+    let members = crate::types::list_members::all_members(&db, &env, boxed);
+    let value = members
+        .iter()
+        .find(|member| member.name == "value")
+        .unwrap();
+    assert_eq!(value.ty, int);
+    assert!(!value.is_type_check_only);
+
+    let readable_int = Type::protocol_with_readonly_members(&db, &env, [("value", int)]);
+    let narrowed = |receiver| {
+        IntersectionBuilder::new(&db, &env)
+            .positive_elements([receiver, readable_int])
+            .build()
+    };
+    let boxed_object = refine(
+        &db,
+        symbol("box"),
+        Type::object(),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    let masked_object = refine(
+        &db,
+        symbol("child"),
+        Type::object(),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    assert!(narrowed(boxed_object).is_assignable_to(&db, &env, boxed));
+    assert_eq!(
+        narrowed(masked_object)
+            .member(&db, &env, "value")
+            .place
+            .expect_type(),
+        int
+    );
+    assert!(!narrowed(masked_object).is_assignable_to(&db, &env, boxed));
+
+    let string_with_storage = refine(&db, str, int, None, ProvidedInstanceDisplay::Full);
+    assert!(!Type::string_literal(&db, "x").is_assignable_to(&db, &env, string_with_storage));
+    assert!(Type::unknown().is_assignable_to(&db, &env, boxed));
+    assert!(Type::Never.is_subtype_of(&db, &env, boxed));
+
+    let Type::ClassLiteral(box_class) = symbol("Box") else {
+        anyhow::bail!("Expected the Box class");
+    };
+    let context = box_class.generic_context(&db).expect("generic Box");
+    let variable = Type::TypeVar(context.variables(&db).next().expect("Box type parameter"));
+    let generic_storage = refine(&db, str, variable, None, ProvidedInstanceDisplay::Full);
+    let specialized = generic_storage.apply_specialization(&db, context.specialize(&db, &[int]));
+    assert_eq!(
+        specialized.member(&db, &env, "value").place.expect_type(),
+        int
+    );
+    let gradual_storage = refine(
+        &db,
+        str,
+        Type::unknown(),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    assert_eq!(
+        gradual_storage
+            .top_materialization(&db, &env)
+            .member(&db, &env, "value")
+            .place
+            .expect_type(),
+        Type::object()
+    );
+    let invariant_storage = refine(
+        &db,
+        str,
+        KnownClass::List.to_specialized_instance(&db, &env, &[variable]),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    let mut occurrence = None;
+    invariant_storage.visit_specialization(&db, &env, |ty, variance| {
+        if ty == variable {
+            occurrence = Some(variance);
+        }
+    });
+    assert_eq!(
+        occurrence,
+        Some(crate::types::variance::TypeVarVariance::Invariant)
+    );
+    let constraints = ConstraintSetBuilder::new();
+    let mut inference = SpecializationBuilder::new(&db, &env, &constraints, context);
+    inference
+        .infer(generic_storage, string_with_storage)
+        .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
+    let inferred = inference
+        .build_inference_with(|_, _| None)
+        .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?
+        .merged_specialization(&db);
+    assert_eq!(inferred.types(&db), [int]);
+
+    let Type::ClassLiteral(handler_class) = symbol("Handler") else {
+        anyhow::bail!("Expected the Handler class");
+    };
+    let handler_context = handler_class.generic_context(&db).expect("generic Handler");
+    let handler = Type::instance(&db, &env, handler_class.identity_specialization(&db));
+    let formal = refine(
+        &db,
+        handler,
+        handler.member(&db, &env, "callback").place.expect_type(),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    let actual_handler = symbol("handler");
+    let actual = refine(
+        &db,
+        actual_handler,
+        actual_handler
+            .member(&db, &env, "callback")
+            .place
+            .expect_type(),
+        None,
+        ProvidedInstanceDisplay::Full,
+    );
+    let expected = actual
+        .class_specialization(&db, &env)
+        .expect("generic Handler")
+        .1;
+    assert!(matches!(expected.types(&db), [Type::Callable(_)]));
+    let constraints = ConstraintSetBuilder::new();
+    let mut inference = SpecializationBuilder::new(&db, &env, &constraints, handler_context);
+    inference
+        .infer(formal, actual)
+        .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
+    let inferred = inference
+        .build_inference_with(|_, _| None)
+        .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?
+        .merged_specialization(&db);
+    assert_eq!(inferred.types(&db), expected.types(&db));
+    Ok(())
+}
+
+#[test]
+fn optional_supplied_fields_preserve_storage_relations_and_specialization() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.pyi",
+            r#"
+class Box[T]: ...
+class Other: ...
+class Descriptor(Box[int]):
+    @property
+    def value(self) -> object: ...
+
+box: Box[int]
+other: Other
+descriptor: Descriptor
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.pyi")?;
+    let program_file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program_file);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, program_file, name)
+            .place
+            .expect_type()
+    };
+    let refine = |receiver, ty, is_required| {
+        Type::with_provided_instance_fields(
+            receiver,
+            &db,
+            Box::from([ProvidedField {
+                name: Name::new_static("value"),
+                ty,
+                is_required,
+                source: None,
+            }]),
+            ProvidedInstanceDisplay::Full,
+        )
+        .expect("nominal instance")
+    };
+    let int = KnownClass::Int.to_instance(&db, &env);
+    let str = KnownClass::Str.to_instance(&db, &env);
+    let box_type = symbol("box");
+    let optional = refine(box_type, int, false);
+    let required = refine(box_type, int, true);
+    let absent = refine(box_type, Type::Never, false);
+    let wrong = refine(box_type, str, false);
+    let nullable = refine(
+        box_type,
+        crate::types::UnionType::from_two_elements(&db, &env, int, Type::none(&db, &env)),
+        true,
+    );
+    assert!(required.is_assignable_to(&db, &env, optional));
+    assert!(absent.is_assignable_to(&db, &env, optional));
+    assert!(!optional.is_assignable_to(&db, &env, required));
+    assert!(!absent.is_assignable_to(&db, &env, required));
+    assert!(!optional.is_assignable_to(&db, &env, absent));
+    assert!(!wrong.is_assignable_to(&db, &env, optional));
+    assert!(!nullable.is_assignable_to(&db, &env, optional));
+    assert!(!optional.is_assignable_to(&db, &env, nullable));
+    // A missing declaration does not prove that an instance lacks this field.
+    assert!(!box_type.is_assignable_to(&db, &env, optional));
+    assert!(!refine(symbol("other"), int, false).is_assignable_to(&db, &env, optional));
+    let protocol = Type::protocol_with_readonly_members(&db, &env, [("value", int)]);
+    assert!(!protocol.is_assignable_to(&db, &env, optional));
+    let structural = IntersectionBuilder::new(&db, &env)
+        .positive_elements([box_type, protocol])
+        .build();
+    assert!(!structural.is_assignable_to(&db, &env, optional));
+    let guarded = IntersectionBuilder::new(&db, &env)
+        .positive_elements([optional, protocol])
+        .build();
+    assert!(!guarded.is_assignable_to(&db, &env, required));
+
+    let lists = |element| KnownClass::List.to_specialized_instance(&db, &env, &[element]);
+    assert!(!refine(box_type, lists(str), false).is_assignable_to(
+        &db,
+        &env,
+        refine(box_type, lists(Type::object()), false),
+    ));
+
+    // A descriptor or protocol can narrow the read without narrowing physical storage.
+    let masked = refine(symbol("descriptor"), Type::object(), false);
+    let narrowed = IntersectionBuilder::new(&db, &env)
+        .positive_elements([masked, protocol])
+        .build();
+    assert!(!narrowed.is_assignable_to(&db, &env, optional));
+    assert!(!refine(symbol("descriptor"), int, false).is_assignable_to(&db, &env, optional));
+
+    let Type::ClassLiteral(class) = symbol("Box") else {
+        anyhow::bail!("Expected Box class");
+    };
+    let context = class.generic_context(&db).context("generic Box")?;
+    let variable = context
+        .variables(&db)
+        .next()
+        .context("Box type parameter")?;
+    let variable = Type::TypeVar(variable);
+    let generic = refine(box_type, variable, false);
+    let specialized = generic.apply_specialization(&db, context.specialize(&db, &[int]));
+    assert!(specialized.is_equivalent_to(&db, &env, optional));
+    assert!(
+        !specialized
+            .member(&db, &env, "value")
+            .place
+            .is_definitely_bound()
+    );
+    assert!(!absent.has_immutable_field_path(&db, &env, &[Name::new_static("value")]));
+    let callback = |ty| {
+        Type::function_like_callable(
+            &db,
+            Signature::new(
+                Parameters::standard([Parameter::positional_only(Some(Name::new_static(
+                    "argument",
+                )))
+                .with_annotated_type(ty)]),
+                ty,
+            ),
+        )
+    };
+    let generic_callback = refine(box_type, callback(variable), false);
+    let specialized_callback =
+        generic_callback.apply_specialization(&db, context.specialize(&db, &[int]));
+    let member = specialized_callback.member(&db, &env, "value");
+    assert!(!member.place.is_definitely_bound());
+    let fields = specialized_callback
+        .provided_instance_fields(&db)
+        .context("specialized callback storage")?;
+    let [field] = fields else {
+        anyhow::bail!("Expected one callback field, found {fields:?}");
+    };
+    let ProvidedField {
+        name,
+        ty,
+        is_required,
+        source,
+    } = field;
+    assert_eq!(name, "value");
+    assert!(!is_required);
+    assert_eq!(*source, None);
+    assert!(ty.is_equivalent_to(&db, &env, callback(int)));
+    assert!(member.place.expect_type().is_equivalent_to(&db, &env, *ty));
+    let constraints = ConstraintSetBuilder::new();
+    let mut inference = SpecializationBuilder::new(&db, &env, &constraints, context);
+    inference
+        .infer(generic, optional)
+        .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
+    let inferred = inference
+        .build_inference_with(|_, _| None)
+        .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?;
+    let inferred = inferred.merged_specialization(&db);
+    assert_eq!(inferred.types(&db), [int]);
+    Ok(())
+}
+
+#[test]
+fn optional_supplied_fields_require_checked_absence_evidence() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_getattr_result_provider(|_db, _definition, _receiver, _attribute| {
+            ProvidedGetattrPresence::Absent.into()
+        })
+        .with_file(
+            "/src/main.pyi",
+            r#"
+class Closed:
+    def __getattr__(self, name: str) -> object: ...
+
+class Malformed(Closed):
+    def __getattr__(self, name: int) -> object: ...
+
+class Intercepted(Closed):
+    def __getattribute__(self, name: str) -> object: ...
+
+class Declared(Closed):
+    value: object
+
+closed: Closed
+malformed: Malformed
+intercepted: Intercepted
+declared: Declared
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.pyi")?;
+    let file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(file);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type()
+    };
+    let target = symbol("closed")
+        .with_provided_instance_fields(
+            &db,
+            Box::from([ProvidedField {
+                name: Name::new_static("value"),
+                ty: KnownClass::Int.to_instance(&db, &env),
+                is_required: false,
+                source: None,
+            }]),
+            ProvidedInstanceDisplay::Full,
+        )
+        .context("nominal instance")?;
+    assert!(symbol("closed").is_assignable_to(&db, &env, target));
+    for name in ["malformed", "intercepted", "declared"] {
+        assert!(!symbol(name).is_assignable_to(&db, &env, target), "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn optional_supplied_fields_keep_getattr_defaults_and_hasattr_guards() -> anyhow::Result<()> {
+    fn factory<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        let declaration = call.declaration()?;
+        let name = declaration.name(db)?;
+        let ty = match name.as_str() {
+            "optional" | "required" => {
+                let CheckedArgument::Value { ty, expression: _ } = call.argument("value") else {
+                    return None;
+                };
+                ty
+            }
+            "absent" => Type::Never,
+            _ => return None,
+        };
+        let native = system_path_to_file(db, "/src/native.pyi").ok()?;
+        let native = db.program_file(native);
+        let env = ProgramEnvironment::from_file(native);
+        let class = crate::place::global_symbol(db, native, "Record")
+            .place
+            .ignore_possibly_undefined()?;
+        let instance = class.to_instance_approximation(db, &env)?;
+        instance.with_provided_instance_fields(
+            db,
+            Box::from([ProvidedField {
+                name: Name::new_static("value"),
+                ty,
+                is_required: name == "required",
+                source: None,
+            }]),
+            ProvidedInstanceDisplay::Full,
+        )
+    }
+    let registry = crate::default_lint_registry();
+    let mut rules = crate::lint::RuleSelection::from_registry(registry);
+    let possibly_missing_attribute = registry.get("possibly-missing-attribute")?;
+    rules.enable(
+        possibly_missing_attribute,
+        Severity::Error,
+        crate::lint::LintSource::Default,
+    );
+    let source = r#"
+from native import absent, optional, required
+from typing_extensions import assert_type, Literal
+
+stored = required(1)
+assert_type(hasattr(stored, "value"), Literal[True])
+assert_type(stored.value if hasattr(stored, "value") else None, Literal[1])
+assert_type(hasattr(stored, "missing"), bool)
+nullable = required(None)
+assert_type(hasattr(nullable, "value"), Literal[True])
+check = hasattr
+assert_type(check(stored, "value"), Literal[True])
+
+def named(name: str):
+    assert_type(hasattr(stored, name), bool)
+
+record = optional(1)
+assert_type(hasattr(record, "value"), bool)
+assert_type(getattr(record, "value", None), Literal[1] | None)
+unguarded = record.value
+if hasattr(record, "value"):
+    assert_type(record.value, Literal[1])
+else:
+    negative = record.value
+
+def callback(value: int, *, flag: bool) -> str:
+    return str(value)
+
+handler = optional(callback)
+if hasattr(handler, "value"):
+    assert_type(handler.value(1, flag=True), str)
+    handler.value("wrong", flag=True)
+
+empty = absent()
+assert_type(getattr(empty, "value", None), None)
+assert_type(hasattr(empty, "value"), bool)
+assert_type(hasattr(stored, "value", 1), bool)
+assert_type(hasattr(stored, name="value"), bool)
+"#;
+    let db = TestDbBuilder::new()
+        .with_rule_selection(rules)
+        .with_file(
+            "/src/native.pyi",
+            "class Record: ...\ndef optional(value: object) -> Record: ...\ndef absent() -> Record: ...\ndef required(value: object) -> Record: ...\n",
+        )
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(|db, call| factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.id().as_str(),
+                &source[diagnostic.range().unwrap()]
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("possibly-missing-attribute", "record.value"),
+            ("possibly-missing-attribute", "record.value"),
+            ("invalid-argument-type", "\"wrong\""),
+            ("too-many-positional-arguments", "1"),
+            ("positional-only-parameter-as-kwarg", "name=\"value\""),
+        ],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn deferred_nominal_fields_preserve_identity_and_follow_edits() -> anyhow::Result<()> {
+    fn annotation<'db>(
+        db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        value_type: Type<'db>,
+        _definition: Option<Definition<'db>>,
+    ) -> Option<Type<'db>> {
+        let Type::FunctionLiteral(function) = value_type else {
+            return None;
+        };
+        let definition = function.definition(db);
+        let file = definition.program_file(db);
+        let path = file.file(db).path(db).as_system_path()?;
+        if path.as_str() != "/src/native.pyi"
+            || !matches!(function.name(db).as_str(), "first" | "second")
+        {
+            return None;
+        }
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let ty_python_core::definition::DefinitionKind::Function(declaration) = definition.kind(db)
+        else {
+            return None;
+        };
+        let declaration = declaration.node(&module);
+        let expression = declaration.returns.as_deref()?;
+        let class = ProvidedClass {
+            name: function.name(db).clone(),
+            bases: Box::default(),
+            class_members: Box::default(),
+            instance_fields: ProvidedInstanceFieldsSource::Deferred(ProvidedData::new(
+                function.name(db).clone(),
+            )),
+        }
+        .into_type_at_expression(db, file, expression.into())?;
+        class.to_instance_approximation(db, &ProgramEnvironment::from_file(file))
+    }
+
+    fn fields<'db>(
+        db: &'db TestDb,
+        file: ProgramFile<'db>,
+        data: &ProvidedData,
+    ) -> Option<ProvidedInstanceFields<'db>> {
+        let name = data.downcast_ref::<Name>()?;
+        let other = match name.as_str() {
+            "first" => "second",
+            "second" => "first",
+            _ => return None,
+        };
+        let resolve = |name| {
+            crate::place::global_symbol(db, file, name)
+                .place
+                .ignore_possibly_undefined()
+        };
+        let constructor = resolve(name.as_str())?;
+        let peer = annotation(db, file, constructor, None)?;
+        let constructor = resolve(other)?;
+        let other = annotation(db, file, constructor, None)?;
+        let value = resolve("value")?;
+        let required = resolve("required")?;
+        let is_required = required == Type::bool_literal(true);
+        Some(ProvidedInstanceFields {
+            fields: Box::from([
+                ProvidedField {
+                    name: Name::new_static("peer"),
+                    ty: peer,
+                    is_required: true,
+                    source: None,
+                },
+                ProvidedField {
+                    name: Name::new_static("other"),
+                    ty: other,
+                    is_required: true,
+                    source: None,
+                },
+                ProvidedField {
+                    name: Name::new_static("value"),
+                    ty: value,
+                    is_required,
+                    source: Some(FileRange::new(
+                        file.file(db),
+                        TextRange::new(0.into(), 5.into()),
+                    )),
+                },
+            ]),
+            has_dynamic_fields: false,
+            implications: Box::default(),
+            data: None,
+        })
+    }
+
+    let registry = crate::default_lint_registry();
+    let mut rules = crate::lint::RuleSelection::from_registry(registry);
+    let possibly_missing_attribute = registry.get("possibly-missing-attribute")?;
+    rules.enable(
+        possibly_missing_attribute,
+        Severity::Error,
+        crate::lint::LintSource::Default,
+    );
+    let mut db = TestDbBuilder::new()
+        .with_rule_selection(rules)
+        .with_type_reference_provider(annotation)
+        .with_instance_fields_provider(fields)
+        .with_file(
+            "/src/native.pyi",
+            "value: int\nrequired = True\ndef first() -> int: ...\ndef second() -> int: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import first as First, second as Second
+def use(a: First, b: Second) -> None:
+    same: First = a.peer
+    other: Second = a.other
+    recursive: int = a.other.peer.other.value
+    wrong: First = b
+runtime: int = First()
+",
+        )
+        .build()?;
+    let native_file = system_path_to_file(&db, "/src/native.pyi")?;
+    {
+        let native = db.program_file(native_file);
+        let constructor = crate::place::global_symbol(&db, native, "first")
+            .place
+            .expect_type();
+        let first =
+            annotation(&db, native, constructor, None).context("missing nominal annotation")?;
+        let env = ProgramEnvironment::from_file(native);
+        assert_eq!(
+            first
+                .provided_data(&db, &env)
+                .and_then(ProvidedData::downcast_ref::<Name>),
+            Some(&Name::new_static("first"))
+        );
+        assert!(first.is_assignable_to(&db, &env, first));
+        let Type::NominalInstance(instance) = first else {
+            anyhow::bail!("Expected a nominal instance, got {first:?}");
+        };
+        let class = Type::ClassLiteral(instance.class_literal(&db, &env));
+        let members = crate::types::list_members::all_members(&db, &env, class);
+        assert!(!members.iter().any(|member| member.name == "value"));
+    }
+    let events = db.take_salsa_events();
+    assert_function_query_was_not_run_by_name(&db, "deferred_instance_fields", None, &events);
+
+    let native = db.program_file(native_file);
+    let constructor = crate::place::global_symbol(&db, native, "first")
+        .place
+        .expect_type();
+    let first = annotation(&db, native, constructor, None).context("missing nominal annotation")?;
+    let env = ProgramEnvironment::from_file(native);
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-assignment"],
+        "{diagnostics:#?}"
+    );
+    let members = crate::types::list_members::all_members(&db, &env, first);
+    assert!(members.iter().any(|member| member.name == "value"));
+    let source = FileRange::new(native.file(&db), TextRange::new(0.into(), 5.into()));
+    assert_eq!(
+        definitions_for_attribute(&db, &env, first, "value"),
+        [crate::types::ide_support::ResolvedDefinition::FileWithRange(source)]
+    );
+
+    db.write_file(
+        "/src/native.pyi",
+        "value: str\nrequired = True\ndef first() -> int: ...\ndef second() -> int: ...\n",
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-assignment", "invalid-assignment"],
+        "{diagnostics:#?}"
+    );
+    db.write_file(
+        "/src/native.pyi",
+        "value: int\nrequired = False\ndef first() -> int: ...\ndef second() -> int: ...\n",
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["possibly-missing-attribute", "invalid-assignment"],
+        "{diagnostics:#?}"
+    );
+    let native = db.program_file(native_file);
+    let constructor = crate::place::global_symbol(&db, native, "first")
+        .place
+        .expect_type();
+    let first = annotation(&db, native, constructor, None).context("missing nominal annotation")?;
+    let env = ProgramEnvironment::from_file(native);
+    assert!(!first.member(&db, &env, "value").place.is_definitely_bound());
+    assert_eq!(
+        definitions_for_attribute(&db, &env, first, "value"),
+        [
+            crate::types::ide_support::ResolvedDefinition::FileWithRange(FileRange::new(
+                native_file,
+                TextRange::new(0.into(), 5.into()),
+            ))
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn intersections_preserve_unambiguous_provided_data() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/main.py", "first = 1\nsecond = 2\nthird = 3\n")
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let mut instances = Vec::new();
+    for (index, (statement, data)) in module.suite().iter().zip([1_u8, 1, 2]).enumerate() {
+        let ruff_python_ast::Stmt::Assign(assignment) = statement else {
+            anyhow::bail!("Expected an assignment");
+        };
+        let class = ProvidedClass {
+            name: Name::new(format!("Class{index}")),
+            bases: Box::default(),
+            class_members: Box::default(),
+            instance_fields: ProvidedInstanceFieldsSource::Eager(ProvidedInstanceFields {
+                fields: Box::default(),
+                has_dynamic_fields: false,
+                implications: Box::default(),
+                data: Some(ProvidedData::new(data)),
+            }),
+        }
+        .into_type_at_expression(&db, file, assignment.value.as_ref().into())
+        .context("missing provided class")?;
+        let instance = class
+            .to_instance_approximation(&db, &env)
+            .context("missing instance type")?;
+        instances.push(instance);
+    }
+    let [first, second, third] = instances.as_slice() else {
+        anyhow::bail!("Expected three provided instances");
+    };
+    let shape = Type::protocol_with_readonly_members(
+        &db,
+        &env,
+        [("value", KnownClass::Str.to_instance(&db, &env))],
+    );
+    for (left, right, expected) in [
+        (*first, shape, Some(1)),
+        (shape, *first, Some(1)),
+        (*first, *second, Some(1)),
+        (*first, *third, None),
+        (*third, *first, None),
+    ] {
+        let intersection =
+            crate::types::IntersectionType::from_two_elements(&db, &env, left, right);
+        assert!(
+            matches!(intersection, Type::Intersection(_)),
+            "{intersection:?}"
+        );
+        assert_eq!(
+            intersection
+                .provided_data(&db, &env)
+                .and_then(ProvidedData::downcast_ref::<u8>)
+                .copied(),
+            expected,
+        );
+    }
+    let negative = IntersectionBuilder::new(&db, &env)
+        .add_positive(shape)
+        .add_negative(*first)
+        .build();
+    assert_eq!(negative.provided_data(&db, &env), None);
+    Ok(())
+}
+
+#[test]
+fn supplied_readonly_fields_preserve_type_variables() -> anyhow::Result<()> {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the type application hook requires this signature"
+    )]
+    fn application<'db>(
+        db: &'db TestDb,
+        application: ProvidedTypeApplication<'_, 'db>,
+        context: &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<Type<'db>> {
+        let ProvidedTypeApplication {
+            expression,
+            value_type,
+            definition: _,
+        } = application;
+        let Type::ClassLiteral(class) = value_type else {
+            return None;
+        };
+        let ClassLiteral::Static(class) = class else {
+            return None;
+        };
+        if class.name(db) != "Field" {
+            return None;
+        }
+        let path = class.program_file(db).file(db).path(db).as_system_path()?;
+        if path.as_str() != "/src/schema.pyi" {
+            return None;
+        }
+        let (ty, _) = context.infer_annotation_expression(&expression.slice);
+        Some(Type::protocol_with_readonly_members(
+            db,
+            &ProgramEnvironment::from_file(context.program_file()),
+            [("value", ty)],
+        ))
+    }
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_type_application_provider(application)
+        .with_file("/src/schema.pyi", "class Field[T]: ...\n")
+        .with_file(
+            "/src/main.py",
+            r#"
+from schema import Field
+from typing import Any, Callable, Literal, Protocol, TypeVar, assert_type
+
+def scalar[T](value: T) -> Field[T]:
+    raise NotImplementedError
+
+def mutable[T](value: T) -> Field[list[T]]:
+    raise NotImplementedError
+
+def accepts[T](value: T) -> Callable[[Field[T]], None]:
+    raise NotImplementedError
+
+literal: Literal["text"] = scalar("text").value
+values = mutable("text").value
+values.append("other")
+context: Field[list[str]] = mutable("text")
+accepts("text")(scalar("other"))
+
+# Recursive properties share the enclosing legacy type-variable traversal.
+type Recursive = Field[dict[str, Recursive]]
+T = TypeVar("T")
+
+def recursive_member(value: Field[tuple[Recursive, T]]) -> None: ...
+
+def identity_after_recursive(value: Recursive, item: T) -> T:
+    return item
+
+def read(value: Field[T]) -> T:
+    return value.value
+
+def read_modern[T](value: Field[T]) -> T:
+    return value.value
+
+def read_nested(value: Field[tuple[Recursive, T]]) -> T:
+    return value.value[1]
+
+def read_nested_modern[T](value: Field[tuple[Recursive, T]]) -> T:
+    return value.value[1]
+
+class NamedField[T](Protocol):
+    @property
+    def value(self) -> T: ...
+
+def read_named[T](value: NamedField[T]) -> T:
+    return value.value
+
+def read_integer[T: int](value: Field[T]) -> T:
+    return value.value
+
+def check_recursive(
+    value: Recursive,
+    integer: int,
+    text: str,
+    integer_field: Field[int],
+    text_field: Field[str],
+    nested_integer: Field[tuple[Recursive, int]],
+    nested_text: Field[tuple[Recursive, str]],
+    gradual_field: Field[Any],
+) -> None:
+    assert_type(identity_after_recursive(value, integer), int)
+    assert_type(identity_after_recursive(value, text), str)
+    assert_type(read(integer_field), int)
+    assert_type(read(text_field), str)
+    assert_type(read_modern(integer_field), int)
+    assert_type(read_modern(text_field), str)
+    assert_type(read_nested(nested_integer), int)
+    assert_type(read_nested(nested_text), str)
+    assert_type(read_nested_modern(nested_integer), int)
+    assert_type(read_nested_modern(nested_text), str)
+    assert_type(read_named(integer_field), int)
+    assert_type(read_named(text_field), str)
+    assert_type(read_integer(integer_field), int)
+    assert_type(read(gradual_field), Any)
+    assert_type(read_modern(gradual_field), Any)
+
+def unknown(): ...
+
+unknown_result = read(scalar(unknown()))
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let member = crate::place::global_symbol(&db, db.program_file(file), "recursive_member")
+        .place
+        .expect_type();
+    let Type::FunctionLiteral(member) = member else {
+        anyhow::bail!("Expected a function, got {member:?}");
+    };
+    let signature = member.last_definition_signature(&db);
+    let context = signature.generic_context.context("missing legacy binder")?;
+    assert_eq!(context.variables(&db).len(), 1);
+    let unknown = crate::place::global_symbol(&db, db.program_file(file), "unknown_result")
+        .place
+        .expect_type();
+    assert_eq!(unknown, Type::unknown());
+    let source = source_text(&db, file).to_string();
+    db.write_file(
+        "/src/main.py",
+        format!(
+            r#"{source}
+values.append(42)
+accepts("text")(scalar(42))
+
+def reject(integer: Field[int], text: Field[str], nested: Field[tuple[Recursive, int]]) -> None:
+    bad: str = read(integer)
+    nested_bad: str = read_nested(nested)
+    read_integer(text)
+"#,
+        ),
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-argument-type",
+            "invalid-argument-type",
+            "invalid-assignment",
+            "invalid-assignment",
+            "invalid-argument-type",
+        ],
+        "{diagnostics:#?}",
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_type_applications_use_annotation_inference() -> anyhow::Result<()> {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the type application hook requires this signature"
+    )]
+    fn application<'db>(
+        db: &'db TestDb,
+        application: ProvidedTypeApplication<'_, 'db>,
+        context: &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<Type<'db>> {
+        let ProvidedTypeApplication {
+            expression,
+            value_type,
+            definition: _,
+        } = application;
+        let Type::ClassLiteral(ClassLiteral::Static(class)) = value_type else {
+            return None;
+        };
+        if class.name(db) != "Field"
+            || class
+                .program_file(db)
+                .file(db)
+                .path(db)
+                .as_system_path()?
+                .as_str()
+                != "/src/schema.pyi"
+        {
+            return None;
+        }
+        let (ty, qualifiers) = context.infer_annotation_expression(&expression.slice);
+        let allowed =
+            TypeQualifiers::REQUIRED | TypeQualifiers::NOT_REQUIRED | TypeQualifiers::READ_ONLY;
+        if !allowed.contains(qualifiers) {
+            context.report_invalid_type_form(expression.slice.range(), "Invalid field qualifier");
+        }
+        let field = TypedDictFieldBuilder::new(ty)
+            .required(!qualifiers.contains(TypeQualifiers::NOT_REQUIRED))
+            .read_only(qualifiers.contains(TypeQualifiers::READ_ONLY))
+            .build();
+        Some(Type::TypedDict(
+            TypedDictType::from_schema_items_with_openness(
+                db,
+                [(Name::new_static("value"), field)].into_iter().collect(),
+                TypedDictOpenness::Closed,
+            ),
+        ))
+    }
+
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_type_application_provider(application)
+        .with_file("/src/schema.pyi", "class Field[T]: ...\n")
+        .with_file(
+            "/src/main.py",
+            r#"
+from schema import Field as Alias
+from typing import Final
+from typing_extensions import NotRequired, ReadOnly
+
+valid: Alias[int] = {"value": 1}
+optional: Alias[NotRequired[int]] = {}
+readonly: Alias[ReadOnly[int]] = {"value": 1}
+nested: list[Alias[str]] = [{"value": "ok"}]
+def forward(value: "Alias[Later]") -> "Alias[Later]":
+    return value
+
+class Later: ...
+
+def generic[T](value: T) -> Alias[T]:
+    return {"value": value}
+
+def shadow() -> None:
+    class Alias[T]: ...
+    shadowed: Alias[int] = Alias()
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    db.write_file(
+        "/src/main.py",
+        r#"
+from schema import Field
+from typing import Final
+from typing_extensions import ReadOnly
+
+wrong: Field[int] = {"value": "bad"}
+missing: Field[int] = {}
+extra: Field[int] = {"value": 1, "extra": 2}
+readonly: Field[ReadOnly[int]] = {"value": 1}
+readonly["value"] = 2
+invalid: Field[Final[int]] = {"value": 1}
+ordinary: list[int] = ["bad"]
+"#,
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-argument-type",
+            "missing-typed-dict-key",
+            "invalid-key",
+            "invalid-assignment",
+            "invalid-type-form",
+            "invalid-assignment"
+        ],
+        "{diagnostics:#?}",
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_type_applications_infer_callable_values() -> anyhow::Result<()> {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the type application hook requires this signature"
+    )]
+    fn application<'db>(
+        db: &'db TestDb,
+        application: ProvidedTypeApplication<'_, 'db>,
+        context: &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<Type<'db>> {
+        let Type::ClassLiteral(ClassLiteral::Static(class)) = application.value_type else {
+            return None;
+        };
+        if class.name(db) != "Arguments" {
+            return None;
+        }
+        let callable = context.infer_value_expression(&application.expression.slice);
+        let env = ProgramEnvironment::from_file(context.program_file());
+        let signature = callable.single_callable_signature(db, &env)?;
+        crate::types::keyword_arguments_type(db, &env, signature.parameters())
+    }
+
+    let db = TestDbBuilder::new()
+        .with_type_application_provider(application)
+        .with_file(
+            "/src/contracts.pyi",
+            "from typing import Callable, overload\n\
+             from ty_extensions import Intersection\n\
+             class Arguments: ...\n\
+             def target(*, required: str, optional: int = ...) -> None: ...\n\
+             @overload\n\
+             def overloaded(value: int) -> int: ...\n\
+             @overload\n\
+             def overloaded(value: str) -> str: ...\n\
+             alternatives: Callable[[int], int] | Callable[[str], str]\n\
+             intersection: Intersection[Callable[[int], int], Callable[[str], str]]\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"from contracts import Arguments, target
+valid: Arguments[target] = {"required": "value"}
+wrong: Arguments[target] = {"required": 42}
+missing: Arguments[target] = {}
+def scoped() -> None:
+    def target(*, required: int) -> None: pass
+    local: Arguments[target] = {"required": 42}
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type", "missing-typed-dict-key"],
+        "{diagnostics:#?}",
+    );
+    let contracts = db.program_file(system_path_to_file(&db, "/src/contracts.pyi")?);
+    let env = ProgramEnvironment::from_file(contracts);
+    let target = crate::place::global_symbol(&db, contracts, "target")
+        .place
+        .expect_type();
+    let overloads = target.callable_overloads(&db, &env).unwrap();
+    assert_eq!(overloads.len(), 1);
+    assert_eq!(
+        &overloads[0],
+        target.single_callable_signature(&db, &env).unwrap()
+    );
+
+    let overloaded = crate::place::global_symbol(&db, contracts, "overloaded")
+        .place
+        .expect_type();
+    let overloads = overloaded.callable_overloads(&db, &env).unwrap();
+    assert_eq!(overloads.len(), 2);
+    assert_eq!(
+        overloads[0].return_type(),
+        KnownClass::Int.to_instance(&db, &env)
+    );
+    assert_eq!(
+        overloads[1].return_type(),
+        KnownClass::Str.to_instance(&db, &env)
+    );
+    assert!(overloaded.single_callable_signature(&db, &env).is_none());
+
+    for name in ["alternatives", "intersection"] {
+        let callable = crate::place::global_symbol(&db, contracts, name)
+            .place
+            .expect_type();
+        assert!(callable.callable_overloads(&db, &env).is_none());
+        assert!(callable.single_callable_signature(&db, &env).is_none());
+    }
+    Ok(())
+}
+
+fn keyword_capture_db(source: &str) -> anyhow::Result<TestDb> {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the type application hook requires this signature"
+    )]
+    fn application<'db>(
+        db: &'db TestDb,
+        application: ProvidedTypeApplication<'_, 'db>,
+        context: &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<Type<'db>> {
+        let Type::ClassLiteral(ClassLiteral::Static(class)) = application.value_type else {
+            return None;
+        };
+        if class.name(db) != "Keywords" {
+            return None;
+        }
+        let value = context.infer_value_expression(&application.expression.slice);
+        context.capture_keyword_parameters(application.expression, value)
+    }
+
+    TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_type_application_provider(application)
+        .with_file("/src/main.py", source)
+        .build()
+}
+
+#[test]
+fn overload_bodies_preserve_captured_keyword_parameters() -> anyhow::Result<()> {
+    let source = r#"from typing import Literal, Protocol, overload
+class Keywords: ...
+class Callback[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+@overload
+def invoke[**P](callback: Callback[P], *, flag: Literal[True], **kwargs: Keywords[P]) -> None: ...
+@overload
+def invoke[**P](callback: Callback[P], *, flag: Literal[False], **kwargs: Keywords[P]) -> None: ...
+def invoke[**P](callback: Callback[P], *, flag: bool, **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **kwargs)
+"#;
+    for (generated, expected) in [("\"made\"", 0), ("42", 1)] {
+        let db = keyword_capture_db(&source.replace("\"made\"", generated))?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let function = crate::place::global_symbol(&db, file, "invoke")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        let mut family = function.iter_overloads_and_implementation(&db);
+        let implementation = family.next_back().unwrap().signature(&db);
+        let environment = ProgramEnvironment::from_file(file);
+        for overload in family {
+            assert!(
+                implementation.supports_overload_implementation_consistency_with(
+                    &db,
+                    &environment,
+                    &overload.signature(&db)
+                ),
+                "implementation {implementation:?}, overload {:?}",
+                overload.signature(&db)
+            );
+        }
+        for index in [0, 1] {
+            let diagnostics = crate::types::check_overload_body(&db, function, index)
+                .unwrap()
+                .into_diagnostics();
+            assert_eq!(diagnostics.len(), expected, "{diagnostics:#?}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn overload_body_forwards_a_captured_tail_after_deleting_a_fixed_keyword() -> anyhow::Result<()> {
+    let source = r#"from typing import Never, Protocol, overload
+class Keywords: ...
+class Callback[T, **P](Protocol):
+    def __call__(self, *, generated: T, retained: bool, **kwargs: Keywords[P]) -> None: ...
+@overload
+def invoke[**P](callback: Callback[int, P], *, input: int, retained: bool, **kwargs: Keywords[P]) -> None: ...
+@overload
+def invoke[**P](callback: Callback[str, P], *, input: str, retained: bool, **kwargs: Keywords[P]) -> None: ...
+def invoke(callback: object, **kwargs: object) -> None:
+    forwarded = dict(kwargs)
+    forwarded.pop("input", None)
+    callback(generated=kwargs["input"], **forwarded)
+"#;
+    for (source, expected) in [
+        (source.to_owned(), [0, 0]),
+        (
+            source.replace(
+                "forwarded.pop(\"input\", None)",
+                "forwarded.pop(\"input\", None)\n    forwarded.pop(\"required\", None)",
+            ),
+            [1, 1],
+        ),
+        (
+            source.replace(
+                "forwarded.pop(\"input\", None)",
+                "forwarded.pop(\"input\", None)\n    forwarded.pop(\"retained\", None)",
+            ),
+            [1, 1],
+        ),
+        (
+            source.replace("generated=kwargs[\"input\"]", "generated=42"),
+            [0, 1],
+        ),
+        (
+            source
+                .replace("input: int,", "input: Never = ...,")
+                .replace("generated=kwargs[\"input\"]", "generated=42"),
+            [0, 1],
+        ),
+    ] {
+        let db = keyword_capture_db(&source)?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let function = crate::place::global_symbol(&db, file, "invoke")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        for (index, count) in expected.into_iter().enumerate() {
+            let diagnostics = crate::types::check_overload_body(&db, function, index)
+                .unwrap()
+                .into_diagnostics();
+            assert_eq!(
+                diagnostics.len(),
+                count,
+                "{index}: {source}\n{diagnostics:#?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn observed_fixed_keywords_do_not_close_the_whole_mapping() -> anyhow::Result<()> {
+    let source = r#"from typing import Protocol, overload
+from typing_extensions import TypedDict
+class Keywords: ...
+class Fixed(TypedDict, closed=True):
+    input: int
+class Callback[**P](Protocol):
+    def __call__(self, **kwargs: Keywords[P]) -> None: ...
+def accept_closed(value: Fixed) -> None: ...
+@overload
+def invoke[**P](callback: Callback[P], *, input: int, **kwargs: Keywords[P]) -> None: ...
+@overload
+def invoke[**P](callback: Callback[P], *, input: str, **kwargs: Keywords[P]) -> None: ...
+def invoke(callback: object, **kwargs: object) -> None:
+    accept_closed(kwargs)
+"#;
+    let db = keyword_capture_db(source)?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let function = crate::place::global_symbol(&db, file, "invoke")
+        .place
+        .expect_type()
+        .expect_function_literal();
+    let diagnostics = crate::types::check_overload_body(&db, function, 0).unwrap();
+    let diagnostics = diagnostics.into_diagnostics();
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("expected a closed-mapping rejection: {diagnostics:#?}");
+    };
+    assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+    assert_eq!(
+        &source[diagnostic.primary_span().unwrap().range().unwrap()],
+        "kwargs"
+    );
+    Ok(())
+}
+
+fn assert_keyword_diagnostics(db: &TestDb, file: File, expected: &[(&str, &str)]) {
+    let diagnostics = db.check_file(file);
+    let source = source_text(db, file);
+    let actual: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let span = diagnostic
+                .primary_span()
+                .and_then(|span| span.range())
+                .expect("diagnostic has a source range");
+            (diagnostic.id().as_str(), &source[span])
+        })
+        .collect();
+    assert_eq!(actual, expected, "{diagnostics:#?}");
+}
+
+#[test]
+fn captured_keywords_specialize_gradual_parameters() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Any, Protocol
+class Keywords: ...
+class Wrapped[**P](Protocol):
+    def __call__(self, *, name: str, **kwargs: Keywords[P]) -> None: ...
+def identity[**P](callback: Wrapped[P]) -> Wrapped[P]:
+    return callback
+def target(*, name: str, srcs: list[str]) -> None: ...
+def check(dynamic: Any, explicit: Wrapped[...]) -> None:
+    inferred = identity(dynamic)
+    inferred(name="x", extra=1)
+    explicit(name="x", extra=1)
+    inferred(name=42)
+    inferred(extra=1)
+    inferred(0, name="x")
+    precise = identity(target)
+    precise(name="x", srcs=["file"])
+    precise(name="x", srcs=42)
+    precise(name="x")
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[
+            ("invalid-argument-type", "name=42"),
+            ("missing-argument", "inferred(extra=1)"),
+            ("too-many-positional-arguments", "0"),
+            ("invalid-argument-type", "srcs=42"),
+            ("missing-argument", "precise(name=\"x\")"),
+        ],
+    );
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let function = crate::place::global_symbol(&db, file, "check")
+        .place
+        .expect_type()
+        .expect_function_literal();
+    let projected = function.last_definition_signature(&db).parameters()[1].annotated_type();
+    let env = db.program_environment();
+    let known = Type::single_callable(
+        &db,
+        Signature::new(
+            Parameters::standard([Parameter::keyword_only(Name::new_static("name"))
+                .with_annotated_type(KnownClass::Str.to_instance(&db, &env))]),
+            Type::none(&db, &env),
+        ),
+    );
+    assert!(projected.is_assignable_to(&db, &env, known));
+    assert!(!projected.is_subtype_of(&db, &env, known));
+    Ok(())
+}
+
+#[test]
+fn captured_keywords_contextualize_individual_arguments() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol, TypedDict
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+class Options(TypedDict):
+    symbol: str
+def invoke[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **kwargs)
+def target(*, generated: str, x_defs: Options) -> None: ...
+target(generated="made", x_defs={"symbol": False})
+invoke(target, x_defs={"symbol": "ok"})
+invoke(target, x_defs={"symbol": 42})
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[
+            ("invalid-argument-type", "x_defs={\"symbol\": False}"),
+            ("invalid-argument-type", "False"),
+            ("invalid-argument-type", "x_defs={\"symbol\": 42}"),
+            ("invalid-argument-type", "42"),
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_keyword_parameters_preserve_callback_contracts() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+
+def invoke[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    copied = dict(kwargs)
+    callback(generated="made", **copied)
+
+def wrong_body[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated=1, **kwargs)
+
+def missing_body[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(**kwargs)
+
+def cleared_body[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    kwargs.clear()
+    callback(generated="made", **kwargs)
+
+def omitted_body[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated="made")
+
+def empty_body[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **{})
+
+def target(*, generated: str, required: int, optional: bool = False) -> None: ...
+def generated_only(*, generated: str) -> None: ...
+class Handler[T]:
+    def target(self, *, generated: str, required: T) -> None: ...
+handler = Handler[int]()
+invoke(target, required=1)
+invoke(target, required="wrong")
+invoke(target)
+invoke(target, required=1, generated="overridden")
+invoke(generated_only)
+invoke(handler.target, required=1)
+invoke(handler.target, required="wrong")
+
+def consume[**P](callback: Injected[P], *, consumed: int, **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **kwargs)
+def requires_consumed(*, generated: str, consumed: int) -> None: ...
+def optional_consumed(*, generated: str, consumed: int = 0) -> None: ...
+consume(requires_consumed, consumed=1)
+consume(optional_consumed, consumed=1)
+consume(target, consumed=1, required=1)
+"#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-argument-type",
+            "missing-argument",
+            "missing-argument",
+            "missing-argument",
+            "missing-argument",
+            "invalid-argument-type",
+            "missing-argument",
+            "unknown-argument",
+            "invalid-argument-type",
+            "missing-argument",
+        ],
+        "{diagnostics:#?}",
+    );
+    let collision = diagnostics
+        .last()
+        .and_then(|diagnostic| diagnostic.primary_span())
+        .and_then(|span| span.range())
+        .context("the required collision must have a source range")?;
+    assert_eq!(
+        &source_text(&db, file)[collision],
+        "consume(requires_consumed, consumed=1)"
+    );
+    let env = db.program_environment();
+    let program_file = ProgramFile::new(&db, file, env.program(&db));
+    let parsed = parsed_module(&db, program_file.python_file(&db)).load(&db);
+    let call = parsed
+        .suite()
+        .iter()
+        .find_map(|statement| statement.as_expr_stmt()?.value.as_call_expr())
+        .context("expected the successful invocation")?;
+    let model = SemanticModel::new(&db, program_file);
+    let inputs = crate::types::ide_support::call_input_types(&model, call)
+        .expect("the checked call has complete inputs");
+    assert_eq!(
+        inputs[1][0].parameter_type,
+        KnownClass::Int.to_instance(&db, &env)
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_keyword_parameters_preserve_symbolic_callback_contracts() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, enabled: bool, **kwargs: Keywords[P]) -> None: ...
+class Flexible[**P](Protocol):
+    def __call__(self, enabled: bool, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+class Wrong[**P](Protocol):
+    def __call__(self, *, generated: int, enabled: bool, **kwargs: Keywords[P]) -> None: ...
+def passthrough[**P](callback: Injected[P]) -> Injected[P]:
+    return callback
+def relay[**Q](callback: Injected[Q]) -> Injected[Q]:
+    return passthrough(callback)
+def flexible[**Q](callback: Flexible[Q]) -> Injected[Q]:
+    return passthrough(callback)
+def wrong[**Q](callback: Wrong[Q]) -> None:
+    passthrough(callback)
+def shared[**P](left: Injected[P], right: Injected[P]) -> Injected[P]:
+    return right
+def different_rows[**Q, **R](left: Injected[Q], right: Injected[R]) -> Injected[Q]:
+    return shared(left, right)
+"#,
+    )?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    assert_keyword_diagnostics(
+        &db,
+        file.file(&db),
+        &[
+            ("invalid-argument-type", "callback"),
+            ("invalid-return-type", "shared(left, right)"),
+        ],
+    );
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let model = SemanticModel::new(&db, file);
+    for name in ["relay", "flexible"] {
+        let function = module
+            .suite()
+            .iter()
+            .filter_map(ast::Stmt::as_function_def_stmt)
+            .find(|function| function.name.as_str() == name)
+            .unwrap();
+        let result = function
+            .body
+            .last()
+            .unwrap()
+            .as_return_stmt()
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap();
+        let declared = crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type()
+            .expect_function_literal()
+            .last_definition_signature(&db)
+            .return_type();
+        assert_eq!(result.inferred_type(&model), Some(declared), "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn keyword_projection_does_not_constrain_positional_parameters() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Callable, Concatenate, Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+def choose[**P](callback: Injected[P], full: Callable[P, int]) -> Callable[P, int]:
+    return full
+def relay[**Q](callback: Injected[Q], full: Callable[Concatenate[int, Q], int]) -> Callable[Concatenate[int, Q], int]:
+    return choose(callback, full)
+def callback(*, generated: str, key: str) -> None: ...
+def full(x: int, /, *, key: str) -> int: return x
+result = choose(callback, full)
+result(1, key="ok")
+result("wrong", key="ok")
+def incompatible_full(x: int, /, *, key: int) -> int: return x
+choose(callback, incompatible_full)
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[
+            ("invalid-argument-type", "\"wrong\""),
+            ("invalid-argument-type", "callback"),
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn callback_keyword_projection_combines_argument_evidence() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+def both[**P](first: Injected[P], second: Injected[P], **kwargs: Keywords[P]) -> None:
+    first(generated="first", **kwargs)
+    second(generated="second", **kwargs)
+def accepts_object(*, generated: str, key: object) -> None: ...
+def accepts_str(*, generated: str, key: str) -> None: ...
+both(accepts_object, accepts_str, key="ok")
+both(accepts_str, accepts_object, key="ok")
+both(accepts_object, accepts_str, key=42)
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[("invalid-argument-type", "key=42")],
+    );
+    Ok(())
+}
+
+#[test]
+fn callback_keyword_projection_rejects_unpromised_keywords() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+def invoke[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **kwargs)
+def relay[**Q](callback: Injected[Q], **kwargs: Keywords[Q]) -> None:
+    invoke(callback, unexpected=42, **kwargs)
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[("invalid-argument-type", "unexpected=42")],
+    );
+    Ok(())
+}
+
+#[test]
+fn callback_keyword_projection_preserves_only_keyword_calls() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Named[**P](Protocol):
+    def __call__(self, *, name: str, **kwargs: Keywords[P]) -> None: ...
+def wrap[**P](callback: Named[P]) -> Named[P]:
+    def wrapped(*, name: str, **kwargs: Keywords[P]) -> None:
+        callback(name=name, **kwargs)
+    return wrapped
+def legacy(name: str, *, flag: bool = False) -> None: ...
+wrapped = wrap(legacy)
+wrapped(name="ok", flag=True)
+wrapped("not keyword-only", name="ok", flag=True)
+wrapped(name="ok", flag="not bool")
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[
+            ("too-many-positional-arguments", "\"not keyword-only\""),
+            ("invalid-argument-type", "flag=\"not bool\""),
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_kwargs_do_not_supply_all_keyword_parameters() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Injected[**P](Protocol):
+    def __call__(self, *, generated: str, **kwargs: Keywords[P]) -> None: ...
+def broken[**P](callback: Injected[P], *args: P.args, **kwargs: P.kwargs) -> None:
+    callback(generated="made", **kwargs)
+def complete[**P](callback: Injected[P], **kwargs: Keywords[P]) -> None:
+    callback(generated="made", **kwargs)
+def mixed[**P](*args: P.args, **kwargs: Keywords[P]) -> None: ...
+"#,
+    )?;
+    assert_keyword_diagnostics(
+        &db,
+        system_path_to_file(&db, "/src/main.py")?,
+        &[
+            ("invalid-argument-type", "**kwargs"),
+            ("invalid-paramspec", "**kwargs: Keywords[P]"),
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn keyword_components_have_runtime_dictionary_behavior() -> anyhow::Result<()> {
+    let db = keyword_capture_db(
+        r#"from typing import Protocol
+class Keywords: ...
+class Callback[**P](Protocol):
+    def __call__(self, **kwargs: Keywords[P]) -> None: ...
+def accept_strings(*values: str) -> None: ...
+def accept_integers(*values: int) -> None: ...
+def captured[**P](**keywords: Keywords[P]) -> None:
+    keywords.args
+    keywords.kwargs
+    keywords.items()
+    accept_strings(*keywords)
+    accept_integers(*keywords)
+def python[**P](*args: P.args, **kwargs: P.kwargs) -> None:
+    kwargs.args
+    accept_strings(*kwargs)
+    accept_integers(*kwargs)
+def wrap[**P](callback: Callback[P]) -> Callback[P]:
+    return lambda **kwargs: callback(**kwargs)
+"#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    assert_keyword_diagnostics(
+        &db,
+        file,
+        &[
+            ("unresolved-attribute", "keywords.args"),
+            ("unresolved-attribute", "keywords.kwargs"),
+            ("invalid-argument-type", "*keywords"),
+            ("unresolved-attribute", "kwargs.args"),
+            ("invalid-argument-type", "*kwargs"),
+        ],
+    );
+    let program = db.program_file(file);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let ast::Stmt::FunctionDef(wrap) = module.suite().last().unwrap() else {
+        panic!("expected the wrapper function");
+    };
+    let [ast::Stmt::Return(returned)] = wrap.body.as_slice() else {
+        panic!("expected the returned callback");
+    };
+    let Some(ast::Expr::Lambda(lambda)) = returned.value.as_deref() else {
+        panic!("expected a contextual lambda");
+    };
+    let ast::Expr::Call(call) = lambda.body.as_ref() else {
+        panic!("expected callback forwarding");
+    };
+    let model = SemanticModel::new(&db, program);
+    let inferred = call.arguments.keywords[0].value.inferred_type(&model);
+    assert!(
+        matches!(inferred, Some(Type::TypeVar(variable)) if variable.is_captured_keyword_arguments(&db)),
+        "{inferred:?}",
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_type_applications_specialize_signature_results() -> anyhow::Result<()> {
+    fn signature<'db>(db: &'db TestDb, value: Type<'db>) -> Option<&'db Signature<'db>> {
+        let Type::FunctionLiteral(function) = value else {
+            return None;
+        };
+        let file = function.definition(db).program_file(db);
+        let path = file.file(db).path(db).as_system_path()?;
+        if path.as_str() != "/src/schema.pyi" {
+            return None;
+        }
+        let [signature] = function.signature(db).overloads.as_slice() else {
+            return None;
+        };
+        Some(signature)
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the type application hook requires this signature"
+    )]
+    fn application<'db>(
+        db: &'db TestDb,
+        application: ProvidedTypeApplication<'_, 'db>,
+        context: &mut dyn TypeExpressionContext<'db>,
+    ) -> Option<Type<'db>> {
+        let ProvidedTypeApplication {
+            expression,
+            value_type,
+            definition: _,
+        } = application;
+        let signature = signature(db, value_type)?;
+        Some(context.infer_specialized_return_type(expression, signature))
+    }
+
+    fn annotation<'db>(
+        db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        value_type: Type<'db>,
+        _definition: Option<Definition<'db>>,
+    ) -> Option<Type<'db>> {
+        let signature = signature(db, value_type)?;
+        Some(signature.default_specialized_return_type(db))
+    }
+
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_type_application_provider(application)
+        .with_type_reference_provider(annotation)
+        .with_file(
+            "/src/schema.pyi",
+            "def Items[T = str]() -> list[T]: ...\n\
+             def Bounded[T: str]() -> list[T]: ...\n\
+             def Plain() -> int: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from schema import Items as Alias, Bounded, Plain
+
+explicit: Alias[int] = [1]
+default: Alias = ["ok"]
+empty: Alias[()] = ["ok"]
+bounded: Bounded[str] = ["ok"]
+plain: Plain = 1
+
+def generic[T](value: T) -> Alias[T]:
+    return [value]
+
+def shadow() -> None:
+    class Alias[T]: ...
+    value: Alias[int] = Alias()
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    db.write_file(
+        "/src/main.py",
+        r#"
+from schema import Items, Bounded, Plain
+
+explicit: Items[int] = ["bad"]
+default: Items = [1]
+bound: Bounded[int] = [1]
+excess: Items[int, str] = []
+missing: Bounded[()] = []
+nongeneric: Plain[str] = 1
+"#,
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "invalid-assignment",
+            "invalid-assignment",
+            "invalid-type-arguments",
+            "invalid-type-arguments",
+            "invalid-type-arguments",
+            "not-subscriptable",
+        ],
+        "{diagnostics:#?}",
+    );
+    Ok(())
+}
+
+struct AllocationSource;
+
+impl SourceProvider for AllocationSource {
+    fn allocation_class<'db>(
+        &self,
+        db: &'db TestDb,
+        program: crate::Program<'db>,
+        class: KnownClass,
+    ) -> Option<ProvidedBindingValue<'db>> {
+        if class != KnownClass::Dict
+            || program.semantic_namespace(db).as_deref() == Some("unallocated")
+        {
+            return None;
+        }
+        let file = system_path_to_file(db, "/src/leaf.pyi").ok()?;
+        Some(ProvidedBindingValue::Export {
+            file: db.program_file(file),
+            name: Name::new_static("Exact"),
+            value: None,
+        })
+    }
+
+    fn statements(
+        &self,
+        _db: &TestDb,
+        _file: ProgramFile<'_>,
+    ) -> Vec<ty_python_core::definition::ProvidedStatement> {
+        Vec::new()
+    }
+    fn annotation<'db>(
+        &self,
+        _db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        _owner: NodeIndex,
+    ) -> Option<ty_python_core::ProvidedAnnotation<'db>> {
+        None
+    }
+    fn binding<'db>(
+        &self,
+        _db: &'db TestDb,
+        _definition: ty_python_core::definition::Definition<'db>,
+    ) -> ProvidedBindingResolution<'db> {
+        ProvidedBindingValue::Unresolved.into()
+    }
+    fn builtin<'db>(
+        &self,
+        _db: &'db TestDb,
+        _file: ProgramFile<'db>,
+        _name: &str,
+        _usage: BuiltinUsage,
+    ) -> Option<ProvidedBindingValue<'db>> {
+        None
+    }
+}
+
+#[test]
+fn supplied_allocation_uses_collection_and_constructor_inference() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_source_provider(AllocationSource)
+        .with_file(
+            "/src/leaf.pyi",
+            "from typing import final\n@final\nclass Exact[K, V](dict[K, V]): ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from leaf import Exact
+from typing import Callable, TypedDict
+
+literal: Exact[str, int] = {"x": 1}
+empty: Exact[str, int] = {}
+nested: Exact[str, Exact[str, int]] = {"x": {}}
+comp: Exact[str, int] = {key: 1 for key in ["x"]}
+specialized: Exact[str, int] = dict[str, int]()
+constructor: Callable[[dict[str, int]], Exact[str, int]] = dict
+constructor_specialized: Callable[[dict[str, int]], Exact[str, int]] = dict[str, int]
+alias = dict
+aliased: Exact[str, int] = alias(x=1)
+
+def consume(value: Exact[str, int]) -> None: ...
+def later() -> None:
+    value = {}
+    consume(value)
+
+def generic_empty[K, V]() -> dict[K, V]:
+    return {}
+
+def generic_mutation[K, V](key: K, value: V) -> tuple[dict[K, V], int]:
+    result = {}
+    for _ in range(1):
+        result[key] = value
+    return result, 0
+
+def callback() -> None: ...
+def later_update(enabled: bool) -> object:
+    result = {"callback": callback}
+    if enabled:
+        result.update(nullable=None)
+    return result
+
+def annotated_update() -> None:
+    result: Exact[str, int] = {"x": 1}
+    result.update(invalid=None)
+
+class Row(TypedDict):
+    x: int
+row: Row = {"x": 1}
+def erase(value: dict[str, int], schema: Row) -> None:
+    exact: Exact[str, int] = value
+    structural: Exact[str, int] = schema
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = crate::types::check_types(&db, db.program_file(file));
+    let ids: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.id().as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "invalid-argument-type",
+            "invalid-assignment",
+            "invalid-assignment"
+        ],
+        "{diagnostics:#?}"
+    );
+    let program = db.program_file(file);
+    let model = SemanticModel::new(&db, program);
+    let env = ProgramEnvironment::from_file(program);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let mut returned_types = Vec::new();
+    for statement in module.suite() {
+        let Some(function) = statement.as_function_def_stmt() else {
+            continue;
+        };
+        if !matches!(
+            function.name.as_str(),
+            "generic_empty" | "generic_mutation" | "later_update"
+        ) {
+            continue;
+        }
+        let returned = function.body.last().unwrap().as_return_stmt().unwrap();
+        let result = returned.value.as_ref().unwrap();
+        returned_types.push(
+            result
+                .inferred_type(&model)
+                .unwrap()
+                .display(&db, &env)
+                .to_string(),
+        );
+    }
+    assert_eq!(
+        returned_types,
+        [
+            "Exact[K@generic_empty, V@generic_empty]",
+            "tuple[Exact[K@generic_mutation, V@generic_mutation], Literal[0]]",
+            "Exact[str, None | (() -> None)]",
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_allocation_preserves_parameter_contents() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_source_provider(AllocationSource)
+        .with_file(
+            "/src/leaf.pyi",
+            "from typing import final\n@final\nclass Exact[K, V](dict[K, V]): ...\n",
+        )
+        .with_file(
+            "/src/native.pyi",
+            "def observed(value: object) -> bool: ...\ndef first(value: object) -> object: ...\ndef expose(value: object) -> None: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from leaf import Exact
+from native import observed, first, expose
+from typing import Literal
+from typing_extensions import assert_type
+
+def exact(values: Exact[str, object]) -> None:
+    values.values()
+    assert_type(observed(values), Literal[True])
+    values.clear()
+    values['first'] = 1
+    assert_type(first(values), Literal[1])
+
+def assigned(original: Exact[str, object]) -> None:
+    values: Exact[str, object] = original
+    values.clear()
+    values['first'] = 1
+    assert_type(first(values), Literal[1])
+
+def exposed(values: Exact[str, object]) -> None:
+    values.clear()
+    values['first'] = 1
+    expose(values)
+    assert_type(first(values), object)
+
+def optional(values: Exact[str, int | None] | None) -> None:
+    if values is None:
+        return
+    values.values()
+    assert_type(observed(values), Literal[True])
+    assert_type(list(values.values())[0], int | None)
+
+def apply(*, tags: list[str], testonly: bool = False) -> None: ...
+
+def augment(testonly: bool) -> None:
+    options = {"tags": ["manual"]}
+    if testonly:
+        options["testonly"] = testonly
+    options["tags"] += ["local"]
+    assert_type(options["tags"], list[str])
+    apply(**options)
+
+def nominal(values: dict[str, object]) -> None:
+    values.values()
+    assert_type(observed(values), Literal[False])
+    values.clear()
+    values['first'] = 1
+    assert_type(first(values), object)
+"#,
+        )
+        .with_call_result_provider(|db, call| {
+            let name = call.declaration().and_then(|declaration| declaration.name(db));
+            let result = match name.as_deref() {
+                Some("observed") => Some(Type::bool_literal(
+                    call.dictionary_argument(db, "value").is_some(),
+                )),
+                Some("first") => Some(
+                    call.dictionary_argument(db, "value")
+                        .and_then(|dictionary| match dictionary.first_entry {
+                            DictionaryFirstEntry::Entry { key: _, value } => Some(value),
+                            DictionaryFirstEntry::Unknown => None,
+                            DictionaryFirstEntry::Empty => None,
+                        })
+                        .unwrap_or(Type::object()),
+                ),
+                _ => None,
+            };
+            result.into()
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn supplied_allocation_follows_program_and_declaration_edits() -> anyhow::Result<()> {
+    let leaf = "from typing import final\n@final\nclass Exact[K, V](dict[K, V]): ...\n";
+    let mut db = TestDbBuilder::new()
+        .with_source_provider(AllocationSource)
+        .with_file("/src/leaf.pyi", leaf)
+        .with_file("/src/main.py", "value = {'x': 1}\n")
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (declaration, expected) in [
+        (leaf, "Exact[str, int]"),
+        (
+            "from typing import final\n@final\nclass Exact[K, V](dict[V, K]): ...\n",
+            "dict[str, int]",
+        ),
+        (leaf, "Exact[str, int]"),
+    ] {
+        db.write_file("/src/leaf.pyi", declaration)?;
+        let program = db.program_file(file).program(&db);
+        let unallocated = crate::Program::with_semantic_namespace(
+            &db,
+            program.python_platform(&db),
+            program.resolver_environment(&db),
+            &Name::new_static("unallocated"),
+        );
+        for (program, expected) in [(program, expected), (unallocated, "dict[str, int]")] {
+            let source = ProgramFile::new(&db, file, program);
+            let env = ProgramEnvironment::from_file(source);
+            let actual = crate::place::global_symbol(&db, source, "value")
+                .place
+                .expect_type();
+            assert_eq!(actual.display(&db, &env).to_string(), expected);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_allocation_requires_unchanged_builtin_parameters() -> anyhow::Result<()> {
+    for declaration in [
+        "from typing import final, TypeVar\nK = TypeVar('K', covariant=True)\nV = TypeVar('V')\n@final\nclass Exact(dict[K,V]): ...\n",
+        "from typing import final\n@final\nclass Exact[K, V](dict[V,K]): ...\n",
+        "from typing import final\n@final\nclass Exact[K: str, V](dict[K,V]): ...\n",
+        "from typing import final\n@final\nclass Exact[K, V = int](dict[K,V]): ...\n",
+        "from typing import final\nfrom dataclasses import dataclass\n@final\n@dataclass\nclass Exact[K, V](dict[K,V]): ...\n",
+        "from typing import final\n@final\nclass Exact[K, V](dict[K,V]):\n    def clear(self) -> int: ...\n",
+    ] {
+        let db = TestDbBuilder::new()
+            .with_source_provider(AllocationSource)
+            .with_file("/src/leaf.pyi", declaration)
+            .build()?;
+        assert!(
+            KnownClass::Dict
+                .provided_allocation_class(&db, &db.program_environment())
+                .is_none(),
+            "{declaration}"
+        );
+    }
+    Ok(())
+}
+
+crate::declare_lint! {
+    /// An obligation supplied by an application after checking a call.
+    static PROVIDED_CALL_CHECK = {
+        summary: "reports an application-specific call check",
+        status: crate::lint::LintStatus::stable("0.0.0"),
+        default_level: crate::lint::Level::Warn,
+    }
+}
+
+#[test]
+fn supplied_call_target_uses_ordinary_binding_without_changing_other_uses() -> anyhow::Result<()> {
+    let source = "\
+from native import Ordinary, make
+proxy = make()
+read = proxy
+valid: int = proxy(checked=1)
+invalid = proxy(checked='bad')
+ordinary: object = proxy(unchecked='ok')
+proxy(rejected=True)
+proxy(rejected=True)  # ty: ignore[invalid-argument-type]
+Ordinary()(checked='not a proxy')
+if False:
+    proxy(unreachable=True)
+";
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "class Ordinary:\n    def __call__(self, **kwargs: object) -> object: ...\ndef make() -> Ordinary: ...\n",
+        )
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(|db, call| {
+            let Some(declaration) = call.declaration() else {
+                return ProvidedCallResult::default();
+            };
+            if declaration.name(db).as_deref() != Some("make") {
+                return ProvidedCallResult::default();
+            }
+            let env = ProgramEnvironment::from_file(call.file());
+            let base = crate::place::global_symbol(db, declaration.program_file(db), "Ordinary")
+                .place
+                .expect_type();
+            let class = call.class_type(
+                db,
+                ProvidedClass {
+                    name: Name::new_static("Proxy"),
+                    bases: Box::from([base]),
+                    class_members: Box::default(),
+                    instance_fields: ProvidedInstanceFields {
+                        fields: Box::default(),
+                        has_dynamic_fields: false,
+                        implications: Box::default(),
+                        data: Some(ProvidedData::new(Name::new_static("proxy"))),
+                    }
+                    .into(),
+                },
+            );
+            class.to_instance_approximation(db, &env).into()
+        })
+        .with_call_target_provider(|db, file, call, class, data| {
+            assert_eq!(data.downcast_ref::<Name>().map(Name::as_str), Some("proxy"));
+            let [keyword] = call.arguments.keywords.as_ref() else {
+                return Ok(None);
+            };
+            match keyword.arg.as_ref().map(|name| name.as_str()) {
+                Some("unchecked") => return Ok(None),
+                Some("rejected") => {
+                    let mut diagnostic = Diagnostic::new(
+                        DiagnosticId::lint("invalid-argument-type"),
+                        Severity::Error,
+                        "Rejected by the application",
+                    );
+                    diagnostic.annotate(Annotation::primary(
+                        Span::from(file.file(db)).with_range(call.range()),
+                    ));
+                    return Err(diagnostic);
+                }
+                Some("checked") => {}
+                other => panic!("unexpected call target: {other:?}"),
+            }
+            let env = ProgramEnvironment::from_file(file);
+            let int = KnownClass::Int.to_instance(db, &env);
+            let callable = Type::function_like_callable(
+                db,
+                Signature::new(
+                    Parameters::standard([
+                        Parameter::positional_only(Some(Name::new_static("self"))),
+                        Parameter::keyword_only(Name::new_static("checked"))
+                            .with_annotated_type(int),
+                    ]),
+                    int,
+                ),
+            );
+            let class = ProvidedClass {
+                name: Name::new_static("Proxy"),
+                bases: Box::from([class]),
+                class_members: Box::from([(Name::new_static("__call__"), callable)]),
+                instance_fields: ProvidedInstanceFields::default().into(),
+            }
+            .into_type_at_expression(db, file, ast::ExprRef::Call(call))
+            .unwrap();
+            Ok(class.to_instance_approximation(db, &env))
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| &source[diagnostic.range().unwrap()])
+            .collect::<Vec<_>>(),
+        ["checked='bad'", "proxy(rejected=True)"],
+        "{diagnostics:#?}",
+    );
+    let file = db.program_file(file);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type()
+    };
+    assert_eq!(symbol("proxy"), symbol("read"));
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let valid = module.suite()[3].as_ann_assign_stmt().unwrap();
+    let call = valid.value.as_deref().unwrap().as_call_expr().unwrap();
+    let model = SemanticModel::new(&db, file);
+    let target = call.func.inferred_type(&model).unwrap();
+    assert_ne!(target, symbol("proxy"));
+    assert!(target.is_assignable_to(&db, &model.program_environment(), symbol("proxy")));
+    Ok(())
+}
+
+#[test]
+fn supplied_call_diagnostics_follow_native_policy() -> anyhow::Result<()> {
+    fn check<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
+        if call
+            .declaration()
+            .and_then(|definition| definition.name(db))
+            .as_deref()
+            != Some("make")
+        {
+            return ProvidedCallResult::default();
+        }
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticId::Lint(PROVIDED_CALL_CHECK.name()),
+            Severity::Warning,
+            "Application call obligation",
+        );
+        diagnostic.annotate(Annotation::primary(
+            Span::from(call.file().file(db)).with_range(call.call().range()),
+        ));
+        ProvidedCallResult {
+            return_type: None,
+            diagnostics: vec![diagnostic],
+        }
+    }
+
+    for (source, enabled, expected) in [
+        ("result = make(1)\n", true, vec!["provided-call-check"]),
+        (
+            "result = make('bad')\n",
+            true,
+            vec!["invalid-argument-type", "provided-call-check"],
+        ),
+        (
+            "result = make('bad')\n",
+            false,
+            vec!["invalid-argument-type"],
+        ),
+        (
+            "result = make(1) # ty: ignore[provided-call-check]\n",
+            true,
+            vec![],
+        ),
+        ("if False:\n    make(1)\nresult: int = 1\n", true, vec![]),
+        (
+            "from typing import no_type_check\n@no_type_check\ndef skipped() -> int:\n    return make(1)\nresult: int = 1\n",
+            true,
+            vec![],
+        ),
+    ] {
+        let mut registry =
+            crate::lint::LintRegistryBuilder::from(crate::default_lint_registry().clone());
+        registry.register_lint(&PROVIDED_CALL_CHECK);
+        let registry = registry.build();
+        let mut rules = crate::lint::RuleSelection::from_registry(&registry);
+        if !enabled {
+            rules.disable(registry.get("provided-call-check").unwrap());
+        }
+        let db = TestDbBuilder::new()
+            .with_lint_registry(registry)
+            .with_rule_selection(rules)
+            .with_call_result_provider(check)
+            .with_file("/src/native.pyi", "def make(value: int) -> int: ...\n")
+            .with_file(
+                "/src/main.py",
+                &format!("from native import make\n{source}"),
+            )
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let diagnostics =
+            crate::types::check_types_with_diagnostics(&db, db.program_file(file), []);
+        let mut ids: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "{source}: {diagnostics:#?}");
+        let file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(file);
+        let result = crate::place::global_symbol(&db, file, "result")
+            .place
+            .expect_type();
+        assert_eq!(result, KnownClass::Int.to_instance(&db, &env), "{source}");
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_call_result_infers_an_annotation_in_the_callers_scope() -> anyhow::Result<()> {
+    let source = r#"
+from native import decode_a, decode_b
+from typing_extensions import assert_type
+
+def parse(flag: bool):
+    Local = str
+    decode = decode_a if flag else decode_b
+    assert_type(decode("list[Local]"), list[str])
+    decode("Missing")
+    decode("list[")
+    decode("Silenced")  # ty: ignore[unresolved-reference]
+"#;
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "def decode_a(schema: str) -> object: ...\ndef decode_b(schema: str) -> object: ...\n",
+        )
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(|_, call| {
+            let CheckedArgument::Value {
+                expression: Some(owner),
+                ty: _,
+            } = call.argument("schema")
+            else {
+                return ProvidedCallResult::default();
+            };
+            let literal = owner
+                .as_string_literal_expr()
+                .unwrap()
+                .as_single_part_string()
+                .unwrap();
+            call.infer_annotation_at(owner, literal.content_range())
+                .into()
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.id().as_str(),
+                &source[diagnostic.range().unwrap()]
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("unresolved-reference", "Missing"),
+            ("invalid-type-form", "")
+        ],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_call_results_follow_selected_overloads() -> anyhow::Result<()> {
+    fn result<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
+        let name = call
+            .declaration()
+            .and_then(|definition| definition.name(db));
+        match name.as_deref() {
+            Some("select" | "first" | "ambiguous") => {
+                assert!(!call.has_binding_errors());
+                assert!(!matches!(
+                    call.argument("rejected"),
+                    CheckedArgument::Value { .. }
+                ));
+                let (parameter, value, expected) =
+                    if matches!(call.argument("one"), CheckedArgument::Value { .. }) {
+                        ("one", 1, KnownClass::Int)
+                    } else {
+                        assert!(matches!(
+                            call.argument("two"),
+                            CheckedArgument::Value { .. }
+                        ));
+                        ("two", 2, KnownClass::Str)
+                    };
+                let env = ProgramEnvironment::from_file(call.file());
+                assert_eq!(
+                    call.expected_parameter_type(db, parameter),
+                    Some(expected.to_instance(db, &env)),
+                );
+                Some(Type::int_literal(value)).into()
+            }
+            Some("generic") => call.expected_parameter_type(db, "value").into(),
+            Some("expanded") => panic!("one overload handles two expansions"),
+            Some("shared") => Some(Type::int_literal(3)).into(),
+            Some("partial") if matches!(call.argument("one"), CheckedArgument::Value { .. }) => {
+                Some(KnownClass::Str.to_instance(db, &ProgramEnvironment::from_file(call.file())))
+                    .into()
+            }
+            Some("recover") => {
+                assert!(call.has_binding_errors());
+                Some(Type::int_literal(-1)).into()
+            }
+            _ => ProvidedCallResult::default(),
+        }
+    }
+
+    let db = TestDbBuilder::new()
+        .with_call_result_provider(result)
+        .with_file(
+            "/src/native.pyi",
+            r#"
+from typing import Any, overload
+@overload
+def select(one: int) -> object: ...
+@overload
+def select(two: str, suffix: str) -> object: ...
+@overload
+def first(one: int) -> object: ...
+@overload
+def first(rejected: object) -> object: ...
+@overload
+def ambiguous(one: int) -> int: ...
+@overload
+def ambiguous(two: str) -> str: ...
+@overload
+def shared(one: int) -> int: ...
+@overload
+def shared(two: str) -> str: ...
+@overload
+def partial(one: int) -> int: ...
+@overload
+def partial(two: str) -> str: ...
+@overload
+def expanded(one: int | bytes) -> int: ...
+@overload
+def expanded(two: str) -> str: ...
+def recover(value: int) -> int: ...
+def gradual() -> Any: ...
+def generic[T](values: list[T], value: T) -> object: ...
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from native import select, first, ambiguous, shared, partial, expanded, recover, gradual, generic
+from typing import Literal
+from typing_extensions import assert_type
+
+assert_type(select(1), Literal[1])
+assert_type(select("a", "b"), Literal[2])
+assert_type(first(1), Literal[1])
+integers: list[int] = []
+assert_type(generic(integers, value=True), int)
+assert_type(generic(integers, **{"value": True}), int)
+value = gradual()
+ambiguous_result = ambiguous(value)
+assert_type(shared(value), Literal[3])
+partial_result = partial(value)
+def expand(value: int | bytes | str):
+    assert_type(expanded(value), int | str)
+invalid = select([])
+recovered = recover("bad")
+assert_type(recovered, Literal[-1])
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type", "invalid-argument-type"],
+        "{diagnostics:#?}"
+    );
+    let file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(file);
+    let actual = crate::place::global_symbol(&db, file, "ambiguous_result")
+        .place
+        .expect_type();
+    let expected = crate::types::IntersectionType::from_two_elements(
+        &db,
+        &env,
+        Type::Dynamic(crate::types::DynamicType::AmbiguousOverload),
+        crate::types::UnionType::from_elements(
+            &db,
+            &env,
+            [Type::int_literal(1), Type::int_literal(2)],
+        ),
+    );
+    assert_eq!(actual, expected);
+    let actual = crate::place::global_symbol(&db, file, "partial_result")
+        .place
+        .expect_type();
+    let expected = crate::types::IntersectionType::from_two_elements(
+        &db,
+        &env,
+        Type::Dynamic(crate::types::DynamicType::AmbiguousOverload),
+        KnownClass::Str.to_instance(&db, &env),
+    );
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
+fn supplied_call_results_follow_complete_expansion_bindings() -> anyhow::Result<()> {
+    fn result<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
+        match call
+            .declaration()
+            .and_then(|definition| definition.name(db))
+            .as_deref()
+        {
+            Some("ambiguous_expansion" | "limited") => {
+                panic!("an incomplete expansion cannot supply checked bindings")
+            }
+            Some("correlated") => {}
+            _ => return ProvidedCallResult::default(),
+        }
+        let CheckedArgument::Value { ty, expression } = call.argument("value") else {
+            panic!("a checked value and source are retained for each expansion");
+        };
+        assert!(matches!(expression, Some(ast::Expr::Name(_))));
+        let env = ProgramEnvironment::from_file(call.file());
+        let mut common = Diagnostic::new(
+            DiagnosticId::Lint(PROVIDED_CALL_CHECK.name()),
+            Severity::Warning,
+            "Both alternatives violate an application contract",
+        );
+        common.annotate(Annotation::primary(
+            Span::from(call.file().file(db)).with_range(call.call().range()),
+        ));
+        if ty == KnownClass::Str.to_instance(db, &env) {
+            return ProvidedCallResult {
+                return_type: None,
+                diagnostics: vec![common],
+            };
+        }
+        assert_eq!(ty, KnownClass::Int.to_instance(db, &env));
+        let mut integer_only = common.clone();
+        integer_only.set_headline_message("Only the integer arm violates another contract");
+        ProvidedCallResult {
+            return_type: Some(Type::int_literal(0)),
+            diagnostics: vec![common, integer_only],
+        }
+    }
+
+    let mut registry =
+        crate::lint::LintRegistryBuilder::from(crate::default_lint_registry().clone());
+    registry.register_lint(&PROVIDED_CALL_CHECK);
+    let registry = registry.build();
+    let rules = crate::lint::RuleSelection::from_registry(&registry);
+    let db = TestDbBuilder::new()
+        .with_lint_registry(registry)
+        .with_rule_selection(rules)
+        .with_call_result_provider(result)
+        .with_file(
+            "/src/native.pyi",
+            r#"from typing import overload
+@overload
+def correlated(value: int) -> int: ...
+@overload
+def correlated(value: str) -> str: ...
+@overload
+def ambiguous_expansion(first: int, second: int) -> int: ...
+@overload
+def ambiguous_expansion(first: int, second: str) -> str: ...
+@overload
+def ambiguous_expansion(first: str, second: str) -> str: ...
+@overload
+def limited(*values: int) -> int: ...
+@overload
+def limited(*values: str) -> str: ...
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            r#"from typing import Any, Literal
+from typing_extensions import assert_type
+from native import ambiguous_expansion, correlated, limited
+
+def check(value: int | str, uncertain: tuple[int, Any] | tuple[str, str]) -> None:
+    assert_type(correlated(value), Literal[0] | str)
+    ambiguous_expansion(*uncertain)
+    limited(value, value, value, value, value, value, value, value, value)
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = crate::types::check_types_with_diagnostics(&db, db.program_file(file), []);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "provided-call-check",
+            "provided-call-check",
+            "no-matching-overload",
+        ],
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics[0].headline_message(),
+        "Both alternatives violate an application contract"
+    );
+    assert_eq!(
+        diagnostics[1].headline_message(),
+        "Only the integer arm violates another contract"
+    );
+    assert!(diagnostics[2].sub_diagnostics().iter().any(|sub| {
+        sub.headline_message()
+            .starts_with("Limit of argument type expansion reached")
+    }));
+    Ok(())
+}
+
+fn runtime_type_test<'db>(
+    db: &'db TestDb,
+    file: ProgramFile<'db>,
+    callable: Type<'db>,
+    compared_value: Type<'db>,
+) -> Option<Type<'db>> {
+    let Type::FunctionLiteral(function) = callable else {
+        return None;
+    };
+    let definition = function.definition(db);
+    let path = definition.program_file(db).file(db).path(db);
+    let path = path.as_system_path()?;
+    let name = definition.name(db)?;
+    if path.as_str() != "/src/native.pyi" || name.as_str() != "category" {
+        return None;
+    }
+    let env = ProgramEnvironment::from_file(file);
+    let class = match compared_value.string_literal_value(db)? {
+        "list" => KnownClass::List,
+        "tuple" => return Some(Type::homogeneous_tuple(db, &env, Type::unknown())),
+        "str" => KnownClass::Str,
+        _ => return None,
+    };
+    Some(class.to_instance_unknown(db, &env))
+}
+
+#[test]
+fn supplied_type_tests_share_flow_narrowing() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "\
+from collections.abc import Sequence
+from typing import Any
+def category(value: object, *args: object, **kwargs: object) -> str: ...
+def unknown(): ...
+value: list[int] | str
+iterable: list[int] | tuple[int, ...] | str
+sequence: Sequence[int]
+dynamic: Any
+tag: str
+",
+        )
+        .with_file("/src/main.py", "")
+        .with_type_test_provider(runtime_type_test)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (setup, condition, positive, negative) in [
+        ("", "category(value) == 'list'", "list[int]", "str"),
+        ("", "'list' == category(value)", "list[int]", "str"),
+        ("", "category(value) != 'list'", "str", "list[int]"),
+        ("", "'list' != category(value)", "str", "list[int]"),
+        ("", "not (category(value) != 'list')", "list[int]", "str"),
+        ("", "category(value) in ('list',)", "list[int]", "str"),
+        ("", "category(value) not in ('list',)", "str", "list[int]"),
+        ("", "not (category(value) in ['list'])", "str", "list[int]"),
+        (
+            "value = iterable",
+            "category(value) in ('list', 'tuple')",
+            "list[int] | tuple[int, ...]",
+            "str",
+        ),
+        (
+            "value = iterable\ntags = ('list', 'tuple')",
+            "category(value) in tags",
+            "list[int] | tuple[int, ...]",
+            "str",
+        ),
+        (
+            "choice = 'list' if tag else 'str'",
+            "category(value) in (choice,)",
+            "list[int] | str",
+            "list[int] | str",
+        ),
+        (
+            "class Tags(tuple[str, ...]):\n    def __contains__(self, value: object) -> bool:\n        return True\ntags = Tags(('list',))",
+            "category(value) in tags",
+            "list[int] | str",
+            "list[int] | str",
+        ),
+        (
+            "",
+            "category(value) == 'list' or category(value) == 'str'",
+            "list[int] | str",
+            "Never",
+        ),
+        (
+            "",
+            "category(value) != 'str' and category(value) == 'list'",
+            "list[int]",
+            "str",
+        ),
+        (
+            "alias = category",
+            "alias(value) == 'list'",
+            "list[int]",
+            "str",
+        ),
+        (
+            "predicate = category(value) == 'list'",
+            "predicate",
+            "list[int]",
+            "str",
+        ),
+        (
+            "predicate = category(value) == 'list'\nvalue = tag",
+            "predicate",
+            "str",
+            "str",
+        ),
+        (
+            "value = sequence",
+            "category(value) == 'list'",
+            "list[int]",
+            "Sequence[int] & ~Top[list[Unknown]]",
+        ),
+        (
+            "value = dynamic",
+            "category(value) == 'list'",
+            "Any & list[Unknown]",
+            "Any & ~Top[list[Unknown]]",
+        ),
+        (
+            "value = unknown()",
+            "category(value) == 'list'",
+            "Unknown & list[Unknown]",
+            "Unknown & ~Top[list[Unknown]]",
+        ),
+        (
+            "def category(value: object) -> str:\n    return str(value)",
+            "category(value) == 'list'",
+            "list[int] | str",
+            "list[int] | str",
+        ),
+    ] {
+        let source = format!(
+            "from native import category, value, iterable, sequence, dynamic, unknown, tag\n{setup}\nif {condition}:\n    positive = value\nelse:\n    negative = value\n",
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let program_file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program_file);
+        for (name, expected) in [("positive", positive), ("negative", negative)] {
+            let actual = crate::place::global_symbol(&db, program_file, name)
+                .place
+                .expect_type();
+            assert_eq!(
+                actual.display(&db, &env).to_string(),
+                expected,
+                "{source}: {name}"
+            );
+        }
+    }
+    for condition in [
+        "category(value) == 'missing'",
+        "category(value) == tag",
+        "category(value=value) == 'list'",
+        "category(value, value) == 'list'",
+        "category(value, extra=value) == 'list'",
+        "category(value) is 'list'",
+        "category(value) < 'list'",
+        "category(value) in ('list', tag)",
+        "category(value) in ('list', 'missing')",
+        "'list' in category(value)",
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!(
+                "from native import category, value, tag\nif {condition}:\n    result = value\n"
+            ),
+        )?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{condition}: {diagnostics:#?}");
+        let program_file = db.program_file(file);
+        let result = crate::place::global_symbol(&db, program_file, "result")
+            .place
+            .expect_type();
+        let env = ProgramEnvironment::from_file(program_file);
+        assert_eq!(
+            result.display(&db, &env).to_string(),
+            "list[int] | str",
+            "{condition}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_type_tests_recover_saved_call_results() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", "def category(value: object) -> str: ...")
+        .with_file(
+            "/src/main.py",
+            r#"
+from native import category
+from typing_extensions import assert_type
+
+def saved(value: list[int] | str):
+    tag = category(value)
+    if tag == "list":
+        assert_type(value, list[int])
+    else:
+        assert_type(value, str)
+
+def per_iteration(values: list[list[int] | str]):
+    for value in values:
+        tag = category(value)
+        if "list" == tag:
+            assert_type(value, list[int])
+        else:
+            assert_type(value, str)
+
+def reassigned_subject(value: list[int] | str, replacement: list[int] | str):
+    tag = category(value)
+    value = replacement
+    if tag == "list":
+        assert_type(value, list[int] | str)
+
+def reassigned_tag(value: list[int] | str, replacement: str):
+    tag = category(value)
+    tag = replacement
+    if tag == "list":
+        assert_type(value, list[int] | str)
+
+def nested_writer(value: list[int] | str, replacement: list[int] | str):
+    def replace():
+        nonlocal value
+        value = replacement
+    tag = category(value)
+    replace()
+    if tag == "list":
+        assert_type(value, list[int] | str)
+
+def prior_iteration(values: list[list[int] | str], original: list[int] | str, refresh: bool):
+    tag = category(original)
+    for value in values:
+        if refresh:
+            tag = category(value)
+        if tag == "list":
+            assert_type(value, list[int] | str)
+
+def later_iteration(value: list[int] | str, replacement: list[int] | str, repeat: bool):
+    tag = category(value)
+    while repeat:
+        if tag == "list":
+            assert_type(value, list[int] | str)
+        value = replacement
+
+def shadowed(value: list[int] | str):
+    def category(value: object) -> str:
+        return "list"
+    tag = category(value)
+    if tag == "list":
+        assert_type(value, list[int] | str)
+"#,
+        )
+        .with_type_test_provider(runtime_type_test)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+fn field_implication_factory<'db>(
+    db: &'db TestDb,
+    call: &CheckedCall<'_, 'db>,
+) -> Option<Type<'db>> {
+    let declaration = call.declaration()?;
+    if declaration
+        .program_file(db)
+        .file(db)
+        .path(db)
+        .as_system_path()?
+        .as_str()
+        != "/src/native.pyi"
+    {
+        return None;
+    }
+    let name = declaration.name(db)?;
+    if !matches!(name.as_str(), "record" | "related") {
+        return None;
+    }
+    let fields = call.dictionary_argument(db, "fields")?;
+    if !fields.is_complete() || !fields.items.iter().all(DictionaryItem::is_required) {
+        return None;
+    }
+    let DictionaryItems {
+        items,
+        extra_items: _,
+        first_entry: _,
+    } = fields;
+    let fields = items
+        .into_iter()
+        .map(
+            |DictionaryItem {
+                 name,
+                 ty,
+                 source: _,
+                 kind: _,
+             }| {
+                ProvidedField {
+                    name,
+                    ty,
+                    is_required: true,
+                    source: None,
+                }
+            },
+        )
+        .collect();
+    let env = ProgramEnvironment::from_file(call.file());
+    let bases = match call.argument("base") {
+        CheckedArgument::Omitted => Box::default(),
+        CheckedArgument::Value { ty, expression: _ } => Box::from([ty]),
+        CheckedArgument::Indeterminate => return None,
+    };
+    let implications = if name == "related" {
+        let restriction = match call.argument("restriction") {
+            CheckedArgument::Omitted => KnownClass::Str.to_instance(db, &env),
+            CheckedArgument::Value { ty, expression: _ } => {
+                ty.to_instance_approximation(db, &env)?
+            }
+            CheckedArgument::Indeterminate => return None,
+        };
+        let first = match call.argument("key") {
+            CheckedArgument::Omitted => "first",
+            CheckedArgument::Value { ty, expression: _ } => ty.string_literal_value(db)?,
+            CheckedArgument::Indeterminate => return None,
+        };
+        [first, "second"]
+            .map(|key| ProvidedFieldImplication {
+                guard: Box::from([Name::new("guard"), Name::new(key)]),
+                target: Box::from([Name::new("target"), Name::new(key)]),
+                ty: restriction,
+            })
+            .into()
+    } else {
+        Box::default()
+    };
+    call.class_type(
+        db,
+        ProvidedClass {
+            name: Name::new(name),
+            bases,
+            class_members: Box::default(),
+            instance_fields: ProvidedInstanceFields {
+                fields,
+                has_dynamic_fields: false,
+                implications,
+                data: None,
+            }
+            .into(),
+        },
+    )
+    .to_instance_approximation(db, &env)
+}
+
+const FIELD_IMPLICATION_DECLARATIONS: &str = "\
+from typing import Any
+def record(fields: dict[str, object], base: type = object) -> Any: ...
+def related(fields: dict[str, object], restriction: type = str, key: str = 'first', base: type = object) -> Any: ...
+flag: bool
+optional: int | str | None
+";
+
+const FIELD_IMPLICATION_SETUP: &str = "\
+from native import record, related, flag, optional
+guard = record({'first': flag, 'second': flag, 'other': flag})
+target = record({'first': optional, 'second': optional, 'other': optional})
+ctx = related({'guard': guard, 'target': target})
+other = record({'guard': guard, 'target': target})
+";
+
+#[test]
+fn overload_bodies_check_functions_in_immutable_storage() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    for (base, branch, complete, expected) in [
+        ("object", "return namespace.operation('ok')", true, None),
+        (
+            "object",
+            "namespace.operation('ok')\n        return None",
+            true,
+            Some("invalid-return-type"),
+        ),
+        ("Shadowed", "return namespace.operation('ok')", false, None),
+    ] {
+        let source = format!(
+            r#"from typing import Literal, overload
+from ty_extensions._internal import TypeOf
+from native import record
+
+def operation(value: str) -> str:
+    return value
+
+class Shadowed:
+    @property
+    def operation(self) -> TypeOf[operation]:
+        return operation
+
+namespace = record({{'operation': operation}}, base={base})
+
+@overload
+def f(flag: Literal[True]) -> str: ...
+@overload
+def f(flag: Literal[False]) -> None: ...
+def f(flag: bool) -> str | None:
+    if flag:
+        {branch}
+    return None
+"#
+        );
+        db.write_file("/src/main.py", source)?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let function = crate::place::global_symbol(&db, file, "f")
+            .place
+            .expect_type()
+            .expect_function_literal();
+        let analysis = crate::types::OverloadBodyAnalysis::new(&db, function);
+        assert_eq!(analysis.is_complete(), complete, "{base}: {branch}");
+        let diagnostics =
+            crate::types::check_types_with_overload_analysis(&db, file, [], [analysis]);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            expected.into_iter().collect::<Vec<_>>(),
+            "{base}: {branch}: {diagnostics:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_storage_getattr_comparisons_preserve_saved_receivers() -> anyhow::Result<()> {
+    let declarations = format!(
+        "{FIELD_IMPLICATION_DECLARATIONS}\
+from typing import final
+@final
+class Version(str): ...
+class Closed:
+    def __getattr__(self, name: str) -> object: ...
+number: int
+text: str
+maybe_version: str | None
+version: Version
+"
+    );
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", &declarations)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .with_getattr_result_provider(|db, definition, _, _| {
+            if definition.name(db).as_deref() == Some("__getattr__")
+                && definition
+                    .program_file(db)
+                    .file(db)
+                    .path(db)
+                    .as_system_path()
+                    .is_some_and(|path| path.as_str() == "/src/native.pyi")
+            {
+                ProvidedGetattrPresence::Absent.into()
+            } else {
+                ProvidedGetattrResult::default()
+            }
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (definition, right, before, condition, expected) in [
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "getattr(ctx.attr, 'runtime_jre_version', None) is not None",
+            vec![],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "runtime_version is not None",
+            vec![],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': version}, base=Closed)",
+            "",
+            "runtime_version != None",
+            vec![],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "runtime_version != None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': maybe_version}, base=Closed)",
+            "",
+            "runtime_version is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "class Property(Closed):\n    @property\n    def runtime_jre_version(self) -> str:\n        raise AttributeError()\n",
+            "Property()",
+            "",
+            "getattr(ctx.attr, 'runtime_jre_version', None) is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "class Intercepted(Closed):\n    def __getattribute__(self, name: str) -> str:\n        raise AttributeError()\n",
+            "Intercepted()",
+            "",
+            "runtime_version is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "    ctx = record({'attr': right, 'marker': text})\n",
+            "runtime_version is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "    runtime_version = None\n",
+            "runtime_version is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "getattr(ctx.attr, 'runtime_jre_version', default) == None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "getattr(ctx.attr, (name := 'runtime_jre_version'), None) is not None",
+            vec!["invalid-assignment"],
+        ),
+        (
+            "",
+            "record({'runtime_jre_version': text}, base=Closed)",
+            "",
+            "getattr(ctx.attr, 'runtime_jre_version', ((ctx := record({'attr': right, 'marker': text})), None)[1]) is not None",
+            vec!["invalid-assignment"],
+        ),
+    ] {
+        let fallback = if expected.is_empty() {
+            "ctx.attr.jre_version"
+        } else {
+            "'fallback'"
+        };
+        let source = format!(
+            "from native import record, Closed, flag, number, text, maybe_version, version\n{definition}\
+def run(default: object):
+    left = record({{'jre_version': text}}, base=Closed)
+    right = {right}
+    ctx = record({{'attr': left, 'marker': number}}) if flag else record({{'attr': right, 'marker': text}})
+    runtime_version = getattr(ctx.attr, 'runtime_jre_version', None)
+{before}    if {condition}:
+        pass
+    else:
+        marker: int = ctx.marker
+        print(marker)
+        runtime_version = {fallback}
+    runtime_version = runtime_version or 'default'
+    print(runtime_version)
+"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{source}: {diagnostics:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hasattr_respects_supplied_storage_lookup_precedence() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (definition, expected) in [
+        ("class Base: pass", "Literal[True]"),
+        (
+            "class Base:\n    @property\n    def field(self) -> int: raise AttributeError()",
+            "bool",
+        ),
+        (
+            "class Base:\n    def __getattribute__(self, name: str) -> int: raise AttributeError()",
+            "bool",
+        ),
+        (
+            "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> int: raise AttributeError()\n    def __set__(self, instance: object, value: object) -> None: pass\nclass Base:\n    field = Descriptor()",
+            "bool",
+        ),
+        (
+            "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> int: raise AttributeError()\nclass Base:\n    field = Descriptor()",
+            "Literal[True]",
+        ),
+    ] {
+        let source = format!(
+            "from typing import Literal\nfrom typing_extensions import assert_type\nfrom native import record\n{definition}\nvalue = record({{'field': 1}}, base=Base)\nassert_type(hasattr(value, 'field'), {expected})\n"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_storage_preserves_subscript_continuation() -> anyhow::Result<()> {
+    let declarations = format!(
+        "{FIELD_IMPLICATION_DECLARATIONS}\
+class Target:
+    label: str
+    def __getitem__(self, key: int) -> int: ...
+target: Target | None
+"
+    );
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", &declarations)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (definition, setup, between, extra_errors) in [
+        ("", "attrs = record({'dep': target})", "", vec![]),
+        (
+            "",
+            "attrs = record({'dep': target})",
+            "    ctx = record({'attr': record({'dep': None})})\n",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "",
+            "attrs = record({'dep': target})",
+            "    ctx.attr = record({'dep': None})\n",
+            vec!["invalid-assignment", "unresolved-attribute"],
+        ),
+        (
+            "",
+            "attrs = record({'dep': target})",
+            "    ctx.attr.dep = None\n",
+            vec!["invalid-assignment", "unresolved-attribute"],
+        ),
+        (
+            "class Mutable:\n    dep: Target | None = target\n",
+            "attrs = Mutable()",
+            "",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "class Base:\n    @property\n    def dep(self) -> Target | None: return target\n",
+            "attrs = record({'dep': target}, base=Base)",
+            "",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "class Base:\n    def __getattribute__(self, name: str) -> Target | None: return target\n",
+            "attrs = record({'dep': target}, base=Base)",
+            "",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> Target | None: return target\n    def __set__(self, instance: object, value: object) -> None: pass\nclass Base:\n    dep = Descriptor()\n",
+            "attrs = record({'dep': target}, base=Base)",
+            "",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> Target | None: return target\nclass Base:\n    dep = Descriptor()\n",
+            "attrs = record({'dep': target}, base=Base)",
+            "",
+            vec![],
+        ),
+        (
+            "class Mutable:\n    dep: Target | None = target\n",
+            "attrs = record({'dep': target}) if flag else Mutable()",
+            "",
+            vec!["unresolved-attribute"],
+        ),
+        (
+            "",
+            "attrs = record({'dep': target})\n    def reset():\n        nonlocal ctx\n        ctx = record({'attr': record({'dep': None})})",
+            "    reset()\n",
+            vec!["unresolved-attribute"],
+        ),
+    ] {
+        let source = format!(
+            "from native import record, Target, target, flag\n{definition}\
+def use() -> str:
+    {setup}
+    ctx = record({{'attr': attrs}})
+    ctx.attr.dep[0]
+{between}    return ctx.attr.dep.label
+"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        let expected: Vec<_> = std::iter::once("not-subscriptable")
+            .chain(extra_errors)
+            .collect();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{source}: {diagnostics:#?}",
+        );
+        let lookup = source.find("ctx.attr.dep[0]").unwrap();
+        let first = diagnostics.first().expect("the initial lookup must fail");
+        let range = first.primary_span().unwrap().range().unwrap();
+        assert_eq!(usize::from(range.start()), lookup, "{diagnostics:#?}");
+    }
+    for lookup in [
+        "    try:\n        ctx.attr.dep[0]\n    except TypeError:\n        pass\n",
+        "    flag and ctx.attr.dep[0]\n",
+    ] {
+        let source = format!(
+            "from native import record, target, flag\n\
+def use() -> str:
+    ctx = record({{'attr': record({{'dep': target}})}})
+{lookup}    return ctx.attr.dep.label
+"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            ["not-subscriptable", "unresolved-attribute"],
+            "{source}: {diagnostics:#?}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_share_root_narrowing() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (body, expected) in [
+        (
+            "if ctx.guard.first:\n    result = ctx.target.first\n",
+            "str",
+        ),
+        (
+            "result = ctx.target.first if ctx.guard.first else ''\n",
+            "str",
+        ),
+        (
+            "if ctx.guard.first and ctx.guard.second:\n    result = (ctx.target.first, ctx.target.second)\n",
+            "tuple[str, str]",
+        ),
+        (
+            "if ctx.guard.first:\n    if ctx.guard.second:\n        result = (ctx.target.first, ctx.target.second)\n",
+            "tuple[str, str]",
+        ),
+        (
+            "if ctx.guard.first:\n    result = ctx.target.other\n",
+            "int | str | None",
+        ),
+        (
+            "if not ctx.guard.first:\n    result = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "if ctx.guard.first:\n    pass\nresult = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "if ctx.guard.first:\n    ctx = other\n    result = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "saved = bool(ctx.guard.first)\nif saved:\n    result = ctx.target.first\n",
+            "str",
+        ),
+        (
+            "saved = bool(ctx.guard.first)\nctx = other\nif saved:\n    result = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "ctx = ctx if flag else other\nif ctx.guard.first:\n    result = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "for ctx in (ctx, other):\n    if ctx.guard.first:\n        result = ctx.target.first\n",
+            "int | str | None",
+        ),
+        (
+            "while flag:\n    if ctx.guard.first:\n        result = ctx.target.first\n    ctx = other\n",
+            "int | str | None",
+        ),
+    ] {
+        let source = format!("{FIELD_IMPLICATION_SETUP}{body}");
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{body}: {diagnostics:#?}");
+        let program_file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program_file);
+        let result = crate::place::global_symbol(&db, program_file, "result")
+            .place
+            .expect_type();
+        assert_eq!(result.display(&db, &env).to_string(), expected, "{body}");
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_require_storage() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (definition, receiver, expected) in [
+        (
+            "class Base:\n    @property\n    def first(self) -> bool: return True\n",
+            "guard = record({'first': flag}, base=Base)",
+            "int | str | None",
+        ),
+        (
+            "class Base:\n    @property\n    def first(self) -> int | str | None: return None\n",
+            "target = record({'first': optional}, base=Base)",
+            "int | str | None",
+        ),
+        (
+            "class Base:\n    def __getattribute__(self, name: str) -> object: return object()\n",
+            "guard = record({'first': flag}, base=Base)",
+            "int | str | None",
+        ),
+        (
+            "class Base:\n    first = property(lambda self: True) if flag else False\n",
+            "guard = record({'first': flag}, base=Base)",
+            "int | str | None",
+        ),
+        (
+            "class Base:\n    first = False\n",
+            "guard = record({'first': flag}, base=Base)",
+            "str",
+        ),
+        (
+            "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> bool: return True\nclass Base:\n    first = Descriptor()\n",
+            "guard = record({'first': flag}, base=Base)",
+            "str",
+        ),
+        (
+            "class Mutable:\n    first: bool = False\n",
+            "guard = Mutable()",
+            "int | str | None",
+        ),
+        (
+            "class Mutable:\n    first: bool = False\n",
+            "guard = guard if flag else Mutable()",
+            "int | str | None",
+        ),
+    ] {
+        let source = format!(
+            "{FIELD_IMPLICATION_SETUP}{definition}{receiver}\nctx = related({{'guard': guard, 'target': target}})\nif ctx.guard.first:\n    result = ctx.target.first\n"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let program_file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program_file);
+        let result = crate::place::global_symbol(&db, program_file, "result")
+            .place
+            .expect_type();
+        assert_eq!(result.display(&db, &env).to_string(), expected, "{source}");
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_invalidate_with_declarations() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (declaration, expected) in [
+        ("related({'guard': guard, 'target': target})", "str"),
+        (
+            "record({'guard': guard, 'target': target})",
+            "int | str | None",
+        ),
+        (
+            "related({'guard': guard, 'target': target}, restriction=int)",
+            "int",
+        ),
+        (
+            "related({'guard': guard, 'target': target}, key='other')",
+            "int | str | None",
+        ),
+        ("related({'guard': guard, 'target': target})", "str"),
+    ] {
+        let source = format!(
+            "{FIELD_IMPLICATION_SETUP}ctx = {declaration}\nif ctx.guard.first:\n    result = ctx.target.first\n"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let program_file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program_file);
+        let result = crate::place::global_symbol(&db, program_file, "result")
+            .place
+            .expect_type();
+        assert_eq!(result.display(&db, &env).to_string(), expected, "{source}");
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_keep_invalid_write_diagnostics() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for assignment in [
+        "ctx.guard = guard",
+        "ctx.target = target",
+        "ctx.target.first = 1",
+        "del ctx.guard",
+        "del ctx.target",
+    ] {
+        for condition in ["flag", "ctx.guard.first"] {
+            let source = format!(
+                "{FIELD_IMPLICATION_SETUP}if {condition}:\n    {assignment}\n    result = ctx.target.first\n"
+            );
+            db.write_file("/src/main.py", &source)?;
+            let diagnostics = db.check_file(file);
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+            assert_eq!(diagnostics[0].id().as_str(), "invalid-assignment");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_normalize_recursive_metadata() -> anyhow::Result<()> {
+    let source = "\
+from native import record, related, flag
+def requires_string(value: str) -> None: pass
+guard = record({'first': flag, 'second': flag})
+target = record({'first': object(), 'second': object()})
+ctx = related({'guard': guard, 'target': target})
+while flag:
+    ctx = related({'guard': guard, 'target': target}, restriction=type(ctx))
+    guard_value = ctx.guard.first
+    if ctx.guard.first:
+        result = ctx.target.first
+        requires_string(result)
+";
+    let db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+    let program_file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program_file);
+    let result = crate::place::global_symbol(&db, program_file, "result")
+        .place
+        .expect_type();
+    let guard = crate::place::global_symbol(&db, program_file, "guard_value")
+        .place
+        .expect_type();
+    assert_eq!(guard.display(&db, &env).to_string(), "bool");
+    assert_eq!(result.display(&db, &env).to_string(), "object");
+    Ok(())
+}
+
+#[test]
+fn supplied_field_implications_retain_nominal_and_call_behavior() -> anyhow::Result<()> {
+    let source = format!(
+        "{FIELD_IMPLICATION_SETUP}\
+class Base: pass
+def accept_base(value: Base) -> None: pass
+def accept_string(value: str) -> None: pass
+def use() -> None:
+    replacement = related({{'guard': guard, 'target': target}}, base=Base)
+    ctx = related({{'guard': guard, 'target': target}}, base=Base)
+    def reset() -> None:
+        nonlocal ctx
+        ctx = replacement
+    if ctx.guard.first:
+        accept_base(ctx)
+        reset()
+        accept_string(ctx.target.first)
+"
+    );
+    let db = TestDbBuilder::new()
+        .with_file("/src/native.pyi", FIELD_IMPLICATION_DECLARATIONS)
+        .with_file("/src/main.py", &source)
+        .with_call_result_provider(|db, call| field_implication_factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
+    fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        let contents = match call.declaration()?.name(db)?.as_str() {
+            "observe" => call.dictionary_argument(db, "value"),
+            "observe_child" => {
+                let [argument] = call.call().arguments.args.as_slice() else {
+                    return None;
+                };
+                let [element] = argument.as_tuple_expr()?.elts.as_slice() else {
+                    return None;
+                };
+                call.dictionary_items(db, element)
+            }
+            _ => return None,
+        };
+        let description = match contents {
+            None => "unavailable".to_owned(),
+            Some(dictionary) => match dictionary.first_entry {
+                DictionaryFirstEntry::Unknown => "unknown".to_owned(),
+                DictionaryFirstEntry::Empty => "empty".to_owned(),
+                DictionaryFirstEntry::Entry { key, value } => format!(
+                    "{}: {}",
+                    key.as_deref().unwrap_or("?"),
+                    value.display(db, &ProgramEnvironment::from_file(call.file())),
+                ),
+            },
+        };
+        Some(Type::string_literal(db, description.as_str()))
+    }
+
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "def observe(value: object, other: object = ...) -> str: ...\ndef observe_child(value: object, other: object = ...) -> str: ...\ndef expose(value: object) -> None: ...\ndef preserve(data: object, other: object = ...) -> object: ...\nflag: bool\nkey: str\n",
+        )
+        .with_file("/src/main.py", "")
+.with_call_result_provider(|db, call| observe(db, call).into())
+        .with_parameter_contents_preserver(|db, declaration, parameter| {
+            declaration.name(db).is_some_and(|name| name == "preserve")
+                && declaration
+                    .program_file(db)
+                    .file(db)
+                    .path(db)
+                    .as_system_path()
+                    .is_some_and(|path| path.as_str() == "/src/native.pyi")
+                && parameter == "data"
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (source, expected) in [
+        ("result = observe({})", "empty"),
+        ("result = observe(dict())", "empty"),
+        (
+            "values = {'first': 1}\nresult = observe(value=values, *(values.clear() or ()))",
+            "empty",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(other=values.clear(), *(values,))",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe_child((values,), other=values.clear())",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(value=values, other=values.clear())",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, other=values.clear())",
+            "empty",
+        ),
+        (
+            "left = {'first': 'old'}\nright = {'first': 2}\nresult = observe(left | right, other=right.clear())",
+            "first: Literal[2]",
+        ),
+        (
+            "left = {'first': 1}\nright = {'first': 2}\nresult = observe((left | {}) | right, other=right.clear())",
+            "first: Literal[2]",
+        ),
+        (
+            "from typing_extensions import TypedDict\nclass Fields(TypedDict, closed=True):\n    other: int\ndef fields() -> Fields: return {'other': 2}\nleft = {'first': 1}\nresult = observe(left | fields(), other=left.clear())",
+            "first: Literal[1]",
+        ),
+        (
+            "shared = {'first': 2}\nclass Alias(dict[str, int]):\n    def __ror__(self, other: object) -> dict[str, int]: return shared\nresult = observe({'first': 1} | Alias(), other=shared.clear())",
+            "unavailable",
+        ),
+        (
+            "shared = {'first': 2}\nclass Alias(dict[str, int]):\n    def __or__(self, other: object) -> dict[str, int]: return shared\nleft = Alias()\nresult = observe(left | {'replacement': (left := {})}, other=shared.clear())",
+            "unavailable",
+        ),
+        (
+            "child = {'first': 1}\nleft = {'nested': child}\nresult = observe((left | {})['nested'], other=child.clear())",
+            "unavailable",
+        ),
+        (
+            "left = {'first': 1}\noriginal = left\nresult = observe(left | {'replacement': (left := {})}, other=original.clear())",
+            "unavailable",
+        ),
+        (
+            "left = {'first': 1}\nresult = observe(left | {'replacement': left.clear()}, other=left.clear())",
+            "replacement: None",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, values.update({'first': 2}))",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, other=values.update({'first': 2}))",
+            "first: Literal[2]",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, (values := {'new': 2}))",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, other=(values := {'new': 2}))",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe({'fresh': 3}, expose(values))",
+            "fresh: Literal[3]",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values if flag else values, other=values.clear())",
+            "unavailable",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(dict(), other=values.clear())",
+            "empty",
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(value=values, other='doc')",
+            "first: Literal[1]",
+        ),
+        (
+            "def clear(): expose(values)\nvalues = {'first': 1}\nresult = observe(values, other=[clear])\nclear()",
+            "first: Literal[1]",
+        ),
+        (
+            "def clear(): expose(values)\nvalues = {'first': 1}\nclear()\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "def clear(): expose(values)\ndef run(callback): callback()\nvalues = {'first': 1}\nrun(clear)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "def clear(): expose(values)\nvalues = {'first': 1}\nresult = observe(values, other=clear())",
+            "unknown",
+        ),
+        (
+            "def clear(): values.clear()\nvalues = {'first': 1}\nresult = observe(other=clear(), value=values)",
+            "unknown",
+        ),
+        (
+            "def clear(): values.clear()\nvalues = {'first': 1}\nalias = values\nalias.clear()\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\npreserve(values)\npreserve(data=values)\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\nreader = preserve\nreader(data=values)\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\npreserve(data=values, other=values)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\npreserve(data=values, other=[values])\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\nalias = values\npreserve(data=values, other=alias)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\nalias = values\npreserve(data=values, other=[alias])\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\ndef mutate() -> None:\n    values.clear()\npreserve(data=values, other=mutate)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\npreserve(*[values])\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\npreserve(data=values, **{'other': values})\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'child': {'first': 1}}\npreserve(values)\nresult = observe(values['child'])",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\ndef preserve(data: object) -> None: pass\npreserve(values)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': None, 'second': {}}\nresult = observe(values)",
+            "first: None",
+        ),
+        (
+            "result = observe({'first': 1, 'second': 2, 'first': 3})",
+            "first: Literal[3]",
+        ),
+        (
+            "values = {'first': 1, 'second': 2}\nvalues['first'] = 3\nresult = observe(values)",
+            "first: Literal[3]",
+        ),
+        (
+            "values = {'first': 1}\nvalues['second'] = 2\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {}\nvalues['first'] = 1\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\nvalues[key] = 2\nresult = observe(values)",
+            "first: Literal[1, 2]",
+        ),
+        (
+            "values = {'first': 1, 'second': 2}\ndel values['second']\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1, 'second': 2}\ndel values['first']\nvalues['first'] = 3\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\ndel values[key]\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\nvalues.clear()\nresult = observe(values)",
+            "empty",
+        ),
+        (
+            "values = {'first': 1}\nvalues.clear()\nvalues['second'] = 2\nresult = observe(values)",
+            "second: Literal[2]",
+        ),
+        (
+            "if flag:\n    values = {'first': 1, 'second': 2}\nelse:\n    values = {'second': 2, 'first': 1}\nresult = observe(values)",
+            "?: Literal[1, 2]",
+        ),
+        (
+            "if flag:\n    values = {'first': 1}\nelse:\n    values = {'first': 2}\nresult = observe(values)",
+            "first: Literal[1, 2]",
+        ),
+        (
+            "values = {'first': 1}\nif flag:\n    values.clear()\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\ncopy = dict(values)\nvalues.clear()\nresult = observe(copy)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\ncopy = {**values}\nvalues.clear()\nresult = observe(copy)",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\ncopy = values | {'first': 2}\nvalues.clear()\nresult = observe(copy)",
+            "first: Literal[2]",
+        ),
+        (
+            "values = {'first': 1}\nvalues.update({'first': 2, 'second': 3})\nresult = observe(values)",
+            "first: Literal[2]",
+        ),
+        (
+            "values = {'first': 1}\nvalues.update({'second': 2})\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "extra = {'first': 2}\nif flag:\n    extra.clear()\nvalues = {'first': None}\nvalues.update(extra)\nresult = observe(values)",
+            "first: None | Literal[2]",
+        ),
+        (
+            "values = {}\nvalues[key] = 1\nresult = observe(values)",
+            "?: Literal[1]",
+        ),
+        (
+            "values = {'first': 1}\nexpose(values)\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\nalias = values\nalias.clear()\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "values = {'first': 1}\nbefore = observe(values)\nvalues.clear()\nresult = before",
+            "first: Literal[1]",
+        ),
+        (
+            "values = {'first': 1 if flag else None}\nassert values['first'] is None\nresult = observe(values)",
+            "first: None",
+        ),
+        (
+            "values = {'first': 1 if flag else None}\nis_none = values['first'] is None\nassert is_none\nresult = observe(values)",
+            "first: None",
+        ),
+        (
+            "values = {'first': 1 if flag else None}\nis_none = values['first'] is None\nvalues['first'] = 2\nassert is_none\nresult = observe(values)",
+            "first: Literal[2]",
+        ),
+        (
+            "values = {'first': 1}\nwhile flag:\n    values['second'] = 2\nresult = observe(values)",
+            "first: Literal[1]",
+        ),
+        (
+            "values: dict[str, tuple[int, ...]] = {'first': ()}\nwhile flag:\n    values['first'] += (1,)\nresult = observe(values)",
+            "first: tuple[Literal[1], ...]",
+        ),
+        (
+            "values = {'first': 1 for _ in range(2)}\nresult = observe(values)",
+            "unknown",
+        ),
+        (
+            "from typing_extensions import TypedDict\nclass Schema(TypedDict, closed=True):\n    first: int\n    second: str\ndef source() -> Schema:\n    return {'second': 's', 'first': 1}\nvalues = source()\nresult = observe(values)",
+            "unknown",
+        ),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!(
+                "from native import observe, observe_child, expose, preserve, flag, key\n{source}\n"
+            ),
+        )?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let result = crate::place::global_symbol(&db, db.program_file(file), "result")
+            .place
+            .expect_type();
+        assert_eq!(result.string_literal_value(&db), Some(expected), "{source}");
+    }
+    Ok(())
+}
+
+#[test]
+fn dictionary_observations_follow_retained_fields() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "class Record:\n    values: dict[str, int]\n    other: object\ndef record(*, values: dict[str, int], other: object = ...) -> Record: ...\ndef untrusted(*, values: dict[str, int]) -> Record: ...\ndef observe(value: object, *, other: object = ...) -> str: ...\ndef touch(value: object) -> None: ...\ncondition: bool\n",
+        )
+        .with_file("/src/main.py", "")
+        .with_keyword_field_factory(|db, declaration| {
+            declaration.name(db).is_some_and(|name| name == "record")
+                && declaration
+                    .program_file(db)
+                    .file(db)
+                    .path(db)
+                    .as_system_path()
+                    .is_some_and(|path| path.as_str() == "/src/native.pyi")
+        })
+        .with_call_result_provider(|db, call| {
+            if call
+                .declaration()
+                .and_then(|declaration| declaration.name(db))
+                .is_none_or(|name| name != "observe")
+            {
+                return ProvidedCallResult::default();
+            }
+            let known = call.dictionary_argument(db, "value").is_some_and(|contents| {
+                contents.is_complete()
+                    && contents.items.iter().any(|item| item.name == "first" && item.is_required())
+            });
+            Some(Type::string_literal(db, if known { "known" } else { "unknown" })).into()
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    // Reuse one database/file across mutations: a recovered snapshot must be invalidated
+    // when either the source history, factory identity, or field history changes.
+    for (before, call, intervening, read, expected) in [
+        ("", "record(values=values)", "", "holder.values", "known"),
+        (
+            "",
+            "record(values=values)",
+            "",
+            "dict(holder.values)",
+            "known",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "",
+            "dict(second=2, **holder.values)",
+            "known",
+        ),
+        (
+            "values['second'] = 2\n",
+            "record(values=values)",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "holder.values.clear()\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "holder.values.clear()\n",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "touch(holder)\n",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "alias = holder\n",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "if condition:\n    holder.values.clear()\n",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "",
+            "values, other=holder.values.clear()",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "",
+            "values, other=holder.other",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values, other=values)",
+            "",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values, other=[values])",
+            "",
+            "values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "values.clear()\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "values['second'] = 2\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "alias = values\n",
+            "record(values=values)",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "alias = values\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "alias = holder\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "touch(holder)\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "touch(values)\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "values = {}\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "holder = record(values={})\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "holder.values = {}\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "del holder.values\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "len(values)\n",
+            "holder.values",
+            "known",
+        ),
+        (
+            "def captured() -> None:\n    values.clear()\n",
+            "record(values=values)",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "def captured() -> None:\n    values.clear()\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "def captured() -> None:\n    holder.values.clear()\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "if condition:\n    values.clear()\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values)",
+            "for item in [1]:\n    values['second'] = item\n",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values, other=values)",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values, other=values.clear())",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "record(values=values, other=(values := {}))",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        (
+            "",
+            "untrusted(values=values)",
+            "",
+            "holder.values",
+            "unknown",
+        ),
+        // Even an earlier field read can expose its value; this first slice does not install
+        // persistent field contents or propagate effects through a retained alias.
+        (
+            "",
+            "record(values=values)",
+            "touch(holder.values)\n",
+            "holder.values",
+            "unknown",
+        ),
+        ("", "record(values=values)", "", "holder.values", "known"),
+        ("", "record(values=values)", "", "values", "known"),
+        (
+            "",
+            "record(values=values, other=42)",
+            "",
+            "values, other=holder.other",
+            "known",
+        ),
+    ] {
+        let source = format!(
+            "from native import condition, observe, record, touch, untrusted\nvalues = {{'first': 1}}\n{before}holder = {call}\n{intervening}result = observe({read})\n"
+        );
+        db.write_file("/src/main.py", &source)?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let result = crate::place::global_symbol(&db, db.program_file(file), "result")
+            .place
+            .expect_type();
+        assert_eq!(result.string_literal_value(&db), Some(expected), "{source}");
+    }
+    db.write_file(
+        "/src/main.py",
+        r#"
+from typing_extensions import Literal, assert_type
+from native import observe, record
+
+def from_parameter(values: dict[str, int]) -> None:
+    holder = record(values=values)
+    assert_type(observe(holder.values), Literal["unknown"])
+
+def from_allocation() -> None:
+    values = dict(first=1)
+    holder = record(values=values, other=42)
+    assert_type(observe(dict(second=2, **holder.values)), Literal["known"])
+
+def in_loop() -> None:
+    values = dict(first=1)
+    for _ in range(2):
+        holder = record(values=values)
+        assert_type(observe(holder.values), Literal["unknown"])
+
+def at_next_call() -> None:
+    values = {"first": 1}
+    holder = record(values=values)
+    first = observe(values)
+    later = observe(values)
+    assert_type(first, Literal["known"])
+    assert_type(later, Literal["unknown"])
+
+class InClass:
+    values = {"first": 1}
+    holder = record(values=values)
+    result = observe(values)
+    assert_type(result, Literal["unknown"])
+"#,
+    )?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn checked_calls_distinguish_definite_unpacked_arguments() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "def observe(value: object = ...) -> str: ...\ndef collect(**options: object) -> str: ...\n",
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from typing_extensions import Literal, NotRequired, TypedDict, assert_type
+from native import collect, observe
+
+class OptionalValue(TypedDict):
+    value: NotRequired[int]
+
+def use(optional: OptionalValue) -> None:
+    required = {"value": 1}
+    assert_type(observe(**required), Literal["value"])
+    assert_type(observe(**optional), Literal["indeterminate"])
+    assert_type(observe(), Literal["omitted"])
+    options = {"first": 1, "second": 2}
+    assert_type(collect(**options), Literal["indeterminate"])
+    assert_type(collect(first=1, second=2), Literal["indeterminate"])
+    assert_type(collect(**{"first": 1}), Literal["value"])
+"#,
+        )
+        .with_call_result_provider(|db, call| {
+            let parameter = match call
+                .declaration()
+                .and_then(|declaration| declaration.name(db))
+                .as_deref()
+            {
+                Some("observe") => "value",
+                Some("collect") => "options",
+                _ => return None.into(),
+            };
+            let presence = match call.argument(parameter) {
+                CheckedArgument::Omitted => "omitted",
+                CheckedArgument::Value { .. } => "value",
+                CheckedArgument::Indeterminate => "indeterminate",
+            };
+            Some(Type::string_literal(db, presence)).into()
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn checked_calls_share_dictionary_observations() -> anyhow::Result<()> {
+    fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        if call.declaration()?.name(db)?.as_str() != "observe" {
+            return None;
+        }
+        let Some(entries) = call.dictionary_argument(db, "value") else {
+            return Some(Type::string_literal(db, "unavailable"));
+        };
+        let CheckedArgument::Value { ty: _, expression } = call.argument("value") else {
+            panic!("one dictionary argument");
+        };
+        if let Some(expression) = expression {
+            assert_eq!(Some(entries.clone()), call.dictionary_items(db, expression));
+        }
+        Some(describe(db, call.file(), entries))
+    }
+
+    fn describe<'db>(
+        db: &'db TestDb,
+        file: ProgramFile<'db>,
+        entries: DictionaryItems<'db>,
+    ) -> Type<'db> {
+        let DictionaryItems {
+            items,
+            extra_items,
+            first_entry: _,
+        } = entries;
+        let source = source_text(db, file.file(db));
+        let env = ProgramEnvironment::from_file(file);
+        let mut description = extra_items.value_type().map_or_else(
+            || "complete".to_owned(),
+            |ty| format!("extra: {}", ty.display(db, &env)),
+        );
+        // Preserve key order, values, and their source spelling through the public call view.
+        for DictionaryItem {
+            name,
+            ty,
+            kind,
+            source: range,
+        } in items
+        {
+            write!(
+                description,
+                "; {name}{}: {} at {}",
+                match kind {
+                    DictionaryItemKind::Required => "",
+                    DictionaryItemKind::Optional => "?",
+                    DictionaryItemKind::Residual => "~",
+                },
+                ty.display(db, &env),
+                &source[range]
+            )
+            .unwrap();
+        }
+        Type::string_literal(db, description.as_str())
+    }
+
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "def observe(value: object, *, other: object = ...) -> str: ...\n",
+        )
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| observe(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (source, expected) in [
+        ("result = observe({})", "complete"),
+        ("result = observe(dict())", "complete"),
+        (
+            "arguments = {'value': {'x': 1}}\nresult = observe(**arguments)",
+            "complete; x: Literal[1] at 'x'",
+        ),
+        (
+            "arguments = {'value': {'x': 1} | {'y': 2}}\nresult = observe(**arguments)",
+            "complete; x: Literal[1] at 'x'; y: Literal[2] at 'y'",
+        ),
+        (
+            "copy = dict\noperand = copy(x=1)\narguments = {'value': {'y': 2} | operand}\nresult = observe(**arguments)",
+            "complete; y: Literal[2] at 'y'; x: Literal[1] at x",
+        ),
+        (
+            "from typing import TypedDict\nclass Value(TypedDict):\n    x: int\nclass Arguments(TypedDict):\n    value: Value\ndef get_arguments() -> Arguments: return {'value': {'x': 1}}\narguments = get_arguments()\nresult = observe(**arguments)",
+            "extra: Unknown; x: int at arguments",
+        ),
+        (
+            "arguments = {'value': {'x': 1}}\narguments['value']['x'] = 2\nresult = observe(**arguments)",
+            "complete; x: Literal[2] at 'x'",
+        ),
+        (
+            "arguments = {'value': {'x': 1}}\nresult = observe(**arguments, other=arguments['value'].clear())",
+            "complete",
+        ),
+        (
+            "arguments = {'value': {'x': 1}}\nresult = observe(**arguments, other=arguments.update({'value': {'y': 2}}))",
+            "extra: int",
+        ),
+        (
+            "arguments = {'value': {'x': 1}}\nalias = arguments['value']\nalias.clear()\nresult = observe(**arguments)",
+            "extra: int",
+        ),
+        (
+            "arguments = {'value': {'x': 1}}\nresult = observe(**arguments, other=(arguments := {'value': {'y': 2}}))",
+            "unavailable",
+        ),
+        (
+            "result = observe(dict({'x': 'old'}, x=1, y=2))",
+            "complete; x: Literal[1] at x; y: Literal[2] at y",
+        ),
+        (
+            "copy = dict\nresult = observe({**copy(x=1), **dict(y='new')})",
+            "complete; x: Literal[1] at x; y: Literal[\"new\"] at y",
+        ),
+        (
+            "result = observe({'x': 1, 'y': 2, 'x': 3})",
+            "complete; x: Literal[3] at 'x'; y: Literal[2] at 'y'",
+        ),
+        (
+            "key = 'x'\nresult = observe(value={key: 1})",
+            "complete; x: Literal[1] at key",
+        ),
+        (
+            "key = 'x'\nresult = observe({'x': 1, **{key: 2}})",
+            "complete; x: Literal[2] at key",
+        ),
+        (
+            "result = observe({'x': 'old', 'left': 1} | {'x': 2})",
+            "complete; x: Literal[2] at 'x'; left: Literal[1] at 'left'",
+        ),
+        (
+            "left = {'x': 1}\nright = {'y': 2}\nmerged = left | right\nleft.clear()\nright.clear()\nresult = observe(merged)",
+            "complete; x: Literal[1] at 'x'; y: Literal[2] at 'y'",
+        ),
+        (
+            "result = observe(({'x': 1} | dict(y=2)) | {'z': 3})",
+            "complete; x: Literal[1] at 'x'; y: Literal[2] at y; z: Literal[3] at 'z'",
+        ),
+        (
+            "values = {'x': 1}\nresult = observe(values | values)",
+            "complete; x: Literal[1] at 'x'",
+        ),
+        (
+            "values = {'x': 1}\nresult = observe(values | {'side': values.clear()})",
+            "complete; side: None at 'side'",
+        ),
+        (
+            "values = {'x': 1}\nresult = observe(values | {'side': (values := {'y': 2})})",
+            "unavailable",
+        ),
+        (
+            "def extra() -> dict[str, int]: return {}\nresult = observe({'x': 1} | dict(extra()))",
+            "extra: int; x: int at 'x'",
+        ),
+        (
+            "class Custom:\n    def __or__(self, other: dict[str, int]) -> dict[str, int]: return {'changed': 1}\nresult = observe(Custom() | {'x': 1})",
+            "unavailable",
+        ),
+        (
+            "class Child(dict[str, int]): pass\nresult = observe(Child() | {'x': 1})",
+            "unavailable",
+        ),
+        (
+            "class Child(dict[str, int]):\n    def __ror__(self, other): return {}\ndef extra() -> dict[str, int]: return Child()\nresult = observe({'x': 1} | extra())",
+            "unavailable",
+        ),
+        (
+            "class Child(dict[str, int]):\n    def clear(self) -> None: pass\ndef extra() -> dict[str, int]: return Child(kept=1)\nvalues = extra()\nvalues.clear()\nresult = observe(values)",
+            "unavailable",
+        ),
+        (
+            "def extra() -> dict[str, int]: return {}\nvalues: dict[str, int] = extra()\nalias = values\nalias.clear()\nresult = observe(alias)",
+            "unavailable",
+        ),
+        (
+            "def extra() -> dict[str, int]: return {}\nvalues = {'x': 1}\nif bool(input()):\n    values = extra()\nvalues.clear()\nresult = observe(values)",
+            "unavailable",
+        ),
+        (
+            "values = {'x': 1}\nalias = values\nalias['y'] = 2\nresult = observe(alias)",
+            "extra: Unknown; y~: Literal[2] at 'y'",
+        ),
+        (
+            "def consume(value: object) -> None: pass\nvalues = {'x': 1}\nconsume(values)\nresult = observe(values | {'y': 2})",
+            "extra: Unknown; y: Literal[2] at 'y'",
+        ),
+        (
+            "from typing import Any\ndef unknown() -> Any: ...\nresult = observe({'x': 1} | unknown())",
+            "unavailable",
+        ),
+        (
+            "values = {'x': 1}\nresult = observe(values)",
+            "complete; x: Literal[1] at 'x'",
+        ),
+        (
+            "values = dict(x=1, y='value')\nresult = observe(values)",
+            "complete; x: Literal[1] at x; y: Literal[\"value\"] at y",
+        ),
+        (
+            "copy = dict\nvalues = copy(x=1)\ncopied = copy(values, y=2)\nresult = observe(value=copied)",
+            "complete; x: Literal[1] at x; y: Literal[2] at y",
+        ),
+        (
+            "copy = dict\nvalues = copy(x=1)\nobserve(values)\ncopied = copy(values, y=2)\nresult = observe(value=copied)",
+            "extra: Unknown; y: Literal[2] at y",
+        ),
+        (
+            "values = {'x': 1}\nvalues['x'] = 'new'\nresult = observe(value=values)",
+            "complete; x: Literal[\"new\"] at 'x'",
+        ),
+        (
+            "values = {'x': 1}\nvalues = {}\nresult = observe(values)",
+            "complete",
+        ),
+        (
+            "values = {'x': 1}\ndel values['x']\nresult = observe(values)",
+            "complete",
+        ),
+        (
+            "values = {'x': 1}\nvalues.clear()\nresult = observe(values)",
+            "complete",
+        ),
+        (
+            "values = {'x': 1}\nif bool():\n    values['y'] = 2\nresult = observe(values)",
+            "complete; x: Literal[1] at 'x'",
+        ),
+        (
+            "values = {'x': 1}\nif bool(input()):\n    values['y'] = 2\nresult = observe(values)",
+            "complete; x: Literal[1] at 'x'; y?: Literal[2] at 'y'",
+        ),
+        (
+            "values = {}\nvalues['inner'] = {'x': 1}\nvalues['inner']['y'] = 2\nresult = observe(values['inner'])",
+            "extra: int; x~: Literal[1] at 'x'; y~: Literal[2] at 'y'",
+        ),
+        (
+            "values = {'x': 1}\nresult = observe({**values})",
+            "complete; x: Literal[1] at 'x'",
+        ),
+        (
+            "from typing_extensions import TypedDict, NotRequired\nclass Row(TypedDict):\n    required: int\n    optional: NotRequired[str]\ndef make() -> Row: return {'required': 1}\nresult = observe(make())",
+            "extra: Unknown; optional?: str at make(); required: int at make()",
+        ),
+        (
+            "from typing_extensions import TypedDict, NotRequired\nclass Row(TypedDict, closed=True):\n    required: int\n    optional: NotRequired[str]\ndef make() -> Row: return {'required': 1}\nresult = observe(make())",
+            "complete; optional?: str at make(); required: int at make()",
+        ),
+        ("result = observe(1)", "unavailable"),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!("from native import observe\n{source}\n"),
+        )?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let result = crate::place::global_symbol(&db, db.program_file(file), "result")
+            .place
+            .expect_type();
+        assert_eq!(result.string_literal_value(&db), Some(expected), "{source}");
+    }
+    for (source, expected) in [
+        (
+            "def nested():\n    values = {'inner': 1}\n    values['second'] = 2\n    return observe(values)",
+            "complete; inner: Literal[1] at 'inner'; second: Literal[2] at 'second'",
+        ),
+        (
+            "def merge(values: dict[str, int]):\n    return observe({'x': 1} | values)",
+            "unavailable",
+        ),
+        (
+            "def merge(**values: int):\n    values['added'] = 1\n    return observe(values)",
+            "extra: int; added~: Literal[1] at 'added'",
+        ),
+        (
+            "def nested():\n    from typing_extensions import TypedDict, NotRequired\n    class Row(TypedDict, closed=True):\n        required: int\n        optional: NotRequired[str]\n    def make() -> Row: return {'required': 1}\n    return observe(make())",
+            "complete; optional?: str at make(); required: int at make()",
+        ),
+        (
+            "def nested():\n    from typing_extensions import TypedDict, NotRequired\n    class Row(TypedDict):\n        required: int\n        optional: NotRequired[str]\n    def make() -> Row: return {'required': 1}\n    return observe(make())",
+            "extra: Unknown; optional?: str at make(); required: int at make()",
+        ),
+        (
+            "def nested():\n    from typing_extensions import TypedDict, NotRequired\n    class Row(TypedDict, extra_items=bool):\n        required: int\n        optional: NotRequired[str]\n    def make() -> Row: return {'required': 1}\n    return observe(make())",
+            "extra: bool; optional?: str at make(); required: int at make()",
+        ),
+        (
+            "def nested():\n    def make() -> dict[str, int]: return {'required': 1}\n    return observe(make())",
+            "unavailable",
+        ),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!("from native import observe\n{source}\nannotation: \"{{'key': int}}\"\n"),
+        )?;
+        let diagnostics = db.check_file(file);
+        // The detached dictionary literal below deliberately is not a valid annotation.
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-type-form");
+        let file = db.program_file(file);
+        let model = SemanticModel::new(&db, file);
+        let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
+        let [
+            ast::Stmt::ImportFrom(_),
+            ast::Stmt::FunctionDef(function),
+            ast::Stmt::AnnAssign(annotation),
+        ] = parsed.suite().as_slice()
+        else {
+            panic!("expected nested function and annotation");
+        };
+        let ast::Stmt::Return(statement) = function.body.last().unwrap() else {
+            panic!("expected return");
+        };
+        let ast::Expr::Call(call) = statement.value.as_deref().unwrap() else {
+            panic!("expected observe call");
+        };
+        let [argument] = call.arguments.args.as_ref() else {
+            panic!("expected one dictionary argument");
+        };
+        let entries = model.dictionary_items(argument).map_or_else(
+            || Type::string_literal(&db, "unavailable"),
+            |entries| describe(&db, file, entries),
+        );
+        assert_eq!(
+            entries.string_literal_value(&db),
+            Some(expected),
+            "{source}"
+        );
+        assert_eq!(
+            entries,
+            ast::ExprRef::Call(call).inferred_type(&model).unwrap(),
+        );
+        let ast::Expr::StringLiteral(annotation) = annotation.annotation.as_ref() else {
+            panic!("expected string annotation");
+        };
+        let (parsed, detached) = model.enter_string_annotation(annotation).unwrap();
+        assert!(detached.dictionary_items(&parsed.syntax().body).is_none());
+    }
+    Ok(())
+}
+
+const DECLARATIONS: &str = "\
+def make(value: object, required: int = 0) -> object: ...
+def make_class(value: object) -> type: ...
+class Factory:
+    def method(self, value: int, second: str) -> object: ...
+factory: Factory
+";
+
+fn factory_result<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+    let declaration = call.declaration()?;
+    if declaration
+        .program_file(db)
+        .file(db)
+        .path(db)
+        .as_system_path()?
+        .as_str()
+        != "/src/native.pyi"
+    {
+        return None;
+    }
+    let name = declaration.name(db)?;
+    let CheckedArgument::Value { ty, expression } = call.argument("value") else {
+        return None;
+    };
+    let env = ProgramEnvironment::from_file(call.file());
+    let (field_type, members) = match name.as_str() {
+        "make" => (ty, Box::default()),
+        "method" => {
+            let CheckedArgument::Value {
+                ty: receiver,
+                expression: None,
+            } = call.argument("self")
+            else {
+                panic!("bound receiver should retain its type without a source expression");
+            };
+            assert!(matches!(receiver, Type::NominalInstance(_)));
+            assert_eq!(
+                Some(ty),
+                expression.and_then(|expression| call.expression_type(expression))
+            );
+            (ty, Box::default())
+        }
+        "make_class" => {
+            let int = KnownClass::Int.to_instance(db, &env);
+            let init = Type::function_like_callable(
+                db,
+                Signature::new(
+                    Parameters::standard([
+                        Parameter::positional_only(Some(Name::new("self"))),
+                        Parameter::keyword_only(Name::new("value")).with_annotated_type(int),
+                    ]),
+                    Type::none(db, &env),
+                ),
+            );
+            (int, Box::from([(Name::new("__init__"), init)]))
+        }
+        _ => return None,
+    };
+    let class = call.class_type(
+        db,
+        ProvidedClass {
+            name: Name::new("Record"),
+            bases: Box::default(),
+            class_members: members,
+            instance_fields: ProvidedInstanceFields {
+                fields: Box::from([ProvidedField {
+                    name: Name::new("value"),
+                    ty: field_type,
+                    is_required: true,
+                    source: None,
+                }]),
+                has_dynamic_fields: false,
+                implications: Box::default(),
+                data: Some(ProvidedData::new(Name::new("native record"))),
+            }
+            .into(),
+        },
+    );
+    if name == "make_class" {
+        Some(class)
+    } else {
+        class.to_instance_approximation(db, &env)
+    }
+}
+
+fn setup(source: &str) -> anyhow::Result<TestDb> {
+    TestDbBuilder::new()
+        .with_file("/src/native.pyi", DECLARATIONS)
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(|db, call| factory_result(db, call).into())
+        .build()
+}
+
+#[test]
+fn source_call_class_matches_factory_result_identity() -> anyhow::Result<()> {
+    let db = setup("from native import make\nrecord = make(1)\n")?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let file = db.program_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let assignment = module.suite()[1].as_assign_stmt().unwrap();
+    let call = assignment.value.as_call_expr().unwrap();
+    let model = crate::SemanticModel::new(&db, file);
+    let class = model
+        .provided_class_at_call(
+            call,
+            ProvidedClass {
+                name: Name::new("Record"),
+                bases: Box::default(),
+                class_members: Box::default(),
+                instance_fields: ProvidedInstanceFields {
+                    fields: Box::from([ProvidedField {
+                        name: Name::new("value"),
+                        ty: Type::int_literal(1),
+                        is_required: true,
+                        source: None,
+                    }]),
+                    has_dynamic_fields: false,
+                    implications: Box::default(),
+                    data: Some(ProvidedData::new(Name::new("native record"))),
+                }
+                .into(),
+            },
+        )
+        .unwrap();
+    let inferred = crate::place::global_symbol(&db, file, "record")
+        .place
+        .expect_type();
+    assert_eq!(
+        class.to_instance_approximation(&db, &model.program_environment()),
+        Some(inferred)
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_instance_storage_shadows_inherited_defaults_but_not_data_descriptors()
+-> anyhow::Result<()> {
+    fn derived_factory<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        let name = call.declaration()?.name(db)?;
+        let fields = match name.as_str() {
+            "make" | "make_optional" => Box::from([ProvidedField {
+                name: Name::new_static("value"),
+                ty: Type::int_literal(1),
+                is_required: name == "make",
+                source: None,
+            }]),
+            "make_open" => Box::default(),
+            _ => return None,
+        };
+        let native = system_path_to_file(db, "/src/native.pyi").ok()?;
+        let base = crate::place::global_symbol(db, db.program_file(native), "Base")
+            .place
+            .expect_type();
+        let class = call.class_type(
+            db,
+            ProvidedClass {
+                name: Name::new_static("Derived"),
+                bases: Box::from([base]),
+                class_members: Box::default(),
+                instance_fields: ProvidedInstanceFields {
+                    fields,
+                    has_dynamic_fields: name == "make_open",
+                    implications: Box::default(),
+                    data: None,
+                }
+                .into(),
+            },
+        );
+        class.to_instance_approximation(db, &ProgramEnvironment::from_file(call.file()))
+    }
+
+    for (declaration, property) in [
+        ("class Base:\n    value: int\n", false),
+        ("class Base:\n    value: str = 'default'\n", false),
+        ("class Base:\n    def value(self) -> str: ...\n", false),
+        (
+            "class Base:\n    @property\n    def value(self) -> str: ...\n",
+            true,
+        ),
+    ] {
+        let native = format!(
+            "{declaration}\nclass Other:\n    def value(self) -> str: ...\ndef make() -> object: ...\ndef make_optional() -> object: ...\ndef make_open() -> object: ...\n"
+        );
+        let db = TestDbBuilder::new()
+            .with_file("/src/native.pyi", &native)
+            .with_file(
+                "/src/main.py",
+                "from native import make, make_optional, make_open\nstored = make()\nresult = stored.value\noptional = make_optional()\noptional_result = optional.value\nopened = make_open()\nopen_result = opened.value\n",
+            )
+            .with_call_result_provider(|db, call| derived_factory(db, call).into())
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(file);
+        let actual = crate::place::global_symbol(&db, file, "result")
+            .place
+            .expect_type();
+        let expected = if property {
+            KnownClass::Str.to_instance(&db, &env)
+        } else {
+            Type::int_literal(1)
+        };
+        assert_eq!(
+            actual,
+            expected,
+            "{declaration}: {}",
+            actual.display(&db, &env)
+        );
+        let native = db.program_file(system_path_to_file(&db, "/src/native.pyi")?);
+        let opened = crate::place::global_symbol(&db, file, "opened")
+            .place
+            .expect_type();
+        let base_member = opened
+            .member_lookup_with_policy(
+                &db,
+                &env,
+                "value",
+                crate::types::MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+            )
+            .place
+            .expect_type();
+        let open_result = crate::place::global_symbol(&db, file, "open_result")
+            .place
+            .expect_type();
+        let optional_result = crate::place::global_symbol(&db, file, "optional_result")
+            .place
+            .expect_type();
+        let optional = crate::place::global_symbol(&db, file, "optional")
+            .place
+            .expect_type();
+        let optional_default = optional
+            .member_lookup_with_policy(
+                &db,
+                &env,
+                "value",
+                crate::types::MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+            )
+            .place
+            .expect_type();
+        let expected_optional = if property {
+            expected
+        } else {
+            crate::types::UnionType::from_two_elements(
+                &db,
+                &env,
+                Type::int_literal(1),
+                optional_default,
+            )
+        };
+        assert!(
+            optional_result.is_equivalent_to(&db, &env, expected_optional),
+            "{declaration}: expected {}, got {}",
+            expected_optional.display(&db, &env),
+            optional_result.display(&db, &env),
+        );
+        let expected_open = if property {
+            expected
+        } else {
+            crate::types::UnionType::from_two_elements(&db, &env, Type::unknown(), base_member)
+        };
+        assert!(
+            open_result.is_equivalent_to(&db, &env, expected_open),
+            "{declaration}: expected {}, got {}",
+            expected_open.display(&db, &env),
+            open_result.display(&db, &env),
+        );
+
+        let other = crate::place::global_symbol(&db, native, "Other")
+            .place
+            .expect_type()
+            .to_instance_approximation(&db, &env)
+            .unwrap();
+        let stored = crate::place::global_symbol(&db, file, "stored")
+            .place
+            .expect_type();
+        let mixed = crate::types::UnionType::from_two_elements(&db, &env, stored, other);
+        let expected_mixed = crate::types::UnionType::from_two_elements(
+            &db,
+            &env,
+            expected,
+            other.member(&db, &env, "value").place.expect_type(),
+        );
+        let mixed_member = mixed.member(&db, &env, "value");
+        let mixed_type = mixed_member.place.expect_type();
+        assert!(
+            mixed_type.is_equivalent_to(&db, &env, expected_mixed),
+            "{declaration}: expected {}, got {}",
+            expected_mixed.display(&db, &env),
+            mixed_type.display(&db, &env)
+        );
+        assert!(
+            !mixed_member
+                .qualifiers
+                .contains(crate::types::TypeQualifiers::GUARANTEED_INSTANCE_STORAGE)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_declarations_preserve_keyword_and_attribute_navigation() -> anyhow::Result<()> {
+    fn factory<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        let name = call.declaration()?.name(db)?;
+        if name != "make" && name != "make_sourceless" {
+            return None;
+        }
+        let env = ProgramEnvironment::from_file(call.file());
+        let native = system_path_to_file(db, "/src/native.pyi").ok()?;
+        let base = crate::place::global_symbol(db, db.program_file(native), "Base")
+            .place
+            .expect_type();
+        let source = FileRange::new(
+            system_path_to_file(db, "/src/schema.py").ok()?,
+            TextRange::new(0.into(), 5.into()),
+        );
+        let init = Type::function_like_callable(
+            db,
+            Signature::new(
+                Parameters::standard([
+                    Parameter::positional_only(Some(Name::new_static("self"))),
+                    Parameter::positional_or_keyword(Name::new_static("value"))
+                        .with_annotated_type(KnownClass::Int.to_instance(db, &env))
+                        .with_source_range(source),
+                ]),
+                Type::none(db, &env),
+            ),
+        );
+        Some(
+            call.class_type(
+                db,
+                ProvidedClass {
+                    name: Name::new_static("Derived"),
+                    bases: Box::from([base]),
+                    class_members: Box::from([(Name::new_static("__init__"), init)]),
+                    instance_fields: ProvidedInstanceFields {
+                        fields: Box::from([ProvidedField {
+                            name: Name::new_static("value"),
+                            ty: Type::int_literal(1),
+                            is_required: true,
+                            source: (name == "make").then_some(source),
+                        }]),
+                        has_dynamic_fields: false,
+                        implications: Box::default(),
+                        data: None,
+                    }
+                    .into(),
+                },
+            ),
+        )
+    }
+
+    for (base, property, native_member) in [
+        ("class Base: pass\n", false, false),
+        ("class Base:\n    value: int\n", false, true),
+        (
+            "class SetterOnly:\n    def __set__(self, instance: object, value: object) -> None: ...\nclass Base:\n    value = SetterOnly()\n",
+            false,
+            true,
+        ),
+        (
+            "class Base:\n    def value(self) -> str: ...\n",
+            false,
+            true,
+        ),
+        (
+            "class Base:\n    @property\n    def value(self) -> str: ...\n",
+            true,
+            true,
+        ),
+        (
+            "class Base:\n    __slots__ = ('value',)\n    value: int\n",
+            false,
+            true,
+        ),
+    ] {
+        let db = TestDbBuilder::new()
+            .with_file(
+                "/src/native.pyi",
+                &format!("{base}def make() -> type: ...\ndef make_sourceless() -> type: ...\n"),
+            )
+            .with_file("/src/schema.py", "value = 0\n")
+            .with_file(
+                "/src/main.py",
+                "\
+from native import make, make_sourceless
+Derived = make()
+instance = Derived(value=1)
+Sourceless = make_sourceless()
+sourceless = Sourceless(value=1)
+class ChildMethod(Derived):
+    def value(self) -> str: ...
+class ChildAnnotation(Derived):
+    value: str
+class ChildDefault(Derived):
+    value = 'native'
+class ChildProperty(Derived):
+    @property
+    def value(self) -> str: ...
+child_method: ChildMethod
+child_annotation: ChildAnnotation
+child_default: ChildDefault
+child_property: ChildProperty
+Derived(1)
+",
+            )
+            .with_call_result_provider(|db, call| factory(db, call).into())
+            .build()?;
+        let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+        let env = ProgramEnvironment::from_file(file);
+        let model = crate::SemanticModel::new(&db, file);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let call = module.suite()[2]
+            .as_assign_stmt()
+            .unwrap()
+            .value
+            .as_call_expr()
+            .unwrap();
+        let source = FileRange::new(
+            system_path_to_file(&db, "/src/schema.py")?,
+            TextRange::new(0.into(), 5.into()),
+        );
+        if !native_member {
+            let keyword =
+                definitions_for_keyword_argument(&model, &call.arguments.keywords[0], call);
+            assert_eq!(
+                keyword
+                    .iter()
+                    .map(|definition| definition.focus_range(&db))
+                    .collect::<Vec<_>>(),
+                [source],
+                "{base}"
+            );
+
+            let positional_call = module
+                .suite()
+                .last()
+                .unwrap()
+                .as_expr_stmt()
+                .unwrap()
+                .value
+                .as_call_expr()
+                .unwrap();
+            let hints = inlay_hint_call_argument_details(&db, &model, positional_call).unwrap();
+            assert_eq!(
+                hints.argument_names.get(&0),
+                Some(&("value".to_owned(), Some(source)))
+            );
+
+            // The ordinary read owner currently treats an intersection of descriptor values as
+            // non-data. Navigation must select the same stored field without evaluating getters.
+            let native = db.program_file(system_path_to_file(&db, "/src/native.pyi")?);
+            let base_instance = crate::place::global_symbol(&db, native, "Base")
+                .place
+                .expect_type()
+                .to_instance_approximation(&db, &env)
+                .unwrap();
+            let descriptor = crate::types::IntersectionType::from_two_elements(
+                &db,
+                &env,
+                KnownClass::Property.to_instance(&db, &env),
+                base_instance,
+            );
+            assert!(descriptor.is_intersection());
+            let class = model
+                .provided_class_at_call(
+                    call,
+                    ProvidedClass {
+                        name: Name::new_static("IntersectionField"),
+                        bases: Box::default(),
+                        class_members: Box::from([(Name::new_static("value"), descriptor)]),
+                        instance_fields: ProvidedInstanceFields {
+                            fields: Box::from([ProvidedField {
+                                name: Name::new_static("value"),
+                                ty: Type::int_literal(1),
+                                is_required: true,
+                                source: Some(source),
+                            }]),
+                            has_dynamic_fields: false,
+                            implications: Box::default(),
+                            data: None,
+                        }
+                        .into(),
+                    },
+                )
+                .unwrap();
+            let instance = class.to_instance_approximation(&db, &env).unwrap();
+            assert_eq!(
+                instance.member(&db, &env, "value").place.expect_type(),
+                Type::int_literal(1)
+            );
+            assert_eq!(
+                definitions_for_attribute(&db, &env, instance, "value")
+                    .iter()
+                    .map(|definition| definition.focus_range(&db))
+                    .collect::<Vec<_>>(),
+                [source]
+            );
+        }
+
+        for name in ["instance", "sourceless", "Derived"] {
+            let receiver = crate::place::global_symbol(&db, file, name)
+                .place
+                .expect_type();
+            if name != "Derived" {
+                let actual = receiver.member(&db, &env, "value").place.expect_type();
+                let expected = if property {
+                    KnownClass::Str.to_instance(&db, &env)
+                } else {
+                    Type::int_literal(1)
+                };
+                assert_eq!(
+                    actual,
+                    expected,
+                    "{name}: {}; {base}",
+                    actual.display(&db, &env)
+                );
+            }
+            let definitions = definitions_for_attribute(&db, &env, receiver, "value");
+            if property || (name == "Derived" && native_member) {
+                let [definition] = definitions.as_slice() else {
+                    panic!("expected native declaration for {name}: {definitions:?}; {base}");
+                };
+                assert_eq!(
+                    definition.focus_range(&db).file(),
+                    system_path_to_file(&db, "/src/native.pyi")?
+                );
+            } else if name == "instance" {
+                assert_eq!(
+                    definitions
+                        .iter()
+                        .map(|definition| definition.focus_range(&db))
+                        .collect::<Vec<_>>(),
+                    [source],
+                    "{base}"
+                );
+            } else {
+                assert!(definitions.is_empty(), "{name}: {definitions:?}; {base}");
+            }
+        }
+        if !native_member {
+            for (name, supplied_storage) in [
+                ("child_method", true),
+                ("child_annotation", false),
+                ("child_default", true),
+                ("child_property", false),
+            ] {
+                let receiver = crate::place::global_symbol(&db, file, name)
+                    .place
+                    .expect_type();
+                let actual = receiver.member(&db, &env, "value").place.expect_type();
+                let expected = if supplied_storage {
+                    Type::int_literal(1)
+                } else {
+                    KnownClass::Str.to_instance(&db, &env)
+                };
+                assert_eq!(
+                    actual,
+                    expected,
+                    "{name}: {}; {base}",
+                    actual.display(&db, &env)
+                );
+                let definitions = definitions_for_attribute(&db, &env, receiver, "value");
+                let [definition] = definitions.as_slice() else {
+                    panic!("expected one source for {name}: {definitions:?}");
+                };
+                if supplied_storage {
+                    assert_eq!(definition.focus_range(&db), source, "{name}; {base}");
+                } else {
+                    assert_eq!(
+                        definition.focus_range(&db).file(),
+                        file.file(&db),
+                        "{name}; {base}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn factory_fields_preserve_callable_values_and_binding_errors() -> anyhow::Result<()> {
+    let db = setup(
+        "\
+from native import make as factory
+def increment(x: int) -> int:
+    return x + 1
+record = factory(increment, required='bad')
+result = record.value(1)
+record.value('bad')
+",
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type", "invalid-argument-type"],
+        "{diagnostics:#?}"
+    );
+    let file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(file);
+    let result = crate::place::global_symbol(&db, file, "result")
+        .place
+        .ignore_possibly_undefined()
+        .unwrap();
+    assert_eq!(result, KnownClass::Int.to_instance(&db, &env));
+    let record = crate::place::global_symbol(&db, file, "record")
+        .place
+        .ignore_possibly_undefined()
+        .unwrap();
+    assert_eq!(
+        record
+            .provided_data(&db, &env)
+            .unwrap()
+            .downcast_ref::<Name>(),
+        Some(&Name::new("native record"))
+    );
+    let members = crate::types::list_members::all_members(&db, &env, record);
+    assert!(members.iter().any(|member| member.name == "value"));
+    Ok(())
+}
+
+#[test]
+fn factory_method_arguments_skip_the_synthetic_receiver() -> anyhow::Result<()> {
+    let db = setup(
+        "from native import factory\nresult = factory.method(7, 'second')\nkeyword = factory.method(second='second', value=8)\nfirst: int = result.value\nsecond: int = keyword.value\n",
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    Ok(())
+}
+
+#[test]
+fn uncertain_unpacking_does_not_supply_a_definite_factory_value() -> anyhow::Result<()> {
+    let mut db = setup("from native import make\nitems: list[int] = []\nresult = make(*items)\n")?;
+    db.write_file(
+        "/src/native.pyi",
+        "def make(value: object = None) -> object: ...\n",
+    )?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let result = crate::place::global_symbol(&db, file, "result")
+        .place
+        .ignore_possibly_undefined()
+        .unwrap();
+    assert_eq!(result, Type::object());
+    Ok(())
+}
+
+#[test]
+fn synthesized_default_keeps_its_source_spelling() -> anyhow::Result<()> {
+    let expression = "('préfix' + 'suffix')";
+    let db = TestDbBuilder::new()
+        .with_file("/src/main.py", expression)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let env = ProgramEnvironment::from_file(db.program_file(file));
+    let signature = Signature::new(
+        Parameters::standard([Parameter::keyword_only(Name::new("value"))
+            .with_annotated_type(KnownClass::Str.to_instance(&db, &env))
+            .with_default(crate::types::ParameterDefault::Source {
+                ty: Type::string_literal(&db, "préfixsuffix"),
+                source: ruff_db::files::FileRange::new(
+                    file,
+                    TextRange::up_to(expression.text_len()),
+                ),
+            })]),
+        Type::none(&db, &env),
+    );
+    assert_eq!(
+        signature.display(&db, &env).to_string(),
+        "(*, value: str = ('préfix' + 'suffix')) -> None"
+    );
+    Ok(())
+}
+
+#[test]
+fn implicit_keywords_bind_without_appearing_in_the_signature() -> anyhow::Result<()> {
+    fn factory<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        let name = call.declaration()?.name(db)?;
+        let env = ProgramEnvironment::from_file(call.file());
+        let operation = Type::function_like_callable(
+            db,
+            Signature::new(
+                Parameters::standard([
+                    Parameter::keyword_only(Name::new_static("before"))
+                        .with_annotated_type(KnownClass::Int.to_instance(db, &env)),
+                    Parameter::implicit_keyword_only(Name::new_static("$internal"))
+                        .with_annotated_type(if name == "make" {
+                            KnownClass::Bool.to_instance(db, &env)
+                        } else {
+                            KnownClass::Str.to_instance(db, &env)
+                        }),
+                    Parameter::keyword_only(Name::new_static("after"))
+                        .with_annotated_type(KnownClass::Str.to_instance(db, &env)),
+                ]),
+                Type::none(db, &env),
+            ),
+        );
+        match name.as_str() {
+            "make" => Some(operation),
+            "consumer" => Some(Type::function_like_callable(
+                db,
+                Signature::new(
+                    Parameters::standard([
+                        Parameter::positional_only(None).with_annotated_type(operation)
+                    ]),
+                    Type::none(db, &env),
+                ),
+            )),
+            _ => None,
+        }
+    }
+    let source = "from native import make, consumer\noperation = make()\noperation(before=1, **{'$internal': True}, after='ok')\noperation(before=1, after='ok', **{'$internal': 'bad'})\nconsumer()(operation)\n";
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "def make() -> object: ...\ndef consumer() -> object: ...\n",
+        )
+        .with_file("/src/main.py", source)
+        .with_call_result_provider(|db, call| factory(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+    assert_eq!(diagnostics[1].id().as_str(), "invalid-argument-type");
+    let diagnostic = diagnostics[1]
+        .primary_annotation()
+        .unwrap()
+        .get_message()
+        .unwrap();
+    assert!(diagnostic.contains("$internal: bool"), "{diagnostic}");
+    assert!(diagnostic.contains("$internal: str"), "{diagnostic}");
+
+    let file = db.program_file(file);
+    let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
+    let call = parsed.suite()[2]
+        .as_expr_stmt()
+        .unwrap()
+        .value
+        .as_call_expr()
+        .unwrap();
+    let model = SemanticModel::new(&db, file);
+    let details = call_signature_details(&model, call);
+    let [signature] = details.as_slice() else {
+        anyhow::bail!("Expected one signature, got {details:?}");
+    };
+    assert_eq!(signature.label, "(*, before: int, after: str) -> None");
+    assert_eq!(signature.active_parameter(0), Some(0));
+    assert_eq!(signature.active_parameter(1), None);
+    assert_eq!(signature.active_parameter(2), Some(1));
+    Ok(())
+}
+
+#[test]
+fn factory_constructors_use_shared_binding_and_distinct_nominal_classes() -> anyhow::Result<()> {
+    let db = setup(
+        "\
+from native import make_class
+A = make_class(0)
+B = make_class(0)
+a = A(value=1)
+b = B(value=2)
+A(value='bad')
+def accept(value: A): ...
+accept(b)
+",
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type", "invalid-argument-type"],
+        "{diagnostics:#?}"
+    );
+    let file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(file);
+    let a = crate::place::global_symbol(&db, file, "a")
+        .place
+        .ignore_possibly_undefined()
+        .unwrap();
+    let b = crate::place::global_symbol(&db, file, "b")
+        .place
+        .ignore_possibly_undefined()
+        .unwrap();
+    assert_ne!(a, b);
+    assert!(!a.is_assignable_to(&db, &env, b));
+    Ok(())
+}
+
+#[test]
+fn factory_resolution_follows_shadowing_and_loaded_edits() -> anyhow::Result<()> {
+    let mut db = setup(
+        "\
+from native import make
+result = make(1)
+def make(value: str) -> str: return value
+shadowed = make('text')
+",
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let check = |db: &TestDb| {
+        let file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(file);
+        let result = crate::place::global_symbol(db, file, "result")
+            .place
+            .ignore_possibly_undefined()
+            .unwrap();
+        assert!(result.provided_data(db, &env).is_some());
+        let shadowed = crate::place::global_symbol(db, file, "shadowed")
+            .place
+            .ignore_possibly_undefined()
+            .unwrap();
+        assert_eq!(shadowed, KnownClass::Str.to_instance(db, &env));
+    };
+    check(&db);
+    db.write_file("/src/native.pyi", "def make(value: str) -> object: ...\n")?;
+    let diagnostics = db.check_file(file);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.id().as_str() == "invalid-argument-type"),
+        "{diagnostics:#?}"
+    );
+    check(&db);
+    Ok(())
+}
+
+#[test]
+fn callable_metadata_survives_signature_transforms() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new().build()?;
+    let env = db.program_environment();
+    let callable = Type::single_callable(
+        &db,
+        Signature::new(Parameters::empty(), KnownClass::Int.to_instance(&db, &env)),
+    )
+    .with_callable_data(&db, ProvidedData::new(Name::new("generated function docs")))
+    .unwrap();
+    let wrapper = callable
+        .map_callable_signatures(
+            &db,
+            &env,
+            crate::types::CallableTypeKind::FunctionLike,
+            |signature| signature.with_return_type(KnownClass::Str.to_instance(&db, &env)),
+        )
+        .unwrap();
+    assert_eq!(
+        wrapper.provided_data(&db, &env),
+        callable.provided_data(&db, &env)
+    );
+    assert_eq!(
+        wrapper
+            .provided_data(&db, &env)
+            .unwrap()
+            .downcast_ref::<Name>(),
+        Some(&Name::new("generated function docs")),
+    );
+    Ok(())
+}
+
+fn schema_getattr_result<'db>(
+    db: &'db TestDb,
+    definition: Definition<'db>,
+    receiver: Type<'db>,
+    attribute: &str,
+) -> ProvidedGetattrResult<'db> {
+    let file = definition.program_file(db);
+    if file
+        .file(db)
+        .path(db)
+        .as_system_path()
+        .is_none_or(|path| path.as_str() != "/src/native.pyi")
+        || definition.name(db).as_deref() != Some("__getattr__")
+    {
+        return ProvidedGetattrResult::default();
+    }
+    let Type::ClassLiteral(ClassLiteral::Static(class)) =
+        crate::place::global_symbol(db, file, "Store")
+            .place
+            .expect_type()
+    else {
+        return ProvidedGetattrResult::default();
+    };
+    let env = ProgramEnvironment::from_file(file);
+    let Some(specialization) = receiver.base_class_specialization(db, &env, class) else {
+        return ProvidedGetattrResult::default();
+    };
+    let [Type::TypedDict(schema)] = specialization.types(db) else {
+        return ProvidedGetattrPresence::PossiblyMissing.into();
+    };
+    if let Some(field) = schema.items(db).get(attribute) {
+        ProvidedGetattrResult {
+            presence: if field.is_required() {
+                ProvidedGetattrPresence::Present
+            } else {
+                ProvidedGetattrPresence::PossiblyMissing
+            },
+            return_type: Some(field.declared_type()),
+            immutable_storage: field.is_required(),
+        }
+    } else if schema.openness(db) == TypedDictOpenness::Closed {
+        ProvidedGetattrPresence::Absent.into()
+    } else {
+        ProvidedGetattrPresence::PossiblyMissing.into()
+    }
+}
+
+#[test]
+fn supplied_keyword_fields_use_immutable_member_context() -> anyhow::Result<()> {
+    let native = r#"
+from typing import Protocol, TypeVar
+from typing_extensions import NotRequired, ReadOnly, TypedDict
+class Store[S]:
+    def __getattr__(self, name: str) -> object: ...
+class Uniform[V, S](Store[S]): ...
+class Metadata(TypedDict):
+    deps: NotRequired[list[str]]
+class Fields(TypedDict, closed=True):
+    metadata: ReadOnly[Metadata]
+    values: ReadOnly[dict[str, str]]
+class Readonly(Protocol):
+    @property
+    def metadata(self) -> Metadata: ...
+    @property
+    def values(self) -> dict[str, str]: ...
+def record[T](**kwargs: T) -> Uniform[T, Fields]: ...
+def untrusted[T](**kwargs: T) -> Uniform[T, Fields]: ...
+"#;
+    let source = r#"
+from native import Uniform, Metadata, Fields, Readonly, record, untrusted
+from ty_extensions import Intersection
+
+def fields(metadata: Metadata) -> Uniform[Metadata | dict[str, str], Fields]:
+    return record(metadata=metadata, values={"name": "crate"})
+def reversed_fields(metadata: Metadata) -> Uniform[Metadata | dict[str, str], Fields]:
+    return record(values={"name": "crate"}, metadata=metadata)
+def empty(metadata: Metadata) -> Uniform[Metadata | dict[str, str], Fields]:
+    return record(metadata=metadata, values={})
+def protocol(metadata: Metadata) -> Readonly:
+    return record(metadata=metadata, values={"name": "crate"})
+def intersection(metadata: Metadata) -> Intersection[Uniform[Metadata | dict[str, str], Fields], Readonly]:
+    return record(metadata=metadata, values={"name": "crate"})
+"#;
+    let mut db =
+        TestDbBuilder::new()
+            .with_python_version(ruff_python_ast::PythonVersion::PY313)
+            .with_getattr_result_provider(schema_getattr_result)
+            .with_keyword_field_factory(|db, declaration| {
+                declaration.name(db).as_deref() == Some("record")
+                    && declaration
+                        .program_file(db)
+                        .file(db)
+                        .path(db)
+                        .as_system_path()
+                        .is_some_and(|path| path.as_str() == "/src/native.pyi")
+            })
+            .with_call_result_provider(|db, call| {
+                if !matches!(
+                    call.declaration()
+                        .and_then(|declaration| declaration.name(db))
+                        .as_deref(),
+                    Some("record" | "untrusted")
+                ) {
+                    return ProvidedCallResult::default();
+                }
+                let mut fields = TypedDictSchema::default();
+                let mut values = Vec::new();
+                for keyword in &call.call().arguments.keywords {
+                    let Some(name) = &keyword.arg else {
+                        return ProvidedCallResult::default();
+                    };
+                    let Some(ty) = call.expression_type(&keyword.value) else {
+                        return ProvidedCallResult::default();
+                    };
+                    values.push(ty);
+                    fields.insert(
+                        name.id.clone(),
+                        TypedDictFieldBuilder::new(ty)
+                            .required(true)
+                            .read_only(true)
+                            .build(),
+                    );
+                }
+                let schema = Type::TypedDict(TypedDictType::from_schema_items_with_openness(
+                    db,
+                    fields,
+                    TypedDictOpenness::Closed,
+                ));
+                let Some(declaration) = call.declaration() else {
+                    return ProvidedCallResult::default();
+                };
+                let Type::ClassLiteral(class) =
+                    crate::place::global_symbol(db, declaration.program_file(db), "Uniform")
+                        .place
+                        .expect_type()
+                else {
+                    return ProvidedCallResult::default();
+                };
+                let env = ProgramEnvironment::from_file(call.file());
+                let values = crate::types::UnionType::from_elements(db, &env, values);
+                Type::from(class.apply_specialization(db, |context| {
+                    context.specialize(db, vec![values, schema])
+                }))
+                .to_instance_approximation(db, &env)
+                .into()
+            })
+            .with_file("/src/native.pyi", native)
+            .with_file("/src/main.py", source)
+            .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let native_file = system_path_to_file(&db, "/src/native.pyi")?;
+    for declaration in [
+        native.to_string(),
+        native
+            .replace("def record[T]", "T = TypeVar('T')\ndef record")
+            .replace("def untrusted[T]", "def untrusted"),
+    ] {
+        db.write_file("/src/native.pyi", declaration)?;
+        for checked in [native_file, file] {
+            let diagnostics = db.check_file(checked);
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        }
+        let program = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program);
+        let module = parsed_module(&db, program.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, program);
+        for statement in module.suite() {
+            let ruff_python_ast::Stmt::FunctionDef(function) = statement else {
+                continue;
+            };
+            let ruff_python_ast::Stmt::Return(returned) = &function.body[0] else {
+                anyhow::bail!("Expected a return");
+            };
+            let Some(ruff_python_ast::Expr::Call(call)) = returned.value.as_deref() else {
+                anyhow::bail!("Expected a call");
+            };
+            let argument = call
+                .arguments
+                .keywords
+                .iter()
+                .find(|keyword| keyword.arg.as_ref().is_some_and(|name| name.id == "values"))
+                .context("missing values argument")?;
+            let ty = argument
+                .value
+                .inferred_type(&model)
+                .context("missing argument type")?;
+            assert_eq!(
+                ty.display(&db, &env).to_string(),
+                "dict[str, str]",
+                "{}",
+                function.name
+            );
+        }
+    }
+    db.write_file("/src/main.py", source.replace("\"crate\"", "42"))?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.id().as_str() == "invalid-return-type"),
+        "{diagnostics:#?}"
+    );
+    db.write_file(
+        "/src/main.py",
+        source.replace("dict[str, str]", "dict[str, int]"),
+    )?;
+    db.write_file(
+        "/src/native.pyi",
+        native.replace("dict[str, str]", "dict[str, int]"),
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.id().as_str() == "invalid-return-type"),
+        "{diagnostics:#?}"
+    );
+    db.write_file("/src/native.pyi", native)?;
+    db.write_file(
+        "/src/main.py",
+        r#"
+from native import Uniform, Metadata, Fields, untrusted
+def ordinary(metadata: Metadata) -> Uniform[Metadata | dict[str, str], Fields]:
+    return untrusted(metadata=metadata, values={})
+"#,
+    )?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].id().as_str(),
+        "invalid-return-type",
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_keyword_field_callbacks_have_contextual_body_types() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_keyword_field_factory(|db, definition| {
+            definition.name(db).as_deref() == Some("record")
+        })
+        .with_file(
+            "/src/native.pyi",
+            "from typing import Protocol
+from typing_extensions import Unpack
+class Callback(Protocol):
+    def __call__(self, *args: Unpack[tuple[str, Unpack[tuple[str, ...]]]]) -> int: ...
+class Holder(Protocol):
+    @property
+    def callback(self) -> Callback: ...
+def record(**kwargs: object) -> Holder: ...
+def consume(args: tuple[str, ...]) -> int: ...
+",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import Holder, consume, record
+def make() -> Holder:
+    result: Holder = record(callback=lambda *args: consume(args))
+    return result
+",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let program = db.program_file(file);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let function = module.suite()[1].as_function_def_stmt().unwrap();
+    let assignment = function.body[0].as_ann_assign_stmt().unwrap();
+    let factory = assignment.value.as_ref().unwrap().as_call_expr().unwrap();
+    let callback = factory.arguments.keywords[0]
+        .value
+        .as_lambda_expr()
+        .unwrap();
+    let call = callback.body.as_call_expr().unwrap();
+    let model = SemanticModel::new(&db, program);
+    let argument = call.arguments.args[0].inferred_type(&model).unwrap();
+    assert_eq!(
+        argument
+            .display(&db, &model.program_environment())
+            .to_string(),
+        "tuple[str, *tuple[str, ...]]"
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_getters_can_reject_attributes_on_specialized_receivers() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_getattr_result_provider(schema_getattr_result)
+        .with_file(
+            "/src/native.pyi",
+            "from typing_extensions import NotRequired, TypedDict
+class Closed(TypedDict, closed=True):
+    x: int
+    compiler: NotRequired[str]
+class Open(TypedDict):
+    x: int
+class Store[S]:
+    def __getattr__(self, name: str) -> int: ...
+class Derived(Store[Closed]): ...
+class Known:
+    y: str
+class Plain: ...
+class Override(Derived):
+    y: str
+",
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import Store, Closed, Open, Derived, Known, Plain, Override
+from typing import Any, Protocol
+from typing_extensions import assert_type
+closed = Store[Closed]()
+open_ = Store[Open]()
+derived = Derived()
+closed.y
+derived.y
+assert_type(closed.x, int)
+assert_type(closed.compiler, str)
+assert_type(getattr(closed, 'compiler', None), str | None)
+class Required(Protocol):
+    @property
+    def compiler(self) -> str: ...
+def consume(value: Required): ...
+consume(closed)
+if hasattr(closed, 'compiler'):
+    consume(closed)
+    assert_type(closed.compiler, str)
+assert_type(getattr(closed, 'y', None), None)
+assert_type(getattr(open_, 'y', None), int | None)
+assert_type(getattr(Plain(), 'missing', None), Any | None)
+assert_type(Override().y, str)
+assert_type(getattr(Override(), 'y', None), str | None)
+def combined(value: Store[Closed] | Known):
+    assert_type(getattr(value, 'y', None), str | None)
+def mixed(value: Store[Closed] | Store[Open]):
+    assert_type(getattr(value, 'y', None), int | None)
+",
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "unresolved-attribute",
+            "unresolved-attribute",
+            "invalid-argument-type"
+        ],
+        "{diagnostics:#?}"
+    );
+    let program = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program);
+    let closed = crate::place::global_symbol(&db, program, "closed")
+        .place
+        .expect_type();
+    let fields = Type::protocol_with_readonly_members(
+        &db,
+        &env,
+        [("x", KnownClass::Int.to_instance(&db, &env))],
+    );
+    let intersection = crate::types::IntersectionType::from_two_elements(&db, &env, closed, fields);
+    assert!(intersection.member(&db, &env, "y").place.is_undefined());
+    assert_eq!(
+        intersection.member(&db, &env, "x").place.expect_type(),
+        KnownClass::Int.to_instance(&db, &env)
+    );
+    let native = db.program_file(system_path_to_file(&db, "/src/native.pyi")?);
+    let known = crate::place::global_symbol(&db, native, "Known")
+        .place
+        .expect_type()
+        .to_instance_approximation(&db, &env)
+        .context("missing Known instance")?;
+    let union = crate::types::UnionType::from_two_elements(&db, &env, closed, known);
+    let member = union.member(&db, &env, "y");
+    assert_eq!(
+        member.place.expect_type(),
+        KnownClass::Str.to_instance(&db, &env)
+    );
+    assert!(!member.qualifiers.contains(TypeQualifiers::KNOWN_ABSENT));
+    Ok(())
+}
+
+#[test]
+fn supplied_getter_storage_supports_structural_schemas() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_getattr_result_provider(schema_getattr_result)
+        .with_file(
+            "/src/native.pyi",
+            r#"
+from typing import Protocol
+from typing_extensions import NotRequired, TypedDict
+from ty_extensions import Intersection
+
+class Store[S]:
+    def __getattr__(self, name: str) -> object: ...
+class Runtime(TypedDict, closed=True):
+    runtime_jre_version: str
+class Build(TypedDict, closed=True):
+    jre_version: str
+class Optional(TypedDict, closed=True):
+    runtime_jre_version: NotRequired[str]
+class Nullable(TypedDict, closed=True):
+    runtime_jre_version: str | None
+class RuntimeFields(Protocol):
+    @property
+    def runtime_jre_version(self) -> str: ...
+type RuntimeView = Intersection[Store[Runtime], RuntimeFields]
+class RuntimeContext(TypedDict, closed=True):
+    attr: object
+class BuildContext(TypedDict, closed=True):
+    attr: Store[Build]
+class ContextFields(Protocol):
+    @property
+    def attr(self) -> RuntimeView: ...
+type RuntimeContextView = Intersection[Store[RuntimeContext], ContextFields]
+
+class Property:
+    @property
+    def runtime_jre_version(self) -> str: ...
+class Intercepted:
+    def __getattribute__(self, name: str) -> str: ...
+class Mutable(Store[Runtime]):
+    runtime_jre_version: str | None
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from typing_extensions import assert_type
+from ty_extensions import Intersection
+from native import (
+    Store, Runtime, Build, Optional, Nullable, RuntimeFields, RuntimeView,
+    RuntimeContextView, BuildContext, Property, Intercepted, Mutable,
+)
+
+def fallback(value: RuntimeContextView | Store[BuildContext]) -> str:
+    version = getattr(value.attr, "runtime_jre_version", None)
+    if version is not None:
+        pass
+    else:
+        version = value.attr.jre_version
+    version = version or "default"
+    return version
+
+def optional(value: Store[Optional] | Store[Build]):
+    if getattr(value, "runtime_jre_version", None) is None:
+        assert_type(value, Store[Optional] | Store[Build])
+
+def nullable(value: Store[Nullable] | Store[Build]):
+    if getattr(value, "runtime_jre_version", None) is None:
+        assert_type(value, Store[Nullable] | Store[Build])
+
+required: RuntimeView
+optional_field: Store[Optional]
+protocol: RuntimeFields
+property_field: Intersection[Store[Runtime], Property]
+intercepted: Intersection[Store[Runtime], Intercepted]
+mutable_field: Mutable
+context: RuntimeContextView
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(file);
+    for (name, path, expected) in [
+        ("required", &["runtime_jre_version"][..], true),
+        ("optional_field", &["runtime_jre_version"], false),
+        ("protocol", &["runtime_jre_version"], false),
+        ("property_field", &["runtime_jre_version"], false),
+        ("intercepted", &["runtime_jre_version"], false),
+        ("mutable_field", &["runtime_jre_version"], false),
+        ("context", &["attr", "runtime_jre_version"], true),
+    ] {
+        let receiver = crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type();
+        let path = path.iter().map(Name::new).collect::<Vec<_>>();
+        assert_eq!(
+            receiver.has_immutable_field_path(&db, &env, &path),
+            expected,
+            "{name}: {}",
+            receiver.display(&db, &env)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_getter_storage_excludes_unreachable_defaults() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_getattr_result_provider(schema_getattr_result)
+        .with_file(
+            "/src/native.pyi",
+            r#"
+from typing import Protocol
+from typing_extensions import NotRequired, TypedDict
+
+class Required(TypedDict, closed=True):
+    items: list[str]
+    count: int
+    nullable: int | None
+class Other(TypedDict, closed=True):
+    items: list[int]
+class Optional(TypedDict, closed=True):
+    items: NotRequired[list[str]]
+class Store[S]:
+    def __getattr__(self, name: str) -> object: ...
+class Fields(Protocol):
+    @property
+    def items(self) -> list[str]: ...
+class Property(Store[Required]):
+    @property
+    def items(self) -> str: ...
+class Intercepted(Store[Required]):
+    def __getattribute__(self, name: str) -> float: ...
+class Mutable(Store[Required]):
+    items: list[str]
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from typing import Literal
+from typing_extensions import assert_type
+from ty_extensions import Intersection
+from native import Store, Required, Other, Optional, Fields, Property, Intercepted, Mutable
+
+type View = Intersection[Store[Required], Fields]
+
+def stored(value: View, default: bytes, name: Literal["items", "count"]):
+    assert_type(getattr(value, "items", default), list[str])
+    assert_type(getattr(value, "items", []), list[str])
+    assert_type(getattr(value, "nullable", default), int | None)
+    assert_type(getattr(value, name, default), list[str] | int)
+    assert_type(getattr(value, "missing", default), bytes)
+    # Even an unused default expression is evaluated.
+    getattr(value, "items", len(42))
+
+def unions(value: Store[Required] | Store[Other], default: bytes):
+    assert_type(getattr(value, "items", default), list[str] | list[int])
+
+def optional(value: Store[Required] | Store[Optional], default: bytes):
+    assert_type(getattr(value, "items", default), list[str] | bytes)
+    assert_type(getattr(value, "items", None), list[str] | None)
+
+def ordinary(property: Property, intercepted: Intercepted, mutable: Mutable, default: bytes):
+    assert_type(getattr(property, "items", default), str | bytes)
+    assert_type(getattr(intercepted, "items", default), float | bytes)
+    assert_type(getattr(mutable, "items", default), list[str] | bytes)
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type"],
+        "{diagnostics:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_getter_storage_contextualizes_empty_defaults() -> anyhow::Result<()> {
+    let registry = crate::default_lint_registry();
+    let mut rules = crate::lint::RuleSelection::from_registry(registry);
+    rules.enable(
+        registry.get("division-by-zero")?,
+        Severity::Error,
+        crate::lint::LintSource::Default,
+    );
+    let db = TestDbBuilder::new()
+        .with_rule_selection(rules)
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_getattr_result_provider(schema_getattr_result)
+        .with_file(
+            "/src/native.pyi",
+            r#"
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from typing import Any, Protocol
+from typing_extensions import NotRequired, TypedDict
+
+class StaticCollection[T](Iterable[T], Protocol):
+    def __len__(self) -> int: ...
+    def __contains__(self, value: object, /) -> bool: ...
+class TaggedCollection[T](StaticCollection[T], Protocol):
+    tag: str
+class Row(TypedDict):
+    key: int
+class Required(TypedDict, closed=True):
+    items: list[str]
+    mapping: dict[str, int]
+    row: Row
+class Other(TypedDict, closed=True):
+    items: list[int]
+class Optional(TypedDict, closed=True):
+    items: NotRequired[list[str]]
+    mapping: NotRequired[dict[str, int]]
+    iterable: NotRequired[Iterable[str]]
+    collection: NotRequired[StaticCollection[str]]
+    union_collection: NotRequired[StaticCollection[str | int]]
+    tagged_collection: NotRequired[TaggedCollection[str]]
+    python_collection: NotRequired[Collection[str]]
+    sequence: NotRequired[Sequence[str]]
+    abstract_mapping: NotRequired[Mapping[str, Iterable[str]]]
+    row: NotRequired[Row]
+    nullable: NotRequired[list[str] | None]
+class Missing(TypedDict, closed=True):
+    pass
+class ListSubclass(list[str]): ...
+class SubclassField(TypedDict, closed=True):
+    items: NotRequired[ListSubclass]
+class Gradual(TypedDict, closed=True):
+    items: NotRequired[list[Any]]
+class Store[S]:
+    def __getattr__(self, name: str) -> object: ...
+class Property(Store[Required]):
+    @property
+    def items(self) -> bytes: ...
+class Intercepted(Store[Required]):
+    def __getattribute__(self, name: str) -> bytes: ...
+class Mutable(Store[Required]):
+    items: list[bytes]
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            r#"
+from builtins import getattr as lookup
+from typing import Literal
+from native import Store, Required, Other, Optional, Missing, SubclassField, Gradual, Property, Intercepted, Mutable
+
+def required_list(value: Store[Required]):
+    return lookup(value, "items", [])
+def required_dict(value: Store[Required]):
+    return lookup(value, "mapping", {})
+def union_list(value: Store[Required] | Store[Other]):
+    return lookup(value, "items", [])
+def optional_list(value: Store[Optional]):
+    return lookup(value, "items", [])
+def optional_dict(value: Store[Optional]):
+    return lookup(value, "mapping", {})
+def optional_iterable(value: Store[Optional]):
+    return lookup(value, "iterable", [])
+def optional_collection(value: Store[Optional]):
+    return lookup(value, "collection", [])
+def optional_union_collection(value: Store[Optional]):
+    return lookup(value, "union_collection", [])
+def optional_tagged_collection(value: Store[Optional]):
+    return lookup(value, "tagged_collection", [])
+def optional_python_collection(value: Store[Optional]):
+    return lookup(value, "python_collection", [])
+def optional_sequence(value: Store[Optional]):
+    return lookup(value, "sequence", [])
+def optional_mapping(value: Store[Optional]):
+    return lookup(value, "abstract_mapping", {})
+def missing_alternative(value: Store[Optional] | Store[Missing]):
+    return lookup(value, "items", [])
+def optional_row(value: Store[Optional]):
+    return lookup(value, "row", {})
+def optional_nullable(value: Store[Optional]):
+    return lookup(value, "nullable", [])
+def optional_subclass(value: Store[SubclassField]):
+    return lookup(value, "items", [])
+def missing(value: Store[Missing]):
+    return lookup(value, "items", [])
+def gradual(value: Store[Gradual]):
+    return lookup(value, "items", [])
+def property(value: Property):
+    return lookup(value, "items", [])
+def intercepted(value: Intercepted):
+    return lookup(value, "items", [])
+def mutable(value: Mutable):
+    return lookup(value, "items", [])
+
+# Every fallback value is legal, even when it differs from the stored field.
+def required_row(value: Store[Required]):
+    return lookup(value, "row", {})
+def mismatched_list(value: Store[Required]):
+    return lookup(value, "items", {})
+def mismatched_dict(value: Store[Required]):
+    return lookup(value, "mapping", [])
+def nonempty_list(value: Store[Required]):
+    return lookup(value, "items", [b"other"])
+def nonempty_dict(value: Store[Required]):
+    return lookup(value, "mapping", {1: b"other"})
+def mixed_name(value: Store[Required], name: Literal["items", "mapping"]):
+    return lookup(value, name, [])
+def generic_default[T](value: Store[Required], default: T):
+    return lookup(value, "items", default)
+def evaluated_default(value: Store[Required]):
+    return lookup(value, "items", [len(42)])
+def division_default(value: Store[Required]):
+    return lookup(value, "items", [1 / 0])
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect::<Vec<_>>(),
+        ["invalid-argument-type", "division-by-zero"],
+        "{diagnostics:#?}"
+    );
+    let file = db.program_file(file);
+    let model = SemanticModel::new(&db, file);
+    let env = ProgramEnvironment::from_file(file);
+    let module = parsed_module(&db, file.python_file(&db)).load(&db);
+    let defaults = module
+        .suite()
+        .iter()
+        .filter_map(ast::Stmt::as_function_def_stmt)
+        .map(|function| {
+            let returned = function.body.last().unwrap().as_return_stmt().unwrap();
+            let call = returned.value.as_ref().unwrap().as_call_expr().unwrap();
+            let default = &call.arguments.args[2];
+            (
+                function.name.as_str(),
+                default
+                    .inferred_type(&model)
+                    .unwrap()
+                    .display(&db, &env)
+                    .to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        defaults,
+        [
+            ("required_list", "list[str]".into()),
+            ("required_dict", "dict[str, int]".into()),
+            // Existing collection inference selects one compatible arm for the empty literal.
+            ("union_list", "list[str]".into()),
+            ("optional_list", "list[str]".into()),
+            ("optional_dict", "dict[str, int]".into()),
+            ("optional_iterable", "list[str]".into()),
+            ("optional_collection", "list[str]".into()),
+            ("optional_union_collection", "list[str | int]".into()),
+            ("optional_tagged_collection", "list[Any]".into()),
+            // Python's Collection inherits Container[Any], so its full protocol is gradual.
+            ("optional_python_collection", "list[Any]".into()),
+            ("optional_sequence", "list[str]".into()),
+            ("optional_mapping", "dict[str, Iterable[str]]".into()),
+            ("missing_alternative", "list[str]".into()),
+            ("optional_row", "dict[Any, Any]".into()),
+            ("optional_nullable", "list[Any]".into()),
+            ("optional_subclass", "list[Any]".into()),
+            ("missing", "list[Any]".into()),
+            ("gradual", "list[Any]".into()),
+            ("property", "list[Any]".into()),
+            ("intercepted", "list[Any]".into()),
+            ("mutable", "list[bytes]".into()),
+            ("required_row", "dict[Any, Any]".into()),
+            ("mismatched_list", "dict[Any, Any]".into()),
+            ("mismatched_dict", "list[Any]".into()),
+            ("nonempty_list", "list[Any]".into()),
+            ("nonempty_dict", "dict[Any, Any]".into()),
+            ("mixed_name", "list[Any]".into()),
+            ("generic_default", "T@generic_default".into()),
+            ("evaluated_default", "list[Any]".into()),
+            ("division_default", "list[Any]".into()),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn supplied_getter_storage_requires_matching_consensus() -> anyhow::Result<()> {
+    fn result<'db>(
+        db: &'db TestDb,
+        definition: Definition<'db>,
+        _receiver: Type<'db>,
+        _attribute: &str,
+    ) -> ProvidedGetattrResult<'db> {
+        let DefinitionKind::Function(function) = definition.kind(db) else {
+            return ProvidedGetattrResult::default();
+        };
+        let module = parsed_module(db, definition.python_file(db)).load(db);
+        let function = function.node(&module);
+        let Some(parameter) = function.parameters.find("name") else {
+            return ProvidedGetattrResult::default();
+        };
+        let guaranteed = parameter
+            .annotation()
+            .and_then(ast::Expr::as_name_expr)
+            .is_some_and(|annotation| annotation.id == "int");
+        let optional = function
+            .returns
+            .as_deref()
+            .and_then(ast::Expr::as_name_expr)
+            .is_some_and(|annotation| annotation.id == "bool");
+        ProvidedGetattrResult {
+            presence: if optional {
+                ProvidedGetattrPresence::PossiblyMissing
+            } else {
+                ProvidedGetattrPresence::Present
+            },
+            return_type: None,
+            immutable_storage: guaranteed,
+        }
+    }
+    let db = TestDbBuilder::new()
+        .with_getattr_result_provider(result)
+        .with_file(
+            "/src/native.pyi",
+            r#"
+from typing import overload
+class Mixed:
+    @overload
+    def __getattr__(self, name: int) -> int: ...
+    @overload
+    def __getattr__(self, name: str) -> str: ...
+class Equivalent:
+    @overload
+    def __getattr__(self, name: int) -> int: ...
+    @overload
+    def __getattr__(self, name: str) -> int: ...
+class Optional:
+    def __getattr__(self, name: int) -> bool: ...
+"#,
+        )
+        .with_file(
+            "/src/main.py",
+            "from native import Mixed, Equivalent, Optional\nmixed: Mixed\nequivalent: Equivalent\noptional: Optional\n",
+        )
+        .build()?;
+    let file = db.program_file(system_path_to_file(&db, "/src/main.py")?);
+    let env = ProgramEnvironment::from_file(file);
+    let int = KnownClass::Int.to_instance(&db, &env);
+    let str = KnownClass::Str.to_instance(&db, &env);
+    for (name, argument, valid, expected) in [
+        ("mixed", int, true, true),
+        ("mixed", str, true, false),
+        ("mixed", Type::any(), true, false),
+        ("equivalent", int, true, true),
+        ("equivalent", Type::any(), true, false),
+        ("optional", int, true, false),
+        (
+            "mixed",
+            KnownClass::Float.to_instance(&db, &env),
+            false,
+            false,
+        ),
+        (
+            "mixed",
+            crate::types::UnionType::from_two_elements(&db, &env, int, str),
+            true,
+            false,
+        ),
+    ] {
+        let receiver = crate::place::global_symbol(&db, file, name)
+            .place
+            .expect_type();
+        let mut arguments = crate::types::CallArguments::positional([argument]);
+        let result = receiver.try_call_dunder_with_policy(
+            &db,
+            &env,
+            "__getattr__",
+            &mut arguments,
+            crate::types::TypeContext::default(),
+            MemberLookupPolicy::default(),
+        );
+        assert_eq!(result.is_ok(), valid, "{name}: {result:?}");
+        let bindings = match result {
+            Ok(bindings) => bindings,
+            Err(crate::types::CallDunderError::CallError(_, bindings, _)) => *bindings,
+            Err(other) => panic!("unexpected getter result: {other:?}"),
+        };
+        assert_eq!(
+            bindings.getattr_result(&db, &env, receiver, "field").1,
+            expected,
+            "{name}: {}",
+            argument.display(&db, &env)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_getter_inputs_and_defaults_remain_independent() -> anyhow::Result<()> {
+    fn presence<'db>(
+        db: &'db TestDb,
+        definition: Definition<'db>,
+        _receiver: Type<'db>,
+        _attribute: &str,
+    ) -> ProvidedGetattrPresence {
+        if definition.name(db).as_deref() == Some("__getattr__") {
+            ProvidedGetattrPresence::PossiblyMissing
+        } else {
+            ProvidedGetattrPresence::Present
+        }
+    }
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            r#"
+from builtins import getattr as lookup
+from typing import Literal
+
+class Record:
+    def __getattr__(self, name: str) -> str: ...
+
+class BadReceiver:
+    def __getattr__(self: int, name: str) -> str: ...
+
+class BadName:
+    def __getattr__(self, name: Literal["other"]) -> str: ...
+
+class Getter:
+    def __init__(self, name: str) -> None: ...
+
+class Constructed:
+    __getattr__ = Getter
+
+class Intercepted(Record):
+    def __getattribute__(self, name: str) -> str: ...
+
+record: Record
+bad_receiver: BadReceiver
+bad_name: BadName
+constructed: Constructed
+intercepted: Intercepted
+"#,
+        )
+        .with_getattr_result_provider(|db, definition, receiver, attribute| {
+            presence(db, definition, receiver, attribute).into()
+        })
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let program = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program);
+    let lookup = crate::place::global_symbol(&db, program, "lookup")
+        .place
+        .expect_type();
+    let str_type = KnownClass::Str.to_instance(&db, &env);
+    let default_type = Type::int_literal(0);
+    for name in [
+        "record",
+        "bad_receiver",
+        "bad_name",
+        "constructed",
+        "intercepted",
+    ] {
+        let receiver = crate::place::global_symbol(&db, program, name)
+            .place
+            .expect_type();
+        assert!(receiver.as_nominal_instance().is_some(), "{name}");
+        let ordinary_member = receiver.member_lookup_with_policy_and_receiver(
+            &db,
+            &env,
+            "field",
+            MemberLookupPolicy::RUNTIME_ATTRIBUTE,
+            None,
+        );
+        for default in [None, Some(default_type)] {
+            let arguments = crate::types::CallArguments::positional(
+                [receiver, Type::string_literal(&db, "field")]
+                    .into_iter()
+                    .chain(default),
+            );
+            let ordinary = lookup.try_call(&db, &env, &arguments).unwrap();
+            if name == "record" {
+                let expected = default.map_or(Type::any(), |default| {
+                    crate::types::UnionType::from_two_elements(&db, &env, str_type, default)
+                });
+                assert_eq!(ordinary.return_type(&db, &env), expected);
+                assert!(
+                    !ordinary_member
+                        .unwrap()
+                        .member(&db)
+                        .place
+                        .is_definitely_bound()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_argument_context_uses_checked_siblings() -> anyhow::Result<()> {
+    fn parameters(db: &TestDb, definition: Definition<'_>) -> Box<[Name]> {
+        let file = definition.program_file(db).file(db);
+        if file
+            .path(db)
+            .as_system_path()
+            .is_some_and(|path| path.as_str() == "/src/native.pyi")
+            && definition.name(db).is_some_and(|name| name != "plain")
+        {
+            Box::from([Name::new("callback")])
+        } else {
+            Box::default()
+        }
+    }
+
+    fn context<'db>(
+        db: &'db TestDb,
+        call: &CheckedCall<'_, 'db>,
+        parameter: &str,
+    ) -> Option<Type<'db>> {
+        assert_eq!(parameter, "callback");
+        assert!(
+            call.call()
+                .func
+                .as_name_expr()
+                .is_none_or(|name| name.id != "selected")
+        );
+        let name = call.declaration()?.name(db)?;
+        assert!(matches!(
+            name.as_str(),
+            "register" | "generic" | "strict" | "bounded" | "optional"
+        ));
+        if call.has_binding_errors() {
+            return None;
+        }
+        let fields = call.dictionary_argument(db, "schema")?;
+        let field = fields.items.iter().find(|field| field.name == "value")?;
+        let parameter = Parameter::positional_only(None).with_annotated_type(field.ty);
+        let parameter = if name == "optional" {
+            parameter.with_default_type(field.ty)
+        } else {
+            parameter
+        };
+        Some(Type::function_like_callable(
+            db,
+            Signature::new(Parameters::standard([parameter]), Type::object()),
+        ))
+    }
+
+    let declarations = r#"
+from typing import Callable, overload
+
+def register(callback: Callable[..., object], schema: dict[str, object]) -> None: ...
+def generic[**P, R](callback: Callable[P, R], schema: dict[str, object]) -> R: ...
+def strict(callback: Callable[[str], object], schema: dict[str, object]) -> None: ...
+def bounded[R: int](callback: Callable[..., R], schema: dict[str, object]) -> R: ...
+def optional(callback: Callable[..., object], schema: dict[str, object]) -> None: ...
+class Registry:
+    def register(self, callback: Callable[..., object], schema: dict[str, object]) -> None: ...
+registry: Registry
+def plain(callback: Callable[..., object], schema: dict[str, object]) -> None: ...
+@overload
+def overloaded(callback: Callable[..., object], schema: dict[str, int]) -> int: ...
+@overload
+def overloaded(callback: Callable[..., object], schema: dict[str, str]) -> str: ...
+seed: int
+text: str
+"#;
+    let source = r#"
+from typing_extensions import assert_type
+from native import register, generic, strict, bounded, optional, registry, plain, overloaded, seed, text
+
+def require_int(value: int) -> int:
+    return value
+
+def require_str(value: str) -> str:
+    return value
+
+register(lambda value: assert_type(value, int), {'value': seed})
+register(lambda value: assert_type(value, str), {'value': text})
+registry.register(lambda value: assert_type(value, int), {'value': seed})
+optional(lambda value=0: assert_type(value, int), {'value': seed})
+register(schema={'value': seed}, callback=lambda value: assert_type(value, int))
+alias = register
+alias(lambda value: require_int(value), {'value': seed})
+assert_type(generic(lambda value: require_int(value), {'value': seed}), int)
+
+def deferred() -> None:
+    register(lambda value: assert_type(value, int), {'value': seed})
+
+plain(lambda value: value, {'value': seed})
+overloaded(lambda value: value, {'value': seed})
+
+def union(flag: bool) -> None:
+    selected = register if flag else plain
+    selected(lambda value: value, {'value': seed})
+"#;
+    let builder = || {
+        TestDbBuilder::new()
+            .with_python_version(ruff_python_ast::PythonVersion::PY313)
+            .with_file("/src/native.pyi", declarations)
+            .with_file("/src/main.py", source)
+    };
+    let ordinary = builder().build()?;
+    let file = system_path_to_file(&ordinary, "/src/main.py")?;
+    let diagnostics = ordinary.check_file(file);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.id().as_str() == "type-assertion-failure"),
+        "ordinary inference must not derive a callback parameter from this schema: {diagnostics:#?}"
+    );
+
+    let mut db = builder()
+        .with_call_argument_context_provider(parameters, context)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    db.write_file(
+        "/src/native.pyi",
+        declarations.replace("seed: int", "seed: str"),
+    )?;
+    let diagnostics = db.check_file(file);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.id().as_str() == "invalid-argument-type"),
+        "{diagnostics:#?}"
+    );
+    db.write_file("/src/native.pyi", declarations)?;
+    let diagnostics = db.check_file(file);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    for (call, expected) in [
+        (
+            "register(lambda value: require_str(value), {'value': seed})",
+            "invalid-argument-type",
+        ),
+        (
+            "strict(lambda value: value, {'value': seed})",
+            "invalid-argument-type",
+        ),
+        (
+            "bounded(lambda value: 'wrong', {'value': seed})",
+            "invalid-argument-type",
+        ),
+        (
+            "optional(lambda value='wrong': require_int(value), {'value': seed})",
+            "invalid-argument-type",
+        ),
+        (
+            "register(lambda value: value, {'value': seed}, 42)",
+            "too-many-positional-arguments",
+        ),
+        ("register(lambda value: value)", "missing-argument"),
+        ("register(lambda value: value, 42)", "invalid-argument-type"),
+    ] {
+        db.write_file("/src/main.py", format!("{source}\n{call}\n"))?;
+        let diagnostics = db.check_file(file);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id().as_str() == expected),
+            "{call}: {diagnostics:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_getattr_refines_matched_operands() -> anyhow::Result<()> {
+    fn refine<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> ProvidedCallResult<'db> {
+        if call
+            .declaration()
+            .and_then(|definition| definition.name(db))
+            .as_deref()
+            != Some("native_getattr")
+        {
+            return ProvidedCallResult::default();
+        }
+        call.getattr_return_type(db).into()
+    }
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            r#"
+from typing import final
+
+def native_getattr(x: object, name: str, default: object = ..., /) -> object: ...
+
+class Record:
+    field: str
+
+class Lookup:
+    field: str
+    def native_getattr(self, name: str, default: object = ..., /) -> object: ...
+
+class KnownInt:
+    field: int = 1
+
+class Base: ...
+
+class Child(Base):
+    field: str = "text"
+
+def condition() -> bool:
+    return True
+
+class RequiredBridge:
+    record = KnownInt()
+
+class OptionalBridge:
+    if condition():
+        record = KnownInt()
+
+class OptionalKeys:
+    if condition():
+        field: int = 1
+
+class OptionalKeyBridge:
+    record = OptionalKeys()
+
+@final
+class Missing: ...
+
+class MissingKeyBridge:
+    record = Missing()
+
+type OpenReceiver = KnownInt | Base
+
+def field_name() -> str: ...
+def default_values() -> tuple[()] | tuple[int]: ...
+def open_receiver() -> OpenReceiver: ...
+
+record = Record()
+name = field_name()
+omitted = native_getattr(record, "field")
+explicit_none = native_getattr(record, "field", None)
+computed = native_getattr(record, name)
+defaults = default_values()
+possible_default = native_getattr(record, "field", *defaults)
+invalid = native_getattr(record, "field", None, 0)
+bound = Lookup().native_getattr("field")
+open_union = native_getattr(open_receiver(), "field", 0)
+required_bridge = native_getattr(native_getattr(RequiredBridge(), "record", None), "field", None)
+optional_bridge = native_getattr(native_getattr(OptionalBridge(), "record", None), "field", None)
+optional_key = native_getattr(native_getattr(OptionalKeyBridge(), "record", None), "field", None)
+missing_bridge = native_getattr(native_getattr(Missing(), "record", None), "field", None)
+missing_key = native_getattr(native_getattr(MissingKeyBridge(), "record", None), "field", None)
+none_default = native_getattr(None, "field", 0)
+none_no_default = native_getattr(None, "field")
+none_class = None.__class__
+none_present = native_getattr(None, "__class__", 0)
+
+def bounded[T: OpenReceiver](value: T):
+    return native_getattr(value, "field", 0)
+
+def constrained[T: (KnownInt, Base)](value: T):
+    return native_getattr(value, "field", 0)
+
+def class_bound[T: OpenReceiver](value: type[T]):
+    return native_getattr(value, "field", 0)
+"#,
+        )
+        .with_call_result_provider(refine)
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let program = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program);
+    let str_type = KnownClass::Str.to_instance(&db, &env);
+    let object_type = KnownClass::Object.to_instance(&db, &env);
+    let int_type = KnownClass::Int.to_instance(&db, &env);
+    let none_type = KnownClass::NoneType.to_instance(&db, &env);
+    let optional_int = crate::types::UnionType::from_two_elements(&db, &env, int_type, none_type);
+    let none_class = crate::place::global_symbol(&db, program, "none_class")
+        .place
+        .expect_type();
+    for (name, expected) in [
+        ("omitted", str_type),
+        (
+            "explicit_none",
+            crate::types::UnionType::from_two_elements(&db, &env, str_type, none_type),
+        ),
+        (
+            "possible_default",
+            crate::types::UnionType::from_two_elements(&db, &env, str_type, int_type),
+        ),
+        ("computed", object_type),
+        ("invalid", object_type),
+        ("bound", object_type),
+        ("open_union", object_type),
+        ("required_bridge", optional_int),
+        ("optional_bridge", optional_int),
+        ("optional_key", optional_int),
+        ("missing_bridge", object_type),
+        ("missing_key", object_type),
+        ("none_default", Type::int_literal(0)),
+        ("none_no_default", object_type),
+        (
+            "none_present",
+            crate::types::UnionType::from_two_elements(&db, &env, none_class, Type::int_literal(0)),
+        ),
+    ] {
+        assert_eq!(
+            crate::place::global_symbol(&db, program, name)
+                .place
+                .expect_type(),
+            expected,
+            "{name}",
+        );
+    }
+    let model = SemanticModel::new(&db, program);
+    let module = parsed_module(&db, program.python_file(&db)).load(&db);
+    let mut symbolic_results = Vec::new();
+    for statement in module.suite() {
+        let Some(function) = statement.as_function_def_stmt() else {
+            continue;
+        };
+        if !matches!(
+            function.name.as_str(),
+            "bounded" | "constrained" | "class_bound"
+        ) {
+            continue;
+        }
+        let returned = function.body[0].as_return_stmt().unwrap();
+        let result = returned.value.as_ref().unwrap();
+        let result_type = result.inferred_type(&model).unwrap();
+        symbolic_results.push((function.name.as_str(), result_type));
+    }
+    assert_eq!(
+        symbolic_results,
+        [
+            ("bounded", object_type),
+            ("constrained", object_type),
+            ("class_bound", object_type),
+        ],
+        "{:?}",
+        symbolic_results
+            .iter()
+            .map(|(name, ty)| (name, ty.display(&db, &env).to_string()))
+            .collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+#[test]
+fn optional_getters_retain_results() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.py",
+            r#"
+from builtins import getattr as lookup
+from typing import Any, Callable
+
+def condition() -> bool: ...
+
+class Present:
+    field: int
+
+class MaybeFallback[T]:
+    if condition():
+        def __getattr__(self: MaybeFallback[Callable[[Any], None]], name: str) -> str: ...
+
+optional: MaybeFallback[Callable[[str], None]]
+combined: Present | MaybeFallback[Callable[[str], None]]
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let program = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program);
+    let lookup = crate::place::global_symbol(&db, program, "lookup")
+        .place
+        .expect_type();
+    let name_type = Type::string_literal(&db, "field");
+    let str_type = KnownClass::Str.to_instance(&db, &env);
+    let int_type = KnownClass::Int.to_instance(&db, &env);
+    for (name, result) in [
+        ("optional", str_type),
+        (
+            "combined",
+            crate::types::UnionType::from_two_elements(&db, &env, int_type, str_type),
+        ),
+    ] {
+        let receiver = crate::place::global_symbol(&db, program, name)
+            .place
+            .expect_type();
+        let mut arguments = crate::types::CallArguments::positional([name_type]);
+        match receiver.try_call_dunder_with_policy(
+            &db,
+            &env,
+            "__getattr__",
+            &mut arguments,
+            crate::types::TypeContext::default(),
+            MemberLookupPolicy::default(),
+        ) {
+            Err(crate::types::CallDunderError::PossiblyUnbound {
+                bindings,
+                unbound_on: _,
+            }) => {
+                assert_eq!(bindings.return_type(&db, &env), str_type);
+            }
+            other => panic!("expected optional callable for {name}, got {other:?}"),
+        }
+        let member = receiver
+            .member_lookup_with_policy_and_receiver(
+                &db,
+                &env,
+                "field",
+                MemberLookupPolicy::RUNTIME_ATTRIBUTE,
+                None,
+            )
+            .unwrap();
+        assert_eq!(member.member(&db).place.expect_type(), result, "{name}");
+        assert!(!member.member(&db).place.is_definitely_bound());
+        let default = Type::int_literal(0);
+        let arguments = crate::types::CallArguments::positional([receiver, name_type, default]);
+        let ordinary = lookup.try_call(&db, &env, &arguments).unwrap();
+        let expected = crate::types::UnionType::from_two_elements(&db, &env, result, default);
+        assert_eq!(ordinary.return_type(&db, &env), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn supplied_getters_preserve_attribute_presence() -> anyhow::Result<()> {
+    fn result<'db>(
+        db: &'db TestDb,
+        definition: Definition<'db>,
+        _receiver: Type<'db>,
+        _attribute: &str,
+    ) -> ProvidedGetattrResult<'db> {
+        if definition
+            .program_file(db)
+            .file(db)
+            .path(db)
+            .as_system_path()
+            .is_none_or(|path| path.as_str() != "/src/native.pyi")
+        {
+            return ProvidedGetattrResult::default();
+        }
+        let ty_python_core::definition::DefinitionKind::Function(function) = definition.kind(db)
+        else {
+            return ProvidedGetattrResult::default();
+        };
+        let module = parsed_module(db, definition.python_file(db)).load(db);
+        let function = function.node(&module);
+        if function.name.as_str() != "__getattr__" {
+            return ProvidedGetattrResult::default();
+        }
+        let Some(parameter) = function.parameters.find("name") else {
+            return ProvidedGetattrResult::default();
+        };
+        if parameter
+            .annotation()
+            .and_then(ast::Expr::as_name_expr)
+            .is_some_and(|annotation| matches!(annotation.id.as_str(), "str" | "int"))
+        {
+            ProvidedGetattrPresence::PossiblyMissing.into()
+        } else {
+            ProvidedGetattrResult {
+                presence: ProvidedGetattrPresence::Present,
+                return_type: Some(KnownClass::Str.to_instance(
+                    db,
+                    &ProgramEnvironment::from_file(definition.program_file(db)),
+                )),
+                immutable_storage: false,
+            }
+        }
+    }
+    let original = r#"
+from typing import Literal, overload
+class Record[T]:
+    def __getattr__(self, name: str) -> T: ...
+class Selected:
+    @overload
+    def __getattr__(self, name: Literal["run"]) -> object: ...
+    @overload
+    def __getattr__(self, name: str) -> object: ...
+class Malformed:
+    def __getattr__(self, name: int) -> object: ...
+"#;
+    let mut db = TestDbBuilder::new()
+        .with_python_version(ruff_python_ast::PythonVersion::PY313)
+        .with_file("/src/native.pyi", original)
+        .with_file("/src/main.py", "")
+        .with_getattr_result_provider(result)
+        .build()?;
+    let source = r#"
+from typing import Protocol
+from typing_extensions import assert_type
+from native import Record, Selected, Malformed
+class Required(Protocol):
+    @property
+    def run(self) -> object: ...
+def consume(value: Required): ...
+record = Record[str]()
+assert_type(record.run, str)
+consume(record)
+if hasattr(record, "run"):
+    assert_type(record.run, str)
+    consume(record)
+class Override(Record[object]):
+    def __getattr__(self, name: str) -> int:
+        return 1
+assert_type(Override().other, int)
+class Concrete(Record[str]):
+    run: str = "ok"
+    @property
+    def field(self) -> int:
+        return 1
+consume(Concrete())
+assert_type(Concrete().field, int)
+class Intercept(Record[str]):
+    def __getattribute__(self, name: str) -> int:
+        return 1
+assert_type(Intercept().other, int)
+selected = Selected()
+consume(selected)
+assert_type(selected.run, str)
+assert_type(selected.other, object)
+malformed = Malformed()
+consume(malformed)
+malformed.other
+"#;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    db.write_file("/src/main.py", source)?;
+    let with_field = original.replace("class Record[T]:", "class Record[T]:\n    run: str");
+    for native in [original, with_field.as_str(), original] {
+        db.write_file("/src/native.pyi", native)?;
+        let diagnostics = db.check_file(file);
+        let expected = if native == original {
+            vec![
+                "invalid-argument-type",
+                "invalid-argument-type",
+                "invalid-attribute-access",
+            ]
+        } else {
+            vec!["invalid-argument-type", "invalid-attribute-access"]
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{diagnostics:#?}",
+        );
+        let program = db.program_file(file);
+        let env = ProgramEnvironment::from_file(program);
+        for name in ["record", "selected", "malformed"] {
+            let ty = crate::place::global_symbol(&db, program, name)
+                .place
+                .expect_type();
+            let member = ty.member(&db, &env, "run");
+            let crate::place::Place::Defined(member) = member.place else {
+                panic!("getter supplies a value bound");
+            };
+            let expected = if name == "selected" || (name == "record" && native != original) {
+                crate::place::Definedness::AlwaysDefined
+            } else {
+                crate::place::Definedness::PossiblyUndefined
+            };
+            let crate::place::DefinedPlace {
+                ty: _,
+                origin: _,
+                definedness,
+                public_type_policy: _,
+                provenance: _,
+            } = member;
+            assert_eq!(definedness, expected, "{name}");
+        }
+    }
+    Ok(())
+}

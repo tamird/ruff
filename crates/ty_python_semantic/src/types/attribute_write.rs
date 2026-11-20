@@ -79,6 +79,91 @@ pub(super) enum AttributeWriteRequirement<'db> {
     },
 }
 
+impl<'db> AttributeWriteRequirement<'db> {
+    /// Whether a declared member is present on every possible receiver.
+    ///
+    /// A required intersection member establishes presence even when another member is optional.
+    /// Concrete storage lookups exclude dynamic getters and bases that can synthesize an attribute
+    /// without declaring it.
+    pub(super) fn is_definitely_bound(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        attribute: &str,
+    ) -> bool {
+        match self {
+            Self::All {
+                object_ty: _,
+                element_tys,
+            } => element_tys.iter().all(|ty| {
+                attribute_write_requirement(db, env, *ty, attribute)
+                    .is_definitely_bound(db, env, attribute)
+            }),
+            Self::Any {
+                object_ty: _,
+                intersection,
+            } => intersection.positive(db).iter().any(|ty| {
+                attribute_write_requirement(db, env, *ty, attribute)
+                    .is_definitely_bound(db, env, attribute)
+            }),
+            Self::ProtocolMember {
+                receiver_ty: _,
+                write: _,
+                qualifiers: _,
+            } => true,
+            Self::Instance {
+                object_ty,
+                member: _,
+            } => {
+                object_ty
+                    .class_member_with_policy(
+                        db,
+                        env,
+                        attribute,
+                        MemberLookupPolicy::REQUIRE_CONCRETE,
+                    )
+                    .place
+                    .is_definitely_bound()
+                    || object_ty
+                        .instance_member_with_policy(
+                            db,
+                            env,
+                            attribute,
+                            MemberLookupPolicy::REQUIRE_CONCRETE,
+                        )
+                        .place
+                        .is_definitely_bound()
+            }
+            Self::Class {
+                object_ty,
+                member: _,
+            } => {
+                object_ty
+                    .class_member_with_policy(
+                        db,
+                        env,
+                        attribute,
+                        MemberLookupPolicy::REQUIRE_CONCRETE,
+                    )
+                    .place
+                    .is_definitely_bound()
+                    || object_ty
+                        .class_object_member(
+                            db,
+                            env,
+                            attribute,
+                            MemberLookupPolicy::REQUIRE_CONCRETE,
+                        )
+                        .place
+                        .is_definitely_bound()
+            }
+            Self::Unconstrained => false,
+            Self::CannotAssign => false,
+            Self::Module(_) => false,
+        }
+    }
+}
+
 /// How a writable protocol member validates an assigned value.
 pub(super) enum ProtocolMemberWriteRequirement<'db> {
     /// Check the assigned value against a directly representable write type.
@@ -502,7 +587,7 @@ pub(super) fn attribute_write_requirement<'db>(
                 builtins_symbol(db, env, attribute)
             } else {
                 module
-                    .static_member(db, env, attribute)
+                    .static_member(db, env, attribute, MemberLookupPolicy::default())
                     .map_or_else(|_| Place::Undefined.into(), |member| member.member(db))
             };
             AttributeWriteRequirement::Module(match symbol.place {
@@ -1061,8 +1146,10 @@ fn class_fallback_write_requirement<'db>(
     let ty = ty.bind_self_typevars(db, env, class_attr_self_ty);
     let ty = if matches!(object_ty, Type::ClassLiteral(_))
         && let Type::FunctionLiteral(function) = ty
-        && function.callable_type_kind(db) == CallableTypeKind::FunctionLike
-    {
+        && matches!(
+            function.callable_type_kind(db),
+            CallableTypeKind::FunctionLike | CallableTypeKind::BuiltinFunctionLike
+        ) {
         Type::Callable(function.into_callable_type(db))
     } else {
         ty

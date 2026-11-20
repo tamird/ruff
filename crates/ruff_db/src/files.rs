@@ -675,6 +675,8 @@ pub struct FileRange {
     range: TextRange,
 }
 
+impl get_size2::GetSize for FileRange {}
+
 impl FileRange {
     pub const fn new(file: File, range: TextRange) -> Self {
         Self { file, range }

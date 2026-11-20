@@ -18,7 +18,7 @@ use ruff_db::parsed::parsed_module;
 use ruff_python_ast::find_node::CoveringNode;
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{
-    self as ast, AnyNodeRef,
+    self as ast, AnyNodeRef, HasNodeIndex, NodeIndex,
     name::Name,
     visitor::source_order::{SourceOrderVisitor, TraversalSignal},
 };
@@ -308,7 +308,7 @@ fn is_slots_assignment(node: AnyNodeRef<'_>, value: AnyNodeRef<'_>) -> bool {
 /// Find all references to a local symbol within the current file.
 /// The behavior depends on the provided mode.
 fn references_for_file(
-    db: &dyn Db,
+    db: &dyn SemanticDb,
     file: ProgramFile<'_>,
     search: &LocalReferenceSearch<'_>,
     mode: ReferencesMode,
@@ -333,6 +333,33 @@ fn references_for_file(
     AnyNodeRef::from(module.syntax()).visit_source_order(&mut finder);
 
     references
+}
+
+/// Find occurrences in `file` that share any of the supplied definition identities.
+///
+/// Import aliases retain their own identities. `include_declaration` controls
+/// whether declarations are included.
+/// The caller selects the definitions and their spelling; this search does not
+/// discover project files or follow fixture exposures.
+pub fn references_in_file<'db>(
+    db: &'db dyn SemanticDb,
+    file: ProgramFile<'db>,
+    name: &str,
+    definitions: &[ResolvedDefinition<'db>],
+    include_declaration: bool,
+) -> Vec<ReferenceTarget> {
+    let search = LocalReferenceSearch {
+        target_text: name.into(),
+        target_definitions: Definitions::new(definitions.to_vec()),
+        import_alias_resolution: ImportAliasResolution::PreserveAliases,
+        fixture_resolution: None,
+    };
+    let mode = if include_declaration {
+        ReferencesMode::DocumentHighlights
+    } else {
+        ReferencesMode::ReferencesSkipDeclaration
+    };
+    references_for_file(db, file, &search, mode)
 }
 
 /// Determines whether the resolved definitions can have references outside their file.
@@ -513,7 +540,7 @@ fn fixture_reference_resolution_for_definition<'db>(
         ) || (matches!(
             kind,
             DefinitionKind::Assignment(_) | DefinitionKind::AnnotatedAssignment(_)
-        ) && definition.file(db).is_stub(db)) =>
+        ) && definition.program_file(db).is_stub(db)) =>
         {
             // These definitions refer to Python bindings. Only `Binding` name sources use
             // that Python name as the fixture name; `Explicit` sources instead use the decorator:
@@ -577,7 +604,7 @@ fn collect_fixture_reference_roots<'db>(
     if !found_source_root {
         // Keep references resolved through a stub separate from the explicit-name declaration in
         // its runtime implementation, matching reference behavior for ordinary Python symbols.
-        let root = if exposure.local_binding().file(db).is_stub(db) {
+        let root = if exposure.local_binding().program_file(db).is_stub(db) {
             FixtureNameSource::Binding(exposure.local_binding())
         } else {
             exposure.name_source(db)
@@ -604,10 +631,15 @@ struct LocalReferencesFinder<'a> {
 
 impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
     fn enter_node(&mut self, node: AnyNodeRef<'a>) -> TraversalSignal {
-        self.ancestors.push(node);
+        if let TraversalSignal::Skip = self.push_ancestor(node) {
+            return TraversalSignal::Skip;
+        }
 
         match node {
             AnyNodeRef::ExprName(name_expr) => {
+                if name_expr.ctx.is_store() {
+                    self.visit_provided_annotation(name_expr.node_index().load());
+                }
                 // If the name doesn't match our target text, this isn't a match
                 if name_expr.id.as_str() != self.search.target_text {
                     return TraversalSignal::Traverse;
@@ -623,12 +655,14 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
             }
             AnyNodeRef::StmtFunctionDef(func) => {
                 self.check_declaration_identifier(&func.name);
+                self.visit_provided_annotation(func.node_index().load());
             }
             AnyNodeRef::StmtClassDef(class) => {
                 self.check_declaration_identifier(&class.name);
             }
             AnyNodeRef::Parameter(parameter) => {
                 self.check_declaration_identifier(&parameter.name);
+                self.visit_provided_annotation(parameter.node_index().load());
             }
             AnyNodeRef::Keyword(keyword) => {
                 if let Some(arg) = &keyword.arg {
@@ -683,16 +717,7 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
                 // Highlight the sub-AST of a string annotation
                 if let Some((sub_ast, sub_model)) = self.model.enter_string_annotation(string_expr)
                 {
-                    let mut sub_finder = LocalReferencesFinder {
-                        model: &sub_model,
-                        search: self.search,
-                        references: self.references,
-                        mode: self.mode,
-                        tokens: sub_ast.tokens(),
-                        fixture_match_cache: FxHashMap::default(),
-                        ancestors: Vec::new(),
-                    };
-                    sub_finder.visit_expr(sub_ast.expr());
+                    self.visit_annotation(sub_ast.expr(), sub_ast.tokens(), &sub_model);
                 }
             }
             AnyNodeRef::Alias(alias) => {
@@ -723,7 +748,9 @@ struct KeywordArgumentReferencesFinder<'a>(LocalReferencesFinder<'a>);
 
 impl<'a> SourceOrderVisitor<'a> for KeywordArgumentReferencesFinder<'a> {
     fn enter_node(&mut self, node: AnyNodeRef<'a>) -> TraversalSignal {
-        self.0.ancestors.push(node);
+        if let TraversalSignal::Skip = self.0.push_ancestor(node) {
+            return TraversalSignal::Skip;
+        }
 
         if let AnyNodeRef::Keyword(keyword) = node {
             if let Some(arg) = &keyword.arg {
@@ -741,6 +768,43 @@ impl<'a> SourceOrderVisitor<'a> for KeywordArgumentReferencesFinder<'a> {
 }
 
 impl<'a> LocalReferencesFinder<'a> {
+    fn visit_provided_annotation(&mut self, owner: NodeIndex) {
+        if let Some((parsed, model)) = self.model.enter_provided_annotation(owner) {
+            self.visit_annotation(parsed.expr(), parsed.tokens(), &model);
+        }
+    }
+
+    fn visit_annotation(
+        &mut self,
+        expression: &ast::Expr,
+        tokens: &Tokens,
+        model: &SemanticModel<'a>,
+    ) {
+        let mut finder = LocalReferencesFinder {
+            model,
+            search: self.search,
+            references: self.references,
+            mode: self.mode,
+            tokens,
+            fixture_match_cache: FxHashMap::default(),
+            ancestors: Vec::new(),
+        };
+        finder.visit_expr(expression);
+    }
+
+    fn push_ancestor(&mut self, node: AnyNodeRef<'a>) -> TraversalSignal {
+        // The visitor calls leave_node even for skipped subtrees.
+        self.ancestors.push(node);
+        if node.is_statement()
+            && ty_python_core::semantic_index(self.model.db(), self.model.program_file())
+                .is_excluded(node.range())
+        {
+            TraversalSignal::Skip
+        } else {
+            TraversalSignal::Traverse
+        }
+    }
+
     /// Checks an identifier of a binding (e.g. `x = 10`)
     fn check_binding_identifier(&mut self, identifier: &ast::Identifier) {
         self.check_identifier(identifier, OccurrenceKind::Binding);
@@ -974,7 +1038,7 @@ impl<'a> LocalReferencesFinder<'a> {
     /// slot.
     fn target_belongs_to_class(&self, class: &'a ast::StmtClassDef) -> bool {
         let db = self.model.db();
-        let file = self.model.file();
+        let file = self.model.program_file();
         let class_range = class.range();
         let module = ruff_db::parsed::parsed_module(db, self.model.python_file()).load(db);
         let index = ty_python_core::semantic_index(db, self.model.program_file());
@@ -994,7 +1058,7 @@ impl<'a> LocalReferencesFinder<'a> {
             let Some(definition) = resolved.definition() else {
                 return false;
             };
-            if definition.file(db) != file {
+            if definition.program_file(db) != file {
                 return false;
             }
 
@@ -1019,7 +1083,7 @@ impl<'a> LocalReferencesFinder<'a> {
                     definition.kind(db),
                     DefinitionKind::AnnotatedAssignment(assignment)
                         if assignment.value(&module).is_none_or(|value| {
-                            file.is_stub(db) && value.is_ellipsis_literal_expr()
+                            definition.program_file(db).is_stub(db) && value.is_ellipsis_literal_expr()
                         })
                 );
             place.is_member() || is_class_attribute_declaration
@@ -1033,10 +1097,8 @@ impl<'a> LocalReferencesFinder<'a> {
             return false;
         };
 
-        let file = local_definition.file(db);
         let module = ruff_db::parsed::parsed_module(db, local_definition.python_file(db)).load(db);
-        let kind = local_definition.kind(db);
-        let category = kind.category(file.is_stub(db), &module);
+        let category = local_definition.category(db, &module);
 
         if category.is_declaration() {
             return true;
@@ -1076,6 +1138,71 @@ mod tests {
     use super::*;
     use crate::goto::find_goto_target;
     use crate::tests::{CursorTest, cursor_test};
+
+    #[test]
+    fn file_references_preserve_definition_identity() {
+        let test = cursor_test(
+            "value<CURSOR> = 1\nvalue\ndef shadow():\n    value = 2\n    return value\nvalue = 3\nvalue",
+        );
+        let file = test.program_file(test.cursor.file);
+        let model = SemanticModel::new(&test.db, file);
+        let target = find_goto_target(&model, &test.cursor.parsed, test.cursor.offset).unwrap();
+        let definitions = target
+            .definitions(&model, ImportAliasResolution::PreserveAliases)
+            .unwrap();
+        let definitions = definitions.iter().cloned().collect::<Vec<_>>();
+        let references = references_in_file(&test.db, file, "value", &definitions, true);
+        let actual = references
+            .iter()
+            .map(|reference| {
+                assert_eq!(reference.file(), test.cursor.file);
+                (usize::from(reference.range().start()), reference.kind())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                (0, ReferenceKind::Write),
+                (10, ReferenceKind::Read),
+                (
+                    test.cursor.source.rfind("value =").unwrap(),
+                    ReferenceKind::Write
+                ),
+                (
+                    test.cursor.source.rfind("value").unwrap(),
+                    ReferenceKind::Read
+                ),
+            ]
+        );
+        let without_declaration = references_in_file(&test.db, file, "value", &definitions, false);
+        assert_eq!(without_declaration, references[1..]);
+    }
+
+    #[test]
+    fn slot_references_preserve_semantic_file_identity() {
+        let test =
+            cursor_test("class Example:\n    __slots__ = ('value',)\n    value<CURSOR>: int\n");
+        let source = test.program_file(test.cursor.file);
+        let stub = ProgramFile::from_python_file_with_kind(
+            &test.db,
+            source.python_file(&test.db),
+            source.program(&test.db),
+            ty_python_core::ProgramFileKind::Stub,
+        );
+        for file in [source, stub] {
+            let model = SemanticModel::new(&test.db, file);
+            let target = find_goto_target(&model, &test.cursor.parsed, test.cursor.offset).unwrap();
+            let definitions = target
+                .definitions(&model, ImportAliasResolution::PreserveAliases)
+                .unwrap();
+            let definitions = definitions.iter().cloned().collect::<Vec<_>>();
+            let references = references_in_file(&test.db, file, "value", &definitions, true);
+            assert_eq!(references.len(), 2, "{references:?}");
+            let other = if file == source { stub } else { source };
+            let references = references_in_file(&test.db, other, "value", &definitions, true);
+            assert!(references.is_empty(), "{references:?}");
+        }
+    }
 
     fn cursor_target_is_externally_visible(test: &CursorTest) -> bool {
         let model = SemanticModel::new(&test.db, test.program_file(test.cursor.file));

@@ -1,13 +1,18 @@
+use crate::types::dictionary::{
+    DictionaryExtraItems, DictionaryFallback, DictionaryFirstEntry, DictionaryItem,
+    DictionaryItemKind, DictionaryItems, DictionaryObservation,
+};
 use crate::Db;
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::fmt::Display;
 use std::hash::BuildHasherDefault;
 
+use indexmap::map::Entry;
 use itertools::{Either, Itertools};
 use ruff_python_ast as ast;
 use ruff_python_ast::name::Name;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::FxIndexMap;
 use crate::ProgramEnvironment;
@@ -26,6 +31,80 @@ use crate::types::{Parameter, Type, TypeContext, UnionType, expand_type};
 ///
 /// [pyright]: https://github.com/microsoft/pyright/blob/5a325e4874e775436671eed65ad696787a1ef74b/packages/pyright-internal/src/analyzer/typeEvaluator.ts#L566
 const MAX_TOTAL_EXPANSION: usize = 256;
+
+/// Combine keyword sources on paths where their call succeeds. Unlike dictionary overlays,
+/// separate keyword sources cannot overwrite a supplied name: a collision raises instead.
+pub(crate) fn collect_keyword_items<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    sources: impl IntoIterator<Item = DictionaryObservation<'db>>,
+) -> DictionaryObservation<'db> {
+    let mut items: FxIndexMap<Name, DictionaryItem<'db>> = FxIndexMap::default();
+    let mut extra_items = DictionaryExtraItems::Closed;
+    let mut first_entry = DictionaryFirstEntry::Empty;
+    for source in sources {
+        let DictionaryItems {
+            items: incoming,
+            extra_items: incoming_extra,
+            first_entry: incoming_first,
+        } = source?;
+        if incoming_first != DictionaryFirstEntry::Empty {
+            // This combines argument evidence, rather than observing a runtime mapping.
+            first_entry = DictionaryFirstEntry::Unknown;
+        }
+        let previous_empty =
+            items.is_empty() && matches!(extra_items, DictionaryExtraItems::Closed);
+        let incoming_empty =
+            incoming.is_empty() && matches!(incoming_extra, DictionaryExtraItems::Closed);
+        if let Some(ty) = incoming_extra.value_type() {
+            let names: FxHashSet<_> = incoming.iter().map(|item| item.name.clone()).collect();
+            for item in items.values_mut() {
+                if !item.is_required() && !names.contains(&item.name) {
+                    item.ty = UnionType::from_two_elements(db, env, item.ty, ty);
+                }
+            }
+        }
+        for mut item in incoming {
+            match items.entry(item.name.clone()) {
+                Entry::Occupied(mut entry) => {
+                    let previous = entry.get();
+                    if previous.kind != DictionaryItemKind::Residual
+                        && item.kind != DictionaryItemKind::Residual
+                    {
+                        // Decline metadata for possibly colliding named arguments. The ordinary
+                        // call checker retains responsibility for their diagnostics.
+                        return Err(DictionaryFallback::Unavailable);
+                    }
+                    if previous.is_required() {
+                        continue;
+                    }
+                    if !item.is_required() {
+                        item.ty = UnionType::from_two_elements(db, env, previous.ty, item.ty);
+                        if item.kind == DictionaryItemKind::Residual {
+                            item.kind = previous.kind;
+                            item.source = previous.source;
+                        }
+                    }
+                    entry.insert(item);
+                }
+                Entry::Vacant(entry) => {
+                    if !item.is_required()
+                        && let Some(ty) = extra_items.value_type()
+                    {
+                        item.ty = UnionType::from_two_elements(db, env, ty, item.ty);
+                    }
+                    entry.insert(item);
+                }
+            }
+        }
+        extra_items = extra_items.combine(db, env, incoming_extra, previous_empty, incoming_empty);
+    }
+    Ok(DictionaryItems {
+        first_entry,
+        items: items.into_values().collect(),
+        extra_items,
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Argument<'a> {
@@ -118,7 +197,11 @@ impl<'a, 'db> CallArgument<'a, 'db> {
             Self::Variadic(
                 VariadicArgument::Type(types) | VariadicArgument::Sequence { types, .. },
             )
-            | Self::Keywords(KeywordArgument::Type(types) | KeywordArgument::Known { types, .. }) => {
+            | Self::Keywords(
+                KeywordArgument::Type(types)
+                | KeywordArgument::Known { types, .. }
+                | KeywordArgument::Observed { types, .. },
+            ) => {
                 types
             }
         }
@@ -382,10 +465,77 @@ impl<'db> VariadicArgument<'db> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum KeywordArgument<'db> {
     Type(CallArgumentTypes<'db>),
+    /// Contents observed at this call, including optional keys and residual exclusions.
+    Observed {
+        types: CallArgumentTypes<'db>,
+        keywords: KnownKeywords<'db>,
+    },
     Known {
         types: CallArgumentTypes<'db>,
         keywords: UnpackedKeywords<'db>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KnownKeywords<'db> {
+    pub(super) items: Box<[DictionaryItem<'db>]>,
+    pub(super) extra_items: DictionaryExtraItems<'db>,
+    /// Prefix parameters removed while forwarding to a `ParamSpec` remain excluded from the tail.
+    pub(super) excluded_names: Vec<Name>,
+}
+
+impl<'db> KnownKeywords<'db> {
+    /// All values supplied without named-key evidence, after any `ParamSpec` projection.
+    pub(super) fn residual_values(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Type<'db> {
+        let Self {
+            items,
+            extra_items,
+            excluded_names: _,
+        } = self;
+        UnionType::from_elements(
+            db,
+            env,
+            extra_items.argument_type().into_iter().chain(
+                items.iter().filter_map(|item| {
+                    (item.kind == DictionaryItemKind::Residual).then_some(item.ty)
+                }),
+            ),
+        )
+    }
+
+    pub(super) fn residual_value(
+        &self,
+        db: &'db dyn Db,
+        name: Option<&str>,
+        all_values: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let Self {
+            items,
+            extra_items,
+            excluded_names,
+        } = self;
+        let ty = if let Some(name) = name {
+            if excluded_names.iter().any(|excluded| excluded == name) {
+                return None;
+            }
+            if let Some(item) = items.iter().find(|item| item.name == name) {
+                match item.kind {
+                    DictionaryItemKind::Required => return None,
+                    DictionaryItemKind::Optional => return None,
+                    DictionaryItemKind::Residual => item.ty,
+                }
+            } else {
+                extra_items.argument_type()?
+            }
+        } else {
+            all_values
+        };
+        (!ty.resolve_type_alias(db).is_never()).then_some(ty)
+    }
 }
 
 /// Known keyword values and possible undeclared keys.
@@ -396,9 +546,29 @@ pub(crate) struct UnpackedKeywords<'db> {
 }
 
 impl<'db> KeywordArgument<'db> {
+    /// Remove keyword names consumed by the fixed prefix of a forwarded call.
+    pub(super) fn remove_prefix_keywords(&mut self, prefix: &[Parameter<'db>]) {
+        match self {
+            Self::Type(_) => {}
+            Self::Known { types: _, keywords } => {
+                keywords.keys = keywords.keys.iter()
+                    .filter(|(name, _)| !prefix.iter().any(|p| p.keyword_name() == Some(name)))
+                    .cloned().collect();
+            }
+            Self::Observed { types: _, keywords } => {
+                keywords.items = keywords.items.iter()
+                    .filter(|item| !prefix.iter().any(|p| p.keyword_name() == Some(&item.name)))
+                    .cloned().collect();
+                keywords.excluded_names.extend(
+                    prefix.iter().filter_map(|parameter| parameter.keyword_name().cloned()),
+                );
+            }
+        }
+    }
+
     fn source_types(&self) -> &CallArgumentTypes<'db> {
         match self {
-            Self::Type(types) | Self::Known { types, .. } => types,
+            Self::Type(types) | Self::Known { types, .. } | Self::Observed { types, keywords: _ } => types,
         }
     }
 
@@ -408,18 +578,32 @@ impl<'db> KeywordArgument<'db> {
 
     /// Whether all keyword values were captured at the call site, rather than described by a type.
     pub(crate) fn is_complete(&self) -> bool {
-        matches!(self, Self::Known { keywords, .. }
-            if matches!(keywords.openness, TypedDictOpenness::Closed)
-                && keywords.keys.iter().all(|(_, key)| key.is_required))
+        match self {
+            Self::Type(_) => false,
+            Self::Known { keywords, .. } => {
+                matches!(keywords.openness, TypedDictOpenness::Closed)
+                    && keywords.keys.iter().all(|(_, key)| key.kind.is_required())
+            }
+            Self::Observed { types: _, keywords } => {
+                matches!(keywords.extra_items, DictionaryExtraItems::Closed)
+                    && keywords.items.iter().all(DictionaryItem::is_required)
+            }
+        }
     }
 
     pub(crate) fn explicit_keyword_names(&self) -> impl Iterator<Item = &Name> {
-        let keys = match self {
-            Self::Type(_) => [].as_slice(),
-            Self::Known { keywords, .. } => keywords.keys.as_ref(),
-        };
-        keys.iter()
-            .filter_map(|(name, key)| key.is_required.then_some(name))
+        match self {
+            Self::Observed { types: _, keywords } => Either::Left(
+                keywords.items.iter().filter_map(|item| item.is_required().then_some(&item.name)),
+            ),
+            Self::Type(_) | Self::Known { .. } => {
+                let keys = match self {
+                    Self::Known { keywords, .. } => keywords.keys.as_ref(),
+                    _ => [].as_slice(),
+                };
+                Either::Right(keys.iter().filter_map(|(name, key)| key.kind.is_required().then_some(name)))
+            }
+        }
     }
 
     fn expand(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Option<Vec<Self>> {
@@ -447,6 +631,26 @@ impl<'db> KeywordArgument<'db> {
                     })
                     .collect()
             }
+            Self::Observed { types, keywords } => {
+                expand_elements(db, env, keywords.items.iter().map(|item| item.ty))?
+                    .into_iter()
+                    .map(|elements| Self::Observed {
+                        types: types.clone(),
+                        keywords: KnownKeywords {
+                            items: keywords.items.iter().zip(elements).map(|(item, ty)| {
+                                DictionaryItem {
+                                    name: item.name.clone(),
+                                    ty,
+                                    kind: item.kind,
+                                    source: item.source,
+                                }
+                            }).collect(),
+                            extra_items: keywords.extra_items,
+                            excluded_names: keywords.excluded_names.clone(),
+                        },
+                    })
+                    .collect()
+            }
         })
     }
 
@@ -457,6 +661,19 @@ impl<'db> KeywordArgument<'db> {
     ) -> Option<UnpackedKeywords<'db>> {
         if let Self::Known { keywords, .. } = self {
             return Some(keywords.clone());
+        }
+        if let Self::Observed { types: _, keywords } = self {
+            return Some(UnpackedKeywords {
+                keys: keywords.items.iter().map(|item| {
+                    (item.name.clone(), UnpackedTypedDictKey {
+                        value_ty: item.ty,
+                        kind: item.kind,
+                        definition: None,
+                    })
+                }).collect(),
+                openness: keywords.extra_items.value_type()
+                    .map_or(TypedDictOpenness::Closed, |ty| TypedDictOpenness::extra(db, ty, true)),
+            });
         }
         let unpacked = extract_unpacked_typed_dict_from_value_type(db, env, self.source_type()?)?;
         Some(UnpackedKeywords {
@@ -478,9 +695,15 @@ impl<'db> KeywordArgument<'db> {
                 .find_map(|(key, value)| (Some(key.as_str()) == name).then_some(value.value_ty))
                 .unwrap_or(Type::unknown());
         }
+        if let Self::Observed { types: _, keywords } = self {
+            return keywords.items.iter()
+                .find_map(|item| (Some(item.name.as_str()) == name).then_some(item.ty))
+                .or_else(|| keywords.residual_value(db, name, keywords.residual_values(db, env)))
+                .unwrap_or(Type::unknown());
+        }
         self.source_type()
             .and_then(|ty| {
-                ty.as_paramspec_typevar(db)
+                ty.as_paramspec_keyword_component(db)
                     .or_else(|| ty.getitem_dunder_call(db, env, name))
             })
             .unwrap_or(Type::unknown())
@@ -555,6 +778,25 @@ impl<'db> CallArgumentTypes<'db> {
             .iter()
             .map(|(tcx, ty)| (TypeContext::preference(Some(*tcx)), *ty))
             .chain(self.fallback_type.map(|ty| (TypeContext::default(), ty)))
+    }
+
+    /// Whether a nominal argument alternative still needs final contextual inference.
+    /// Callable alternatives retain their separate contextual inference behavior.
+    pub(crate) fn has_unspecialized_nominal_type(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
+        self.iter().any(|(_, ty)| {
+            let ty = ty.expand_top_level_aliases(db, env);
+            let alternatives = match &ty {
+                Type::Union(union) => union.elements(db),
+                ty => std::slice::from_ref(ty),
+            };
+            alternatives.iter().any(|ty| {
+                matches!(ty, Type::NominalInstance(_)) && ty.has_unspecialized_type_var(db, env)
+            })
+        })
     }
 }
 
@@ -703,7 +945,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                             Name::new(key.value.to_str()),
                             UnpackedTypedDictKey {
                                 value_ty,
-                                is_required: true,
+                                kind: DictionaryItemKind::Required,
                                 definition: None,
                             },
                         );
@@ -720,6 +962,43 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                     }
                 }
                 _ => {}
+            }
+        }
+        self
+    }
+
+    /// Retain dictionary observations after argument inference without inferring expressions again.
+    #[must_use]
+    pub(crate) fn with_observed_unpacking(
+        mut self,
+        arguments: &ast::Arguments,
+        expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+        mut dictionary_items: impl FnMut(&ast::Expr) -> DictionaryObservation<'db>,
+    ) -> Self {
+        self = self.with_known_unpacking(arguments, expression_type);
+        for (argument, source) in self.items.iter_mut().zip(arguments.iter_source_order()) {
+            let CallArgument::Keywords(keyword) = argument else {
+                continue;
+            };
+            let ast::ArgOrKeyword::Keyword(ast::Keyword {
+                node_index: _, range: _, arg: None, value,
+            }) = source else {
+                continue;
+            };
+            if keyword.source_type().is_some_and(|ty| ty.is_never()) {
+                continue;
+            }
+            match dictionary_items(value) {
+                Err(DictionaryFallback::Unavailable) => {}
+                Err(DictionaryFallback::Unreachable) => {
+                    *keyword = KeywordArgument::Type(CallArgumentTypes::new(Some(Type::Never)));
+                }
+                Ok(DictionaryItems { items, extra_items, first_entry: _ }) => {
+                    *keyword = KeywordArgument::Observed {
+                        types: keyword.source_types().clone(),
+                        keywords: KnownKeywords { items, extra_items, excluded_names: Vec::new() },
+                    };
+                }
             }
         }
         self
@@ -1091,5 +1370,202 @@ impl<'a, 'db> FromIterator<(Argument<'a>, Option<Type<'db>>)> for CallArguments<
         }
 
         Self { items }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruff_db::files::system_path_to_file;
+    use ruff_text_size::TextRange;
+
+    use super::*;
+    use crate::db::tests::TestDbBuilder;
+    use crate::types::call::{Bindings, CallableBinding};
+    use crate::types::constraints::ConstraintSetBuilder;
+    use crate::types::{DynamicType, KnownClass, Parameter, Signature};
+
+    #[test]
+    fn nominal_union_arguments_need_final_context() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new().with_file("/src/main.py", "").build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let env = ProgramEnvironment::from_file(db.program_file(file));
+        let string = KnownClass::Str.to_instance(&db, &env);
+        let list = |element| KnownClass::List.to_specialized_instance(&db, &env, &[element]);
+        let provisional = list(Type::Dynamic(DynamicType::UnspecializedTypeVar));
+        let callback = Type::single_callable(&db, Signature::new(Parameters::empty(), provisional));
+        let other_callback = Type::single_callable(
+            &db,
+            Signature::new(Parameters::empty(), Type::int_literal(42)),
+        );
+        for (ty, needs_final_context) in [
+            (provisional, true),
+            (
+                UnionType::from_two_elements(&db, &env, string, provisional),
+                true,
+            ),
+            (
+                UnionType::from_two_elements(&db, &env, string, list(Type::any())),
+                false,
+            ),
+            (
+                UnionType::from_two_elements(&db, &env, string, list(Type::unknown())),
+                false,
+            ),
+            (callback, false),
+            (
+                UnionType::from_two_elements(&db, &env, callback, other_callback),
+                false,
+            ),
+            (
+                UnionType::from_two_elements(&db, &env, string, callback),
+                false,
+            ),
+        ] {
+            let types = CallArgumentTypes::new(Some(ty));
+            assert_eq!(
+                types.has_unspecialized_nominal_type(&db, &env),
+                needs_final_context,
+                "{ty:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn literal_unpacking_preserves_operand_and_child_types() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new().with_file("/src/main.py", "").build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let env = ProgramEnvironment::from_file(db.program_file(file));
+        let int = KnownClass::Int.to_instance(&db, &env);
+        let divergent = Type::divergent(salsa::plumbing::Id::from_bits(1));
+        let source = "call(*[first, second])";
+        let parsed = ruff_python_parser::parse_module(source)?;
+        assert_eq!(parsed.syntax().body.len(), 1, "Expected one call statement");
+        let statement = parsed.syntax().body[0]
+            .as_expr_stmt()
+            .expect("Expected an expression statement");
+        let call = statement
+            .value
+            .as_call_expr()
+            .expect("Expected a call expression");
+        for operand in [Some(Type::unknown()), Some(divergent), None] {
+            let arguments: CallArguments =
+                [(Argument::Variadic, operand)].into_iter().collect();
+            let arguments = arguments.with_known_unpacking(
+                &call.arguments,
+                |expression| {
+                    let name = expression
+                        .as_name_expr()
+                        .expect("Expected a literal child name");
+                    match name.id.as_str() {
+                        "first" => Some(int),
+                        "second" => Some(divergent),
+                        _ => panic!("Unexpected literal child"),
+                    }
+                },
+            );
+            let types = arguments
+                .source_types(0)
+                .expect("Expected the unpacked operand");
+            assert_eq!(
+                types.get_default(),
+                operand,
+                "Original operand must remain available"
+            );
+            let Some(CallArgument::Variadic(argument)) = arguments.get(0) else {
+                panic!("Expected the starred argument");
+            };
+            let shape = argument
+                .sequence(&db, &env)
+                .expect("Literal children must supply a shape without an operand type");
+            assert!(
+                !shape.len().is_variable(),
+                "Literal children retain fixed slots"
+            );
+            assert_eq!(
+                shape.iter_element_types(&db).collect::<Vec<_>>(),
+                [int, divergent]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn residual_keywords_follow_paramspec_projection() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new().with_file("/src/main.py", "").build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let env = ProgramEnvironment::from_file(db.program_file(file));
+        let forwarded = Type::string_literal(&db, "forwarded");
+        let arguments = CallArguments {
+            items: vec![CallArgument::Keywords(KeywordArgument::Observed {
+                types: CallArgumentTypes::new(Some(Type::unknown())),
+                keywords: KnownKeywords {
+                    items: [
+                        DictionaryItem {
+                            name: Name::new_static("prefix"),
+                            ty: Type::int_literal(1),
+                            kind: DictionaryItemKind::Residual,
+                            source: TextRange::default(),
+                        },
+                        DictionaryItem {
+                            name: Name::new_static("value"),
+                            ty: forwarded,
+                            kind: DictionaryItemKind::Residual,
+                            source: TextRange::default(),
+                        },
+                    ]
+                    .into(),
+                    extra_items: DictionaryExtraItems::Closed,
+                    excluded_names: Vec::new(),
+                },
+            })],
+        };
+        let parameters =
+            Parameters::standard([Parameter::keyword_only(Name::new_static("prefix"))]);
+        let mut projected = arguments;
+        let CallArgument::Keywords(keywords) = &mut projected.items[0] else {
+            panic!("expected keyword argument");
+        };
+        keywords.remove_prefix_keywords(parameters.as_slice());
+        let Some(CallArgument::Keywords(KeywordArgument::Observed { types: _, keywords })) = projected.get(0) else {
+            panic!(
+                "expected projected keywords, got {:?}",
+                projected.get(0)
+            );
+        };
+        let values = keywords.residual_values(&db, &env);
+        assert_eq!(values, forwarded);
+        assert_eq!(keywords.residual_value(&db, None, values), Some(forwarded));
+        assert_eq!(
+            keywords.residual_value(&db, Some("value"), values),
+            Some(forwarded)
+        );
+        assert_eq!(keywords.residual_value(&db, Some("prefix"), values), None);
+        for parameter in [
+            Parameter::keyword_only(Name::new_static("value")),
+            Parameter::keyword_variadic(Name::new_static("kwargs")),
+        ] {
+            for (expected, valid) in [(KnownClass::Str, true), (KnownClass::Int, false)] {
+                let signature = Signature::new(
+                    Parameters::standard([parameter
+                        .clone()
+                        .with_annotated_type(expected.to_instance(&db, &env))]),
+                    Type::none(&db, &env),
+                );
+                let binding = CallableBinding::from_overloads(Type::unknown(), [signature]);
+                let result = Bindings::from(binding)
+                    .match_parameters(&db, &env, &projected)
+                    .check_types(
+                        &db,
+                        &env,
+                        &ConstraintSetBuilder::new(),
+                        &projected,
+                        TypeContext::default(),
+                        &[],
+                    );
+                assert_eq!(result.is_ok(), valid, "{parameter:?}: {result:?}");
+            }
+        }
+        Ok(())
     }
 }
