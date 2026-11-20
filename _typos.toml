@@ -1,6 +1,9 @@
 [files]
 # https://github.com/crate-ci/typos/issues/868
 extend-exclude = [
+    # Canonical generator outputs contain upstream dependency names.
+    "bazel/cargo-bazel.json",
+    "MODULE.bazel.lock",
     "crates/ty_vendored/vendor/**/*",
     "crates/ruff_unicode_names2/data/NameAliases.txt",
     "crates/ruff_unicode_names2/data/UnicodeData.txt",

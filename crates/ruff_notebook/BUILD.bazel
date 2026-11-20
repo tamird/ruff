@@ -1,0 +1,10 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ruff_notebook",
+    deps = [
+        "//crates/ruff_diagnostics:ruff_diagnostics",
+        "//crates/ruff_source_file:ruff_source_file",
+        "//crates/ruff_text_size:ruff_text_size",
+    ],
+)

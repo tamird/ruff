@@ -1,0 +1,25 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ty_ide",
+    unit_test = True,
+    test_deps = ["//crates/ruff_python_parser:ruff_python_parser", "//crates/ty_project:ty_project"],
+    test_data = glob(["src/**/snapshots/**"]),
+    deps = [
+        "//crates/ruff_db:ruff_db",
+        "//crates/ruff_diagnostics:ruff_diagnostics",
+        "//crates/ruff_index:ruff_index",
+        "//crates/ruff_memory_usage:ruff_memory_usage",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_python_literal:ruff_python_literal",
+        "//crates/ruff_python_stdlib:ruff_python_stdlib",
+        "//crates/ruff_python_trivia:ruff_python_trivia",
+        "//crates/ruff_source_file:ruff_source_file",
+        "//crates/ruff_text_size:ruff_text_size",
+        "//crates/ty_module_resolver:ty_module_resolver",
+        "//crates/ty_project:ty_project",
+        "//crates/ty_python_core:ty_python_core",
+        "//crates/ty_python_semantic:ty_python_semantic",
+        "//crates/ty_vendored:ty_vendored",
+    ],
+)

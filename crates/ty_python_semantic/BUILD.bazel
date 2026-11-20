@@ -1,0 +1,57 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//bazel:rust_crate.bzl", "RUST_TEST_CPUS", "RUST_TEST_ENV", "rust_crate", "rust_mdtest")
+
+rust_crate(
+    name = "ty_python_semantic",
+    proc_macro_deps = ["//crates/ruff_macros:ruff_macros"],
+    deps = [
+        "//crates/ruff_db:ruff_db",
+        "//crates/ruff_diagnostics:ruff_diagnostics",
+        "//crates/ruff_index:ruff_index",
+        "//crates/ruff_memory_usage:ruff_memory_usage",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_python_codegen:ruff_python_codegen",
+        "//crates/ruff_python_edits:ruff_python_edits",
+        "//crates/ruff_python_importer:ruff_python_importer",
+        "//crates/ruff_python_literal:ruff_python_literal",
+        "//crates/ruff_python_parser:ruff_python_parser",
+        "//crates/ruff_python_stdlib:ruff_python_stdlib",
+        "//crates/ruff_python_trivia:ruff_python_trivia",
+        "//crates/ruff_source_file:ruff_source_file",
+        "//crates/ruff_text_size:ruff_text_size",
+        "//crates/ty_combine:ty_combine",
+        "//crates/ty_module_resolver:ty_module_resolver",
+        "//crates/ty_python_core:ty_python_core",
+        "//crates/ty_site_packages:ty_site_packages",
+        "//crates/ty_static:ty_static",
+    ],
+    unit_test = True,
+    test_deps = ["//crates/ruff_db:ruff_db", "//crates/ty_test:ty_test", "//crates/ty_vendored:ty_vendored"],
+    test_data = glob(["src/**/snapshots/**"]),
+    compile_data = glob(["resources/lint_docs/*.md", "resources/removed_lint_docs/*.md"]),
+)
+
+rust_mdtest(
+    name = "mdtest",
+    deps = [":ty_python_semantic", "//crates/ty_test:ty_test"],
+    data = glob(["resources/mdtest/**", "resources/lint_docs/**"]),
+)
+
+
+# Network-backed fixture setup runs on the Remote Bazel frontend, not an RBE
+# action or the developer's machine. See //bazel:README.md for the required CLI.
+sh_test(
+    name = "mdtest_external",
+    srcs = ["//bazel:mdtest_external.sh"],
+    args = [
+        "$(rootpath :mdtest)",
+        "$(rootpath @uv_linux_amd64//:uv)",
+        "--test-threads={}".format(RUST_TEST_CPUS),
+    ],
+    data = [":mdtest", "@uv_linux_amd64//:uv"],
+    env = RUST_TEST_ENV | {"MDTEST_EXTERNAL": "1"},
+    tags = ["manual", "no-cache", "no-remote", "requires-network"],
+    target_compatible_with = ["@platforms//os:linux", "@platforms//cpu:x86_64"],
+    timeout = "long",
+    visibility = ["//visibility:public"],
+)

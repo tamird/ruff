@@ -1,0 +1,3 @@
+load("//bazel:cargo_metadata.bzl", "cargo_metadata_files")
+
+cargo_metadata_files()

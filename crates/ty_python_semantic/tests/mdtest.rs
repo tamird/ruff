@@ -1,5 +1,8 @@
 use anyhow::anyhow;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
+
+const MDTEST_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/mdtest");
+const LINT_DOC_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/lint_docs");
 
 thread_local! {
     // Restrict each fixture's Rayon work to one thread so concurrent tests do not compete for the
@@ -17,7 +20,7 @@ fn mdtest(fixture_path: &Utf8Path, content: String) -> datatest_stable::Result<(
     run(
         fixture_path,
         &content,
-        "./resources/mdtest",
+        MDTEST_ROOT,
         ty_test::RunOptions::default(),
     )
 }
@@ -34,7 +37,7 @@ fn lint_doc(fixture_path: &Utf8Path, content: String) -> datatest_stable::Result
     run(
         fixture_path,
         &content,
-        "./resources/lint_docs",
+        LINT_DOC_ROOT,
         ty_test::RunOptions {
             default_error_rule: Some(rule.name.as_str()),
         },
@@ -52,10 +55,17 @@ fn run(
         .ok_or_else(|| anyhow!("Expected fixture path to have a file name"))?;
 
     let crate_dir = Utf8Path::new(env!("CARGO_MANIFEST_DIR"));
-    let snapshot_path = crate_dir.join("resources").join("mdtest").join("snapshots");
-    let absolute_fixture_path = crate_dir.join(fixture_path);
-    let workspace_relative_fixture_path = Utf8Path::new("crates/ty_python_semantic")
-        .join(fixture_path.strip_prefix(".").unwrap_or(fixture_path));
+    let relative_fixture_path = fixture_path.strip_prefix(crate_dir)?;
+    let absolute_crate_dir = std::path::absolute(crate_dir)?;
+    let absolute_crate_dir = Utf8PathBuf::from_path_buf(absolute_crate_dir)
+        .map_err(|path| anyhow!("Crate directory is not UTF-8: {}", path.display()))?;
+    let snapshot_path = absolute_crate_dir
+        .join("resources")
+        .join("mdtest")
+        .join("snapshots");
+    let absolute_fixture_path = absolute_crate_dir.join(relative_fixture_path);
+    let workspace_relative_fixture_path =
+        Utf8Path::new("crates/ty_python_semantic").join(relative_fixture_path);
 
     let test_name = fixture_path
         .strip_prefix(resource_root)
@@ -80,6 +90,6 @@ fn run(
 }
 
 datatest_stable::harness! {
-    { test = mdtest, root = "./resources/mdtest", pattern = r"\.md$" },
-    { test = lint_doc, root = "./resources/lint_docs", pattern = r"\.md$" },
+    { test = mdtest, root = MDTEST_ROOT, pattern = r"\.md$" },
+    { test = lint_doc, root = LINT_DOC_ROOT, pattern = r"\.md$" },
 }

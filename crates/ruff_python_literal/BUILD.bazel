@@ -1,0 +1,8 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ruff_python_literal",
+    deps = [
+        "//crates/ruff_python_ast:ruff_python_ast",
+    ],
+)
