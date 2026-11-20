@@ -315,6 +315,24 @@ impl KnownClass {
         matches!(self, Self::SpecialForm)
     }
 
+    /// Whether an exact builtin instance cannot change its truth value.
+    ///
+    /// Subclasses can override truthiness; callers must prove the exact runtime class.
+    pub(crate) const fn has_stable_truthiness(self) -> bool {
+        matches!(
+            self,
+            Self::Bool
+                | Self::Int
+                | Self::Float
+                | Self::Complex
+                | Self::Str
+                | Self::Bytes
+                | Self::Tuple
+                | Self::FrozenSet
+                | Self::Range
+        )
+    }
+
     /// Determine whether instances of this class are always truthy, always falsy,
     /// or have an ambiguous truthiness.
     ///

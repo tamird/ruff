@@ -45,6 +45,7 @@ use std::ops::ControlFlow;
 
 use super::RecursivelyDefined;
 use super::generic_gradual_intersections::{GenericIntersection, generic_gradual_intersection};
+use crate::types::call::has_exact_runtime_class;
 use crate::types::enums::EnumComplement;
 use crate::types::set_theoretic::expand_intersection_typevars_and_newtypes;
 use crate::types::visitor::any_over_type;
@@ -2678,6 +2679,30 @@ impl<'db> InnerIntersectionBuilder<'db> {
         }
 
         self.simplify_constrained_typevars(db, env);
+
+        // Stateful objects can satisfy both exclusions. An exact immutable builtin
+        // cannot change its truth value, so it cannot satisfy both.
+        if self
+            .negative
+            .iter()
+            .any(|ty| ty.resolve_type_alias(db) == Type::AlwaysTruthy)
+            && self
+                .negative
+                .iter()
+                .any(|ty| ty.resolve_type_alias(db) == Type::AlwaysFalsy)
+            && self.positive.iter().any(|ty| {
+                let ty = ty.resolve_type_alias(db);
+                let Type::NominalInstance(instance) = ty else {
+                    return false;
+                };
+                instance
+                    .known_class(db)
+                    .is_some_and(KnownClass::has_stable_truthiness)
+                    && has_exact_runtime_class(db, env, ty)
+            })
+        {
+            return Type::Never;
+        }
 
         // If any typevars are in `self.positive`, speculatively solve all bounded type variables
         // to their upper bound and all constrained type variables to the union of their constraints.
