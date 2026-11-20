@@ -13091,7 +13091,7 @@ mod tests {
         let forwarded = Type::string_literal(&db, "forwarded");
         let mut arguments = CallArguments::positional([Type::int_literal(1)]);
         arguments.push(CallArgument::Keywords(KeywordArgument::Observed {
-            types: CallArgumentTypes::new(Some(Type::unknown())),
+            types: CallArgumentTypes::default(),
             keywords: KnownKeywords {
                 items: [
                     DictionaryItem {
@@ -13112,6 +13112,7 @@ mod tests {
                 excluded_names: Vec::new(),
             },
         }));
+        arguments.insert_type(1, TypeContext::default(), Type::unknown());
         let bindings = wrapper
             .bindings(&db, &env)
             .match_parameters(&db, &env, &arguments);
