@@ -222,7 +222,8 @@ impl<'db> FieldMetadata<'db> {
             let Some(literal) = string.as_single_part_string() else {
                 return;
             };
-            let Ok(inner) = parsed_string_annotation(db, definition.python_file(db), literal) else {
+            let Ok(inner) = parsed_string_annotation(db, definition.python_file(db), literal)
+            else {
                 return;
             };
             parsed = inner;

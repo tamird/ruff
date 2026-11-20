@@ -56,8 +56,8 @@ use crate::types::{
     CallableType, ClassLiteral, ClassType, ErrorContext, ErrorContextTree,
     FindLegacyTypeVarsVisitor, MaterializationKind, ParamSpecAttrKind, ParamSpecValue,
     ParameterDescription, SelfBinding, SelfTypeVarOrigin, TypeContext, TypeMapping,
-    TypeVarBoundOrConstraints, TypedDictType, UnionBuilder, VarianceInferable,
-    VarianceTerm, infer_complete_scope_types, todo_type,
+    TypeVarBoundOrConstraints, TypedDictType, UnionBuilder, VarianceInferable, VarianceTerm,
+    infer_complete_scope_types, todo_type,
 };
 use crate::{Db, FxOrderSet};
 use ruff_db::files::FileRange;

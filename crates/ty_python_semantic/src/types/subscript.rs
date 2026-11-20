@@ -252,11 +252,18 @@ fn is_single_key_type_error(kind: CallErrorKind, bindings: &super::call::Binding
         .iter_flat()
         .flatten()
         .flat_map(super::call::bind::Binding::errors);
-    matches!(errors.next(), Some(super::call::bind::BindingError::InvalidArgumentType {
-        parameter: _, argument_index: _, last_argument_index: _, expected_ty: _,
-        provided_ty: _, provenance: _, parameter_source: _,
-    }))
-        && errors.next().is_none()
+    matches!(
+        errors.next(),
+        Some(super::call::bind::BindingError::InvalidArgumentType {
+            parameter: _,
+            argument_index: _,
+            last_argument_index: _,
+            expected_ty: _,
+            provided_ty: _,
+            provenance: _,
+            parameter_source: _,
+        })
+    ) && errors.next().is_none()
 }
 
 impl<'db> SubscriptError<'db> {
