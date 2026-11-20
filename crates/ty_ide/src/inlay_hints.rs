@@ -1,7 +1,7 @@
 use std::{fmt, vec};
 use ty_python_semantic::ProgramEnvironment;
 
-use crate::{ FxIndexMap, HasNavigationTargets, NavigationTarget};
+use crate::{FxIndexMap, HasNavigationTargets, NavigationTarget};
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::token::{Tokens, parenthesized_range};
 use ruff_python_ast::visitor::source_order::{self, SourceOrderVisitor, TraversalSignal};
@@ -70,7 +70,8 @@ impl InlayHint {
         let InlayHintImportContext { db, file, importer } = context;
         let env = ProgramEnvironment::from_file(file);
         allow_edits &= importer.is_some();
-        let mut dynamic_importer = importer.map(|importer| DynamicImporter::new(importer, scope_node));
+        let mut dynamic_importer =
+            importer.map(|importer| DynamicImporter::new(importer, scope_node));
 
         // Ok so the idea here is that we potentially have a random soup of spans here,
         // and each byte of the string can have at most one target associate with it.
