@@ -3,8 +3,8 @@ use crate::{
     Db, DisplaySettings, FxIndexMap, ProgramEnvironment,
     reachability::is_end_of_scope_reachable_in_domain,
     types::{
-        Bindings, CallableBinding, CallableType, CheckedCall, ClassBase, ClassLiteral,
-        ClassType, DeclaredType, DynamicType, IntersectionBuilder, KnownClass, KnownInstanceType,
+        Bindings, CallableBinding, CallableType, CheckedCall, ClassBase, ClassLiteral, ClassType,
+        DeclaredType, DynamicType, IntersectionBuilder, KnownClass, KnownInstanceType,
         NarrowingConstraint, ParamSpecAttrKind, SpecialFormType, SubclassOfInner, SubclassOfType,
         Type, TypeContext, TypeVarBoundOrConstraints, TypeVarKind, UnionBuilder, UnionType,
         UnionTypeInstance,
@@ -36,7 +36,8 @@ use crate::{
         infer::{
             InferenceFlags, StatementInference, TypeExpressionFlags, TypeInferenceBuilder,
             builder::{
-                CallArgumentInference, DeclaredAndInferredType, TypeAndRange, validate_paramspec_components,
+                CallArgumentInference, DeclaredAndInferredType, TypeAndRange,
+                validate_paramspec_components,
             },
             function_known_decorator_flags, function_known_decorators, infer_deferred_types,
             infer_function_default_types, infer_statement_types, nearest_enclosing_function,

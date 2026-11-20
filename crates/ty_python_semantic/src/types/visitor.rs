@@ -8,11 +8,11 @@ use smallvec::SmallVec;
 use ty_python_core::definition::Definition;
 
 use crate::types::{
-    BoundMethodType, BoundSuperType, BoundTypeVarInstance, CallableType,
-    EnumComplementType, GenericAlias, IntersectionType, KnownBoundMethodType, KnownInstanceType,
-    NominalInstanceType, PropertyInstanceType, ProtocolInstanceType, RecursiveType, Signature,
-    SlotDescriptorType, StaticClassLiteral, SubclassOfType, Type, TypeAliasType, TypeFormType,
-    TypeGuardType, TypeIsType, TypedDictType, UnionType,
+    BoundMethodType, BoundSuperType, BoundTypeVarInstance, CallableType, EnumComplementType,
+    GenericAlias, IntersectionType, KnownBoundMethodType, KnownInstanceType, NominalInstanceType,
+    PropertyInstanceType, ProtocolInstanceType, RecursiveType, Signature, SlotDescriptorType,
+    StaticClassLiteral, SubclassOfType, Type, TypeAliasType, TypeFormType, TypeGuardType,
+    TypeIsType, TypedDictType, UnionType,
     bound_super::walk_bound_super_type,
     callable::walk_callable_type,
     class::walk_generic_alias,
