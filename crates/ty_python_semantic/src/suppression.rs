@@ -308,7 +308,9 @@ impl<'a> CheckSuppressionsContext<'a> {
             python_file,
             suppressions: suppressions(db, python_file),
             diagnostics: diagnostics.into(),
-            require_valid_suppressions: db.rule_selection(python_file.file(db)).requires_valid_suppressions(),
+            require_valid_suppressions: db
+                .rule_selection(python_file.file(db))
+                .requires_valid_suppressions(),
         }
     }
 
@@ -319,9 +321,9 @@ impl<'a> CheckSuppressionsContext<'a> {
     fn is_lint_disabled(&self, lint: &'static LintMetadata) -> bool {
         !self.require_valid_suppressions
             && !self
-            .db
-            .rule_selection(self.file())
-            .is_enabled(LintId::of(lint))
+                .db
+                .rule_selection(self.file())
+                .is_enabled(LintId::of(lint))
     }
 
     fn is_suppression_used(&self, id: FileSuppressionId) -> bool {
@@ -379,7 +381,9 @@ impl<'ctx, 'db> SuppressionDiagnosticGuardBuilder<'ctx, 'db> {
         let severity = if ctx.require_valid_suppressions {
             Severity::Error
         } else {
-            ctx.db.rule_selection(ctx.file()).severity(LintId::of(lint))?
+            ctx.db
+                .rule_selection(ctx.file())
+                .severity(LintId::of(lint))?
         };
 
         Some(Self {

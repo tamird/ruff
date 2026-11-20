@@ -2742,7 +2742,13 @@ fn protocol_member_read_type<'db>(
             InstanceFallbackShadowsNonDataDescriptor::No,
         )
     } else {
-        receiver_ty.member_lookup_with_policy_and_receiver(db, env, member.name, lookup_policy, None)
+        receiver_ty.member_lookup_with_policy_and_receiver(
+            db,
+            env,
+            member.name,
+            lookup_policy,
+            None,
+        )
     };
 
     match protocol_implementation_read_place(db, member, lookup) {
@@ -2819,7 +2825,8 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     db,
                     env,
                     member.name,
-                    MemberLookupPolicy::NO_INSTANCE_FALLBACK | MemberLookupPolicy::RUNTIME_ATTRIBUTE,
+                    MemberLookupPolicy::NO_INSTANCE_FALLBACK
+                        | MemberLookupPolicy::RUNTIME_ATTRIBUTE,
                     None,
                 ),
             )

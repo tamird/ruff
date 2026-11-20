@@ -21,9 +21,10 @@ use crate::types::typed_dict::{
     deferred_functional_typed_dict_openness, deferred_functional_typed_dict_schema,
 };
 use crate::types::{
-    BoundTypeVarInstance, CallArguments, CallableType, ClassBase, ClassLiteral, ClassType, IntersectionBuilder,
-    KnownClass, MemberLookupPolicy, RecursivelyDefined, SelfTypeVarOrigin, Type, TypeContext, TypeMapping,
-    TypeVarVariance, TypedDictType, TypingModule, UnionType, determine_self_class,
+    BoundTypeVarInstance, CallArguments, CallableType, ClassBase, ClassLiteral, ClassType,
+    IntersectionBuilder, KnownClass, MemberLookupPolicy, RecursivelyDefined, SelfTypeVarOrigin,
+    Type, TypeContext, TypeMapping, TypeVarVariance, TypedDictType, TypingModule, UnionType,
+    determine_self_class,
 };
 use crate::{Db, FxIndexMap};
 use ty_python_core::definition::Definition;

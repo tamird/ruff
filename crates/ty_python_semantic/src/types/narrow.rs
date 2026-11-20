@@ -42,10 +42,10 @@ use ty_python_core::predicate::{
 };
 use ty_python_core::scope::{ScopeId, ScopeKind};
 use ty_python_core::symbol::Symbol;
+use ty_python_core::unpack::UnpackKind;
 use ty_python_core::{
     ExpressionNodeKey, NarrowingAliasPredicate, NarrowingEvaluator, place_table, semantic_index,
 };
-use ty_python_core::unpack::UnpackKind;
 
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::helpers::any_over_expr;
@@ -391,8 +391,8 @@ pub(crate) fn is_stable_boolean_guard<'db>(
     let env = ProgramEnvironment::from_scope(scope);
     occurrence
         .expression_type(expression.node_ref(db))
-        .bool_if_inhabited(db, &env)
-        == Some(Truthiness::Ambiguous)
+        .bool(db, &env)
+        == Truthiness::Ambiguous
 }
 
 #[salsa::tracked(
@@ -2369,7 +2369,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         is_positive: bool,
     ) -> bool {
         let db = self.db;
-        match alias.node_ref(db).node(self.module) {
+        match alias.expression.node_ref(db).node(self.module) {
             ast::Expr::Attribute(_) => {
                 return self.saved_member_lookup(name, expression).is_some();
             }
@@ -5359,15 +5359,27 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                     (operand, inference)
                 };
                 if let Some(test) = RuntimeTypeTest::from_comparison(
-                    db, self.scope(), operand, compared_value, *op, is_positive,
+                    db,
+                    self.scope(),
+                    operand,
+                    compared_value,
+                    *op,
+                    is_positive,
                     &|expression| operand_inference.expression_type(expression),
                 ) && matches!(test.kind, RuntimeTypeTestKind::Native)
                     && let Some(target) = PlaceExpr::try_from_expr(test.subject)
                 {
-                    insert_narrowing_constraint(&mut constraints, self.expect_place(&target), self.type_test_constraint(test.target, test.is_positive));
+                    insert_narrowing_constraint(
+                        &mut constraints,
+                        self.expect_place(&target),
+                        self.type_test_constraint(test.target, test.is_positive),
+                    );
                 }
-                let Some(target_expr) = exact_class_narrowing_target(db,
-                    &|expression| operand_inference.expression_type(expression), operand) else {
+                let Some(target_expr) = exact_class_narrowing_target(
+                    db,
+                    &|expression| operand_inference.expression_type(expression),
+                    operand,
+                ) else {
                     continue;
                 };
                 let other = compared_value;

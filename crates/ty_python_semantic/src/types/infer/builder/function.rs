@@ -3,10 +3,11 @@ use crate::{
     Db, DisplaySettings, FxIndexMap, ProgramEnvironment,
     reachability::is_end_of_scope_reachable_in_domain,
     types::{
-        Binding, Bindings, CallableBinding, CallableType, CheckedCall, ClassBase, ClassLiteral, ClassType,
-        DeclaredType, DynamicType, IntersectionBuilder, KnownClass, KnownInstanceType, NarrowingConstraint, ParamSpecAttrKind,
-        SpecialFormType, SubclassOfInner, SubclassOfType, Type, TypeContext,
-        TypeVarBoundOrConstraints, TypeVarKind, UnionBuilder, UnionType, UnionTypeInstance,
+        Bindings, CallableBinding, CallableType, CheckedCall, ClassBase, ClassLiteral,
+        ClassType, DeclaredType, DynamicType, IntersectionBuilder, KnownClass, KnownInstanceType,
+        NarrowingConstraint, ParamSpecAttrKind, SpecialFormType, SubclassOfInner, SubclassOfType,
+        Type, TypeContext, TypeVarBoundOrConstraints, TypeVarKind, UnionBuilder, UnionType,
+        UnionTypeInstance,
         callable::CallableTypeKind,
         constraints::ConstraintSetBuilder,
         context::InferContext,
@@ -35,8 +36,7 @@ use crate::{
         infer::{
             InferenceFlags, StatementInference, TypeExpressionFlags, TypeInferenceBuilder,
             builder::{
-                CallArgumentInference, DeclaredAndInferredType, DeferredExpressionState,
-                TypeAndRange, validate_paramspec_components,
+                CallArgumentInference, DeclaredAndInferredType, TypeAndRange, validate_paramspec_components,
             },
             function_known_decorator_flags, function_known_decorators, infer_deferred_types,
             infer_function_default_types, infer_statement_types, nearest_enclosing_function,
@@ -400,7 +400,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 (parameters.kwarg.as_deref(), ParamSpecAttrKind::Kwargs),
             ] {
                 if let Some(annotation) = parameter.and_then(ast::Parameter::annotation) {
-                    self.variadic_parameter_annotation(&SourceAnnotation::Native(annotation), self.file_expression_type(annotation), self.file_type_expression_flags(annotation), component);
+                    self.variadic_parameter_annotation(
+                        &SourceAnnotation::Native(annotation),
+                        self.file_expression_type(annotation),
+                        self.file_type_expression_flags(annotation),
+                        component,
+                    );
                 }
             }
         } else {
@@ -529,17 +534,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 };
                 if !inferred_return
                     .to_instance_unknown(db, env)
-                    .is_assignable_to(db, env, *public)
+                    .is_assignable_to(db, env, expected_ty)
                 {
                     report_invalid_generator_function_return_type(
                         &self.context,
                         return_range,
                         inferred_return,
-                        *declared_ty,
+                        declared_ty,
                     );
                 }
 
-                if let Some(expected_return_ty) = (*declared_ty).generator_return_type(db, env) {
+                if let Some(expected_return_ty) = declared_ty.generator_return_type(db, env) {
                     for &return_statement in &self.return_types_and_ranges {
                         let assignable =
                             return_statement
@@ -1460,8 +1465,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             if let Some(default_expr) = default_expr {
                 let default_expr = default_expr.as_ref();
                 let default_ty = match definition {
-                    Some(definition) => parameter_default_expression_type(db, definition, default_expr),
-                    None => self.infer_expression(default_expr, TypeContext::preference(Some(declared_ty))),
+                    Some(definition) => {
+                        parameter_default_expression_type(db, definition, default_expr)
+                    }
+                    None => self
+                        .infer_expression(default_expr, TypeContext::preference(Some(declared_ty))),
                 };
 
                 if matches!(
@@ -1551,15 +1559,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
         if !typevar.is_paramspec(db)
             || typevar.paramspec_attr(db) == Some(expected)
-            || (expected == ParamSpecAttrKind::Args
-                && flags.contains(TypeExpressionFlags::UNPACK))
+            || (expected == ParamSpecAttrKind::Args && flags.contains(TypeExpressionFlags::UNPACK))
         {
             return ty;
         }
 
         // A bare ParamSpec is diagnosed when inferring the annotation.
         if let Some(component) = typevar.paramspec_attr(db)
-            && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, annotation.range())
+            && let Some(builder) = self
+                .context
+                .report_lint(&INVALID_TYPE_FORM, annotation.range())
         {
             let name = typevar.name(db);
             let parameter = match component {
@@ -1589,8 +1598,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) {
         let db = self.db();
 
-        if let Some((annotation, annotated_type, flags)) = self.parameter_annotation_type(parameter) {
-            let annotated_type = self.variadic_parameter_annotation(&annotation, annotated_type, flags, ParamSpecAttrKind::Args);
+        if let Some((annotation, annotated_type, flags)) = self.parameter_annotation_type(parameter)
+        {
+            let annotated_type = self.variadic_parameter_annotation(
+                &annotation,
+                annotated_type,
+                flags,
+                ParamSpecAttrKind::Args,
+            );
             let has_unpacked_annotation = flags.contains(TypeExpressionFlags::UNPACK);
             let ty = match annotated_type {
                 Type::TypeVar(typevar)
@@ -1644,6 +1659,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     DeclaredAndInferredType::MightBeDifferent {
                         declared_ty: DeclaredType::from_type(ty),
                         inferred_ty: entry_ty,
+                        has_explicit_type: true,
                     }
                 } else {
                     // A fresh kwargs dictionary is validated through parameter coverage, not
@@ -1729,10 +1745,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let env = self.program_environment();
         let db = self.db();
 
-        if let Some((annotation, annotated_type, flags)) = self.parameter_annotation_type(parameter) {
-            let annotated_type = self.variadic_parameter_annotation(&annotation, annotated_type, flags, ParamSpecAttrKind::Kwargs);
+        if let Some((annotation, annotated_type, flags)) = self.parameter_annotation_type(parameter)
+        {
+            let annotated_type = self.variadic_parameter_annotation(
+                &annotation,
+                annotated_type,
+                flags,
+                ParamSpecAttrKind::Kwargs,
+            );
             let ty = if matches!(annotated_type, Type::TypeVar(typevar) if typevar.is_paramspec(db))
-                || extract_unpacked_typed_dict_keys_from_kwargs_annotation(db, annotated_type, flags).is_some()
+                || extract_unpacked_typed_dict_keys_from_kwargs_annotation(
+                    db,
+                    annotated_type,
+                    flags,
+                )
+                .is_some()
             {
                 annotated_type
             } else {
@@ -2216,7 +2243,10 @@ impl KnownFunction {
                     && call.argument_expression(1).is_none_or(|value_expr| {
                         builder
                             .speculate_without_diagnostics()
-                            .infer_expression(value_expr, TypeContext::preference(Some(casted_type)))
+                            .infer_expression(
+                                value_expr,
+                                TypeContext::preference(Some(casted_type)),
+                            )
                             .is_disjoint_from(db, env, casted_type)
                     })
                     && let Some(diagnostic) =
@@ -2949,4 +2979,18 @@ fn report_invalid_union_type_elements<'db>(
             other_invalid_elements.len(),
         )),
     }
+}
+
+fn call_argument_node<'a>(
+    call_expression: &'a ast::ExprCall,
+    name: &str,
+    position: usize,
+) -> Option<ast::AnyNodeRef<'a>> {
+    call_expression
+        .arguments
+        .find_argument(name, position)
+        .map(|argument| match argument {
+            ast::ArgOrKeyword::Arg(expr) => ast::AnyNodeRef::from(expr),
+            ast::ArgOrKeyword::Keyword(keyword) => ast::AnyNodeRef::from(keyword),
+        })
 }
