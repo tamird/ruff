@@ -469,32 +469,26 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         if !unpacked.is_empty() {
             self.record_contents_snapshot_for_sources(expression, &unpacked, true);
         }
-        // A positional mapping is copied after every argument has evaluated.
-        if let [source] = call.arguments.args.as_ref() {
-            self.record_contents_snapshot(expression, &[source]);
-        }
+        // Observe tracked argument mappings after every argument has evaluated,
+        // before this call exposes their contents.
+        let arguments: SmallVec<[_; 2]> = call
+            .arguments
+            .args
+            .iter()
+            .chain(
+                call.arguments
+                    .keywords
+                    .iter()
+                    .filter(|keyword| keyword.arg.is_some())
+                    .map(|keyword| &keyword.value),
+            )
+            .collect();
+        self.record_contents_snapshot(expression, &arguments);
         if let ast::Expr::Attribute(attribute) = call.func.as_ref()
             && attribute.attr.as_str() == "get"
         {
             // The default expression can mutate the receiver before get reads its key.
             self.record_contents_snapshot(expression, &[&attribute.value]);
-        }
-
-        // Retained fields refer to values after all factory arguments have evaluated,
-        // but before this call exposes the original source mappings.
-        if self
-            .current_scope_info()
-            .contents_retaining_calls
-            .contains_key(&call.node_index().load())
-        {
-            let keywords: SmallVec<[_; 2]> = call
-                .arguments
-                .keywords
-                .iter()
-                .filter(|keyword| keyword.arg.is_some())
-                .map(|keyword| &keyword.value)
-                .collect();
-            self.record_contents_snapshot(expression, &keywords);
         }
 
         let occurrences = call_receivers(call);
