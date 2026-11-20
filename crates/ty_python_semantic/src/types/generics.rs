@@ -11,7 +11,9 @@ use smallvec::SmallVec;
 use crate::types::callable::walk_callable_type;
 use crate::types::class::ClassType;
 use crate::types::class_base::ClassBase;
-use crate::types::constraints::projection::{ProjectionBudget, ProjectionError, SolutionBudget, SolutionProjection};
+use crate::types::constraints::projection::{
+    ProjectionBudget, ProjectionError, SolutionBudget, SolutionProjection,
+};
 use crate::types::constraints::resolution::{
     SolutionType, resolve_merged_solution, resolve_solution,
 };
@@ -3354,8 +3356,10 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         resources: &mut ProjectionBudget,
     ) -> Result<PendingInference<'db, SolutionPaths<'db>>, Vec<SpecializationError<'db>>> {
         let db = self.db;
-        if matches!(inference.solutions, Err(TypeVarInferenceFallback::BudgetExceeded))
-            && self.has_missing_keyword_components(&FxHashMap::default())
+        if matches!(
+            inference.solutions,
+            Err(TypeVarInferenceFallback::BudgetExceeded)
+        ) && self.has_missing_keyword_components(&FxHashMap::default())
         {
             // Unknown recovery bindings are not complete ParamSpec witnesses. Do not
             // restart the exhausted search to try to construct one.
@@ -3368,9 +3372,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     self.has_missing_keyword_components(&inference.merged_types)
                 } else {
                     paths.as_slice().iter().any(|path| {
-                        let types = path.solved_typevars.iter().map(|binding| {
-                            (binding.bound_typevar.identity(db), binding.solution)
-                        }).collect();
+                        let types = path
+                            .solved_typevars
+                            .iter()
+                            .map(|binding| (binding.bound_typevar.identity(db), binding.solution))
+                            .collect();
                         self.has_missing_keyword_components(&types)
                     })
                 }
@@ -3390,15 +3396,22 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 let mut completed = Vec::with_capacity(paths.len());
                 let mut merged_types = FxHashMap::default();
                 for mut path in paths {
-                    let mut types = path.solved_typevars.iter().map(|binding| {
-                        (binding.bound_typevar.identity(db), binding.solution)
-                    }).collect();
-                    match self.infer_keyword_components(&mut types, &path.solved_typevars, resources) {
+                    let mut types = path
+                        .solved_typevars
+                        .iter()
+                        .map(|binding| (binding.bound_typevar.identity(db), binding.solution))
+                        .collect();
+                    match self.infer_keyword_components(
+                        &mut types,
+                        &path.solved_typevars,
+                        resources,
+                    ) {
                         Ok(true) => {
                             for variable in self.generic_context.variables(db) {
                                 if !path.solved_typevars.iter().any(|binding| {
                                     binding.bound_typevar.identity(db) == variable.identity(db)
-                                }) && let Some(solution) = types.get(&variable.identity(db)) {
+                                }) && let Some(solution) = types.get(&variable.identity(db))
+                                {
                                     path.solved_typevars.push(TypeVarSolution {
                                         bound_typevar: variable,
                                         solution: *solution,
@@ -3424,13 +3437,15 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 } else {
                     for (identity, variable) in self.generic_context.variables_inner(db) {
                         if let Some(ty) = merged_types.get_mut(identity) {
-                            *ty = self.remove_inferable_typevar_artifacts_from_solution(*variable, *ty);
+                            *ty = self
+                                .remove_inferable_typevar_artifacts_from_solution(*variable, *ty);
                         }
                     }
                 }
                 if completed.is_empty() && unverified {
                     inference.merged_types = merged_types;
-                    inference.solutions = Err(TypeVarInferenceFallback::UnverifiedKeywordProjection);
+                    inference.solutions =
+                        Err(TypeVarInferenceFallback::UnverifiedKeywordProjection);
                     return Ok(inference);
                 }
                 if completed.is_empty() && !incomplete {
@@ -3448,24 +3463,39 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 // their classification while requiring the same complete-signature proof.
                 if reason == TypeVarInferenceFallback::BudgetExceeded {
                     if self.has_missing_keyword_components(&inference.merged_types) {
-                        inference.solutions = Err(TypeVarInferenceFallback::UnverifiedKeywordProjection);
+                        inference.solutions =
+                            Err(TypeVarInferenceFallback::UnverifiedKeywordProjection);
                     } else {
                         inference.solutions = Err(reason);
                     }
                 } else {
                     let mut seen = FxHashSet::default();
-                    let fixed = self.generic_context.variables(db).chain(
-                        self.pending.referenced_typevars(db, |_| true).iter(db),
-                    ).filter_map(|variable| {
-                        inference.merged_types.get(&variable.identity(db)).map(|solution| {
-                            TypeVarSolution { bound_typevar: variable, solution: *solution }
+                    let fixed = self
+                        .generic_context
+                        .variables(db)
+                        .chain(self.pending.referenced_typevars(db, |_| true).iter(db))
+                        .filter_map(|variable| {
+                            inference
+                                .merged_types
+                                .get(&variable.identity(db))
+                                .map(|solution| TypeVarSolution {
+                                    bound_typevar: variable,
+                                    solution: *solution,
+                                })
                         })
-                    }).filter(|binding| seen.insert(binding.bound_typevar.identity(db)))
+                        .filter(|binding| seen.insert(binding.bound_typevar.identity(db)))
                         .collect::<Vec<_>>();
-                    match self.infer_keyword_components(&mut inference.merged_types, &fixed, resources) {
+                    match self.infer_keyword_components(
+                        &mut inference.merged_types,
+                        &fixed,
+                        resources,
+                    ) {
                         Ok(true) => inference.solutions = Err(reason),
                         Ok(false) => return Err(Vec::new()),
-                        Err(_) => inference.solutions = Err(TypeVarInferenceFallback::UnverifiedKeywordProjection),
+                        Err(_) => {
+                            inference.solutions =
+                                Err(TypeVarInferenceFallback::UnverifiedKeywordProjection)
+                        }
                     }
                 }
             }
@@ -3479,7 +3509,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     ) -> TypeVarSet<'db> {
         self.pending.referenced_typevars(self.db, |variable| {
             variable.is_keyword_parameters(self.db)
-                && variable.paramspec_base(self.db).is_inferable(self.db, self.inferable)
+                && variable
+                    .paramspec_base(self.db)
+                    .is_inferable(self.db, self.inferable)
                 && !types.contains_key(&variable.paramspec_base(self.db).identity(self.db))
         })
     }
@@ -3537,6 +3569,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             self.env,
             candidate_variables,
             resources,
+            &fixed,
             |solved, type_budget| {
                 let mut bindings = fixed.clone();
                 bindings.extend(
@@ -3548,10 +3581,14 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 for (component, base) in &bases {
                     let Some(binding) = fixed
                         .iter()
-                        .find(|binding| binding.bound_typevar.identity(db) == component.identity(db))
-                        .or_else(|| solved.iter().find(|binding| {
+                        .find(|binding| {
                             binding.bound_typevar.identity(db) == component.identity(db)
-                        }))
+                        })
+                        .or_else(|| {
+                            solved.iter().find(|binding| {
+                                binding.bound_typevar.identity(db) == component.identity(db)
+                            })
+                        })
                     else {
                         return Ok(None);
                     };
@@ -4912,11 +4949,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     .elements(db)
                     .iter()
                     .filter_map(|ty| ty.as_typevar());
-                let bare_typevar = bound_typevars.next();
-
                 // TODO:
                 // Handling more than one bare typevar is something that we can't handle yet.
-                if bound_typevars.next().is_some() {
+                if bound_typevars.nth(1).is_some() {
                     return Ok(());
                 }
 
@@ -5552,10 +5587,6 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 return self.infer_from_constraint_set(when);
             }
 
-            (formal @ Type::TypedDict(_), actual) => {
-                let when = self.constraint_for_relation(formal, actual, relation_polarity);
-                return self.infer_from_constraint_set(when);
-            }
 
             (Type::Callable(formal_callable), _) => {
                 let Some(actual_callables) = actual.try_upcast_to_callable(db, self.env) else {
@@ -5618,6 +5649,7 @@ impl<'db> SpecializationError<'db> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     use crate::types::constraints::resolution::SolutionType::{Resolved, Unresolved};
 
@@ -5649,10 +5681,12 @@ mod tests {
         let db = setup_db();
         let db = &db;
         let env = db.program_environment();
+        assert_matches!(KnownClass::List.to_class_literal(db, &env), Type::ClassLiteral(origin));
         let [u] = create_typevars(db, ["U"]);
         let bound = KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(u)]);
         let captured = BoundTypeVarInstance::synthetic_self(
             db,
+            SelfTypeVarOrigin::Class(origin),
             bound,
             BindingContext::Synthetic(env.program(db)),
         );
@@ -5714,7 +5748,7 @@ mod tests {
                     .infer(formal, actual)
                     .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
                 let inference = builder
-                    .build_inference_with(|_, _| None)
+                    .build_inference_with(ReportDiagnostics::No, |_, _| None)
                     .map_err(|_| anyhow::anyhow!("expected unconstrained inference"))?;
                 assert_eq!(
                     inference.merged_specialization(db).types(db),
@@ -5997,10 +6031,10 @@ mod tests {
             [[int, int], [str, int]],
         ));
         let inference = builder
-            .build_inference_with(|typevar, bounds| {
+            .build_inference_with(ReportDiagnostics::No, |typevar, bounds| {
                 let lower = bounds
                     .as_ref()
-                    .and_then(|bounds| bounds.inference_lower(db, &env));
+                    .and_then(|bounds| bounds.inference_lower());
                 (typevar == t && lower == Some(str)).then_some(PathBoundSolution::BudgetExceeded {
                     fallback: Some(int),
                 })
@@ -6196,52 +6230,134 @@ mod tests {
         let db = &db;
         let env = db.program_environment();
         let context = function_context(db, "f")?;
-        let (value, paramspec) = context.variables(db).collect_tuple()
+        let (value, paramspec) = context
+            .variables(db)
+            .collect_tuple()
             .ok_or_else(|| anyhow::anyhow!("expected T and P"))?;
         let int = KnownClass::Int.to_instance(db, &env);
         let string = KnownClass::Str.to_instance(db, &env);
-        let signature = |ty| Type::paramspec_value_callable(db, Parameters::standard([
-            Parameter::keyword_only(Name::new_static("key")).with_annotated_type(ty),
-        ]));
+        let signature = |ty| {
+            Type::paramspec_value_callable(
+                db,
+                Parameters::standard([
+                    Parameter::keyword_only(Name::new_static("key")).with_annotated_type(ty)
+                ]),
+            )
+        };
         let first = signature(int);
         let second = signature(string);
-        let first_shape = first.keyword_projection(db, &env, KeywordProjection::Parameters)
+        let first_shape = first
+            .keyword_projection(db, &env, KeywordProjection::Parameters)
             .ok_or_else(|| anyhow::anyhow!("expected first keyword shape"))?;
-        let second_shape = second.keyword_projection(db, &env, KeywordProjection::Parameters)
+        let second_shape = second
+            .keyword_projection(db, &env, KeywordProjection::Parameters)
             .ok_or_else(|| anyhow::anyhow!("expected second keyword shape"))?;
         for whole_paramspec in [false, true] {
             let constraints = ConstraintSetBuilder::new();
             let arm = |ty, full, shape| {
                 ConstraintSet::constrain_typevar_equivalence_bound(
-                    db, &env, &constraints, ConstraintProvenance::INFERRED, value, ty,
-                ).and(db, &constraints, || {
+                    db,
+                    &env,
+                    &constraints,
+                    ConstraintProvenance::INFERRED,
+                    value,
+                    ty,
+                )
+                .and(db, &constraints, || {
                     ConstraintSet::constrain_typevar_equivalence_bound(
-                        db, &env, &constraints, ConstraintProvenance::INFERRED,
-                        if whole_paramspec { paramspec } else { paramspec.keyword_parameters(db) },
+                        db,
+                        &env,
+                        &constraints,
+                        ConstraintProvenance::INFERRED,
+                        if whole_paramspec {
+                            paramspec
+                        } else {
+                            paramspec.keyword_parameters(db)
+                        },
                         if whole_paramspec { full } else { shape },
                     )
                 })
             };
-            let relation = arm(int, first, first_shape).or(db, &constraints, || {
-                arm(string, second, second_shape)
-            });
+            let relation = arm(int, first, first_shape)
+                .or(db, &constraints, || arm(string, second, second_shape));
             let mut builder = SpecializationBuilder::new(db, &env, &constraints, context);
             builder.record_constraint_set(relation);
-            let inference = builder.build_inference_with(ReportDiagnostics::No, |_, _| None)
+            let inference = builder
+                .build_inference_with(ReportDiagnostics::No, |_, _| None)
                 .map_err(|_| anyhow::anyhow!("expected both complete alternatives"))?;
             let TypeVarInferenceSolutions::Alternatives(paths) = inference.solutions(db) else {
-                anyhow::bail!("expected correlated alternatives, got {:?}", inference.solutions(db));
+                anyhow::bail!(
+                    "expected correlated alternatives, got {:?}",
+                    inference.solutions(db)
+                );
             };
             let mut actual = FxHashSet::default();
             for path in paths {
-                let [Some(SolutionType::Resolved(value)), Some(SolutionType::Resolved(paramspec))] = path.as_ref() else {
+                let [
+                    Some(SolutionType::Resolved(value)),
+                    Some(SolutionType::Resolved(paramspec)),
+                ] = path.as_ref()
+                else {
                     anyhow::bail!("expected complete T and P bindings: {path:?}");
                 };
-                let shape = paramspec.keyword_projection(db, &env, KeywordProjection::Parameters)
+                let shape = paramspec
+                    .keyword_projection(db, &env, KeywordProjection::Parameters)
                     .ok_or_else(|| anyhow::anyhow!("expected complete ParamSpec witness"))?;
                 actual.insert((*value, shape));
             }
-            assert_eq!(actual, FxHashSet::from_iter([(int, first_shape), (string, second_shape)]));
+            assert_eq!(
+                actual,
+                FxHashSet::from_iter([(int, first_shape), (string, second_shape)])
+            );
+            if !whole_paramspec {
+                // Calibrate against real native collection and each real witness proof.
+                // Both witnesses fit individually; the remaining budget must not reset
+                // when completing the next alternative.
+                let budget = SolutionBudget::default();
+                let mut native_resources = ProjectionBudget::new(budget);
+                let native = builder.pending.solutions_with_shared_budget(
+                    db, &env, context.inferable_typevars(db), &mut native_resources,
+                    ReportDiagnostics::No, |_, bound| {
+                        CandidateSolutions::default_solve(db, &env, &constraints, bound)
+                            .map(|ty| builder.remove_inferable_typevar_artifacts_from_solution(
+                                bound.bound_typevar, ty,
+                            ))
+                    },
+                ).map_err(|error| anyhow::anyhow!("native collection failed: {error:?}"))?;
+                let Solutions::Constrained(SolutionPaths::Complete(native_paths)) = native else {
+                    anyhow::bail!("expected complete native alternatives: {native:?}");
+                };
+                assert_eq!(native_paths.len(), 2);
+                let native_visits = budget.visits - native_resources.remaining_visits();
+                let mut proof_visits = Vec::new();
+                for path in &native_paths {
+                    let mut types = path.solved_typevars.iter().map(|binding| {
+                        (binding.bound_typevar.identity(db), binding.solution)
+                    }).collect();
+                    assert!(builder.has_missing_keyword_components(&types));
+                    let mut resources = ProjectionBudget::new(budget);
+                    let verified = builder.infer_keyword_components(
+                        &mut types, &path.solved_typevars, &mut resources,
+                    ).map_err(|error| anyhow::anyhow!("witness proof failed: {error:?}"))?;
+                    assert!(verified);
+                    let visits = budget.visits - resources.remaining_visits();
+                    assert!(visits > 0);
+                    proof_visits.push(visits);
+                }
+                let completion_visits = proof_visits.into_iter().max()
+                    .ok_or_else(|| anyhow::anyhow!("expected witness proofs"))?;
+                let mut limited = SpecializationBuilder::new(db, &env, &constraints, context);
+                limited.record_constraint_set(relation);
+                let inference = limited.solve_pending_with(
+                    SolutionBudget { visits: native_visits + completion_visits, ..budget },
+                    ReportDiagnostics::No, &mut |_, _| None,
+                ).map_err(|_| anyhow::anyhow!("work exhaustion must remain incomplete"))?;
+                let TypeVarInferenceSolutions::Incomplete(paths) = inference.solutions(db) else {
+                    anyhow::bail!("expected an incomplete alternative family: {:?}", inference.solutions(db));
+                };
+                assert_eq!(paths.len(), 1);
+            }
+
         }
         Ok(())
     }
@@ -6282,6 +6398,7 @@ mod tests {
             db,
             &env,
             &constraints,
+            ConstraintProvenance::INFERRED,
             variable.keyword_parameters(db),
             shape,
         ));
