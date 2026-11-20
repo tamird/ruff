@@ -6332,6 +6332,34 @@ def make_result() -> Result[T]:
 
 result: Result[Stream[int]] = make_result()
 reveal_type(result)  # revealed: Result[Stream[int]]
+
+from typing import TypeAlias
+
+StreamResult: TypeAlias = Result[Stream[T]]
+aliased_result: StreamResult[int] = make_result()
+reveal_type(aliased_result)  # revealed: Result[Stream[int]]
+
+class PayloadStream(Stream[T_co], Protocol[T_co]):
+    def payload(self) -> T_co: ...
+    def read(self: "PayloadStream[U]") -> U: ...
+
+def string_stream() -> PayloadStream[str]:
+    raise NotImplementedError
+
+same_payload: PayloadStream[str] = string_stream()
+wrong_payload: PayloadStream[int] = string_stream()  # error: [invalid-assignment]
+
+class NumberView(Protocol):
+    def payload(self) -> int: ...
+    def read(self) -> int: ...
+
+class TextView(Protocol):
+    def payload(self) -> int: ...
+    def read(self) -> str: ...
+
+def check_receiver_witness(value: PayloadStream[int]) -> None:
+    number: NumberView = value
+    text: TextView = value  # error: [invalid-assignment]
 ```
 
 ## Generic property setter overrides
