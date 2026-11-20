@@ -9237,7 +9237,6 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         })) = self.arguments.get(argument_index)
         {
             self.check_variadic_argument_type(
-                constraints,
                 argument_index,
                 adjusted_argument_index,
                 Argument::Keywords,
