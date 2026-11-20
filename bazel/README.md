@@ -51,15 +51,36 @@ on an automatic module-lock update.
 The semantic, Markdown and IDE harnesses are also available:
 
 ```sh
-bb remote --git_fetch_url=https://github.com/tamird/ruff.git test --config=buildbuddy --config=cargo-dev --lockfile_mode=error //crates/ty_python_semantic:unit_tests //crates/ty_python_semantic:mdtest //crates/ty_ide:unit_tests
+bb remote --git_fetch_url=https://github.com/tamird/ruff.git test --config=buildbuddy --config=cargo-dev --lockfile_mode=error //crates/ty_python_semantic:unit_tests //crates/ty_python_semantic:mdtests //crates/ty_ide:unit_tests
 ```
 
 All harnesses reject snapshot changes (`INSTA_UPDATE=no`). Snapshot files and
 Markdown resources are declared runfiles; the Markdown harness resolves its
-manifest directory at runtime. Normal test filters can be passed using
-`--test_arg=<filter>`. External-dependency Markdown cases retain the native
-harness's default skip policy: this target does not yet qualify `MDTEST_EXTERNAL=1`.
-A passing core test does not qualify the semantic, Markdown or IDE suites.
+manifest directory at runtime. The `mdtests` suite gives each Markdown fixture
+its own test action, reusing one compiled native harness and its shared runfiles.
+Its generated selector inventory must exactly match the native `--list` output.
+Each action verifies one registered selector and one executed test, preserving
+native failures. The shared runfiles can still invalidate several test actions
+when a fixture changes; they are not separate fixture trees.
+
+Select a fixture by its generated target, for example:
+
+```sh
+bb remote --git_fetch_url=https://github.com/tamird/ruff.git test --config=buildbuddy --config=cargo-dev --lockfile_mode=error //crates/ty_python_semantic:mdtests/mdtest/annotations/union.md
+```
+
+Canonical fixture actions reject extra native arguments, Bazel `--test_filter`,
+inner-section filters and external-dependency mode. Default external cases remain skipped. For filtered
+diagnostics, the explicit manual `mdtest` aggregate target retains the native CLI:
+
+```sh
+bb remote --git_fetch_url=https://github.com/tamird/ruff.git test --config=buildbuddy --config=cargo-dev --lockfile_mode=error //crates/ty_python_semantic:mdtest --test_arg=--exact --test_arg=mdtest::annotations/union.md
+```
+
+Use the suite for whole-Markdown qualification so fixtures run in separate
+processes. Unit targets retain their normal Rust test filters. A passing core
+test does not qualify the semantic, Markdown or IDE suites. External Markdown
+cases use the separate network-backed gate below.
 
 Formatting and Clippy use the same declared crate graph and the workspace's
 `rustfmt.toml`, `clippy.toml` and Cargo lint declarations:
