@@ -2349,6 +2349,11 @@ pub enum ApplySpecialization<'a, 'db> {
     ReturnCallables(&'a FxIndexMap<BoundTypeVarInstance<'db>, BoundTypeVarInstance<'db>>),
     /// Maps a single type variable to its replacement.
     Single(BoundTypeVarInstance<'db>, Type<'db>, AliasPolicy),
+    /// Shadows substitutions for variables quantified by a retained callable, including nested types.
+    WithBoundVariables {
+        specialization: &'a ApplySpecialization<'a, 'db>,
+        variables: &'a [BoundTypeVarInstance<'db>],
+    },
     /// Selects parameter lists for the current callable's outer signatures. Ordinary type
     /// variable lookups still use the underlying specialization.
     WithBindings {
@@ -2373,6 +2378,9 @@ impl<'db> ApplySpecialization<'_, 'db> {
             Self::WithBindings { specialization, .. } => {
                 specialization.specializes_typevar_domains()
             }
+            Self::WithBoundVariables { specialization, variables: _ } => {
+                specialization.specializes_typevar_domains()
+            }
             _ => false,
         }
     }
@@ -2382,6 +2390,9 @@ impl<'db> ApplySpecialization<'_, 'db> {
         match self {
             Self::ReturnCallables(_) | Self::TypeAlias(_) => true,
             Self::WithBindings { specialization, .. } => specialization.preserves_lazy_signatures(),
+            Self::WithBoundVariables { specialization, variables: _ } => {
+                specialization.preserves_lazy_signatures()
+            }
             _ => false,
         }
     }
@@ -2446,6 +2457,11 @@ impl<'db> ApplySpecialization<'_, 'db> {
                     None
                 }
             }
+            ApplySpecialization::WithBoundVariables { specialization, variables } => {
+                variables.iter().copied().find(|variable| {
+                    variable.is_same_typevar_as(db, bound_typevar)
+                }).map(Type::TypeVar).or_else(|| specialization.get(db, bound_typevar))
+            }
             ApplySpecialization::WithBindings { specialization, .. } => {
                 specialization.get(db, bound_typevar)
             }
@@ -2470,6 +2486,14 @@ impl<'db> ApplySpecialization<'_, 'db> {
                 ),
             ),
             ApplySpecialization::ReturnCallables(_) | ApplySpecialization::Single(..) => None,
+            ApplySpecialization::WithBoundVariables { specialization, variables: _ } => {
+                let underlying = specialization.as_specialization(db)?;
+                let context = underlying.generic_context(db);
+                let types = context.variables(db).map(|variable| {
+                    self.get(db, variable).unwrap_or(Type::TypeVar(variable))
+                }).collect::<Vec<_>>();
+                Some(Specialization::new(db, context, types, underlying.materialization_kind(db), underlying.tuple_inner(db)))
+            }
             ApplySpecialization::WithBindings { specialization, .. } => {
                 specialization.as_specialization(db)
             }
