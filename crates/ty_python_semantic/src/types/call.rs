@@ -72,9 +72,9 @@ pub(crate) enum BinaryOperatorMethod {
     Reflected,
 }
 
-/// Returns whether every inhabitant of `ty` has the same nominal runtime class.
+/// Whether `ty` fixes the runtime class of its values.
 ///
-/// A false positive could incorrectly rule out subclass-specific method dispatch.
+/// For example, `Literal[1]` can only be an `int`, while `int` also includes subclasses.
 pub(super) fn has_exact_runtime_class<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
