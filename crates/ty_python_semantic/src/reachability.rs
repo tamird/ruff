@@ -817,9 +817,17 @@ fn evaluate_reachability_constraint<'db>(
     let root = constraints.get_interior_node(id);
     analyze_non_terminal_calls_up_to_predicate(db, predicates, root, domain);
     evaluate_reachability_path(
-        db, scope, constraints,
-        PredicateEvaluator { entries: predicates, cache: predicate_cache, body_domain: domain },
-        id, INITIAL_CHECKPOINT_MASK, None,
+        db,
+        scope,
+        constraints,
+        PredicateEvaluator {
+            entries: predicates,
+            cache: predicate_cache,
+            body_domain: domain,
+        },
+        id,
+        INITIAL_CHECKPOINT_MASK,
+        None,
     )
     .resolve(db, scope, domain)
 }
@@ -901,7 +909,12 @@ enum ReachabilitySegment {
 }
 
 impl ReachabilitySegment {
-    fn resolve<'db>(mut self, db: &'db dyn Db, scope: ScopeId<'db>, domain: Option<FunctionBodyDomain<'db>>) -> Truthiness {
+    fn resolve<'db>(
+        mut self,
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        domain: Option<FunctionBodyDomain<'db>>,
+    ) -> Truthiness {
         loop {
             match self {
                 Self::Complete(result) => return result,
@@ -1009,7 +1022,9 @@ fn evaluate_reachability_path<'db>(
                         is_positive: _,
                     } => {
                         // Keep identities correlated across every queued bypass branch.
-                        return ReachabilitySegment::Complete(constraints.project(original_root, evaluate_atom));
+                        return ReachabilitySegment::Complete(
+                            constraints.project(original_root, evaluate_atom),
+                        );
                     }
                 };
                 id = match truthiness {

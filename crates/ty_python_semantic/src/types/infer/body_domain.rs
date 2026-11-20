@@ -2759,20 +2759,12 @@ mod tests {
     #[test]
     fn body_domains_narrow_after_terminal_calls() -> anyhow::Result<()> {
         let mut db = setup_db();
-        db.write_dedented(
+        let padding = "        print()\n".repeat(32);
+        db.write_file(
             "/src/body.py",
-            "
-            from typing import Callable, overload
-            from typing_extensions import Never
-            @overload
-            def f(callback: Callable[[], Never], value: int | None) -> int: ...
-            @overload
-            def f(callback: Callable[[], None], value: int | None) -> int | None: ...
-            def f(callback: Callable[[], None], value: int | None) -> int | None:
-                if value is None:
-                    callback()
-                return value
-        ",
+            format!(
+                "from typing import Callable, overload\nfrom typing_extensions import Never\n@overload\ndef f(callback: Callable[[], Never], value: int | None) -> int: ...\n@overload\ndef f(callback: Callable[[], None], value: int | None) -> int | None: ...\ndef f(callback: Callable[[], None], value: int | None) -> int | None:\n    check = value is None\n    if check:\n        callback()\n{padding}    return value\n"
+            ),
         )?;
         let f = function(&db);
         let ordinary = returned_type(&db, f, None);
@@ -2783,6 +2775,17 @@ mod tests {
             assert_eq!(returned_type(&db, f, Some(domain)), domain.return_type(&db));
             assert_eq!(returned_type(&db, f, None), ordinary);
         }
+        let events = db.take_salsa_events();
+        assert!(
+            ruff_db::testing::find_will_execute_event_by_name(
+                &db,
+                "evaluate_body_reachability_checkpoint",
+                None,
+                &events,
+            )
+            .is_some(),
+            "the statement-call chain must cross a body-domain reachability checkpoint"
+        );
         Ok(())
     }
 
