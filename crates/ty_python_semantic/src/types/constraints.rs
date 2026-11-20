@@ -3392,6 +3392,23 @@ impl<'db> CandidateTypeVarSolver<'db> {
                     })
             });
 
+        // Preserve an equality to a caller variable only when both original evidence
+        // directions name that variable. Validity-derived bounds cannot establish it.
+        let family_equivalence = if bound_typevar.typevar(db).is_constrained(db) {
+            let mut lower = iter_lower_bounds(EvidenceSource::All, false);
+            lower.next().and_then(Type::as_typevar).filter(|&peer| {
+                if !lower.all(|ty| ty == Type::TypeVar(peer)) {
+                    return false;
+                }
+                let mut upper = upper
+                    .iter_evidence_without_validity(EvidenceSource::All)
+                    .peekable();
+                upper.peek().is_some() && upper.all(|ty| ty == Type::TypeVar(peer))
+            })
+        } else {
+            None
+        };
+
         let union_lower_bounds = |source, include_validity| {
             let bounds: FxIndexSet<_> = iter_lower_bounds(source, include_validity).collect();
             (!bounds.is_empty()).then(|| UnionType::from_elements(db, env, bounds))
@@ -3428,6 +3445,7 @@ impl<'db> CandidateTypeVarSolver<'db> {
             upper,
             has_declared_evidence,
             has_only_non_concrete_evidence,
+            family_equivalence,
             selected_declared_constraint: None,
         };
         let lower = range.effective_lower(db, env, EvidenceSource::All);
@@ -3526,6 +3544,8 @@ pub(crate) struct CandidateTypeVarSolution<'db> {
     has_declared_evidence: bool,
     /// Whether every original evidence bound is gradual or another `TypeVar`.
     has_only_non_concrete_evidence: Option<bool>,
+    /// A single caller variable occurring as all original lower and upper evidence.
+    family_equivalence: Option<BoundTypeVarInstance<'db>>,
     /// The declared constraint selected for this range, if the typevar is constrained.
     selected_declared_constraint: Option<Type<'db>>,
 }
@@ -3546,6 +3566,7 @@ impl<'db> CandidateTypeVarSolution<'db> {
             upper: UpperBound::from_clause(ty),
             has_declared_evidence: false,
             has_only_non_concrete_evidence: None,
+            family_equivalence: None,
             selected_declared_constraint: None,
         }
     }
@@ -8620,6 +8641,7 @@ mod tests {
             upper: UpperBound::unconstrained(),
             has_declared_evidence: false,
             has_only_non_concrete_evidence: None,
+            family_equivalence: None,
             selected_declared_constraint: None,
         };
 

@@ -2169,6 +2169,10 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             }
         }
 
+        let preserves_equivalent_family = evidence
+            .family_equivalence
+            .is_some_and(|peer| peer.can_specialize_typevar(db, env, bound_typevar));
+
         if try_family_solution {
             let has_preservable_typevar_evidence = bounds.any(|ty| {
                 any_over_type(db, env, ty, false, |ty| {
@@ -2204,7 +2208,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 }
             }
 
-            if potentially_satisfied_constraint_count > 1 {
+            if potentially_satisfied_constraint_count > 1
+                || (potentially_satisfied_constraint_count == 1 && preserves_equivalent_family)
+            {
                 // We're eligible to return a family solution, but first we need to find it! First
                 // check any remaining constrained typevars with _no_ validity assignment for this
                 // typevar.
@@ -2275,13 +2281,15 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                                 ControlFlow::Continue(())
                             }
                             1 => {
-                                // This family solution satisfies exactly one declared constraint.
-                                // Family solutions are only used when the can consolidate more
-                                // than one declared constraint. That means we don't want to use
-                                // this family solution _or any other_. We'll create one or more
-                                // individual solutions below.
-                                individual_solution_is_required.set(true);
-                                ControlFlow::Continue(())
+                                if preserves_equivalent_family {
+                                    // A caller variable can remain a parametric witness even if
+                                    // this path permits only one of its declared alternatives.
+                                    has_family_solution.set(true);
+                                    process_satisfied(this, storage, path)
+                                } else {
+                                    individual_solution_is_required.set(true);
+                                    ControlFlow::Continue(())
+                                }
                             }
                             _ => {
                                 // This solution satisfies more than one declared constraint, so

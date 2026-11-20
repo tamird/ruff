@@ -6229,6 +6229,26 @@ def forward_nominal_reversed[S: (Left, Right)](
     return result
 ```
 
+Passing `join` to `apply` should preserve the type variable of `compose` in `Selected`.
+
+```py
+class Selected[T]: ...
+
+def make[T](value: T) -> Selected[T]:
+    return Selected()
+
+def join[T: (str, list[str], object)](result: Selected[T], part: T | Selected[T]) -> Selected[T]:
+    return result
+
+def apply[P, S](value: P, make: Callable[[P], S], join: Callable[[S, P | S], S]) -> S:
+    return make(value)
+
+def compose[R: (str, list[str], object)](value: R) -> Selected[R]:
+    return apply(value, make, join)
+
+reveal_type(compose("x"))  # revealed: Selected[str]
+```
+
 ## Display ordering
 
 Where possible, we want the types that appear in inferred specializations to line up with the types
