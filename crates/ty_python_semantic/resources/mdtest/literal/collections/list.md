@@ -122,7 +122,7 @@ wrong: Rows = [{"value": "bad"}]
 # error: [missing-typed-dict-key]
 missing: Rows = [{}]
 # error: [invalid-assignment]
-# error: [invalid-key]
+# error: [unknown-typed-dict-constructor-key]
 hidden: Rows = [{"value": 1, "hidden": 2}]
 
 class KeywordRows(Protocol):

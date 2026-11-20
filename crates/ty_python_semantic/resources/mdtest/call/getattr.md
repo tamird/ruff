@@ -143,7 +143,7 @@ def wrong_default(value: Collections):
     strings(getattr(value, "collection", 42))
 
 def wrong_empty_default(value: Collections) -> Mapping[str, Iterable[str]]:
-    # error: [invalid-return-type]
+    # error: [invalid-explicit-return]
     return getattr(value, "mapping", [])
 ```
 
