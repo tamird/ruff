@@ -5,7 +5,7 @@ use crate::Db;
 use crate::ProgramEnvironment;
 use crate::types::call::arguments::CallArguments;
 use crate::types::constraints::ConstraintSetBuilder;
-use crate::types::generics::{GenericContext, Specialization};
+use crate::types::generics::{GenericContext, Specialization, TypeVarProjection};
 use crate::types::signatures::Parameter;
 use crate::types::typevar::TypeVarNonceGenerator;
 use crate::types::{
@@ -440,11 +440,13 @@ impl<'db> ConstructorBinding<'db> {
                     .class_specialization(db, env)?;
                 Some(
                     inference.merged_specialization_with(db, |typevar, inferred| {
-                        (inferred.is_none()
-                            && class_specialization
-                                .types(db)
-                                .contains(&Type::TypeVar(typevar)))
-                        .then_some(Type::Dynamic(DynamicType::UnspecializedTypeVar))
+                        if inferred.is_none()
+                            && class_specialization.types(db).contains(&Type::TypeVar(typevar))
+                        {
+                            TypeVarProjection::Override(Type::Dynamic(DynamicType::UnspecializedTypeVar))
+                        } else {
+                            TypeVarProjection::Inferred
+                        }
                     }),
                 )
             });

@@ -193,8 +193,7 @@ impl<'db> Type<'db> {
                         TypeContext::default(),
                         policy,
                     )
-                    .map(|outcome| outcome.return_type(db, env))
-                    .ok();
+                    .map(|outcome| outcome.return_type(db, env));
             }
 
             receiver

@@ -2061,8 +2061,11 @@ fn class_comparison_semantics<'db>(
                 (KnownClass::Tuple, KnownComparisonSemantics::Tuple),
                 (KnownClass::List, KnownComparisonSemantics::List),
             ] {
-                let known_equality = lookup_dunder(db, env, known_class.to_class_literal(db, env), "__eq__")?;
-                if !equality.place.is_undefined() && same_member_implementation(db, equality, known_equality) {
+                let known_equality =
+                    lookup_dunder(db, env, known_class.to_class_literal(db, env), "__eq__")?;
+                if !equality.place.is_undefined()
+                    && same_member_implementation(db, equality, known_equality)
+                {
                     return Some(semantics);
                 }
             }

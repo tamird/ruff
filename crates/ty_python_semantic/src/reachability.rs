@@ -197,7 +197,7 @@ use crate::ProgramEnvironment;
 use std::cell::RefCell;
 
 use crate::types::FunctionBodyDomain;
-use crate::types::infer::TruthinessAnalyzer;
+use crate::types::TruthinessAnalyzer;
 use crate::{
     Db,
     dunder_all::dunder_all_names,
@@ -207,12 +207,14 @@ use crate::{
         KnownInstanceType, NarrowingConstraint, SpecialFormType, Type, TypeContext, UnionType,
         class_pattern_coverage_target, definite_match_pattern_type,
         definite_match_pattern_type_for_subject, equality_truthiness, expand_type,
-        infer_expression_with_body_domain, infer_narrowing_constraints, infer_predicate_truthiness, infer_same_file_expression_type,
-        mapping_pattern_type, pattern_binding_fallthrough_type, same_enum_or_pattern_type,
-        sequence_pattern_type_builder, singleton_pattern_type,
+        infer_expression_with_body_domain, infer_narrowing_constraints, infer_predicate_truthiness,
+        infer_same_file_expression_type, mapping_pattern_type, pattern_binding_fallthrough_type,
+        same_enum_or_pattern_type, sequence_pattern_type_builder, singleton_pattern_type,
     },
 };
+use ruff_db::parsed::parsed_module;
 use ruff_index::{Idx, IndexSlice};
+use ruff_python_ast as ast;
 use ruff_python_ast::name::Name;
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -223,18 +225,18 @@ use ty_python_core::{
     Truthiness, UseDefMap,
     ast_ids::HasScopedUseId,
     definition::{BindingsOwner, Definition, DefinitionKind, DefinitionState},
-    expression::{Expression, ExpressionContext, ExpressionKind},
+    expression::{Expression, ExpressionContext},
     narrowing_constraints::{NarrowingConstraints, ScopedNarrowingConstraint},
     place::ScopedPlaceId,
     place_table,
     predicate::{
-        BooleanGuard, CallableAndCallExpr, PatternPredicate, PatternPredicateKind, Predicate, PredicateNode,
-        ScopedPredicateId,
+        BooleanGuard, CallableAndCallExpr, PatternPredicate, PatternPredicateKind, Predicate,
+        PredicateNode, ScopedPredicateId,
     },
+    reachability_constraints::InteriorNode,
     reachability_constraints::{
         ReachabilityAtom, ReachabilityConstraints, ScopedReachabilityConstraintId,
     },
-    reachability_constraints::InteriorNode,
     scope::ScopeId,
     use_def_map,
 };
@@ -924,7 +926,10 @@ struct PredicateEvaluator<'a, 'db> {
 }
 
 impl<'a, 'db> PredicateEvaluator<'a, 'db> {
-    fn uncached(entries: &'a IndexSlice<ScopedPredicateId, Predicate<'db>>, body_domain: Option<FunctionBodyDomain<'db>>) -> Self {
+    fn uncached(
+        entries: &'a IndexSlice<ScopedPredicateId, Predicate<'db>>,
+        body_domain: Option<FunctionBodyDomain<'db>>,
+    ) -> Self {
         Self {
             entries,
             cache: None,
@@ -999,7 +1004,10 @@ fn evaluate_reachability_path<'db>(
             } else {
                 let truthiness = match evaluate_atom(node.atom()) {
                     ReachabilityAtom::Known(truthiness) => truthiness,
-                    ReachabilityAtom::Symbolic { key: _, is_positive: _ } => {
+                    ReachabilityAtom::Symbolic {
+                        key: _,
+                        is_positive: _,
+                    } => {
                         // Keep identities correlated across every queued bypass branch.
                         return ReachabilitySegment::Complete(constraints.project(original_root, evaluate_atom));
                     }
@@ -1377,10 +1385,13 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         constraints: &ReachabilityConstraints,
     ) -> Self {
         self.predicates.cache = cache
-            .filter(|cache| cache.primary_constraints == std::ptr::from_ref(constraints).addr()
-                && cache.body_domain == self.predicates.body_domain
-                && self.predicates.entries.first().is_some_and(|predicate|
-                    predicate_scope(self.db, predicate) == cache.primary_scope))
+            .filter(|cache| {
+                cache.primary_constraints == std::ptr::from_ref(constraints).addr()
+                    && cache.body_domain == self.predicates.body_domain
+                    && self.predicates.entries.first().is_some_and(|predicate| {
+                        predicate_scope(self.db, predicate) == cache.primary_scope
+                    })
+            })
             .map(|cache| &cache.primary_predicates);
         self
     }
@@ -1461,8 +1472,12 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
             return cached.clone();
         }
 
-        let constraints =
-            infer_narrowing_constraints(db, self.predicates.entries[predicate_id], self.place, self.predicates.body_domain);
+        let constraints = infer_narrowing_constraints(
+            db,
+            self.predicates.entries[predicate_id],
+            self.place,
+            self.predicates.body_domain,
+        );
         self.graph
             .predicate_constraints_cache
             .insert(predicate_id, constraints.clone());
@@ -1670,7 +1685,8 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                             ))
                     {
                         let scope = predicate_scope(db, &predicate);
-                        let checkpoint = self.predicates
+                        let checkpoint = self
+                            .predicates
                             .body_domain
                             .filter(|domain| domain.scope(db) == scope)
                             .map_or_else(
@@ -2087,7 +2103,10 @@ fn analyze_single_pattern_predicate_kind<'db>(
     },
     heap_size = get_size2::GetSize::get_heap_size
 )]
-fn analyze_non_terminal_call<'db>(db: &'db dyn Db, call_expr: CallableAndCallExpr<'db>) -> Truthiness {
+fn analyze_non_terminal_call<'db>(
+    db: &'db dyn Db,
+    call_expr: CallableAndCallExpr<'db>,
+) -> Truthiness {
     analyze_non_terminal_call_impl(db, call_expr, None)
 }
 
@@ -2607,48 +2626,56 @@ pub(crate) fn evaluate_reachability_assuming_boolean<'db>(
             let module = parsed_module(db, expression.python_file(db)).load(db);
             let current_use = name.scoped_use_id(db, scope.program_file(db));
             let leaf_type = |leaf: &ast::Expr| {
-                    let ast::Expr::Name(guard) = leaf else {
-                        return Type::unknown();
-                    };
-                    if guard.id != name.id
-                        || guard.end() > name.start()
-                        || loop_body.is_some_and(|body| !body.contains_range(guard.range()))
-                    {
-                        return Type::unknown();
-                    }
-                    let guard_use = guard.scoped_use_id(db, scope.program_file(db));
-                    let record = |BindingWithConstraints {
-                                      binding,
-                                      binding_order,
-                                      narrowing_constraint,
-                                      reachability_constraint,
-                                  }| {
-                        (
-                            binding,
-                            binding_order,
-                            narrowing_constraint.constraint(),
-                            reachability_constraint,
-                        )
-                    };
-                    // Equality is useful only within the region above: the same static records
-                    // may otherwise denote values produced by different loop iterations.
-                    let same_value = use_def
-                        .bindings_at_use(current_use)
-                        .map(record)
-                        .eq(use_def.bindings_at_use(guard_use).map(record));
-                    if same_value {
-                        Type::bool_literal(value)
-                    } else {
-                        Type::unknown()
-                    }
+                let ast::Expr::Name(guard) = leaf else {
+                    return Type::unknown();
+                };
+                if guard.id != name.id
+                    || guard.end() > name.start()
+                    || loop_body.is_some_and(|body| !body.contains_range(guard.range()))
+                {
+                    return Type::unknown();
+                }
+                let guard_use = guard.scoped_use_id(db, scope.program_file(db));
+                let record = |BindingWithConstraints {
+                                  binding,
+                                  binding_order,
+                                  narrowing_constraint,
+                                  reachability_constraint,
+                              }| {
+                    (
+                        binding,
+                        binding_order,
+                        narrowing_constraint.constraint(),
+                        reachability_constraint,
+                    )
+                };
+                // Equality is useful only within the region above: the same static records
+                // may otherwise denote values produced by different loop iterations.
+                let same_value = use_def
+                    .bindings_at_use(current_use)
+                    .map(record)
+                    .eq(use_def.bindings_at_use(guard_use).map(record));
+                if same_value {
+                    Type::bool_literal(value)
+                } else {
+                    Type::unknown()
+                }
             };
-            let truthiness = TruthinessAnalyzer::new(db, &env, leaf_type, |_| None)
-                .truthiness(expression.node_ref(db).node(&module), ExpressionContext::Condition);
+            let truthiness = TruthinessAnalyzer::new(db, &env, leaf_type, |_| None).truthiness(
+                expression.node_ref(db).node(&module),
+                ExpressionContext::Condition,
+            );
             if !truthiness.is_ambiguous() {
                 return ReachabilityAtom::Known(truthiness.negate_if(!predicate.is_positive));
             }
         }
-        match analyze_reachability_atom(db, &env, use_def, PredicateEvaluator::uncached(predicates, None), atom) {
+        match analyze_reachability_atom(
+            db,
+            &env,
+            use_def,
+            PredicateEvaluator::uncached(predicates, None),
+            atom,
+        ) {
             ReachabilityAtom::Symbolic { key, is_positive } => {
                 if stable_definition == Some(key) {
                     ReachabilityAtom::Known(Truthiness::from(value == is_positive))
@@ -3121,8 +3148,14 @@ class TargetB:
         let scope = function_scope.to_scope_id(&db, program_file);
         let use_def = use_def_map(&db, scope);
         assert!(
-            evaluate_reachability_constraint(&db, scope, use_def.end_of_scope_reachability(), None, None)
-                .is_always_false()
+            evaluate_reachability_constraint(
+                &db,
+                scope,
+                use_def.end_of_scope_reachability(),
+                None,
+                None
+            )
+            .is_always_false()
         );
         Ok(())
     }

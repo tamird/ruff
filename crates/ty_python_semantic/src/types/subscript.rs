@@ -90,6 +90,7 @@ impl DunderMethod {
                 return_ty: Type<'db>,
                 callable_ty: Type<'db>,
                 kind: CallErrorKind,
+                key_type_mismatch: bool,
             },
         }
 
@@ -128,6 +129,7 @@ impl DunderMethod {
                     return_ty: bindings.return_type(db, &env),
                     callable_ty: bindings.callable_type(),
                     kind,
+                    key_type_mismatch: is_single_key_type_error(kind, &bindings),
                 }),
                 Err(CallDunderError::MethodNotAvailable) => None,
             }
@@ -147,6 +149,7 @@ impl DunderMethod {
                 return_ty,
                 callable_ty,
                 kind,
+                key_type_mismatch,
             } => Err(SubscriptError::new(
                 return_ty,
                 SubscriptErrorKind::DunderCallError {
@@ -155,6 +158,7 @@ impl DunderMethod {
                     slice_ty,
                     kind,
                     callable_ty,
+                    key_type_mismatch,
                 },
             )),
         })
@@ -210,6 +214,7 @@ pub(crate) enum SubscriptErrorKind<'db> {
         slice_ty: Type<'db>,
         kind: CallErrorKind,
         callable_ty: Type<'db>,
+        key_type_mismatch: bool,
     },
     /// A `TypedDict` was subscripted with an invalid key.
     InvalidTypedDictKey {
@@ -236,6 +241,22 @@ pub(crate) enum SubscriptErrorKind<'db> {
     TypeVarTupleNotUnpacked { origin: LegacyGenericOrigin },
     /// More than one `TypeVarTuple` was provided to `Generic` or `Protocol`.
     MultipleTypeVarTuples { origin: LegacyGenericOrigin },
+}
+
+/// Retain the mismatch classification without keeping full call bindings in the cached outcome.
+fn is_single_key_type_error(kind: CallErrorKind, bindings: &super::call::Bindings<'_>) -> bool {
+    if !matches!(kind, CallErrorKind::BindingError) {
+        return false;
+    }
+    let mut errors = bindings
+        .iter_flat()
+        .flatten()
+        .flat_map(super::call::bind::Binding::errors);
+    matches!(errors.next(), Some(super::call::bind::BindingError::InvalidArgumentType {
+        parameter: _, argument_index: _, last_argument_index: _, expected_ty: _,
+        provided_ty: _, provenance: _, parameter_source: _,
+    }))
+        && errors.next().is_none()
 }
 
 impl<'db> SubscriptError<'db> {
@@ -267,25 +288,17 @@ impl<'db> SubscriptError<'db> {
 
     /// Only the key-type mismatch is discharged by an established membership test.
     pub(super) fn is_key_type_mismatch(&self) -> bool {
-        let [
-            SubscriptErrorKind::DunderCallError {
-                method: DunderMethod::GetItem,
-                kind: CallErrorKind::BindingError,
-                bindings,
-                ..
-            },
-        ] = self.errors.as_slice()
-        else {
-            return false;
-        };
-        let mut errors = bindings
-            .iter_flat()
-            .flatten()
-            .flat_map(super::call::bind::Binding::errors);
         matches!(
-            errors.next(),
-            Some(super::call::bind::BindingError::InvalidArgumentType { .. })
-        ) && errors.next().is_none()
+            self.errors.as_slice(),
+            [SubscriptErrorKind::DunderCallError {
+                method: DunderMethod::GetItem,
+                value_ty: _,
+                slice_ty: _,
+                kind: CallErrorKind::BindingError,
+                callable_ty: _,
+                key_type_mismatch: true,
+            }]
+        )
     }
 
     fn into_errors(self) -> Vec<SubscriptErrorKind<'db>> {
@@ -395,6 +408,7 @@ impl<'db> SubscriptErrorKind<'db> {
                 slice_ty,
                 kind,
                 callable_ty,
+                key_type_mismatch: _,
             } => match kind {
                 CallErrorKind::NotCallable => {
                     if let Some(builder) = context.report_lint(&NOT_CALLABLE, value_node) {
@@ -1133,7 +1147,8 @@ impl<'db> Type<'db> {
                         value_ty,
                         slice_ty,
                         kind: call_error_kind,
-                        bindings,
+                        callable_ty: bindings.callable_type(),
+                        key_type_mismatch: is_single_key_type_error(call_error_kind, &bindings),
                     },
                 ));
             }

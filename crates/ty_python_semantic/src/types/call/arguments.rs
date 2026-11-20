@@ -1,8 +1,8 @@
+use crate::Db;
 use crate::types::dictionary::{
     DictionaryExtraItems, DictionaryFallback, DictionaryFirstEntry, DictionaryItem,
     DictionaryItemKind, DictionaryItems, DictionaryObservation,
 };
-use crate::Db;
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::fmt::Display;
@@ -201,9 +201,7 @@ impl<'a, 'db> CallArgument<'a, 'db> {
                 KeywordArgument::Type(types)
                 | KeywordArgument::Known { types, .. }
                 | KeywordArgument::Observed { types, .. },
-            ) => {
-                types
-            }
+            ) => types,
         }
     }
 
@@ -568,7 +566,9 @@ impl<'db> KeywordArgument<'db> {
 
     fn source_types(&self) -> &CallArgumentTypes<'db> {
         match self {
-            Self::Type(types) | Self::Known { types, .. } | Self::Observed { types, keywords: _ } => types,
+            Self::Type(types)
+            | Self::Known { types, .. }
+            | Self::Observed { types, keywords: _ } => types,
         }
     }
 
@@ -594,14 +594,20 @@ impl<'db> KeywordArgument<'db> {
     pub(crate) fn explicit_keyword_names(&self) -> impl Iterator<Item = &Name> {
         match self {
             Self::Observed { types: _, keywords } => Either::Left(
-                keywords.items.iter().filter_map(|item| item.is_required().then_some(&item.name)),
+                keywords
+                    .items
+                    .iter()
+                    .filter_map(|item| item.is_required().then_some(&item.name)),
             ),
             Self::Type(_) | Self::Known { .. } => {
                 let keys = match self {
                     Self::Known { keywords, .. } => keywords.keys.as_ref(),
                     _ => [].as_slice(),
                 };
-                Either::Right(keys.iter().filter_map(|(name, key)| key.kind.is_required().then_some(name)))
+                Either::Right(
+                    keys.iter()
+                        .filter_map(|(name, key)| key.kind.is_required().then_some(name)),
+                )
             }
         }
     }
@@ -637,14 +643,17 @@ impl<'db> KeywordArgument<'db> {
                     .map(|elements| Self::Observed {
                         types: types.clone(),
                         keywords: KnownKeywords {
-                            items: keywords.items.iter().zip(elements).map(|(item, ty)| {
-                                DictionaryItem {
+                            items: keywords
+                                .items
+                                .iter()
+                                .zip(elements)
+                                .map(|(item, ty)| DictionaryItem {
                                     name: item.name.clone(),
                                     ty,
                                     kind: item.kind,
                                     source: item.source,
-                                }
-                            }).collect(),
+                                })
+                                .collect(),
                             extra_items: keywords.extra_items,
                             excluded_names: keywords.excluded_names.clone(),
                         },
@@ -664,15 +673,26 @@ impl<'db> KeywordArgument<'db> {
         }
         if let Self::Observed { types: _, keywords } = self {
             return Some(UnpackedKeywords {
-                keys: keywords.items.iter().map(|item| {
-                    (item.name.clone(), UnpackedTypedDictKey {
-                        value_ty: item.ty,
-                        kind: item.kind,
-                        definition: None,
+                keys: keywords
+                    .items
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.name.clone(),
+                            UnpackedTypedDictKey {
+                                value_ty: item.ty,
+                                kind: item.kind,
+                                definition: None,
+                            },
+                        )
                     })
-                }).collect(),
-                openness: keywords.extra_items.value_type()
-                    .map_or(TypedDictOpenness::Closed, |ty| TypedDictOpenness::extra(db, ty, true)),
+                    .collect(),
+                openness: keywords
+                    .extra_items
+                    .value_type()
+                    .map_or(TypedDictOpenness::Closed, |ty| {
+                        TypedDictOpenness::extra(db, ty, true)
+                    }),
             });
         }
         let unpacked = extract_unpacked_typed_dict_from_value_type(db, env, self.source_type()?)?;
@@ -696,7 +716,9 @@ impl<'db> KeywordArgument<'db> {
                 .unwrap_or(Type::unknown());
         }
         if let Self::Observed { types: _, keywords } = self {
-            return keywords.items.iter()
+            return keywords
+                .items
+                .iter()
                 .find_map(|item| (Some(item.name.as_str()) == name).then_some(item.ty))
                 .or_else(|| keywords.residual_value(db, name, keywords.residual_values(db, env)))
                 .unwrap_or(Type::unknown());
@@ -981,8 +1003,12 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                 continue;
             };
             let ast::ArgOrKeyword::Keyword(ast::Keyword {
-                node_index: _, range: _, arg: None, value,
-            }) = source else {
+                node_index: _,
+                range: _,
+                arg: None,
+                value,
+            }) = source
+            else {
                 continue;
             };
             if keyword.source_type().is_some_and(|ty| ty.is_never()) {
@@ -993,10 +1019,18 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                 Err(DictionaryFallback::Unreachable) => {
                     *keyword = KeywordArgument::Type(CallArgumentTypes::new(Some(Type::Never)));
                 }
-                Ok(DictionaryItems { items, extra_items, first_entry: _ }) => {
+                Ok(DictionaryItems {
+                    items,
+                    extra_items,
+                    first_entry: _,
+                }) => {
                     *keyword = KeywordArgument::Observed {
                         types: keyword.source_types().clone(),
-                        keywords: KnownKeywords { items, extra_items, excluded_names: Vec::new() },
+                        keywords: KnownKeywords {
+                            items,
+                            extra_items,
+                            excluded_names: Vec::new(),
+                        },
                     };
                 }
             }
@@ -1449,21 +1483,17 @@ mod tests {
             .as_call_expr()
             .expect("Expected a call expression");
         for operand in [Some(Type::unknown()), Some(divergent), None] {
-            let arguments: CallArguments =
-                [(Argument::Variadic, operand)].into_iter().collect();
-            let arguments = arguments.with_known_unpacking(
-                &call.arguments,
-                |expression| {
-                    let name = expression
-                        .as_name_expr()
-                        .expect("Expected a literal child name");
-                    match name.id.as_str() {
-                        "first" => Some(int),
-                        "second" => Some(divergent),
-                        _ => panic!("Unexpected literal child"),
-                    }
-                },
-            );
+            let arguments: CallArguments = [(Argument::Variadic, operand)].into_iter().collect();
+            let arguments = arguments.with_known_unpacking(&call.arguments, |expression| {
+                let name = expression
+                    .as_name_expr()
+                    .expect("Expected a literal child name");
+                match name.id.as_str() {
+                    "first" => Some(int),
+                    "second" => Some(divergent),
+                    _ => panic!("Unexpected literal child"),
+                }
+            });
             let types = arguments
                 .source_types(0)
                 .expect("Expected the unpacked operand");

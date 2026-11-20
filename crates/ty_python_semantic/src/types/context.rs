@@ -798,9 +798,12 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
                     lint_id,
                 )
             } else {
-                ctx.diagnostics
-                    .borrow_mut()
-                    .is_suppressed(ctx.db(), ctx.python_file(), range, lint_id)
+                ctx.diagnostics.borrow_mut().is_suppressed(
+                    ctx.db(),
+                    ctx.python_file(),
+                    range,
+                    lint_id,
+                )
             };
 
             // Suppress diagnostics in unreachable code. This checks both whether
@@ -960,7 +963,9 @@ mod tests {
     #[test]
     fn alternative_call_diagnostics_keep_shared_source_ownership() -> anyhow::Result<()> {
         let source = "def checked():\n    pass # ty: ignore[unresolved-reference]\n    pass\n";
-        let db = TestDbBuilder::new().with_file("/src/main.py", source).build()?;
+        let db = TestDbBuilder::new()
+            .with_file("/src/main.py", source)
+            .build()?;
         let file = system_path_to_file(&db, "/src/main.py")?;
         let program_file = db.program_file(file);
         let parsed = parsed_module(&db, program_file.python_file(&db)).load(&db);
@@ -973,25 +978,25 @@ mod tests {
         };
         let ranges = [first.range(), second.range()];
         let scope = ty_python_core::semantic_index(&db, program_file)
-            .scope_ids().find(|scope| scope.node(&db).as_function().is_some())
+            .scope_ids()
+            .find(|scope| scope.node(&db).as_function().is_some())
             .ok_or_else(|| anyhow::anyhow!("expected function body scope"))?;
         let mut combined = TypeCheckDiagnostics::default();
         combined.push(Diagnostic::new(
-            DiagnosticId::Io, Severity::Warning, "Unshared prefix diagnostic",
+            DiagnosticId::Io,
+            Severity::Warning,
+            "Unshared prefix diagnostic",
         ));
         // The same failure can first appear in an ordinary check, then become owned by
         // the source annotation. Its shared index must point past the unrelated prefix.
-        let ordinary = InferContext::new(
-            &db, &environment, scope, file, program_file, &parsed,
-        );
+        let ordinary = InferContext::new(&db, &environment, scope, file, program_file, &parsed);
         if let Some(diagnostic) = ordinary.report_lint(&UNRESOLVED_REFERENCE, ranges[1]) {
             diagnostic.into_diagnostic("Shared call failure");
         }
         combined.extend(&ordinary.finish().diagnostics);
         for _ in 0..2 {
-            let mut context = InferContext::new(
-                &db, &environment, scope, file, program_file, &parsed,
-            );
+            let mut context =
+                InferContext::new(&db, &environment, scope, file, program_file, &parsed);
             context.inference_flags |= InferenceFlags::IN_ANNOTATION_EXPRESSION;
             for range in ranges {
                 if let Some(diagnostic) = context.report_lint(&UNRESOLVED_REFERENCE, range) {
@@ -1009,11 +1014,13 @@ mod tests {
         };
         let diagnostics = check_suppressions(&db, program_file.python_file(&db), result);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics.iter().all(|diagnostic| {
-            diagnostic.id() == DiagnosticId::Lint(UNRESOLVED_REFERENCE.name())
-                && diagnostic.primary_span().and_then(|span| span.range()) == Some(ranges[1])
-        }), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.id() == DiagnosticId::Lint(UNRESOLVED_REFERENCE.name())
+                    && diagnostic.primary_span().and_then(|span| span.range()) == Some(ranges[1])
+            }),
+            "{diagnostics:?}"
+        );
         Ok(())
     }
-
 }

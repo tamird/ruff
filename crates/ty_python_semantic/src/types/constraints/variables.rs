@@ -18,7 +18,7 @@ use crate::types::{ApplyTypeMappingVisitor, DynamicType, Type, TypeContext, Type
 use crate::{Db, ProgramEnvironment};
 
 /// The solver policy for handling unspecialized type variables as inference evidence.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, salsa::SalsaValue)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(super) enum UnspecializedTypeVarPolicy {
     Retain,
     Ignore,
@@ -183,7 +183,9 @@ impl<'db> Constraint<'db> {
     }
 
     pub(super) fn types(&self) -> impl Iterator<Item = Type<'db>> {
-        self.as_atomic().into_iter().flat_map(AtomicConstraint::types)
+        self.as_atomic()
+            .into_iter()
+            .flat_map(AtomicConstraint::types)
     }
 
     pub(super) fn display<'a>(
@@ -801,7 +803,7 @@ impl<'db> AtomicConstraint<'db> {
         }
     }
 
-    fn types(self) -> impl Iterator<Item = Type<'db>> {
+    pub(super) fn types(self) -> impl Iterator<Item = Type<'db>> {
         let types = match self {
             AtomicConstraint::ConcreteLower(this) => [Type::TypeVar(this.typevar), this.bound],
             AtomicConstraint::ConcreteUpper(this) => [Type::TypeVar(this.typevar), this.bound],

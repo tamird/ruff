@@ -12,9 +12,10 @@ use crate::db::tests::{TestDb, setup_db};
 use crate::place::global_symbol;
 use crate::types::constraints::{
     BoundedSolutionLimits, CandidateSolution, CandidateSolutions, CandidateTypeVarSolution,
-    ConstraintFailureEvidence, ConstraintProvenance, ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension,
-    PathBoundSolution, ReportDiagnostics, Solution, SolutionPaths, SolutionValidity, SolutionViolationKind, Solutions,
-    TypeVarSolution, UnspecializedTypeVarPolicy,
+    ConstraintFailureEvidence, ConstraintProvenance, ConstraintSet, ConstraintSetBuilder,
+    IteratorConstraintsExtension, PathBoundSolution, ReportDiagnostics, Solution, SolutionPaths,
+    SolutionValidity, SolutionViolationKind, Solutions, TypeVarSolution,
+    UnspecializedTypeVarPolicy,
 };
 use crate::types::signatures::{Parameter, Parameters, Signature};
 use crate::types::typevar::{
@@ -137,8 +138,14 @@ fn specialization_proof_preserves_original_graph() {
     let builder = ConstraintSetBuilder::new();
     let integer = known_instance(db, KnownClass::Int);
     let relation = exact(db, &builder, variable, integer);
-    let tautology =
-        ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, variable, Type::Never);
+    let tautology = ConstraintSet::constrain_typevar_lower_bound(
+        db,
+        &env,
+        &builder,
+        ConstraintProvenance::INFERRED,
+        variable,
+        Type::Never,
+    );
     assert!(!tautology.node.is_terminal());
     assert!(
         tautology
@@ -1272,14 +1279,21 @@ fn validation_shares_the_projection_visit_budget() {
     // The first alternative is retained. The second requires validation, but collection has
     // consumed the visit budget, so neither API may return the prefix as a complete result.
     let mut selected_paths = 0;
-    let result = set.solutions_with(db, &env, inferable, budget, ReportDiagnostics::Yes, |_, candidate| {
-        if candidate.bound_typevar == t {
-            selected_paths += 1;
-            PathBoundSolution::Solved(if selected_paths == 1 { bound } else { selected })
-        } else {
-            CandidateSolutions::default_solve(db, &env, &builder, candidate)
-        }
-    });
+    let result = set.solutions_with(
+        db,
+        &env,
+        inferable,
+        budget,
+        ReportDiagnostics::Yes,
+        |_, candidate| {
+            if candidate.bound_typevar == t {
+                selected_paths += 1;
+                PathBoundSolution::Solved(if selected_paths == 1 { bound } else { selected })
+            } else {
+                CandidateSolutions::default_solve(db, &env, &builder, candidate)
+            }
+        },
+    );
     assert_eq!(selected_paths, 2);
     assert_eq!(result, Err(ProjectionError::TraversalBudgetExceeded));
 
