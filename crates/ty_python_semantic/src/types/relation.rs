@@ -726,10 +726,14 @@ impl<'db> Type<'db> {
             (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => false,
             (Type::Never | Type::Dynamic(_), _) | (_, Type::Dynamic(_)) => true,
             (_, Type::NominalInstance(instance)) if instance.is_object() => true,
-            (Type::LiteralValue(literal), Type::NominalInstance(instance)) => literal
-                .kind()
-                .known_class()
-                .is_some_and(|class| instance.has_known_class(db, class)),
+            (Type::LiteralValue(literal), Type::NominalInstance(instance)) => {
+                // Provided instances need the full relation check for their storage fields.
+                instance.provided_instance().is_none()
+                    && literal
+                        .kind()
+                        .known_class()
+                        .is_some_and(|class| instance.has_known_class(db, class))
+            }
             (_, Type::Union(union)) => {
                 self.materialized_divergent_fallback().is_none() && union.contains_member(db, self)
             }
