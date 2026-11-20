@@ -5055,7 +5055,7 @@ impl<'db> Type<'db> {
             _ => self.to_class_type(db),
         };
         let own_class_attr =
-            own_class.map(|class| class.own_class_member(db, env, None, name).inner);
+            own_class.map(|class| class.own_class_member_with_policy(db, env, None, name, policy).inner);
 
         // A definitely-declared attribute in this class's own namespace is the contract for
         // values populated by metaclass initialization, analogous to a declared instance

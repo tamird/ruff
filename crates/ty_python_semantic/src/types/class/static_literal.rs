@@ -1631,6 +1631,20 @@ impl<'db> StaticClassLiteral<'db> {
         specialization: Option<Specialization<'db>>,
         name: &str,
     ) -> Member<'db> {
+        self.own_class_member_with_policy(
+            db, env, inherited_generic_context, specialization, name, MemberLookupPolicy::default(),
+        )
+    }
+
+    pub(super) fn own_class_member_with_policy(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        inherited_generic_context: Option<GenericContext<'db>>,
+        specialization: Option<Specialization<'db>>,
+        name: &str,
+        policy: MemberLookupPolicy,
+    ) -> Member<'db> {
         fn into_dunder_paramspec_callable<'d>(
             db: &'d dyn Db,
             env: &ProgramEnvironment<'d>,
@@ -1727,6 +1741,16 @@ impl<'db> StaticClassLiteral<'db> {
             }
         });
 
+        // A typing-only hash declaration does not prevent a runtime equality method
+        // from creating `__hash__ = None` when the class has no other runtime hash.
+        let member = if name == "__hash__"
+            && policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE)
+        {
+            ClassType::NonGeneric(self.into()).runtime_member(db, env, name, member)
+        } else {
+            member
+        };
+
         if self.has_own_slot_descriptor(db, name) {
             return Member::definitely_declared(self.own_slot_descriptor(
                 db,
@@ -1749,7 +1773,7 @@ impl<'db> StaticClassLiteral<'db> {
             ) {
                 return Member::definitely_declared(synthesized_member);
             }
-            if let Some(hash) = self.implicit_hash(db, env, name) {
+            if let Some(hash) = self.implicit_hash(db, env, name, policy) {
                 return Member { inner: hash };
             }
             // The symbol was not found in the class scope. It might still be implicitly defined in `@classmethod`s.
@@ -1760,12 +1784,13 @@ impl<'db> StaticClassLiteral<'db> {
         // If both methods are conditional, we cannot tell whether they are defined together.
         if name == "__hash__"
             && !member.inner.place.is_definitely_bound()
-            && let Some(hash) = self.own_synthesized_member(
+            && let Some(hash) = self.own_synthesized_member_with_policy(
                 db,
                 env,
                 specialization,
                 inherited_generic_context,
                 name,
+                policy,
             )
         {
             return Member {
@@ -1818,6 +1843,7 @@ impl<'db> StaticClassLiteral<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
+        policy: MemberLookupPolicy,
     ) -> Option<PlaceAndQualifiers<'db>> {
         if name != "__hash__" {
             return None;
@@ -1828,7 +1854,18 @@ impl<'db> StaticClassLiteral<'db> {
             return None;
         }
         let bindings = use_def_map(db, scope).end_of_scope_symbol_bindings(eq);
-        let Place::Defined(eq) = place_from_bindings(db, env, bindings).place else {
+        let eq = place_from_bindings(db, env, bindings).place;
+        let eq = if policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE) {
+            // A typing-only equality declaration can describe an operation without adding
+            // the runtime `__hash__ = None` attribute created by a Python equality method.
+            ClassType::NonGeneric(self.into())
+                .runtime_member(db, env, "__eq__", Member { inner: eq.into() })
+                .inner
+                .place
+        } else {
+            eq
+        };
+        let Place::Defined(eq) = eq else {
             return None;
         };
         Some(Type::with_definedness(
@@ -1847,6 +1884,20 @@ impl<'db> StaticClassLiteral<'db> {
         inherited_generic_context: Option<GenericContext<'db>>,
         name: &str,
     ) -> Option<Type<'db>> {
+        self.own_synthesized_member_with_policy(
+            db, env, specialization, inherited_generic_context, name, MemberLookupPolicy::default(),
+        )
+    }
+
+    fn own_synthesized_member_with_policy(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        specialization: Option<Specialization<'db>>,
+        inherited_generic_context: Option<GenericContext<'db>>,
+        name: &str,
+        policy: MemberLookupPolicy,
+    ) -> Option<Type<'db>> {
         self.own_generated_member(
             db,
             env,
@@ -1856,7 +1907,7 @@ impl<'db> StaticClassLiteral<'db> {
             || CodeGeneratorKind::from_static_class(db, self),
         )
         .or_else(|| {
-            self.implicit_hash(db, env, name)?
+            self.implicit_hash(db, env, name, policy)?
                 .into_lookup_result(db, env)
                 .ok()
                 .map(|member| member.inner_type())
