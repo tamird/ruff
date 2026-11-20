@@ -287,9 +287,13 @@ mod tests {
 
         fn module_parser(&self, namespace: &'static str) -> Option<super::ModuleParser> {
             (namespace == "test:skip-marker").then_some(|source, options| {
-                let range =
-                    ruff_text_size::TextRange::new(1.into(), ruff_text_size::TextSize::of(source));
-                ruff_python_parser::parse_cells_unchecked(source, [range], &options)
+                assert!(source.starts_with('#'));
+                let mut source = source.to_owned();
+                // Keep AST offsets relative to the original source after removing the marker.
+                source.replace_range(..1, " ");
+                ruff_python_parser::parse_unchecked(&source, options)
+                    .try_into_module()
+                    .expect("the test parser must parse a module")
             })
         }
 

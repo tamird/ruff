@@ -99,7 +99,7 @@ def operations(row: View[Text]):
         [
             ("invalid-argument-type", "row"),
             ("invalid-assignment", "row[\"value\"]"),
-            ("unresolved-attribute", "row.update"),
+            ("missing-attribute", "row.update"),
         ],
         "{diagnostics:#?}"
     );
@@ -1292,7 +1292,7 @@ ordinary: list[int] = ["bad"]
         [
             "invalid-argument-type",
             "missing-typed-dict-key",
-            "invalid-typed-dict-key",
+            "unknown-typed-dict-constructor-key",
             "invalid-assignment",
             "invalid-type-form",
             "invalid-assignment"
@@ -1988,10 +1988,10 @@ def wrap[**P](callback: Callback[P]) -> Callback[P]:
         &db,
         file,
         &[
-            ("unresolved-attribute", "keywords.args"),
-            ("unresolved-attribute", "keywords.kwargs"),
+            ("missing-attribute", "keywords.args"),
+            ("missing-attribute", "keywords.kwargs"),
             ("invalid-argument-type", "*keywords"),
-            ("unresolved-attribute", "kwargs.args"),
+            ("missing-attribute", "kwargs.args"),
             ("invalid-argument-type", "*kwargs"),
         ],
     );
@@ -3626,43 +3626,43 @@ target: Target | None
             "",
             "attrs = record({'dep': target})",
             "    ctx = record({'attr': record({'dep': None})})\n",
-            vec!["unresolved-attribute"],
+            vec!["missing-attribute"],
         ),
         (
             "",
             "attrs = record({'dep': target})",
             "    ctx.attr = record({'dep': None})\n",
-            vec!["invalid-assignment", "unresolved-attribute"],
+            vec!["invalid-assignment", "missing-attribute"],
         ),
         (
             "",
             "attrs = record({'dep': target})",
             "    ctx.attr.dep = None\n",
-            vec!["invalid-assignment", "unresolved-attribute"],
+            vec!["invalid-assignment", "missing-attribute"],
         ),
         (
             "class Mutable:\n    dep: Target | None = target\n",
             "attrs = Mutable()",
             "",
-            vec!["unresolved-attribute"],
+            vec!["missing-attribute"],
         ),
         (
             "class Base:\n    @property\n    def dep(self) -> Target | None: return target\n",
             "attrs = record({'dep': target}, base=Base)",
             "",
-            vec!["unresolved-attribute"],
+            vec!["missing-attribute"],
         ),
         (
             "class Base:\n    def __getattribute__(self, name: str) -> Target | None: return target\n",
             "attrs = record({'dep': target}, base=Base)",
             "",
-            vec!["unresolved-attribute"],
+            vec!["missing-attribute"],
         ),
         (
             "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> Target | None: return target\n    def __set__(self, instance: object, value: object) -> None: pass\nclass Base:\n    dep = Descriptor()\n",
             "attrs = record({'dep': target}, base=Base)",
             "",
-            vec!["unresolved-attribute"],
+            vec!["missing-attribute"],
         ),
         (
             "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> Target | None: return target\nclass Base:\n    dep = Descriptor()\n",
@@ -3674,13 +3674,13 @@ target: Target | None
             "class Mutable:\n    dep: Target | None = target\n",
             "attrs = record({'dep': target}) if flag else Mutable()",
             "",
-            vec!["unresolved-attribute"],
+            vec!["missing-attribute"],
         ),
         (
             "",
             "attrs = record({'dep': target})\n    def reset():\n        nonlocal ctx\n        ctx = record({'attr': record({'dep': None})})",
             "    reset()\n",
-            vec!["unresolved-attribute"],
+            vec!["missing-attribute"],
         ),
     ] {
         let source = format!(
@@ -3728,7 +3728,7 @@ def use() -> str:
                 .iter()
                 .map(|diagnostic| diagnostic.id().as_str())
                 .collect::<Vec<_>>(),
-            ["not-subscriptable", "unresolved-attribute"],
+            ["not-subscriptable", "missing-attribute"],
             "{source}: {diagnostics:#?}",
         );
     }
@@ -6310,8 +6310,8 @@ def mixed(value: Store[Closed] | Store[Open]):
             .map(|diagnostic| diagnostic.id().as_str())
             .collect::<Vec<_>>(),
         [
-            "unresolved-attribute",
-            "unresolved-attribute",
+            "missing-attribute",
+            "missing-attribute",
             "invalid-argument-type"
         ],
         "{diagnostics:#?}"

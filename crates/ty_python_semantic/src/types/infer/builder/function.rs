@@ -1469,8 +1469,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     Some(definition) => {
                         parameter_default_expression_type(db, definition, default_expr)
                     }
-                    None => self
-                        .infer_expression(default_expr, TypeContext::preference(Some(declared_ty))),
+                    None => self.file_expression_type(default_expr),
                 };
 
                 if matches!(
