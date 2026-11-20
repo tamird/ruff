@@ -469,7 +469,7 @@ def _(union: E1 | Any, intersection: E1 & Any):
     reveal_type(intersection.f())  # revealed: list[E1 & Any] & Any
 ```
 
-#### Descriptor receivers on a union-bounded type variable
+### Descriptor receivers on a union-bounded type variable
 
 A classmethod captures the class, while a custom descriptor can return a method bound to an
 unrelated object.
