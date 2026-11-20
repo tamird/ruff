@@ -180,7 +180,16 @@ to return random values, or in the case of a `list()`, the result depends on the
 in the list. Therefore, these types should not be narrowed by `if x` or `if not x`.
 
 ```py
-class A: ...
+from typing import final
+
+@final
+class A(int):
+    state: bool = False
+
+    def __bool__(self) -> bool:
+        self.state = not self.state
+        return self.state
+
 class B: ...
 
 def f(x: A | B):
@@ -198,6 +207,18 @@ def f(x: A | B):
         reveal_type(x)  # revealed: A | B
     else:
         reveal_type(x)  # revealed: (A & ~AlwaysTruthy & ~AlwaysFalsy) | (B & ~AlwaysTruthy & ~AlwaysFalsy)
+
+def range_result(mask: range, payload: str | None) -> str:
+    selected = mask and payload
+    if selected:
+        return selected
+    return ""
+
+def open_int_result(mask: int, payload: str | None) -> str:
+    selected = mask and payload
+    if selected:
+        return selected  # error: [invalid-explicit-return]
+    return ""
 ```
 
 ### Truthiness of Types
