@@ -5587,7 +5587,6 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 return self.infer_from_constraint_set(when);
             }
 
-
             (Type::Callable(formal_callable), _) => {
                 let Some(actual_callables) = actual.try_upcast_to_callable(db, self.env) else {
                     return Ok(());
@@ -5649,7 +5648,6 @@ impl<'db> SpecializationError<'db> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::assert_matches;
 
     use crate::types::constraints::resolution::SolutionType::{Resolved, Unresolved};
 
@@ -5681,7 +5679,9 @@ mod tests {
         let db = setup_db();
         let db = &db;
         let env = db.program_environment();
-        assert_matches!(KnownClass::List.to_class_literal(db, &env), Type::ClassLiteral(origin));
+        let Type::ClassLiteral(origin) = KnownClass::List.to_class_literal(db, &env) else {
+            panic!("expected the builtin list class literal");
+        };
         let [u] = create_typevars(db, ["U"]);
         let bound = KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(u)]);
         let captured = BoundTypeVarInstance::synthetic_self(
@@ -6032,9 +6032,7 @@ mod tests {
         ));
         let inference = builder
             .build_inference_with(ReportDiagnostics::No, |typevar, bounds| {
-                let lower = bounds
-                    .as_ref()
-                    .and_then(|bounds| bounds.inference_lower());
+                let lower = bounds.as_ref().and_then(|bounds| bounds.inference_lower());
                 (typevar == t && lower == Some(str)).then_some(PathBoundSolution::BudgetExceeded {
                     fallback: Some(int),
                 })
@@ -6315,15 +6313,26 @@ mod tests {
                 // when completing the next alternative.
                 let budget = SolutionBudget::default();
                 let mut native_resources = ProjectionBudget::new(budget);
-                let native = builder.pending.solutions_with_shared_budget(
-                    db, &env, context.inferable_typevars(db), &mut native_resources,
-                    ReportDiagnostics::No, |_, bound| {
-                        CandidateSolutions::default_solve(db, &env, &constraints, bound)
-                            .map(|ty| builder.remove_inferable_typevar_artifacts_from_solution(
-                                bound.bound_typevar, ty,
-                            ))
-                    },
-                ).map_err(|error| anyhow::anyhow!("native collection failed: {error:?}"))?;
+                let native = builder
+                    .pending
+                    .solutions_with_shared_budget(
+                        db,
+                        &env,
+                        context.inferable_typevars(db),
+                        &mut native_resources,
+                        ReportDiagnostics::No,
+                        |_, bound| {
+                            CandidateSolutions::default_solve(db, &env, &constraints, bound).map(
+                                |ty| {
+                                    builder.remove_inferable_typevar_artifacts_from_solution(
+                                        bound.bound_typevar,
+                                        ty,
+                                    )
+                                },
+                            )
+                        },
+                    )
+                    .map_err(|error| anyhow::anyhow!("native collection failed: {error:?}"))?;
                 let Solutions::Constrained(SolutionPaths::Complete(native_paths)) = native else {
                     anyhow::bail!("expected complete native alternatives: {native:?}");
                 };
@@ -6331,33 +6340,45 @@ mod tests {
                 let native_visits = budget.visits - native_resources.remaining_visits();
                 let mut proof_visits = Vec::new();
                 for path in &native_paths {
-                    let mut types = path.solved_typevars.iter().map(|binding| {
-                        (binding.bound_typevar.identity(db), binding.solution)
-                    }).collect();
+                    let mut types = path
+                        .solved_typevars
+                        .iter()
+                        .map(|binding| (binding.bound_typevar.identity(db), binding.solution))
+                        .collect();
                     assert!(builder.has_missing_keyword_components(&types));
                     let mut resources = ProjectionBudget::new(budget);
-                    let verified = builder.infer_keyword_components(
-                        &mut types, &path.solved_typevars, &mut resources,
-                    ).map_err(|error| anyhow::anyhow!("witness proof failed: {error:?}"))?;
+                    let verified = builder
+                        .infer_keyword_components(&mut types, &path.solved_typevars, &mut resources)
+                        .map_err(|error| anyhow::anyhow!("witness proof failed: {error:?}"))?;
                     assert!(verified);
                     let visits = budget.visits - resources.remaining_visits();
                     assert!(visits > 0);
                     proof_visits.push(visits);
                 }
-                let completion_visits = proof_visits.into_iter().max()
+                let completion_visits = proof_visits
+                    .into_iter()
+                    .max()
                     .ok_or_else(|| anyhow::anyhow!("expected witness proofs"))?;
                 let mut limited = SpecializationBuilder::new(db, &env, &constraints, context);
                 limited.record_constraint_set(relation);
-                let inference = limited.solve_pending_with(
-                    SolutionBudget { visits: native_visits + completion_visits, ..budget },
-                    ReportDiagnostics::No, &mut |_, _| None,
-                ).map_err(|_| anyhow::anyhow!("work exhaustion must remain incomplete"))?;
+                let inference = limited
+                    .solve_pending_with(
+                        SolutionBudget {
+                            visits: native_visits + completion_visits,
+                            ..budget
+                        },
+                        ReportDiagnostics::No,
+                        &mut |_, _| None,
+                    )
+                    .map_err(|_| anyhow::anyhow!("work exhaustion must remain incomplete"))?;
                 let TypeVarInferenceSolutions::Incomplete(paths) = inference.solutions(db) else {
-                    anyhow::bail!("expected an incomplete alternative family: {:?}", inference.solutions(db));
+                    anyhow::bail!(
+                        "expected an incomplete alternative family: {:?}",
+                        inference.solutions(db)
+                    );
                 };
                 assert_eq!(paths.len(), 1);
             }
-
         }
         Ok(())
     }

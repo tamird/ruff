@@ -5,8 +5,8 @@ use std::ops::ControlFlow;
 
 use super::{
     ALWAYS_FALSE, ALWAYS_TRUE, BoundedSolutionLimits, CandidateSolutions, CandidateTypeVarSolution,
-    ConstraintId, ConstraintProvenance, ConstraintSet, PathBoundSolution, ReportDiagnostics, SolutionLimits, Solutions,
-    TypeVarSolution,
+    ConstraintId, ConstraintProvenance, ConstraintSet, PathBoundSolution, ReportDiagnostics,
+    SolutionLimits, Solutions, TypeVarSolution,
 };
 use crate::types::typevar::TypeVarSet;
 use crate::types::{
@@ -243,15 +243,25 @@ impl<'db> ConstraintSet<'db, '_> {
                 ControlFlow::Continue(()) => {}
                 ControlFlow::Break(error) => return Err(error),
             }
-            selected.intersect(db, self.builder, Self::constrain_typevar_equivalence_bound(
-                db, env, self.builder, ConstraintProvenance::INFERRED,
-                binding.bound_typevar, binding.solution,
-            ));
+            selected.intersect(
+                db,
+                self.builder,
+                Self::constrain_typevar_equivalence_bound(
+                    db,
+                    env,
+                    self.builder,
+                    ConstraintProvenance::INFERRED,
+                    binding.bound_typevar,
+                    binding.solution,
+                ),
+            );
         }
-        let inferable = inferable.merge(db, TypeVarSet::from_typevars(
-            db, fixed.iter().map(|binding| binding.bound_typevar),
-        ));
-        let path_bounds = selected.path_bounds_with_limits(db, env, inferable, limits, ReportDiagnostics::No)?;
+        let inferable = inferable.merge(
+            db,
+            TypeVarSet::from_typevars(db, fixed.iter().map(|binding| binding.bound_typevar)),
+        );
+        let path_bounds =
+            selected.path_bounds_with_limits(db, env, inferable, limits, ReportDiagnostics::No)?;
         let (inferable, paths, incomplete) = match path_bounds {
             CandidateSolutions::Unsatisfiable => return Ok(None),
             CandidateSolutions::Unconstrained => return Err(ProjectionError::IncompleteSolution),
@@ -470,7 +480,6 @@ impl<'db> ConstraintSet<'db, '_> {
             ControlFlow::Break(error) => Err(error),
         }
     }
-
 
     /// Folds complete, correlated solutions without first allocating every solved path.
     ///
