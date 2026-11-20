@@ -321,9 +321,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let env = self.program_environment();
         let scope = self.scope();
         let places = place_table(db, scope);
-        let expression = match predicate.node {
-            PredicateNode::Expression(expression) => expression,
-            _ => return Truthiness::Ambiguous,
+        let PredicateNode::Expression(expression) = predicate.node else {
+            return Truthiness::Ambiguous;
         };
         if expression.scope(db) != scope {
             return Truthiness::Ambiguous;

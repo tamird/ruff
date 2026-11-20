@@ -1430,16 +1430,20 @@ mod tests {
                 .constraint
                 .expect_atomic(&storage)
         });
-        let mut map = SequentMap::default();
-        map.sequents = Box::new([SequentGroup::Ungrouped(Box::new([
-            Sequent::PairImplication {
-                ante1: InternedSequentConstraint::new(db, storage.atomic_constraint_data(left)),
-                ante2: InternedSequentConstraint::new(db, storage.atomic_constraint_data(right)),
-                post: InternedSequentConstraint::new(db, storage.atomic_constraint_data(post)),
-                fuel_cost: (),
-                is_substitution: false,
-            },
-        ]))]);
+        let map = SequentMap {
+            sequents: Box::new([SequentGroup::Ungrouped(Box::new([
+                Sequent::PairImplication {
+                    ante1: InternedSequentConstraint::new(db, storage.atomic_constraint_data(left)),
+                    ante2: InternedSequentConstraint::new(
+                        db,
+                        storage.atomic_constraint_data(right),
+                    ),
+                    post: InternedSequentConstraint::new(db, storage.atomic_constraint_data(post)),
+                    fuel_cost: (),
+                    is_substitution: false,
+                },
+            ]))]),
+        };
         let mut path = PathAssignments::default();
         path.walk_edge(
             db,
@@ -1583,13 +1587,20 @@ mod tests {
                 .interior_node_data(rhs.node)
                 .constraint
                 .expect_atomic(&storage);
-            let mut map = SequentMap::default();
-            map.sequents = Box::new([SequentGroup::Ungrouped(Box::new([Sequent::PairRelation {
-                ante1: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante1)),
-                ante2: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante2)),
-                post: (relation, ConstraintProvenance::INFERRED),
-                fuel_cost: (),
-            }]))]);
+            let map = SequentMap {
+                sequents: Box::new([SequentGroup::Ungrouped(Box::new([Sequent::PairRelation {
+                    ante1: InternedSequentConstraint::new(
+                        db,
+                        storage.atomic_constraint_data(ante1),
+                    ),
+                    ante2: InternedSequentConstraint::new(
+                        db,
+                        storage.atomic_constraint_data(ante2),
+                    ),
+                    post: (relation, ConstraintProvenance::INFERRED),
+                    fuel_cost: (),
+                }]))]),
+            };
             let mut path = set
                 .node
                 .path_assignments(db, &env, &mut storage, set.source_order);
@@ -1731,20 +1742,22 @@ mod tests {
                     .interior_node_data(rhs.node)
                     .constraint
                     .expect_atomic(&storage);
-                let mut map = SequentMap::default();
-                map.sequents =
-                    Box::new([SequentGroup::Ungrouped(Box::new([Sequent::PairRelation {
-                        ante1: InternedSequentConstraint::new(
-                            db,
-                            storage.atomic_constraint_data(ante1),
-                        ),
-                        ante2: InternedSequentConstraint::new(
-                            db,
-                            storage.atomic_constraint_data(ante2),
-                        ),
-                        post: (relation.clone(), ConstraintProvenance::INFERRED),
-                        fuel_cost: (),
-                    }]))]);
+                let map = SequentMap {
+                    sequents: Box::new([SequentGroup::Ungrouped(Box::new([
+                        Sequent::PairRelation {
+                            ante1: InternedSequentConstraint::new(
+                                db,
+                                storage.atomic_constraint_data(ante1),
+                            ),
+                            ante2: InternedSequentConstraint::new(
+                                db,
+                                storage.atomic_constraint_data(ante2),
+                            ),
+                            post: (relation.clone(), ConstraintProvenance::INFERRED),
+                            fuel_cost: (),
+                        },
+                    ]))]),
+                };
                 let mut path =
                     implicit
                         .node

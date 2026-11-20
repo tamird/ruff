@@ -102,6 +102,10 @@ pub fn register_lints(registry: &mut LintRegistryBuilder) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, get_size2::GetSize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Analysis policies are independent options, not mutually exclusive states"
+)]
 pub struct AnalysisSettings {
     /// Whether to infer return types for functions without return annotations.
     pub return_type_inference: ReturnTypeInference,

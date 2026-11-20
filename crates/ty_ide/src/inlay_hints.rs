@@ -605,7 +605,7 @@ impl<'a> SourceOrderVisitor<'a> for InlayHintVisitor<'a, '_> {
                 let position = function.parameters.end();
                 if self.settings.return_types
                     && self.range.contains_inclusive(position)
-                    && let Some(ty) = inlay_hint_return_type(&self.model, function)
+                    && let Some(ty) = inlay_hint_return_type(self.model, function)
                 {
                     self.pending_return_hint = Some((
                         function.parameters.as_ref(),
