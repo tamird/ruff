@@ -13,7 +13,7 @@ const LINEAR_SEARCH_THRESHOLD: usize = 16;
 
 /// Uniquely identifies a symbol in a given scope.
 #[newtype_index]
-#[derive(Ord, PartialOrd, get_size2::GetSize)]
+#[derive(Ord, PartialOrd, get_size2::GetSize, salsa::SalsaValue)]
 pub struct ScopedSymbolId;
 
 /// A symbol in a given scope.

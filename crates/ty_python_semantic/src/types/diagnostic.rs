@@ -12,9 +12,9 @@ use super::{
 use crate::dependency::is_direct_dependency;
 use crate::diagnostic::{did_you_mean, format_enumeration};
 use crate::importer::{ImportAction, ImportRequest, MembersInScope};
-use crate::lint::{Level, LintMetadata, LintRegistryBuilder, LintStatus};
+use crate::lint::{Level, LintId, LintMetadata, LintRegistryBuilder, LintSource, LintStatus};
 use crate::place::{DefinedPlace, Place, imported_symbol, place_from_bindings};
-use crate::suppression::FileSuppressionId;
+use crate::suppression::{FileSuppressionId, suppressions};
 use crate::types::abstract_methods::AbstractMethods;
 use crate::types::call::bind::CallableDescription;
 use crate::types::call::{Bindings, CallDiagnosticOverride, CallError};
@@ -41,9 +41,14 @@ use crate::types::{
 use crate::types::{KnownInstanceType, MemberLookupPolicy, TypeVarKind, TypedDictType, UnionType};
 use crate::{Db, DisplaySettings, FxIndexMap, ProgramEnvironment, SemanticModel, declare_lint};
 use itertools::Itertools;
+use ruff_db::PythonFile;
+use ruff_db::files::FileRange;
 use ruff_db::source::source_text;
 use ruff_db::{
-    diagnostic::{Annotation, Diagnostic, LintName, Span, SubDiagnostic, SubDiagnosticSeverity},
+    diagnostic::{
+        Annotation, Diagnostic, DiagnosticId, LintName, Span, SubDiagnostic, SubDiagnosticSeverity,
+        UnifiedFile,
+    },
     files::File,
     parsed::parsed_module,
 };
@@ -54,6 +59,7 @@ use ruff_python_ast::{self as ast, AnyNodeRef, HasNodeIndex, PythonVersion, Stri
 use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::fmt::{self, Formatter};
 use ty_module_resolver::{
     ImportingFile, KnownModule, Module, ModuleName, SearchPath, file_to_module,
@@ -1759,6 +1765,14 @@ declare_lint! {
 pub struct TypeCheckDiagnostics {
     diagnostics: Vec<Diagnostic>,
     used_suppressions: FxHashSet<FileSuppressionId>,
+    shared_body_diagnostics: Option<Box<SmallVec<[SharedBodyDiagnostic; 1]>>>,
+}
+
+/// Ordinary-source diagnostics and suppressions retained when overloads own the typed body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize)]
+enum SharedBodyDiagnostic {
+    Diagnostic(usize),
+    Suppression(FileSuppressionId),
 }
 
 pub(crate) fn report_mismatched_type_name<'db>(
@@ -1795,8 +1809,79 @@ impl TypeCheckDiagnostics {
     }
 
     pub(super) fn extend(&mut self, other: &TypeCheckDiagnostics) {
+        let offset = self.diagnostics.len();
         self.diagnostics.extend_from_slice(&other.diagnostics);
         self.used_suppressions.extend(&other.used_suppressions);
+        if let Some(other_arguments) = &other.shared_body_diagnostics {
+            self.shared_body_diagnostics
+                .get_or_insert_with(Box::default)
+                .extend(other_arguments.iter().copied().map(|mut argument| {
+                    if let SharedBodyDiagnostic::Diagnostic(index) = &mut argument {
+                        *index += offset;
+                    }
+                    argument
+                }));
+        }
+    }
+
+    /// Conditions and type expressions retain their source interpretation when overloads own
+    /// the typed body. Keep their suppression ownership with that source view.
+    pub(super) fn push_shared_body(&mut self, diagnostic: Diagnostic) {
+        self.shared_body_diagnostics
+            .get_or_insert_with(Box::default)
+            .push(SharedBodyDiagnostic::Diagnostic(self.diagnostics.len()));
+        self.diagnostics.push(diagnostic);
+    }
+
+    pub(super) fn extend_shared_body(&mut self, other: &TypeCheckDiagnostics) {
+        for diagnostic in other
+            .shared_body_diagnostics
+            .iter()
+            .flat_map(|items| items.iter())
+        {
+            match *diagnostic {
+                SharedBodyDiagnostic::Diagnostic(index) => {
+                    self.diagnostics.push(other.diagnostics[index].clone());
+                }
+                SharedBodyDiagnostic::Suppression(id) => {
+                    self.used_suppressions.insert(id);
+                }
+            }
+        }
+    }
+
+    /// Combine alternative checks without duplicating failures or losing source ownership.
+    pub(super) fn extend_deduplicated(&mut self, other: &TypeCheckDiagnostics) {
+        let Self { diagnostics, used_suppressions, shared_body_diagnostics } = self;
+        let Self {
+            diagnostics: incoming,
+            used_suppressions: incoming_suppressions,
+            shared_body_diagnostics: incoming_shared,
+        } = other;
+        let mut positions: rustc_hash::FxHashMap<Diagnostic, usize> = diagnostics
+            .iter().cloned().enumerate().map(|(index, diagnostic)| (diagnostic, index)).collect();
+        let remapped: Vec<_> = incoming.iter().map(|diagnostic| {
+            match positions.entry(diagnostic.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let index = diagnostics.len();
+                    diagnostics.push(diagnostic.clone());
+                    entry.insert(index);
+                    index
+                }
+            }
+        }).collect();
+        used_suppressions.extend(incoming_suppressions.iter().copied());
+        for argument in incoming_shared.iter().flat_map(|items| items.iter()) {
+            let mapped = match *argument {
+                SharedBodyDiagnostic::Diagnostic(index) => SharedBodyDiagnostic::Diagnostic(remapped[index]),
+                SharedBodyDiagnostic::Suppression(id) => SharedBodyDiagnostic::Suppression(id),
+            };
+            let shared = shared_body_diagnostics.get_or_insert_with(Box::default);
+            if !shared.contains(&mapped) {
+                shared.push(mapped);
+            }
+        }
     }
 
     /// Extend with selected diagnostics while retaining all used suppressions.
@@ -1811,11 +1896,114 @@ impl TypeCheckDiagnostics {
                 .filter(|diagnostic| include(diagnostic))
                 .cloned(),
         );
-        self.used_suppressions.extend(&other.used_suppressions);
+        self.used_suppressions
+            .extend(other.used_suppressions.iter().copied());
+    }
+
+    /// Group failures at the same operation while retaining every distinct overload explanation.
+    pub(super) fn extend_overload_domains(&mut self, other: &TypeCheckDiagnostics) {
+        for diagnostic in other {
+            let existing = self.diagnostics.iter_mut().find(|existing| {
+                existing.id() == diagnostic.id()
+                    && existing.primary_span().is_some()
+                    && existing.primary_span() == diagnostic.primary_span()
+            });
+            if let Some(existing) = existing {
+                if existing.headline_message() == diagnostic.headline_message()
+                    && existing.annotations() == diagnostic.annotations()
+                    && diagnostic
+                        .sub_diagnostics()
+                        .iter()
+                        .all(|detail| existing.sub_diagnostics().contains(detail))
+                {
+                    continue;
+                }
+                let mut explanation =
+                    SubDiagnostic::new(SubDiagnosticSeverity::Info, diagnostic.headline_message());
+                for annotation in diagnostic.annotations() {
+                    explanation.annotate(annotation.clone());
+                }
+                if !existing.sub_diagnostics().contains(&explanation) {
+                    existing.sub(explanation);
+                }
+                for detail in diagnostic.sub_diagnostics() {
+                    if !existing.sub_diagnostics().contains(detail) {
+                        existing.sub(detail.clone());
+                    }
+                }
+            } else {
+                self.diagnostics.push(diagnostic.clone());
+            }
+        }
+        self.used_suppressions
+            .extend(other.used_suppressions.iter().copied());
     }
 
     pub(super) fn extend_diagnostics(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
         self.diagnostics.extend(diagnostics);
+    }
+
+    /// Applies the checked file's lint configuration to application-supplied diagnostics.
+    pub(super) fn extend_provided(
+        &mut self,
+        db: &dyn Db,
+        file: PythonFile<'_>,
+        diagnostics: impl IntoIterator<Item = Diagnostic>,
+    ) {
+        for mut diagnostic in diagnostics {
+            if let DiagnosticId::Lint(name) = diagnostic.id()
+                && let Ok(lint) = db.lint_registry().get(name.as_str())
+                && let Some(span) = diagnostic.primary_span()
+                && span.file() == &UnifiedFile::Ty(file.file(db))
+            {
+                if !db.should_check_file(file.file(db)) {
+                    continue;
+                }
+                let Some((severity, source)) = db.rule_selection(file.file(db)).get(lint) else {
+                    continue;
+                };
+                if let Some(range) = span.range()
+                    && self.is_suppressed(db, file, range, lint)
+                {
+                    continue;
+                }
+                if source != LintSource::Default {
+                    diagnostic.set_severity(severity);
+                }
+            }
+            self.push(diagnostic);
+        }
+    }
+
+    pub(crate) fn is_suppressed(
+        &mut self,
+        db: &dyn Db,
+        file: PythonFile<'_>,
+        range: TextRange,
+        lint: LintId,
+    ) -> bool {
+        let Some(suppression) = suppressions(db, file).find_suppression(range, lint) else {
+            return false;
+        };
+        self.mark_used(suppression.id());
+        true
+    }
+
+    pub(super) fn is_shared_body_suppressed(
+        &mut self,
+        db: &dyn Db,
+        file: PythonFile<'_>,
+        range: TextRange,
+        lint: LintId,
+    ) -> bool {
+        let Some(suppression) = suppressions(db, file).find_suppression(range, lint) else {
+            return false;
+        };
+        self.mark_used(suppression.id());
+        self.shared_body_diagnostics
+            .get_or_insert_with(Box::default)
+            .push(SharedBodyDiagnostic::Suppression(suppression.id()));
+        true
     }
 
     pub(crate) fn mark_used(&mut self, suppression_id: FileSuppressionId) {
@@ -1833,21 +2021,31 @@ impl TypeCheckDiagnostics {
     pub(crate) fn shrink_to_fit(&mut self) {
         self.used_suppressions.shrink_to_fit();
         self.diagnostics.shrink_to_fit();
+        if let Some(arguments) = &mut self.shared_body_diagnostics {
+            arguments.shrink_to_fit();
+        }
     }
 
     pub(crate) fn into_diagnostics(self) -> Vec<Diagnostic> {
         self.diagnostics
     }
 
+    pub(crate) fn has_diagnostics_or_used_suppressions(&self) -> bool {
+        !self.diagnostics.is_empty()
+            || !self.used_suppressions.is_empty()
+            || self.shared_body_diagnostics.is_some()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.diagnostics.is_empty() && self.used_suppressions.is_empty()
+        !self.has_diagnostics_or_used_suppressions()
     }
 
     fn iter(&self) -> std::slice::Iter<'_, Diagnostic> {
         self.diagnostics().iter()
     }
 
-    fn diagnostics(&self) -> &[Diagnostic] {
+    /// Reported diagnostics; suppression usage is retained separately in this bundle.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
         self.diagnostics.as_slice()
     }
 }
@@ -2100,18 +2298,18 @@ pub(super) enum AssignmentDeclaration<'db> {
 }
 
 struct AssignmentDeclarationAnnotation {
-    range: TextRange,
+    source: FileRange,
     declaration_kind: DeclarationKind,
 }
 
 impl AssignmentDeclarationAnnotation {
     fn into_annotation(
         self,
-        context: &InferContext,
         target_type_display: impl fmt::Display,
         ordinary_message: impl fmt::Display,
     ) -> Annotation {
-        let annotation = context.secondary(self.range);
+        let annotation =
+            Annotation::secondary(Span::from(self.source.file()).with_range(self.source.range()));
 
         match self.declaration_kind {
             DeclarationKind::KeywordVariadicParameter => annotation.message(format_args!(
@@ -2135,6 +2333,22 @@ fn assignment_declaration_annotation<'db>(
     declaration: AssignmentDeclaration<'db>,
 ) -> Option<AssignmentDeclarationAnnotation> {
     let db = context.db();
+    if let DefinitionKind::Assignment(assignment) = definition_kind
+        && let Some(annotation) = crate::types::string_annotation::SourceAnnotation::new(
+            db,
+            context.program_file(),
+            assignment.target(context.module()),
+            None,
+        )
+    {
+        return Some(AssignmentDeclarationAnnotation {
+            source: annotation.source(context.file()),
+            declaration_kind: match declaration {
+                AssignmentDeclaration::InheritedClassVar => DeclarationKind::InheritedClassVar,
+                AssignmentDeclaration::Ordinary(_) => DeclarationKind::Regular,
+            },
+        });
+    }
     let (declaration_definition_kind, kind) = match (declaration, definition_kind) {
         (AssignmentDeclaration::InheritedClassVar, _) => {
             (definition_kind, DeclarationKind::InheritedClassVar)
@@ -2143,31 +2357,52 @@ fn assignment_declaration_annotation<'db>(
         (AssignmentDeclaration::Ordinary(prior), _) => (prior?.kind(db), DeclarationKind::Regular),
     };
 
-    let (annotation, declaration_kind) = match declaration_definition_kind {
-        DefinitionKind::AnnotatedAssignment(assignment) => {
-            Some((assignment.annotation(context.module()), kind))
+    let parameter_annotation = |parameter: &ast::Parameter, kind| {
+        crate::types::string_annotation::SourceAnnotation::new(
+            db,
+            context.program_file(),
+            parameter,
+            parameter.annotation(),
+        )
+        .map(|annotation| (annotation.source(context.file()), kind))
+    };
+    let (source, declaration_kind) = match declaration_definition_kind {
+        DefinitionKind::AnnotatedAssignment(assignment) => Some((
+            FileRange::new(
+                context.file(),
+                assignment.annotation(context.module()).range(),
+            ),
+            kind,
+        )),
+        DefinitionKind::Assignment(assignment) => {
+            crate::types::string_annotation::SourceAnnotation::new(
+                db,
+                context.program_file(),
+                assignment.target(context.module()),
+                None,
+            )
+            .map(|annotation| (annotation.source(context.file()), DeclarationKind::Regular))
         }
-        DefinitionKind::Parameter(ParameterDefinitionNodeKind::Parameter(parameter)) => parameter
-            .node(context.module())
-            .parameter
-            .annotation
-            .as_deref()
-            .map(|annotation| (annotation, DeclarationKind::Regular)),
+        DefinitionKind::Parameter(ParameterDefinitionNodeKind::Parameter(parameter)) => {
+            parameter_annotation(
+                &parameter.node(context.module()).parameter,
+                DeclarationKind::Regular,
+            )
+        }
         DefinitionKind::Parameter(ParameterDefinitionNodeKind::VariadicPositionalParameter(
             parameter,
-        )) => parameter
-            .node(context.module())
-            .annotation
-            .as_deref()
-            .map(|annotation| (annotation, DeclarationKind::VariadicParameter)),
+        )) => parameter_annotation(
+            parameter.node(context.module()),
+            DeclarationKind::VariadicParameter,
+        ),
         DefinitionKind::Parameter(ParameterDefinitionNodeKind::VariadicKeywordParameter(
             parameter,
-        )) => parameter
-            .node(context.module())
-            .annotation
-            .as_deref()
-            .map(|annotation| (annotation, DeclarationKind::KeywordVariadicParameter)),
-        DefinitionKind::Import(_)
+        )) => parameter_annotation(
+            parameter.node(context.module()),
+            DeclarationKind::KeywordVariadicParameter,
+        ),
+        DefinitionKind::ProvidedBinding(_)
+        | DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)
         | DefinitionKind::ImportFromSubmodule(_)
         | DefinitionKind::StarImport(_)
@@ -2175,9 +2410,9 @@ fn assignment_declaration_annotation<'db>(
         | DefinitionKind::Class(_)
         | DefinitionKind::TypeAlias(_)
         | DefinitionKind::NamedExpression(_)
-        | DefinitionKind::Assignment(_)
         | DefinitionKind::AugmentedAssignment(_)
         | DefinitionKind::DictKeyAssignment(_)
+        | DefinitionKind::DictionaryContents(_)
         | DefinitionKind::For(_)
         | DefinitionKind::Comprehension(_)
         | DefinitionKind::LambdaParameter(_)
@@ -2192,7 +2427,7 @@ fn assignment_declaration_annotation<'db>(
     }?;
 
     Some(AssignmentDeclarationAnnotation {
-        range: annotation.range(),
+        source,
         declaration_kind,
     })
 }
@@ -2228,7 +2463,8 @@ fn assignment_value_node<'db, 'ast>(
         DefinitionKind::NamedExpression(assignment) => {
             Some(&*assignment.node(context.module()).value)
         }
-        DefinitionKind::Import(_)
+        DefinitionKind::ProvidedBinding(_)
+        | DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)
         | DefinitionKind::ImportFromSubmodule(_)
         | DefinitionKind::StarImport(_)
@@ -2237,6 +2473,7 @@ fn assignment_value_node<'db, 'ast>(
         | DefinitionKind::TypeAlias(_)
         | DefinitionKind::AugmentedAssignment(_)
         | DefinitionKind::DictKeyAssignment(_)
+        | DefinitionKind::DictionaryContents(_)
         | DefinitionKind::For(_)
         | DefinitionKind::Comprehension(_)
         | DefinitionKind::Parameter(_)
@@ -2464,7 +2701,6 @@ pub(super) fn report_invalid_assignment<'db>(
         assignment_declaration_annotation(context, definition_kind, declaration)
     {
         diag.annotate(declaration_annotation.into_annotation(
-            context,
             target_ty.display_with(db, env, settings.clone()),
             "Declared type",
         ));
@@ -2580,7 +2816,6 @@ pub(super) fn report_unsound_assignment<'db>(
         assignment_declaration_annotation(context, definition_kind, declaration)
     {
         diagnostic.annotate(declaration_annotation.into_annotation(
-            context,
             &expected_display,
             format_args!("Expected a subtype of `{expected_display}` because of this annotation"),
         ));
@@ -3048,7 +3283,7 @@ pub(super) fn report_dynamic_function_decorator_return<'db>(
 pub(super) fn report_invalid_explicit_return(
     context: &InferContext,
     object_range: impl Ranged,
-    return_type_range: impl Ranged,
+    return_type_range: FileRange,
     expected_ty: Type,
     actual_ty: Type,
 ) {
@@ -3060,7 +3295,8 @@ pub(super) fn report_invalid_explicit_return(
     let env = &context.program_environment();
     let settings =
         DisplaySettings::from_possibly_ambiguous_types(db, env, [expected_ty, actual_ty]);
-    let return_type_span = context.span(return_type_range);
+    let return_type_span =
+        Span::from(return_type_range.file()).with_range(return_type_range.range());
 
     let mut diag = builder.into_diagnostic("Return type does not match returned value");
     diag.set_primary_annotation_message(format_args!(
@@ -3082,7 +3318,7 @@ pub(super) fn report_invalid_explicit_return(
 pub(super) fn report_unsound_return(
     context: &InferContext,
     object_range: impl Ranged,
-    return_type_range: impl Ranged,
+    return_type_range: FileRange,
     expected_ty: Type,
     actual_ty: Type,
 ) {
@@ -3113,9 +3349,14 @@ pub(super) fn report_unsound_return(
         of `{expected_ty_display}`"
     ));
     diag.set_primary_annotation_message(format_args!("Inferred as `{actual_ty_display}`"));
-    diag.annotate(context.secondary(return_type_range).message(format_args!(
-        "Expected a subtype of `{expected_ty_display}` because of the return type",
-    )));
+    diag.annotate(
+        Annotation::secondary(
+            Span::from(return_type_range.file()).with_range(return_type_range.range()),
+        )
+        .message(format_args!(
+            "Expected a subtype of `{expected_ty_display}` because of the return type",
+        )),
+    );
 
     diag.info(format_args!(
         "`{actual_ty_display}` is assignable to `{expected_ty_display}`, \
@@ -5727,7 +5968,10 @@ pub(super) fn report_overridden_final_method<'db>(
             "At least one function definition in the superclass should be decorated with `@final`",
         );
 
-    let superclass_function_literal = if first_final_superclass_definition.file(db).is_stub(db) {
+    let superclass_function_literal = if first_final_superclass_definition
+        .program_file(db)
+        .is_stub(db)
+    {
         first_final_superclass_definition.first_overload_or_implementation(db)
     } else {
         first_final_superclass_definition

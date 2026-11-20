@@ -284,6 +284,157 @@ info[possibly-missing-attribute]: Attribute `attr` may be missing on object of t
   |     ^^^^^^^^^^^^^
 ```
 
+## Possibly-missing attributes in intersections
+
+An intersection has a member if either positive element requires it. This also applies when writing
+through an instance or a class object:
+
+```py
+from typing import Final, Protocol
+from ty_extensions import Intersection
+
+def condition() -> bool:
+    return bool(input())
+
+class Partial:
+    if condition():
+        field = 1
+
+class Required(Protocol):
+    field: int
+
+class RequiredNominal:
+    field: int = 1
+
+class RequiredInstance:
+    field: int
+
+class RequiredReadonly(Protocol):
+    @property
+    def field(self) -> int: ...
+
+def write_required(value: Intersection[Partial, Required]) -> None:
+    value.field = 1  # no diagnostic
+
+def write_nominal(value: Intersection[Partial, RequiredNominal]) -> None:
+    value.field = 1  # no diagnostic
+
+def write_instance(value: Intersection[Partial, RequiredInstance]) -> None:
+    value.field = 1  # no diagnostic
+
+def write_required_union(value: Intersection[Partial, Required] | RequiredNominal) -> None:
+    value.field = 1  # no diagnostic
+
+def write_class(value: Intersection[type[Partial], RequiredReadonly]) -> None:
+    value.field = 1  # no diagnostic
+
+def write_nominal_class(value: Intersection[type[Partial], type[RequiredNominal]]) -> None:
+    value.field = 1  # no diagnostic
+```
+
+The member's presence does not permit reassignment of a `Final` attribute:
+
+```py
+class PartialFinal:
+    if condition():
+        field: Final[int] = 1
+
+def write_final(value: Intersection[PartialFinal, RequiredReadonly]) -> None:
+    value.field = 1  # error: [invalid-assignment]
+```
+
+A union still has a possibly-missing member when one element permits its absence:
+
+```py
+def write_partial(value: Partial) -> None:
+    value.field = 1  # error: [possibly-missing-attribute]
+
+def write_union(value: Partial | Required) -> None:
+    value.field = 1  # error: [possibly-missing-attribute]
+
+def read_union(value: Partial | Required) -> int:
+    return value.field  # error: [possibly-missing-attribute]
+```
+
+A dynamic base does not guarantee that a member exists, even when a conditional declaration supplies
+part of its type. An unconditional declaration in the subclass does guarantee presence:
+
+```py
+from typing import Any, TypeVar
+
+class DynamicBase(Any):
+    tag = 1
+
+class DynamicConditional(DynamicBase):
+    if condition():
+        field = 1
+
+class DynamicRequired(DynamicBase):
+    field: int = 1
+
+def write_dynamic(value: Intersection[Partial, DynamicBase]) -> None:
+    value.field = 1  # error: [possibly-missing-attribute]
+
+def write_dynamic_conditional(value: Intersection[Partial, DynamicConditional]) -> None:
+    value.field = 1  # error: [possibly-missing-attribute]
+
+def write_dynamic_class(value: Intersection[type[Partial], type[DynamicBase]]) -> None:
+    value.field = 1  # error: [possibly-missing-attribute]
+
+def write_dynamic_required(value: Intersection[Partial, DynamicRequired]) -> None:
+    value.field = 1  # no diagnostic
+
+T = TypeVar("T", bound=Any)
+
+def write_dynamic_typevar(value: Intersection[Partial, T]) -> None:
+    value.field = 1  # error: [possibly-missing-attribute]
+
+def write_dynamic_type(value: Intersection[type[Partial], type[Any]]) -> None:
+    value.field = 1  # error: [possibly-missing-attribute]
+```
+
+## Possibly-missing attributes with dynamic lookup
+
+Dynamic getters can supply a value for a read without declaring a member that receives writes. An
+intersection with another type that also lacks the member preserves the write diagnostic:
+
+```py
+from ty_extensions import Intersection
+
+def condition() -> bool:
+    return bool(input())
+
+class Partial:
+    if condition():
+        field = 1
+
+    def __getattribute__(self, name: str) -> int:
+        return 1
+
+class Tag:
+    tag = 1
+
+def read(value: Intersection[Partial, Tag]) -> int:
+    return value.field  # no diagnostic
+
+def write(value: Intersection[Partial, Tag]) -> None:
+    value.field = 1  # error: [possibly-missing-attribute]
+```
+
+The same applies to a fallback `__getattr__`:
+
+```py
+class PartialFallback:
+    if condition():
+        field = 1
+
+    def __getattr__(self, name: str) -> int:
+        return 1
+
+def write_fallback(value: Intersection[PartialFallback, Tag]) -> None:
+    value.field = 1  # error: [possibly-missing-attribute]
+```
+
 ## Data descriptors
 
 When assigning to a data descriptor attribute, we implicitly call the descriptor's `__set__` method.

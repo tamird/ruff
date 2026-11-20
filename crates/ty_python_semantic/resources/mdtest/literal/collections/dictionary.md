@@ -139,6 +139,48 @@ dictionary["b"] = 2  # ok
 reveal_type(method())  # revealed: dict_values[str, int]
 ```
 
+## Conditional dictionary contents
+
+Dictionary contents reflect both arms of a conditional expression. A subsequent union preserves
+unrelated entries and accounts for conditional overwrites.
+
+```py
+def conditional_contents(flag: bool):
+    extra = {"left": 1} if flag else {"right": 2}
+    values = {"stable": "known"} | extra
+    reveal_type(values["stable"])  # revealed: Literal["known"]
+
+    overwrite = {"stable": 1} if flag else {"right": 2}
+    replaced = {"stable": "known"} | overwrite
+    reveal_type(replaced["stable"])  # revealed: Literal["known", 1]
+
+    certain = {"stable": "known"} if True else {"stable": 1}
+    reveal_type(certain["stable"])  # revealed: Literal["known"]
+
+def opaque() -> dict[str, int | str]:
+    raise NotImplementedError
+
+def unknown_override(flag: bool):
+    extra = {"other": 1} if flag else opaque()
+    values = {"stable": "known"} | extra
+    reveal_type(values["stable"])  # revealed: str | int
+
+def conditional_alias(flag: bool):
+    original: dict[str, int | str] = {"value": 1}
+    selected = original if flag else {"value": 2}
+    original["value"] = "changed"
+    reveal_type(selected["value"])  # revealed: int | str
+
+def consume(*, tags: list[str] | None = None, enabled: bool = False) -> None: ...
+def required(*, tags: list[str]) -> None: ...
+def conditional_keywords(flag: bool):
+    options = {"tags": ["manual"]}
+    consume(**(options if flag else {}))  # no diagnostic
+    invalid = {"enabled": ["manual"]}
+    consume(**(invalid if flag else {}))  # error: [invalid-argument-type]
+    required(**({} if flag else {}))  # error: [missing-argument]
+```
+
 ## Key narrowing
 
 The original assignment to each key, as well as future assignments, are used to narrow access to
@@ -224,6 +266,106 @@ d = {"keep": 1, **{**{"outer": {"current": 2}}}, "outer": {"last": "value"}}
 reveal_type(d["keep"])  # revealed: Literal[1]
 reveal_type(d["outer"]["last"])  # revealed: Literal["value"]
 reveal_type(d["outer"]["current"])  # revealed: str
+```
+
+## Dictionary constructor keys
+
+Explicit keywords in a `dict` constructor establish observed key values. These observations narrow
+subscripts and arguments unpacked into a call, just as dictionary literals do.
+
+Explicit key assignments and rebinding update the observations. As with dictionary literals,
+mutations through aliases or methods such as `clear` may leave earlier observations in place.
+
+```py
+def consume(tags: list[str], testonly: bool): ...
+
+options = dict(tags=["example"], testonly=True)
+reveal_type(options["tags"])  # revealed: list[str]
+reveal_type(options["testonly"])  # revealed: Literal[True]
+consume(**options)
+
+options["testonly"] = False
+reveal_type(options["testonly"])  # revealed: Literal[False]
+consume(**options)
+
+options = dict(tags=["replacement"], testonly=False)
+reveal_type(options["testonly"])  # revealed: Literal[False]
+consume(**options)
+
+options = {}
+reveal_type(options["testonly"])  # revealed: Unknown
+```
+
+## Dictionary constructor identity
+
+The callee must resolve to the builtin dictionary class. Other definitions named `dict` can
+transform their arguments, including nested dictionaries.
+
+```py
+from builtins import dict as Dictionary
+
+def dict(**values: object) -> Dictionary[str, Dictionary[str, int]]:
+    return {"inner": {"a": 1}}
+
+values = dict(inner={"a": "input"})
+reveal_type(values["inner"])  # revealed: dict[str, int]
+reveal_type(values["inner"]["a"])  # revealed: int
+```
+
+A class with the same name also uses its own subscript behavior.
+
+```py
+class dict:
+    def __init__(self, **values: object): ...
+    def __getitem__(self, key: str) -> int:
+        return 1
+
+values = dict(a="input")
+reveal_type(values["a"])  # revealed: int
+```
+
+## Dictionary constructor argument forms
+
+Positional inputs and keyword unpacking use the dictionary's inferred value type for key access.
+
+```py
+positional = dict({"a": 1}, b="value")
+reveal_type(positional["a"])  # revealed: int | str
+
+unpacked = dict(a=1, **{"b": "value"})
+reveal_type(unpacked["a"])  # revealed: int | str
+```
+
+## Rejected dictionary constructor assignments
+
+Key observations are discarded when an assignment is incompatible with its declared type.
+
+```py
+def f(values: dict[str, int]):
+    values = dict(a="bad")  # error: [invalid-assignment]
+    reveal_type(values["a"])  # revealed: int
+
+values: dict[str, int] = dict(a="bad")  # error: [invalid-assignment]
+reveal_type(values["a"])  # revealed: int
+```
+
+## Dictionary constructors assigned through setters
+
+A setter may transform the assigned dictionary. Subsequent key reads use the getter's value type.
+
+```py
+class Normalizing:
+    @property
+    def values(self) -> dict[str, int]:
+        return {}
+
+    @values.setter
+    def values(self, value: dict[str, str]) -> None:
+        pass
+
+def f(normalizing: Normalizing):
+    normalizing.values = dict(a="input")
+    reveal_type(normalizing.values["a"])  # revealed: int
 ```
 
 ## Dict unpacking in function calls

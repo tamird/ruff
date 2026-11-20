@@ -14,7 +14,7 @@ use crate::types::constraints::variables::{
     TypeVarRangeBound,
 };
 use crate::types::constraints::{
-    ALWAYS_FALSE, AtomicConstraintId, ConstraintSetBuilder, ConstraintSetStorage, Node,
+    ALWAYS_FALSE, AtomicConstraintId, Constraint, ConstraintSetBuilder, ConstraintSetStorage, Node,
     OwnedConstraintSet,
 };
 use crate::types::generics::AliasPolicy;
@@ -73,7 +73,7 @@ struct SequentMapBuilder<'db> {
     sequents: Vec<SequentGroup<'db>>,
     /// Pending sequents that have not yet been added to [`sequents`][Self::sequents]. This is only
     /// used during construction, and will be empty in a finalized sequent map.
-    pending: Vec<Sequent<InternedSequentConstraint<'db>>>,
+    pending: Vec<CachedSequent<'db>>,
 }
 
 /// A batch of sequents, along with information about the order they need to be imported into a
@@ -94,7 +94,7 @@ struct SequentMapBuilder<'db> {
 /// to import first, based on its builder's local typevar ordering.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(super) enum SequentGroup<'db> {
-    Ungrouped(Box<[Sequent<InternedSequentConstraint<'db>>]>),
+    Ungrouped(Box<[CachedSequent<'db>]>),
     // Grouped sequents are uncommon; keeping their extra metadata out of line makes the common
     // ungrouped entries smaller.
     Grouped(Box<GroupedSequents<'db>>),
@@ -103,14 +103,17 @@ pub(super) enum SequentGroup<'db> {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(super) struct GroupedSequents<'db> {
     pub(super) equivalence: TypeVarEquivalenceBound<'db>,
-    pub(super) leftwards: Box<[Sequent<InternedSequentConstraint<'db>>]>,
-    pub(super) rightwards: Box<[Sequent<InternedSequentConstraint<'db>>]>,
+    pub(super) leftwards: Box<[CachedSequent<'db>]>,
+    pub(super) rightwards: Box<[CachedSequent<'db>]>,
 }
+
+pub(super) type CachedSequent<'db> =
+    Sequent<InternedSequentConstraint<'db>, (), (OwnedConstraintSet<'db>, ConstraintProvenance)>;
 
 /// Describes one rule for deriving new implicit constraints from existing constraints in a BDD
 /// path. Fuel costs are filled in when cached sequents are imported into a builder.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
-pub(super) enum Sequent<C, FuelCost = ()> {
+pub(super) enum Sequent<C, FuelCost = (), Relation = ()> {
     /// Sequent of the form `¬C → false`
     ///
     /// This indicates that `C` is always true. Any path that assumes it is false is impossible and
@@ -122,6 +125,10 @@ pub(super) enum Sequent<C, FuelCost = ()> {
     /// This indicates that `C₁` and `C₂` are disjoint: it is not possible for both to hold. Any
     /// path that assumes both is impossible and can be pruned.
     PairImpossibility { ante1: C, ante2: C },
+
+    /// `C₁` and `C₂` have the same truth value but different inference provenance.
+    /// Opposite assignments conflict; neither atom supplies evidence for the other.
+    PairEquivalence { left: C, right: C },
 
     /// Sequent of the form `C₁ ∧ C₂ ∧ C₃ → false`
     ///
@@ -152,6 +159,13 @@ pub(super) enum Sequent<C, FuelCost = ()> {
         is_substitution: bool,
         fuel_cost: FuelCost,
     },
+    /// A consequence whose quantified variables must remain scoped together.
+    PairRelation {
+        ante1: C,
+        ante2: C,
+        post: Relation,
+        fuel_cost: FuelCost,
+    },
 }
 
 impl<'db> SequentMap<'db> {
@@ -176,6 +190,32 @@ impl<'db> SequentMap<'db> {
             for sequent in self.all_sequents() {
                 match sequent {
                     Sequent::SingleTautology { .. } => {}
+                    Sequent::PairEquivalence { left, right } => {
+                        maybe_write_prefix(f)?;
+                        write!(
+                            f,
+                            "{} ⇔ {}",
+                            left.constraint(db).display(db, env, Some(true)),
+                            right.constraint(db).display(db, env, Some(true))
+                        )?;
+                    }
+                    Sequent::PairRelation {
+                        ante1,
+                        ante2,
+                        post: (post, _),
+                        fuel_cost: (),
+                    } => {
+                        maybe_write_prefix(f)?;
+                        post.query(|_, when| {
+                            write!(
+                                f,
+                                "{} ∧ {} → {}",
+                                ante1.constraint(db).display(db, env, Some(true)),
+                                ante2.constraint(db).display(db, env, Some(true)),
+                                when.display(db, env)
+                            )
+                        })?;
+                    }
 
                     Sequent::PairImpossibility { ante1, ante2 } => {
                         maybe_write_prefix(f)?;
@@ -234,9 +274,9 @@ impl<'db> SequentMap<'db> {
         })
     }
 
-    fn all_sequents(&self) -> impl Iterator<Item = Sequent<InternedSequentConstraint<'db>>> + '_ {
+    fn all_sequents(&self) -> impl Iterator<Item = CachedSequent<'db>> {
         self.sequents.iter().flat_map(|group| match group {
-            SequentGroup::Ungrouped(ungrouped) => Either::Left(ungrouped.iter().copied()),
+            SequentGroup::Ungrouped(ungrouped) => Either::Left(ungrouped.iter().cloned()),
             SequentGroup::Grouped(grouped) => {
                 let GroupedSequents {
                     leftwards,
@@ -244,8 +284,8 @@ impl<'db> SequentMap<'db> {
                     ..
                 } = grouped.as_ref();
                 Either::Right(std::iter::chain(
-                    leftwards.iter().copied(),
-                    rightwards.iter().copied(),
+                    leftwards.iter().cloned(),
+                    rightwards.iter().cloned(),
                 ))
             }
         })
@@ -261,7 +301,7 @@ impl<'db> SequentMapBuilder<'db> {
         }
     }
 
-    fn extract_pending(&mut self) -> Box<[Sequent<InternedSequentConstraint<'db>>]> {
+    fn extract_pending(&mut self) -> Box<[CachedSequent<'db>]> {
         self.pending.drain(..).collect()
     }
 
@@ -492,12 +532,21 @@ impl<'db> SequentMap<'db> {
             let right = right.constraint(db);
             tracing::trace!(
                 target: "ty_python_semantic::types::constraints::SequentMap",
-                left = %left.display(db, env, Some(true)),
-                right = %right.display(db, env, Some(true)),
+                left = %left.constraint(db).display(db, env, Some(true)),
+                right = %right.constraint(db).display(db, env, Some(true)),
                 "add sequents for constraint pair",
             );
             let mut map = SequentMapBuilder::new(db);
-            left.add_sequents_with(db, env, &mut map, right);
+            if left.with_provenance(right.provenance()) == right {
+                // A declaration restricts the same specializations as matching call-site evidence,
+                // but deriving the evidence atom would change inference choices.
+                map.pending.push(Sequent::PairEquivalence {
+                    left: InternedSequentConstraint::new(db, left),
+                    right: InternedSequentConstraint::new(db, right),
+                });
+            } else {
+                left.add_sequents_with(db, env, &mut map, right);
+            }
             map.finish()
         }
 
@@ -533,12 +582,26 @@ impl ReplacementSource {
 }
 
 impl<'db> AtomicConstraint<'db> {
+    /// A sufficient test for truth without assumptions about other constraints.
+    pub(super) fn is_intrinsically_true(self, db: &'db dyn Db) -> bool {
+        match self {
+            Self::ConcreteLower(bound) => bound.bound == bound.typevar.domain(db).bottom(db),
+            Self::ConcreteUpper(bound) => bound.bound == bound.typevar.domain(db).top(db),
+            Self::ConcreteEquivalence(_) => false,
+            Self::TypeVarRange(bound) => bound.left.is_same_typevar_as(db, bound.right),
+            Self::TypeVarEquivalence(bound) => bound.left.is_same_typevar_as(db, bound.right),
+        }
+    }
+
     fn add_sequents(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         map: &mut SequentMapBuilder<'db>,
     ) {
+        if self.is_intrinsically_true(db) {
+            map.add_single_tautology(self);
+        }
         match self {
             AtomicConstraint::ConcreteLower(this) => this.add_sequents(db, env, map),
             AtomicConstraint::ConcreteUpper(this) => this.add_sequents(db, env, map),
@@ -770,6 +833,22 @@ impl<'db> AtomicConstraint<'db> {
         upper_constraint: Self,
         when: &OwnedConstraintSet<'db>,
     ) {
+        // A quantified consequence is one relation: splitting its body into atomic
+        // sequents would lose the shared witness and its scope.
+        if when.inner.as_ref().is_some_and(|inner| {
+            inner
+                .constraints
+                .iter()
+                .any(|constraint| matches!(constraint, Constraint::Existential(_)))
+        }) {
+            map.pending.push(Sequent::PairRelation {
+                ante1: InternedSequentConstraint::new(map.db, lower_constraint),
+                ante2: InternedSequentConstraint::new(map.db, upper_constraint),
+                post: (when.clone(), provenance),
+                fuel_cost: (),
+            });
+            return;
+        }
         when.query(|builder, when| {
             // If the relation _never_ holds, these constraints are contradictory.
             if when.is_trivially_never_satisfied() {
@@ -1434,11 +1513,6 @@ impl<'db> ConcreteLowerBound<'db> {
         _env: &ProgramEnvironment<'db>,
         map: &mut SequentMapBuilder<'db>,
     ) {
-        // `⊥ ≤ T` is always true
-        if self.bound == self.typevar.domain(db).bottom(db) {
-            map.add_single_tautology(self.into());
-        }
-
         // `⊤ ≤ T` implies `T = ⊤`
         if self.bound == self.typevar.domain(db).top(db) {
             // The implied upper bound comes from the type variable's domain, not inference evidence.
@@ -1670,11 +1744,6 @@ impl<'db> ConcreteUpperBound<'db> {
         env: &ProgramEnvironment<'db>,
         map: &mut SequentMapBuilder<'db>,
     ) {
-        // `T ≤ ⊤` is always true
-        if self.bound == self.typevar.domain(db).top(db) {
-            map.add_single_tautology(self.into());
-        }
-
         // `T ≤ ⊥` implies `T = ⊥`
         if self.bound == self.typevar.domain(db).bottom(db) {
             // The implied lower bound comes from the type variable's domain, not inference evidence.

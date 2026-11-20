@@ -3933,6 +3933,84 @@ def _(a_and_b: Intersection[A, B]):
     reveal_type(a_and_b.x)  # revealed: P & Q
 ```
 
+### Declared attributes take precedence over `__getattr__`
+
+A definite attribute on one intersection element takes precedence over another element's
+`__getattr__`, just as it does on a class inheriting both elements. Missing and possibly missing
+attributes still use the fallback.
+
+```py
+from ty_extensions import Intersection
+
+class Fallback:
+    def __getattr__(self, name: str) -> str:
+        return "fallback"
+
+class Named:
+    value: int = 1
+
+class Both(Fallback, Named): ...
+
+reveal_type(Both().value)  # revealed: int
+reveal_type(Both().missing)  # revealed: str
+
+def declared(left: Intersection[Fallback, Named]):
+    reveal_type(left.missing)  # revealed: str
+    reveal_type(left.value)  # revealed: int
+
+def reversed_elements(right: Intersection[Named, Fallback]):
+    reveal_type(right.missing)  # revealed: str
+    reveal_type(right.value)  # revealed: int
+
+def flag() -> bool:
+    return True
+
+class PossiblyNamed:
+    if flag():
+        value: bytes = b"value"
+
+def possibly_missing(value: Intersection[Fallback, PossiblyNamed]):
+    reveal_type(value.value)  # revealed: bytes | str
+```
+
+### Implicit methods do not use intersection fallbacks
+
+Explicit attribute access can use `__getattr__`, but Python bypasses it for implicit special
+methods.
+
+```py
+from typing import Callable
+from ty_extensions import Intersection
+
+class Fallback:
+    def __getattr__(self, name: str) -> Callable[[], int]:
+        return lambda: 1
+
+class Marker: ...
+
+def use(value: Intersection[Fallback, Marker]):
+    reveal_type(value.__neg__())  # revealed: int
+    -value  # error: [unsupported-operator]
+```
+
+### Fallback methods bind to the full intersection
+
+```py
+from typing_extensions import Self
+from ty_extensions import Intersection
+
+class Fallback:
+    def __getattr__(self, name: str) -> Self:
+        return self
+
+class Named:
+    value: int = 1
+
+def read(value: Intersection[Fallback, Named]):
+    reveal_type(value.missing)  # revealed: Fallback & Named
+    reveal_type(value.missing.value)  # revealed: int
+```
+
 ## Attribute access on `Any`
 
 The union of the set of types that `Any` could materialise to is equivalent to `object`. It follows
@@ -4971,6 +5049,41 @@ def recursive_class(value: Recursive):
     reveal_type(type(value))  # revealed: type[int | type]
 ```
 
+## Custom object declarations control synthetic class attributes
+
+The precise `__class__` projection requires that attribute in the canonical `object` declaration. A
+supplied builtins module can omit that guarantee while retaining explicitly declared fields.
+
+```toml
+[environment]
+typeshed = "/typeshed"
+```
+
+`/typeshed/stdlib/builtins.pyi`:
+
+```pyi
+class object: ...
+class int: ...
+```
+
+`/typeshed/stdlib/typing_extensions.pyi`:
+
+```pyi
+def reveal_type(obj, /): ...
+```
+
+```py
+class Plain: ...
+
+class HasClass:
+    __class__: int
+
+def check(plain: Plain, explicit: HasClass, value: object):
+    plain.__class__  # error: [missing-attribute]
+    reveal_type(value.__class__)  # revealed: Unknown
+    reveal_type(explicit.__class__)  # revealed: int
+```
+
 ## Module attributes
 
 ### Basic
@@ -5912,6 +6025,135 @@ error[missing-attribute]: Object of type `(...) -> Any` has no attribute `__anno
   |     ^^^^^^^^^^^^^^
 help: Function objects have an `__annotate__` attribute, but not all callable objects are functions
 help: See this FAQ for more information: <https://docs.astral.sh/ty/reference/typing-faq/#why-does-ty-say-callable-has-no-attribute-__name__>
+```
+
+## Typing-only operations do not provide runtime attributes
+
+A typing-only method can describe an implicit operation. Ordinary attribute and method contracts
+still require a member that is available at runtime.
+
+`operations.pyi`:
+
+```pyi
+from typing import TYPE_CHECKING, ClassVar, Protocol, type_check_only
+
+class Native:
+    @type_check_only
+    def helper(self) -> int: ...
+    @type_check_only
+    def __getitem__(self, key: int) -> int: ...
+    if TYPE_CHECKING:
+        marker: ClassVar[None]
+
+class Operation(Protocol):
+    @type_check_only
+    def __getitem__(self, key: int) -> int: ...
+
+class Helpers:
+    @type_check_only
+    class Annotation: ...
+
+flag: bool
+
+class Conditional:
+    if flag:
+        @type_check_only
+        def helper(self) -> int: ...
+
+    else:
+        @type_check_only
+        def helper(self) -> str: ...
+
+class Mixed:
+    if flag:
+        @type_check_only
+        def helper(self) -> int: ...
+
+    else:
+        def helper(self) -> str: ...
+
+class Guarded:
+    if TYPE_CHECKING:
+        marker: ClassVar[int]
+        marker = 1
+
+class Real(Native):
+    def helper(self) -> int: ...
+
+class GuardedAnnotation:
+    if TYPE_CHECKING:
+        marker: ClassVar[int]
+    marker = 1
+```
+
+`main.py`:
+
+```py
+from inspect import getattr_static
+from typing import Callable, Protocol
+from operations import Conditional, Guarded, GuardedAnnotation, Helpers, Mixed, Native, Operation, Real
+
+class Method(Protocol):
+    def __getitem__(self, key: int) -> int: ...
+
+class Field(Protocol):
+    @property
+    def helper(self) -> object: ...
+
+class Marker(Protocol):
+    @property
+    def marker(self) -> object: ...
+
+def method(value: Method) -> None: ...
+def field(value: Field) -> None: ...
+def marker(value: Marker) -> None: ...
+def operation(value: Operation) -> None: ...
+def annotation(value: Helpers.Annotation) -> None: ...
+def check(value: Native, abstract: Operation):
+    value.helper  # error: [missing-attribute]
+    value.__getitem__  # error: [missing-attribute]
+    value.marker  # error: [missing-attribute]
+    reveal_type(value[0])  # revealed: int
+    method(value)  # error: [invalid-argument-type]
+    field(value)  # error: [invalid-argument-type]
+    marker(value)  # error: [invalid-argument-type]
+    operation(value)
+    abstract.__getitem__  # error: [missing-attribute]
+    reveal_type(abstract[0])  # revealed: int
+    reveal_type(getattr_static(value, "helper", None))  # revealed: None
+    reveal_type(getattr_static(abstract, "__getitem__", None))  # revealed: None
+
+def conditional(value: Conditional, mixed: Mixed, guarded: Guarded, real: Real):
+    value.helper  # error: [missing-attribute]
+    mixed.helper  # error: [possibly-missing-attribute]
+    field(value)  # error: [invalid-argument-type]
+    field(mixed)  # error: [invalid-argument-type]
+    marker(guarded)  # error: [invalid-argument-type]
+    field(real)
+
+def defined(value: GuardedAnnotation):
+    marker(value)
+    reveal_type(value.marker)  # revealed: int
+
+class Callback(Protocol):
+    def __call__(self, value: int) -> int: ...
+
+def callback(value: Callback):
+    reveal_type(value.__call__(1))  # revealed: int
+
+def function(value: int) -> int:
+    return value
+
+class PythonMethod:
+    def method(self, value: int) -> int:
+        return value
+
+def ordinary_calls(value: Callable[[int], int], instance: PythonMethod):
+    reveal_type(value.__call__(1))  # revealed: int
+    reveal_type(function.__call__(1))  # revealed: int
+    reveal_type(instance.method.__call__(1))  # revealed: int
+
+reveal_type("value".__len__())  # revealed: Literal[5]
 ```
 
 ## References

@@ -1,7 +1,7 @@
 use std::{fmt, vec};
 use ty_python_semantic::ProgramEnvironment;
 
-use crate::{Db, FxIndexMap, HasNavigationTargets, NavigationTarget};
+use crate::{ FxIndexMap, HasNavigationTargets, NavigationTarget};
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::token::{Tokens, parenthesized_range};
 use ruff_python_ast::visitor::source_order::{self, SourceOrderVisitor, TraversalSignal};
@@ -18,7 +18,7 @@ use ty_python_semantic::types::ide_support::{
     inlay_hint_call_argument_details, inlay_hint_return_type,
 };
 use ty_python_semantic::types::{Type, TypeDetail, TypeDisplayDetails, is_valid_annotation_target};
-use ty_python_semantic::{HasType, SemanticModel};
+use ty_python_semantic::{Db, HasType, SemanticModel};
 
 #[derive(Debug, Clone)]
 pub struct InlayHint {
@@ -69,7 +69,8 @@ impl InlayHint {
     ) -> Self {
         let InlayHintImportContext { db, file, importer } = context;
         let env = ProgramEnvironment::from_file(file);
-        let mut dynamic_importer = DynamicImporter::new(importer, scope_node);
+        allow_edits &= importer.is_some();
+        let mut dynamic_importer = importer.map(|importer| DynamicImporter::new(importer, scope_node));
 
         // Ok so the idea here is that we potentially have a random soup of spans here,
         // and each byte of the string can have at most one target associate with it.
@@ -151,7 +152,9 @@ impl InlayHint {
                     // Ok, this is the first type that claimed these bytes, give it the target
                     if start >= offset {
                         // Try to import the symbol and update the edit label if required
-                        if let Some(qualified_name) = qualified_name(&mut dynamic_importer) {
+                        if let Some(qualified_name) =
+                            dynamic_importer.as_mut().and_then(&mut qualified_name)
+                        {
                             let edit_start = (start.cast_signed() + edit_offset).cast_unsigned();
                             let edit_end = (end.cast_signed() + edit_offset).cast_unsigned();
 
@@ -188,7 +191,9 @@ impl InlayHint {
                 new_text: format!("{prefix}{edit_label}"),
             }];
 
-            text_edits.extend(dynamic_importer.text_edits());
+            if let Some(dynamic_importer) = dynamic_importer {
+                text_edits.extend(dynamic_importer.text_edits());
+            }
 
             text_edits
         } else {
@@ -366,11 +371,43 @@ pub fn inlay_hints(
     range: TextRange,
     settings: &InlayHintSettings,
 ) -> Vec<InlayHint> {
+    let model = SemanticModel::new(db, file);
+    collect_inlay_hints(&model, range, settings, true)
+}
+
+/// Produces display hints and navigation targets for a semantic model.
+///
+/// The model must describe its canonical source file, as constructed by
+/// [`SemanticModel::new`].
+///
+/// The caller supplies any source edits appropriate for its language. The
+/// Python [`inlay_hints`] entry point also generates annotation and import edits.
+pub fn inlay_hints_for_model(
+    model: &SemanticModel<'_>,
+    range: TextRange,
+    settings: &InlayHintSettings,
+) -> Vec<InlayHint> {
+    collect_inlay_hints(model, range, settings, false)
+}
+
+fn collect_inlay_hints(
+    model: &SemanticModel<'_>,
+    range: TextRange,
+    settings: &InlayHintSettings,
+    generate_edits: bool,
+) -> Vec<InlayHint> {
+    let db = model.db();
+    let file = model.program_file();
     let ast = parsed_module(db, file.python_file(db)).load(db);
-    let mut visitor = InlayHintVisitor::new(db, file, &ast, range, settings);
+    let importer = generate_edits.then(|| Importer::new(db, file, &ast));
+
+    let mut visitor = InlayHintVisitor::new(model, importer, &ast, range, settings);
 
     visitor.visit_body(ast.suite());
 
+    visitor
+        .hints
+        .retain(|hint| range.contains_inclusive(hint.position));
     visitor.hints
 }
 
@@ -420,13 +457,13 @@ impl Default for InlayHintSettings {
 struct InlayHintImportContext<'a, 'db> {
     db: &'db dyn Db,
     file: ProgramFile<'db>,
-    importer: &'a Importer<'db>,
+    importer: Option<&'a Importer<'db>>,
 }
 
 struct InlayHintVisitor<'a, 'db> {
     db: &'db dyn Db,
-    model: SemanticModel<'db>,
-    importer: Importer<'db>,
+    model: &'db SemanticModel<'db>,
+    importer: Option<Importer<'db>>,
     tokens: &'db Tokens,
     hints: Vec<InlayHint>,
     pending_return_hint: Option<(&'a Parameters, InlayHint)>,
@@ -437,16 +474,16 @@ struct InlayHintVisitor<'a, 'db> {
 
 impl<'a, 'db> InlayHintVisitor<'a, 'db> {
     fn new(
-        db: &'db dyn Db,
-        file: ProgramFile<'db>,
+        model: &'db SemanticModel<'db>,
+        importer: Option<Importer<'db>>,
         ast: &'db ParsedModuleRef,
         range: TextRange,
         settings: &'a InlayHintSettings,
     ) -> Self {
         Self {
-            db,
-            model: SemanticModel::new(db, file),
-            importer: Importer::new(db, file, ast),
+            db: model.db(),
+            model,
+            importer,
             tokens: ast.tokens(),
             hints: Vec::new(),
             pending_return_hint: None,
@@ -463,14 +500,18 @@ impl<'a, 'db> InlayHintVisitor<'a, 'db> {
         if !self.settings.variable_types || is_ignored_variable_assignment_target(expr) {
             return;
         }
-        let Some(ty) = expr.inferred_type(&self.model) else {
+        // Excluded hints must not reserve imports needed by hints inside the range.
+        if !self.range.contains_inclusive(expr.end()) {
+            return;
+        }
+        let Some(ty) = expr.inferred_type(self.model) else {
             return;
         };
 
         let context = InlayHintImportContext {
             db: self.db,
             file: self.model.program_file(),
-            importer: &self.importer,
+            importer: self.importer.as_ref(),
         };
 
         if let Some(inlay_hint) =
@@ -497,7 +538,11 @@ impl<'a, 'db> InlayHintVisitor<'a, 'db> {
         let mut inlay_hint = InlayHint::call_argument_name(range.start(), name, navigation_target);
         match mode {
             ArgumentHintMode::DisplayOnly => {}
-            ArgumentHintMode::Insertable => inlay_hint.enable_call_argument_edit(argument),
+            ArgumentHintMode::Insertable => {
+                if self.importer.is_some() {
+                    inlay_hint.enable_call_argument_edit(argument);
+                }
+            }
         }
 
         self.hints.push(inlay_hint);
@@ -516,6 +561,13 @@ impl<'a> SourceOrderVisitor<'a> for InlayHintVisitor<'a, '_> {
     }
 
     fn enter_node(&mut self, node: AnyNodeRef<'a>) -> TraversalSignal {
+        if node.is_statement()
+            && ty_python_core::semantic_index(self.db, self.model.program_file())
+                .is_excluded(node.range())
+        {
+            return TraversalSignal::Skip;
+        }
+
         if self.range.intersect(node.range()).is_some() {
             TraversalSignal::Traverse
         } else {
@@ -585,8 +637,8 @@ impl<'a> SourceOrderVisitor<'a> for InlayHintVisitor<'a, '_> {
                 source_order::walk_expr(self, expr);
             }
             Expr::Call(call) => {
-                let details = inlay_hint_call_argument_details(self.db, &self.model, call)
-                    .unwrap_or_default();
+                let details =
+                    inlay_hint_call_argument_details(self.db, self.model, call).unwrap_or_default();
 
                 self.visit_expr(&call.func);
 
@@ -1506,6 +1558,83 @@ Source with applied edits:
         {
             source.replace_range(edit.range.to_std_range(), &edit.new_text);
         }
+    }
+
+    #[test]
+    fn model_hints_share_labels_without_source_edits() {
+        let test = inlay_hint_test(
+            "def identity(value: int) -> int:\n    return value\nresult = identity(1)\n",
+        );
+        let file = ProgramFile::new(
+            &test.db,
+            test.file,
+            test.db.program_environment().program(&test.db),
+        );
+        let settings = InlayHintSettings::default();
+        let model = SemanticModel::new(&test.db, file);
+        let hints = inlay_hints_for_model(&model, test.range, &settings);
+        let editable_hints = inlay_hints(&test.db, file, test.range, &settings);
+
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints.len(), editable_hints.len());
+        for (hint, editable_hint) in hints.iter().zip(&editable_hints) {
+            assert_eq!(hint.position, editable_hint.position);
+            assert_eq!(
+                hint.display().to_string(),
+                editable_hint.display().to_string()
+            );
+            assert!(hint.text_edits.is_empty());
+            assert!(!editable_hint.text_edits.is_empty());
+            for (part, editable_part) in hint.label.parts().iter().zip(editable_hint.label.parts())
+            {
+                assert_eq!(part.target(), editable_part.target());
+            }
+        }
+    }
+
+    #[test]
+    fn hint_positions_stay_within_the_requested_range() {
+        let test = inlay_hint_test(
+            "def combine(first: int, second: int) -> int:\n    return first\nresult = combine(1, <START>2<END>)\n",
+        );
+        let file = ProgramFile::new(
+            &test.db,
+            test.file,
+            test.db.program_environment().program(&test.db),
+        );
+        let settings = InlayHintSettings::default();
+        let model = SemanticModel::new(&test.db, file);
+
+        for hints in [
+            inlay_hints(&test.db, file, test.range, &settings),
+            inlay_hints_for_model(&model, test.range, &settings),
+        ] {
+            assert_eq!(hints.len(), 1);
+            assert_eq!(hints[0].position, test.range.start());
+            assert_eq!(hints[0].display().to_string(), "second=");
+        }
+    }
+
+    #[test]
+    fn out_of_range_hints_do_not_reserve_imports() {
+        let mut test = inlay_hint_test(
+            "from other import make\nfirst = <START>make()\nsecond = make()<END>\n",
+        );
+        test.with_extra_file("other.py", "class Item: pass\ndef make() -> Item: ...\n");
+        let file = ProgramFile::new(
+            &test.db,
+            test.file,
+            test.db.program_environment().program(&test.db),
+        );
+        let hints = inlay_hints(&test.db, file, test.range, &InlayHintSettings::default());
+
+        assert_eq!(hints.len(), 1);
+        let hint = &hints[0];
+        assert!(
+            hint.text_edits.iter().any(|edit| {
+                edit.range.start() < hint.position && edit.new_text.contains("Item")
+            })
+        );
     }
 
     #[test]

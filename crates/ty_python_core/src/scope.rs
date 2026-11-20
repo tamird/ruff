@@ -96,7 +96,7 @@ impl<'db> ScopeId<'db> {
 
 /// ID that uniquely identifies a scope inside of a module.
 #[newtype_index]
-#[derive(Ord, PartialOrd, get_size2::GetSize)]
+#[derive(Ord, PartialOrd, get_size2::GetSize, salsa::SalsaValue)]
 pub struct FileScopeId;
 
 impl FileScopeId {

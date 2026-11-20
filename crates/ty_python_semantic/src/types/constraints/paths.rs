@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::ops::{ControlFlow, Range};
+use std::ops::Range;
 
 use indexmap::map::Entry;
 use itertools::Itertools;
@@ -11,18 +11,19 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use ruff_index::{IndexVec, newtype_index};
 
-use crate::types::constraints::sequents::{
-    GroupedSequents, InternedSequentConstraint, Sequent, SequentGroup, SequentMap,
-};
+use crate::types::constraints::sequents::{CachedSequent, GroupedSequents, Sequent, SequentGroup, SequentMap};
+use crate::types::constraints::support::Support;
 use crate::types::constraints::variables::AtomicConstraint::{
     ConcreteEquivalence, ConcreteLower, ConcreteUpper, TypeVarEquivalence, TypeVarRange,
 };
 use crate::types::constraints::variables::{AtomicConstraint, UnspecializedTypeVarPolicy};
 use crate::types::constraints::{
-    Assignment, AtomicConstraintId, ConstraintSetStorage, Node, NodeId, PathVisitor, SourceOrderId,
+    Assignment, AtomicConstraintId, ConstraintSetStorage, NodeId, SourceOrderId,
     TypeVarId,
 };
 use crate::{Db, FxIndexMap, FxIndexSet, ProgramEnvironment};
+
+type PathSequent = Sequent<AtomicConstraintId, u16, (NodeId, Option<SourceOrderId>)>;
 
 /// The position of an assignment in insertion order.
 #[newtype_index]
@@ -57,9 +58,14 @@ struct AssignmentIndex;
 #[derive(Debug)]
 pub(crate) struct PathAssignments {
     /// All of the rules that we know for inferring derived constraints on the current path.
-    sequents: Vec<Sequent<AtomicConstraintId, u16>>,
+    sequents: Vec<PathSequent>,
     /// The sequents that can fire when a particular assignment is added to the path.
-    sequent_antecedents: FxHashMap<Assignment<AtomicConstraintId>, Vec<usize>>,
+    sequent_triggers: FxHashMap<Assignment<AtomicConstraintId>, Vec<usize>>,
+    /// Whole relations activated by atomic antecedents on this path.
+    relations: FxIndexMap<usize, u16>,
+    visiting_relations: FxHashSet<usize>,
+    /// Atomic edges inside a derived relation continue the antecedents' fuel chain.
+    origin_fuel: AssignmentFuel,
     /// Each assignment's source constraint and greatest remaining per-path fuel.
     pub(super) assignments: FxIndexMap<Assignment<AtomicConstraintId>, (AtomicConstraintId, u16)>,
     /// Constraints that have been _replaced_ with other constraints on this path, because a
@@ -67,6 +73,8 @@ pub(crate) struct PathAssignments {
     substituted_constraints: FxIndexSet<AtomicConstraintId>,
     /// Substitutions awaiting admission of their replacement assignment.
     pending_substitutions: Vec<(AtomicConstraintId, AtomicConstraintId)>,
+    /// The typevars that are bound by a quantifier on this path.
+    pub(super) quantified_typevars: Support,
     /// Positions in `assignments`, cleared when their branch is left. Fuel stays in the map so
     /// replenishment and rollback do not need to update these indices.
     positive_assignment_indices: IndexVec<AtomicConstraintId, Option<AssignmentIndex>>,
@@ -82,11 +90,6 @@ pub(crate) struct PathAssignments {
     discovered: FxIndexMap<AtomicConstraintId, bool>,
     /// Constraint pairs that we have already checked and added to `sequents`.
     elaborated_pairs: FxHashSet<(AtomicConstraintId, AtomicConstraintId)>,
-
-    /// Consequents grouped by the discovery call that introduced their sequents.
-    single_replay_consequents: FxHashMap<AtomicConstraintId, Vec<AtomicConstraintId>>,
-    pair_replay_consequents:
-        FxHashMap<(AtomicConstraintId, AtomicConstraintId), Vec<AtomicConstraintId>>,
 
     /// Type variables that only involve concrete constraints and so do not participate in sequent
     /// discovery.
@@ -108,6 +111,7 @@ pub(super) struct PathSnapshot {
     substituted_constraints: usize,
     fuel_undo: usize,
     remaining_overall_fuel: u16,
+    relations: usize,
 }
 
 /// The total amount of fuel that we are willing to spend for this path traversal. This was
@@ -149,7 +153,7 @@ const PATH_FUEL_BUDGET: u16 = 8;
 
 /// The fuel cost of deriving a particular assignment during BDD path walking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AssignmentFuel {
+pub(super) struct AssignmentFuel {
     /// The amount of fuel consumed when deriving the assignment, or None if this assignment came
     /// directly from the BDD
     consumed: Option<u16>,
@@ -195,18 +199,20 @@ impl Default for PathAssignments {
     fn default() -> Self {
         Self {
             sequents: Vec::default(),
-            sequent_antecedents: FxHashMap::default(),
+            sequent_triggers: FxHashMap::default(),
+            relations: FxIndexMap::default(),
+            visiting_relations: FxHashSet::default(),
+            origin_fuel: AssignmentFuel::origin(),
             assignments: FxIndexMap::default(),
             substituted_constraints: FxIndexSet::default(),
             pending_substitutions: Vec::default(),
+            quantified_typevars: Support::default(),
             positive_assignment_indices: IndexVec::default(),
             negative_assignment_indices: IndexVec::default(),
             fuel_undo: Vec::default(),
             remaining_overall_fuel: OVERALL_FUEL_BUDGET,
             discovered: FxIndexMap::default(),
             elaborated_pairs: FxHashSet::default(),
-            single_replay_consequents: FxHashMap::default(),
-            pair_replay_consequents: FxHashMap::default(),
             independent_typevars: FxHashSet::default(),
             assignment_queue: VecDeque::default(),
             new_assignments: FxIndexMap::default(),
@@ -215,70 +221,6 @@ impl Default for PathAssignments {
 }
 
 impl PathAssignments {
-    /// Orders projected facts by replaying the rules already discovered during this walk.
-    ///
-    /// Projection emits derived facts in TDD branch order. Retaining that order can prevent
-    /// recursive relations from converging when an equivalent diagram is rebuilt in a different
-    /// arena. Start with the original source order and visit each rule's consequences in order,
-    /// including intermediate facts that are themselves projected away. This only replays cached
-    /// rules; it does not derive more facts or change the walk's assignments and fuel.
-    pub(super) fn projection_source_order(
-        &self,
-        storage: &mut ConstraintSetStorage<'_>,
-        original_source_order: Option<SourceOrderId>,
-        derived_source_order: Option<SourceOrderId>,
-    ) -> Option<SourceOrderId> {
-        let emitted = storage.calculate_source_orders(derived_source_order);
-        if emitted.is_empty() {
-            return None;
-        }
-        let mut ordered = storage.calculate_source_orders(original_source_order);
-        ordered.retain(|constraint| self.discovered.contains_key(constraint));
-        let mut index = 0;
-        // Once all emitted facts have positions, later appends cannot change their relative order.
-        while !emitted.is_subset(&ordered)
-            && let Some(constraint) = ordered.get_index(index).copied()
-        {
-            if self.discovered.get(&constraint) == Some(&true) {
-                if let Some(consequents) = self.single_replay_consequents.get(&constraint) {
-                    ordered.extend(
-                        consequents
-                            .iter()
-                            .copied()
-                            .filter(|constraint| self.discovered.contains_key(constraint)),
-                    );
-                }
-            }
-            for earlier_index in 0..index {
-                let earlier = ordered[earlier_index];
-                // Pair rules are not commutative. Replay the orientation used by this walk,
-                // which can differ from the order in which the replay reaches its inputs.
-                let pair = [(earlier, constraint), (constraint, earlier)]
-                    .into_iter()
-                    .find(|pair| self.elaborated_pairs.contains(pair));
-                if let Some(consequents) =
-                    pair.and_then(|pair| self.pair_replay_consequents.get(&pair))
-                {
-                    ordered.extend(
-                        consequents
-                            .iter()
-                            .copied()
-                            .filter(|constraint| self.discovered.contains_key(constraint)),
-                    );
-                }
-            }
-            index += 1;
-        }
-        debug_assert!(emitted.is_subset(&ordered));
-        ordered
-            .into_iter()
-            .filter(|constraint| emitted.contains(constraint))
-            .fold(None, |source_order, constraint| {
-                let next = storage.atomic_constraint_source_order(constraint);
-                storage.ordered_source_order(source_order, Some(next))
-            })
-    }
-
     pub(super) fn new(
         constraints: impl IntoIterator<Item = AtomicConstraintId>,
         independent_typevars: FxHashSet<TypeVarId>,
@@ -289,134 +231,23 @@ impl PathAssignments {
             .collect();
         Self {
             sequents: Vec::default(),
-            sequent_antecedents: FxHashMap::default(),
+            sequent_triggers: FxHashMap::default(),
+            relations: FxIndexMap::default(),
+            visiting_relations: FxHashSet::default(),
+            origin_fuel: AssignmentFuel::origin(),
             assignments: FxIndexMap::default(),
             substituted_constraints: FxIndexSet::default(),
             pending_substitutions: Vec::default(),
+            quantified_typevars: Support::default(),
             positive_assignment_indices: IndexVec::default(),
             negative_assignment_indices: IndexVec::default(),
             fuel_undo: Vec::default(),
             discovered,
             elaborated_pairs: FxHashSet::default(),
-            single_replay_consequents: FxHashMap::default(),
-            pair_replay_consequents: FxHashMap::default(),
             independent_typevars,
             remaining_overall_fuel: OVERALL_FUEL_BUDGET,
             assignment_queue: VecDeque::default(),
             new_assignments: FxIndexMap::default(),
-        }
-    }
-
-    pub(super) fn visit<'db, V>(
-        &mut self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        storage: &mut ConstraintSetStorage<'db>,
-        node: NodeId,
-        visitor: &mut V,
-    ) -> ControlFlow<V::Break, V::Result>
-    where
-        V: PathVisitor,
-    {
-        visitor.visit_node()?;
-        match node.node() {
-            Node::AlwaysTrue => visitor.visit_satisfied(db, storage, self),
-            Node::AlwaysFalse => visitor.visit_unsatisfied(db, storage, self),
-
-            Node::Interior(interior) => {
-                let interior_value = visitor.enter_interior(db, storage, interior)?;
-                let interior = storage.interior_node_data(node);
-                let Some(constraint) = interior.constraint.as_atomic(storage) else {
-                    panic!("cannot visit non-atomic constraint");
-                };
-
-                let if_true = self.walk_edge(
-                    db,
-                    env,
-                    storage,
-                    constraint.when_true(),
-                    UnspecializedTypeVarPolicy::Ignore,
-                    |storage, path, new_range, found_conflict| {
-                        let subtree = if found_conflict {
-                            visitor.visit_impossible(db, storage, path)
-                        } else {
-                            path.visit(db, env, storage, interior.if_true, visitor)
-                        };
-                        match subtree {
-                            ControlFlow::Continue(subtree) => visitor.visit_edge(
-                                db,
-                                storage,
-                                &interior_value,
-                                subtree,
-                                path,
-                                new_range,
-                            ),
-                            ControlFlow::Break(b) => ControlFlow::Break(b),
-                        }
-                    },
-                )?;
-
-                let if_uncertain = self.walk_edge(
-                    db,
-                    env,
-                    storage,
-                    constraint.when_unconstrained(),
-                    UnspecializedTypeVarPolicy::Ignore,
-                    |storage, path, new_range, found_conflict| {
-                        let subtree = if found_conflict {
-                            visitor.visit_impossible(db, storage, path)
-                        } else {
-                            path.visit(db, env, storage, interior.if_uncertain, visitor)
-                        };
-                        match subtree {
-                            ControlFlow::Continue(subtree) => visitor.visit_edge(
-                                db,
-                                storage,
-                                &interior_value,
-                                subtree,
-                                path,
-                                new_range,
-                            ),
-                            ControlFlow::Break(b) => ControlFlow::Break(b),
-                        }
-                    },
-                )?;
-
-                let if_false = self.walk_edge(
-                    db,
-                    env,
-                    storage,
-                    constraint.when_false(),
-                    UnspecializedTypeVarPolicy::Ignore,
-                    |storage, path, new_range, found_conflict| {
-                        let subtree = if found_conflict {
-                            visitor.visit_impossible(db, storage, path)
-                        } else {
-                            path.visit(db, env, storage, interior.if_false, visitor)
-                        };
-                        match subtree {
-                            ControlFlow::Continue(subtree) => visitor.visit_edge(
-                                db,
-                                storage,
-                                &interior_value,
-                                subtree,
-                                path,
-                                new_range,
-                            ),
-                            ControlFlow::Break(b) => ControlFlow::Break(b),
-                        }
-                    },
-                )?;
-
-                visitor.leave_interior(
-                    db,
-                    storage,
-                    &interior_value,
-                    if_true,
-                    if_uncertain,
-                    if_false,
-                )
-            }
         }
     }
 
@@ -432,7 +263,7 @@ impl PathAssignments {
     ) -> bool {
         debug_assert!(self.assignment_queue.is_empty());
         self.assignment_queue
-            .push_back((assignment, AssignmentFuel::origin()));
+            .push_back((assignment, self.origin_fuel));
         self.drain_assignment_queue(
             db,
             env,
@@ -446,6 +277,7 @@ impl PathAssignments {
     pub(super) fn snapshot(&self) -> PathSnapshot {
         PathSnapshot {
             assignments: self.assignments.len(),
+            relations: self.relations.len(),
             substituted_constraints: self.substituted_constraints.len(),
             fuel_undo: self.fuel_undo.len(),
             remaining_overall_fuel: self.remaining_overall_fuel,
@@ -472,6 +304,7 @@ impl PathAssignments {
             }
         }
         self.assignments.truncate(snapshot.assignments);
+        self.relations.truncate(snapshot.relations);
         self.substituted_constraints
             .truncate(snapshot.substituted_constraints);
         self.remaining_overall_fuel = snapshot.remaining_overall_fuel;
@@ -549,6 +382,67 @@ impl PathAssignments {
         result
     }
 
+    /// Relation continuations carry proof and fuel context absent from atomic path keys.
+    pub(super) fn has_relation_context(&self) -> bool {
+        !self.relations.is_empty() || !self.visiting_relations.is_empty()
+    }
+
+    pub(super) fn pending_relation(&self) -> Option<(usize, NodeId, Option<SourceOrderId>)> {
+        self.relations.keys().find_map(|index| {
+            if self.visiting_relations.contains(index) {
+                return None;
+            }
+            let Sequent::PairRelation {
+                ante1: _,
+                ante2: _,
+                post: (node, source_order),
+                fuel_cost: _,
+            } = self.sequents[*index]
+            else {
+                unreachable!("only whole relations are activated");
+            };
+            Some((*index, node, source_order))
+        })
+    }
+
+    pub(super) fn with_relation<R>(
+        &mut self,
+        index: usize,
+        f: impl FnOnce(&mut Self, AssignmentFuel) -> R,
+    ) -> R {
+        let previous_fuel = self.origin_fuel;
+        self.origin_fuel = AssignmentFuel::derived(0, self.relations[&index]);
+        self.visiting_relations.insert(index);
+        let result = f(self, previous_fuel);
+        self.visiting_relations.remove(&index);
+        self.origin_fuel = previous_fuel;
+        result
+    }
+
+    pub(super) fn with_origin_fuel<R>(
+        &mut self,
+        fuel: AssignmentFuel,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous_fuel = self.origin_fuel;
+        self.origin_fuel = fuel;
+        let result = f(self);
+        self.origin_fuel = previous_fuel;
+        result
+    }
+
+    pub(super) fn with_quantified_typevars<R>(
+        &mut self,
+        quantified_typevars: &Support,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous_quantified_typevars = self.quantified_typevars.clone();
+        self.quantified_typevars |= quantified_typevars;
+        let result = f(self);
+        self.quantified_typevars = previous_quantified_typevars;
+        result
+    }
+
     pub(super) fn positive_constraints(
         &self,
     ) -> impl Iterator<Item = (AtomicConstraintId, AtomicConstraintId)> + '_ {
@@ -618,35 +512,76 @@ impl PathAssignments {
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
         map: &SequentMap<'db>,
-    ) -> Range<usize> {
+    ) {
         fn intern_sequents<'db>(
             db: &'db dyn Db,
             env: &ProgramEnvironment<'db>,
             storage: &mut ConstraintSetStorage<'db>,
-            sequents: &[Sequent<InternedSequentConstraint<'db>>],
-            dest: &mut Vec<Sequent<AtomicConstraintId, u16>>,
-            antecedents: &mut FxHashMap<Assignment<AtomicConstraintId>, Vec<usize>>,
+            sequents: &[CachedSequent<'db>],
+            dest: &mut Vec<PathSequent>,
+            triggers: &mut FxHashMap<Assignment<AtomicConstraintId>, Vec<usize>>,
         ) {
             for sequent in sequents {
                 let sequent_index = dest.len();
-                let mut add_antecedent = |assignment| {
-                    antecedents
-                        .entry(assignment)
-                        .or_default()
-                        .push(sequent_index);
+                let mut add_trigger = |assignment| {
+                    triggers.entry(assignment).or_default().push(sequent_index);
                 };
 
                 let sequent = match sequent {
+                    Sequent::PairRelation {
+                        ante1,
+                        ante2,
+                        post: (post, provenance),
+                        fuel_cost: (),
+                    } => {
+                        let ante1 = storage.intern_atomic_constraint(db, env, ante1.constraint(db));
+                        let ante2 = storage.intern_atomic_constraint(db, env, ante2.constraint(db));
+                        add_trigger(ante1.when_true());
+                        add_trigger(ante2.when_true());
+                        let post = storage.load_with_provenance(db, env, post, Some(*provenance));
+                        let (ante1_depth, _) =
+                            storage.cached_constraint_bound_depth(db, env, ante1);
+                        let (ante2_depth, _) =
+                            storage.cached_constraint_bound_depth(db, env, ante2);
+                        let fuel_cost = storage
+                            .calculate_source_orders(post.1)
+                            .into_iter()
+                            .map(|constraint| {
+                                storage.sequent_fuel_cost(
+                                    db,
+                                    env,
+                                    constraint,
+                                    ante1_depth.max(ante2_depth),
+                                )
+                            })
+                            .max()
+                            .unwrap_or(1);
+                        Sequent::PairRelation {
+                            ante1,
+                            ante2,
+                            post,
+                            fuel_cost,
+                        }
+                    }
                     Sequent::SingleTautology { ante } => {
                         let ante = storage.intern_atomic_constraint(db, env, ante.constraint(db));
-                        add_antecedent(ante.when_false());
+                        add_trigger(ante.when_false());
                         Sequent::SingleTautology { ante }
+                    }
+                    Sequent::PairEquivalence { left, right } => {
+                        let left = storage.intern_atomic_constraint(db, env, left.constraint(db));
+                        let right = storage.intern_atomic_constraint(db, env, right.constraint(db));
+                        add_trigger(left.when_true());
+                        add_trigger(left.when_false());
+                        add_trigger(right.when_true());
+                        add_trigger(right.when_false());
+                        Sequent::PairEquivalence { left, right }
                     }
                     Sequent::PairImpossibility { ante1, ante2 } => {
                         let ante1 = storage.intern_atomic_constraint(db, env, ante1.constraint(db));
                         let ante2 = storage.intern_atomic_constraint(db, env, ante2.constraint(db));
-                        add_antecedent(ante1.when_true());
-                        add_antecedent(ante2.when_true());
+                        add_trigger(ante1.when_true());
+                        add_trigger(ante2.when_true());
                         Sequent::PairImpossibility { ante1, ante2 }
                     }
                     Sequent::TripleImpossibility {
@@ -657,9 +592,9 @@ impl PathAssignments {
                         let ante1 = storage.intern_atomic_constraint(db, env, ante1.constraint(db));
                         let ante2 = storage.intern_atomic_constraint(db, env, ante2.constraint(db));
                         let ante3 = storage.intern_atomic_constraint(db, env, ante3.constraint(db));
-                        add_antecedent(ante1.when_true());
-                        add_antecedent(ante2.when_true());
-                        add_antecedent(ante3.when_true());
+                        add_trigger(ante1.when_true());
+                        add_trigger(ante2.when_true());
+                        add_trigger(ante3.when_true());
                         Sequent::TripleImpossibility {
                             ante1,
                             ante2,
@@ -676,8 +611,9 @@ impl PathAssignments {
                         let ante1 = storage.intern_atomic_constraint(db, env, ante1.constraint(db));
                         let ante2 = storage.intern_atomic_constraint(db, env, ante2.constraint(db));
                         let post = storage.intern_atomic_constraint(db, env, post.constraint(db));
-                        add_antecedent(ante1.when_true());
-                        add_antecedent(ante2.when_true());
+                        add_trigger(ante1.when_true());
+                        add_trigger(ante2.when_true());
+                        add_trigger(post.when_false());
                         let (ante1_depth, _) =
                             storage.cached_constraint_bound_depth(db, env, ante1);
                         let (ante2_depth, _) =
@@ -695,7 +631,10 @@ impl PathAssignments {
                     Sequent::SingleImplication { ante, post, .. } => {
                         let ante = storage.intern_atomic_constraint(db, env, ante.constraint(db));
                         let post = storage.intern_atomic_constraint(db, env, post.constraint(db));
-                        add_antecedent(ante.when_true());
+                        add_trigger(ante.when_true());
+                        // A sibling can negate a consequence rolled back after its rule was
+                        // discovered. Recheck the still-held antecedent in that branch.
+                        add_trigger(post.when_false());
                         let (ante_depth, _) = storage.cached_constraint_bound_depth(db, env, ante);
                         let fuel_cost = storage.sequent_fuel_cost(db, env, post, ante_depth);
                         Sequent::SingleImplication {
@@ -710,7 +649,6 @@ impl PathAssignments {
             }
         }
 
-        let start = self.sequents.len();
         for group in &map.sequents {
             match group {
                 SequentGroup::Ungrouped(sequents) => {
@@ -720,7 +658,7 @@ impl PathAssignments {
                         storage,
                         sequents,
                         &mut self.sequents,
-                        &mut self.sequent_antecedents,
+                        &mut self.sequent_triggers,
                     );
                 }
                 SequentGroup::Grouped(grouped) => {
@@ -741,7 +679,7 @@ impl PathAssignments {
                         storage,
                         first,
                         &mut self.sequents,
-                        &mut self.sequent_antecedents,
+                        &mut self.sequent_triggers,
                     );
                     intern_sequents(
                         db,
@@ -749,13 +687,11 @@ impl PathAssignments {
                         storage,
                         second,
                         &mut self.sequents,
-                        &mut self.sequent_antecedents,
+                        &mut self.sequent_triggers,
                     );
                 }
             }
         }
-        let end = self.sequents.len();
-        start..end
     }
 
     /// Update our sequent map to ensure that it holds all of the sequents that involve the given
@@ -779,23 +715,7 @@ impl PathAssignments {
 
         let constraint_data = storage.atomic_constraint_data(constraint);
         if let Some(map) = SequentMap::for_constraint(db, env, constraint_data) {
-            let added = self.add_sequents(db, env, storage, map);
-
-            // `projection_source_order` depends on knowing the order that sequents were discovered for
-            // each constraint. Since we are salsa-caching sequent derivation, we don't have easy
-            // access to that in ConstraintSetStorage, so we need to maintain a local view of that
-            // information here.
-            self.single_replay_consequents.insert(
-                constraint,
-                self.sequents[added]
-                    .iter()
-                    .filter_map(|sequent| match sequent {
-                        Sequent::SingleImplication { post, .. }
-                        | Sequent::PairImplication { post, .. } => Some(*post),
-                        _ => None,
-                    })
-                    .collect(),
-            );
+            self.add_sequents(db, env, storage, map);
         }
 
         for existing_index in 0..self.discovered.len() {
@@ -843,23 +763,7 @@ impl PathAssignments {
                 continue;
             };
             self.elaborated_pairs.insert((a, b));
-            let added = self.add_sequents(db, env, storage, map);
-
-            // `projection_source_order` depends on knowing the order that sequents were discovered for
-            // each constraint. Since we are salsa-caching sequent derivation, we don't have easy
-            // access to that in ConstraintSetStorage, so we need to maintain a local view of that
-            // information here.
-            self.pair_replay_consequents.insert(
-                (a, b),
-                self.sequents[added]
-                    .iter()
-                    .filter_map(|sequent| match sequent {
-                        Sequent::SingleImplication { post, .. }
-                        | Sequent::PairImplication { post, .. } => Some(*post),
-                        _ => None,
-                    })
-                    .collect(),
-            );
+            self.add_sequents(db, env, storage, map);
         }
     }
 
@@ -999,19 +903,16 @@ impl PathAssignments {
 
         self.new_assignments.clear();
         let previous_sequents_len = self.sequents.len();
-        let previous_antecedents_len = self
-            .sequent_antecedents
-            .get(&assignment)
-            .map_or(0, Vec::len);
+        let previous_triggers_len = self.sequent_triggers.get(&assignment).map_or(0, Vec::len);
         self.discover_constraint(db, env, storage, assignment.constraint());
         let sequents_len = self.sequents.len();
 
-        // Previously discovered sequents can only start firing if the assignment that we just
-        // added is one of their antecedents.
-        for index in 0..previous_antecedents_len {
-            let sequent_index = self.sequent_antecedents[&assignment][index];
+        // Recheck cached rules when an antecedent is added or an implication's consequence
+        // is negated after a sibling branch rolled back its derived assignment.
+        for index in 0..previous_triggers_len {
+            let sequent_index = self.sequent_triggers[&assignment][index];
             let sequent = self.sequents[sequent_index];
-            self.check_sequent(db, env, storage, sequent)?;
+            self.check_sequent(db, env, storage, sequent_index, sequent)?;
         }
 
         // Sequent elaboration can produce rules whose antecedents do not include the constraint
@@ -1019,7 +920,7 @@ impl PathAssignments {
         // complete set of assignments on the current path.
         for sequent_index in previous_sequents_len..sequents_len {
             let sequent = self.sequents[sequent_index];
-            self.check_sequent(db, env, storage, sequent)?;
+            self.check_sequent(db, env, storage, sequent_index, sequent)?;
         }
 
         // If we were able to derive any new assignments from this one, add them to the processing
@@ -1047,9 +948,42 @@ impl PathAssignments {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
-        sequent: Sequent<AtomicConstraintId, u16>,
+        sequent_index: usize,
+        sequent: PathSequent,
     ) -> Result<(), PathAssignmentConflict> {
         match sequent {
+            Sequent::PairRelation {
+                ante1,
+                ante2,
+                fuel_cost,
+                post: _,
+            } => {
+                let Some(left) = self.max_remaining_fuel_for(ante1.when_true()) else {
+                    return Ok(());
+                };
+                let Some(right) = self.max_remaining_fuel_for(ante2.when_true()) else {
+                    return Ok(());
+                };
+                if let Entry::Vacant(entry) = self.relations.entry(sequent_index)
+                    && let Some(remaining) = left.min(right).checked_sub(fuel_cost)
+                    && let Some(overall) = self.remaining_overall_fuel.checked_sub(fuel_cost)
+                {
+                    self.remaining_overall_fuel = overall;
+                    entry.insert(remaining);
+                }
+                Ok(())
+            }
+            Sequent::PairEquivalence { left, right } => {
+                if (self.assignment_holds(left.when_true())
+                    && self.assignment_holds(right.when_false()))
+                    || (self.assignment_holds(left.when_false())
+                        && self.assignment_holds(right.when_true()))
+                {
+                    Err(PathAssignmentConflict)
+                } else {
+                    Ok(())
+                }
+            }
             Sequent::SingleTautology { ante } => {
                 self.check_single_tautology(db, env, storage, ante)
             }
@@ -1242,6 +1176,9 @@ struct PathAssignmentConflict;
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
+    use super::super::sequents::{InternedSequentConstraint, Sequent, SequentGroup, SequentMap};
     use super::super::solutions::{Polarity, SolutionWalker};
     use super::super::*;
 
@@ -1274,6 +1211,494 @@ mod tests {
             bound_typevar,
             ty,
         )
+    }
+
+    #[test]
+    fn equivalent_provenance_conflicts_preserve_evidence() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let builder = ConstraintSetBuilder::new();
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let u = Type::TypeVar(create_typevar(db, "U"));
+        let cases = [
+            create_constraint(db, &builder, t, KnownClass::Int),
+            ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, t, integer),
+            ConstraintSet::constrain_typevar_upper_bound(db, &env, &builder, ConstraintProvenance::INFERRED, t, integer),
+            ConstraintSet::constrain_typevar_upper_bound(db, &env, &builder, ConstraintProvenance::INFERRED, t, u),
+            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, ConstraintProvenance::INFERRED, t, u),
+        ];
+        let different = [
+            create_constraint(db, &builder, t, KnownClass::Str),
+            create_constraint(db, &builder, create_typevar(db, "V"), KnownClass::Int),
+        ];
+        let mut storage = builder.storage.borrow_mut();
+        let different = different.map(|set| {
+            storage
+                .interior_node_data(set.node)
+                .constraint
+                .expect_atomic(&storage)
+        });
+        for case in cases {
+            let original = storage
+                .interior_node_data(case.node)
+                .constraint
+                .expect_atomic(&storage);
+            let atom = storage.atomic_constraint_data(original);
+            let [validity, mixed, evidence] = [
+                ConstraintProvenance::VALIDITY,
+                ConstraintProvenance::INFERRED.union(ConstraintProvenance::VALIDITY),
+                ConstraintProvenance::INFERRED,
+            ]
+            .map(|provenance| {
+                storage.intern_atomic_constraint(db, &env, atom.with_provenance(provenance))
+            });
+            for first in [validity, mixed, evidence] {
+                for second in [validity, mixed, evidence] {
+                    let mut path = PathAssignments::new([first, second], FxHashSet::default());
+                    path.walk_edge(
+                        db,
+                        &env,
+                        &mut storage,
+                        first.when_true(),
+                        UnspecializedTypeVarPolicy::Ignore,
+                        |storage, path, _, conflict| {
+                            assert!(!conflict);
+                            // Truth agrees across provenance, but a declaration alone must not become
+                            // new inference evidence.
+                            assert_eq!(path.assignment_holds(second.when_true()), first == second);
+                            for other in different {
+                                path.walk_edge(
+                                    db,
+                                    &env,
+                                    storage,
+                                    other.when_false(),
+                                    UnspecializedTypeVarPolicy::Ignore,
+                                    |_, _, _, conflict| {
+                                        assert!(!conflict);
+                                    },
+                                );
+                            }
+                            path.walk_edge(
+                                db,
+                                &env,
+                                storage,
+                                second.when_false(),
+                                UnspecializedTypeVarPolicy::Ignore,
+                                |_, _, _, conflict| {
+                                    assert!(conflict);
+                                },
+                            );
+                        },
+                    );
+                    // Leaving the positive branch removes the conflicting assignment.
+                    path.walk_edge(
+                        db,
+                        &env,
+                        &mut storage,
+                        second.when_false(),
+                        UnspecializedTypeVarPolicy::Ignore,
+                        |storage, path, _, conflict| {
+                            assert!(!conflict);
+                            path.walk_edge(
+                                db,
+                                &env,
+                                storage,
+                                first.when_true(),
+                                UnspecializedTypeVarPolicy::Ignore,
+                                |_, _, _, conflict| {
+                                    assert!(conflict);
+                                },
+                            );
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn negated_consequent_rechecks_a_cached_implication() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let builder = ConstraintSetBuilder::new();
+        let exact = create_constraint(db, &builder, t, KnownClass::Object);
+        let lower = ConstraintSet::constrain_typevar_lower_bound(
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            t,
+            KnownClass::Str.to_instance(db, &env),
+        );
+        let mut storage = builder.storage.borrow_mut();
+        let exact = storage
+            .interior_node_data(exact.node)
+            .constraint
+            .expect_atomic(&storage);
+        let lower = storage
+            .interior_node_data(lower.node)
+            .constraint
+            .expect_atomic(&storage);
+        let mut path = PathAssignments::default();
+        path.walk_edge(
+            db,
+            &env,
+            &mut storage,
+            exact.when_true(),
+            UnspecializedTypeVarPolicy::Ignore,
+            |storage, path, _, conflict| {
+                assert!(!conflict);
+                // This branch discovers `T = object => str <= T`. Its consequence is then
+                // rolled back while the implication remains cached for sibling branches.
+                path.walk_edge(db, &env, storage, lower.when_true(), UnspecializedTypeVarPolicy::Ignore, |_, _, _, conflict| {
+                    assert!(!conflict);
+                });
+                path.walk_edge(
+                    db,
+                    &env,
+                    storage,
+                    lower.when_false(),
+                    UnspecializedTypeVarPolicy::Ignore,
+                    |_, _, _, conflict| assert!(conflict),
+                );
+            },
+        );
+        // Without the antecedent, the same negative edge is satisfiable.
+        path.walk_edge(
+            db,
+            &env,
+            &mut storage,
+            lower.when_false(),
+            UnspecializedTypeVarPolicy::Ignore,
+            |_, _, _, conflict| assert!(!conflict),
+        );
+    }
+
+    #[test]
+    fn negated_consequent_rechecks_a_cached_pair_implication() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let builder = ConstraintSetBuilder::new();
+        let left = create_constraint(db, &builder, create_typevar(db, "T"), KnownClass::Int);
+        let right = create_constraint(db, &builder, create_typevar(db, "U"), KnownClass::Str);
+        let post = create_constraint(db, &builder, create_typevar(db, "V"), KnownClass::Bytes);
+        let mut storage = builder.storage.borrow_mut();
+        let [left, right, post] = [left, right, post].map(|set| {
+            storage
+                .interior_node_data(set.node)
+                .constraint
+                .expect_atomic(&storage)
+        });
+        let mut map = SequentMap::default();
+        map.sequents = Box::new([SequentGroup::Ungrouped(Box::new([
+            Sequent::PairImplication {
+                ante1: InternedSequentConstraint::new(db, storage.atomic_constraint_data(left)),
+                ante2: InternedSequentConstraint::new(db, storage.atomic_constraint_data(right)),
+                post: InternedSequentConstraint::new(db, storage.atomic_constraint_data(post)),
+                fuel_cost: (),
+                is_substitution: false,
+            },
+        ]))]);
+        let mut path = PathAssignments::default();
+        path.walk_edge(
+            db,
+            &env,
+            &mut storage,
+            left.when_true(),
+            UnspecializedTypeVarPolicy::Ignore,
+            |storage, path, _, conflict| {
+                assert!(!conflict);
+                path.walk_edge(
+                    db,
+                    &env,
+                    storage,
+                    right.when_true(),
+                    UnspecializedTypeVarPolicy::Ignore,
+                    |storage, path, _, conflict| {
+                        assert!(!conflict);
+                        path.walk_edge(
+                            db,
+                            &env,
+                            storage,
+                            post.when_true(),
+                            UnspecializedTypeVarPolicy::Ignore,
+                            |storage, path, _, conflict| {
+                                assert!(!conflict);
+                                path.add_sequents(db, &env, storage, &map);
+                            },
+                        );
+                        path.walk_edge(
+                            db,
+                            &env,
+                            storage,
+                            post.when_false(),
+                            UnspecializedTypeVarPolicy::Ignore,
+                            |_, _, _, conflict| assert!(conflict),
+                        );
+                    },
+                );
+                // Removing either antecedent makes the negative consequence satisfiable.
+                path.walk_edge(db, &env, storage, post.when_false(), UnspecializedTypeVarPolicy::Ignore, |_, _, _, conflict| {
+                    assert!(!conflict);
+                });
+            },
+        );
+        path.walk_edge(
+            db,
+            &env,
+            &mut storage,
+            right.when_true(),
+            UnspecializedTypeVarPolicy::Ignore,
+            |storage, path, _, conflict| {
+                assert!(!conflict);
+                path.walk_edge(db, &env, storage, post.when_false(), UnspecializedTypeVarPolicy::Ignore, |_, _, _, conflict| {
+                    assert!(!conflict);
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn derived_relations_preserve_witnesses_and_domains() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let string = KnownClass::Str.to_instance(db, &env);
+        let integer = KnownClass::Int.to_instance(db, &env);
+        let left = create_typevar(db, "Left");
+        let right = create_typevar(db, "Right");
+        let result = create_typevar(db, "Result");
+        let list_string = KnownClass::List.to_specialized_instance(db, &env, &[string]);
+        let list_integer = KnownClass::List.to_specialized_instance(db, &env, &[integer]);
+        for (domain, expected, negative, valid) in [
+            (string, list_string, false, true),
+            (string, list_integer, false, false),
+            (integer, list_string, false, false),
+            (integer, list_string, true, true),
+            (string, list_string, true, false),
+        ] {
+            let local = create_typevar(db, "Local").map_bound_or_constraints(db, |_| {
+                Some(TypeVarBoundOrConstraints::UpperBound(domain))
+            });
+            let relation = ConstraintSetBuilder::new().into_owned(|builder| {
+                let list_local =
+                    KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
+                let body =
+                    create_constraint(db, builder, local, KnownClass::Str).and(db, builder, || {
+                        ConstraintSet::constrain_typevar_equivalence_bound(
+                            db, &env, builder, ConstraintProvenance::INFERRED, result, list_local,
+                        )
+                    });
+                let relation = body.reduce_inferable(
+                    db,
+                    &env,
+                    builder,
+                    TypeVarSet::from_typevars(db, [local]),
+                );
+                if negative {
+                    relation.negate(db, builder)
+                } else {
+                    relation
+                }
+            });
+            let builder = ConstraintSetBuilder::new();
+            let lhs = create_constraint(db, &builder, left, KnownClass::Str);
+            let rhs = create_constraint(db, &builder, right, KnownClass::Int);
+            let set = lhs.and(db, &builder, || rhs).and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db, &env, &builder, ConstraintProvenance::INFERRED, result, expected,
+                )
+            });
+            let mut storage = builder.storage.borrow_mut();
+            let ante1 = storage
+                .interior_node_data(lhs.node)
+                .constraint
+                .expect_atomic(&storage);
+            let ante2 = storage
+                .interior_node_data(rhs.node)
+                .constraint
+                .expect_atomic(&storage);
+            let mut map = SequentMap::default();
+            map.sequents = Box::new([SequentGroup::Ungrouped(Box::new([Sequent::PairRelation {
+                    ante1: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante1)),
+                    ante2: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante2)),
+                    post: (relation, ConstraintProvenance::INFERRED),
+                    fuel_cost: (),
+                }]))]);
+            let mut path = set
+                .node
+                .path_assignments(db, &env, &mut storage, set.source_order);
+            path.add_sequents(db, &env, &mut storage, &map);
+            let inferable = TypeVarSet::from_typevars(db, [left, right, result]);
+            let support = Support::from_typevar_set(db, &mut storage, inferable);
+            // Reusing the path exercises activation rollback, including negatively walked roots.
+            for polarity in [Polarity::Positive, Polarity::Negative] {
+                let node = if polarity == Polarity::Positive {
+                    set.node
+                } else {
+                    set.node.negate(&mut storage)
+                };
+                let orders = storage.calculate_source_orders(set.source_order);
+                let mut walker = SolutionWalker::new(
+                    db,
+                    &mut storage,
+                    orders,
+                    inferable,
+                    UnboundedSolutionLimits,
+                    (set.node, set.source_order),
+                );
+                let ControlFlow::Continue(()) = walker.visit_node(
+                    db,
+                    &env,
+                    &mut storage,
+                    &mut path,
+                    Some(&support),
+                    polarity,
+                    node,
+                );
+                let candidates = walker.finish();
+                assert_eq!(
+                    !matches!(candidates, CandidateSolutions::Unsatisfiable),
+                    valid,
+                    "domain={domain:?}, expected={expected:?}, negative={negative}, polarity={polarity:?}"
+                );
+                let selection = ConstraintSetBuilder::new();
+                let solved = candidates.solve(db, &env, &selection);
+                if valid {
+                    assert_matches!(solved, Solutions::Constrained(SolutionPaths::Complete(solutions)) if
+                        solutions.iter().any(|solution| {
+                            solution.is_valid() && solution.solved_typevars.iter().any(|binding| {
+                                binding.bound_typevar == result && binding.solution == expected
+                            })
+                        })
+                    );
+                } else {
+                    assert!(matches!(solved, Solutions::Unsatisfiable(_)));
+                }
+                assert!(path.assignments.is_empty());
+                assert!(path.relations.is_empty());
+                assert!(path.visiting_relations.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn derived_relation_evidence_matches_explicit_relation() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let left = create_typevar(db, "Left");
+        let right = create_typevar(db, "Right");
+        let local = create_typevar(db, "Local");
+        let result = create_typevar(db, "Result");
+        let string = KnownClass::Str.to_instance(db, &env);
+        let gradual = UnionType::from_elements(db, &env, [Type::any(), string]);
+        let inferable = TypeVarSet::from_typevars(db, [result]);
+        let relation = ConstraintSetBuilder::new().into_owned(|builder| {
+            create_constraint(db, builder, local, KnownClass::Str)
+                .and(db, builder, || {
+                    ConstraintSet::constrain_typevar_lower_bound(db, &env, builder, ConstraintProvenance::INFERRED, result, gradual)
+                })
+                .reduce_inferable(db, &env, builder, TypeVarSet::from_typevars(db, [local]))
+        });
+        for reverse in [false, true] {
+            for reload in [false, true] {
+                let builder = ConstraintSetBuilder::new();
+                let lhs = create_constraint(db, &builder, left, KnownClass::Str);
+                let rhs = create_constraint(db, &builder, right, KnownClass::Int);
+                let antecedents = lhs.and(db, &builder, || rhs);
+                let later = ConstraintSet::constrain_typevar_upper_bound(
+                    db, &env, &builder, ConstraintProvenance::INFERRED, result, string,
+                );
+                let explicit = builder.load(db, &env, &relation);
+                let explicit = if reverse {
+                    later
+                        .and(db, &builder, || explicit)
+                        .and(db, &builder, || antecedents)
+                } else {
+                    antecedents
+                        .and(db, &builder, || explicit)
+                        .and(db, &builder, || later)
+                };
+                let expected = explicit.solutions(db, &env, inferable).unwrap();
+                assert!(matches!(
+                    expected,
+                    Solutions::Constrained(SolutionPaths::Complete(_))
+                ));
+                let implicit = if reverse {
+                    later.and(db, &builder, || antecedents)
+                } else {
+                    antecedents.and(db, &builder, || later)
+                };
+                let implicit = if reload {
+                    let owned = match implicit.node.node() {
+                        Node::Interior(root) => OwnedConstraintSetBuilder::snapshot(
+                            &builder.storage.borrow(),
+                            root,
+                            implicit.source_order.unwrap(),
+                        ),
+                        Node::AlwaysTrue | Node::AlwaysFalse => {
+                            unreachable!("test relation is nonterminal")
+                        }
+                    };
+                    builder.load(db, &env, &owned)
+                } else {
+                    implicit
+                };
+                let mut storage = builder.storage.borrow_mut();
+                let ante1 = storage
+                    .interior_node_data(lhs.node)
+                    .constraint
+                    .expect_atomic(&storage);
+                let ante2 = storage
+                    .interior_node_data(rhs.node)
+                    .constraint
+                    .expect_atomic(&storage);
+                let mut map = SequentMap::default();
+                map.sequents = Box::new([SequentGroup::Ungrouped(Box::new([Sequent::PairRelation {
+                        ante1: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante1)),
+                        ante2: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante2)),
+                        post: (relation.clone(), ConstraintProvenance::INFERRED),
+                        fuel_cost: (),
+                    }]))]);
+                let mut path =
+                    implicit
+                        .node
+                        .path_assignments(db, &env, &mut storage, implicit.source_order);
+                path.add_sequents(db, &env, &mut storage, &map);
+                let support = Support::from_typevar_set(db, &mut storage, inferable);
+                let orders = storage.calculate_source_orders(implicit.source_order);
+                let mut walker = SolutionWalker::new(
+                    db,
+                    &mut storage,
+                    orders,
+                    inferable,
+                    UnboundedSolutionLimits,
+                    (implicit.node, implicit.source_order),
+                );
+                let ControlFlow::Continue(()) = walker.visit_node(
+                    db,
+                    &env,
+                    &mut storage,
+                    &mut path,
+                    Some(&support),
+                    Polarity::Positive,
+                    implicit.node,
+                );
+                let candidates = walker.finish();
+                drop(storage);
+                assert_eq!(
+                    candidates.solve(db, &env, &builder),
+                    expected,
+                    "reverse={reverse}, reload={reload}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1398,7 +1823,7 @@ mod tests {
                 source_orders.clone(),
                 inferable,
                 limits,
-                set.node,
+                (set.node, set.source_order),
             );
             assert_eq!(
                 walker.visit_node(
@@ -1421,7 +1846,7 @@ mod tests {
                 source_orders.clone(),
                 inferable,
                 limits,
-                set.node,
+                (set.node, set.source_order),
             );
             let ControlFlow::Continue(()) = walker.visit_node(
                 db,

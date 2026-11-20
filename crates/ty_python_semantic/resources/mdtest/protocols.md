@@ -5635,6 +5635,10 @@ class ValidConstrainedReceiver(str):
 class RecursiveReceiverBound:
     def method[T: ReceiverOnly](self: T) -> None: ...
 
+class InvalidRecursiveReceiverBound:
+    def method[T: ReceiverOnly](self: T) -> int:
+        return 1
+
 static_assert(is_equivalent_to(LegacyFunctionScoped, NewStyleFunctionScoped))
 static_assert(is_assignable_to(NominalNewStyle, NewStyleFunctionScoped))
 static_assert(is_assignable_to(NominalNewStyle, LegacyFunctionScoped))
@@ -5699,6 +5703,8 @@ static_assert(is_subtype_of(ValidConstrainedReceiver, ReceiverOnly))
 # Verifying the receiver's bound recurses into the protocol relation currently being checked.
 static_assert(is_assignable_to(RecursiveReceiverBound, ReceiverOnly))
 static_assert(is_subtype_of(RecursiveReceiverBound, ReceiverOnly))
+static_assert(not is_assignable_to(InvalidRecursiveReceiverBound, ReceiverOnly))
+static_assert(not is_subtype_of(InvalidRecursiveReceiverBound, ReceiverOnly))
 
 # These test cases are taken from the typing conformance suite:
 class ShapeProtocolImplicitSelf(Protocol):
@@ -5882,6 +5888,100 @@ class FactoryModule(Protocol):
 
 factory_object: FactoryObject = factory
 factory_module: FactoryModule = factory
+```
+
+## Generic protocol inference from bounded type variables
+
+An outer type variable's members determine the type arguments of a protocol accepted by a generic
+function. Methods returning `Self` preserve the original type variable as their receiver.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from collections.abc import Callable, Iterable
+from typing import Protocol, Self
+
+class Keyed[K, V](Protocol):
+    def keys(self) -> Iterable[K]: ...
+    def __getitem__(self, key: K, /) -> V: ...
+
+def capture[K, V](value: Keyed[K, V]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def capture_either[K, V](value: Keyed[K, V] | Iterable[tuple[K, V]]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def require_same_values[K, V](value: Keyed[K, V], values: list[V]) -> None: ...
+def require_same_either[K, V](value: Keyed[K, V] | Iterable[tuple[K, V]], values: list[V]) -> None: ...
+
+def bounded[T: dict[str, int]](value: T) -> None:
+    reveal_type(capture(value))  # revealed: tuple[str, int]
+    reveal_type(capture_either(value))  # revealed: tuple[str, int]
+    require_same_values(value, ["wrong"])  # error: [invalid-argument-type]
+    require_same_either(value, ["wrong"])  # error: [invalid-argument-type]
+
+def arguments[**P](callback: Callable[P, None], *args: P.args, **kwargs: P.kwargs) -> None:
+    reveal_type(dict(kwargs))  # revealed: dict[str, object]
+    reveal_type(capture(kwargs))  # revealed: tuple[str, object]
+    reveal_type(capture_either(kwargs))  # revealed: tuple[str, object]
+
+class Clonable[T](Protocol):
+    def clone(self) -> T: ...
+
+class Parent:
+    def clone(self) -> Self:
+        return self
+
+def capture_clone[T](value: Clonable[T]) -> T:
+    return value.clone()
+
+def clone[S: Parent](value: S) -> S:
+    return capture_clone(value)  # no diagnostic
+
+class Widens:
+    def clone(self) -> "Widens":
+        return self
+
+def clone_widens[S: Widens](value: S) -> S:
+    return capture_clone(value)  # error: [invalid-explicit-return]
+
+class Left[T](Protocol):
+    def left(self) -> T: ...
+
+class Right[T](Protocol):
+    def right(self) -> T: ...
+
+class FromLeft:
+    def left(self) -> int:
+        return 1
+
+class FromRight:
+    def right(self) -> str:
+        return "right"
+
+class Neither: ...
+
+def capture_distributed[T](value: Left[T] | Right[T]) -> T:
+    raise NotImplementedError
+
+def distributed[S: FromLeft | FromRight](value: S) -> None:
+    reveal_type(capture_distributed(value))  # revealed: int | str
+
+def missing_method[S: Neither](value: S) -> None:
+    capture_distributed(value)  # error: [invalid-argument-type]
+
+class Owner(Parent):
+    def accept[T](self, value: Clonable[Self] | Iterable[T], fallback: T) -> tuple[Self, T]:
+        return self, fallback
+
+def preserve_owner[S: Owner](owner: S) -> tuple[S, str]:
+    return owner.accept(owner, "fallback")  # no diagnostic
+
+def reject_other_owner[S: Owner, O: Owner](owner: S, other: O) -> None:
+    owner.accept(other, "fallback")  # error: [invalid-argument-type]
 ```
 
 ## Generic protocol inference from module objects
@@ -7470,6 +7570,85 @@ def two(some_list: list[Any], some_tuple: tuple[int, str], some_sized: Sized):
     a: Sized = some_list
     b: Sized = some_tuple
     c: Sized = some_sized
+```
+
+## Finite nesting in iterable protocols
+
+The `__iter__` and `__next__` requirements recur at each container level. A repeated method
+declaration does not establish that its different specializations are compatible.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from collections.abc import Collection, Iterable, Iterator
+
+class Items[T]:
+    def __iter__(self) -> Iterator[T]:
+        raise NotImplementedError
+
+    def __len__(self) -> int:
+        raise NotImplementedError
+
+    def __contains__(self, item: object) -> bool:
+        raise NotImplementedError
+
+type NestedInts = Items[int]
+type NestedStrings = Items[str]
+
+def nested(values: Iterable[Iterable[str]]) -> None: ...
+def collections(values: Iterable[Collection[str]]) -> None: ...
+def check(
+    wrong: Items[Items[int]],
+    right: Items[Items[str]],
+    wrong_list: list[list[int]],
+    right_list: list[list[str]],
+    wrong_tuple: tuple[tuple[int, ...], ...],
+    right_tuple: tuple[tuple[str, ...], ...],
+    wrong_alias: Items[NestedInts],
+    right_alias: Items[NestedStrings],
+) -> None:
+    nested(wrong)  # error: [invalid-argument-type]
+    nested(right)  # no diagnostic
+    collections(wrong)  # error: [invalid-argument-type]
+    collections(right)  # no diagnostic
+    nested(wrong_list)  # error: [invalid-argument-type]
+    nested(right_list)  # no diagnostic
+    nested(wrong_tuple)  # error: [invalid-argument-type]
+    nested(right_tuple)  # no diagnostic
+    nested(wrong_alias)  # error: [invalid-argument-type]
+    nested(right_alias)  # no diagnostic
+```
+
+## Iterable protocol nested in a method return
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from collections.abc import Iterable, Iterator
+from typing import Protocol
+
+class Box[T]:
+    def __iter__(self) -> Iterator[T]:
+        raise NotImplementedError
+
+class HasItems[K, V](Protocol):
+    def items(self) -> Iterable[tuple[K, V]]: ...
+
+class Entries[K, V]:
+    def items(self) -> Box[tuple[K, V]]:
+        raise NotImplementedError
+
+def consume(values: Iterable[HasItems[str, str]]) -> None: ...
+def check(good: Box[Entries[str, str]], bad_key: Box[Entries[int, str]], bad_value: Box[Entries[str, int]]):
+    consume(good)
+    consume(bad_key)  # error: [invalid-argument-type]
+    consume(bad_value)  # error: [invalid-argument-type]
 ```
 
 ## Recursive protocols

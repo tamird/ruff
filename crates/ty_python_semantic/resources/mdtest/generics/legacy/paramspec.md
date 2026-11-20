@@ -2034,6 +2034,38 @@ def construct(factory: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> 
 reveal_type(construct(Factory))  # revealed: Factory[object]
 ```
 
+The callable-local variable also remains available when `P` is inferred from another callable:
+
+```py
+def construct_with(factory: Callable[P, R], other: Callable[P, object], /, *args: P.args, **kwargs: P.kwargs) -> R:
+    return factory(*args, **kwargs)
+
+construct_with(Factory, lambda: object())  # ok
+```
+
+A generic callable can also return a type containing a variable fixed by an enclosing function.
+Capturing the callable's own type variable in `P` does not make the enclosing variable inferable:
+
+```py
+S = TypeVar("S")
+U = TypeVar("U")
+
+def outer(value: S) -> None:
+    def make(value: U) -> Factory[S]:
+        raise NotImplementedError
+
+    construct(make, 1)  # error: [invalid-argument-type]
+```
+
+A generic callable whose return type satisfies the bound is accepted:
+
+```py
+def make_object(value: U) -> Factory[object]:
+    raise NotImplementedError
+
+construct(make_object, 1)  # ok
+```
+
 ### Class method with a generic callable receiver
 
 A class method's receiver can be a generic callable whose parameters are captured by a `ParamSpec`.
@@ -2137,8 +2169,7 @@ def unrestricted(fixed: S) -> None:
     def make(value: T) -> tuple[T, S]:
         return value, fixed
 
-    # TODO: Reject this call because `S` is not bounded by `str`.
-    forward(make, 1)  # ok
+    forward(make, 1)  # error: [invalid-argument-type]
 
 def non_generic(fixed: S) -> None:
     def make(value: int) -> tuple[int, S]:
@@ -2152,6 +2183,28 @@ def bounded(fixed: BoundedS) -> None:
         return value, fixed
 
     forward(make, 1)  # ok
+```
+
+### Bounds in captured callables
+
+A captured variable's bound allows the return type to satisfy the return bound, while forwarded
+arguments must still satisfy that variable's bound.
+
+```py
+from typing import Callable, ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R", bound=tuple[str, int])
+T = TypeVar("T", bound=str)
+
+def forward(factory: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> R:
+    return factory(*args, **kwargs)
+
+def make(value: T) -> tuple[T, int]:
+    return value, 1
+
+forward(make, "text")  # ok
+forward(make, 1)  # error: [invalid-argument-type]
 ```
 
 ### Specializing a captured variable to satisfy a return bound
@@ -2305,6 +2358,103 @@ reveal_type(constructor(1))  # revealed: Example
 constructor()
 ```
 
+## Forwarding unpacked arguments
+
+A collection unpack can supply several forwarded parameters. Each element is checked against its
+parameter in the target callable.
+
+```py
+from typing import Callable, ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def forward(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    return callback(*args, **kwargs)
+
+def target(x: int, y: str) -> int:
+    return x
+
+reveal_type(forward(target, *[1, "ok"]))  # revealed: int
+reveal_type(forward(target, **{"x": 1, "y": "ok"}))  # revealed: int
+forward(target, *["bad", "ok"])  # error: [invalid-argument-type]
+forward(target, **{"x": 1})  # error: [missing-argument]
+```
+
+The wrapper consumes its own keyword parameters before forwarding the remaining keys. Both the
+wrapper and target parameter types are enforced.
+
+```py
+def with_prefix(callback: Callable[P, R], prefix: int, *args: P.args, **kwargs: P.kwargs) -> R:
+    return callback(*args, **kwargs)
+
+reveal_type(with_prefix(target, **{"prefix": 0, "x": 1, "y": "ok"}))  # revealed: int
+with_prefix(target, **{"prefix": 0, "x": 1}, y="ok")
+with_prefix(target, **{"prefix": "bad", "x": 1, "y": "ok"})  # error: [invalid-argument-type]
+with_prefix(target, **{"prefix": 0, "x": "bad", "y": "ok"})  # error: [invalid-argument-type]
+with_prefix(target, **{"prefix": 0, "x": 1})  # error: [missing-argument]
+with_prefix(target, **{"prefix": 0, "x": 1, "y": "ok", "extra": 2})  # error: [unknown-argument]
+
+def callback_target(x: int, transform: Callable[[int], str]) -> str:
+    return transform(x)
+
+with_prefix(callback_target, **{"prefix": 0, "x": 1}, transform=lambda x: str(reveal_type(x)))  # revealed: int
+```
+
+A keyword with the same name as a positional-only wrapper parameter belongs to the target.
+
+```py
+def positional_prefix(callback: Callable[P, R], prefix: int, /, *args: P.args, **kwargs: P.kwargs) -> R:
+    return callback(*args, **kwargs)
+
+def named_prefix(*, prefix: str) -> int:
+    return len(prefix)
+
+reveal_type(positional_prefix(named_prefix, 0, **{"prefix": "value"}))  # revealed: int
+```
+
+## Forwarding dictionary spreads
+
+Known entries and additional mapping values are forwarded together. A wrapper's consumed prefix
+names remain excluded even when the mapping can contain other names.
+
+```py
+from typing import Callable, ParamSpec
+
+P = ParamSpec("P")
+
+def forward(callback: Callable[P, None], prefix: int, *args: P.args, **kwargs: P.kwargs) -> None:
+    callback(*args, **kwargs)
+
+def target(value: str): ...
+def needs_prefix(prefix: str): ...
+def calls(values: dict[str, str]):
+    forward(target, **{**values, "prefix": 0, "value": "ok"})
+    forward(target, **{**values, "prefix": 0, "value": 1})  # error: [invalid-argument-type]
+    forward(target, **{**values, "prefix": "bad"})  # error: [invalid-argument-type]
+    forward(needs_prefix, **{**values, "prefix": 0})  # error: [missing-argument]
+```
+
+## Forwarding copied keyword arguments
+
+```py
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def copy_arguments(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    copied = dict(kwargs)
+    kwargs.pop("required", None)
+    return callback(*args, **copied)  # ok
+
+def remove_argument(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    copied = dict(kwargs)
+    copied.pop("required", None)
+    return callback(*args, **copied)  # error: [invalid-argument-type]
+```
+
 ## Calling methods on a union of `ParamSpec` specializations
 
 A caller's parameter list can be shared by the receivers while the return type preserves the
@@ -2410,4 +2560,64 @@ class Box(Generic[C]):
             callback(1)
 
         raise NotImplementedError
+```
+
+## Projecting a generic callback result
+
+Extracting a callback's result closes its local type variables. Returning the callback itself
+preserves its generic signature, and enclosing function variables remain available.
+
+```py
+from typing import Any, Callable, Generic, ParamSpec, TypeVar
+from ty_extensions import Top, static_assert
+from ty_extensions._internal import TypeOf, is_equivalent_to
+
+T = TypeVar("T")
+R = TypeVar("R")
+P = ParamSpec("P")
+
+class Info(Generic[T]):
+    @property
+    def value(self) -> T:
+        raise NotImplementedError
+    @property
+    def items(self) -> list[T]:
+        raise NotImplementedError
+
+def project(callback: Callable[P, R]) -> R:
+    raise NotImplementedError
+
+def decorate(callback: Callable[P, R]) -> Callable[P, R]:
+    return callback
+
+def generic(*, value: T) -> Info[T]:
+    raise NotImplementedError
+
+first = project(generic)
+second = project(generic)
+static_assert(is_equivalent_to(TypeOf[first], Top[Info[Any]]))
+# error: [invalid-argument-type]
+first.items.append(second.value)
+# error: [invalid-argument-type]
+first.items.extend(second.items)
+
+def caller(value: T) -> Info[T]:
+    def captured() -> Info[T]:
+        raise NotImplementedError
+    result = project(captured)
+    result.items.append(value)  # ok
+    return result
+
+class Owner(Generic[T]):
+    def captured(self) -> Info[T]:
+        raise NotImplementedError
+    def projected(self, value: T) -> Info[T]:
+        result = project(self.captured)
+        result.items.append(value)  # ok
+        return result
+
+decorated = decorate(generic)
+
+def use(value: str) -> Info[str]:
+    return decorated(value=value)  # ok
 ```

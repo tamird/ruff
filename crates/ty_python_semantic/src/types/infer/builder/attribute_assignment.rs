@@ -15,7 +15,7 @@ use crate::types::call::{Bindings, CallArguments, CallDiagnosticOverride, CallEr
 use crate::types::class::FrozenDataclassDispatch;
 use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
-    DEPRECATED, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS, MISSING_ATTRIBUTE, MISSING_SLOT,
+    DEPRECATED, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS, MISSING_ATTRIBUTE, POSSIBLY_MISSING_ATTRIBUTE, MISSING_SLOT,
     report_bad_dunder_set_call, report_invalid_attribute_assignment,
     report_possibly_missing_attribute,
 };
@@ -51,6 +51,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             value,
             object_ty,
             attribute,
+            requirement: &requirement,
+            definitely_bound: None,
             infer_value_ty: MultiInferenceGuard::new(infer_value_ty),
         };
         let valid = evaluator.evaluate(&requirement, emit_diagnostics, deprecation.as_mut());
@@ -208,6 +210,8 @@ struct AssignmentAttributeWriteEvaluator<'a, 'db, 'ast, 'infer> {
     value: &'a ast::Expr,
     object_ty: Type<'db>,
     attribute: &'a str,
+    requirement: &'a AttributeWriteRequirement<'db>,
+    definitely_bound: Option<bool>,
     infer_value_ty: MultiInferenceGuard<'db, 'ast, 'infer>,
 }
 
@@ -1118,12 +1122,22 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                 );
             }
             AssignmentAttributeWriteDiagnostic::PossiblyMissing => {
-                report_possibly_missing_attribute(
-                    &self.builder.context,
-                    self.target,
-                    self.attribute,
-                    self.object_ty,
-                );
+                if self
+                    .builder
+                    .context
+                    .is_lint_enabled(&POSSIBLY_MISSING_ATTRIBUTE)
+                    && !*self.definitely_bound.get_or_insert_with(|| {
+                        self.requirement
+                            .is_definitely_bound(db, env, self.attribute)
+                    })
+                {
+                    report_possibly_missing_attribute(
+                        &self.builder.context,
+                        self.target,
+                        self.attribute,
+                        self.object_ty,
+                    );
+                }
             }
             AssignmentAttributeWriteDiagnostic::BadSetAttr { value_ty, failure } => {
                 failure.report_diagnostics_with_override(

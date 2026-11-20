@@ -16,7 +16,10 @@ use ruff_benchmark::TestFile;
 use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::source::source_text;
-use ruff_db::system::{InMemorySystem, MemoryFileSystem, SystemPath, SystemPathBuf, TestSystem};
+use ruff_db::system::{
+    DbWithWritableSystem as _, InMemorySystem, MemoryFileSystem, SystemPath, SystemPathBuf,
+    TestSystem,
+};
 use ruff_ranged_value::RangedValue;
 use ty_project::metadata::options::{AnalysisOptions, EnvironmentOptions, Options, Rules};
 use ty_project::metadata::python_version::SupportedPythonVersion;
@@ -1488,6 +1491,139 @@ fn benchmark_async_context_manager_recursive_protocol(criterion: &mut Criterion)
     );
 }
 
+/// Regression benchmark for <https://github.com/astral-sh/ty/issues/4629>.
+///
+/// Comparing a materialized recursive protocol to its original type can repeatedly expand
+/// the protocol's members when they contain the protocol inside a generic type.
+fn benchmark_recursive_protocol_materialization_scaling(criterion: &mut Criterion) {
+    setup_rayon();
+
+    for num_methods in [24, 48, 96, 192] {
+        let mut code = "\
+from __future__ import annotations
+
+from typing import Protocol
+from ty_extensions import Top, static_assert
+from ty_extensions._internal import is_subtype_of
+
+class Node(Protocol):
+"
+        .to_string();
+
+        for i in 0..num_methods {
+            writeln!(
+                &mut code,
+                "    def edit_{i}(self, nodes: list[Node]) -> list[Node]: ..."
+            )
+            .ok();
+        }
+
+        code.push_str("\nstatic_assert(is_subtype_of(Top[Node], Node))\n");
+
+        criterion.bench_function(
+            &format!("ty_micro[recursive_protocol_materialization_{num_methods}]"),
+            |b| {
+                b.iter_batched_ref(
+                    || setup_micro_case(&code),
+                    |case| assert_eq!(case.db.check().len(), 0),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+}
+
+/// Comparing a recursive protocol whose specializations grow should not repeatedly expand its
+/// members.
+fn benchmark_recursive_protocol_growing_specialization(criterion: &mut Criterion) {
+    setup_rayon();
+
+    let mut code = "\
+from __future__ import annotations
+
+from typing import Protocol
+from ty_extensions import Top, static_assert
+from ty_extensions._internal import is_subtype_of
+
+class Node[T](Protocol):
+    def value(self) -> T: ...
+"
+    .to_string();
+    for i in 0..16 {
+        writeln!(
+            &mut code,
+            "    def child_{i}(self) -> Node[tuple[T, T]]: ..."
+        )
+        .ok();
+    }
+    code.push_str("\nstatic_assert(is_subtype_of(Top[Node[int]], Node[int]))\n");
+
+    criterion.bench_function("ty_micro[recursive_protocol_growing_specialization]", |b| {
+        b.iter_batched_ref(
+            || setup_micro_case(&code),
+            |case| assert_eq!(case.db.check().len(), 0),
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+/// Regression benchmark for a recursive protocol with a specialized receiver.
+///
+/// Comparing these types can repeatedly bind `read` to deeper specializations of `Node`.
+fn benchmark_recursive_protocol_specialized_receiver(criterion: &mut Criterion) {
+    setup_rayon();
+
+    let code = r#"
+from __future__ import annotations
+
+from typing import Protocol
+from ty_extensions import Top, static_assert
+from ty_extensions._internal import is_subtype_of
+
+class Node[T](Protocol):
+    def child(self) -> Node[tuple[T, T]]: ...
+    def read(self: Node[int]) -> int: ...
+
+static_assert(is_subtype_of(Top[Node[int]], Node[int]))
+"#;
+
+    criterion.bench_function("ty_micro[recursive_protocol_specialized_receiver]", |b| {
+        b.iter_batched_ref(
+            || setup_micro_case(code),
+            |case| assert_eq!(case.db.check().len(), 0),
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+/// Regression benchmark for a recursively specialized context-manager yield type.
+fn benchmark_async_context_manager_recursive_protocol(criterion: &mut Criterion) {
+    setup_rayon();
+
+    let code = r#"
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from typing import Protocol
+
+class Stream[T](Protocol):
+    def flatten(self: Stream[Stream[T]]) -> None: ...
+
+@asynccontextmanager
+async def open_stream(value: Stream[int]) -> AsyncGenerator[Stream[int], None]:
+    yield value
+"#;
+
+    criterion.bench_function("ty_micro[async_context_manager_recursive_protocol]", |b| {
+        b.iter_batched_ref(
+            || setup_micro_case(code),
+            |case| assert_eq!(case.db.check().len(), 0),
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 /// Regression benchmark for large calls to a gradual variadic tail.
 ///
 /// Without the gradual-call shortcut, every positional argument type is folded into the same
@@ -2718,6 +2854,69 @@ fn benchmark_repeated_statement_calls(criterion: &mut Criterion) {
         );
 
         benchmark_micro_case(criterion, name, &code);
+    }
+
+    for (name, subsequent_keyword, prefix_calls) in [
+        ("ty_micro[repeated_statement_calls_in_if_branches]", "if", 0),
+        (
+            "ty_micro[repeated_statement_calls_in_elif_branches]",
+            "elif",
+            0,
+        ),
+        (
+            "ty_micro[repeated_statement_calls_before_elif_branches]",
+            "elif",
+            6_000,
+        ),
+    ] {
+        let mut code = String::from("def call() -> None:\n    pass\n");
+        for index in 0..prefix_calls + 6_000 {
+            writeln!(&mut code, "call_{index} = call").unwrap();
+        }
+        if prefix_calls == 0 {
+            code.push_str("def f(flag: int) -> None:\n");
+        } else {
+            code.push_str(
+                "def f(flag: int, include_prefix: bool) -> None:\n    if include_prefix:\n",
+            );
+            for index in 0..prefix_calls {
+                writeln!(&mut code, "        call_{index}()").unwrap();
+            }
+        }
+        for branch in 0..150 {
+            let keyword = if branch == 0 {
+                "if"
+            } else {
+                subsequent_keyword
+            };
+            writeln!(&mut code, "    {keyword} flag == {branch}:").unwrap();
+            for index in prefix_calls + branch * 40..prefix_calls + (branch + 1) * 40 {
+                writeln!(&mut code, "        call_{index}()").unwrap();
+            }
+            if prefix_calls > 0 {
+                code.push_str("        values = []\n        options = {}\n");
+            }
+        }
+
+        // Importing the function builds its semantic index without inferring its body. Distinct
+        // callee names create places whose pending call gates are materialized at branch merges.
+        criterion.bench_function(name, |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut case = setup_micro_case("from dependency import f");
+                    case.db
+                        .write_file(SystemPath::new("/src/dependency.py"), &code)
+                        .unwrap();
+                    case
+                },
+                |case| {
+                    let Case { db } = case;
+                    let result = db.check();
+                    assert_eq!(result.len(), 0);
+                },
+                BatchSize::SmallInput,
+            );
+        });
     }
 }
 

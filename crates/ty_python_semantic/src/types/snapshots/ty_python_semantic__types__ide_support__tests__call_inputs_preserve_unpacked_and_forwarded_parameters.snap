@@ -1,0 +1,36 @@
+---
+source: crates/ty_python_semantic/src/types/ide_support.rs
+expression: "call_inputs(r#\"\nfrom typing import Callable, TypedDict, Unpack\n\nclass Options(TypedDict):\n    count: int\n    name: str\ndef target(count: int, *, name: str) -> None: ...\ndef invoke[**P, R](f: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R: ...\ndef fields(**kwargs: Unpack[Options]) -> None: ...\ndef pair(first: int, second: str) -> None: ...\noptions: Options = {\"count\": 1, \"name\": \"x\"}\npair(*(1, \"x\"))\nfields(**options)\ninvoke(target, 1, name=\"x\")\n\"#,)?"
+---
+[
+    Ok(
+        [
+            [
+                "Literal[1] <: int: true",
+                "Literal[\"x\"] <: str: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "int <: int: true",
+                "str <: str: true",
+                "object <: object: true",
+            ],
+        ],
+    ),
+    Ok(
+        [
+            [
+                "def target(count: int, *, name: str) -> None <: (count: int, *, name: str) -> None: true",
+            ],
+            [
+                "Literal[1] <: int: true",
+            ],
+            [
+                "Literal[\"x\"] <: str: true",
+            ],
+        ],
+    ),
+]

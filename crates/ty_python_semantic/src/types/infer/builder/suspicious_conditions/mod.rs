@@ -86,7 +86,7 @@ use self::exemptions::RedundantConditionContext;
 /// This is used to determine which diagnostic rule would apply to the condition.
 #[derive(Debug, PartialEq, Eq)]
 enum ConditionKind<'db> {
-    /// A condition whose value type is assignable to `int`, including `bool`.
+    /// A condition whose value type is assignable to `bool | int`.
     ///
     /// These tests commonly enforce runtime invariants, so they are only flagged by the
     /// opt-in `redundant-condition-strict` rule and are exempted entirely in `assert` tests.
@@ -402,9 +402,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             &TRUTHINESS_TEST_OF_NONE_UNION,
         ];
 
-        !self.in_string_annotation()
+        // Specializing an overload can make a necessary source test constant or suspicious.
+        // Ordinary inference checks these condition lints against the shared implementation.
+        self.context.body_domain.is_none()
+            && !self.in_detached_annotation()
             && self.db().should_check_file(self.file())
-            && !self.file().is_stub(self.db())
+            && !self.program_file().is_stub(self.db())
             && RELEVANT_RULES
                 .iter()
                 .any(|rule| self.context.is_lint_enabled(rule))
@@ -541,6 +544,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
 
         for (i, statement) in suite.iter().enumerate() {
+            if self.index.is_excluded(statement.range()) {
+                continue;
+            }
             match statement {
                 ast::Stmt::If(if_stmt) => {
                     let ast::StmtIf {
@@ -733,7 +739,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             } else {
                 return None;
             }
-        } else if value_type.is_assignable_to(db, env, KnownClass::Int.to_instance(db, env)) {
+        } else if value_type.is_assignable_to(
+            db,
+            env,
+            UnionType::from_two_elements(
+                db,
+                env,
+                KnownClass::Bool.to_instance(db, env),
+                KnownClass::Int.to_instance(db, env),
+            ),
+        ) {
             ConditionKind::Boolean
         } else if value_type.bool(db, env).is_ambiguous() {
             ConditionKind::ShortCircuit
@@ -1275,7 +1290,7 @@ fn suite_ends_with_exit(
     suite
         .iter()
         .rev()
-        .find(|stmt| !is_trivial_statement(stmt))
+        .find(|stmt| !builder.index.is_excluded(stmt.range()) && !is_trivial_statement(stmt))
         .is_some_and(|stmt| match stmt {
             ast::Stmt::Raise(_) => true,
             ast::Stmt::Break(_) | ast::Stmt::Continue(_) => kind == SuiteExitKind::Any,

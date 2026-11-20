@@ -1361,6 +1361,41 @@ def open_typed_dict_container(value: Literal["present", "other", "missing", 1], 
         reveal_type(value)  # revealed: Literal["present", "other", "missing"]
 ```
 
+## Explicit extra items retain their contracts
+
+A present key already has a field contract when extra items are explicit. Its value type and
+mutability remain available after the membership test.
+
+```py
+from typing_extensions import ReadOnly, TypedDict
+
+class MutableExtras(TypedDict, extra_items=int): ...
+class ReadOnlyExtras(TypedDict, extra_items=ReadOnly[int]): ...
+class HiddenExtras(TypedDict): ...
+class NoExtras(TypedDict, closed=True): ...
+
+def mutable(values: MutableExtras):
+    if "extra" in values:
+        reveal_type(values)  # revealed: MutableExtras
+        reveal_type(values["extra"])  # revealed: int
+        reveal_type(values.pop("extra"))  # revealed: int
+        values["extra"] = "wrong"  # error: [invalid-assignment]
+
+def readonly(values: ReadOnlyExtras):
+    if "extra" in values:
+        reveal_type(values)  # revealed: ReadOnlyExtras
+        reveal_type(values["extra"])  # revealed: int
+        values.pop("extra")  # error: [invalid-argument-type]
+
+def hidden(values: HiddenExtras):
+    if "extra" in values:
+        reveal_type(values["extra"])  # revealed: object
+
+def closed(values: NoExtras):
+    if "extra" in values:
+        reveal_type(values)  # revealed: Never
+```
+
 ## bool
 
 ```py
@@ -1549,4 +1584,56 @@ def test(x: Literal["none", "auto", "required"] | tuple[list[str], Literal["auto
         reveal_type(x)  # revealed: Literal["auto", "required"]
     else:
         reveal_type(x)  # revealed: Literal["none"] | tuple[list[str], Literal["auto", "required"]]
+```
+
+## Reading a dictionary after membership
+
+A membership test accepts an equal key even when it has a different type. For example, the
+integer key `1` matches the float `1.0`. The dictionary's stored value is a string; the key of
+the comprehension's result is the float from the input.
+
+```py
+from typing import final
+
+@final
+class IntKeys(dict[int, str]): ...
+
+def can_proceed(data: dict[int, str]) -> bool:
+    data.clear()
+    return True
+
+def select(keys: list[float], data: IntKeys, other: dict[int, str]):
+    result = {k: data[k] for k in keys if k in data}
+    reveal_type(result)  # revealed: dict[float, str]
+    # error: [invalid-argument-type]
+    wrong_map = [data[k] for k in keys if k in other]
+    # error: [invalid-argument-type]
+    unguarded = [data[k] for k in keys]
+    # error: [invalid-argument-type]
+    changed = [data[k] for k in keys if k in data if can_proceed(data)]
+
+def changed_receiver(keys: list[float], data: IntKeys, other: IntKeys):
+    for k in keys:
+        if k in data:
+            data = other
+            # error: [invalid-argument-type]
+            data[k]
+
+@final
+class AlwaysContains(dict[int, str]):
+    def __contains__(self, key: object, /) -> bool:
+        return True
+
+def overridden(keys: list[float], data: AlwaysContains):
+    # error: [invalid-argument-type]
+    return [data[k] for k in keys if k in data]
+
+@final
+class OtherLookup(dict[int, str]):
+    def __getitem__(self, key: int, /) -> str:
+        return ""
+
+def overridden_lookup(keys: list[float], data: OtherLookup):
+    # error: [invalid-argument-type]
+    return [data[k] for k in keys if k in data]
 ```

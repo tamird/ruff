@@ -10,6 +10,7 @@ use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange};
 
 use super::{DeferredExpressionState, InferenceRegion, TypeInferenceBuilder};
+use crate::provided::{ProvidedTypeApplication, TypeExpressionContext};
 use crate::types::call::CallArguments;
 use crate::types::diagnostic::{
     self, CYCLIC_TYPE_ALIAS_DEFINITION, EXPERIMENTAL_SYNTAX, INVALID_INIT_TYPE_VARIABLE,
@@ -26,8 +27,8 @@ use crate::types::infer::{
 };
 use crate::types::signatures::{ConcatenateTail, Signature};
 use crate::types::special_form::{AliasSpec, LegacyStdlibAlias};
-use crate::types::string_annotation::parse_string_annotation;
 use crate::types::tuple::{TupleSpec, TupleSpecBuilder, TupleType};
+use crate::types::typevar::TypeVarDomain;
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::scope::ScopeKind;
 
@@ -35,7 +36,7 @@ use crate::types::{
     BindingContext, CallableType, DynamicType, GenericContext, IntersectionBuilder,
     IntersectionType, InvalidTypeExpression, KnownClass, KnownInstanceType, LintDiagnosticGuard,
     Parameter, Parameters, SpecialFormType, SubclassOfType, Type, TypeCheckDiagnostics,
-    TypeContext, TypeFormType, TypeGuardType, TypeIsType, TypeMapping, TypeVarKind, UnionBuilder,
+    TypeContext, TypeFormType, TypeGuardType, TypeIsType, TypeMapping, TypeQualifiers, TypeVarKind, UnionBuilder,
     UnionType, any_over_type, binding_type, todo_type,
 };
 use crate::{FxOrderSet, SemanticModel, add_inferred_python_version_hint_to_diagnostic};
@@ -53,6 +54,95 @@ enum LegacyTypeAliasReference<'db> {
     Invalid,
     /// Use ordinary value-to-type conversion, including recovery for invalid type arguments.
     ValueFallback,
+}
+
+impl<'db> TypeExpressionContext<'db> for TypeInferenceBuilder<'db, '_> {
+    fn program_file(&self) -> ty_python_core::ProgramFile<'db> {
+        self.program_file()
+    }
+
+    fn infer_value_expression(&mut self, expression: &ast::Expr) -> Type<'db> {
+        self.infer_maybe_standalone_expression(expression, TypeContext::default())
+    }
+
+    fn infer_type_expression(&mut self, expression: &ast::Expr) -> Type<'db> {
+        self.infer_type_expression(expression)
+    }
+
+    fn infer_annotation_expression(
+        &mut self,
+        expression: &ast::Expr,
+    ) -> (Type<'db>, TypeQualifiers) {
+        let annotation = self.infer_annotation_expression(expression, self.deferred_state);
+        (annotation.inner_type_or_unknown(), annotation.qualifiers())
+    }
+
+    fn capture_keyword_parameters(
+        &mut self,
+        application: &ast::ExprSubscript,
+        parameter_specification: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let db = self.db();
+        let flags = self.inference_flags();
+        let Type::TypeVar(parameter_specification) = parameter_specification
+            .in_type_expression(
+                db,
+                self.scope(),
+                self.typevar_binding_context,
+                flags | InferenceFlags::ALLOW_PARAMSPEC_TYPE_EXPR,
+            )
+            .ok()?
+        else {
+            return None;
+        };
+        if parameter_specification.domain(db) != TypeVarDomain::ParameterSignature {
+            return None;
+        }
+        if !flags.contains(InferenceFlags::IN_KWARG_ANNOTATION)
+            || flags.contains(InferenceFlags::IN_NESTED_TYPE_EXPRESSION)
+        {
+            self.report_invalid_type_form(
+                application.range(),
+                "Keyword parameters must annotate a keyword-variadic parameter directly",
+            );
+            return Some(Type::unknown());
+        }
+        self.store_type_expression_flags(
+            ast::ExprRef::from(application),
+            TypeExpressionFlags::KEYWORD_PARAM_SPEC,
+        );
+        Some(Type::TypeVar(
+            parameter_specification.captured_keyword_arguments(db),
+        ))
+    }
+
+    fn infer_specialized_return_type(
+        &mut self,
+        subscript: &ast::ExprSubscript,
+        signature: &Signature<'db>,
+    ) -> Type<'db> {
+        let db = self.db();
+        let context = signature.generic_context.unwrap_or_else(|| {
+            GenericContext::from_typevar_instances(db, self.program_environment(), [])
+        });
+        let value_ty = Type::single_callable(db, signature.clone());
+        self.infer_explicit_callable_specialization(subscript, value_ty, context, &|arguments| {
+            signature.return_type().apply_specialization(
+                db,
+                context.specialize_partial(db, arguments.iter().copied()),
+            )
+        })
+    }
+
+    fn report_invalid_type_form(&mut self, range: TextRange, message: &str) {
+        if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, range) {
+            builder.into_diagnostic(message);
+        }
+    }
+
+    fn store_expression_type(&mut self, expression: &ast::Expr, ty: Type<'db>) {
+        self.store_expression_type(expression, ty);
+    }
 }
 
 /// Type expressions
@@ -281,7 +371,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 (resolved.inner_type(), resolved.provenance().definition())
             }
             _ => (
-                self.infer_expression(expression, TypeContext::default()),
+                self.infer_maybe_standalone_expression(expression, TypeContext::default()),
                 None,
             ),
         }
@@ -295,6 +385,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     ) -> Type<'db> {
         let db = self.db();
         let env = self.program_environment();
+        if let Some(ty) = db.provided_type_reference(self.program_file(), ty, definition) {
+            return ty;
+        }
         match self.legacy_type_alias_reference(ty, definition, annotation) {
             LegacyTypeAliasReference::Alias(alias, parameters) => {
                 let specialization =
@@ -467,7 +560,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         }
                     }
                 } else {
-                    if !self.in_string_annotation() {
+                    if !self.in_detached_annotation() {
                         self.infer_attribute_expression(attribute_expression);
                     }
                     self.report_invalid_type_expression(
@@ -525,9 +618,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     }
                     ty
                 } else {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(value, TypeContext::default());
-                        self.infer_expression(slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(value, TypeContext::default());
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     }
                     self.report_invalid_type_expression(
                         expression,
@@ -566,10 +659,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             // Infer the operands as values to report the types used by the runtime
                             // operation rather than their interpretation as type expressions.
                             let mut speculative_builder = self.speculate_without_diagnostics();
-                            let left_value = speculative_builder
-                                .infer_expression(&binary.left, TypeContext::default());
+                            let left_value = speculative_builder.infer_maybe_standalone_expression(
+                                &binary.left,
+                                TypeContext::default(),
+                            );
                             let right_value = speculative_builder
-                                .infer_expression(&binary.right, TypeContext::default());
+                                .infer_maybe_standalone_expression(
+                                    &binary.right,
+                                    TypeContext::default(),
+                                );
                             if Type::try_call_bin_op(
                                 db,
                                 env,
@@ -596,7 +694,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         // Avoid inferring the types of invalid binary expressions that have been
                         // parsed from a string annotation, as they are not present in the semantic
                         // index.
-                        if !self.in_string_annotation() {
+                        if !self.in_detached_annotation() {
                             self.infer_binary_expression(binary, TypeContext::default());
                         }
                         self.report_invalid_type_expression(
@@ -713,7 +811,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::List(list) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_list_expression(list, TypeContext::default());
                 }
 
@@ -738,7 +836,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         ));
                     }
 
-                    if !self.in_string_annotation()
+                    if !self.in_detached_annotation()
                         && env.python_version(db) >= PythonVersion::PY39
                         && !single_element.is_starred_expr()
                         && !source_text(db, self.file()).contains_line_break(list.range())
@@ -757,9 +855,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 
             ast::Expr::Tuple(tuple) => {
                 if tuple.parenthesized {
-                    if !self.in_string_annotation() {
+                    if !self.in_detached_annotation() {
                         for element in tuple {
-                            self.infer_expression(element, TypeContext::default());
+                            self.infer_maybe_standalone_expression(element, TypeContext::default());
                         }
                     }
 
@@ -785,7 +883,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             ));
                         }
 
-                        if !self.in_string_annotation()
+                        if !self.in_detached_annotation()
                             && !source_text(db, self.file()).contains_line_break(tuple.range())
                             && env.python_version(db) >= PythonVersion::PY39
                             && !tuple.elts.iter().any(ast::Expr::is_starred_expr)
@@ -836,7 +934,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::BoolOp(bool_op) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_boolean_expression(bool_op, TypeContext::default());
                 }
                 self.report_invalid_type_expression(
@@ -850,7 +948,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Named(named) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_named_expression(named);
                 }
                 self.report_invalid_type_expression(
@@ -879,7 +977,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 if !ignore_experimental_runtime_errors(self) {
                     let operand_value = self
                         .speculate_without_diagnostics()
-                        .infer_expression(operand, TypeContext::default());
+                        .infer_maybe_standalone_expression(operand, TypeContext::default());
                     if let Err(error) = operand_value.try_call_dunder(
                         db,
                         env,
@@ -901,7 +999,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::UnaryOp(unary) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_unary_expression(unary);
                 }
                 self.report_invalid_type_expression(
@@ -915,7 +1013,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Lambda(lambda_expression) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_lambda_expression(lambda_expression, TypeContext::default());
                 }
                 self.report_invalid_type_expression(
@@ -929,7 +1027,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::If(if_expression) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_if_expression(if_expression, TypeContext::default());
                 }
                 self.report_invalid_type_expression(
@@ -943,7 +1041,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Dict(dict) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_dict_expression(dict, TypeContext::default());
                 }
                 if let Some(mut diagnostic) = self.report_invalid_type_expression(
@@ -973,7 +1071,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             hinted_type.display(db, env),
                         ));
                     }
-                    if !self.in_string_annotation()
+                    if !self.in_detached_annotation()
                         && env.python_version(db) >= PythonVersion::PY39
                         && !source_text(db, self.file()).contains_line_break(dict.range())
                         && SemanticModel::new(db, self.program_file())
@@ -1008,7 +1106,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Set(set) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_set_expression(set, TypeContext::default());
                 }
                 if let Some(mut diagnostic) = self.report_invalid_type_expression(
@@ -1032,7 +1130,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         ));
                     }
 
-                    if !self.in_string_annotation()
+                    if !self.in_detached_annotation()
                         && env.python_version(db) >= PythonVersion::PY39
                         && !single_element.is_starred_expr()
                         && !source_text(db, self.file()).contains_line_break(set.range())
@@ -1062,7 +1160,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::DictComp(dictcomp) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_dict_comprehension_expression(dictcomp, TypeContext::default());
                 }
                 self.report_invalid_type_expression(
@@ -1076,7 +1174,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::ListComp(listcomp) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_list_comprehension_expression(listcomp, TypeContext::default());
                 }
                 self.report_invalid_type_expression(
@@ -1090,7 +1188,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::SetComp(setcomp) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_set_comprehension_expression(setcomp, TypeContext::default());
                 }
                 self.report_invalid_type_expression(
@@ -1104,7 +1202,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Generator(generator) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_generator_expression(generator, TypeContext::default());
                 }
                 self.report_invalid_type_expression(
@@ -1118,7 +1216,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Await(await_expression) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_await_expression(await_expression, TypeContext::default());
                 }
                 self.report_invalid_type_expression(
@@ -1132,7 +1230,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Yield(yield_expression) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_yield_expression(yield_expression);
                 }
                 self.report_invalid_type_expression(
@@ -1146,7 +1244,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::YieldFrom(yield_from) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_yield_from_expression(yield_from);
                 }
                 self.report_invalid_type_expression(
@@ -1160,7 +1258,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Compare(compare) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_compare_expression(compare);
                 }
                 self.report_invalid_type_expression(
@@ -1174,7 +1272,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Call(call_expr) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_call_expression(call_expr, TypeContext::default());
                 }
                 self.report_invalid_type_expression(
@@ -1188,7 +1286,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::FString(fstring) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_fstring_expression(fstring);
                 }
                 self.report_invalid_type_expression(
@@ -1202,7 +1300,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::TString(tstring) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_tstring_expression(tstring);
                 }
                 self.report_invalid_type_expression(
@@ -1216,7 +1314,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Slice(slice) => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     self.infer_slice_expression(slice);
                 }
                 self.report_invalid_type_expression(
@@ -1320,7 +1418,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             && !binary.right.is_dict_expr()
         {
             let value =
-                speculative.infer_binary_expression_from_types(binary, left_value, right_value);
+                speculative.infer_binary_expression_from_types(binary, left_value, right_value, TypeContext::default());
             speculative.cycle_recovery.is_none().then_some(value)
         } else {
             None
@@ -1509,6 +1607,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         value_ty: Type<'db>,
         definition: Option<Definition<'db>>,
     ) -> Type<'db> {
+        let application = ProvidedTypeApplication {
+            expression: subscript,
+            value_type: value_ty,
+            definition,
+        };
+        if let Some(ty) = self.db().provided_type_application(application, self) {
+            return ty;
+        }
         let db = self.db();
         let alias_reference =
             self.legacy_type_alias_reference(value_ty, definition, &subscript.value);
@@ -1564,48 +1670,40 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         &mut self,
         string: &ast::ExprStringLiteral,
     ) -> Type<'db> {
-        match parse_string_annotation(&self.context, self.inference_flags(), string) {
-            Some(parsed) => {
-                self.string_annotations
-                    .insert(ruff_python_ast::ExprRef::StringLiteral(string).into());
-                // String annotations are always evaluated in the deferred context.
-                let parsed_expr = parsed.expr();
-                let string_was_nested = self
-                    .inference_flags()
-                    .contains(InferenceFlags::IN_NESTED_TYPE_EXPRESSION);
-                let previously_in_type_expression = self
-                    .context
-                    .inference_flags
-                    .replace(InferenceFlags::IN_TYPE_EXPRESSION, false);
-                let previously_in_nested_type_expression = self
-                    .context
-                    .inference_flags
-                    .replace(InferenceFlags::IN_NESTED_TYPE_EXPRESSION, string_was_nested);
-                let ty = self.infer_type_expression_with_state(
-                    parsed_expr,
-                    DeferredExpressionState::InStringAnnotation(
-                        self.enclosing_node_key(string.into()),
-                    ),
-                );
-                self.context.inference_flags.set(
-                    InferenceFlags::IN_NESTED_TYPE_EXPRESSION,
-                    previously_in_nested_type_expression,
-                );
-                self.context.inference_flags.set(
-                    InferenceFlags::IN_TYPE_EXPRESSION,
-                    previously_in_type_expression,
-                );
-                let parsed_flags = self.type_expression_flags(parsed_expr);
-                if !parsed_flags.is_empty() {
-                    self.store_type_expression_flags(
-                        ruff_python_ast::ExprRef::StringLiteral(string),
-                        parsed_flags,
-                    );
-                }
-                ty
-            }
-            None => Type::unknown(),
+        let Some(annotation) = self.parse_string_annotation(string) else {
+            return Type::unknown();
+        };
+        let Some((parsed_expr, state)) = self.annotation_expression(&annotation) else {
+            return Type::unknown();
+        };
+        let string_was_nested = self
+            .inference_flags()
+            .contains(InferenceFlags::IN_NESTED_TYPE_EXPRESSION);
+        let previously_in_type_expression = self
+            .context
+            .inference_flags
+            .replace(InferenceFlags::IN_TYPE_EXPRESSION, false);
+        let previously_in_nested_type_expression = self
+            .context
+            .inference_flags
+            .replace(InferenceFlags::IN_NESTED_TYPE_EXPRESSION, string_was_nested);
+        let ty = self.infer_type_expression_with_state(parsed_expr, state);
+        self.context.inference_flags.set(
+            InferenceFlags::IN_NESTED_TYPE_EXPRESSION,
+            previously_in_nested_type_expression,
+        );
+        self.context.inference_flags.set(
+            InferenceFlags::IN_TYPE_EXPRESSION,
+            previously_in_type_expression,
+        );
+        let parsed_flags = self.type_expression_flags(parsed_expr);
+        if !parsed_flags.is_empty() {
+            self.store_type_expression_flags(
+                ruff_python_ast::ExprRef::StringLiteral(string),
+                parsed_flags,
+            );
         }
+        ty
     }
 
     /// Return the type represented by a `tuple[]` expression in a type annotation.
@@ -1624,7 +1722,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         match &*tuple.slice {
             ast::Expr::Tuple(elements) => {
                 if let [element, ellipsis @ ast::Expr::EllipsisLiteral(_)] = &*elements.elts {
-                    self.infer_expression(ellipsis, TypeContext::default());
+                    self.infer_maybe_standalone_expression(ellipsis, TypeContext::default());
                     let previously_in_valid_unpack_context = self
                         .context
                         .inference_flags
@@ -1847,8 +1945,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 infer_type_argument(self, slice)
             }
             ast::Expr::Tuple(_) => {
-                if !self.in_string_annotation() {
-                    self.infer_expression(slice, TypeContext::default());
+                if !self.in_detached_annotation() {
+                    self.infer_maybe_standalone_expression(slice, TypeContext::default());
                 }
                 if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, slice) {
                     builder.into_diagnostic("type[...] must have exactly one type argument");
@@ -1856,7 +1954,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 Type::unknown()
             }
             ast::Expr::NoneLiteral(_) => {
-                self.infer_expression(slice, TypeContext::default());
+                self.infer_maybe_standalone_expression(slice, TypeContext::default());
                 KnownClass::NoneType.to_subclass_of(db, env)
             }
             ast::Expr::Subscript(ast::ExprSubscript { value, .. }) if !is_dotted_name(value) => {
@@ -1869,7 +1967,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     ..
                 },
             ) => {
-                let parameters_ty = match self.infer_expression(value, TypeContext::default()) {
+                let parameters_ty = match self
+                    .infer_maybe_standalone_expression(value, TypeContext::default())
+                {
                     Type::SpecialForm(SpecialFormType::Union) => match &**parameters {
                         ast::Expr::Tuple(tuple) => {
                             let ty = UnionType::from_elements_leave_aliases(
@@ -1917,8 +2017,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                                     )
                                 }
                                 None => {
-                                    if !self.in_string_annotation() {
-                                        self.infer_expression(parameters, TypeContext::default());
+                                    if !self.in_detached_annotation() {
+                                        self.infer_maybe_standalone_expression(
+                                            parameters,
+                                            TypeContext::default(),
+                                        );
                                     }
                                     self.report_invalid_type_expression(
                                         subscript,
@@ -2044,12 +2147,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         match value_ty {
             Type::Never => {
                 // This case can be entered when we use a type annotation like `Literal[1]`
-                // in unreachable code, since we infer `Never` for `Literal`.  We call
-                // `infer_expression` (instead of `infer_type_expression`) here to avoid
+                // in unreachable code, since we infer `Never` for `Literal`. Use value
+                // inference here to avoid
                 // false-positive `invalid-type-form` diagnostics (`1` is not a valid type
                 // expression).
-                if !self.in_string_annotation() {
-                    self.infer_expression(slice, TypeContext::default());
+                if !self.in_detached_annotation() {
+                    self.infer_maybe_standalone_expression(slice, TypeContext::default());
                 }
                 Type::unknown()
             }
@@ -2058,8 +2161,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
             Type::KnownInstance(known_instance) => match known_instance {
                 KnownInstanceType::SubscriptedProtocol(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2070,8 +2173,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::SubscriptedGeneric(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2082,8 +2185,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::Deprecated(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2094,8 +2197,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::Field(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2106,8 +2209,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::ConstraintSet(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2118,8 +2221,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::ConstraintSetSolution(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2130,8 +2233,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::GenericContext(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2142,8 +2245,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::Specialization(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2164,8 +2267,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                                 Type::TypeAlias,
                             ),
                         None => {
-                            if !self.in_string_annotation() {
-                                self.infer_expression(slice, TypeContext::default());
+                            if !self.in_detached_annotation() {
+                                self.infer_maybe_standalone_expression(
+                                    slice,
+                                    TypeContext::default(),
+                                );
                             }
                             if let Some(builder) =
                                 self.context.report_lint(&NOT_SUBSCRIPTABLE, subscript)
@@ -2194,8 +2300,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     }
                 }
                 KnownInstanceType::Literal(ty) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2216,8 +2322,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     if typevar.identity(self.db()).kind(self.db()) == TypeVarKind::Pep613Alias {
                         self.infer_explicit_type_alias_specialization(subscript, value_ty, false)
                     } else {
-                        if !self.in_string_annotation() {
-                            self.infer_expression(slice, TypeContext::default());
+                        if !self.in_detached_annotation() {
+                            self.infer_maybe_standalone_expression(slice, TypeContext::default());
                         }
                         if let Some(builder) =
                             self.context.report_lint(&INVALID_TYPE_FORM, subscript)
@@ -2237,8 +2343,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     self.infer_explicit_type_alias_specialization(subscript, value_ty, true)
                 }
                 KnownInstanceType::NewType(newtype) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(&subscript.slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(
+                            &subscript.slice,
+                            TypeContext::default(),
+                        );
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2249,8 +2358,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::Sentinel(sentinel) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(&subscript.slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(
+                            &subscript.slice,
+                            TypeContext::default(),
+                        );
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2261,8 +2373,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::NamedTupleSpec(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(&subscript.slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(
+                            &subscript.slice,
+                            TypeContext::default(),
+                        );
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2282,8 +2397,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::MethodWrapper(wrapper) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(&subscript.slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(
+                            &subscript.slice,
+                            TypeContext::default(),
+                        );
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2294,8 +2412,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     Type::unknown()
                 }
                 KnownInstanceType::Range { .. } => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(&subscript.slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(
+                            &subscript.slice,
+                            TypeContext::default(),
+                        );
                     }
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                         builder.into_diagnostic(format_args!(
@@ -2312,8 +2433,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 // Infer slice as a value expression to avoid false-positive
                 // `invalid-type-form` diagnostics, when we have e.g.
                 // `MyCallable[[int, str], None]` but `MyCallable` is dynamic.
-                if !self.in_string_annotation() {
-                    self.infer_expression(slice, TypeContext::default());
+                if !self.in_detached_annotation() {
+                    self.infer_maybe_standalone_expression(slice, TypeContext::default());
                 }
                 value_ty
             }
@@ -2328,8 +2449,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             |class| Type::instance(db, env, class),
                         ),
                     _ => {
-                        if !self.in_string_annotation() {
-                            self.infer_expression(slice, TypeContext::default());
+                        if !self.in_detached_annotation() {
+                            self.infer_maybe_standalone_expression(slice, TypeContext::default());
                         }
                         self.report_invalid_type_expression(
                             subscript,
@@ -2346,7 +2467,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 self.infer_explicit_type_alias_specialization(subscript, value_ty, true)
             }
             Type::LiteralValue(literal) if literal.is_string() => {
-                self.infer_expression(slice, TypeContext::default());
+                self.infer_maybe_standalone_expression(slice, TypeContext::default());
                 // For stringified TypeAlias; remove once properly supported
                 todo_type!("string literal subscripted in type expression")
             }
@@ -2356,8 +2477,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 union.elements(db).iter().copied(),
             ),
             _ => {
-                if !self.in_string_annotation() {
-                    self.infer_expression(slice, TypeContext::default());
+                if !self.in_detached_annotation() {
+                    self.infer_maybe_standalone_expression(slice, TypeContext::default());
                 }
                 if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                     builder.into_diagnostic(format_args!(
@@ -2492,7 +2613,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             "Did you mean `Callable[..., {}]`?",
                             returns.display(db, builder.program_environment())
                         ));
-                        if !builder.in_string_annotation()
+                        if !builder.in_detached_annotation()
                             && !source_text(db, builder.file())
                                 .contains_line_break(first_argument.range())
                         {
@@ -2670,9 +2791,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 let negated_type = if num_arguments == 1 {
                     self.infer_type_expression(&arguments[0]).negate(db, env)
                 } else {
-                    if !self.in_string_annotation() {
+                    if !self.in_detached_annotation() {
                         for argument in arguments {
-                            self.infer_expression(argument, TypeContext::default());
+                            self.infer_maybe_standalone_expression(
+                                argument,
+                                TypeContext::default(),
+                            );
                         }
                     }
                     report_invalid_argument_number_to_special_form(
@@ -2716,9 +2840,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 let arg = if num_arguments == 1 {
                     self.infer_type_expression(&arguments[0])
                 } else {
-                    if !self.in_string_annotation() {
+                    if !self.in_detached_annotation() {
                         for argument in arguments {
-                            self.infer_expression(argument, TypeContext::default());
+                            self.infer_maybe_standalone_expression(
+                                argument,
+                                TypeContext::default(),
+                            );
                         }
                     }
                     report_invalid_argument_number_to_special_form(
@@ -2742,9 +2869,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 let arg = if num_arguments == 1 {
                     self.infer_type_expression(&arguments[0])
                 } else {
-                    if !self.in_string_annotation() {
+                    if !self.in_detached_annotation() {
                         for argument in arguments {
-                            self.infer_expression(argument, TypeContext::default());
+                            self.infer_maybe_standalone_expression(
+                                argument,
+                                TypeContext::default(),
+                            );
                         }
                     }
                     report_invalid_argument_number_to_special_form(
@@ -2766,12 +2896,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 };
                 let num_arguments = arguments.len();
                 let type_of_type = if num_arguments == 1 {
-                    // N.B. This uses `infer_expression` rather than `infer_type_expression`
-                    self.infer_expression(&arguments[0], TypeContext::default())
+                    // Infer the argument as a runtime value.
+                    self.infer_maybe_standalone_expression(&arguments[0], TypeContext::default())
                 } else {
-                    if !self.in_string_annotation() {
+                    if !self.in_detached_annotation() {
                         for argument in arguments {
-                            self.infer_expression(argument, TypeContext::default());
+                            self.infer_maybe_standalone_expression(
+                                argument,
+                                TypeContext::default(),
+                            );
                         }
                     }
                     report_invalid_argument_number_to_special_form(
@@ -2799,9 +2932,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 } else {
                     let num_arguments = arguments.len();
 
-                    if !self.in_string_annotation() {
+                    if !self.in_detached_annotation() {
                         for argument in arguments {
-                            self.infer_expression(argument, TypeContext::default());
+                            self.infer_maybe_standalone_expression(
+                                argument,
+                                TypeContext::default(),
+                            );
                         }
                     }
                     report_invalid_argument_number_to_special_form(
@@ -2829,9 +2965,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 let num_arguments = arguments.len();
 
                 if num_arguments != 1 {
-                    if !self.in_string_annotation() {
+                    if !self.in_detached_annotation() {
                         for argument in arguments {
-                            self.infer_expression(argument, TypeContext::default());
+                            self.infer_maybe_standalone_expression(
+                                argument,
+                                TypeContext::default(),
+                            );
                         }
                     }
                     report_invalid_argument_number_to_special_form(
@@ -2847,7 +2986,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     return Type::unknown();
                 }
 
-                let argument_type = self.infer_expression(&arguments[0], TypeContext::default());
+                let argument_type =
+                    self.infer_maybe_standalone_expression(&arguments[0], TypeContext::default());
                 let Some(callable_type) = argument_type
                     .try_upcast_to_callable_with_recursive_fallback(
                         db,
@@ -2915,8 +3055,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
             SpecialFormType::TypeIs => match arguments_slice {
                 ast::Expr::Tuple(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(arguments_slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(
+                            arguments_slice,
+                            TypeContext::default(),
+                        );
                     }
 
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
@@ -2941,8 +3084,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             },
             SpecialFormType::TypeGuard => match arguments_slice {
                 ast::Expr::Tuple(_) => {
-                    if !self.in_string_annotation() {
-                        self.infer_expression(arguments_slice, TypeContext::default());
+                    if !self.in_detached_annotation() {
+                        self.infer_maybe_standalone_expression(
+                            arguments_slice,
+                            TypeContext::default(),
+                        );
                     }
 
                     if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
@@ -3029,7 +3175,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     .context
                     .inference_flags
                     .replace(InferenceFlags::IN_UNPACK_TYPE_ARGUMENT, true);
-                let inner_ty = if self.in_string_annotation()
+                let inner_ty = if self.in_detached_annotation()
                     && (is_nested_unpack || is_nested_kwargs || is_invalid_context)
                 {
                     // Invalid string annotations never execute, so their operands must not
@@ -3111,8 +3257,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             | SpecialFormType::Never
             | SpecialFormType::AlwaysTruthy
             | SpecialFormType::AlwaysFalsy => {
-                if !self.in_string_annotation() {
-                    self.infer_expression(arguments_slice, TypeContext::default());
+                if !self.in_detached_annotation() {
+                    self.infer_maybe_standalone_expression(arguments_slice, TypeContext::default());
                 }
 
                 if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
@@ -3130,8 +3276,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             | SpecialFormType::Todo
             | SpecialFormType::Any
             | SpecialFormType::NamedTuple => {
-                if !self.in_string_annotation() {
-                    self.infer_expression(arguments_slice, TypeContext::default());
+                if !self.in_detached_annotation() {
+                    self.infer_maybe_standalone_expression(arguments_slice, TypeContext::default());
                 }
 
                 if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
@@ -3142,7 +3288,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 Type::unknown()
             }
             SpecialFormType::LiteralString => {
-                self.infer_expression(arguments_slice, TypeContext::default());
+                self.infer_maybe_standalone_expression(arguments_slice, TypeContext::default());
                 if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                     let mut diag =
                         builder.into_diagnostic("`LiteralString` expects no type parameter");
@@ -3180,8 +3326,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             SpecialFormType::Type => self.infer_subclass_of_type_expression(arguments_slice),
             SpecialFormType::Tuple => Type::tuple(self.infer_tuple_type_expression(subscript)),
             SpecialFormType::Generic | SpecialFormType::Protocol => {
-                if !self.in_string_annotation() {
-                    self.infer_expression(arguments_slice, TypeContext::default());
+                if !self.in_detached_annotation() {
+                    self.infer_maybe_standalone_expression(arguments_slice, TypeContext::default());
                 }
                 if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                     builder.into_diagnostic(format_args!(
@@ -3202,7 +3348,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let env = self.program_environment();
         let ty = match parameters {
             ast::Expr::Subscript(ast::ExprSubscript { value, slice, .. }) => {
-                let value_ty = self.infer_expression(value, TypeContext::default());
+                let value_ty =
+                    self.infer_maybe_standalone_expression(value, TypeContext::default());
                 if matches!(value_ty, Type::SpecialForm(SpecialFormType::Literal)) {
                     let ty = self.infer_literal_parameter_type(slice)?;
 
@@ -3211,7 +3358,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     self.store_expression_type(parameters, ty);
                     ty
                 } else {
-                    self.infer_expression(slice, TypeContext::default());
+                    self.infer_maybe_standalone_expression(slice, TypeContext::default());
                     self.store_expression_type(parameters, Type::unknown());
 
                     return Err(vec![parameters]);
@@ -3248,9 +3395,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             literal @ (ast::Expr::StringLiteral(_)
             | ast::Expr::BytesLiteral(_)
             | ast::Expr::BooleanLiteral(_)
-            | ast::Expr::NoneLiteral(_)) => self.infer_expression(literal, TypeContext::default()),
+            | ast::Expr::NoneLiteral(_)) => {
+                self.infer_maybe_standalone_expression(literal, TypeContext::default())
+            }
             literal @ ast::Expr::NumberLiteral(number) if number.value.is_int() => {
-                self.infer_expression(literal, TypeContext::default())
+                self.infer_maybe_standalone_expression(literal, TypeContext::default())
             }
 
             // for negative and positive numbers
@@ -3270,7 +3419,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
             // enum members and aliases to literal types
             ast::Expr::Name(_) | ast::Expr::Attribute(_) => {
-                let subscript_ty = self.infer_expression(parameters, TypeContext::default());
+                let subscript_ty =
+                    self.infer_maybe_standalone_expression(parameters, TypeContext::default());
                 match subscript_ty {
                     // type aliases to literal types
                     Type::KnownInstance(KnownInstanceType::TypeAliasType(type_alias)) => {
@@ -3301,8 +3451,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 return Err(vec![parameters]);
             }
             _ => {
-                if !self.in_string_annotation() {
-                    self.infer_expression(parameters, TypeContext::default());
+                if !self.in_detached_annotation() {
+                    self.infer_maybe_standalone_expression(parameters, TypeContext::default());
                 }
                 return Err(vec![parameters]);
             }
@@ -3381,7 +3531,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 return Some(Parameters::from_annotation(db, parameters));
             }
             ast::Expr::Subscript(subscript) => {
-                let value_ty = self.infer_expression(&subscript.value, TypeContext::default());
+                let value_ty = self
+                    .infer_maybe_standalone_expression(&subscript.value, TypeContext::default());
 
                 if matches!(value_ty, Type::SpecialForm(SpecialFormType::Concatenate)) {
                     return Some(self.infer_concatenate_special_form(subscript));
@@ -3425,21 +3576,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 }
             }
             ast::Expr::StringLiteral(string) => {
-                if let Some(parsed) =
-                    parse_string_annotation(&self.context, self.inference_flags(), string)
+                if let Some(annotation) = self.parse_string_annotation(string)
+                    && let Some((expression, state)) = self.annotation_expression(&annotation)
                 {
-                    self.string_annotations
-                        .insert(ruff_python_ast::ExprRef::StringLiteral(string).into());
-                    let node_key = self.enclosing_node_key(string.into());
-
-                    let previous_deferred_state = self.replace_deferred_state(
-                        DeferredExpressionState::InStringAnnotation(node_key),
-                    );
+                    let previous_deferred_state = self.replace_deferred_state(state);
                     let result = matches!(
-                        parsed.expr(),
+                        expression,
                         ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Subscript(_)
                     )
-                    .then(|| self.infer_callable_parameter_types(parsed.expr()));
+                    .then(|| self.infer_callable_parameter_types(expression));
                     self.deferred_state = previous_deferred_state;
 
                     if let Some(result) = result {
@@ -3480,9 +3625,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let (last_arg, prefix_args) = match arguments.split_last() {
             Some((last_arg, prefix_args)) if !prefix_args.is_empty() => (last_arg, prefix_args),
             _ => {
-                if !self.in_string_annotation() {
+                if !self.in_detached_annotation() {
                     for argument in arguments {
-                        self.infer_expression(argument, TypeContext::default());
+                        self.infer_maybe_standalone_expression(argument, TypeContext::default());
                     }
                 }
                 if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
@@ -3570,28 +3715,21 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 Some(ConcatenateTail::ParamSpec(typevar))
             }
             ast::Expr::StringLiteral(string) => {
-                let Some(parsed) =
-                    parse_string_annotation(&self.context, self.inference_flags(), string)
-                else {
+                let Some(annotation) = self.parse_string_annotation(string) else {
                     report_invalid_concatenate_last_arg(&self.context, expr, Type::unknown());
                     return None;
                 };
-
-                self.string_annotations
-                    .insert(ruff_python_ast::ExprRef::StringLiteral(string).into());
-                let node_key = self.enclosing_node_key(string.into());
-
+                let (expression, state) = self.annotation_expression(&annotation)?;
                 if !matches!(
-                    parsed.expr(),
+                    expression,
                     ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Subscript(_)
                 ) {
                     report_invalid_concatenate_last_arg(&self.context, expr, Type::unknown());
                     return None;
                 }
 
-                let previous_deferred_state = self
-                    .replace_deferred_state(DeferredExpressionState::InStringAnnotation(node_key));
-                let result = self.infer_concatenate_tail(parsed.expr());
+                let previous_deferred_state = self.replace_deferred_state(state);
+                let result = self.infer_concatenate_tail(expression);
                 self.deferred_state = previous_deferred_state;
 
                 result

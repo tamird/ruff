@@ -1546,9 +1546,7 @@ impl<'db> StaticClassLiteral<'db> {
                     let specialization = generic_context.default_specialization(db, self.known(db));
                     // An inherited method's `Self` bound can still contain this class's type
                     // variables, so the default arguments must also specialize that bound.
-                    member.map_type(|ty| {
-                        ty.apply_optional_owner_specialization_to_member(db, Some(specialization))
-                    })
+                    member.map_type(|ty| ty.apply_optional_specialization(db, Some(specialization)))
                 }
             }
         } else {
@@ -2903,7 +2901,7 @@ impl<'db> StaticClassLiteral<'db> {
                 // Annotation-only declarations in stubs also act as bindings for attribute
                 // lookup, but they do not supply field defaults.
                 let mut default_ty = if field_policy == CodeGeneratorKind::TypedDict
-                    || (self.file(db).is_stub(db)
+                    || (self.program_file(db).is_stub(db)
                         && !first_declaration.is_some_and(|definition| {
                             matches!(
                                 definition.kind(db),
@@ -3222,7 +3220,7 @@ impl<'db> StaticClassLiteral<'db> {
                     // Stub assignments to slots describe instance storage, not runtime class
                     // attributes.
                     let has_binding = !(inferred.is_undefined()
-                        || self.file(db).is_stub(db) && self.has_instance_slot(db, name));
+                        || self.program_file(db).is_stub(db) && self.has_instance_slot(db, name));
 
                     let union_with_implicit = |implicit: DefinedPlace<'db>| Member {
                         inner: Place::Defined(DefinedPlace {

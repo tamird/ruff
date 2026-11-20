@@ -120,6 +120,20 @@ def to_str(x: int | str):
 reveal_type(to_str(1))  # revealed: str
 ```
 
+## Generic wrappers
+
+A generic wrapper that returns a function unchanged preserves that function's inferred return type.
+
+```py
+def identity[T](value: T) -> T:
+    return value
+
+def produce():
+    return 1
+
+reveal_type(identity(produce)())  # revealed: Literal[1]
+```
+
 ## Functions with non-trivial control flow
 
 ### Returning from a loop
@@ -855,6 +869,21 @@ class Box[T]:
 
 reveal_type(Box[int].identity(1))  # revealed: int | Unknown
 value: int = Box[int].identity(1)  # ok
+```
+
+### Inherited methods
+
+Type arguments from an inherited method's defining class specialize its inferred return type.
+
+```py
+class Base[T]:
+    def value(self, item: T):
+        return item
+
+class Child[S](Base[list[S]]):
+    pass
+
+reveal_type(Child[int]().value([1]))  # revealed: list[int] | Unknown
 ```
 
 ## Overloaded functions

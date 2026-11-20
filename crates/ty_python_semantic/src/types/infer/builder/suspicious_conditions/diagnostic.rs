@@ -203,7 +203,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             && (test_type.is_subtype_of(db, env, KnownClass::Bool.to_instance(db, env))
                 || test_type.bool(db, env) != *truthiness);
 
-        let builder = self.context.report_lint(rule, test)?;
+        let builder = self.context.report_shared_body_lint(rule, test)?;
 
         let diagnostic = if let ConditionKind::Callable(callables) = kind {
             let mut diagnostic = builder.into_diagnostic("Suspicious boolean test of a `Callable`");
@@ -970,9 +970,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let db = self.db();
         match annotation {
             ast::Expr::StringLiteral(string) => {
-                let source = source_text(db, definition.file(db));
-                let parsed =
-                    parsed_string_annotation(&source, string.as_single_part_string()?).ok()?;
+                let parsed = parsed_string_annotation(
+                    db,
+                    definition.python_file(db),
+                    string.as_single_part_string()?,
+                )
+                .ok()?;
                 self.iterable_annotation_ranges(definition, parsed.expr())
             }
             ast::Expr::Subscript(subscript) => {
@@ -1526,7 +1529,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 return None;
             }
             let place = places.symbol_id(&name.id)?;
-            let (constraint, _) = infer_narrowing_constraints(db, predicate, place.into());
+            let (constraint, _) =
+                infer_narrowing_constraints(db, predicate, place.into(), self.context.body_domain);
             NarrowingConstraint::intersection(ty)
                 .merge_constraint_and(constraint?)
                 .evaluate_constraint_type(db, env)
