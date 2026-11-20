@@ -126,12 +126,17 @@ impl<'db> TypeExpressionContext<'db> for TypeInferenceBuilder<'db, '_> {
             GenericContext::from_typevar_instances(db, self.program_environment(), [])
         });
         let value_ty = Type::single_callable(db, signature.clone());
-        self.infer_explicit_callable_specialization(subscript, value_ty, Some(context), &|arguments| {
-            signature.return_type().apply_specialization(
-                db,
-                context.specialize_partial(db, arguments.iter().copied()),
-            )
-        })
+        self.infer_explicit_callable_specialization(
+            subscript,
+            value_ty,
+            Some(context),
+            &|arguments| {
+                signature.return_type().apply_specialization(
+                    db,
+                    context.specialize_partial(db, arguments.iter().copied()),
+                )
+            },
+        )
     }
 
     fn report_invalid_type_form(&mut self, range: TextRange, message: &str) {

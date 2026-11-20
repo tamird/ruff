@@ -291,21 +291,25 @@ impl<'a, 'db> CheckedCall<'a, 'db> {
         &self,
         parameter: usize,
     ) -> impl Iterator<Item = Type<'db>> {
-        self.matched_arguments(parameter).flat_map(move |argument| {
-            match argument {
+        self.matched_arguments(parameter)
+            .flat_map(move |argument| match argument {
                 Some((_, source, matched_argument)) => {
                     let formal = &self.binding.signature.parameters()[parameter];
-                    Either::Left(matched_argument.parameters.iter().filter_map(move |matched| {
-                        if matched.index == parameter {
-                            matched.argument_type(formal, source)
-                        } else {
-                            None
-                        }
-                    }))
+                    Either::Left(
+                        matched_argument
+                            .parameters
+                            .iter()
+                            .filter_map(move |matched| {
+                                if matched.index == parameter {
+                                    matched.argument_type(formal, source)
+                                } else {
+                                    None
+                                }
+                            }),
+                    )
                 }
                 None => Either::Right(self.parameter_types()[parameter].into_iter()),
-            }
-        })
+            })
     }
 
     /// Returns the complete source argument for diagnostics, including a keyword's name.

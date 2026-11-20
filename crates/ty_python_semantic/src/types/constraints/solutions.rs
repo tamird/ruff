@@ -1481,7 +1481,11 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                                 // Signature and tuple packs need a witness in their own domain.
                                 has_type_endpoint(bound.bound_typevar).then(|| TypeVarSolution {
                                     bound_typevar: bound.bound_typevar,
-                                    solution: bound.effective_lower(db, env, super::EvidenceSource::All),
+                                    solution: bound.effective_lower(
+                                        db,
+                                        env,
+                                        super::EvidenceSource::All,
+                                    ),
                                 })
                             }
                             PathBoundSolution::Unsatisfiable => None,
@@ -2049,7 +2053,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             return ControlFlow::Continue(());
         };
 
-        if self.inferred_lower_satisfies_upper_bound(db, env, storage, path, bound_typevar)? != Some(true) {
+        if self.inferred_lower_satisfies_upper_bound(db, env, storage, path, bound_typevar)?
+            != Some(true)
+        {
             return ControlFlow::Continue(());
         }
 
@@ -2788,14 +2794,13 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
 
         for (bound_typevar, upper_bound) in upper_bounds {
             let satisfied = Cell::new(false);
-            let Some(lower_satisfied) = self.inferred_lower_satisfies_upper_bound(
-                db, env, storage, path, *bound_typevar,
-            )? else {
+            let Some(lower_satisfied) =
+                self.inferred_lower_satisfies_upper_bound(db, env, storage, path, *bound_typevar)?
+            else {
                 // An incomplete proof cannot justify attributing an upper-bound violation.
                 return ControlFlow::Continue(());
             };
-            if lower_satisfied && let Some(constraints) = upper_bound.constraints.as_deref()
-            {
+            if lower_satisfied && let Some(constraints) = upper_bound.constraints.as_deref() {
                 self.visit_constraints_and_then(
                     db,
                     env,
@@ -3291,6 +3296,102 @@ mod tests {
     use crate::types::constraints::tests::quantify_constraint;
     use crate::types::constraints::{SolutionPaths, Solutions, UnboundedSolutionLimits};
     use ruff_python_ast::name::Name;
+
+    use ruff_db::files::system_path_to_file;
+    use ruff_db::system::DbWithWritableSystem;
+    use crate::place::global_symbol;
+    use ty_python_core::ProgramFile;
+
+    #[test]
+    fn incomplete_fixed_upper_bound_is_not_a_diagnostic_violation() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+            from collections.abc import Callable
+            def identity[Local](value: Local) -> Local: ...
+            def bound[Free](value: Callable[[str], Free]) -> None: ...
+            "#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let identity = global_symbol(db, file, "identity").place.expect_type();
+        let Type::FunctionLiteral(identity) = identity else {
+            anyhow::bail!("expected generic identity function");
+        };
+        let [signature] = identity.signature(db).overloads.as_slice() else {
+            anyhow::bail!("expected one generic identity signature");
+        };
+        let lower = Type::single_callable(db, signature.clone());
+        let bound = global_symbol(db, file, "bound").place.expect_type();
+        let bindings = bound.bindings(db, &env);
+        let callable = bindings.single_element()
+            .ok_or_else(|| anyhow::anyhow!("expected one bound callable"))?;
+        let [binding] = callable.overloads() else {
+            anyhow::bail!("expected one bound overload");
+        };
+        let [parameter] = binding.signature.parameters().iter().as_slice() else {
+            anyhow::bail!("expected one bound parameter");
+        };
+        let upper = parameter.annotated_type();
+        let target = BoundTypeVarInstance::synthetic(
+            db, &env, Name::new_static("Target"), TypeVarVariance::Invariant,
+        ).map_bound_or_constraints(db, |_| Some(TypeVarBoundOrConstraints::UpperBound(upper)));
+        let inferable = TypeVarSet::from_typevars(db, [target]);
+        let builder = ConstraintSetBuilder::new();
+        let relation = ConstraintSet::constrain_typevar_lower_bound(
+            db, &env, &builder, ConstraintProvenance::INFERRED, target, lower,
+        );
+        let mut storage = builder.storage.borrow_mut();
+        let root = storage.interior_node_data(relation.node);
+        let lower_atom = root.constraint.as_atomic(&storage)
+            .ok_or_else(|| anyhow::anyhow!("expected actual lower-bound evidence"))?;
+
+        // The real callable comparison quantifies Local in str <= Local <= Free. Exhaust
+        // witness work rather than fabricating a proof outcome. First assert that this
+        // fixture reaches the fixed-upper-bound query itself, so another incomplete path
+        // cannot make the caller assertions pass accidentally.
+        let mut path = relation.node.path_assignments(db, &env, &mut storage, relation.source_order);
+        assert!(path.assume(db, &env, &mut storage, lower_atom.when_true(),
+            UnspecializedTypeVarPolicy::Ignore));
+        let source_orders = storage.calculate_source_orders(relation.source_order);
+        let mut walker = SolutionWalker::new(
+            db, &mut storage, source_orders, inferable, UnboundedSolutionLimits,
+            (relation.node, relation.source_order),
+        );
+        walker.witness_budget = ProjectionTypeBudget::new(0);
+        let ControlFlow::Continue(result) = walker.inferred_lower_satisfies_upper_bound(
+            db, &env, &mut storage, &mut path, target,
+        ) else {
+            anyhow::bail!("unbounded traversal unexpectedly stopped");
+        };
+        assert_eq!(result, None);
+        assert!(walker.incomplete);
+
+        // Walk the original relation with its real declaration support. The terminal owner
+        // performs upper-bound validation, then failure attribution when no path was certified.
+        let source_orders = storage.calculate_source_orders(relation.source_order);
+        let mut walker = SolutionWalker::new(
+            db, &mut storage, source_orders, inferable, UnboundedSolutionLimits,
+            (relation.node, relation.source_order),
+        );
+        walker.witness_budget = ProjectionTypeBudget::new(0);
+        let mut path = relation.node.path_assignments(db, &env, &mut storage, relation.source_order);
+        let support = storage.node_support(relation.node).cloned();
+        let ControlFlow::Continue(()) = walker.visit_node(
+            db, &env, &mut storage, &mut path, support.as_ref(), Polarity::Positive, relation.node,
+        );
+        assert!(walker.incomplete);
+        assert!(walker.pending.is_empty(), "incomplete proof fabricated a candidate or violation");
+        let CandidateSolutions::Constrained { inferable: _, paths, incomplete } = walker.finish() else {
+            anyhow::bail!("incomplete bound proof must remain constrained");
+        };
+        assert!(incomplete);
+        assert!(paths.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn existential_proof_budget_is_shared_across_queries() {
