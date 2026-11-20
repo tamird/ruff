@@ -4285,11 +4285,6 @@ mod tests {
                 "check = value.upper()\n    return value",
                 BodyDomainError::Unsupported,
             ),
-            (
-                "value: int | str",
-                "if value:\n        return str(1)\n    return value",
-                BodyDomainError::Unsupported,
-            ),
         ] {
             db.write_file("/src/body.py", format!("from typing import overload\n@overload\ndef f(value: int) -> int: ...\n@overload\ndef f(value: str) -> str: ...\ndef f({parameter}) -> int | str:\n    {body}\n"))?;
             assert_eq!(
@@ -4300,6 +4295,35 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn body_domains_check_conditional_returns() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/body.py",
+            r#"
+            from typing import overload
+            @overload
+            def f(value: int) -> int: ...
+            @overload
+            def f(value: str) -> str: ...
+            def f(value: int | str) -> int | str:
+                if value:
+                    return str(1)
+                return value
+            "#,
+        )?;
+        let function = function(&db);
+        let diagnostics = check_overload_body(&db, function, 0).unwrap().into_diagnostics();
+        let [diagnostic] = diagnostics.as_slice() else {
+            anyhow::bail!("expected one invalid integer-domain return: {diagnostics:#?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "invalid-explicit-return");
+        let diagnostics = check_overload_body(&db, function, 1).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        Ok(())
+    }
+
     #[test]
     fn body_domains_follow_overload_edits() -> anyhow::Result<()> {
         let mut db = setup_db();

@@ -2045,6 +2045,19 @@ impl<'db> ClassType<'db> {
         inherited_generic_context: Option<GenericContext<'db>>,
         name: &str,
     ) -> Member<'db> {
+        self.own_class_member_with_policy(
+            db, env, inherited_generic_context, name, MemberLookupPolicy::default(),
+        )
+    }
+
+    pub(super) fn own_class_member_with_policy(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        inherited_generic_context: Option<GenericContext<'db>>,
+        name: &str,
+        policy: MemberLookupPolicy,
+    ) -> Member<'db> {
         fn synthesize_getitem_overload_signature<'db>(
             index_annotation: Type<'db>,
             return_annotation: Type<'db>,
@@ -2077,7 +2090,7 @@ impl<'db> ClassType<'db> {
             let specialization = specialization
                 .map(|specialization| specialization.tuple_runtime_element_specialization(db));
             class_literal
-                .own_class_member(db, env, inherited_generic_context, specialization, name)
+                .own_class_member_with_policy(db, env, inherited_generic_context, specialization, name, policy)
                 .map_type(|ty| ty.apply_optional_specialization(db, specialization))
         };
 
@@ -3194,7 +3207,7 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                     }
 
                     let member =
-                        class.own_class_member(db, &self.env, inherited_generic_context, name);
+                        class.own_class_member_with_policy(db, &self.env, inherited_generic_context, name, policy);
                     let member = if policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE) {
                         class.runtime_member(db, &self.env, name, member)
                     } else {
