@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::TypeVarSolution;
+use super::{ProjectionTypeBudget, SolutionBudget, TypeVarSolution};
 use crate::types::cyclic::CycleDetector;
 use crate::types::function::FunctionType;
 use crate::types::generics::{ApplySpecialization, GenericContext};
@@ -13,8 +13,8 @@ use crate::types::signatures::{Signature, walk_signature};
 use crate::types::typevar::{BoundTypeVarIdentity, TypeVarSet};
 use crate::types::visitor::{TypeKind, TypeVisitor, walk_non_atomic_type};
 use crate::types::{
-    BoundTypeVarInstance, CallableType, KnownInstanceType, RecursiveType, Type, TypeAliasType,
-    TypeContext, TypeMapping, UnionType,
+    BoundTypeVarInstance, CallableType, IntersectionBuilder, IntersectionType, KnownInstanceType,
+    RecursiveType, Type, TypeAliasType, TypeContext, TypeMapping, UnionType,
 };
 use crate::{Db, FxOrderMap, ProgramEnvironment};
 
@@ -58,12 +58,13 @@ pub(crate) fn resolve_merged_solution<'db>(
     {
         return resolved;
     }
+    let mut filters = ProjectionTypeBudget::new(SolutionBudget::default().type_terms);
     let proposals: Vec<_> = solution
         .iter()
         .zip(&resolved)
         .map(|(binding, result)| {
             if matches!(result, SolutionType::Unresolved(_)) {
-                resolver.resolve_union(db, binding.solution)
+                resolver.resolve_union(db, binding.solution, &mut filters)
             } else {
                 None
             }
@@ -190,29 +191,118 @@ impl<'a, 'db> Resolver<'a, 'db> {
         &self,
         db: &'db dyn Db,
         original: Type<'db>,
+        filters: &mut ProjectionTypeBudget,
     ) -> Option<(Type<'db>, FxHashSet<usize>)> {
-        let mut pending = vec![original];
+        // Closed filters can distinguish exponentially many paths through the same graph.
+        // Share their storage budget across proposals without changing flat union traversal.
+        let mut pending = vec![(original, Type::object())];
         let mut visited = FxHashSet::default();
+        let mut dependencies = FxHashSet::default();
         let mut anchors = Vec::new();
-        while let Some(ty) = pending.pop() {
+        while let Some((ty, filter)) = pending.pop() {
+            if filter != Type::object() {
+                filters.charge_type(db, ty).ok()?;
+            }
             match ty {
                 Type::TypeVar(variable) => {
                     if variable.is_inferable(db, self.inferable) {
                         let index = *self.indices.get(&variable.identity(db))?;
-                        if visited.insert(index) {
-                            pending.push(self.solution[index].solution);
+                        dependencies.insert(index);
+                        if visited.insert((index, filter)) {
+                            if filter != Type::object() {
+                                filters.charge_items(1).ok()?;
+                                filters.charge_type(db, filter).ok()?;
+                                filters.charge_items(1).ok()?;
+                            }
+                            pending.push((self.solution[index].solution, filter));
                         }
                     } else {
-                        anchors.push(ty);
+                        anchors.push(self.filter_union_anchor(db, ty, filter, filters)?);
                     }
                 }
-                Type::Union(union) => pending.extend(union.elements(db).iter().copied()),
-                _ => anchors.push(self.resolve_type(db, ty)?),
+                Type::Union(union) => {
+                    if filter != Type::object() {
+                        filters.charge_items(union.elements(db).len()).ok()?;
+                    }
+                    pending.extend(union.elements(db).iter().map(|element| (*element, filter)));
+                }
+                Type::Intersection(intersection) => {
+                    if let Some(closed) = self.resolve_type(db, ty) {
+                        anchors.push(self.filter_union_anchor(db, closed, filter, filters)?);
+                        continue;
+                    }
+                    filters.charge_type(db, ty).ok()?;
+                    let mut dependent = None;
+                    let mut positive_filters = vec![filter];
+                    let mut negative_filters = IntersectionBuilder::new(db, self.env);
+                    for positive in intersection.iter_positive(db) {
+                        if let Some(resolved) = self.resolve_type(db, positive) {
+                            filters.charge_type(db, resolved).ok()?;
+                            positive_filters.push(resolved);
+                        } else if dependent.replace(positive).is_some() {
+                            // Multiple dependent factors are not a filtered union edge.
+                            return None;
+                        }
+                    }
+                    for negative in intersection.iter_negative(db) {
+                        if !Dependencies::check(db, self.env, self.inferable, negative, |_| false) {
+                            // Complementing an inferable dependency is not monotone.
+                            return None;
+                        }
+                        filters.charge_type(db, negative).ok()?;
+                        negative_filters = negative_filters.bounded_add_negative(negative)?;
+                    }
+                    let negative_filter = negative_filters.build();
+                    filters.charge_type(db, negative_filter).ok()?;
+                    positive_filters.push(negative_filter);
+                    let filter = IntersectionType::bounded_from_elements(
+                        db,
+                        self.env,
+                        positive_filters.iter().copied(),
+                    )?;
+                    filters.charge_type(db, filter).ok()?;
+                    if let Some(dependent) = dependent {
+                        filters.charge_items(1).ok()?;
+                        pending.push((dependent, filter));
+                    } else {
+                        anchors.push(filter);
+                    }
+                }
+                _ => anchors.push(self.filter_union_anchor(
+                    db,
+                    self.resolve_type(db, ty)?,
+                    filter,
+                    filters,
+                )?),
             }
         }
-        // Flat positive-union equations collect every reachable closed anchor. Visiting all
-        // edges keeps X = Y | int, Y = X | str symmetric; a bare cycle has no anchor.
-        (!anchors.is_empty()).then(|| (UnionType::from_elements(db, self.env, anchors), visited))
+        // Every reachable anchor contributes through the filters on its path. A component
+        // with no anchor stays unresolved, including one reached from an anchored dependent.
+        (!anchors.is_empty()).then(|| {
+            (
+                UnionType::from_elements(db, self.env, anchors),
+                dependencies,
+            )
+        })
+    }
+
+    fn filter_union_anchor(
+        &self,
+        db: &'db dyn Db,
+        ty: Type<'db>,
+        filter: Type<'db>,
+        filters: &mut ProjectionTypeBudget,
+    ) -> Option<Type<'db>> {
+        if filter == Type::object() {
+            return Some(ty);
+        }
+        // Charge before constructing or retaining an additional filtered contribution.
+        // One visited state can expose an entire union of otherwise closed anchors.
+        filters.charge_type(db, ty).ok()?;
+        filters.charge_type(db, filter).ok()?;
+        let filtered = IntersectionType::bounded_from_elements(db, self.env, [ty, filter])?;
+        filters.charge_type(db, filtered).ok()?;
+        Some(filtered)
     }
 }
 
@@ -344,14 +434,15 @@ mod tests {
     use ruff_python_ast::name::Name;
     use ty_python_core::ProgramFile;
 
-    use super::{SolutionType, resolve_merged_solution, resolve_solution};
+    use super::{Resolver, SolutionType, resolve_merged_solution, resolve_solution};
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::global_symbol;
-    use crate::types::constraints::TypeVarSolution;
+    use crate::types::constraints::{ProjectionTypeBudget, SolutionBudget, TypeVarSolution};
     use crate::types::tuple::TupleType;
     use crate::types::typevar::TypeVarSet;
     use crate::types::{
-        BoundTypeVarInstance, KnownClass, KnownInstanceType, Type, TypeVarVariance, UnionType,
+        BoundTypeVarInstance, IntersectionType, KnownClass, KnownInstanceType, Type,
+        TypeVarVariance, UnionType,
     };
 
     fn create_typevar<'db>(db: &'db TestDb, name: &str) -> BoundTypeVarInstance<'db> {
@@ -423,6 +514,467 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn merged_union_cycles_preserve_closed_filters() -> anyhow::Result<()> {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let dependent = create_typevar(db, "Dependent");
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let union = UnionType::from_two_elements(db, &env, int, str);
+        let selected_t = binding(
+            t,
+            UnionType::from_two_elements(
+                db,
+                &env,
+                IntersectionType::from_elements(db, &env, [Type::TypeVar(u), str.negate(db, &env)]),
+                int,
+            ),
+        );
+        let selected_u = binding(
+            u,
+            UnionType::from_two_elements(db, &env, Type::TypeVar(t), str),
+        );
+        let selected_dependent = binding(
+            dependent,
+            KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(t)]),
+        );
+        let inferable = TypeVarSet::from_typevars(db, [t, u, dependent]);
+        for selected in [
+            [selected_t, selected_u, selected_dependent],
+            [selected_u, selected_t, selected_dependent],
+        ] {
+            assert!(
+                resolve_solution(db, &env, inferable, &selected)
+                    .iter()
+                    .all(|result| matches!(result, SolutionType::Unresolved(_)))
+            );
+            for (binding, result) in selected
+                .iter()
+                .zip(resolve_merged_solution(db, &env, inferable, &selected))
+            {
+                let expected = if binding.bound_typevar == t {
+                    int
+                } else if binding.bound_typevar == u {
+                    union
+                } else {
+                    KnownClass::List.to_specialized_instance(db, &env, &[int])
+                };
+                let SolutionType::Resolved(ty) = result else {
+                    anyhow::bail!("expected filtered cycle to close: {result:?}");
+                };
+                assert!(ty.is_equivalent_to(db, &env, expected));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_cycle_budget_exhaustion_does_not_export_partial_anchors() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let selected = [
+            binding(
+                t,
+                UnionType::from_two_elements(
+                    db,
+                    &env,
+                    IntersectionType::from_elements(
+                        db,
+                        &env,
+                        [Type::TypeVar(u), str.negate(db, &env)],
+                    ),
+                    int,
+                ),
+            ),
+            binding(
+                u,
+                UnionType::from_two_elements(db, &env, Type::TypeVar(t), str),
+            ),
+        ];
+        let resolver = Resolver::new(db, &env, TypeVarSet::from_typevars(db, [t, u]), &selected);
+        assert!(
+            resolver
+                .resolve_union(db, selected[0].solution, &mut ProjectionTypeBudget::new(0))
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve_union(db, selected[0].solution, &mut ProjectionTypeBudget::new(1))
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve_union(
+                    db,
+                    selected[0].solution,
+                    &mut ProjectionTypeBudget::new(SolutionBudget::default().type_terms)
+                )
+                .is_some()
+        );
+        let unfiltered = [
+            binding(
+                t,
+                UnionType::from_two_elements(db, &env, Type::TypeVar(u), int),
+            ),
+            binding(
+                u,
+                UnionType::from_two_elements(db, &env, Type::TypeVar(t), str),
+            ),
+        ];
+        let resolver = Resolver::new(db, &env, TypeVarSet::from_typevars(db, [t, u]), &unfiltered);
+        assert!(
+            resolver
+                .resolve_union(
+                    db,
+                    unfiltered[0].solution,
+                    &mut ProjectionTypeBudget::new(0)
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn filtered_union_fanout_shares_the_projection_budget() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let v = create_typevar(db, "V");
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let bytes = KnownClass::Bytes.to_instance(db, &env);
+        let anchor_count = 32;
+        let anchors = UnionType::from_elements(
+            db,
+            &env,
+            (1..=anchor_count).map(|length| {
+                Type::tuple(TupleType::heterogeneous(
+                    db,
+                    &env,
+                    std::iter::repeat_n(int, length),
+                ))
+            }),
+        );
+        let selected = [
+            binding(
+                t,
+                UnionType::from_elements(
+                    db,
+                    &env,
+                    [
+                        IntersectionType::from_elements(
+                            db,
+                            &env,
+                            [Type::TypeVar(u), str.negate(db, &env)],
+                        ),
+                        IntersectionType::from_elements(
+                            db,
+                            &env,
+                            [Type::TypeVar(v), bytes.negate(db, &env)],
+                        ),
+                        int,
+                    ],
+                ),
+            ),
+            binding(
+                u,
+                UnionType::from_two_elements(db, &env, Type::TypeVar(t), anchors),
+            ),
+            binding(
+                v,
+                UnionType::from_two_elements(db, &env, Type::TypeVar(t), anchors),
+            ),
+        ];
+        let resolver = Resolver::new(
+            db,
+            &env,
+            TypeVarSet::from_typevars(db, [t, u, v]),
+            &selected,
+        );
+        // This permits initial traversal but cannot queue and retain the crossed anchor family.
+        assert!(
+            resolver
+                .resolve_union(
+                    db,
+                    selected[0].solution,
+                    &mut ProjectionTypeBudget::new(anchor_count * 4)
+                )
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve_union(
+                    db,
+                    selected[0].solution,
+                    &mut ProjectionTypeBudget::new(SolutionBudget::default().type_terms)
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn merged_cycles_preserve_reversed_and_alternating_filters() -> anyhow::Result<()> {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let bytes = KnownClass::Bytes.to_instance(db, &env);
+        let inferable = TypeVarSet::from_typevars(db, [t, u]);
+        for [first, second] in [[str, bytes], [bytes, str]] {
+            let selected = [
+                binding(
+                    t,
+                    UnionType::from_two_elements(
+                        db,
+                        &env,
+                        IntersectionType::from_elements(
+                            db,
+                            &env,
+                            [Type::TypeVar(u), first.negate(db, &env)],
+                        ),
+                        int,
+                    ),
+                ),
+                binding(
+                    u,
+                    UnionType::from_two_elements(
+                        db,
+                        &env,
+                        IntersectionType::from_elements(
+                            db,
+                            &env,
+                            [Type::TypeVar(t), second.negate(db, &env)],
+                        ),
+                        str,
+                    ),
+                ),
+            ];
+            let resolved = resolve_merged_solution(db, &env, inferable, &selected);
+            for (index, result) in resolved.iter().enumerate() {
+                let expected = if index == 0 && first == str {
+                    int
+                } else {
+                    UnionType::from_two_elements(db, &env, int, str)
+                };
+                let SolutionType::Resolved(ty) = result else {
+                    anyhow::bail!("expected alternating filters to close: {result:?}");
+                };
+                assert!(ty.is_equivalent_to(db, &env, expected));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn merged_cycle_handles_a_disjunctive_closed_filter() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented("/src/a.py", "class A: ...\nclass B: ...")?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let instance = |name| -> anyhow::Result<_> {
+            let class = global_symbol(db, file, name)
+                .place
+                .expect_type()
+                .as_class_literal()
+                .ok_or_else(|| anyhow::anyhow!("expected class {name}"))?;
+            Ok(Type::instance(db, &env, class.identity_specialization(db)))
+        };
+        let a = instance("A")?;
+        let b = instance("B")?;
+        let mask = IntersectionType::from_elements(db, &env, [a, b]).negate(db, &env);
+        assert!(matches!(mask, Type::Union(_)));
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let int = KnownClass::Int.to_instance(db, &env);
+        let selected = [
+            binding(
+                t,
+                UnionType::from_two_elements(
+                    db,
+                    &env,
+                    IntersectionType::from_elements(db, &env, [Type::TypeVar(u), mask]),
+                    int,
+                ),
+            ),
+            binding(
+                u,
+                UnionType::from_elements(db, &env, [Type::TypeVar(t), a, b]),
+            ),
+        ];
+        let inferable = TypeVarSet::from_typevars(db, [t, u]);
+        let resolver = Resolver::new(db, &env, inferable, &selected);
+        assert!(
+            resolver
+                .resolve_union(db, selected[0].solution, &mut ProjectionTypeBudget::new(1))
+                .is_none()
+        );
+        let resolved = resolve_merged_solution(db, &env, inferable, &selected);
+        let expected = UnionType::from_two_elements(
+            db,
+            &env,
+            int,
+            IntersectionType::from_elements(
+                db,
+                &env,
+                [UnionType::from_two_elements(db, &env, a, b), mask],
+            ),
+        );
+        assert!(matches!(resolved[0], SolutionType::Resolved(ty)
+            if ty.is_equivalent_to(db, &env, expected)));
+        Ok(())
+    }
+
+    #[test]
+    fn merged_filtered_cycle_expands_a_closed_negative_alias() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented("/src/a.py", "type Excluded = str")?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let alias = Type::TypeAlias(
+            global_symbol(db, file, "Excluded")
+                .place
+                .expect_type()
+                .as_type_alias()
+                .ok_or_else(|| anyhow::anyhow!("expected Excluded alias"))?,
+        );
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let selected = [
+            binding(
+                t,
+                UnionType::from_two_elements(
+                    db,
+                    &env,
+                    IntersectionType::from_elements(
+                        db,
+                        &env,
+                        [Type::TypeVar(u), alias.negate(db, &env)],
+                    ),
+                    int,
+                ),
+            ),
+            binding(
+                u,
+                UnionType::from_two_elements(db, &env, Type::TypeVar(t), str),
+            ),
+        ];
+        let resolved =
+            resolve_merged_solution(db, &env, TypeVarSet::from_typevars(db, [t, u]), &selected);
+        assert_eq!(resolved[0], SolutionType::Resolved(int));
+        assert!(matches!(resolved[1], SolutionType::Resolved(ty)
+            if ty.is_equivalent_to(db, &env, UnionType::from_two_elements(db, &env, int, str))));
+        Ok(())
+    }
+
+    #[test]
+    fn merged_filtered_cycles_reject_unsupported_dependencies() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let v = create_typevar(db, "V");
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let inferable = TypeVarSet::from_typevars(db, [t, u, v]);
+        let filtered =
+            IntersectionType::from_elements(db, &env, [Type::TypeVar(u), str.negate(db, &env)]);
+        for selected in [
+            // An anchored dependent cannot supply an anchor to an unanchored component.
+            vec![
+                binding(t, UnionType::from_two_elements(db, &env, filtered, int)),
+                binding(u, Type::TypeVar(u)),
+            ],
+            // Missing selections do not acquire defaults during closure.
+            vec![binding(
+                t,
+                UnionType::from_two_elements(db, &env, filtered, int),
+            )],
+            // A closed selected value does not permit a negative inferable edge.
+            vec![
+                binding(
+                    t,
+                    UnionType::from_two_elements(
+                        db,
+                        &env,
+                        IntersectionType::from_elements(
+                            db,
+                            &env,
+                            [Type::TypeVar(u), Type::TypeVar(v).negate(db, &env)],
+                        ),
+                        int,
+                    ),
+                ),
+                binding(u, Type::TypeVar(t)),
+                binding(v, str),
+            ],
+            // More than one dependent positive factor is not a filtered edge.
+            vec![
+                binding(
+                    t,
+                    UnionType::from_two_elements(
+                        db,
+                        &env,
+                        IntersectionType::from_elements(
+                            db,
+                            &env,
+                            [Type::TypeVar(u), Type::TypeVar(v)],
+                        ),
+                        int,
+                    ),
+                ),
+                binding(u, Type::TypeVar(t)),
+                binding(v, Type::TypeVar(t)),
+            ],
+            // Filtering does not permit recursion through a growing container.
+            vec![
+                binding(
+                    t,
+                    UnionType::from_two_elements(
+                        db,
+                        &env,
+                        KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(u)]),
+                        int,
+                    ),
+                ),
+                binding(
+                    u,
+                    IntersectionType::from_elements(
+                        db,
+                        &env,
+                        [Type::TypeVar(t), str.negate(db, &env)],
+                    ),
+                ),
+            ],
+            // A filtered cycle without an anchor remains unresolved.
+            vec![binding(t, filtered), binding(u, Type::TypeVar(t))],
+        ] {
+            assert_eq!(
+                resolve_merged_solution(db, &env, inferable, &selected),
+                resolve_solution(db, &env, inferable, &selected)
+            );
+        }
     }
 
     #[test]
