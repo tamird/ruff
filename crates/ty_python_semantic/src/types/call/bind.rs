@@ -9926,15 +9926,13 @@ impl<'db> Binding<'db> {
         }
     }
 
-    /// Supplies context for a fresh empty default compatible with a finite lookup result.
-    pub(crate) fn empty_getattr_default_context(
+    /// Identifies the builtin default parameter whose empty container context uses sibling operands.
+    pub(crate) fn empty_getattr_default_parameter(
         &self,
         db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
         binding: &CallableBinding<'db>,
         argument_index: usize,
-        collection: KnownClass,
-    ) -> Option<ArgumentTypeContext<'db>> {
+    ) -> Option<usize> {
         let Type::FunctionLiteral(function) = binding.callable_type else {
             return None;
         };
@@ -9945,9 +9943,19 @@ impl<'db> Binding<'db> {
         let [parameter] = argument.parameters.as_slice() else {
             return None;
         };
-        if parameter.index != 2 {
-            return None;
-        }
+        (argument.matched && parameter.index == 2).then_some(parameter.index)
+    }
+
+    /// Supplies context for a fresh empty default compatible with a finite lookup result.
+    pub(crate) fn empty_getattr_default_context(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        binding: &CallableBinding<'db>,
+        argument_index: usize,
+        collection: KnownClass,
+    ) -> Option<ArgumentTypeContext<'db>> {
+        let parameter_index = self.empty_getattr_default_parameter(db, binding, argument_index)?;
         // The fallback is still being inferred. Use the finite member facts before
         // joining its type, including when the member may be missing. The completed
         // call separately joins the actual fallback without changing presence facts.
@@ -9975,7 +9983,7 @@ impl<'db> Binding<'db> {
         // instances and protocols instead let the container relation check their requirements.
         matches.then(|| {
             ArgumentTypeContext::standard(
-                self.signature.parameters()[parameter.index].annotated_type(),
+                self.signature.parameters()[parameter_index].annotated_type(),
                 TypeContext::preference(Some(context)),
             )
         })

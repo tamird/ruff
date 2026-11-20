@@ -6314,12 +6314,36 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 )
             })
             .unwrap_or_default();
+        // Empty getattr defaults depend on the receiver and name, even when the
+        // default's bare type variable would otherwise allow a single inference pass.
+        let builtin_context_arguments: SmallVec<[usize; 1]> = ast_arguments
+            .clone()
+            .enumerate()
+            .filter_map(|(index, argument)| {
+                if argument.is_variadic() {
+                    return None;
+                }
+                Self::empty_collection_context_class(argument.value())?;
+                let mut needs_context = false;
+                bindings.visit_overload_set(&overload_candidates, &mut |overload, binding| {
+                    needs_context |= overload
+                        .empty_getattr_default_parameter(db, binding, index)
+                        .is_some();
+                });
+                needs_context.then_some(index)
+            })
+            .collect();
+        for index in &builtin_context_arguments {
+            generic_arguments[*index] = true;
+        }
         for (index, _) in &provided_arguments {
             generic_arguments[*index] = true;
         }
         // Supplied contexts can change even when the declaration has no type variables.
         // Account for them before choosing between the simple and iterative paths.
-        fixpoint_iteration_limit += provided_arguments.len();
+        fixpoint_iteration_limit += provided_arguments.len() + builtin_context_arguments.len();
+        let context_depends_on_arguments =
+            !provided_arguments.is_empty() || !builtin_context_arguments.is_empty();
 
         let generic_arguments: SmallVec<_> = generic_arguments
             .into_iter()
@@ -6386,6 +6410,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         &ast_arguments,
                         collection_arguments,
                         provided_arguments.as_slice(),
+                        context_depends_on_arguments,
                         arguments,
                         infer_argument_ty,
                         bindings,
@@ -6658,6 +6683,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         ast_arguments: &ArgumentsIter<'_>,
         collection_arguments: &[usize],
         provided_arguments: &[(usize, Name)],
+        context_depends_on_arguments: bool,
         argument_types: &mut CallArguments<'_, 'db>,
         infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
         bindings: &mut Bindings<'db>,
@@ -6712,7 +6738,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // If the inferred types have converged, and already evaluated the bindings from the
             // previous iteration, we are done.
-            if iteration > 0 && inferred_types_converged && provided_arguments.is_empty() {
+            if iteration > 0 && inferred_types_converged && !context_depends_on_arguments {
                 break (speculative_builder, next_argument_types);
             }
 
@@ -6728,9 +6754,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 CheckTypesMode::Provisional,
             );
 
-            // Supplied contexts may still change when inferred types are stable. The final
+            // Sibling-dependent contexts may still change when inferred types are stable. The final
             // call check remains authoritative if the bounded iteration does not converge.
-            if (inferred_types_converged && provided_arguments.is_empty())
+            if (inferred_types_converged && !context_depends_on_arguments)
                 || iteration == fixpoint_iteration_limit
             {
                 break (speculative_builder, next_argument_types);
@@ -6872,6 +6898,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         result
     }
 
+    fn empty_collection_context_class(expression: &ast::Expr) -> Option<KnownClass> {
+        match expression {
+            ast::Expr::List(list) => list.elts.is_empty().then_some(KnownClass::List),
+            ast::Expr::Dict(dict) => dict.items.is_empty().then_some(KnownClass::Dict),
+            _ => None,
+        }
+    }
+
     /// Collects the type contexts used to infer the arguments of a call expression.
     #[expect(clippy::too_many_arguments)]
     fn collect_call_arguments_type_context<'bindings>(
@@ -6927,11 +6961,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 } else {
                     CheckTypesMode::Provisional
                 };
-                let empty_collection = match argument.value() {
-                    ast::Expr::List(list) => list.elts.is_empty().then_some(KnownClass::List),
-                    ast::Expr::Dict(dict) => dict.items.is_empty().then_some(KnownClass::Dict),
-                    _ => None,
-                };
+                let empty_collection = Self::empty_collection_context_class(argument.value());
                 let contexts = overloads_with_binding
                     .iter()
                     .map(|(overload, binding, cache)| {
