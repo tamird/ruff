@@ -11,10 +11,10 @@ use super::{ProjectionError, ProjectionTypeBudget, SolutionBudget, SolutionProje
 use crate::db::tests::{TestDb, setup_db};
 use crate::place::global_symbol;
 use crate::types::constraints::{
-    BoundedSolutionLimits, CandidateSolution, CandidateSolutions, CandidateTypeVarSolution,
-    ConstraintFailureEvidence, ConstraintProvenance, ConstraintSet, ConstraintSetBuilder,
-    IteratorConstraintsExtension, PathBoundSolution, ReportDiagnostics, Solution, SolutionPaths,
-    SolutionValidity, SolutionViolationKind, Solutions, TypeVarSolution,
+    BoundedSolutionLimits, CandidateSearch, CandidateSolution, CandidateSolutions,
+    CandidateTypeVarSolution, ConstraintFailureEvidence, ConstraintProvenance, ConstraintSet,
+    ConstraintSetBuilder, IteratorConstraintsExtension, PathBoundSolution, ReportDiagnostics,
+    Solution, SolutionPaths, SolutionValidity, SolutionViolationKind, Solutions, TypeVarSolution,
     UnspecializedTypeVarPolicy,
 };
 use crate::types::signatures::{Parameter, Parameters, Signature};
@@ -1266,7 +1266,13 @@ fn validation_shares_the_projection_visit_budget() {
         .and(db, &builder, || binary_choice(db, &builder, u, [int, str]));
     let default_budget = SolutionBudget::default();
     let (_, remaining) = set
-        .bounded_path_bounds(db, &env, inferable, default_budget, ReportDiagnostics::Yes)
+        .bounded_path_bounds(
+            db,
+            &env,
+            inferable,
+            default_budget,
+            CandidateSearch::All(ReportDiagnostics::Yes),
+        )
         .unwrap();
     let budget = SolutionBudget {
         visits: default_budget.visits - remaining.remaining_visits,
