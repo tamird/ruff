@@ -112,15 +112,15 @@ use crate::types::constraints::projection::{
 use crate::types::constraints::support::{Support, SupportId};
 use crate::types::generics::{ApplySpecialization, GenericContext, Specialization};
 use crate::types::typevar::{
-    BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarConstraints, TypeVarDomain,
-    TypeVarNonce, TypeVarSet,
+    BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarConstraints, TypeVarDomain, TypeVarNonce,
+    TypeVarSet,
 };
 use crate::types::visitor::{
     NonAtomicType, TypeKind, TypeVisitor, any_over_type_expanding_aliases, walk_non_atomic_type,
 };
 use crate::types::{
-    ApplyTypeMappingVisitor, BoundTypeVarInstance, DynamicType, IntersectionType, Type, TypeContext,
-    TypeMapping, TypePair, TypeVarBoundOrConstraints, TypeVarVariance, UnionType,
+    ApplyTypeMappingVisitor, BoundTypeVarInstance, DynamicType, IntersectionType, Type,
+    TypeContext, TypeMapping, TypePair, TypeVarBoundOrConstraints, TypeVarVariance, UnionType,
 };
 use crate::{Db, FxIndexMap, FxIndexSet, FxOrderSet, ProgramEnvironment};
 use resolution::{SolutionType, resolve_merged_solution, resolve_solution};
@@ -5083,7 +5083,7 @@ impl<'db> CandidateSolutions<'db> {
                 &mut constraints.storage.borrow_mut(),
                 inferable,
                 relation.source_order,
-                limits,
+                &mut *limits,
             )?;
             if !always_satisfied
                 && !violations.iter().any(|violation| {
@@ -5266,14 +5266,11 @@ impl<'db> CandidateSolutions<'db> {
                 && lower.is_fully_static(db, env)
                 && !lower.has_indeterminate_inference(db, env)
             {
-                let equivalent_uppers = path_bound
-                    .upper
-                    .iter_evidence(source)
-                    .filter(|upper| {
-                        upper.is_fully_static(db, env)
-                            && !upper.has_indeterminate_inference(db, env)
-                            && lower.is_equivalent_to(db, env, *upper)
-                    });
+                let equivalent_uppers = path_bound.upper.iter_evidence(source).filter(|upper| {
+                    upper.is_fully_static(db, env)
+                        && !upper.has_indeterminate_inference(db, env)
+                        && lower.is_equivalent_to(db, env, *upper)
+                });
                 return PathBoundSolution::Solved(UnionType::from_elements(
                     db,
                     env,

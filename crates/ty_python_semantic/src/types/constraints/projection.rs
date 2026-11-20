@@ -39,6 +39,22 @@ impl Default for SolutionBudget {
     }
 }
 
+/// Work shared by collection and every witness completion for one inference request.
+pub(crate) struct ProjectionBudget {
+    limits: BoundedSolutionLimits,
+    types: ProjectionTypeBudget,
+}
+
+impl ProjectionBudget {
+    pub(crate) fn new(budget: SolutionBudget) -> Self {
+        let SolutionBudget { paths, visits, type_terms } = budget;
+        Self {
+            limits: BoundedSolutionLimits { remaining_paths: paths, remaining_visits: visits },
+            types: ProjectionTypeBudget::new(type_terms),
+        }
+    }
+}
+
 /// Why an exact projection could not be completed.
 ///
 /// None of these outcomes proves that the constraint set is unsatisfiable. In particular, a
@@ -153,6 +169,18 @@ impl<'db> ConstraintSet<'db, '_> {
             remaining_paths: budget.paths,
             remaining_visits: budget.visits,
         };
+        let paths = self.path_bounds_with_limits(db, env, inferable, &mut limits, report_diagnostics)?;
+        Ok((paths, limits))
+    }
+
+    fn path_bounds_with_limits(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        inferable: TypeVarSet<'db>,
+        limits: &mut BoundedSolutionLimits,
+        report_diagnostics: ReportDiagnostics,
+    ) -> Result<CandidateSolutions<'db>, ProjectionError> {
         let paths = CandidateSolutions::compute_with_limits(
             db,
             env,
@@ -160,12 +188,12 @@ impl<'db> ConstraintSet<'db, '_> {
             self.node,
             inferable,
             self.source_order,
-            &mut limits,
+            limits,
             super::variables::UnspecializedTypeVarPolicy::Ignore,
             report_diagnostics,
         );
         match paths {
-            ControlFlow::Continue(paths) => Ok((paths, limits)),
+            ControlFlow::Continue(paths) => Ok(paths),
             ControlFlow::Break(error) => Err(error),
         }
     }
@@ -180,15 +208,15 @@ impl<'db> ConstraintSet<'db, '_> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         inferable: TypeVarSet<'db>,
-        budget: SolutionBudget,
+        resources: &mut ProjectionBudget,
         mut project: impl FnMut(
             &[TypeVarSolution<'db>],
             &mut ProjectionTypeBudget,
         ) -> Result<Option<Vec<TypeVarSolution<'db>>>, ProjectionError>,
         fallback: Vec<TypeVarSolution<'db>>,
     ) -> Result<Option<Vec<TypeVarSolution<'db>>>, ProjectionError> {
-        let (path_bounds, mut limits) =
-            self.bounded_path_bounds(db, env, inferable, budget, ReportDiagnostics::No)?;
+        let ProjectionBudget { limits, types: type_budget } = resources;
+        let path_bounds = self.path_bounds_with_limits(db, env, inferable, limits, ReportDiagnostics::No)?;
         let (inferable, paths, incomplete) = match path_bounds {
             CandidateSolutions::Unsatisfiable => return Ok(None),
             CandidateSolutions::Unconstrained => return Err(ProjectionError::IncompleteSolution),
@@ -202,7 +230,6 @@ impl<'db> ConstraintSet<'db, '_> {
             return Err(ProjectionError::IncompleteSolution);
         }
 
-        let mut type_budget = ProjectionTypeBudget::new(budget.type_terms);
         let verify = |bindings: &[TypeVarSolution<'db>],
                       limits: &mut BoundedSolutionLimits,
                       type_budget: &mut ProjectionTypeBudget| {
@@ -220,8 +247,8 @@ impl<'db> ConstraintSet<'db, '_> {
                 env,
                 inferable,
                 &path,
-                &mut limits,
-                &mut type_budget,
+                limits,
+                type_budget,
                 &mut |_, bound| CandidateSolutions::default_solve(db, env, self.builder, bound),
             );
             let Some((solution, incomplete)) = (match solution {
@@ -236,16 +263,16 @@ impl<'db> ConstraintSet<'db, '_> {
             if !solution.is_valid() {
                 continue;
             }
-            let Some(bindings) = project(&solution.solved_typevars, &mut type_budget)? else {
+            let Some(bindings) = project(&solution.solved_typevars, type_budget)? else {
                 continue;
             };
-            match verify(&bindings, &mut limits, &mut type_budget) {
+            match verify(&bindings, limits, type_budget) {
                 ControlFlow::Continue(true) => return Ok(Some(bindings)),
                 ControlFlow::Continue(false) => {}
                 ControlFlow::Break(error) => return Err(error),
             }
         }
-        match verify(&fallback, &mut limits, &mut type_budget) {
+        match verify(&fallback, limits, type_budget) {
             ControlFlow::Continue(true) => Ok(Some(fallback)),
             ControlFlow::Continue(false) => Err(ProjectionError::IncompleteSolution),
             ControlFlow::Break(error) => Err(error),
@@ -355,14 +382,27 @@ impl<'db> ConstraintSet<'db, '_> {
         report_diagnostics: ReportDiagnostics,
         choose: impl FnMut(TypeVarVariance, &CandidateTypeVarSolution<'db>) -> PathBoundSolution<'db>,
     ) -> Result<Solutions<'db>, ProjectionError> {
-        let (path_bounds, mut limits) =
-            self.bounded_path_bounds(db, env, inferable, budget, report_diagnostics)?;
-        let mut type_budget = ProjectionTypeBudget::new(budget.type_terms);
+        self.solutions_with_shared_budget(
+            db, env, inferable, &mut ProjectionBudget::new(budget), report_diagnostics, choose,
+        )
+    }
+
+    pub(crate) fn solutions_with_shared_budget(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        inferable: TypeVarSet<'db>,
+        resources: &mut ProjectionBudget,
+        report_diagnostics: ReportDiagnostics,
+        choose: impl FnMut(TypeVarVariance, &CandidateTypeVarSolution<'db>) -> PathBoundSolution<'db>,
+    ) -> Result<Solutions<'db>, ProjectionError> {
+        let ProjectionBudget { limits, types: type_budget } = resources;
+        let path_bounds = self.path_bounds_with_limits(db, env, inferable, limits, report_diagnostics)?;
         match path_bounds.try_solve_with(
             db,
             env,
-            &mut limits,
-            &mut type_budget,
+            limits,
+            type_budget,
             choose,
             |solution, type_budget| {
                 let mut charge = || {

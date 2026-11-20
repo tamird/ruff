@@ -195,8 +195,8 @@ impl<'db> SequentMap<'db> {
                         write!(
                             f,
                             "{} ⇔ {}",
-                            left.display(db, env, Some(true)),
-                            right.display(db, env, Some(true))
+                            left.constraint(db).display(db, env, Some(true)),
+                            right.constraint(db).display(db, env, Some(true))
                         )?;
                     }
                     Sequent::PairRelation {
@@ -532,8 +532,8 @@ impl<'db> SequentMap<'db> {
             let right = right.constraint(db);
             tracing::trace!(
                 target: "ty_python_semantic::types::constraints::SequentMap",
-                left = %left.constraint(db).display(db, env, Some(true)),
-                right = %right.constraint(db).display(db, env, Some(true)),
+                left = %left.display(db, env, Some(true)),
+                right = %right.display(db, env, Some(true)),
                 "add sequents for constraint pair",
             );
             let mut map = SequentMapBuilder::new(db);

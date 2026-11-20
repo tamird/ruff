@@ -38,10 +38,10 @@ use crate::lint::LintMetadata;
 use crate::place::{DefinedPlace, Definedness, Place, PlaceAndQualifiers};
 use crate::provided::{ProvidedGetattrPresence, ProvidedGetattrResult};
 use crate::subscript::PyIndex;
+use crate::types::DictionaryItemKind;
 use crate::types::ProgramEnvironment;
 use crate::types::call::arguments::{
-    CallArgument, CallArgumentExpansions, Expansion, KeywordArgument,
-    VariadicArgument,
+    CallArgument, CallArgumentExpansions, Expansion, KeywordArgument, VariadicArgument,
 };
 use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::projection::{ProjectionTypeBudget, SolutionBudget};
@@ -86,8 +86,7 @@ use crate::types::typed_dict::{
     extract_unpacked_typed_dict_from_value_type,
 };
 use crate::types::typevar::{
-    BoundTypeVarIdentity, TypeVarDomain, TypeVarKind, TypeVarNonceGenerator,
-    TypeVarSet,
+    BoundTypeVarIdentity, TypeVarDomain, TypeVarKind, TypeVarNonceGenerator, TypeVarSet,
 };
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
@@ -104,7 +103,6 @@ use crate::types::{
     UnionAccumulator, UnionBuilder, UnionType, WrapperDescriptorKind, enums, is_known_class_method,
     is_property_method, list_members,
 };
-use crate::types::DictionaryItemKind;
 use crate::{DisplaySettings, FxOrderSet};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
 use ruff_python_ast::{self as ast, AnyNodeRef, ArgOrKeyword, PythonVersion};
@@ -10163,7 +10161,8 @@ impl<'db> Binding<'db> {
                 {
                     return None;
                 }
-                let matches = self.matched_argument_for_call_argument(binding.bound_type.is_some(), index)?;
+                let matches =
+                    self.matched_argument_for_call_argument(binding.bound_type.is_some(), index)?;
                 count += matches
                     .iter()
                     .filter(|matched| matched.index == matched_parameter.index)
