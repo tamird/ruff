@@ -666,68 +666,6 @@ impl<'db> CallableSignature<'db> {
         }
     }
 
-    /// Captures `typing.Self` for a method call while retaining its receiver contract.
-    ///
-    /// The call matcher still checks the implicit receiver argument against the original first
-    /// parameter. Only the remaining parameters and result use the captured receiver's `Self`.
-    pub(crate) fn apply_self_for_call(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        receiver_type: Type<'db>,
-        self_type: Type<'db>,
-    ) -> std::borrow::Cow<'_, Self> {
-        if !self.overloads.iter().any(|signature| {
-            let [receiver, parameters @ ..] = signature.parameters.as_slice() else {
-                return false;
-            };
-            receiver.is_positional() && signature.needs_self_mapping(db, env, parameters)
-        }) {
-            return std::borrow::Cow::Borrowed(self);
-        }
-        std::borrow::Cow::Owned(Self::from_overloads(self.overloads.iter().map(
-            |signature| {
-                let [receiver, parameters @ ..] = signature.parameters.as_slice() else {
-                    return signature.clone();
-                };
-                if !receiver.is_positional() || !signature.needs_self_mapping(db, env, parameters) {
-                    return signature.clone();
-                }
-                // Class specialization can introduce a caller's `Self` with the same source
-                // definition but a different receiver domain. Capture only this signature's
-                // own variable, preserving those already-bound type arguments.
-                let Some(definition) = signature.definition else {
-                    return signature.clone();
-                };
-                let Some(context) = signature.generic_context else {
-                    return signature.clone();
-                };
-                let Ok(self_typevar) = context
-                    .variables(db)
-                    .filter(|variable| {
-                        variable.typevar(db).is_self(db)
-                            && variable.binding_context(db).definition() == Some(definition)
-                    })
-                    .exactly_one()
-                else {
-                    return signature.clone();
-                };
-                let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Single(
-                    self_typevar,
-                    self_type,
-                    AliasPolicy::Expand,
-                ));
-                let mut captured =
-                    signature.apply_self_mapping_with_receiver(db, env, receiver_type, &mapping);
-                captured.parameters = captured.parameters.with_transformed_parameters(
-                    std::iter::once(receiver.clone())
-                        .chain(captured.parameters.iter().skip(1).cloned()),
-                );
-                captured
-            },
-        )))
-    }
-
     pub(crate) fn is_single_paramspec(
         &self,
     ) -> Option<(BoundTypeVarInstance<'db>, &Signature<'db>)> {

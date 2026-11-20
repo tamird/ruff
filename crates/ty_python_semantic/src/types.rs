@@ -7735,15 +7735,8 @@ impl<'db> Type<'db> {
                     binding.bake_bound_type_into_overloads(db, env);
                     binding.into()
                 } else {
-                    // Capture typing.Self before inferring method-local variables, while retaining
-                    // the receiver itself for call inference and receiver diagnostics.
-                    let signature = signature.apply_self_for_call(
-                        db,
-                        env,
-                        self_instance,
-                        bound_method.typing_self_type(db),
-                    );
-                    // Solve exact receiver constraints before checking the other arguments.
+                    // Solve exact receiver constraints before checking the other arguments, but
+                    // retain the receiver itself for joint inference of `Self` and diagnostics.
                     let overloads = signature.overloads.iter().flat_map(|overload| {
                         if overload.has_receiver_determined_method_typevar(db, env)
                             && let Some(specialized) = overload.specialize_for_bound_receiver(
