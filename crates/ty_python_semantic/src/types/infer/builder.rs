@@ -13706,7 +13706,34 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     )
                 });
 
-                let comparison = match literal_membership {
+                let known_comparison = literal_membership.or_else(|| {
+                    let inferred_type =
+                        |expression: &ast::Expr| builder.expression_type(expression);
+                    let truthiness = crate::types::narrow::native_type_test_truthiness(
+                        db,
+                        builder.scope(),
+                        left,
+                        right_ty,
+                        *op,
+                        &inferred_type,
+                    )
+                    .or_else(|| {
+                        crate::types::narrow::native_type_test_truthiness(
+                            db,
+                            builder.scope(),
+                            right,
+                            left_ty,
+                            *op,
+                            &inferred_type,
+                        )
+                    })?;
+                    Some(Type::from_truthiness(
+                        db,
+                        builder.program_environment(),
+                        truthiness,
+                    ))
+                });
+                let comparison = match known_comparison {
                     Some(ty) => Ok(ty),
                     None => comparisons::infer_binary_type_comparison(
                         &builder.context,

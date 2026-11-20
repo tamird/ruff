@@ -52,7 +52,7 @@ use ruff_python_ast::helpers::any_over_expr;
 use ruff_python_ast::name::Name;
 use ruff_python_stdlib::identifiers::is_identifier;
 
-use super::call::CallArguments;
+use super::call::{CallArguments, has_exact_runtime_class};
 use super::constraints::{ConstraintSetBuilder, Solutions};
 use super::equality::{
     ComparisonSoundnessPolicy, equality_exclusion_constraint, equality_truthiness,
@@ -60,6 +60,7 @@ use super::equality::{
 };
 use super::literal::{LiteralComparisonKind, WideLiteralComparison};
 use super::match_pattern::is_typed_dict_runtime_domain;
+use super::typevar::TypeVarSet;
 use super::{FunctionBodyDomain, UnionType};
 use itertools::{Either, Itertools};
 use ruff_python_ast as ast;
@@ -181,6 +182,9 @@ impl<'db, 'ast> RuntimeTypeTest<'db, 'ast> {
                 let [subject] = call.arguments.args.as_ref() else {
                     return None;
                 };
+                if subject.is_starred_expr() {
+                    return None;
+                }
                 let target = db.provided_type_test(
                     scope.program_file(db),
                     inferred_type(&call.func),
@@ -261,6 +265,75 @@ impl<'db, 'ast> RuntimeTypeTest<'db, 'ast> {
             kind: RuntimeTypeTestKind::Native,
         })
     }
+}
+
+/// Prove only impossible native type-tag comparisons, using already inferred operands.
+/// A read-only interface may have several runtime tags; disjointness does not select one.
+pub(super) fn native_type_test_truthiness<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    operand: &ast::Expr,
+    compared_value: Type<'db>,
+    op: ast::CmpOp,
+    inferred_type: &impl Fn(&ast::Expr) -> Type<'db>,
+) -> Option<Truthiness> {
+    if !matches!(op, ast::CmpOp::Eq | ast::CmpOp::NotEq) {
+        return None;
+    }
+    compared_value.string_literal_value(db)?;
+    let RuntimeTypeTest {
+        subject,
+        target,
+        is_positive,
+        kind,
+    } = RuntimeTypeTest::from_comparison(
+        db,
+        scope,
+        operand,
+        compared_value,
+        op,
+        true,
+        inferred_type,
+    )?;
+    match kind {
+        RuntimeTypeTestKind::Native => {}
+        RuntimeTypeTestKind::ExactClass => return None,
+    }
+    let env = ProgramEnvironment::from_scope(scope);
+    let result = inferred_type(operand);
+    let builtin_string = match result {
+        Type::LiteralValue(literal) => matches!(
+            literal.kind(),
+            LiteralValueTypeKind::String(_) | LiteralValueTypeKind::LiteralString
+        ),
+        Type::NominalInstance(instance) => {
+            instance.known_class(db) == Some(KnownClass::Str)
+                && has_exact_runtime_class(db, &env, result)
+        }
+        _ => false,
+    };
+    if !builtin_string {
+        return None;
+    }
+    let subject = inferred_type(subject);
+    if subject.is_never()
+        || [subject, target]
+            .into_iter()
+            .any(|ty| ty.has_indeterminate_inference(db, &env))
+        || !subject.is_fully_static(db, &env)
+    {
+        return None;
+    }
+    let constraints = ConstraintSetBuilder::new();
+    let disjoint = subject.when_disjoint_from(db, &env, target, &constraints, TypeVarSet::None);
+    if disjoint.is_always_satisfied_bounded(db, &env, TypeVarSet::None) != Some(true) {
+        return None;
+    }
+    Some(if is_positive {
+        Truthiness::AlwaysFalse
+    } else {
+        Truthiness::AlwaysTrue
+    })
 }
 
 /// Attempt to find an underlying class literal for purposes of `if type(x) is Y` narrowing.
