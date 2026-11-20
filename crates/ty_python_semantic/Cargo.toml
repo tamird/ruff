@@ -32,6 +32,7 @@ ty_site_packages = { workspace = true }
 ty_python_core = { workspace = true }
 ty_static = { workspace = true }
 
+arrayvec = { workspace = true }
 bitflags = { workspace = true }
 char_str = { workspace = true, features = ["get-size"] }
 compact_str = { workspace = true }
@@ -68,6 +69,7 @@ insta = { workspace = true }
 pretty_assertions = { workspace = true }
 quickcheck = { workspace = true }
 quickcheck_macros = { workspace = true }
+zip = { workspace = true }
 
 [features]
 schemars = ["dep:schemars"]

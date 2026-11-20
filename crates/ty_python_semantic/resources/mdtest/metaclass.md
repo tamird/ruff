@@ -912,7 +912,9 @@ typeshed = "/typeshed"
 `/typeshed/stdlib/builtins.pyi`:
 
 ```pyi
-class object: ...
+class object:
+    __class__: type
+
 class type: ...
 class tuple: ...
 ```

@@ -286,6 +286,174 @@ def _(t9: tuple[int | None, str] | tuple[str, int]):
         reveal_type(t9)  # revealed: tuple[int | None, str] | tuple[str, int]
 ```
 
+### Unpacked Boolean tags
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+A truthiness test on stable local unpack targets preserves the relationship between a Boolean tag
+and its payload. Reassigning either target must not restore the original relationship.
+
+```py
+from collections.abc import AsyncIterable
+from typing import Literal
+
+def unpacked(item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], str]):
+    flag, payload = item
+    if flag:
+        reveal_type(payload)  # revealed: dict[str, int]
+    else:
+        reveal_type(payload)  # revealed: str
+
+type Tagged = tuple[Literal[True], dict[str, int]] | tuple[Literal[False], str]
+
+def aliased(item: Tagged):
+    flag, payload = item
+    if flag:
+        reveal_type(payload)  # revealed: dict[str, int]
+    else:
+        reveal_type(payload)  # revealed: str
+
+def for_targets(items: list[Tagged]):
+    for flag, payload in items:
+        if flag:
+            reveal_type(payload)  # revealed: dict[str, int]
+        else:
+            reveal_type(payload)  # revealed: str
+
+async def async_for_targets(items: AsyncIterable[Tagged]):
+    async for flag, payload in items:
+        if flag:
+            reveal_type(payload)  # revealed: dict[str, int]
+        else:
+            reveal_type(payload)  # revealed: str
+
+def assigned_in_loop(items: list[Tagged]):
+    for item in items:
+        flag, payload = item
+        if flag:
+            reveal_type(payload)  # revealed: dict[str, int]
+        else:
+            reveal_type(payload)  # revealed: str
+
+def replaced_for_payload(items: list[Tagged]) -> dict[str, int]:
+    for flag, payload in items:
+        payload = "replacement"
+        if flag:
+            return payload  # error: [invalid-return-type]
+    return {}
+
+def deleted_for_payload(items: list[Tagged]):
+    for flag, payload in items:
+        del payload
+        if flag:
+            payload  # error: [unresolved-reference]
+
+def replaced_source(item: Tagged):
+    flag, payload = item
+    item = (False, "replacement")
+    if flag:
+        reveal_type(payload)  # revealed: dict[str, int]
+    else:
+        reveal_type(payload)  # revealed: str
+
+def ambiguous(item: tuple[Literal[True], dict[str, int]] | tuple[bool, str]):
+    flag, payload = item
+    if flag:
+        reveal_type(payload)  # revealed: dict[str, int] | str
+    else:
+        reveal_type(payload)  # revealed: str
+
+def recovery(item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], str, int]):
+    flag, payload = item  # error: [invalid-assignment]
+    if flag:
+        reveal_type(payload)  # revealed: dict[str, int] | Unknown
+
+def replaced_flag(
+    item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], object],
+) -> dict[str, int]:
+    flag, payload = item
+    flag = True
+    if flag:
+        return payload  # error: [invalid-return-type]
+    return {}
+
+def replaced_payload(
+    item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], object],
+) -> dict[str, int]:
+    flag, payload = item
+    payload = object()
+    if flag:
+        return payload  # error: [invalid-return-type]
+    return {}
+
+def duplicate_targets(
+    item: tuple[Literal[True], Literal[False], dict[str, int]] | tuple[Literal[False], Literal[True], str],
+) -> dict[str, int]:
+    flag, flag, payload = item
+    if flag:
+        return payload  # error: [invalid-return-type]
+    return {}
+
+def loop_write(
+    item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], object],
+) -> dict[str, int]:
+    flag, payload = item
+    for index in range(2):
+        if index and flag:
+            return payload  # error: [invalid-return-type]
+        payload = object()
+    return {}
+
+def nested_write(
+    item: tuple[Literal[True], dict[str, int]] | tuple[Literal[False], object],
+) -> dict[str, int]:
+    flag, payload = item
+    def replace():
+        nonlocal payload
+        payload = object()
+    replace()
+    if flag:
+        return payload  # error: [invalid-return-type]
+    return {}
+```
+
+Comprehension targets retain the relationship within each unpacked item. Rebinding a target in a
+later generator prevents projection, and failed outer iteration cannot provide narrowing evidence.
+
+```py
+from collections.abc import Iterator
+
+def consume_dict(value: dict[str, int]) -> None: ...
+def consume_str(value: str) -> None: ...
+def comprehensions(items: list[Tagged]):
+    [consume_dict(payload) if flag else consume_str(payload) for flag, payload in items]
+    reveal_type([payload for flag, payload in items if flag])  # revealed: list[dict[str, int]]
+    reveal_type([payload for flag, payload in items if not flag])  # revealed: list[str]
+
+def replaced_comprehension_flag(items: list[Tagged], flags: list[bool]):
+    # error: [invalid-argument-type]
+    [consume_dict(payload) for flag, payload in items for flag in flags if flag]
+
+def replaced_comprehension_payload(items: list[Tagged], replacements: list[dict[str, int] | str]):
+    # error: [invalid-argument-type]
+    [consume_dict(payload) for flag, payload in items for payload in replacements if flag]
+
+class Broken:
+    def __iter__(self, required: object) -> Iterator[Tagged]:
+        return iter(())
+
+def failed_outer_iteration():
+    # error: [not-iterable]
+    reveal_type([payload for flag, payload in Broken() if flag])  # revealed: list[dict[str, int] | str]
+
+    for flag, payload in Broken():  # error: [not-iterable]
+        if flag:
+            reveal_type(payload)  # revealed: dict[str, int] | str
+```
+
 ### Tagged unions of tuples (equality narrowing)
 
 Narrow unions of tuples based on literal tag elements using `==` comparison:
@@ -1074,4 +1242,152 @@ class Container:
 def _(c: Container):
     if c.data[b"key"] is not None:
         reveal_type(c.data[b"key"])  # revealed: int
+```
+
+## Constructing tagged tuples after a branch join
+
+```py
+from typing import Literal
+
+Tagged = tuple[Literal[True], int] | tuple[Literal[False], str]
+
+def joined(flag: bool) -> Tagged:
+    if flag:
+        payload = 1
+    else:
+        payload = "x"
+    reveal_type((flag, payload))  # revealed: tuple[Literal[True], Literal[1]] | tuple[Literal[False], Literal["x"]]
+    return flag, payload
+
+def branch_local(flag: bool) -> Tagged:
+    if flag:
+        return True, 1
+    else:
+        return False, "x"
+
+def narrowed_payload(flag: bool, integer: int | None, text: str | None) -> Tagged:
+    if flag:
+        payload = integer
+    else:
+        payload = text
+    assert payload is not None
+    return flag, payload
+```
+
+Reassigning either field or using an independent payload does not establish the tagged contract. A
+captured writer can also replace a local after its branch assignment.
+
+```py
+from typing import Literal
+
+Tagged = tuple[Literal[True], int] | tuple[Literal[False], str]
+
+def unrelated(flag: bool, payload: int | str) -> Tagged:
+    return flag, payload  # error: [invalid-return-type]
+
+def changed_tag(flag: bool) -> Tagged:
+    if flag:
+        payload = 1
+    else:
+        payload = "x"
+    flag = not flag
+    return flag, payload  # error: [invalid-return-type]
+
+def changed_payload(flag: bool, other: int | str) -> Tagged:
+    if flag:
+        payload = 1
+    else:
+        payload = "x"
+    payload = other
+    return flag, payload  # error: [invalid-return-type]
+
+def captured_payload(flag: bool, other: int | str) -> Tagged:
+    if flag:
+        payload = 1
+    else:
+        payload = "x"
+    def replace():
+        nonlocal payload
+        payload = other
+    replace()
+    return flag, payload  # error: [invalid-return-type]
+
+def missing_payload(flag: bool):
+    if flag:
+        payload = 1
+    return flag, payload  # error: [possibly-unresolved-reference]
+```
+
+## Constructing tagged tuples within a loop iteration
+
+```py
+from typing import Literal
+
+LoopTagged = tuple[Literal[True], int] | tuple[Literal[False], object]
+
+def consume_loop(value: LoopTagged) -> None: ...
+def compound_joined(selected: bool, brace: bool) -> None:
+    if selected or brace:
+        payload = 1
+    else:
+        payload = "x"
+    consume_loop((selected, payload))
+
+def loop_joined(signals: list[bool], brace: bool) -> None:
+    selected = False
+    for signal in signals:
+        if signal:
+            selected = True
+        if selected or brace:
+            payload = 1
+        else:
+            payload = "x"
+        consume_loop((selected, payload))
+        selected = False
+
+def loop_changed(signals: list[bool], brace: bool, replacement: bool) -> None:
+    selected = False
+    for signal in signals:
+        if signal:
+            selected = True
+        if selected or brace:
+            payload = 1
+        else:
+            payload = "x"
+        selected = replacement
+        consume_loop((selected, payload))  # error: [invalid-argument-type]
+        selected = False
+
+def carried_payload(signals: list[bool], refresh: bool) -> None:
+    payload: int | str = "x"
+    for selected in signals:
+        if refresh:
+            if selected:
+                payload = 1
+            else:
+                payload = "x"
+        consume_loop((selected, payload))  # error: [invalid-argument-type]
+
+def after_while(signals: list[bool], running: bool) -> None:
+    payload: int | str = "x"
+    selected = False
+    while (selected := signals.pop()) == running:
+        if selected:
+            payload = 1
+        else:
+            payload = "x"
+    consume_loop((selected, payload))  # error: [invalid-argument-type]
+
+def nested_loop(signals: list[bool], replacements: list[bool]) -> None:
+    selected = False
+    for signal in signals:
+        if signal:
+            selected = True
+        if selected:
+            payload = 1
+        else:
+            payload = "x"
+        for selected in replacements:
+            pass
+        consume_loop((selected, payload))  # error: [invalid-argument-type]
 ```

@@ -21,6 +21,34 @@ TODO: For an invariant position, e.g. `list[Any]`, it should be replaced with an
 representing "all lists, containing any type". We currently represent this by replacing `Any` in
 invariant position with an unresolved type variable.
 
+## Generic function signatures
+
+A function with fully static parameter and return types is equivalent to both materializations.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Any
+from ty_extensions import Bottom, Top, static_assert
+from ty_extensions._internal import TypeOf, is_equivalent_to
+
+def optional[T: int](value: T | None) -> T | None:
+    return value
+
+static_assert(is_equivalent_to(TypeOf[optional], Top[TypeOf[optional]]))
+static_assert(is_equivalent_to(TypeOf[optional], Bottom[TypeOf[optional]]))
+optional("wrong")  # error: [invalid-argument-type]
+
+def gradual[T: int](value: T | None, other: Any) -> T | None:
+    return value
+
+static_assert(not is_equivalent_to(TypeOf[gradual], Top[TypeOf[gradual]]))
+static_assert(not is_equivalent_to(TypeOf[gradual], Bottom[TypeOf[gradual]]))
+```
+
 ## Replacement rules
 
 ### Top materialization

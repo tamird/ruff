@@ -519,6 +519,51 @@ def _(
     reveal_type(i4)  # revealed: P
 ```
 
+### Negating generic ancestors of known values
+
+Known values retain their class's generic ancestors. For example, `range(3)` is a `Sequence[int]`
+and therefore also a `Sequence[object]` by covariance. It cannot satisfy the negation of either
+type.
+
+```py
+from collections.abc import Sequence
+from ty_extensions import Not, static_assert
+from ty_extensions._internal import TypeOf, is_disjoint_from, is_subtype_of
+
+type NonSequence = Not[Sequence[object]]
+
+def accept_scalar(value: NonSequence) -> None: ...
+def accept_sequence(value: Not[Not[Sequence[object]]]) -> None: ...
+
+nonempty = range(3)
+empty = range(0)
+static_assert(is_subtype_of(TypeOf[nonempty], Sequence[object]))
+static_assert(not is_subtype_of(TypeOf[nonempty], NonSequence))
+static_assert(not is_disjoint_from(TypeOf[nonempty], Sequence[object]))
+static_assert(not is_disjoint_from(Sequence[object], TypeOf[empty]))
+
+accept_scalar(range(3))  # error: [invalid-argument-type]
+accept_scalar(nonempty)  # error: [invalid-argument-type]
+accept_scalar(empty)  # error: [invalid-argument-type]
+accept_scalar("text")  # error: [invalid-argument-type]
+accept_scalar(b"bytes")  # error: [invalid-argument-type]
+accept_scalar([1])  # error: [invalid-argument-type]
+accept_scalar((1,))  # error: [invalid-argument-type]
+accept_scalar(1)
+accept_scalar(None)
+accept_sequence(nonempty)
+accept_sequence(empty)
+
+wrong: NonSequence = range(3)  # error: [invalid-assignment]
+
+class IntSequence(Sequence[int]): ...
+
+def check_other_sequences(value: IntSequence, condition: bool):
+    accept_scalar(value)  # error: [invalid-argument-type]
+    accept_scalar(range(3) if condition else None)  # error: [invalid-argument-type]
+    accept_sequence(value)
+```
+
 ## Simplification strategies
 
 In this section, we present various simplification strategies that go beyond the structure of the
@@ -1415,6 +1460,79 @@ class SpecificArgs:
 def _(x: AcceptsAnything & SpecificArgs) -> None:
     reveal_type(x(42))  # revealed: RetA & RetB
     reveal_type(x("foo"))  # revealed: RetA
+```
+
+### Narrowing a callable to a function
+
+A function's runtime type provides function-specific attributes; its generic `__call__` signature
+does not add another overload to a callable whose signature is already known.
+
+```py
+from types import FunctionType
+from typing import Any, Callable, Protocol
+from ty_extensions import Top
+
+def narrowed(callback: Callable[[int], str]) -> None:
+    if isinstance(callback, FunctionType):
+        reveal_type(callback.__name__)  # revealed: str
+        reveal_type(callback(1))  # revealed: str
+        callback("wrong")  # error: [invalid-argument-type]
+        reveal_type(callback.__call__(1))  # revealed: str
+        callback.__call__("wrong")  # error: [invalid-argument-type]
+
+def without_signature(callback: FunctionType) -> None:
+    callback(1)
+
+class Callback(Protocol):
+    def __call__(self, *, enabled: bool) -> int: ...
+
+def narrowed_protocol(callback: Callback) -> None:
+    if isinstance(callback, FunctionType):
+        reveal_type(callback(enabled=True))  # revealed: int
+        callback(enabled="wrong")  # error: [invalid-argument-type]
+
+def overloads(callback: FunctionType & Callable[[int], str] & Callable[[str], int]) -> None:
+    reveal_type(callback(1))  # revealed: str
+    reveal_type(callback("value"))  # revealed: int
+    # error: [invalid-argument-type]
+    # error: [invalid-argument-type]
+    callback(None)
+
+def unknown_signature(callback: FunctionType & Top[Callable[..., bytes]]) -> None:
+    # error: [call-top-callable]
+    reveal_type(callback())  # revealed: bytes
+```
+
+Passing the narrowed function through a generic callable preserves its parameter type.
+
+```py
+def capture[T](callback: Callable[[T], str]) -> Callable[[T], str]:
+    return callback
+
+def inferred(callback: Callable[[int], str]) -> None:
+    if isinstance(callback, FunctionType):
+        reveal_type(capture(callback))  # revealed: (int, /) -> str
+        capture(callback)("wrong")  # error: [invalid-argument-type]
+
+def nominal_only(callback: FunctionType) -> None:
+    reveal_type(capture(callback))  # revealed: (Any, /) -> str
+
+def gradual(callback: FunctionType & Callable[[Any], str]) -> None:
+    reveal_type(capture(callback))  # revealed: (Any, /) -> str
+
+def incompatible(callback: FunctionType & Callable[[int], int]) -> None:
+    capture(callback)  # error: [invalid-argument-type]
+
+def independent_signatures(
+    callback: FunctionType & Callable[[int], str] & Callable[[str], str],
+) -> None:
+    reveal_type(capture(callback))  # revealed: (Never, /) -> str
+
+class IndependentCallable:
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+def independent(callback: IndependentCallable & Callable[[int], str]) -> None:
+    reveal_type(capture(callback))  # revealed: (Any & int, /) -> str
 ```
 
 ### No callable elements

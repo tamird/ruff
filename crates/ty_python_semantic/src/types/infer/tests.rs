@@ -9,6 +9,7 @@ use crate::place::{ConsideredDefinitions, Place, PlaceAndQualifiers};
 use crate::types::{KnownClass, KnownInstanceType, TypeAndQualifiers, check_types};
 use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
+use ruff_db::source::source_text;
 use ruff_db::system::DbWithWritableSystem as _;
 use ruff_db::testing::{
     assert_function_query_was_not_run, assert_function_query_was_not_run_by_name,
@@ -92,6 +93,199 @@ fn assert_revealed_type(db: &TestDb, filename: &str, expected: &str) {
             .and_then(|annotation| annotation.get_message()),
         Some(expected.as_str())
     );
+}
+
+#[test]
+fn keyword_field_factory_context() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY312)
+        .with_keyword_field_factory(|db, definition| {
+            let DefinitionKind::Function(function) = definition.kind(db) else {
+                return false;
+            };
+            let module = parsed_module(db, definition.program_file(db).python_file(db)).load(db);
+            function.node(&module).name.as_str() == "record"
+        })
+        .build()?;
+    for (declaration, expected_type, argument, revealed) in [
+        (
+            r#"T = TypeVar('T')
+class Parent(Protocol[T]):
+    @property
+    def run(self) -> Callable[[T], T]: ...
+class Row(Parent[str], Protocol): ..."#,
+            "Row",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "str",
+        ),
+        (
+            r#"class Parent[T](Protocol):
+    @property
+    def run(self) -> Callable[[T], T]: ...
+class Row(Parent[str], Protocol): ..."#,
+            "Row",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "str",
+        ),
+        (
+            "class Row(Protocol):\n    @property\n    def run(self) -> Callable[[Self], str]: ...",
+            "Row",
+            "run=lambda value: (reveal_type(value), 'ok')[1]",
+            "Row",
+        ),
+        (
+            "class Row(Protocol):\n    run: Callable[[str], str]",
+            "Row",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "Unknown",
+        ),
+        (
+            "class Row(Protocol):\n    def run(self, value: str) -> str: ...",
+            "Row",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "Unknown",
+        ),
+        (
+            r#"class Row(Protocol):
+    @property
+    def run(self) -> Callable[[str], str]: ...
+    @run.setter
+    def run(self, value: Callable[[str], str]) -> None: ..."#,
+            "Row",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "Unknown",
+        ),
+        (
+            "class Row(Protocol):\n    @property\n    def run(self) -> Callable[[str], str]: ...",
+            "Row | None",
+            "run=lambda value: (reveal_type(value), value)[1]",
+            "Unknown",
+        ),
+        (
+            "class Row(Protocol):\n    @property\n    def run(self) -> Callable[[str], str]: ...",
+            "Row",
+            "other=lambda value: (reveal_type(value), value)[1]",
+            "Unknown",
+        ),
+        (
+            "class Row(Protocol):\n    @property\n    def run(self) -> Callable[[str], str]: ...",
+            "Row",
+            "**{'run': lambda value: (reveal_type(value), value)[1]}",
+            "Unknown",
+        ),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!(
+                r#"from typing import Any, Callable, Protocol, Self, TypeVar, reveal_type
+{declaration}
+def record(**fields: object) -> Any: ...
+value: {expected_type} = record({argument})
+"#
+            ),
+        )?;
+        assert_revealed_type(&db, "/src/main.py", revealed);
+    }
+    db.write_file(
+        "/src/main.py",
+        r#"from typing import Any, Callable, Protocol
+class Row(Protocol):
+    @property
+    def run(self) -> Callable[[str], str]: ...
+def record(**fields: int) -> Any: ...
+value: Row = record(run=lambda value: value.lower())
+"#,
+    )?;
+    assert_file_diagnostics(
+        &db,
+        "/src/main.py",
+        &["Argument to function `record` is incorrect"],
+    );
+    Ok(())
+}
+
+#[test]
+fn elif_conditions_use_incoming_type_checking_context() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import TYPE_CHECKING
+
+        if TYPE_CHECKING:
+            pass
+        elif runtime_after_type_only:
+            pass
+
+        if not TYPE_CHECKING:
+            pass
+        elif type_only_after_runtime:
+            pass
+
+        if flag:
+            pass
+        elif TYPE_CHECKING:
+            pass
+
+        if TYPE_CHECKING:
+            if flag:
+                pass
+            elif nested_type_only:
+                pass
+        "#,
+    )?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let index = semantic_index(&db, program_file(&db, file));
+    let source = source_text(&db, file);
+    for (text, expected) in [
+        ("runtime_after_type_only", false),
+        ("type_only_after_runtime", true),
+        ("elif TYPE_CHECKING", false),
+        ("nested_type_only", true),
+    ] {
+        let condition = text.strip_prefix("elif ").unwrap_or(text);
+        let start = source.find(text).expect("condition exists") + text.len() - condition.len();
+        let range = ruff_text_size::TextRange::new(
+            start.try_into().unwrap(),
+            (start + condition.len()).try_into().unwrap(),
+        );
+        assert_eq!(
+            index.is_in_type_checking_block(FileScopeId::global(), range),
+            expected,
+            "{text}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn successful_subscript_without_scope_inference() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "src/receivers.pyi",
+        r#"
+        from typing import NoReturn
+        class Present:
+            def __getitem__(self, key: int) -> int: ...
+        class Absent:
+            def __getitem__(self, key: int) -> NoReturn: ...
+        "#,
+    )?;
+    db.write_dedented(
+        "src/main.py",
+        r#"
+        from receivers import Present, Absent
+        def f(value: Present | Absent):
+            value[0]
+            result = value
+        "#,
+    )?;
+    let ty = get_symbol(&db, "src/main.py", &["f"], "result").expect_type();
+    assert_eq!(
+        ty.display(&db, &db.program_environment()).to_string(),
+        "Present"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1147,6 +1341,49 @@ fn redundant_cast_without_closing_parenthesis() -> anyhow::Result<()> {
 }
 
 // Incremental inference tests
+#[test]
+fn captured_collection_context_after_rebinding() -> anyhow::Result<()> {
+    for query_order in [["initial", "callback"], ["callback", "initial"]] {
+        let mut db = setup_db();
+        for (rebind, expected) in [
+            ("", "list[str]"),
+            ("    values = [1]\n", "list[Unknown]"),
+            ("", "list[str]"),
+        ] {
+            let source = format!(
+                r#"def outer():
+    values = []
+    initial = values
+    callback = lambda: consume(values)
+{rebind}
+def consume(values: list[str]) -> None: ...
+"#
+            );
+            db.write_file("/src/main.py", &source)?;
+            for name in query_order {
+                let ty = get_symbol(&db, "/src/main.py", &["outer"], name).expect_type();
+                let expected = if name == "initial" {
+                    expected
+                } else {
+                    "() -> None"
+                };
+                assert_eq!(
+                    ty.display(&db, &db.program_environment()).to_string(),
+                    expected,
+                    "symbol {name}, query order {query_order:?}, rebind {rebind:?}",
+                );
+            }
+            let expected_diagnostics = if rebind.is_empty() {
+                &[][..]
+            } else {
+                &["Argument to function `consume` is incorrect"]
+            };
+            assert_file_diagnostics(&db, "/src/main.py", expected_diagnostics);
+        }
+    }
+    Ok(())
+}
+
 #[track_caller]
 fn first_public_binding<'db>(db: &'db TestDb, file: File, name: &str) -> Definition<'db> {
     let scope = global_scope(db, program_file(db, file));
@@ -1429,6 +1666,40 @@ fn function_inference_regions_are_disjoint() -> anyhow::Result<()> {
         crate::types::definition_expression_type(&db, definition, default),
         defaults.expression_type(default)
     );
+    Ok(())
+}
+
+#[test]
+fn parameter_default_dependency_scope() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    let path = "/src/main.py";
+    db.write_files([
+        ("/src/values.py", "value = 1"),
+        (
+            path,
+            "from values import value\n\ndef f(x=value): pass\n\nunrelated = 1",
+        ),
+    ])?;
+    let source = system_path_to_file(&db, path)?;
+    let parameter_type = |db: &TestDb| {
+        get_symbol(db, path, &["f"], "x")
+            .expect_type()
+            .display(db, &db.program_environment())
+            .to_string()
+    };
+
+    db.clear_salsa_events();
+    assert_eq!(parameter_type(&db), "Unknown | Literal[1]");
+    let events = db.take_salsa_events();
+    assert_function_query_was_not_run(
+        &db,
+        infer_definition_types,
+        first_public_binding(&db, source, "unrelated"),
+        &events,
+    );
+
+    db.write_file("/src/values.py", "value = 'changed'")?;
+    assert_eq!(parameter_type(&db), r#"Unknown | Literal["changed"]"#);
     Ok(())
 }
 

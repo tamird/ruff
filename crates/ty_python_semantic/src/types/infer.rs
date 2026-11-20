@@ -60,7 +60,7 @@ use crate::types::unpacker::{UnpackResult, Unpacker};
 use crate::types::{
     ClassLiteral, DeclaredType, KnownClass, RecursiveType, StaticClassLiteral, Type, TypeQualifiers,
 };
-use crate::{Db, FxIndexSet};
+use crate::{Db, FxIndexMap};
 
 use builder::TypeInferenceBuilder;
 pub(super) use comparisons::UnsupportedComparisonError;
@@ -71,10 +71,13 @@ use ty_python_core::statement::StatementInner;
 use ty_python_core::unpack::Unpack;
 use ty_python_core::{ExpressionNodeKey, SemanticIndex, Statement, Truthiness, semantic_index};
 
+mod body_domain;
 mod builder;
 mod legacy_type_alias;
 use legacy_type_alias::legacy_type_alias_definition;
 pub(super) use legacy_type_alias::legacy_type_alias_parameters;
+pub(crate) use body_domain::FunctionBodyDomain;
+pub use body_domain::{BodyDomainError, OverloadBodyAnalysis, OverloadBodyView, check_overload_body};
 mod comparisons;
 mod expression_truthiness;
 pub(crate) use expression_truthiness::TruthinessAnalyzer;
@@ -197,6 +200,10 @@ bitflags::bitflags! {
 
         /// The expression refers to a `TypeVarTuple` without unpacking it.
         const INVALID_BARE_TYPE_VAR_TUPLE = 1 << 2;
+
+        /// An application-defined `**kwargs` annotation captures only a parameter
+        /// specification's keyword arguments.
+        const KEYWORD_PARAM_SPEC = 1 << 3;
     }
 }
 
@@ -208,9 +215,27 @@ struct TypeAndRange<'db> {
     range: TextRange,
 }
 
-type CollectionUseConstraints<'db> = FxHashMap<Definition<'db>, FxIndexSet<Type<'db>>>;
+/// Both kinds contribute to inference. Only a declared context constrains singleton promotion:
+/// a projected mutation such as `append(None)` still permits other values in the collection.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
+enum CollectionUseConstraintKind {
+    Context,
+    Inferred,
+}
 
-/// Extends the current collection-use constraints with those from the previous cycle iteration.
+impl CollectionUseConstraintKind {
+    fn merge(self, other: Self) -> Self {
+        match self {
+            Self::Context => Self::Context,
+            Self::Inferred => other,
+        }
+    }
+}
+
+type CollectionUseConstraints<'db> =
+    FxHashMap<Definition<'db>, FxIndexMap<Type<'db>, CollectionUseConstraintKind>>;
+
+/// Merges collection-use constraints from another inference result or cycle iteration.
 ///
 /// Constraints for a collection can appear and disappear while dependent inference results are
 /// still changing. Retaining previous constraints makes this part of inference monotonic.
@@ -223,10 +248,13 @@ fn extend_collection_use_constraints<'db>(
         reason = "constraints for distinct collection definitions are merged independently"
     )]
     for (collection_def, constraints) in previous {
-        current
-            .entry(*collection_def)
-            .or_default()
-            .extend(constraints);
+        let current = current.entry(*collection_def).or_default();
+        for (ty, kind) in constraints {
+            current
+                .entry(*ty)
+                .and_modify(|current| *current = current.merge(*kind))
+                .or_insert(*kind);
+        }
     }
 }
 
@@ -244,10 +272,13 @@ fn normalize_collection_use_constraints<'db>(
         reason = "constraints for distinct collection definitions are normalized independently"
     )]
     for types in constraints.values_mut() {
-        *types = std::mem::take(types)
-            .into_iter()
-            .map(|ty| ty.recursive_type_normalized(db, env, cycle))
-            .collect();
+        for (ty, kind) in std::mem::take(types) {
+            let ty = ty.recursive_type_normalized(db, env, cycle);
+            types
+                .entry(ty)
+                .and_modify(|current| *current = current.merge(kind))
+                .or_insert(kind);
+        }
         types.shrink_to_fit();
     }
 }
@@ -268,6 +299,14 @@ pub(crate) fn infer_definition_types<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
 ) -> DefinitionInference<'db> {
+    infer_definition_region(db, definition, None)
+}
+
+fn infer_definition_region<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> DefinitionInference<'db> {
     let program_file = definition.program_file(db);
     let python_file = program_file.python_file(db);
     let module = parsed_module(db, python_file).load(db);
@@ -280,6 +319,7 @@ pub(crate) fn infer_definition_types<'db>(
 
     let env = ProgramEnvironment::from_file(program_file);
     TypeInferenceBuilder::for_definition(db, &env, definition, &module)
+        .with_body_domain(domain)
         .finish_definition(definition)
 }
 
@@ -301,7 +341,19 @@ pub(crate) fn is_discarded_dict_key_assignment<'db>(
     };
 
     let assignment = dict_key_assignment.assignment();
-    infer_definition_types(db, assignment).discards_dict_key_assignments()
+    let inference = infer_definition_types(db, assignment);
+    if inference.discards_dict_key_assignments() {
+        return true;
+    }
+    let Some(constructor) = dict_key_assignment.constructor() else {
+        return false;
+    };
+    let module = parsed_module(db, assignment.program_file(db).python_file(db)).load(db);
+    let constructor = constructor.node(&module);
+    let Type::ClassLiteral(class) = inference.expression_type(&*constructor.func) else {
+        return true;
+    };
+    !class.is_known(db, KnownClass::Dict)
 }
 
 /// Infer decorator expression types for a function definition.
@@ -545,6 +597,14 @@ pub(crate) fn infer_scope_types_impl<'db>(
     db: &'db dyn Db,
     input: InferScope<'db>,
 ) -> ScopeInference<'db> {
+    infer_scope_region(db, input, None)
+}
+
+fn infer_scope_region<'db>(
+    db: &'db dyn Db,
+    input: InferScope<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> ScopeInference<'db> {
     let (scope, tcx) = input.into_inner(db);
     let program_file = scope.program_file(db);
     let python_file = program_file.python_file(db);
@@ -568,6 +628,7 @@ pub(crate) fn infer_scope_types_impl<'db>(
         index,
         &module,
     )
+    .with_body_domain(domain)
     .finish_scope()
 }
 
@@ -588,22 +649,24 @@ pub(crate) fn infer_expression_types<'db>(
 pub(crate) fn infer_predicate_truthiness<'db>(
     db: &'db dyn Db,
     expression: Expression<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> Truthiness {
+    let domain = domain.filter(|domain| domain.scope(db) == expression.scope(db));
     if matches!(
         expression.kind(db),
         ExpressionKind::Predicate { in_loop: true, .. }
     ) {
-        evaluate_predicate_truthiness(db, expression)
+        evaluate_predicate_truthiness(db, expression, domain)
     } else {
-        cached_predicate_truthiness(db, expression)
+        cached_predicate_truthiness(db, expression, domain)
     }
 }
 
 /// Reachability walks can revisit the same predicate for many different bindings.
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, _, _| Truthiness::Ambiguous,
-    cycle_fn = |_, cycle: &salsa::Cycle, previous: &Truthiness, current: Truthiness, _| {
+    cycle_initial = |_, _, _, _| Truthiness::Ambiguous,
+    cycle_fn = |_, cycle: &salsa::Cycle, previous: &Truthiness, current: Truthiness, _, _| {
         // A predicate can guard one of its own inputs. Keep both outcomes when iterations
         // disagree, but give the initial ambiguous result a chance to resolve first.
         if cycle.iteration() > crate::TAINTED_CYCLES {
@@ -614,17 +677,25 @@ pub(crate) fn infer_predicate_truthiness<'db>(
     },
     heap_size = get_size2::GetSize::get_heap_size
 )]
-fn cached_predicate_truthiness<'db>(db: &'db dyn Db, expression: Expression<'db>) -> Truthiness {
-    evaluate_predicate_truthiness(db, expression)
+fn cached_predicate_truthiness<'db>(
+    db: &'db dyn Db,
+    expression: Expression<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Truthiness {
+    evaluate_predicate_truthiness(db, expression, domain)
 }
 
 /// A widened operand can require a new metaclass lookup, so evaluate truthiness after
 /// expression inference has normalized the operand types.
-fn evaluate_predicate_truthiness<'db>(db: &'db dyn Db, expression: Expression<'db>) -> Truthiness {
+fn evaluate_predicate_truthiness<'db>(
+    db: &'db dyn Db,
+    expression: Expression<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> Truthiness {
     let ExpressionKind::Predicate { context, .. } = expression.kind(db) else {
         return Truthiness::Ambiguous;
     };
-    let inference = infer_expression_types(db, expression, TypeContext::default());
+    let inference = infer_expression_with_body_domain(db, expression, TypeContext::default(), domain);
     let env = ProgramEnvironment::from_scope(expression.scope(db));
     let module = parsed_module(db, expression.python_file(db)).load(db);
     TruthinessAnalyzer::new(
@@ -649,6 +720,14 @@ fn evaluate_predicate_truthiness<'db>(db: &'db dyn Db, expression: Expression<'d
 pub(super) fn infer_expression_types_impl<'db>(
     db: &'db dyn Db,
     input: InferExpression<'db>,
+) -> ExpressionInference<'db> {
+    infer_expression_region(db, input, None)
+}
+
+fn infer_expression_region<'db>(
+    db: &'db dyn Db,
+    input: InferExpression<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> ExpressionInference<'db> {
     let (expression, tcx) = input.into_inner(db);
 
@@ -676,6 +755,7 @@ pub(super) fn infer_expression_types_impl<'db>(
         index,
         &module,
     )
+    .with_body_domain(domain)
     .finish_expression()
 }
 
@@ -745,15 +825,57 @@ pub(super) fn infer_statement_types<'db>(
     db: &'db dyn Db,
     statement: Statement<'db>,
 ) -> StatementInference<'db> {
+    infer_statement_with_body_domain(db, statement, None)
+}
+
+/// Keep module declarations and other scopes on their ordinary query identity.
+pub(crate) fn infer_definition_with_body_domain<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> &'db DefinitionInference<'db> {
+    if let Some(domain) = domain.filter(|domain| domain.scope(db) == definition.scope(db)) {
+        body_domain::infer_body_definition(db, definition, domain)
+    } else {
+        infer_definition_types(db, definition)
+    }
+}
+
+pub(crate) fn infer_expression_with_body_domain<'db>(
+    db: &'db dyn Db,
+    expression: Expression<'db>,
+    tcx: TypeContext<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> &'db ExpressionInference<'db> {
+    if let Some(domain) = domain.filter(|domain| domain.scope(db) == expression.scope(db)) {
+        body_domain::infer_body_expression(db, InferExpression::new(db, expression, tcx), domain)
+    } else {
+        infer_expression_types(db, expression, tcx)
+    }
+}
+
+pub(crate) fn infer_statement_with_body_domain<'db>(
+    db: &'db dyn Db,
+    statement: Statement<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> StatementInference<'db> {
     match statement {
         Statement::Expression(expression) => StatementInference::Expression(
-            infer_expression_types(db, expression, TypeContext::default()),
+            infer_expression_with_body_domain(db, expression, TypeContext::default(), domain),
         ),
-        Statement::Definition(definition) => {
-            StatementInference::Definition(definition, infer_definition_types(db, definition))
-        }
+        Statement::Definition(definition) => StatementInference::Definition(
+            definition,
+            infer_definition_with_body_domain(db, definition, domain),
+        ),
         Statement::Other(statement) => {
-            StatementInference::Other(infer_statement_types_impl(db, statement))
+            let inference = if let Some(domain) =
+                domain.filter(|domain| domain.scope(db) == statement.scope(db))
+            {
+                body_domain::infer_body_statement(db, statement, domain)
+            } else {
+                infer_statement_types_impl(db, statement)
+            };
+            StatementInference::Other(inference)
         }
     }
 }
@@ -772,6 +894,14 @@ pub(super) fn infer_statement_types<'db>(
 fn infer_statement_types_impl<'db>(
     db: &'db dyn Db,
     statement: StatementInner<'db>,
+) -> StatementInferenceInner<'db> {
+    infer_statement_region(db, statement, None)
+}
+
+fn infer_statement_region<'db>(
+    db: &'db dyn Db,
+    statement: StatementInner<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
 ) -> StatementInferenceInner<'db> {
     let program_file = statement.program_file(db);
     let python_file = program_file.python_file(db);
@@ -797,6 +927,7 @@ fn infer_statement_types_impl<'db>(
         index,
         &module,
     )
+    .with_body_domain(domain)
     .finish_statement()
 }
 
@@ -804,7 +935,7 @@ fn infer_statement_types_impl<'db>(
 ///
 /// This is a Salsa supertype used as the input to `infer_expression_types` to avoid
 /// interning an `ExpressionWithContext` unnecessarily when no type context is provided.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, salsa::Supertype)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, salsa::Supertype, salsa::SalsaValue)]
 pub(super) enum InferExpression<'db> {
     Bare(Expression<'db>),
     WithContext(ExpressionWithContext<'db>),
@@ -1624,7 +1755,7 @@ impl<'db> DefinitionInference<'db> {
             };
 
             if let Some(known_collection) = known_collection {
-                if let Some(collection_class) = known_collection.try_to_class_literal(db, &env) {
+                if let Some(collection_class) = known_collection.allocation_class(db, &env) {
                     let divergent_collection = collection_class
                         .apply_specialization(db, |generic_context| {
                             generic_context.repeat_specialization(db, cycle_recovery)
@@ -1798,7 +1929,7 @@ impl<'db> DefinitionInference<'db> {
     fn collection_use_constraints(
         &self,
         collection_def: Definition<'db>,
-    ) -> Option<&FxIndexSet<Type<'db>>> {
+    ) -> Option<&FxIndexMap<Type<'db>, CollectionUseConstraintKind>> {
         self.extra
             .as_deref()?
             .collection_use_constraints()?
@@ -1846,6 +1977,11 @@ impl<'db> DefinitionInference<'db> {
                 "definition should belong to this TypeInference region and \
                 TypeInferenceBuilder should have inferred a type for it",
             )
+    }
+
+    /// Whether this result depends on provisional types from cycle recovery.
+    pub(crate) fn is_provisional(&self) -> bool {
+        self.fallback_type().is_some()
     }
 
     fn bindings(
@@ -2159,7 +2295,7 @@ impl<'db> ExpressionInference<'db> {
     fn collection_use_constraints(
         &self,
         collection_def: Definition<'db>,
-    ) -> Option<&FxIndexSet<Type<'db>>> {
+    ) -> Option<&FxIndexMap<Type<'db>, CollectionUseConstraintKind>> {
         self.extra
             .as_ref()?
             .collection_use_constraints
@@ -2188,6 +2324,26 @@ pub(crate) enum StatementInference<'db> {
 }
 
 impl<'db> StatementInference<'db> {
+    pub(super) fn is_provisional(&self) -> bool {
+        match self {
+            Self::Expression(inference) => inference.fallback_type().is_some(),
+            Self::Definition(_, inference) => inference.fallback_type().is_some(),
+            Self::Other(inference) => inference.fallback_type().is_some(),
+        }
+    }
+
+    pub(super) fn try_expression_type(
+        &self,
+        expression: impl Into<ExpressionNodeKey>,
+    ) -> Option<Type<'db>> {
+        let expression = expression.into();
+        match self {
+            Self::Expression(inference) => inference.try_expression_type(expression),
+            Self::Definition(_, inference) => inference.try_expression_type(expression),
+            Self::Other(inference) => inference.try_expression_type(expression),
+        }
+    }
+
     fn expression_type(&self, expression: impl Into<ExpressionNodeKey>) -> Type<'db> {
         match self {
             StatementInference::Expression(inference) => inference.expression_type(expression),
@@ -2199,7 +2355,7 @@ impl<'db> StatementInference<'db> {
     fn collection_use_constraints(
         &self,
         collection_def: Definition<'db>,
-    ) -> Option<&FxIndexSet<Type<'db>>> {
+    ) -> Option<&FxIndexMap<Type<'db>, CollectionUseConstraintKind>> {
         match self {
             StatementInference::Expression(inference) => {
                 inference.collection_use_constraints(collection_def)
@@ -2396,7 +2552,7 @@ impl<'db> StatementInferenceInner<'db> {
     fn collection_use_constraints(
         &self,
         collection_def: Definition<'db>,
-    ) -> Option<&FxIndexSet<Type<'db>>> {
+    ) -> Option<&FxIndexMap<Type<'db>, CollectionUseConstraintKind>> {
         self.extra
             .as_ref()?
             .collection_use_constraints
@@ -2418,7 +2574,7 @@ impl<'db> StatementInferenceInner<'db> {
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub(crate) struct InferenceFlags: u16 {
+    pub(crate) struct InferenceFlags: u32 {
         /// Whether to allow `ParamSpec` in type expressions.
         ///
         /// In most contexts inside type expressions, bare `ParamSpec`s are not allowed.
@@ -2473,6 +2629,9 @@ bitflags::bitflags! {
 
         /// Whether the visitor is currently visiting an explicit `__init__` receiver annotation.
         const IN_INIT_RECEIVER_ANNOTATION = 1 << 15;
+
+        /// Whether the visitor is inferring an annotation, including its outer qualifiers.
+        const IN_ANNOTATION_EXPRESSION = 1 << 16;
     }
 }
 

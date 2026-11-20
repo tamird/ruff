@@ -146,6 +146,37 @@ def __getattr__(name: str) -> str:
     return "dynamic"
 ```
 
+## Precedence after protocol narrowing
+
+A protocol can refine a module's dynamic attributes while unrelated names still use the module
+fallback.
+
+```py
+from typing import Protocol
+from typing_extensions import TypeIs
+import dynamic_module
+
+class Named(Protocol):
+    value: int
+
+def has_value(value: object) -> TypeIs[Named]:
+    return isinstance(getattr(value, "value", None), int)
+
+if has_value(dynamic_module):
+    reveal_type(dynamic_module)  # revealed: <module 'dynamic_module'> & Named
+    reveal_type(dynamic_module.value)  # revealed: int
+    reveal_type(dynamic_module.missing)  # revealed: Any
+```
+
+`dynamic_module.py`:
+
+```py
+from typing import Any
+
+def __getattr__(name: str) -> Any:
+    return 1 if name == "value" else "fallback"
+```
+
 ## Precedence: submodules vs `__getattr__`
 
 If a package's `__init__.py` (e.g. `mod/__init__.py`) defines a `__getattr__` function, and there is

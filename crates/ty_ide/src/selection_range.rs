@@ -1,9 +1,7 @@
-use ruff_db::PythonFile;
 use ruff_db::parsed::parsed_module;
+use ruff_db::{Db, PythonFile};
 use ruff_python_ast::find_node::covering_node;
 use ruff_text_size::{Ranged, TextRange, TextSize};
-
-use crate::Db;
 
 /// Returns a list of nested selection ranges, where each range contains the next one.
 /// The first range in the list is the largest range containing the cursor position.

@@ -17,14 +17,13 @@ use super::{Type, TypeCheckDiagnostics, infer_definition_types};
 use crate::diagnostic::DiagnosticGuard;
 use crate::importer::Importer;
 use crate::lint::LintSource;
-use crate::reachability::is_range_reachable;
+use crate::reachability::is_range_reachable_in_domain;
 use crate::types::diagnostic::INVALID_TYPE_FORM;
 use crate::types::function::FunctionDecorators;
-use crate::types::infer::InferenceFlags;
+use crate::types::infer::{FunctionBodyDomain, InferenceFlags};
 use crate::{
     Db, Program,
     lint::{LintId, LintMetadata},
-    suppression::suppressions,
 };
 use ty_module_resolver::ResolverEnvironment;
 use ty_python_core::definition::Definition;
@@ -34,7 +33,8 @@ use ty_python_core::{ProgramFile, semantic_index};
 /// The lazily resolved program used by a semantic operation.
 #[derive(Clone)]
 pub struct ProgramEnvironment<'db> {
-    environment: Cell<ProgramSource>,
+    source: ProgramSource,
+    cached_program: Cell<Option<Id>>,
     lifetime: PhantomData<&'db ()>,
 }
 
@@ -42,7 +42,8 @@ impl<'db> ProgramEnvironment<'db> {
     /// Creates an environment that lazily obtains its program from `file`.
     pub fn from_file(file: ProgramFile<'db>) -> Self {
         Self {
-            environment: Cell::new(ProgramSource::File(file.as_id())),
+            source: ProgramSource::File(file.as_id()),
+            cached_program: Cell::new(None),
             lifetime: PhantomData,
         }
     }
@@ -50,7 +51,8 @@ impl<'db> ProgramEnvironment<'db> {
     /// Creates an environment that lazily obtains its program from `definition`.
     pub(crate) fn from_definition(definition: Definition<'db>) -> Self {
         Self {
-            environment: Cell::new(ProgramSource::Definition(definition.as_id())),
+            source: ProgramSource::Definition(definition.as_id()),
+            cached_program: Cell::new(None),
             lifetime: PhantomData,
         }
     }
@@ -58,7 +60,8 @@ impl<'db> ProgramEnvironment<'db> {
     /// Creates an environment that lazily obtains its program from `scope`.
     pub(crate) fn from_scope(scope: ScopeId<'db>) -> Self {
         Self {
-            environment: Cell::new(ProgramSource::Scope(scope.as_id())),
+            source: ProgramSource::Scope(scope.as_id()),
+            cached_program: Cell::new(None),
             lifetime: PhantomData,
         }
     }
@@ -66,7 +69,8 @@ impl<'db> ProgramEnvironment<'db> {
     /// Creates an environment with an already-established program.
     pub fn from_program(program: Program<'db>) -> Self {
         Self {
-            environment: Cell::new(ProgramSource::Program(program.as_id())),
+            source: ProgramSource::Program(program.as_id()),
+            cached_program: Cell::new(Some(program.as_id())),
             lifetime: PhantomData,
         }
     }
@@ -74,7 +78,10 @@ impl<'db> ProgramEnvironment<'db> {
     /// Returns the program used by this operation.
     #[inline]
     pub fn program(&self, db: &'db dyn Db) -> Program<'db> {
-        let program = match self.environment.get() {
+        if let Some(id) = self.cached_program.get() {
+            return Program::from_id(id);
+        }
+        let program = match self.source {
             ProgramSource::Program(id) => return Program::from_id(id),
             ProgramSource::File(file) => {
                 cold_path();
@@ -96,9 +103,19 @@ impl<'db> ProgramEnvironment<'db> {
             }
         };
 
-        self.environment
-            .set(ProgramSource::Program(program.as_id()));
+        self.cached_program.set(Some(program.as_id()));
         program
+    }
+
+    /// Returns the source environment requesting an operation, when it has one.
+    /// Program-wide operations have no source file and use the program's default semantics.
+    pub fn program_file(&self, db: &'db dyn Db) -> Option<ProgramFile<'db>> {
+        match self.source {
+            ProgramSource::Program(_) => None,
+            ProgramSource::File(id) => Some(ProgramFile::from_id(id)),
+            ProgramSource::Definition(id) => Some(Definition::from_id(id).program_file(db)),
+            ProgramSource::Scope(id) => Some(ScopeId::from_id(id).program_file(db)),
+        }
     }
 
     /// Returns the Python version used by this operation.
@@ -119,8 +136,8 @@ enum ProgramSource {
     Program(Id),
     // Salsa interned handles are thin `Id` wrappers, so converting between `ProgramFile` and `Id`
     // is an inlined representation change with no database lookup. Keeping the lifetime-bearing
-    // `ProgramFile` out of the `Cell` preserves covariance in `'db`; replacing this variant after
-    // the first read avoids repeated Salsa ingredient reads in hot, recursive type operations.
+    // `ProgramFile` out of the cached `Cell` preserves covariance in `'db`. The separate program
+    // cache avoids repeated ingredient reads while retaining the source for builtin lookup.
     File(Id),
     Definition(Id),
     Scope(Id),
@@ -157,6 +174,7 @@ pub(crate) struct InferContext<'db, 'ast> {
     has_invalid_type_form: Cell<bool>,
     has_failed_call: Cell<bool>,
     diagnostic_mode: DiagnosticMode,
+    pub(crate) body_domain: Option<FunctionBodyDomain<'db>>,
     /// This field tracks various flags that control how type inference should behave in the current context.
     pub(crate) inference_flags: InferenceFlags,
     bomb: DebugDropBomb,
@@ -186,6 +204,7 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
             has_invalid_type_form: Cell::new(false),
             has_failed_call: Cell::new(false),
             diagnostic_mode: DiagnosticMode::Normal,
+            body_domain: None,
             inference_flags: InferenceFlags::empty(),
             bomb: DebugDropBomb::new(
                 "`InferContext` needs to be explicitly consumed by calling `::finish` to prevent accidental loss of diagnostics.",
@@ -272,8 +291,20 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
             && !self.is_in_no_type_check()
     }
 
+    pub(super) fn extend_provided_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
+        if self.diagnostic_mode == DiagnosticMode::Normal {
+            let file = self.python_file();
+            let db = self.db;
+            self.diagnostics
+                .get_mut()
+                .extend_provided(db, file, diagnostics);
+        }
+    }
+
     pub(super) fn has_diagnostics(&self) -> bool {
-        !self.diagnostics.borrow().is_empty()
+        self.diagnostics
+            .borrow()
+            .has_diagnostics_or_used_suppressions()
     }
 
     /// Records a reachable failed call even when its diagnostic is suppressed. A recovery type
@@ -357,7 +388,27 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
         if lint == LintId::of(&INVALID_TYPE_FORM) {
             self.mark_invalid_type_form();
         }
-        LintDiagnosticGuardBuilder::new(self, lint, ranged.range())
+        let shared_body = self.body_domain.is_none()
+            && self.inference_flags.intersects(
+                InferenceFlags::IN_TYPE_EXPRESSION | InferenceFlags::IN_ANNOTATION_EXPRESSION,
+            )
+            && self.scope.node(self.db).as_function().is_some();
+        LintDiagnosticGuardBuilder::new(self, lint, ranged.range(), shared_body)
+    }
+
+    /// Report a source annotation or condition heuristic retained with ordinary inference.
+    pub(super) fn report_shared_body_lint<'ctx, T: Ranged>(
+        &'ctx self,
+        lint: &'static LintMetadata,
+        ranged: T,
+    ) -> Option<LintDiagnosticGuardBuilder<'ctx, 'db>> {
+        let lint = LintId::of(lint);
+        if lint == LintId::of(&INVALID_TYPE_FORM) {
+            self.mark_invalid_type_form();
+        }
+        let shared_body =
+            self.body_domain.is_none() && self.scope.node(self.db).as_function().is_some();
+        LintDiagnosticGuardBuilder::new(self, lint, ranged.range(), shared_body)
     }
 
     /// Optionally return a builder for a diagnostic guard.
@@ -422,12 +473,12 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
         let db = self.db;
         let index = semantic_index(self.db(), self.program_file);
         let scope_id = self.scope.file_scope_id(self.db());
-        is_range_reachable(db, index, scope_id, range)
+        is_range_reachable_in_domain(db, index, scope_id, range, self.body_domain)
     }
 
     /// Are we currently inferring types in a stub file?
     pub(crate) fn in_stub(&self) -> bool {
-        self.file.is_stub(self.db())
+        self.program_file.is_stub(self.db())
     }
 
     pub(crate) fn defuse(&mut self) {
@@ -509,6 +560,7 @@ pub(super) struct LintDiagnosticGuard<'db, 'ctx> {
 
     source: LintSource,
     message_override: Option<String>,
+    shared_body: bool,
 }
 
 impl LintDiagnosticGuard<'_, '_> {
@@ -639,7 +691,12 @@ impl Drop for LintDiagnosticGuard<'_, '_> {
             });
         }
 
-        self.ctx.diagnostics.borrow_mut().push(diag);
+        let mut diagnostics = self.ctx.diagnostics.borrow_mut();
+        if self.shared_body {
+            diagnostics.push_shared_body(diag);
+        } else {
+            diagnostics.push(diag);
+        }
     }
 }
 
@@ -676,6 +733,7 @@ pub(super) struct LintDiagnosticGuardBuilder<'db, 'ctx> {
     source: LintSource,
     primary_range: TextRange,
     message_override: Option<(String, String)>,
+    shared_body: bool,
 }
 
 impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
@@ -722,20 +780,37 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
         ctx: &'ctx InferContext<'db, 'ctx>,
         lint_id: LintId,
         range: TextRange,
+        shared_body: bool,
     ) -> Option<LintDiagnosticGuardBuilder<'db, 'ctx>> {
         let (severity, source) = Self::severity_and_source(ctx, lint_id)?;
 
         if !ctx.is_type_expression_explanation() {
-            let suppressions = suppressions(ctx.db(), ctx.python_file());
-            if let Some(suppression) = suppressions.find_suppression(range, lint_id) {
-                ctx.diagnostics.borrow_mut().mark_used(suppression.id());
+            // Excluded overload branches cannot justify source-body suppressions.
+            if ctx.body_domain.is_some() && !ctx.is_range_reachable(range) {
                 return None;
             }
+
+            let suppressed = if shared_body {
+                ctx.diagnostics.borrow_mut().is_shared_body_suppressed(
+                    ctx.db(),
+                    ctx.python_file(),
+                    range,
+                    lint_id,
+                )
+            } else {
+                ctx.diagnostics
+                    .borrow_mut()
+                    .is_suppressed(ctx.db(), ctx.python_file(), range, lint_id)
+            };
 
             // Suppress diagnostics in unreachable code. This checks both whether
             // the scope itself is unreachable and whether the specific statement or
             // expression containing this diagnostic is unreachable.
-            if !ctx.is_range_reachable(range) {
+            if ctx.body_domain.is_none() && !ctx.is_range_reachable(range) {
+                return None;
+            }
+
+            if suppressed {
                 return None;
             }
         }
@@ -747,6 +822,7 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
             source,
             primary_range: range,
             message_override: None,
+            shared_body,
         })
     }
 
@@ -784,6 +860,7 @@ impl<'db, 'ctx> LintDiagnosticGuardBuilder<'db, 'ctx> {
             source: self.source,
             diag: Some(diag),
             message_override,
+            shared_body: self.shared_body,
         }
     }
 
@@ -838,4 +915,105 @@ impl<'db, 'ctx> DiagnosticGuardBuilder<'db, 'ctx> {
 
         DiagnosticGuard::new(self.ctx.file, &self.ctx.diagnostics, diag)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::tests::TestDbBuilder;
+    use crate::suppression::check_suppressions;
+    use crate::types::diagnostic::UNRESOLVED_REFERENCE;
+    use ruff_db::files::system_path_to_file;
+    use ruff_db::parsed::parsed_module;
+    use ty_python_core::global_scope;
+
+    #[test]
+    fn provided_binding_diagnostics_record_used_suppressions() -> anyhow::Result<()> {
+        let db = TestDbBuilder::new()
+            .with_file("/src/main.py", "pass # ty: ignore[unresolved-reference]\n")
+            .build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let program_file = db.program_file(file);
+        let parsed = parsed_module(&db, program_file.python_file(&db)).load(&db);
+        let environment = ProgramEnvironment::from_file(program_file);
+        let mut context = InferContext::new(
+            &db,
+            &environment,
+            global_scope(&db, program_file),
+            file,
+            program_file,
+            &parsed,
+        );
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticId::Lint(UNRESOLVED_REFERENCE.name()),
+            Severity::Warning,
+            "Application binding unavailable",
+        );
+        diagnostic.annotate(Annotation::primary(
+            Span::from(file).with_range(TextRange::new(0.into(), 4.into())),
+        ));
+        context.extend_provided_diagnostics(vec![diagnostic]);
+        let diagnostics = check_suppressions(&db, program_file.python_file(&db), context.finish());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        Ok(())
+    }
+    #[test]
+    fn alternative_call_diagnostics_keep_shared_source_ownership() -> anyhow::Result<()> {
+        let source = "def checked():\n    pass # ty: ignore[unresolved-reference]\n    pass\n";
+        let db = TestDbBuilder::new().with_file("/src/main.py", source).build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let program_file = db.program_file(file);
+        let parsed = parsed_module(&db, program_file.python_file(&db)).load(&db);
+        let environment = ProgramEnvironment::from_file(program_file);
+        let [ruff_python_ast::Stmt::FunctionDef(function)] = parsed.syntax().body.as_slice() else {
+            anyhow::bail!("expected one function");
+        };
+        let [first, second] = function.body.as_slice() else {
+            anyhow::bail!("expected two function-body statements");
+        };
+        let ranges = [first.range(), second.range()];
+        let scope = ty_python_core::semantic_index(&db, program_file)
+            .scope_ids().find(|scope| scope.node(&db).as_function().is_some())
+            .ok_or_else(|| anyhow::anyhow!("expected function body scope"))?;
+        let mut combined = TypeCheckDiagnostics::default();
+        combined.push(Diagnostic::new(
+            DiagnosticId::Io, Severity::Warning, "Unshared prefix diagnostic",
+        ));
+        // The same failure can first appear in an ordinary check, then become owned by
+        // the source annotation. Its shared index must point past the unrelated prefix.
+        let ordinary = InferContext::new(
+            &db, &environment, scope, file, program_file, &parsed,
+        );
+        if let Some(diagnostic) = ordinary.report_lint(&UNRESOLVED_REFERENCE, ranges[1]) {
+            diagnostic.into_diagnostic("Shared call failure");
+        }
+        combined.extend(&ordinary.finish().diagnostics);
+        for _ in 0..2 {
+            let mut context = InferContext::new(
+                &db, &environment, scope, file, program_file, &parsed,
+            );
+            context.inference_flags |= InferenceFlags::IN_ANNOTATION_EXPRESSION;
+            for range in ranges {
+                if let Some(diagnostic) = context.report_lint(&UNRESOLVED_REFERENCE, range) {
+                    diagnostic.into_diagnostic("Shared call failure");
+                }
+            }
+            combined.extend_deduplicated(&context.finish().diagnostics);
+        }
+        let mut shared = TypeCheckDiagnostics::default();
+        shared.extend_shared_body(&combined);
+        let result = InferContextResult {
+            diagnostics: shared,
+            has_invalid_type_form: false,
+            has_failed_call: false,
+        };
+        let diagnostics = check_suppressions(&db, program_file.python_file(&db), result);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.id() == DiagnosticId::Lint(UNRESOLVED_REFERENCE.name())
+                && diagnostic.primary_span().and_then(|span| span.range()) == Some(ranges[1])
+        }), "{diagnostics:?}");
+        Ok(())
+    }
+
 }

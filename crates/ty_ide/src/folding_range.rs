@@ -1,6 +1,6 @@
-use ruff_db::PythonFile;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
+use ruff_db::{Db, PythonFile};
 use ruff_python_ast::token::{TokenKind, Tokens, parenthesized_range};
 use ruff_python_ast::visitor::source_order::{
     SourceOrderVisitor, TraversalSignal, walk_body, walk_node,
@@ -11,8 +11,6 @@ use ruff_python_ast::{
 use ruff_python_trivia::{CommentLinePosition, is_python_whitespace};
 use ruff_source_file::{LineRanges, UniversalNewlines};
 use ruff_text_size::{Ranged, TextRange, TextSize};
-
-use crate::Db;
 
 const PARENTHESES: (TokenKind, TokenKind) = (TokenKind::Lpar, TokenKind::Rpar);
 const BRACKETS: (TokenKind, TokenKind) = (TokenKind::Lsqb, TokenKind::Rsqb);

@@ -29,9 +29,11 @@ use ty_python_core::{
     scope::ScopeId, semantic_index, use_def_map,
 };
 
-/// Iterate over all declarations and bindings that exist at the end
-/// of the given scope.
-pub(crate) fn all_end_of_scope_members<'db>(
+/// Iterate over declarations and bindings reachable at the end of the given scope.
+///
+/// Each item retains the first reachable definition when a symbol has alternatives.
+/// This excludes implicit namespaces and does not apply an export policy.
+pub fn all_end_of_scope_members<'db>(
     db: &'db dyn Db,
     scope_id: ScopeId<'db>,
 ) -> impl Iterator<Item = MemberWithDefinition<'db>> + 'db {
@@ -54,7 +56,7 @@ pub(crate) fn all_end_of_scope_members<'db>(
             let member = Member {
                 name: symbol.name().clone(),
                 ty,
-                is_type_check_only: false,
+                is_type_check_only: !may_exist_at_runtime(db, first_reachable_definition),
             };
             Some(MemberWithDefinition {
                 member,
@@ -75,7 +77,7 @@ pub(crate) fn all_end_of_scope_members<'db>(
                 let member = Member {
                     name: symbol.name().clone(),
                     ty,
-                    is_type_check_only: false,
+                    is_type_check_only: !may_exist_at_runtime(db, first_reachable_definition),
                 };
                 Some(MemberWithDefinition {
                     member,
@@ -160,14 +162,29 @@ const SYNTHETIC_DATACLASS_ATTRIBUTES: &[&str] = &[
     "__dataclass_params__",
 ];
 
+/// Whether member enumeration includes attributes defined by the canonical `object` class.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ObjectMembers {
+    #[default]
+    Include,
+    Exclude,
+}
+
 struct AllMembers<'db> {
     members: FxHashSet<Member<'db>>,
+    object_members: ObjectMembers,
 }
 
 impl<'db> AllMembers<'db> {
-    fn of(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> Self {
+    fn of(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        object_members: ObjectMembers,
+    ) -> Self {
         let mut all_members = Self {
             members: FxHashSet::default(),
+            object_members,
         };
         all_members.extend_with_type(db, env, ty);
         all_members
@@ -200,7 +217,7 @@ impl<'db> AllMembers<'db> {
                     union
                         .elements(db)
                         .iter()
-                        .map(|ty| AllMembers::of(db, env, *ty).members)
+                        .map(|ty| AllMembers::of(db, env, *ty, self.object_members).members)
                         .reduce(|acc, members| acc.intersection(&members).cloned().collect())
                         .unwrap_or_default(),
                 );
@@ -210,7 +227,7 @@ impl<'db> AllMembers<'db> {
                 intersection
                     .positive(db)
                     .iter()
-                    .map(|ty| AllMembers::of(db, env, *ty).members)
+                    .map(|ty| AllMembers::of(db, env, *ty, self.object_members).members)
                     .reduce(|acc, members| acc.union(&members).cloned().collect())
                     .unwrap_or_default(),
             ),
@@ -220,20 +237,17 @@ impl<'db> AllMembers<'db> {
             }
 
             Type::NominalInstance(instance) => {
-                let class = instance.class(db, env);
-                if let Some((class_literal, _)) = class.static_class_literal(db) {
-                    self.extend_with_instance_members(db, env, ty, class_literal);
-                    self.extend_with_synthetic_members(
+                let class = instance.class(db, env).class_literal(db);
+                if let Some(provided) = instance.provided_instance() {
+                    self.extend_with_member_names(
                         db,
                         env,
                         ty,
-                        ClassLiteral::Static(class_literal),
+                        provided.fields(db).iter().map(|field| &field.name),
                     );
-                } else {
-                    // For dynamic classes, we can't enumerate instance members (requires body scope),
-                    // but we can still add synthetic members for dataclass-like classes.
-                    self.extend_with_synthetic_members(db, env, ty, class.class_literal(db));
                 }
+                self.extend_with_instance_members(db, env, ty, class);
+                self.extend_with_synthetic_members(db, env, ty, class);
             }
 
             Type::NewTypeInstance(newtype) => {
@@ -353,7 +367,7 @@ impl<'db> AllMembers<'db> {
                             constraints
                                 .elements(db)
                                 .iter()
-                                .map(|ty| AllMembers::of(db, env, *ty).members)
+                                .map(|ty| AllMembers::of(db, env, *ty, self.object_members).members)
                                 .reduce(|acc, members| {
                                     acc.intersection(&members).cloned().collect()
                                 })
@@ -414,7 +428,7 @@ impl<'db> AllMembers<'db> {
                 if let Type::ClassLiteral(ClassLiteral::Static(class)) =
                     KnownClass::TypedDictFallback.to_class_literal(db, env)
                 {
-                    self.extend_with_instance_members(db, env, ty, class);
+                    self.extend_with_instance_members(db, env, ty, class.into());
                 }
             }
 
@@ -507,11 +521,22 @@ impl<'db> AllMembers<'db> {
         ty: Type<'db>,
         class_literal: ClassLiteral<'db>,
     ) {
-        for parent in class_literal
-            .iter_mro(db)
-            .filter_map(ClassBase::into_class)
-            .filter_map(|class| class.static_class_literal(db).map(|(lit, _)| lit))
-        {
+        for parent in class_literal.iter_mro(db).filter_map(ClassBase::into_class) {
+            let parent = match parent.class_literal(db) {
+                ClassLiteral::Static(parent) => parent,
+                ClassLiteral::Dynamic(parent) => {
+                    self.extend_with_dynamic_members(db, env, ty, parent, false);
+                    continue;
+                }
+                ClassLiteral::DynamicNamedTuple(_)
+                | ClassLiteral::DynamicTypedDict(_)
+                | ClassLiteral::DynamicEnum(_) => continue,
+            };
+            if self.object_members == ObjectMembers::Exclude
+                && parent.is_known(db, KnownClass::Object)
+            {
+                continue;
+            }
             self.extend_with_slot_members(db, env, ty, parent);
 
             let parent_scope = parent.body_scope(db);
@@ -577,9 +602,7 @@ impl<'db> AllMembers<'db> {
         };
 
         self.extend_with_class_members(db, env, ty, metaclass.class_literal(db));
-        if let Some((metaclass, _)) = metaclass.static_class_literal(db) {
-            self.extend_with_instance_members(db, env, ty, metaclass);
-        }
+        self.extend_with_instance_members(db, env, ty, metaclass.class_literal(db));
     }
 
     /// Extend with instance members from a single class (not its MRO).
@@ -590,6 +613,11 @@ impl<'db> AllMembers<'db> {
         ty: Type<'db>,
         class_literal: StaticClassLiteral<'db>,
     ) {
+        if self.object_members == ObjectMembers::Exclude
+            && class_literal.is_known(db, KnownClass::Object)
+        {
+            return;
+        }
         let class_body_scope = class_literal.body_scope(db);
         let program_file = class_body_scope.program_file(db);
         let index = semantic_index(db, program_file);
@@ -637,15 +665,63 @@ impl<'db> AllMembers<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         ty: Type<'db>,
-        class_literal: StaticClassLiteral<'db>,
+        class_literal: ClassLiteral<'db>,
     ) {
-        for class in class_literal
-            .iter_mro(db, None)
-            .filter_map(ClassBase::into_class)
-        {
-            if let Some((class_literal, _)) = class.static_class_literal(db) {
-                self.extend_with_instance_members_for_class(db, env, ty, class_literal);
+        for class in class_literal.iter_mro(db).filter_map(ClassBase::into_class) {
+            match class.class_literal(db) {
+                ClassLiteral::Static(class) => {
+                    self.extend_with_instance_members_for_class(db, env, ty, class);
+                }
+                ClassLiteral::Dynamic(class) => {
+                    self.extend_with_dynamic_members(db, env, ty, class, true);
+                }
+                ClassLiteral::DynamicNamedTuple(_)
+                | ClassLiteral::DynamicTypedDict(_)
+                | ClassLiteral::DynamicEnum(_) => {}
             }
+        }
+    }
+
+    fn extend_with_dynamic_members(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        class: super::class::DynamicClassLiteral<'db>,
+        include_instance_fields: bool,
+    ) {
+        let instance_fields = if include_instance_fields {
+            class
+                .instance_fields(db)
+                .map_or([].as_slice(), |fields| fields.fields.as_ref())
+        } else {
+            &[]
+        };
+        let names = class
+            .members(db)
+            .iter()
+            .map(|(name, _)| name)
+            .chain(instance_fields.iter().map(|field| &field.name));
+        self.extend_with_member_names(db, env, ty, names);
+    }
+
+    fn extend_with_member_names<'a>(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        names: impl IntoIterator<Item = &'a Name>,
+    ) {
+        for name in names {
+            let Some(member_type) = ty.member(db, env, name).place.ignore_possibly_undefined()
+            else {
+                continue;
+            };
+            self.members.insert(Member {
+                name: name.clone(),
+                ty: member_type,
+                is_type_check_only: false,
+            });
         }
     }
 
@@ -702,8 +778,8 @@ impl<'db> AllMembers<'db> {
 /// A member of a type or scope, with the first reachable definition of that member.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct MemberWithDefinition<'db> {
-    pub(crate) member: Member<'db>,
-    pub(crate) first_reachable_definition: Definition<'db>,
+    pub member: Member<'db>,
+    pub first_reachable_definition: Definition<'db>,
 }
 
 /// A member of a type or scope.
@@ -721,10 +797,10 @@ pub struct MemberWithDefinition<'db> {
 /// ordered comparisons.
 #[derive(Clone, Debug)]
 pub struct Member<'db> {
-    pub(crate) name: Name,
-    pub(crate) ty: Type<'db>,
+    pub name: Name,
+    pub ty: Type<'db>,
     /// Whether this member is known to exist only during type checking.
-    pub(crate) is_type_check_only: bool,
+    pub is_type_check_only: bool,
 }
 
 impl<'db> Member<'db> {
@@ -932,5 +1008,14 @@ pub(crate) fn all_members<'db>(
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
 ) -> FxHashSet<Member<'db>> {
-    AllMembers::of(db, env, ty).members
+    all_members_with_object_policy(db, env, ty, ObjectMembers::Include)
+}
+
+pub(crate) fn all_members_with_object_policy<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    object_members: ObjectMembers,
+) -> FxHashSet<Member<'db>> {
+    AllMembers::of(db, env, ty, object_members).members
 }

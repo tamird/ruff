@@ -1,16 +1,19 @@
 use crate::Db;
 use crate::ProgramEnvironment;
+use crate::reachability::ReachabilityEvaluationCache;
+use crate::types::dict::dict_literal_key_value_types;
+use crate::types::dictionary::{DictionaryFallback, DictionaryItem, DictionaryItems};
 use crate::types::{
     AwaitError, Bindings, CallArguments, CallDunderError, KnownClass, LintDiagnosticGuard,
-    LintDiagnosticGuardBuilder, LiteralValueTypeKind, Type, TypeContext, TypeVarBoundOrConstraints,
-    UnionType,
+    LintDiagnosticGuardBuilder, LiteralValueTypeKind, MemberLookupPolicy, Type, TypeContext,
+    TypeVarBoundOrConstraints, UnionBuilder, UnionType,
     call::CallErrorKind,
     context::InferContext,
     diagnostic::NOT_ITERABLE,
     function::function_has_stub_body,
     infer::infer_expression_types,
     todo_type,
-    tuple::{TupleSpec, TupleSpecBuilder},
+    tuple::{TupleSpec, TupleSpecBuilder, TupleType},
 };
 use compact_str::ToCompactString;
 use ruff_db::diagnostic::{Annotation, Span};
@@ -22,6 +25,7 @@ use ruff_text_size::{Ranged, TextRange};
 use std::borrow::Cow;
 use ty_module_resolver::{SearchPath, file_to_module};
 use ty_python_core::definition::{Definition, DefinitionKind};
+use ty_python_core::scope::ScopeId;
 use ty_python_core::{EvaluationMode, semantic_index};
 
 /// Points to a coroutine declaration that may have been intended to describe an async generator.
@@ -67,7 +71,9 @@ fn async_generator_stub_declaration<'db>(
     };
     let module = parsed_module(db, definition.program_file(db).python_file(db)).load(db);
     let node = function.node(&module);
-    if !node.is_async || !function_has_stub_body(node) {
+    if !node.is_async
+        || !function_has_stub_body(node, semantic_index(db, definition.program_file(db)))
+    {
         return None;
     }
     // Start at `async`, excluding any decorators from the declaration's range.
@@ -129,6 +135,38 @@ pub(super) fn extract_literal_container_element_types<'db>(
     }
 }
 
+/// Whether the selected `str` declaration promises a sequence of strings.
+///
+/// Literal character precision relies on this base, which a custom typeshed can omit or specialize
+/// differently. Check the declared MRO directly so this guard does not recurse into type relations.
+pub(super) fn str_has_character_sequence_base<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+) -> bool {
+    let str_instance = KnownClass::Str.to_instance(db, env);
+    KnownClass::Sequence
+        .to_specialized_class_type(db, env, &[str_instance])
+        .is_some_and(|sequence| KnownClass::Str.is_subclass_of(db, env, sequence))
+}
+
+fn str_supports_literal_iteration<'db>(db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+    if !str_has_character_sequence_base(db, env) {
+        return false;
+    }
+    // A declared `__iter__: None` disables iteration even when `__getitem__` is available.
+    !KnownClass::Str
+        .to_instance(db, env)
+        .member_lookup_with_policy(
+            db,
+            env,
+            "__iter__",
+            MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+        )
+        .place
+        .ignore_possibly_undefined()
+        .is_some_and(|iter| iter.is_none(db))
+}
+
 /// Extract the element types from an expression with a statically known fixed-length iteration.
 ///
 /// List and tuple literals are expanded directly so we preserve precise element types, including
@@ -181,6 +219,173 @@ pub(crate) fn extract_fixed_length_iterable_element_types<'db>(
     Some(element_types.into_boxed_slice())
 }
 
+/// Infer an immediately consumed iterable's element type from its already-inferred expressions.
+pub(super) fn precise_iterable_element_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    iterable: &ast::Expr,
+    expression_type: impl FnMut(&ast::Expr) -> Type<'db>,
+) -> Option<Type<'db>> {
+    if let ast::Expr::Dict(dict) = iterable {
+        return dict_literal_key_value_types(db, env, dict, expression_type).map(|(keys, _)| keys);
+    }
+
+    let element_types =
+        extract_fixed_length_iterable_element_types(db, env, iterable, expression_type)?;
+    (!element_types.is_empty())
+        .then(|| UnionType::from_elements(db, env, element_types.iter().copied()))
+}
+
+/// Refine elements of an immediately consumed dictionary items snapshot without changing its
+/// mutable container type. Live views and saved snapshots retain ordinary iteration inference.
+pub(super) fn refine_dict_snapshot_element_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    scope: ScopeId<'db>,
+    iterable: &ast::Expr,
+    element_type: Type<'db>,
+    mode: EvaluationMode,
+    mut expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+) -> Option<Type<'db>> {
+    if mode == EvaluationMode::Async {
+        return None;
+    }
+    let ast::Expr::Call(call) = iterable else {
+        return None;
+    };
+    let ast::ExprCall {
+        node_index: _,
+        range_start: _,
+        func,
+        arguments,
+    } = call;
+    let is_list = match expression_type(func)? {
+        Type::ClassLiteral(class) => class.is_known(db, KnownClass::List),
+        _ => false,
+    };
+    let items = if is_list {
+        let [source] = arguments.args.as_ref() else {
+            return None;
+        };
+        if !arguments.keywords.is_empty() || source.is_starred_expr() {
+            return None;
+        }
+        source
+    } else {
+        iterable
+    };
+    let ast::Expr::Call(items_call) = items else {
+        return None;
+    };
+    let ast::ExprCall {
+        node_index: _,
+        range_start: _,
+        func,
+        arguments,
+    } = items_call;
+    if !arguments.args.is_empty() || !arguments.keywords.is_empty() {
+        return None;
+    }
+    let ast::Expr::Attribute(attribute) = func.as_ref() else {
+        return None;
+    };
+    let ast::ExprAttribute {
+        node_index: _,
+        range: _,
+        value: receiver,
+        attr,
+        ctx: _,
+    } = attribute;
+    if attr.id != "items" {
+        return None;
+    }
+    if !is_list {
+        // Some environments declare builtin dict.items as a list snapshot instead of a live view.
+        let Type::NominalInstance(result) = expression_type(items)? else {
+            return None;
+        };
+        if !result.has_known_class(db, KnownClass::List) {
+            return None;
+        }
+    }
+    let receiver_type = expression_type(receiver)?;
+    let Type::NominalInstance(instance) = receiver_type else {
+        return None;
+    };
+    if !super::dictionary::has_dict_type(db, env, Type::NominalInstance(instance)) {
+        return None;
+    }
+    let Type::BoundMethod(method) = expression_type(func)? else {
+        return None;
+    };
+    let declared = KnownClass::Dict
+        .to_instance(db, env)
+        .member_lookup_with_policy(db, env, "items", MemberLookupPolicy::NO_INSTANCE_FALLBACK)
+        .place
+        .ignore_possibly_undefined()?;
+    let Type::BoundMethod(declared) = declared else {
+        return None;
+    };
+    if method.function(db)?.definition(db) != declared.function(db)?.definition(db) {
+        return None;
+    }
+    let tuple = element_type.exact_tuple_instance_spec(db)?;
+    let [_, value_type] = tuple.as_fixed_length()?.all_elements() else {
+        return None;
+    };
+    let dictionary =
+        match DictionaryItems::expression(db, env, scope, receiver, None, &mut expression_type) {
+            Ok(dictionary) => dictionary,
+            Err(fallback) => match fallback {
+                DictionaryFallback::Unavailable => {
+                    let index = semantic_index(db, scope.program_file(db));
+                    let cache = ReachabilityEvaluationCache::new(
+                        scope,
+                        index
+                            .use_def_map(scope.file_scope_id(db))
+                            .reachability_constraints(),
+                    );
+                    DictionaryItems::observed(db, scope, receiver, receiver_type, &cache).ok()?
+                }
+                DictionaryFallback::Unreachable => return None,
+            },
+        };
+    if !dictionary.is_complete() {
+        return None;
+    }
+    let DictionaryItems {
+        items,
+        extra_items: _,
+        first_entry: _,
+    } = dictionary;
+    let mut keys = UnionBuilder::new(db, env);
+    for DictionaryItem {
+        name,
+        ty,
+        kind,
+        source: _,
+    } in &items
+    {
+        if matches!(ty.resolve_type_alias(db), Type::Never) {
+            // Required bottom values make the mapping impossible, rather than excluding a key.
+            if kind.is_required() {
+                return None;
+            }
+        } else {
+            keys.add_in_place(Type::string_literal(db, name));
+        }
+    }
+    let keys = keys.build();
+    if keys.is_never() {
+        return None;
+    }
+    Some(Type::tuple(TupleType::heterogeneous(
+        db,
+        env,
+        [keys, *value_type],
+    )))
+}
+
 impl<'db> Type<'db> {
     /// Recognizes coroutines whose results can be iterated over asynchronously.
     ///
@@ -229,7 +434,7 @@ impl<'db> Type<'db> {
     /// ```python
     /// y(*x)
     /// ```
-    pub(super) fn try_iterate(
+    pub(crate) fn try_iterate(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -280,6 +485,9 @@ impl<'db> Type<'db> {
                         Some(Cow::Owned(spec))
                     }
                     LiteralValueTypeKind::String(string_literal_ty) => {
+                        if !str_supports_literal_iteration(db, env) {
+                            return None;
+                        }
                         let string_literal = string_literal_ty.value(db);
                         let spec = if string_literal.len() < MAX_TUPLE_LENGTH {
                             TupleSpec::heterogeneous(
@@ -293,9 +501,8 @@ impl<'db> Type<'db> {
                         Some(Cow::Owned(spec))
                     }
                     // N.B. This special case isn't strictly necessary, it's just an obvious optimization
-                    LiteralValueTypeKind::LiteralString => {
-                        Some(Cow::Owned(TupleSpec::homogeneous(ty)))
-                    }
+                    LiteralValueTypeKind::LiteralString => str_supports_literal_iteration(db, env)
+                        .then(|| Cow::Owned(TupleSpec::homogeneous(ty))),
                     _ => None,
                 },
                 Type::Never => {
@@ -326,15 +533,14 @@ impl<'db> Type<'db> {
                             .next()?
                             .try_iterate_with_mode(db, env, EvaluationMode::Sync)
                             .ok()?;
-                        let mut builder = TupleSpecBuilder::from(&*first_element_spec);
+                        let tuple = first_element_spec;
+                        let mut builder = TupleSpecBuilder::from(&*tuple);
                         for element in elements_iter {
-                            builder = builder.union(
-                                db,
-                                env,
-                                &*element
-                                    .try_iterate_with_mode(db, env, EvaluationMode::Sync)
-                                    .ok()?,
-                            );
+                            let outcome = element
+                                .try_iterate_with_mode(db, env, EvaluationMode::Sync)
+                                .ok()?;
+                            let tuple = outcome;
+                            builder = builder.union(db, env, &tuple);
                         }
                         Some(Cow::Owned(builder.build()))
                     } else {
@@ -367,12 +573,14 @@ impl<'db> Type<'db> {
                                     .ok()
                             });
                         let first_spec = specs_iter.next()?;
-                        let mut builder = TupleSpecBuilder::from(&*first_spec);
-                        for spec in specs_iter {
+                        let tuple = first_spec;
+                        let mut builder = TupleSpecBuilder::from(&*tuple);
+                        for outcome in specs_iter {
+                            let tuple = outcome;
                             // Two tuples cannot have incompatible specs unless the tuples themselves
                             // are disjoint. `IntersectionBuilder` eagerly simplifies such
                             // intersections to `Never`, so this should always return `Some`.
-                            let Some(intersected) = builder.intersect(db, env, &spec) else {
+                            let Some(intersected) = builder.intersect(db, env, &tuple) else {
                                 return Some(Cow::Owned(TupleSpec::homogeneous(Type::unknown())));
                             };
                             builder = intersected;
@@ -381,7 +589,9 @@ impl<'db> Type<'db> {
                     }
 
                     // Flattening changed the type; recursively iterate the flattened result.
-                    flattened.try_iterate(db, env).ok()
+                    flattened
+                        .try_iterate_with_mode(db, env, EvaluationMode::Sync)
+                        .ok()
                 }
                 Type::EnumComplement(complement) => {
                     non_async_special_case(db, env, complement.remaining_literal_union(db, env))
@@ -446,7 +656,7 @@ impl<'db> Type<'db> {
                     })
             };
 
-            return match self.try_call_dunder(
+            let result = match self.try_call_dunder(
                 db,
                 env,
                 "__aiter__",
@@ -498,126 +708,119 @@ impl<'db> Type<'db> {
                 }
                 Err(CallDunderError::MethodNotAvailable) => Err(IterationError::UnboundAiterError),
             };
+            return result;
         }
 
         if let Some(special_case) = non_async_special_case(db, env, self) {
-            return Ok(special_case);
-        }
-
-        let try_call_dunder_getitem = || {
-            self.try_call_dunder(
-                db,
-                env,
-                "__getitem__",
-                CallArguments::positional([KnownClass::Int.to_instance(db, env)]),
-                TypeContext::default(),
-            )
-            .map(|dunder_getitem_outcome| dunder_getitem_outcome.return_type(db, env))
-        };
-
-        let try_call_dunder_next_on_iterator = |iterator: Type<'db>| {
-            iterator
-                .try_call_dunder(
+            Ok(special_case)
+        } else {
+            let mode = EvaluationMode::Sync;
+            let try_call_dunder_getitem = || {
+                let mut arguments =
+                    CallArguments::positional([KnownClass::Int.to_instance(db, env)]);
+                self.try_call_dunder_with_policy(
                     db,
                     env,
-                    "__next__",
-                    CallArguments::none(),
+                    "__getitem__",
+                    &mut arguments,
                     TypeContext::default(),
+                    MemberLookupPolicy::default(),
                 )
-                .map(|dunder_next_outcome| dunder_next_outcome.return_type(db, env))
-        };
+                .map(|bindings| bindings.return_type(db, env))
+            };
 
-        let dunder_iter_result = self
-            .try_call_dunder(
+            let try_call_dunder_next_on_iterator = |iterator: Type<'db>| {
+                let mut arguments = CallArguments::none();
+                iterator
+                    .try_call_dunder_with_policy(
+                        db,
+                        env,
+                        "__next__",
+                        &mut arguments,
+                        TypeContext::default(),
+                        MemberLookupPolicy::default(),
+                    )
+                    .map(|bindings| bindings.return_type(db, env))
+            };
+
+            let mut arguments = CallArguments::none();
+            let dunder_iter_result = self.try_call_dunder_with_policy(
                 db,
                 env,
                 "__iter__",
-                CallArguments::none(),
+                &mut arguments,
                 TypeContext::default(),
-            )
-            .map(|dunder_iter_outcome| dunder_iter_outcome.return_type(db, env));
-
-        match dunder_iter_result {
-            Ok(iterator) => {
-                // `__iter__` is definitely bound and calling it succeeds.
-                // See what calling `__next__` on the object returned by `__iter__` gives us...
-                try_call_dunder_next_on_iterator(iterator)
-                    .map(|ty| Cow::Owned(TupleSpec::homogeneous(ty)))
-                    .map_err(
-                        |dunder_next_error| IterationError::IterReturnsInvalidIterator {
+                MemberLookupPolicy::default(),
+            );
+            match dunder_iter_result {
+                Ok(bindings) => {
+                    let iterator = bindings.return_type(db, env);
+                    try_call_dunder_next_on_iterator(iterator)
+                        .map(|ty| Cow::Owned(TupleSpec::homogeneous(ty)))
+                        .map_err(
+                            |dunder_next_error| IterationError::IterReturnsInvalidIterator {
+                                iterator,
+                                dunder_error: dunder_next_error,
+                                mode,
+                            },
+                        )
+                }
+                Err(CallDunderError::PossiblyUnbound {
+                    bindings,
+                    unbound_on: unbound_on_iter,
+                }) => {
+                    let iterator = bindings.return_type(db, env);
+                    match try_call_dunder_next_on_iterator(iterator) {
+                        Ok(dunder_next_return) => {
+                            try_call_dunder_getitem()
+                                .map(|dunder_getitem_return_type| {
+                                    // A possibly absent __iter__ needs both successful routes.
+                                    Cow::Owned(TupleSpec::homogeneous(
+                                        UnionType::from_two_elements(
+                                            db,
+                                            env,
+                                            dunder_next_return,
+                                            dunder_getitem_return_type,
+                                        ),
+                                    ))
+                                })
+                                .map_err(|dunder_getitem_error| {
+                                    IterationError::PossiblyUnboundIterAndGetitemError {
+                                        dunder_next_return,
+                                        unbound_on_iter,
+                                        dunder_getitem_error,
+                                    }
+                                })
+                        }
+                        Err(dunder_next_error) => Err(IterationError::IterReturnsInvalidIterator {
                             iterator,
                             dunder_error: dunder_next_error,
                             mode,
-                        },
-                    )
-            }
-
-            // `__iter__` is possibly unbound...
-            Err(CallDunderError::PossiblyUnbound {
-                bindings: dunder_iter_outcome,
-                unbound_on: unbound_on_iter,
-            }) => {
-                let iterator = dunder_iter_outcome.return_type(db, env);
-
-                match try_call_dunder_next_on_iterator(iterator) {
-                    Ok(dunder_next_return) => {
-                        try_call_dunder_getitem()
-                            .map(|dunder_getitem_return_type| {
-                                // If `__iter__` is possibly unbound,
-                                // but it returns an object that has a bound and valid `__next__` method,
-                                // *and* the object has a bound and valid `__getitem__` method,
-                                // we infer a union of the type returned by the `__next__` method
-                                // and the type returned by the `__getitem__` method.
-                                //
-                                // No diagnostic is emitted; iteration will always succeed!
-                                Cow::Owned(TupleSpec::homogeneous(UnionType::from_two_elements(
-                                    db,
-                                    env,
-                                    dunder_next_return,
-                                    dunder_getitem_return_type,
-                                )))
-                            })
-                            .map_err(|dunder_getitem_error| {
-                                IterationError::PossiblyUnboundIterAndGetitemError {
-                                    dunder_next_return,
-                                    unbound_on_iter,
-                                    dunder_getitem_error,
-                                }
-                            })
+                        }),
                     }
-
-                    Err(dunder_next_error) => Err(IterationError::IterReturnsInvalidIterator {
-                        iterator,
-                        dunder_error: dunder_next_error,
-                        mode,
-                    }),
                 }
+                Err(CallDunderError::CallError(kind, bindings, _)) => {
+                    Err(IterationError::IterCallError {
+                        kind,
+                        bindings,
+                        mode,
+                    })
+                }
+                Err(CallDunderError::MethodNotAvailable) => try_call_dunder_getitem()
+                    .map(|ty| Cow::Owned(TupleSpec::homogeneous(ty)))
+                    .map_err(
+                        |dunder_getitem_error| IterationError::UnboundIterAndGetitemError {
+                            dunder_getitem_error,
+                        },
+                    ),
             }
-
-            // `__iter__` is definitely bound but it can't be called with the expected arguments
-            Err(CallDunderError::CallError(kind, bindings, _)) => {
-                Err(IterationError::IterCallError {
-                    kind,
-                    bindings,
-                    mode,
-                })
-            }
-
-            // There's no `__iter__` method. Try `__getitem__` instead...
-            Err(CallDunderError::MethodNotAvailable) => try_call_dunder_getitem()
-                .map(|ty| Cow::Owned(TupleSpec::homogeneous(ty)))
-                .map_err(
-                    |dunder_getitem_error| IterationError::UnboundIterAndGetitemError {
-                        dunder_getitem_error,
-                    },
-                ),
         }
     }
 }
 
 /// Error returned if a type is not (or may not be) iterable.
 #[derive(Debug)]
-pub(super) enum IterationError<'db> {
+pub(crate) enum IterationError<'db> {
     /// The object being iterated over has a bound `__(a)iter__` method,
     /// but calling it with the expected arguments results in an error.
     IterCallError {

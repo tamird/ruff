@@ -160,6 +160,8 @@ pub struct DisplaySettings<'db> {
     /// Whether to hide the return type of the outermost signature.
     /// Return types of nested callable types inside parameters are still shown.
     hide_return_type: bool,
+    /// Whether callable signatures omit optional inputs outside their documented interface.
+    hide_implicit_parameters: bool,
 }
 
 impl<'db> DisplaySettings<'db> {
@@ -711,6 +713,20 @@ impl<'db> TypeVisitor<'db> for AmbiguousNameCollector<'_, 'db> {
             Type::ProtocolInstance(protocol) if let Some(class) = protocol.class_origin(db) => {
                 return self.visit_type(db, Type::from(class));
             }
+            Type::NominalInstance(instance)
+                if let Some(provided) = instance.provided_instance() =>
+            {
+                let class = instance.class(db, self.env);
+                match provided.display(db) {
+                    crate::provided::ProvidedInstanceDisplay::Full => {
+                        self.visit_type(db, Type::from(class));
+                    }
+                    crate::provided::ProvidedInstanceDisplay::ClassName => {
+                        self.record_class(db, class.class_literal(db));
+                    }
+                }
+                return;
+            }
             // no need to recurse into TypeVar bounds/constraints
             Type::TypeVar(_) => return,
             _ => {}
@@ -791,6 +807,13 @@ impl<'db> DisplayType<'_, 'db> {
             settings: self.settings.multiline(),
             ..self
         }
+    }
+
+    /// Renders documented callable interfaces for IDE presentation.
+    #[must_use]
+    pub fn hide_implicit_parameters(mut self) -> Self {
+        self.settings.hide_implicit_parameters = true;
+        self
     }
 
     #[must_use]
@@ -1193,6 +1216,15 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'_, 'db> {
             Type::RecursiveVar(_) => unreachable!("display of an unbound recursive variable"),
             Type::Never => f.with_type(self.ty).write_str("Never"),
             Type::NominalInstance(instance) => {
+                if instance.provided_instance().is_some_and(|provided| {
+                    provided.display(db) == crate::provided::ProvidedInstanceDisplay::ClassName
+                }) {
+                    return instance
+                        .class(db, self.env)
+                        .class_literal(db)
+                        .display_with(db, self.settings.clone())
+                        .fmt_detailed(f);
+                }
                 let class = instance.class(db, self.env);
 
                 match (class, class.known(db)) {
@@ -1855,8 +1887,8 @@ impl<'db> BoundTypeVarIdentity<'db> {
             {
                 write!(f, "@{binding_context_name}")?;
             }
-            if let Some(paramspec_attr) = self.paramspec_attr {
-                write!(f, ".{paramspec_attr}")?;
+            if let Some(projection) = self.paramspec_projection {
+                write!(f, "{projection}")?;
             }
             Ok(())
         })
@@ -2648,6 +2680,12 @@ pub(crate) struct DisplaySignature<'a, 'db> {
 
 impl DisplaySignature<'_, '_> {
     #[must_use]
+    pub(crate) fn hide_implicit_parameters(mut self) -> Self {
+        self.settings.hide_implicit_parameters = true;
+        self
+    }
+
+    #[must_use]
     pub(crate) fn multiline(self) -> Self {
         Self {
             settings: self.settings.multiline(),
@@ -2826,7 +2864,9 @@ impl<'db> FmtDetailed<'db> for DisplayParameters<'_, 'db> {
             let mut after_synthetic_unpack = false;
             let mut first = true;
 
-            for parameter in parameters {
+            for parameter in parameters.iter().filter(|parameter| {
+                !display.settings.hide_implicit_parameters || !parameter.is_implicit()
+            }) {
                 let is_synthetic_unpack = parameter.definition().is_none()
                     && parameter.is_variadic()
                     && parameter.has_starred_annotation();
@@ -2885,15 +2925,24 @@ impl<'db> FmtDetailed<'db> for DisplayParameters<'_, 'db> {
         // For `Concatenate` kind, use multiline only if there are more than 1 prefix parameters.
         // For `Gradual` kind without prefix params (len <= 2), display as `...`.
         let multiline = if self.settings.multiline {
+            let presented = if self.settings.hide_implicit_parameters {
+                self.parameters
+                    .iter()
+                    .filter(|parameter| !parameter.is_implicit())
+                    .take(4)
+                    .count()
+            } else {
+                self.parameters.len()
+            };
             match self.parameters.kind() {
-                ParametersKind::Standard => self.parameters.len() > 1,
+                ParametersKind::Standard | ParametersKind::Incomplete => presented > 1,
                 ParametersKind::Gradual | ParametersKind::Top | ParametersKind::ParamSpec(_) => {
                     false
                 }
                 ParametersKind::Concatenate(_) => {
                     // The tail already represents 2 parameters. Additionally, there should be more
                     // than 1 prefix parameters to use multiline, so the limit becomes 3.
-                    self.parameters.len() > 3
+                    presented > 3
                 }
             }
         } else {
@@ -2909,7 +2958,9 @@ impl<'db> FmtDetailed<'db> for DisplayParameters<'_, 'db> {
         let arg_separator = if multiline { ",\n    " } else { ", " };
 
         match self.parameters.kind() {
-            ParametersKind::Standard | ParametersKind::Concatenate(_) => {
+            ParametersKind::Standard
+            | ParametersKind::Incomplete
+            | ParametersKind::Concatenate(_) => {
                 display_parameters(self, f, self.parameters.as_slice(), arg_separator)?;
             }
             ParametersKind::Top => {
@@ -3013,6 +3064,13 @@ impl<'db> FmtDetailed<'db> for DisplayParameter<'_, 'db> {
                     f.write_str(" = ")?;
                 } else {
                     f.write_str("=")?;
+                }
+                if let Some(super::ParameterDefault::Source { ty: _, source }) =
+                    self.param.default()
+                {
+                    let text = ruff_db::source::source_text(db, source.file());
+                    f.write_str(&text[source.range()])?;
+                    return Ok(());
                 }
                 match default_type {
                     Type::LiteralValue(literal)

@@ -538,6 +538,29 @@ impl<'db> ProtocolInterfaceView<'db> {
         self.interface.includes_member(db, name)
     }
 
+    /// Returns a readonly property's instance read type, bound to the expected receiver.
+    pub(super) fn readonly_property_type(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        receiver_ty: Type<'db>,
+        name: &str,
+    ) -> Option<Type<'db>> {
+        let member = self.member_by_name(db, name)?;
+        if !matches!(
+            member.data.kind,
+            ProtocolMemberKind::Property { read: _, write: _ }
+        ) {
+            return None;
+        }
+        let access = member.access(ProtocolMemberAccessMode::Instance);
+        if access.write().is_some() {
+            return None;
+        }
+        let read = access.read()?;
+        read.result_type(db, env, Some(receiver_ty))
+    }
+
     /// Includes inherited `object` members that are guaranteed for every instance.
     ///
     /// Subclasses can disable `__hash__`, and slotted instances can omit the `__dict__` that
@@ -649,13 +672,18 @@ impl<'db> ProtocolInterfaceView<'db> {
         })
     }
 
-    pub(super) fn instance_member(
+    pub(super) fn instance_member_with_policy(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
+        policy: MemberLookupPolicy,
     ) -> PlaceAndQualifiers<'db> {
         self.member_by_name(db, name)
+            .filter(|member| {
+                !policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE)
+                    || !member.is_type_check_only()
+            })
             .map(|member| PlaceAndQualifiers {
                 place: member
                     .access(ProtocolMemberAccessMode::Instance)
@@ -666,7 +694,7 @@ impl<'db> ProtocolInterfaceView<'db> {
                     .with_provenance(Provenance::from_definition(member.definition())),
                 qualifiers: member.qualifiers(),
             })
-            .unwrap_or_else(|| Type::object().member(db, env, name))
+            .unwrap_or_else(|| Type::object().member_lookup_with_policy(db, env, name, policy))
     }
 
     /// Looks up a member guaranteed to exist on every inhabitant of `type[Protocol]`.
@@ -679,8 +707,13 @@ impl<'db> ProtocolInterfaceView<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
+        policy: MemberLookupPolicy,
     ) -> Option<PlaceAndQualifiers<'db>> {
         self.member_by_name(db, name).map(|member| {
+            if policy.contains(MemberLookupPolicy::RUNTIME_ATTRIBUTE) && member.is_type_check_only()
+            {
+                return Place::Undefined.into();
+            }
             let access = member.access(ProtocolMemberAccessMode::Class);
             PlaceAndQualifiers {
                 place: access
@@ -834,7 +867,7 @@ impl<'db> ProtocolInterface<'db> {
             .map(|(name, callable)| {
                 (
                     Name::new(name),
-                    ProtocolMemberData::method(db, callable, None),
+                    ProtocolMemberData::method(db, callable, None, false),
                 )
             })
             .collect();
@@ -973,13 +1006,14 @@ impl<'db> ProtocolInterface<'db> {
             })
     }
 
-    pub(super) fn instance_member(
+    pub(super) fn instance_member_with_policy(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
+        policy: MemberLookupPolicy,
     ) -> PlaceAndQualifiers<'db> {
-        ProtocolInterfaceView::new(self, None).instance_member(db, env, name)
+        ProtocolInterfaceView::new(self, None).instance_member_with_policy(db, env, name, policy)
     }
 
     pub(super) fn recursive_type_normalized_impl(
@@ -1787,6 +1821,7 @@ pub(super) struct ProtocolMemberData<'db> {
     kind: ProtocolMemberKind<'db>,
     qualifiers: TypeQualifiers,
     definition: Option<Definition<'db>>,
+    type_check_only: bool,
 }
 
 impl<'db> ProtocolMemberData<'db> {
@@ -1798,6 +1833,7 @@ impl<'db> ProtocolMemberData<'db> {
         db: &'db dyn Db,
         callable: CallableType<'db>,
         definition: Option<Definition<'db>>,
+        type_check_only: bool,
     ) -> Self {
         let (method_kind, callable) = if callable.is_classmethod_like(db) {
             (ProtocolMethodKind::Class, callable)
@@ -1811,6 +1847,7 @@ impl<'db> ProtocolMemberData<'db> {
             kind: ProtocolMemberKind::Method(Type::Callable(callable), method_kind),
             qualifiers: TypeQualifiers::default(),
             definition,
+            type_check_only,
         }
     }
 
@@ -1823,6 +1860,7 @@ impl<'db> ProtocolMemberData<'db> {
             kind: ProtocolMemberKind::Property { read, write },
             qualifiers: TypeQualifiers::default(),
             definition,
+            type_check_only: false,
         }
     }
 
@@ -1834,6 +1872,7 @@ impl<'db> ProtocolMemberData<'db> {
             }),
             qualifiers: candidate.qualifiers,
             definition: candidate.definition,
+            type_check_only: false,
         }
     }
 
@@ -1848,6 +1887,7 @@ impl<'db> ProtocolMemberData<'db> {
             kind: self.kind.cycle_normalized(db, env, previous.kind, cycle),
             qualifiers: self.qualifiers,
             definition: self.definition,
+            type_check_only: self.type_check_only,
         }
     }
 
@@ -1864,6 +1904,7 @@ impl<'db> ProtocolMemberData<'db> {
                 .recursive_type_normalized_impl(db, env, div, nested)?,
             qualifiers: self.qualifiers,
             definition: self.definition,
+            type_check_only: self.type_check_only,
         })
     }
 
@@ -1880,6 +1921,7 @@ impl<'db> ProtocolMemberData<'db> {
                 .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
             qualifiers: self.qualifiers,
             definition: self.definition,
+            type_check_only: self.type_check_only,
         }
     }
 
@@ -1889,10 +1931,10 @@ impl<'db> ProtocolMemberData<'db> {
         env: &ProgramEnvironment<'db>,
         binding_context: Option<Definition<'db>>,
         typevars: &mut FxOrderSet<BoundTypeVarInstance<'db>>,
-        _visitor: &FindLegacyTypeVarsVisitor<'db>,
+        visitor: &FindLegacyTypeVarsVisitor<'db>,
     ) {
         for member_type in self.kind.member_types() {
-            member_type.find_legacy_typevars(db, env, binding_context, typevars);
+            member_type.find_legacy_typevars_impl(db, env, binding_context, typevars, visitor);
         }
     }
 
@@ -2124,6 +2166,10 @@ fn walk_protocol_member<'db, V: super::visitor::TypeVisitor<'db> + ?Sized>(
 impl<'a, 'db> ProtocolMember<'a, 'db> {
     pub(super) fn name(&self) -> &'a str {
         self.name
+    }
+
+    fn is_type_check_only(&self) -> bool {
+        self.data.type_check_only
     }
 
     fn qualifiers(&self) -> TypeQualifiers {
@@ -2664,6 +2710,14 @@ fn protocol_member_read_type<'db>(
         return Some(ty);
     }
 
+    // A typing-only method describes an operation without promising an attribute on the value.
+    // An ordinary method declaration also promises explicit access, even for special names.
+    let lookup_policy = if member.is_type_check_only() {
+        MemberLookupPolicy::default()
+    } else {
+        MemberLookupPolicy::RUNTIME_ATTRIBUTE
+    };
+
     // Module-level functions and ordinary methods on class objects are matched through direct
     // member access. Special instance methods still use special-method lookup on the meta-type.
     let lookup = if access == ProtocolMemberAccessMode::Instance
@@ -2681,14 +2735,14 @@ fn protocol_member_read_type<'db>(
                 member.name,
                 // The undefined fallback excludes instance members. Keep the class
                 // member lookup from reintroducing dynamic instance fallbacks.
-                MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+                lookup_policy | MemberLookupPolicy::NO_INSTANCE_FALLBACK,
             ),
             ty,
             Place::Undefined.into(),
             InstanceFallbackShadowsNonDataDescriptor::No,
         )
     } else {
-        receiver_ty.try_member_lookup(db, env, member.name)
+        receiver_ty.member_lookup_with_policy_and_receiver(db, env, member.name, lookup_policy, None)
     };
 
     match protocol_implementation_read_place(db, member, lookup) {
@@ -2765,7 +2819,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     db,
                     env,
                     member.name,
-                    MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+                    MemberLookupPolicy::NO_INSTANCE_FALLBACK | MemberLookupPolicy::RUNTIME_ATTRIBUTE,
                     None,
                 ),
             )
@@ -3705,14 +3759,19 @@ fn cached_protocol_interface<'db>(
                 definition,
             ),
             Type::Callable(callable) if bound_on_class.is_yes() && callable.is_method_like(db) => {
-                ProtocolMemberData::method(db, callable, definition)
+                ProtocolMemberData::method(db, callable, definition, false)
             }
             Type::FunctionLiteral(function)
                 if bound_on_class.is_yes()
                     || function.is_staticmethod(db)
                     || function.is_classmethod(db) =>
             {
-                ProtocolMemberData::method(db, function.into_callable_type(db), definition)
+                ProtocolMemberData::method(
+                    db,
+                    function.into_callable_type(db),
+                    definition,
+                    Type::FunctionLiteral(function).is_type_check_only(db),
+                )
             }
             _ if bound_on_class.is_yes()
                 && (definition.is_some_and(|definition| definition.kind(db).is_function_def())

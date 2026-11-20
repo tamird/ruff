@@ -7,7 +7,7 @@ use crate::place::TypeOrigin;
 use crate::types::diagnostic::{INVALID_TYPE_FORM, REDUNDANT_FINAL_CLASSVAR};
 use crate::types::infer::builder::InferenceFlags;
 use crate::types::infer::nearest_enclosing_class;
-use crate::types::string_annotation::parse_string_annotation;
+use crate::types::string_annotation::{SourceAnnotation, parse_string_annotation};
 use crate::types::{
     DeclaredType, SpecialFormType, Type, TypeContext, TypeQualifier, TypeQualifiers, todo_type,
 };
@@ -43,7 +43,44 @@ impl<'db> AnnotationExpressionInference<'db> {
 }
 
 /// Annotation expressions.
-impl<'db> TypeInferenceBuilder<'db, '_> {
+impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
+    /// Parses a quoted annotation while retaining the outer canonical lookup anchor.
+    pub(super) fn parse_string_annotation(
+        &mut self,
+        string: &ast::ExprStringLiteral,
+    ) -> Option<SourceAnnotation<'ast, 'db>> {
+        let annotation = parse_string_annotation(
+            &self.context,
+            self.inference_flags(),
+            string,
+            self.enclosing_node_key(string.into()),
+        )?;
+        self.string_annotations
+            .insert(ast::ExprRef::StringLiteral(string).into());
+        Some(annotation)
+    }
+
+    /// Prepares either module syntax or a detached annotation for the ordinary inference paths.
+    pub(super) fn annotation_expression<'a>(
+        &self,
+        annotation: &'a SourceAnnotation<'_, 'db>,
+    ) -> Option<(&'a ast::Expr, DeferredExpressionState)> {
+        let expression = annotation.expression_or_report(&self.context)?;
+        let state = match annotation {
+            SourceAnnotation::Native(_) => self.defer_annotations().into(),
+            SourceAnnotation::Detached {
+                owner,
+                range: _,
+                parsed: _,
+            } => DeferredExpressionState::InDetachedAnnotation(*owner),
+            SourceAnnotation::External {
+                annotation: _,
+                range: _,
+            } => return None,
+        };
+        Some((expression, state))
+    }
+
     /// Infer the type of an annotation expression with the given [`DeferredExpressionState`].
     pub(super) fn infer_annotation_expression(
         &mut self,
@@ -69,10 +106,10 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         deferred_state: DeferredExpressionState,
         pep_613_policy: PEP613Policy,
     ) -> DeclaredType<'db> {
-        // `DeferredExpressionState::InStringAnnotation` takes precedence over other deferred states.
+        // `DeferredExpressionState::InDetachedAnnotation` takes precedence over other deferred states.
         // However, if it's not a stringified annotation, we must still ensure that annotation expressions
         // are always deferred in stub files.
-        let state = if deferred_state.in_string_annotation() {
+        let state = if deferred_state.in_detached_annotation() {
             deferred_state
         } else if self.in_stub() {
             DeferredExpressionState::Deferred
@@ -85,7 +122,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             .context
             .inference_flags
             .replace(InferenceFlags::CHECK_UNBOUND_TYPEVARS, true);
+        let previous_annotation = self
+            .context
+            .inference_flags
+            .replace(InferenceFlags::IN_ANNOTATION_EXPRESSION, true);
         let annotation_ty = self.infer_annotation_expression_impl(annotation, pep_613_policy);
+        self.context.inference_flags.set(
+            InferenceFlags::IN_ANNOTATION_EXPRESSION,
+            previous_annotation,
+        );
         self.context.inference_flags.set(
             InferenceFlags::CHECK_UNBOUND_TYPEVARS,
             previous_check_unbound_typevars,
@@ -375,19 +420,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         &mut self,
         string: &ast::ExprStringLiteral,
     ) -> DeclaredType<'db> {
-        match parse_string_annotation(&self.context, self.inference_flags(), string) {
-            Some(parsed) => {
-                self.string_annotations
-                    .insert(ruff_python_ast::ExprRef::StringLiteral(string).into());
-                // String annotations are always evaluated in the deferred context.
-                self.infer_annotation_expression(
-                    parsed.expr(),
-                    DeferredExpressionState::InStringAnnotation(
-                        self.enclosing_node_key(string.into()),
-                    ),
-                )
-            }
-            None => DeclaredType::from_type(Type::unknown()),
+        if let Some(annotation) = self.parse_string_annotation(string)
+            && let Some((expression, state)) = self.annotation_expression(&annotation)
+        {
+            self.infer_annotation_expression(expression, state)
+        } else {
+            DeclaredType::from_type(Type::unknown())
         }
     }
 }

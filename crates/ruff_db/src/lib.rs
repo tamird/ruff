@@ -6,7 +6,8 @@
 use crate::files::{File, Files};
 use crate::system::System;
 use crate::vendored::VendoredFileSystem;
-use ruff_python_ast::PythonVersion;
+use ruff_python_ast::{PySourceType, PythonVersion};
+pub use ruff_python_parser::StringLiteralDecoder;
 use rustc_hash::FxHasher;
 use std::hash::BuildHasherDefault;
 use std::num::NonZeroUsize;
@@ -26,17 +27,57 @@ pub mod system;
 pub mod testing;
 pub mod vendored;
 
-/// A file paired with the Python version used to parse its contents.
+/// A file paired with the configuration used to parse its contents.
 ///
-/// This is the key for [`parsed::parsed_module`]. Including the Python version allows the same
-/// file to be parsed for different versions within a single Salsa revision without sharing an
-/// incompatible AST or syntax diagnostics.
-#[salsa::interned(debug, heap_size = ruff_memory_usage::heap_size)]
+/// This is the key for [`parsed::parsed_module`]. Including the Python version, source type, and
+/// literal interpretation allows the same file to have different parse results within a single
+/// Salsa revision without sharing an incompatible AST or syntax diagnostics.
+#[salsa::interned(
+    debug,
+    constructor = new_with_module_parser,
+    heap_size = ruff_memory_usage::heap_size
+)]
 pub struct PythonFile<'db> {
     #[returns(copy)]
     pub file: File,
     #[returns(copy)]
     pub python_version: PythonVersion,
+    /// The parser grammar, independent of source decoding and [`File::is_stub`].
+    #[returns(copy)]
+    pub source_type: PySourceType,
+    /// The embedding application's stable name for a string literal interpretation. When
+    /// present, [`Db::string_literal_decoder`] must resolve it for the database's lifetime.
+    #[returns(copy)]
+    pub literal_namespace: Option<&'static str>,
+    /// An optional parser for modules, independent of expression and string-literal parsing.
+    #[returns(copy)]
+    pub module_namespace: Option<&'static str>,
+}
+
+impl<'db> PythonFile<'db> {
+    pub fn new_with_parse_options(
+        db: &'db dyn Db,
+        file: File,
+        version: PythonVersion,
+        source_type: PySourceType,
+        literal_namespace: Option<&'static str>,
+    ) -> Self {
+        Self::new_with_module_parser(db, file, version, source_type, literal_namespace, None)
+    }
+
+    /// Selects the default parser grammar using [`File::source_type`].
+    pub fn new(db: &'db dyn Db, file: File, python_version: PythonVersion) -> Self {
+        Self::new_with_source_type(db, file, python_version, file.source_type(db))
+    }
+
+    pub fn new_with_source_type(
+        db: &'db dyn Db,
+        file: File,
+        python_version: PythonVersion,
+        source_type: PySourceType,
+    ) -> Self {
+        Self::new_with_parse_options(db, file, python_version, source_type, None)
+    }
 }
 
 // The Salsa heap is tracked separately.
@@ -72,12 +113,47 @@ pub fn disable_lru(db: &mut dyn Db) {
     parsed::disable_lru(db);
 }
 
+/// Parses a regular module. Node, token, and error ranges must address the original source.
+pub type ModuleParser = fn(
+    &str,
+    ruff_python_parser::ParseOptions,
+) -> ruff_python_parser::Parsed<ruff_python_ast::ModModule>;
+
+/// Parses a detached annotation. Expression and error ranges must address the original source.
+pub type AnnotationParser = fn(
+    &str,
+    ruff_text_size::TextRange,
+    ruff_python_parser::ParseOptions,
+) -> Result<
+    ruff_python_parser::Parsed<ruff_python_ast::ModExpression>,
+    ruff_python_parser::ParseError,
+>;
+
 /// Most basic database that gives access to files, the host system, source code, and parsed AST.
 #[salsa::db]
 pub trait Db: salsa::Database {
     fn vendored(&self) -> &VendoredFileSystem;
     fn system(&self) -> &dyn System;
     fn files(&self) -> &Files;
+
+    /// Resolves an embedding application's stable literal interpretation name.
+    ///
+    /// A namespace must resolve to the same deterministic decoder for the lifetime of the
+    /// database. Changing interpretation requires a new namespace.
+    fn string_literal_decoder(&self, _namespace: &'static str) -> Option<StringLiteralDecoder> {
+        None
+    }
+
+    /// A registered name must resolve to the same parser for the lifetime of the database.
+    fn module_parser(&self, _namespace: &'static str) -> Option<ModuleParser> {
+        None
+    }
+
+    /// Selects how to parse detached type expressions for this module parser namespace.
+    /// Returning `None` uses the ordinary Python expression parser.
+    fn annotation_parser(&self, _namespace: &'static str) -> Option<AnnotationParser> {
+        None
+    }
 }
 
 static MAX_PARALLELISM: OnceLock<NonZeroUsize> = OnceLock::new();
@@ -199,6 +275,32 @@ mod tests {
 
         fn files(&self) -> &Files {
             &self.files
+        }
+
+        fn string_literal_decoder(
+            &self,
+            namespace: &'static str,
+        ) -> Option<ruff_python_parser::StringLiteralDecoder> {
+            (namespace == "test:uppercase")
+                .then_some(|source| Some(source.to_ascii_uppercase().into_boxed_str()))
+        }
+
+        fn module_parser(&self, namespace: &'static str) -> Option<super::ModuleParser> {
+            (namespace == "test:skip-marker").then_some(|source, options| {
+                let range =
+                    ruff_text_size::TextRange::new(1.into(), ruff_text_size::TextSize::of(source));
+                ruff_python_parser::parse_cells_unchecked(source, [range], &options)
+            })
+        }
+
+        fn annotation_parser(&self, namespace: &'static str) -> Option<super::AnnotationParser> {
+            (namespace == "test:skip-marker").then_some(|source, range, options| {
+                let contents = ruff_text_size::TextRange::new(
+                    range.start() + ruff_text_size::TextSize::new(1),
+                    range.end(),
+                );
+                ruff_python_parser::parse_expression_range_with_options(source, contents, options)
+            })
         }
     }
 

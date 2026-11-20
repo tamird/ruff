@@ -67,14 +67,14 @@ pub use crate::error::{
     InterpolatedStringErrorType, LexicalErrorType, ParseError, ParseErrorType,
     UnsupportedSyntaxError, UnsupportedSyntaxErrorKind,
 };
-pub use crate::parser::ParseOptions;
+pub use crate::parser::{ParseOptions, StringLiteralDecoder};
 
 use crate::parser::Parser;
 
 use ruff_python_ast::token::{Token, TokenFlags, TokenKind, Tokens};
 use ruff_python_ast::{
     AtomicNodeIndex, Expr, Mod, ModExpression, ModModule, PySourceType, StringFlags, StringLiteral,
-    Suite,
+    Suite, TypeParams,
 };
 use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
 
@@ -160,8 +160,49 @@ pub fn parse_expression_range(
     source: &str,
     range: TextRange,
 ) -> Result<Parsed<ModExpression>, ParseError> {
+    parse_expression_range_with_options(source, range, ParseOptions::from(Mode::Expression))
+}
+
+/// Parses an expression at `range` with the supplied parsing options.
+pub fn parse_expression_range_with_options(
+    source: &str,
+    range: TextRange,
+    mut options: ParseOptions,
+) -> Result<Parsed<ModExpression>, ParseError> {
+    options.mode = Mode::Expression;
+    parse_expression_range_impl(source, range, options)
+}
+
+/// Parse a bracketed type parameter list, preserving offsets into the enclosing source.
+///
+/// ```
+/// use ruff_python_parser::{Mode, ParseOptions, parse_type_params_range};
+/// use ruff_text_size::{Ranged, TextRange};
+///
+/// let source = "# [T: str] trailing";
+/// let options = ParseOptions::from(Mode::Module);
+/// let list = parse_type_params_range(source, TextRange::new(2.into(), 10.into()), options.clone())?;
+/// assert_eq!(&source[list.syntax()[0].range()], "T: str");
+/// assert!(parse_type_params_range(source, TextRange::new(2.into(), 19.into()), options).is_err());
+/// # Ok::<(), ruff_python_parser::ParseError>(())
+/// ```
+pub fn parse_type_params_range(
+    source: &str,
+    range: TextRange,
+    mut options: ParseOptions,
+) -> Result<Parsed<TypeParams>, ParseError> {
+    options.mode = Mode::Expression;
+    Parser::new_starts_at(&source[..range.end().to_usize()], range.start(), options)
+        .parse_type_param_list()
+}
+
+fn parse_expression_range_impl(
+    source: &str,
+    range: TextRange,
+    options: ParseOptions,
+) -> Result<Parsed<ModExpression>, ParseError> {
     let source = &source[..range.end().to_usize()];
-    Parser::new_starts_at(source, range.start(), ParseOptions::from(Mode::Expression))
+    Parser::new_starts_at(source, range.start(), options)
         .parse()
         .try_into_expression()
         .unwrap()
@@ -186,14 +227,11 @@ pub fn parse_parenthesized_expression_range(
     source: &str,
     range: TextRange,
 ) -> Result<Parsed<ModExpression>, ParseError> {
-    let source = &source[..range.end().to_usize()];
-    let parsed = Parser::new_starts_at(
+    parse_expression_range_impl(
         source,
-        range.start(),
+        range,
         ParseOptions::from(Mode::ParenthesizedExpression),
     )
-    .parse();
-    parsed.try_into_expression().unwrap().into_result()
 }
 
 /// Parses a Python expression from a string annotation.
@@ -220,16 +258,36 @@ pub fn parse_string_annotation(
     source: &str,
     string: &StringLiteral,
 ) -> Result<Parsed<ModExpression>, ParseError> {
+    parse_string_annotation_with_options(source, string, ParseOptions::from(Mode::Expression))
+}
+
+/// Parses a quoted annotation with the supplied parsing options.
+///
+/// When a custom literal decoder changes the annotation text, the source cannot be reparsed
+/// without a mapping from the interpreted text back to source offsets.
+pub fn parse_string_annotation_with_options(
+    source: &str,
+    string: &StringLiteral,
+    mut options: ParseOptions,
+) -> Result<Parsed<ModExpression>, ParseError> {
     let range = string
         .range()
         .add_start(string.flags.opener_len())
         .sub_end(string.flags.closer_len());
-    let source = &source[..range.end().to_usize()];
-    if string.flags.is_triple_quoted() {
-        parse_parenthesized_expression_range(source, range)
-    } else {
-        parse_expression_range(source, range)
+    if options.has_string_literal_decoder() && &source[range] != string.as_str() {
+        return Err(ParseError {
+            error: ParseErrorType::StringAnnotationError(
+                "String annotation text differs from its source spelling",
+            ),
+            location: range,
+        });
     }
+    options.mode = if string.flags.is_triple_quoted() {
+        Mode::ParenthesizedExpression
+    } else {
+        Mode::Expression
+    };
+    parse_expression_range_impl(source, range, options)
 }
 
 /// Parse the given Python source code using the specified [`ParseOptions`].
@@ -532,6 +590,19 @@ impl Parsed<Mod> {
 }
 
 impl Parsed<ModModule> {
+    /// Attach syntax from trivia before assigning node indices. New nodes and
+    /// errors must use offsets in the original source.
+    pub fn transform_suite(
+        &mut self,
+        transform: impl FnOnce(&mut Suite, &Tokens) -> Vec<ParseError>,
+    ) {
+        let errors = transform(&mut self.syntax.body, &self.tokens);
+        if !errors.is_empty() {
+            self.errors.extend(errors);
+            self.errors.sort_by_key(|error| error.location.start());
+        }
+    }
+
     /// Returns the module body contained in this parsed output as a [`Suite`].
     pub fn suite(&self) -> &Suite {
         &self.syntax.body
