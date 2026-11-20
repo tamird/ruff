@@ -440,7 +440,7 @@ class Collect(Protocol):
 
 collect: Collect = lambda **kwargs: (reveal_type(kwargs), kwargs)[1]  # revealed: dict[str, int]
 reveal_type(collect)  # revealed: (**kwargs: int) -> dict[str, int]
-# error: [unresolved-attribute]
+# error: [missing-attribute]
 wrong_operation: Collect = lambda **kwargs: (kwargs["value"].upper(), kwargs)[1]
 ```
 
@@ -513,7 +513,7 @@ read: Callback = lambda *, name, **kwargs: (
     reveal_type(kwargs.get("suffix")),  # revealed: str | None
     kwargs["count"],
 )[3]
-# error: [unresolved-attribute]
+# error: [missing-attribute]
 wrong_operation: Callback = lambda *, name, **kwargs: kwargs["count"].upper()
 
 direct(name="task", count=1)

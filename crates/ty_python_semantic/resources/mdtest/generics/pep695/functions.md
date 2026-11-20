@@ -4306,7 +4306,7 @@ type PackageAlias = Package
 
 def update_package[T: PackageAlias](value: T) -> T:
     reveal_type(value["metadata"])  # revealed: dict[str, object]
-    value["unknown"]  # error: [invalid-key]
+    value["unknown"]  # error: [invalid-typed-dict-key]
     return value
 ```
 
@@ -7622,23 +7622,23 @@ parameters, or return types.
 
 ```py
 @overload
-def wrong_keywords[T: str](value: T, **kwargs: str) -> T: ...  # error: [invalid-overload]
+def wrong_keywords[T: str](value: T, **kwargs: str) -> T: ...  # error: [inconsistent-overload-implementation]
 @overload
-def wrong_keywords(value: bytes, **kwargs: str) -> bytes: ...  # error: [invalid-overload]
+def wrong_keywords(value: bytes, **kwargs: str) -> bytes: ...  # error: [inconsistent-overload-implementation]
 def wrong_keywords[T: str | bytes](value: T, **kwargs: int) -> T:
     return value
 
 @overload
-def wrong_required[T: str](value: T, *, option: str = "", **kwargs: object) -> T: ...  # error: [invalid-overload]
+def wrong_required[T: str](value: T, *, option: str = "", **kwargs: object) -> T: ...  # error: [inconsistent-overload-implementation]
 @overload
-def wrong_required(value: bytes, *, option: str = "", **kwargs: object) -> bytes: ...  # error: [invalid-overload]
+def wrong_required(value: bytes, *, option: str = "", **kwargs: object) -> bytes: ...  # error: [inconsistent-overload-implementation]
 def wrong_required[T: str | bytes](value: T, *, option: str, **kwargs: object) -> T:
     return value
 
 @overload
-def wrong_return(value: str, **kwargs: object) -> int: ...  # error: [invalid-overload]
+def wrong_return(value: str, **kwargs: object) -> int: ...  # error: [inconsistent-overload-implementation]
 @overload
-def wrong_return(value: bytes, **kwargs: object) -> int: ...  # error: [invalid-overload]
+def wrong_return(value: bytes, **kwargs: object) -> int: ...  # error: [inconsistent-overload-implementation]
 def wrong_return[T: str | bytes](value: T, **kwargs: object) -> T:
     return value
 ```

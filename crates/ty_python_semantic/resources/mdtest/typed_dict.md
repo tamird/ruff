@@ -1173,7 +1173,7 @@ def unrelated(dest: Options, source: Inputs, key: Key, other: Key):
     dest[key] = source.pop(key, "missing")
 
 def arbitrary(dest: Options, source: Inputs, key: str):
-    dest[key] = source[key]  # error: [invalid-typed-dict-key]
+    dest[key] = source[key]  # error: [non-literal-typed-dict-key]
 
 class Singleton(TypedDict):
     color: tuple[int]
@@ -1450,9 +1450,9 @@ def same(a: OpenB, b: OpenB) -> OpenB:
 def hidden(a: A, b: OpenB):
     reveal_type(a | b)  # revealed: dict[str, object]
     # error: [invalid-argument-type]
-    # error: [invalid-typed-dict-key]
+    # error: [unknown-typed-dict-constructor-key]
     unsafe_override: AB = a | b
-    # error: [invalid-typed-dict-key]
+    # error: [unknown-typed-dict-constructor-key]
     hidden_left: AB = b | a
     # error: [invalid-argument-type]
     allowed_extra_keys: OpenAB = a | b
@@ -3784,7 +3784,7 @@ no readable values.
 
 ```py
 def read(source: Closed, key: str) -> None:
-    # error: [invalid-typed-dict-key]
+    # error: [non-literal-typed-dict-key]
     reveal_type(source[key])  # revealed: Descriptor[str]
     reveal_type(source.__getitem__(key))  # revealed: Descriptor[str]
 
