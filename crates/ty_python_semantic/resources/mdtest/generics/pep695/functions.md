@@ -7749,5 +7749,163 @@ def repeat_overloaded[T](value: Box[T], transforms: list[Transform]) -> Box[T]:
     return current  # no diagnostic
 ```
 
+## Context from later uses
+
+Copying entries and adding keyword arguments keeps both the input key type and string keys in the
+returned dictionary.
+
+Lists and sets can likewise combine generic input values with added integers.
+
+### Entry copies and keyword updates
+
+```py
+from collections.abc import Hashable
+
+def add[K: Hashable, V](*dictionaries: dict[K, V], **kwargs: V) -> dict[K | str, V]:
+    result = {}
+    for source in dictionaries:
+        result.update(source.items())
+    result.update(kwargs)
+    return result
+```
+
+### Dictionary constructor
+
+```py
+from collections.abc import Hashable
+
+def combine[K: Hashable, V](*dictionaries: dict[K, V], **kwargs: V) -> dict[K | str, V]:
+    result = dict()
+    for source in dictionaries:
+        result.update(source.items())
+    result.update(kwargs)
+    return result
+```
+
+### Keyword value types
+
+All keys are strings, so standard dictionary copying needs no key widening.
+
+```py
+def add[V](*dictionaries: dict[str, V], **kwargs: int) -> dict[str, V | int]:
+    result = {}
+    for source in dictionaries:
+        result.update(source)
+    result.update(kwargs)
+    return result
+```
+
+### List copies and additions
+
+```py
+def combine[T](values: list[T], extra: int) -> list[T | int]:
+    result = []
+    result.extend(values)
+    result.append(extra)
+    return result
+```
+
+### Set copies and additions
+
+```py
+def combine[T](values: set[T], extra: int) -> set[T | int]:
+    result = set()
+    result.update(values)
+    result.add(extra)
+    return result
+```
+
+### Reordered key unions
+
+```py
+from collections.abc import Hashable
+
+def add[K: Hashable, V](*dictionaries: dict[K, V], **kwargs: V) -> dict[str | K, V]:
+    def consume(values: dict[K | str, V]) -> None: ...
+
+    result = {}
+    for source in dictionaries:
+        result.update(source.items())
+    result.update(kwargs)
+    consume(result)
+    return result
+```
+
+### Reversed key unions
+
+```py
+from collections.abc import Hashable
+
+def add[K: Hashable, V](*dictionaries: dict[K, V], **kwargs: V) -> dict[K | str, V]:
+    def consume(values: dict[str | K, V]) -> None: ...
+
+    result = {}
+    for source in dictionaries:
+        result.update(source.items())
+    result.update(kwargs)
+    consume(result)
+    return result
+```
+
+### Aliased consumer keys
+
+```py
+from collections.abc import Hashable
+
+type Keys[K] = K | str
+
+def add[K: Hashable, V](*dictionaries: dict[K, V], **kwargs: V) -> dict[str | K, V]:
+    def consume(values: dict[Keys[K], V]) -> None: ...
+
+    result = {}
+    for source in dictionaries:
+        result.update(source.items())
+    result.update(kwargs)
+    consume(result)
+    return result
+```
+
+### Aliased return keys
+
+```py
+from collections.abc import Hashable
+
+type Keys[K] = K | str
+
+def add[K: Hashable, V](*dictionaries: dict[K, V], **kwargs: V) -> dict[Keys[K], V]:
+    def consume(values: dict[str | K, V]) -> None: ...
+
+    result = {}
+    for source in dictionaries:
+        result.update(source.items())
+    result.update(kwargs)
+    consume(result)
+    return result
+```
+
+### Several equivalent contexts
+
+```py
+from collections.abc import Hashable
+
+class Tag0:
+    pass
+
+class Tag1:
+    pass
+
+def add[K: Hashable, V](*dictionaries: dict[K, V], **kwargs: V) -> dict[K | str | Tag0 | Tag1, V]:
+    def consume_first(values: dict[Tag0 | K | Tag1 | str, V]) -> None: ...
+    def consume_second(values: dict[str | Tag1 | K | Tag0, V]) -> None: ...
+
+    result = {}
+    for source in dictionaries:
+        result.update(source.items())
+    result.update(kwargs)
+    consume_first(result)
+    consume_second(result)
+    return result
+```
+
 [implies_subtype_of]: ../../type_properties/implies_subtype_of.md
 [ty#2371]: https://github.com/astral-sh/ty/issues/2371

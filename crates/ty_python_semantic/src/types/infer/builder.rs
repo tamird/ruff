@@ -8789,6 +8789,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 > = FxHashMap::default();
                 let mut elt_tcx_variance: FxHashMap<BoundTypeVarIdentity<'_>, TypeVarVariance> =
                     FxHashMap::default();
+                let mut exact_context = false;
 
                 if let Some(tcx) = annotation.map(|tcx| tcx.resolve_type_alias(db))
                     && matches!(tcx, Type::NominalInstance(_))
@@ -8801,6 +8802,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             && typevar.typevar(db).bound_or_constraints(db, env).is_none()
                     })
                 {
+                    exact_context = true;
                     // The builtin and its checked allocation class have corresponding generic
                     // slots. Project either direct specialization without losing caller typevars
                     // from an empty literal's context. Materialized specializations instead
@@ -8809,6 +8811,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     for (typevar, inferred_ty) in
                         generic_context.variables(db).zip(specialization.types(db))
                     {
+                        let original_inferred_ty = *inferred_ty;
                         let inferred_ty = inferred_ty
                             .filter_union(db, env, |ty| {
                                 !ty.as_typevar()
@@ -8817,6 +8820,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             .filter_union(db, env, |ty| {
                                 elts.is_empty() || !ty.has_unspecialized_type_var(db, env)
                             });
+                        exact_context &= inferred_ty == original_inferred_ty;
                         if !elts.is_empty() && inferred_ty.has_unspecialized_type_var(db, env) {
                             continue;
                         }
@@ -8912,9 +8916,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .map(|(identity, accumulator)| (identity, accumulator.into_type(db, env)))
                         .collect();
 
-                (elt_tcx_constraints, elt_tcx_variance)
+                (elt_tcx_constraints, elt_tcx_variance, exact_context)
             };
-        let (elt_tcx_constraints, elt_tcx_variance) =
+        let (elt_tcx_constraints, elt_tcx_variance, _exact_context) =
             project_element_context(tcx.expected_type(), &builder);
         let materialized_context = tcx.expected_type().is_some_and(|annotation| {
             annotation
@@ -9053,6 +9057,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let mut singleton_contexts: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
             FxHashMap::default();
+        let mut later_exact_context: Option<Vec<Type<'db>>> = None;
+        let mut conflicting_exact_contexts = false;
 
         if tcx.expected_type().is_none()
             && let Some(collection_expr) = collection_expr
@@ -9118,8 +9124,69 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         };
                         builder.infer(inference_instance, *constraint).ok()?;
                         if *kind == CollectionUseConstraintKind::Context {
-                            let (contexts, variances) =
+                            let (contexts, variances, exact_context) =
                                 project_element_context(Some(*constraint), &builder);
+                            // A return context `dict[K | str, V]` applies to every `K`. Write
+                            // constraints can instead yield `dict[str, V]` only when `K` is `str`.
+                            // Use the context when every invariant consumer agrees; normal
+                            // use-site checks still reject incompatible writes and arguments.
+                            if !conflicting_exact_contexts && elts.is_empty() && exact_context {
+                                let specialization = generic_context
+                                    .variables(db)
+                                    .map(|typevar| {
+                                        let identity = typevar.identity(db);
+                                        if variances.get(&identity)
+                                            != Some(&TypeVarVariance::Invariant)
+                                        {
+                                            return None;
+                                        }
+                                        let context = contexts.get(&identity).copied()?;
+                                        if !context.is_fully_static(db, env)
+                                            || any_over_type_expanding_aliases(
+                                                db,
+                                                env,
+                                                context,
+                                                |ty| {
+                                                    ty.is_divergent()
+                                                        || ty.is_provisional_marker()
+                                                        || ty.as_typevar().is_some_and(|typevar| {
+                                                            typevar.is_inferable(db, inferable)
+                                                        })
+                                                },
+                                            )
+                                        {
+                                            return None;
+                                        }
+                                        Some(context)
+                                    })
+                                    .collect::<Option<Vec<_>>>();
+                                if let Some(specialization) = specialization {
+                                    if let Some(previous) = &later_exact_context {
+                                        let equivalence_constraints = ConstraintSetBuilder::new();
+                                        conflicting_exact_contexts |= !previous
+                                            .iter()
+                                            .zip(&specialization)
+                                            .all(|(&previous, &current)| {
+                                                previous == current
+                                                    || previous
+                                                        .when_equivalent_to(
+                                                            db,
+                                                            env,
+                                                            current,
+                                                            &equivalence_constraints,
+                                                        )
+                                                        .is_always_satisfied_bounded(
+                                                            db,
+                                                            env,
+                                                            TypeVarSet::None,
+                                                        )
+                                                        == Some(true)
+                                            });
+                                    } else {
+                                        later_exact_context = Some(specialization);
+                                    }
+                                }
+                            }
                             for typevar in generic_context.variables(db) {
                                 let identity = typevar.identity(db);
                                 // Only an upper bound restricts the values stored in this slot.
@@ -9151,6 +9218,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     }
                 }
             }
+        }
+
+        if !conflicting_exact_contexts && let Some(specialization) = later_exact_context {
+            let class_type = collection_alias
+                .origin(db)
+                .apply_specialization(db, |context| {
+                    context.specialize_recursive(db, specialization.into_iter().map(Some))
+                });
+            return Type::from(class_type).to_instance_approximation(db, env);
         }
 
         // Consecutive elements often contribute the same lower bound after literal promotion.
