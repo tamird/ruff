@@ -8505,8 +8505,19 @@ mod tests {
             ReturnTypeConsistency::Consistent => panic!("expected incompatible return type"),
             ReturnTypeConsistency::Inconsistent(_) => {}
         }
+        let generic = signature("generic");
+        let prepared_nullable = signature("nullable")
+            .specialize_for_overload_implementation(&db, &env, generic)
+            .expect("nullable implementation inputs admit a complete specialization");
+        match prepared_nullable.implementation_parameters_consistency_with(&db, &env, generic) {
+            ParameterConsistency::Consistent => {}
+            ParameterConsistency::Inconsistent(_) => panic!("expected nullable inputs to cover the generic overload"),
+        }
+        match prepared_nullable.implementation_return_type_consistency_with(&db, &env, generic) {
+            ReturnTypeConsistency::Consistent => panic!("expected nullable result to violate the generic return promise"),
+            ReturnTypeConsistency::Inconsistent(_) => {}
+        }
         for name in [
-            "nullable",
             "nullable_none",
             "nullable_default",
             "return_only",
