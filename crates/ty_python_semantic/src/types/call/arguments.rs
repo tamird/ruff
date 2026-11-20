@@ -552,16 +552,24 @@ impl<'db> KeywordArgument<'db> {
         match self {
             Self::Type(_) => {}
             Self::Known { types: _, keywords } => {
-                keywords.keys = keywords.keys.iter()
+                keywords.keys = keywords
+                    .keys
+                    .iter()
                     .filter(|(name, _)| !prefix.iter().any(|p| p.keyword_name() == Some(name)))
-                    .cloned().collect();
+                    .cloned()
+                    .collect();
             }
             Self::Observed { types: _, keywords } => {
-                keywords.items = keywords.items.iter()
+                keywords.items = keywords
+                    .items
+                    .iter()
                     .filter(|item| !prefix.iter().any(|p| p.keyword_name() == Some(&item.name)))
-                    .cloned().collect();
+                    .cloned()
+                    .collect();
                 keywords.excluded_names.extend(
-                    prefix.iter().filter_map(|parameter| parameter.keyword_name().cloned()),
+                    prefix
+                        .iter()
+                        .filter_map(|parameter| parameter.keyword_name().cloned()),
                 );
             }
         }
@@ -1559,11 +1567,10 @@ mod tests {
             panic!("expected keyword argument");
         };
         keywords.remove_prefix_keywords(parameters.as_slice());
-        let Some(CallArgument::Keywords(KeywordArgument::Observed { types: _, keywords })) = projected.get(0) else {
-            panic!(
-                "expected projected keywords, got {:?}",
-                projected.get(0)
-            );
+        let Some(CallArgument::Keywords(KeywordArgument::Observed { types: _, keywords })) =
+            projected.get(0)
+        else {
+            panic!("expected projected keywords, got {:?}", projected.get(0));
         };
         let values = keywords.residual_values(&db, &env);
         assert_eq!(values, forwarded);
