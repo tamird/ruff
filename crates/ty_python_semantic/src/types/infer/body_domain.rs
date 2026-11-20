@@ -1295,10 +1295,7 @@ mod tests {
         }
         db.write_file(
             "/src/body.py",
-            source.replace(
-                "ctx.value",
-                "ctx.missing  # ty: ignore[missing-attribute]",
-            ),
+            source.replace("ctx.value", "ctx.missing  # ty: ignore[missing-attribute]"),
         )?;
         let f = function(&db);
         assert!(check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]).is_empty());

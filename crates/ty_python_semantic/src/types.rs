@@ -2438,10 +2438,16 @@ impl<'db> ParamSpecValue<'db> {
         match self {
             Self::Callable(callable) => {
                 let callable = if let Some(capture) = keyword_capture {
-                    let signatures = callable.signatures(db).overloads.iter().map(|signature| {
-                        let parameters = signature.parameters().keyword_projection(db, capture)?;
-                        Some(signature.clone().with_parameters(parameters))
-                    }).collect::<Option<Vec<_>>>()?;
+                    let signatures = callable
+                        .signatures(db)
+                        .overloads
+                        .iter()
+                        .map(|signature| {
+                            let parameters =
+                                signature.parameters().keyword_projection(db, capture)?;
+                            Some(signature.clone().with_parameters(parameters))
+                        })
+                        .collect::<Option<Vec<_>>>()?;
                     callable.with_signatures(db, CallableSignature::from_overloads(signatures))
                 } else {
                     callable
@@ -2456,12 +2462,13 @@ impl<'db> ParamSpecValue<'db> {
                     parameters
                 };
                 Some(Type::Callable(CallableType::single(
-                    db, Signature::new(parameters, Type::unknown()),
+                    db,
+                    Signature::new(parameters, Type::unknown()),
                 )))
             }
-            Self::Intersection(_) => {
-                self.try_map(db, env, &mut |value| value.to_callable_type(db, env, keyword_capture))
-            }
+            Self::Intersection(_) => self.try_map(db, env, &mut |value| {
+                value.to_callable_type(db, env, keyword_capture)
+            }),
         }
     }
 }
