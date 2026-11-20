@@ -6659,6 +6659,33 @@ def make_result[T]() -> Result[T]:
 
 result: Result[Stream[int]] = make_result()
 reveal_type(result)  # revealed: Result[Stream[int]]
+
+type StreamResult[T] = Result[Stream[T]]
+
+aliased_result: StreamResult[int] = make_result()
+reveal_type(aliased_result)  # revealed: Result[Stream[int]]
+
+class PayloadStream[T](Stream[T], Protocol):
+    def payload(self) -> T: ...
+    def read[U](self: "PayloadStream[U]") -> U: ...
+
+def string_stream() -> PayloadStream[str]:
+    raise NotImplementedError
+
+same_payload: PayloadStream[str] = string_stream()
+wrong_payload: PayloadStream[int] = string_stream()  # error: [invalid-assignment]
+
+class NumberView(Protocol):
+    def payload(self) -> int: ...
+    def read(self) -> int: ...
+
+class TextView(Protocol):
+    def payload(self) -> int: ...
+    def read(self) -> str: ...
+
+def check_receiver_witness(value: PayloadStream[int]) -> None:
+    number: NumberView = value
+    text: TextView = value  # error: [invalid-assignment]
 ```
 
 ## Generic property setter overrides
@@ -6763,9 +6790,6 @@ from typing import Annotated
 def metadata[T](value: T) -> None:
     annotated: Annotated[int, list[T]([value])]  # ok
 ```
-
-[implies_subtype_of]: ../../type_properties/implies_subtype_of.md
-[ty#2371]: https://github.com/astral-sh/ty/issues/2371
 
 ## Inferring collection elements from another argument
 
@@ -7629,9 +7653,13 @@ def wrong_keywords[T: str | bytes](value: T, **kwargs: int) -> T:
     return value
 
 @overload
-def wrong_required[T: str](value: T, *, option: str = "", **kwargs: object) -> T: ...  # error: [inconsistent-overload-implementation]
+def wrong_required[T: str](
+    value: T, *, option: str = "", **kwargs: object
+) -> T: ...  # error: [inconsistent-overload-implementation]
 @overload
-def wrong_required(value: bytes, *, option: str = "", **kwargs: object) -> bytes: ...  # error: [inconsistent-overload-implementation]
+def wrong_required(
+    value: bytes, *, option: str = "", **kwargs: object
+) -> bytes: ...  # error: [inconsistent-overload-implementation]
 def wrong_required[T: str | bytes](value: T, *, option: str, **kwargs: object) -> T:
     return value
 
