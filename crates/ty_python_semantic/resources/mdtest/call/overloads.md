@@ -1463,10 +1463,16 @@ P = ParamSpec("P")
 def transform(value: list[T], /, *, render: Callable[Concatenate[T, P], str]) -> str: ...
 @overload
 def transform(prefix: str, value: list[T], /, *, render: Callable[Concatenate[T, P], str]) -> bytes: ...
+
+class Renderer:
+    @overload
+    def render(self, value: list[T], /, *, callback: Callable[[T], str] | Callable[[T, bool], str]) -> str: ...
+    @overload
+    def render(self, prefix: str, value: list[T], /, *, callback: Callable[[T], str] | Callable[[T, bool], str]) -> bytes: ...
 ```
 
 ```py
-from overloaded import transform
+from overloaded import Renderer, transform
 
 def render(value: int) -> str:
     return str(value)
@@ -1474,9 +1480,14 @@ def render(value: int) -> str:
 def wrong(value: int) -> int:
     return value
 
-def check(arguments: tuple[list[int]] | tuple[str, list[int]]) -> None:
+def check(arguments: tuple[list[int]] | tuple[str, list[int]], renderer: Renderer) -> None:
     reveal_type(transform(*arguments, render=render))  # revealed: str | bytes
     transform(*arguments, render=wrong)  # error: [no-matching-overload]
+
+    reveal_type(renderer.render([1], callback=render))  # revealed: str
+    reveal_type(renderer.render("--values", [1], callback=render))  # revealed: bytes
+    reveal_type(renderer.render(*arguments, callback=render))  # revealed: str | bytes
+    renderer.render(*arguments, callback=wrong)  # error: [no-matching-overload]
 ```
 
 ### Shared argument context after type expansion
