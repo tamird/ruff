@@ -3745,13 +3745,13 @@ target: Target | None
             "class Base:\n    def __getattribute__(self, name: str) -> Target | None: return target\n",
             "attrs = record({'dep': target}, base=Base)",
             "",
-            vec!["missing-attribute"],
+            vec!["missing-union-attribute"],
         ),
         (
             "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> Target | None: return target\n    def __set__(self, instance: object, value: object) -> None: pass\nclass Base:\n    dep = Descriptor()\n",
             "attrs = record({'dep': target}, base=Base)",
             "",
-            vec!["missing-attribute"],
+            vec!["missing-union-attribute"],
         ),
         (
             "class Descriptor:\n    def __get__(self, instance: object, owner: type | None = None) -> Target | None: return target\nclass Base:\n    dep = Descriptor()\n",
@@ -3763,7 +3763,7 @@ target: Target | None
             "class Mutable:\n    dep: Target | None = target\n",
             "attrs = record({'dep': target}) if flag else Mutable()",
             "",
-            vec!["missing-attribute"],
+            vec!["missing-union-attribute"],
         ),
         (
             "",
@@ -3817,7 +3817,7 @@ def use() -> str:
                 .iter()
                 .map(|diagnostic| diagnostic.id().as_str())
                 .collect::<Vec<_>>(),
-            ["not-subscriptable", "missing-attribute"],
+            ["not-subscriptable", "missing-union-attribute"],
             "{source}: {diagnostics:#?}",
         );
     }

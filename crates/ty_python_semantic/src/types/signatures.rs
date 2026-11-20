@@ -8460,9 +8460,12 @@ mod tests {
             ParameterConsistency::Consistent => {}
             ParameterConsistency::Inconsistent(_) => panic!("expected nullable inputs to cover the generic overload"),
         }
+        // Implementation return annotations may be broader than the overload's result.
         match prepared_nullable.implementation_return_type_consistency_with(&db, &env, generic) {
-            ReturnTypeConsistency::Consistent => panic!("expected nullable result to violate the generic return promise"),
-            ReturnTypeConsistency::Inconsistent(_) => {}
+            ReturnTypeConsistency::Consistent => {}
+            ReturnTypeConsistency::Inconsistent(_) => {
+                panic!("expected nullable implementation result to cover the overload")
+            }
         }
         for name in [
             "nullable_none",
