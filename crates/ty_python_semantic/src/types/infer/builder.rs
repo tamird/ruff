@@ -11270,18 +11270,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut attempt_contexts = Vec::new();
         let mut supplied_diagnostics = Vec::new();
         for (bindings, attempt_arguments) in inferred.iter_mut() {
-            let mut native = self.speculate();
-            // Native checks can reinfer cast operands. Keep their cache writes isolated from
-            // the enclosing inference, including caches owned by an outer call.
-            native.expression_cache = None;
-            native.expressions.clone_from(&self.expressions);
-            if !self.context.should_collect_diagnostics()
-                && !self.context.is_type_expression_explanation()
-            {
-                native.context.suppress_diagnostics();
+            if let Some(context) = self.check_native_call_results(
+                call_expression, attempt_arguments, bindings,
+            ) {
+                attempt_contexts.push(context);
             }
-            native.check_native_call_results(call_expression, attempt_arguments, bindings);
-            attempt_contexts.push(native.context.finish());
         // Bound methods and generic calls both constrain collection elements. Generic calls
         // currently require exactly one collection argument.
         let collection = match func.as_ref() {
@@ -11538,8 +11531,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         call_expression: &ast::ExprCall,
         call_arguments: &CallArguments<'_, 'db>,
         bindings: &mut Bindings<'db>,
-    ) {
-        let db = self.db();
+    ) -> Option<InferContextResult> {
+        let native = OnceCell::new();
+        let native_context = || native.get_or_init(|| {
+            let mut builder = self.speculate();
+            // Native checks can reinfer cast operands. Detach caches owned by outer calls,
+            // and retain only the diagnostic result of this speculative inference.
+            builder.expression_cache = None;
+            if !self.context.should_collect_diagnostics()
+                && !self.context.is_type_expression_explanation()
+            {
+                builder.context.suppress_diagnostics();
+            }
+            builder
+        });
         let expression_type = |expression: &ast::Expr| self.try_expression_type(expression);
         let dictionary_items = |expression: &ast::Expr, ty, access: DictionaryAccess<'_>| {
             self.call_dictionary_items(call_expression, expression, ty, access)
@@ -11568,12 +11573,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 match binding_type {
                     Type::FunctionLiteral(function_literal) => {
                         if let Some(known_function) = function_literal.known(self.db()) {
-                            known_function.check_call(self, &mut call);
+                            known_function.check_call(native_context(), &mut call);
                         }
                     }
                     Type::ClassLiteral(class) => {
                         if let Some(known_class) = class.known(self.db()) {
-                            known_class.check_call(&self.context, self.index, &mut call);
+                            known_class.check_call(&native_context().context, self.index, &mut call);
                         }
                     }
                     Type::Never => {}
@@ -11581,7 +11586,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             }
         }
-
+        native.into_inner().map(|builder| builder.context.finish())
     }
 
     fn refine_provided_call_results(
