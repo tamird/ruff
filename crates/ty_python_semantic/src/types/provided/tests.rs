@@ -3739,7 +3739,7 @@ target: Target | None
             "class Base:\n    @property\n    def dep(self) -> Target | None: return target\n",
             "attrs = record({'dep': target}, base=Base)",
             "",
-            vec!["missing-attribute"],
+            vec!["missing-union-attribute"],
         ),
         (
             "class Base:\n    def __getattribute__(self, name: str) -> Target | None: return target\n",

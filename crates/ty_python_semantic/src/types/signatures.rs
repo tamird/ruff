@@ -3809,8 +3809,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             if checker.typevar_evaluation != TypeVarEvaluation::LazyStatic {
                 checker.typevar_evaluation = TypeVarEvaluation::Lazy;
             }
-        } else if self.inferable == TypeVarSet::None
-            && checker.typevar_evaluation == TypeVarEvaluation::Eager
+        } else if checker.typevar_evaluation == TypeVarEvaluation::Eager
             && checker.relation.is_assignability()
             && source.has_supported_declared_domain(db, env)
             && target.generic_context.is_none()
