@@ -412,7 +412,10 @@ fn prepare_body_domain<'db>(
     ) {
         return Err(BodyDomainError::Inconsistent);
     }
-    let (parameters, keyword_tail) = project_body_parameters(
+    let ProjectedBodyParameters {
+        parameters,
+        keyword_tail,
+    } = project_body_parameters(
         db,
         &env,
         implementation.body_scope(db),
@@ -435,6 +438,12 @@ fn prepare_body_domain<'db>(
     ))
 }
 
+#[derive(Debug)]
+struct ProjectedBodyParameters<'db> {
+    parameters: Box<[(Definition<'db>, Type<'db>)]>,
+    keyword_tail: Option<CapturedKeywordTail<'db>>,
+}
+
 /// Project a call domain into source bindings using the ordinary argument matcher.
 fn project_body_parameters<'db>(
     db: &'db dyn Db,
@@ -444,13 +453,7 @@ fn project_body_parameters<'db>(
     implementation: &Signature<'db>,
     overload: &Signature<'db>,
     specialization: Option<Specialization<'db>>,
-) -> Result<
-    (
-        Box<[(Definition<'db>, Type<'db>)]>,
-        Option<CapturedKeywordTail<'db>>,
-    ),
-    BodyDomainError,
-> {
+) -> Result<ProjectedBodyParameters<'db>, BodyDomainError> {
     let bind = |keywords: bool| {
         let arguments: Option<CallArguments<'_, 'db>> = overload
             .parameters()
@@ -635,7 +638,10 @@ fn project_body_parameters<'db>(
             Ok((definition, entry))
         })
         .collect::<Result<_, _>>()?;
-    Ok((parameters, keyword_tail))
+    Ok(ProjectedBodyParameters {
+        parameters,
+        keyword_tail,
+    })
 }
 
 fn supported_body(
@@ -2412,7 +2418,10 @@ mod tests {
                 let module = parsed_module(&db, scope.program_file(&db).python_file(&db)).load(&db);
                 let node = scope.node(&db).expect_function().node(&module);
                 let env = ProgramEnvironment::from_scope(scope);
-                let (projected, keyword_tail) = project_body_parameters(
+                let ProjectedBodyParameters {
+                    parameters: projected,
+                    keyword_tail,
+                } = project_body_parameters(
                     &db,
                     &env,
                     scope,

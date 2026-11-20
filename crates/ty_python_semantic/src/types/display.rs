@@ -131,6 +131,10 @@ enum NumericTowerDisplay {
 
 /// Settings for displaying types and signatures
 #[derive(Debug, Clone, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Rendering options can be combined independently"
+)]
 pub struct DisplaySettings<'db> {
     /// Whether rendering can be multiline
     multiline: bool,
