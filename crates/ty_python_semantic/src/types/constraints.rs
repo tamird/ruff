@@ -3998,11 +3998,13 @@ impl<'db> CandidateResidual<'db> {
         set: ConstraintSet<'db, 'c>,
         bindings: &[TypeVarSolution<'db>],
     ) -> ConstraintSet<'db, 'c> {
-        let context = GenericContext::from_typevar_instances(
+        let Some(context) = GenericContext::try_from_typevar_instances(
             db,
             env,
             bindings.iter().map(|binding| binding.bound_typevar),
-        );
+        ) else {
+            return set;
+        };
         let types: Vec<_> = bindings.iter().map(|binding| binding.solution).collect();
         let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Partial {
             generic_context: context,
@@ -4178,23 +4180,25 @@ impl<'db> CandidateResidual<'db> {
                 })
             {
                 let quantified = when.reduce_inferable(db, env, builder, *locals);
-                let context = GenericContext::from_typevar_instances(
+                let replay = ambient.implies(db, builder, || quantified);
+                let replay = if let Some(context) = GenericContext::try_from_typevar_instances(
                     db,
                     env,
                     fixed.iter().map(|binding| binding.bound_typevar),
-                );
-                let types: Vec<_> = fixed.iter().map(|binding| binding.solution).collect();
-                let mapping = TypeMapping::ApplySpecialization(
-                    ApplySpecialization::specialization(context.specialize(db, types)),
-                );
-                let replay = ambient
-                    .implies(db, builder, || quantified)
-                    .apply_type_mapping_impl(
+                ) {
+                    let types: Vec<_> = fixed.iter().map(|binding| binding.solution).collect();
+                    let mapping = TypeMapping::ApplySpecialization(
+                        ApplySpecialization::specialization(context.specialize(db, types)),
+                    );
+                    replay.apply_type_mapping_impl(
                         db,
                         &mapping,
                         TypeContext::default(),
                         &ApplyTypeMappingVisitor::new(env),
-                    );
+                    )
+                } else {
+                    replay
+                };
                 if self.replay_holds(db, env, replay, limits)? {
                     caller.solved_typevars = fixed;
                     return ControlFlow::Continue(Some((caller, false)));
@@ -7245,8 +7249,12 @@ mod tests {
             );
             let root = match relation.node.node() {
                 Node::Interior(root) => root,
-                Node::AlwaysTrue => panic!("expected an interior witness relation, got always true"),
-                Node::AlwaysFalse => panic!("expected an interior witness relation, got always false"),
+                Node::AlwaysTrue => {
+                    panic!("expected an interior witness relation, got always true")
+                }
+                Node::AlwaysFalse => {
+                    panic!("expected an interior witness relation, got always false")
+                }
             };
             let Some(order) = relation.source_order else {
                 panic!("expected source ordering for the witness relation");

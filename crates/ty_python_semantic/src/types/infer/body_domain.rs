@@ -1213,7 +1213,7 @@ mod tests {
         let file = f.program_file(&db);
         let ordinary = crate::types::check_types(&db, file);
         assert_eq!(ordinary.len(), 1, "{ordinary:#?}");
-        assert_eq!(ordinary[0].id().as_str(), "unresolved-attribute");
+        assert_eq!(ordinary[0].id().as_str(), "missing-attribute");
         let analysis = OverloadBodyAnalysis::new(&db, f);
         assert!(analysis.is_complete());
         let module = parsed_module(&db, file.python_file(&db)).load(&db);
@@ -1267,7 +1267,7 @@ mod tests {
         );
 
         for (before, after, expected) in [
-            ("ctx.value", "ctx.missing", "unresolved-attribute"),
+            ("ctx.value", "ctx.missing", "missing-attribute"),
             (
                 "return use(override)",
                 "return use(42)",
@@ -1280,7 +1280,7 @@ mod tests {
             ),
             (
                 "ctx.value",
-                "ctx.value  # ty: ignore[unresolved-attribute]",
+                "ctx.value  # ty: ignore[missing-attribute]",
                 "unused-ignore-comment",
             ),
         ] {
@@ -1297,7 +1297,7 @@ mod tests {
             "/src/body.py",
             source.replace(
                 "ctx.value",
-                "ctx.missing  # ty: ignore[unresolved-attribute]",
+                "ctx.missing  # ty: ignore[missing-attribute]",
             ),
         )?;
         let f = function(&db);
@@ -3475,7 +3475,7 @@ mod tests {
                 None,
             ),
             (
-                "callback(value)  # ty: ignore[call-non-callable]",
+                "callback(value)  # ty: ignore[not-callable]",
                 Some("unused-ignore-comment"),
             ),
             ("callback(42)", Some("invalid-argument-type")),
@@ -3805,7 +3805,7 @@ mod tests {
         assert!(check_overload_body(&db, f, 0).unwrap().is_empty());
         let diagnostics = check_overload_body(&db, f, 1).unwrap().into_diagnostics();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-implicit-return");
         Ok(())
     }
 
@@ -4002,7 +4002,7 @@ mod tests {
                     let diagnostics = check_overload_body(&db, f, index).unwrap();
                     let expected = match member {
                         "marker" => (index == 0).then_some("invalid-explicit-return"),
-                        "missing" => Some("unresolved-attribute"),
+                        "missing" => Some("missing-attribute"),
                         _ => None,
                     };
                     assert_eq!(
@@ -4296,7 +4296,8 @@ mod tests {
         ] {
             db.write_file("/src/body.py", format!("from typing import overload\n@overload\ndef f(value: int) -> int: ...\n@overload\ndef f(value: str) -> str: ...\ndef f({parameter}) -> int | str:\n    {body}\n"))?;
             assert_eq!(
-                check_overload_body(&db, function(&db), 1).unwrap_err(),
+                check_overload_body(&db, function(&db), 1)
+                    .expect_err(&format!("{parameter}: {body}")),
                 expected
             );
         }

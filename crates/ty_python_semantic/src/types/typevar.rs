@@ -2933,9 +2933,18 @@ mod tests {
             .apply_type_mapping_impl(db, &both_mapping, &ApplyTypeMappingVisitor::new(&env))
             .as_typevar()
             .expect("freshening a typevar should return a typevar");
-        // Freshening `U` changes `T`'s domain as well as its nonce. A later freshening of the
-        // original context still needs to see that nonce, or it could recreate `fresh_t`.
-        let delta = freshening_delta(db, [Type::TypeVar(fresh_t)], both_context);
+        // A distinct nonce already separates this occurrence from the original binder.
+        assert_eq!(
+            freshening_delta(db, [Type::TypeVar(fresh_t)], both_context),
+            None
+        );
+        // When an original occurrence does collide, the new nonce must also avoid the
+        // existing fresh occurrence, whose domain changed along with its nonce.
+        let delta = freshening_delta(
+            db,
+            [Type::TypeVar(t), Type::TypeVar(fresh_t)],
+            both_context,
+        );
         assert_eq!(delta, Some(TypeVarNonce::FIRST.increment().value()));
         let next_mapping = TypeMapping::FreshenBoundTypeVars {
             generic_context: both_context,

@@ -4518,8 +4518,12 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .any(|value| any_over_expr(value, &ast::Expr::is_named_expr));
         // Each operand sees the narrowing from the preceding operands. If the expression
         // introduces no bindings, none of that narrowing survives the short-circuit paths
-        // rejoining. Restore their common entry state after visiting the operands.
+        // rejoining. Tracked dictionary contents can change through calls or exposure even
+        // without a named expression, so retain their operand effects when paths rejoin.
         let entry = (!has_named_expression
+            && !values.iter().any(|value| {
+                any_over_expr(value, |expression| self.contents_place(expression).is_some())
+            })
             && !self
                 .exception_context_stack_manager
                 .has_active_exception_handler(self))
