@@ -1,0 +1,18 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ruff_db",
+    deps = [
+        "//crates/ruff_annotate_snippets:ruff_annotate_snippets",
+        "//crates/ruff_cache:ruff_cache",
+        "//crates/ruff_diagnostics:ruff_diagnostics",
+        "//crates/ruff_memory_usage:ruff_memory_usage",
+        "//crates/ruff_notebook:ruff_notebook",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_python_parser:ruff_python_parser",
+        "//crates/ruff_python_trivia:ruff_python_trivia",
+        "//crates/ruff_source_file:ruff_source_file",
+        "//crates/ruff_text_size:ruff_text_size",
+        "//crates/ty_static:ty_static",
+    ],
+)

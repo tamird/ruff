@@ -1,0 +1,11 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ty_module_resolver",
+    deps = [
+        "//crates/ruff_db:ruff_db",
+        "//crates/ruff_memory_usage:ruff_memory_usage",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_python_stdlib:ruff_python_stdlib",
+    ],
+)

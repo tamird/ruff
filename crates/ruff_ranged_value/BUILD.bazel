@@ -1,0 +1,10 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ruff_ranged_value",
+    deps = [
+        "//crates/ruff_db:ruff_db",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_text_size:ruff_text_size",
+    ],
+)

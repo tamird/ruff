@@ -1,0 +1,10 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ty_combine",
+    deps = [
+        "//crates/ruff_db:ruff_db",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_ranged_value:ruff_ranged_value",
+    ],
+)
