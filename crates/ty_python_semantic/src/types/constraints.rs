@@ -590,20 +590,18 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
         // can produce a distinct specialization for every partition of the literals
         // between T and U. A single valid solution establishes overlap.
         let budget = SolutionBudget::default();
-        let Ok((candidates, mut limits)) = self.bounded_path_bounds(
-            db,
-            env,
-            inferable,
-            budget,
-            CandidateSearch::FirstValid,
-        ) else {
+        let Ok((candidates, mut limits)) =
+            self.bounded_path_bounds(db, env, inferable, budget, CandidateSearch::FirstValid)
+        else {
             return false;
         };
         let mut type_budget = ProjectionTypeBudget::new(budget.type_terms);
         let result = candidates.solve_with_limits(
-            db, env, &mut limits, &mut type_budget, |_variance, bounds| {
-                CandidateSolutions::default_solve(db, env, self.builder, bounds)
-            },
+            db,
+            env,
+            &mut limits,
+            &mut type_budget,
+            |_variance, bounds| CandidateSolutions::default_solve(db, env, self.builder, bounds),
         );
         if !matches!(result, Ok(Solutions::Unsatisfiable(_))) {
             return false;
@@ -4258,7 +4256,7 @@ impl<'db> CandidateResidual<'db> {
                         fixed_relation.source_order,
                         &mut *limits,
                         *unspecialized_type_var_policy,
-                        ReportDiagnostics::No,
+                        CandidateSearch::All(ReportDiagnostics::No),
                     )
                 };
                 let candidates = candidates?;

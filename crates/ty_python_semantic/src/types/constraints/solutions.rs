@@ -19,10 +19,10 @@ use crate::types::constraints::variables::{
 };
 use crate::types::constraints::{
     ALWAYS_FALSE, ALWAYS_TRUE, Assignment, AtomicConstraintId, BoundedSolutionLimits,
-    CandidateSearch, CandidateResidual, CandidateSolution, CandidateSolutions, CandidateTypeVarSolution,
-    CandidateTypeVarSolver, ConstraintFailureEvidence, ConstraintId, ConstraintSet,
-    ConstraintSetBuilder, ConstraintSetStorage, EvidenceSource, InteriorNodeData, Node, NodeId,
-    OwnedConstraintSet, OwnedConstraintSetBuilder, SolutionLimits, SolutionValidity,
+    CandidateResidual, CandidateSearch, CandidateSolution, CandidateSolutions,
+    CandidateTypeVarSolution, CandidateTypeVarSolver, ConstraintFailureEvidence, ConstraintId,
+    ConstraintSet, ConstraintSetBuilder, ConstraintSetStorage, EvidenceSource, InteriorNodeData,
+    Node, NodeId, OwnedConstraintSet, OwnedConstraintSetBuilder, SolutionLimits, SolutionValidity,
     SolutionViolation, SolutionViolationKind, SourceOrderId, TypeVarId, TypeVarSolution,
 };
 use crate::types::typevar::{TypeVarBoundOrConstraints, TypeVarConstraints, TypeVarSet};

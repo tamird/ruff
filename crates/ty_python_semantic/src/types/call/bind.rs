@@ -4013,8 +4013,8 @@ impl<'db> OverloadFilter<'db> {
             let inferable = current.inferable;
             if !any_over_type(db, env, parameter_types, false, |ty| ty.is_divergent())
                 && top_materialized_argument_type
-                .when_assignable_to_owned(db, env, parameter_types, inferable)
-                .query(|_, when| when.is_always_satisfied(db, env, inferable))
+                    .when_assignable_to_owned(db, env, parameter_types, inferable)
+                    .query(|_, when| when.is_always_satisfied(db, env, inferable))
             {
                 return index + 1;
             }
@@ -6357,7 +6357,9 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 Some(match argument_type {
                     Some(argument_type) => argument_type
                         .as_paramspec_keyword_component(db)
-                        .unwrap_or_else(|| argument_type.unpacked_value_type(db, env, parameter_name)),
+                        .unwrap_or_else(|| {
+                            argument_type.unpacked_value_type(db, env, parameter_name)
+                        }),
 
                     None => Type::unknown(),
                 })
