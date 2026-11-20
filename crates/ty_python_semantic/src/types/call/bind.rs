@@ -4385,6 +4385,12 @@ impl<'db> CallableBinding<'db> {
                 continue;
             }
             let is_argument_assignable_to_any_overload = self.overloads.iter().any(|overload| {
+                // A provisional arity mismatch can defer type checking until expansion.
+                // Read the signature's variables before the binding has inference results.
+                let inferable = overload.signature.generic_context.map_or(
+                    TypeVarSet::None,
+                    |context| context.inferable_typevars(db),
+                );
                 let matched_parameters = &overload.argument_matches[argument_index].parameters;
                 if matched_parameters.is_empty() {
                     return matches!(call_argument, CallArgument::Variadic(variadic)
@@ -4414,9 +4420,9 @@ impl<'db> CallableBinding<'db> {
                             env,
                             declared_type.unwrap_or_else(|| parameter.annotated_type()),
                             constraints,
-                            overload.inferable_typevars,
+                            inferable,
                         )
-                        .is_never_satisfied(db, env, overload.inferable_typevars)
+                        .is_never_satisfied(db, env, inferable)
                 })
             });
             if !is_argument_assignable_to_any_overload {
