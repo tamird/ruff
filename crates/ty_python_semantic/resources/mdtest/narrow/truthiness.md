@@ -84,7 +84,7 @@ class Foo:
     val: int | None
 
 if (foo := Foo()).val:
-    reveal_type(foo.val)  # revealed: int & ~AlwaysFalsy
+    reveal_type(foo.val)  # revealed: int
 ```
 
 But we don't pick up stale narrowings from before the assignment in the named expression:
@@ -93,7 +93,7 @@ But we don't pick up stale narrowings from before the assignment in the named ex
 foo1 = Foo()
 foo1.val = None
 if (foo1 := Foo()).val:
-    reveal_type(foo1.val)  # revealed: int & ~AlwaysFalsy
+    reveal_type(foo1.val)  # revealed: int
 ```
 
 ## Narrowing tagged unions of nominal classes by attribute truthiness
@@ -142,10 +142,10 @@ def truthiness_after_value_guard(response: Success | Failure | None):
         return
 
     if response.success:
-        reveal_type(response)  # revealed: Success & ~AlwaysFalsy
+        reveal_type(response)  # revealed: Success
         reveal_type(response.result)  # revealed: int
     else:
-        reveal_type(response)  # revealed: Failure & ~AlwaysFalsy
+        reveal_type(response)  # revealed: Failure
         reveal_type(response.errors)  # revealed: list[str]
 ```
 
@@ -171,13 +171,13 @@ else:
     reveal_type(x)  # revealed: Never
 ```
 
-## Mutable Truthiness
+## Repeated Truthiness Checks
 
 ### Truthiness of Instances
 
-The boolean value of an instance is not always consistent. For example, `__bool__` can be customized
-to return random values, or in the case of a `list()`, the result depends on the number of elements
-in the list. Therefore, these types should not be narrowed by `if x` or `if not x`.
+Truthiness can change between evaluations. A list may be mutated, and a custom `__bool__` method may
+return different results on successive calls. A truthy check after a falsy check does not eliminate
+such a value, even when its class is final.
 
 ```py
 from typing import final
@@ -194,26 +194,36 @@ class B: ...
 
 def f(x: A | B):
     if x:
-        reveal_type(x)  # revealed: (A & ~AlwaysFalsy) | (B & ~AlwaysFalsy)
+        reveal_type(x)  # revealed: A | B
     else:
-        reveal_type(x)  # revealed: (A & ~AlwaysTruthy) | (B & ~AlwaysTruthy)
+        reveal_type(x)  # revealed: A | B
 
     if x and not x:
-        reveal_type(x)  # revealed: (A & ~AlwaysFalsy & ~AlwaysTruthy) | (B & ~AlwaysFalsy & ~AlwaysTruthy)
+        reveal_type(x)  # revealed: A | B
     else:
         reveal_type(x)  # revealed: A | B
 
     if x or not x:
         reveal_type(x)  # revealed: A | B
     else:
-        reveal_type(x)  # revealed: (A & ~AlwaysTruthy & ~AlwaysFalsy) | (B & ~AlwaysTruthy & ~AlwaysFalsy)
+        reveal_type(x)  # revealed: A | B
+```
 
+A range has a fixed length. If `mask and payload` returns the range, it was empty and cannot pass
+the later truthiness check.
+
+```py
 def range_result(mask: range, payload: str | None) -> str:
     selected = mask and payload
     if selected:
         return selected
     return ""
+```
 
+An `int` annotation includes subclasses that override `__bool__`. Successive checks can return
+different results for such a subclass, so `selected` can still be an `int` at the return.
+
+```py
 def open_int_result(mask: int, payload: str | None) -> str:
     selected = mask and payload
     if selected:
@@ -235,9 +245,9 @@ x = int if flag() else str
 reveal_type(x)  # revealed: <class 'int'> | <class 'str'>
 
 if x:
-    reveal_type(x)  # revealed: (<class 'int'> & ~AlwaysFalsy) | (<class 'str'> & ~AlwaysFalsy)
+    reveal_type(x)  # revealed: <class 'int'> | <class 'str'>
 else:
-    reveal_type(x)  # revealed: (<class 'int'> & ~AlwaysTruthy) | (<class 'str'> & ~AlwaysTruthy)
+    reveal_type(x)  # revealed: <class 'int'> | <class 'str'>
 ```
 
 ## Determined Truthiness
@@ -303,9 +313,9 @@ if isinstance(x, str) and not isinstance(x, B):
     reveal_type(z)  # revealed: (A & str & ~B) | Literal[0, 42, "", "hello"]
 
     if z:
-        reveal_type(z)  # revealed: (A & str & ~B & ~AlwaysFalsy) | Literal[42, "hello"]
+        reveal_type(z)  # revealed: (A & str & ~B) | Literal[42, "hello"]
     else:
-        reveal_type(z)  # revealed: (A & str & ~B & ~AlwaysTruthy) | Literal[0, ""]
+        reveal_type(z)  # revealed: (A & str & ~B) | Literal[0, ""]
 ```
 
 ## Narrowing Multiple Variables
@@ -347,7 +357,7 @@ x = A()
 
 if x and not x:
     y = x
-    reveal_type(y)  # revealed: A & ~AlwaysFalsy & ~AlwaysTruthy
+    reveal_type(y)  # revealed: A
 else:
     y = x
     reveal_type(y)  # revealed: A
@@ -392,16 +402,16 @@ def _(
 ):
     reveal_type(ta)  # revealed: type[TruthyClass | AmbiguousClass]
     if ta:
-        reveal_type(ta)  # revealed: type[TruthyClass] | (type[AmbiguousClass] & ~AlwaysFalsy)
+        reveal_type(ta)  # revealed: type[TruthyClass | AmbiguousClass]
 
     reveal_type(af)  # revealed: type[AmbiguousClass | FalsyClass]
     if af:
-        reveal_type(af)  # revealed: type[AmbiguousClass] & ~AlwaysFalsy
+        reveal_type(af)  # revealed: type[AmbiguousClass]
 
     # error: [unsupported-bool-conversion] "Boolean conversion is not supported for type `MetaDeferred`"
     if d:
         # TODO: Should be `Unknown`
-        reveal_type(d)  # revealed: type[DeferredClass] & ~AlwaysFalsy
+        reveal_type(d)  # revealed: type[DeferredClass]
 
     tf = TruthyClass if flag else FalsyClass
     reveal_type(tf)  # revealed: <class 'TruthyClass'> | <class 'FalsyClass'>
@@ -424,12 +434,12 @@ def _(x: Literal[0, 1]):
     reveal_type(x and A())  # revealed: Literal[0] | A
 
 def _(x: str):
-    reveal_type(x or A())  # revealed: (str & ~AlwaysFalsy) | A
-    reveal_type(x and A())  # revealed: (str & ~AlwaysTruthy) | A
+    reveal_type(x or A())  # revealed: str | A
+    reveal_type(x and A())  # revealed: str | A
 
 def _(x: bool | str):
-    reveal_type(x or A())  # revealed: Literal[True] | (str & ~AlwaysFalsy) | A
-    reveal_type(x and A())  # revealed: Literal[False] | (str & ~AlwaysTruthy) | A
+    reveal_type(x or A())  # revealed: Literal[True] | str | A
+    reveal_type(x and A())  # revealed: Literal[False] | str | A
 
 class Falsy:
     def __bool__(self) -> Literal[False]:
@@ -538,9 +548,9 @@ def get_value() -> str | None:
 
 def f():
     if x := get_value():
-        reveal_type(x)  # revealed: str & ~AlwaysFalsy
+        reveal_type(x)  # revealed: str
     else:
-        reveal_type(x)  # revealed: (str & ~AlwaysTruthy) | None
+        reveal_type(x)  # revealed: str | None
 ```
 
 ## Narrowing the value of a named expression
@@ -550,9 +560,9 @@ The value expression on the right-hand side of the walrus operator should also b
 ```py
 def foo(value: int | None):
     if foo := value:
-        reveal_type(value)  # revealed: int & ~AlwaysFalsy
+        reveal_type(value)  # revealed: int
     else:
-        reveal_type(value)  # revealed: (int & ~AlwaysTruthy) | None
+        reveal_type(value)  # revealed: int | None
 ```
 
 ## Narrowing a union of a `TypedDict` and `None`
@@ -579,18 +589,17 @@ def f(arg1: Empty | None, arg2: NonEmpty | None, arg3: HasNotRequired1 | None, a
         # the truthiness of `Empty` is ambiguous,
         # because the `Empty` type includes possible `TypedDict` subtypes
         # that might have required keys
-        reveal_type(arg1)  # revealed: Empty & ~AlwaysFalsy
+        reveal_type(arg1)  # revealed: Empty
 
     if arg2:
-        # but `NonEmpty` is known to be a subtype of `AlwaysTruthy`
-        # because of the required key, so we can narrow to a simpler type here
+        # `NonEmpty` always has a required key, so it cannot be empty.
         reveal_type(arg2)  # revealed: NonEmpty
 
     if arg3:
-        reveal_type(arg3)  # revealed: HasNotRequired1 & ~AlwaysFalsy
+        reveal_type(arg3)  # revealed: HasNotRequired1
 
     if arg4:
-        reveal_type(arg4)  # revealed: HasNotRequired2 & ~AlwaysFalsy
+        reveal_type(arg4)  # revealed: HasNotRequired2
 
     # error: [redundant-condition] "always truthy"
     if arg5:
@@ -614,7 +623,7 @@ def test() -> None:
     p = get_person()
     if not p:
         raise ValueError("No person")
-    reveal_type(p)  # revealed: Person & ~AlwaysFalsy
+    reveal_type(p)  # revealed: Person
     # error: [invalid-typed-dict-key] "Unknown key "nonexistent" for TypedDict `Person`"
     print(p["nonexistent"])
 ```
@@ -622,8 +631,7 @@ def test() -> None:
 ## Truthiness narrowing of `NewType`s
 
 `NewType`s over `float` and `complex` use their concrete union base when looking up numeric
-attributes such as `real`. Truthiness adds `~AlwaysFalsy` to the outer `NewType`, but that
-refinement must not be forwarded as the receiver for this special union-base lookup.
+attributes such as `real`. These lookups still work after a truthiness check.
 
 ```py
 from typing import NewType
@@ -635,11 +643,11 @@ def expects_float(x: float): ...
 def expects_complex(x: complex): ...
 def f(floaty: FloatNewType, complexy: ComplexNewType):
     if floaty:
-        reveal_type(floaty)  # revealed:FloatNewType & ~AlwaysFalsy
+        reveal_type(floaty)  # revealed: FloatNewType
         expects_float(floaty)  # fine
 
     if complexy:
-        reveal_type(complexy)  # revealed: ComplexNewType & ~AlwaysFalsy
+        reveal_type(complexy)  # revealed: ComplexNewType
         reveal_type(complexy.real)  # revealed: float
         expects_complex(complexy)  # fine
         expects_float(complexy)  # error: [invalid-argument-type]
