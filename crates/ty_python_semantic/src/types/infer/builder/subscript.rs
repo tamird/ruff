@@ -29,16 +29,16 @@ use crate::types::special_form::AliasSpec;
 use crate::types::subscript::{LegacyGenericOrigin, SubscriptError, SubscriptErrorKind};
 use crate::types::tuple::{Tuple, TupleSpecBuilder, TupleType, VariableSegment};
 use crate::types::typed_dict::{
-    TypedDictAssignmentKind, TypedDictExtraItems, TypedDictField, TypedDictKeyAssignment, TypedDictType,
+    TypedDictAssignmentKind, TypedDictExtraItems, TypedDictField, TypedDictKeyAssignment,
+    TypedDictType,
 };
 use crate::types::typevar::{BindingContext, TypeVarKind, TypeVarSet};
 use crate::types::{
-    BoundTypeVarInstance, CallArguments, CallDunderError, CallableBinding, ClassType, DeclaredType,
-    CycleDetector, DisplaySettings, DynamicType, InternedType, IntersectionType, KnownClass, KnownInstanceType,
-    LintDiagnosticGuard, MemberLookupPolicy, Parameter, Parameters, SpecialFormType,
-    StaticClassLiteral, Type, TypeAliasType, TypeContext, TypeMapping, TypeVarBoundOrConstraints,
-    UnionType, UnionTypeInstance, any_over_type, todo_type,
-};
+    BoundTypeVarInstance, CallArguments, CallDunderError, CallableBinding, ClassType,
+    CycleDetector, DisplaySettings, DynamicType, InternedType, IntersectionType,
+    KnownClass, KnownInstanceType, LintDiagnosticGuard, MemberLookupPolicy, Parameter, Parameters,
+    SpecialFormType, StaticClassLiteral, Type, TypeAliasType, TypeContext, TypeMapping,
+    TypeVarBoundOrConstraints, UnionType, UnionTypeInstance, any_over_type, };
 use crate::{Db, FxOrderSet, ProgramEnvironment};
 use ty_python_core::definition::Definition;
 use ty_python_core::scope::FileScopeId;
@@ -514,8 +514,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         });
         checked
             .map(|result| {
-                self.narrow_expr_with_applicable_constraints(
-                    subscript,
+                self.narrow_source_place(
+                    source_place.as_ref(),
                     observed.map_or(result, |observed| {
                         IntersectionType::from_two_elements(db, env, result, observed)
                     }),
@@ -1404,7 +1404,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
 
             ast::Expr::Subscript(subscript) if inferred_type.is_none() => {
-                let value_ty = self.infer_maybe_standalone_expression(&subscript.value, TypeContext::default());
+                let value_ty = self
+                    .infer_maybe_standalone_expression(&subscript.value, TypeContext::default());
 
                 if matches!(value_ty, Type::SpecialForm(SpecialFormType::Concatenate)) {
                     return Ok(Type::paramspec_value_callable(
@@ -1852,7 +1853,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // Use the checked argument types so fresh empty values retain the receiver's
             // context. Concrete union arms can constrain a self-referential write while the
             // other arm is still provisional. Nested provisional elements need more context.
-            let call_arguments = CallArguments::positional([checked_slice_ty, inferred_value_ty]);
+            let ast_arguments = [ArgOrKeyword::Arg(&target.slice), ArgOrKeyword::Arg(rhs_value)];
+            let mut call_arguments = CallArguments::positional([checked_slice_ty, inferred_value_ty]);
 
             if let Place::Defined(DefinedPlace {
                 ty: dunder_callable,
@@ -1877,6 +1879,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .speculate_without_diagnostics()
                     .infer_and_check_argument_types(
                         ArgumentsIter::synthesized(&ast_arguments),
+                        &[],
                         &mut call_arguments,
                         &mut |builder, (_, expr, tcx)| {
                             // TODO: The argument types have already been inferred and stored in `call_arguments`.

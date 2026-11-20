@@ -1,7 +1,6 @@
 use crate::ProgramEnvironment;
 use char_str::CharStr;
 use ruff_db::parsed::{parsed_module, parsed_string_annotation};
-use ruff_db::source::source_text;
 use ruff_python_ast::{ArgOrKeyword, Arguments, Expr, ExprCall, ExprDict, Keyword, name::Name};
 use rustc_hash::FxHashSet;
 use ty_module_resolver::{KnownModule, file_to_module};
@@ -223,8 +222,7 @@ impl<'db> FieldMetadata<'db> {
             let Some(literal) = string.as_single_part_string() else {
                 return;
             };
-            let source = source_text(db, definition.file(db));
-            let Ok(inner) = parsed_string_annotation(&source, literal) else {
+            let Ok(inner) = parsed_string_annotation(db, definition.python_file(db), literal) else {
                 return;
             };
             parsed = inner;

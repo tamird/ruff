@@ -20,7 +20,7 @@ use crate::types::diagnostic::autofix_with_literal;
 use crate::types::generics::GenericContext;
 use crate::types::infer::{InferenceFlags, TypeExpressionFlags, infer_definition_types};
 use crate::types::signatures::function_signature_annotation_info;
-use crate::types::{Type, TypeAndQualifiers};
+use crate::types::{Type, DeclaredType};
 
 use super::context::InferContext;
 
@@ -285,7 +285,7 @@ impl<'a, 'db> SourceAnnotation<'a, 'db> {
         }
     }
 
-    pub(crate) fn external_declaration(&self, db: &'db dyn Db) -> Option<TypeAndQualifiers<'db>> {
+    pub(crate) fn external_declaration(&self, db: &'db dyn Db) -> Option<DeclaredType<'db>> {
         let Self::External {
             annotation,
             range: _,
@@ -403,12 +403,12 @@ fn external_function_generic_context<'db>(
     };
     let module = parsed_module(db, definition.python_file(db)).load(db);
     let parameters = function.node(&module).type_params.as_deref()?;
-    Some(GenericContext::from_type_params(
+    GenericContext::from_type_params(
         db,
         semantic_index(db, definition.program_file(db)),
         definition,
         parameters,
-    ))
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, salsa::SalsaValue)]
@@ -420,7 +420,7 @@ pub(crate) struct ExternalAnnotation<'db> {
 }
 
 impl<'db> ExternalAnnotation<'db> {
-    fn declaration(&self, db: &'db dyn Db) -> Option<TypeAndQualifiers<'db>> {
+    fn declaration(&self, db: &'db dyn Db) -> Option<DeclaredType<'db>> {
         if !matches!(
             self.definition.kind(db),
             DefinitionKind::AnnotatedAssignment(_)

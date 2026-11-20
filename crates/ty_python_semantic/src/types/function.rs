@@ -80,8 +80,8 @@ use crate::types::known_instance::DeprecatedInstance;
 use crate::types::narrow::ClassInfoConstraintFunction;
 use crate::types::relation::TypeRelationChecker;
 use crate::types::signatures::{CallableSignature, ReturnCallableTypeVarScope, Signature};
-use crate::types::typevar::TypeVarNonce;
 use crate::types::string_annotation::SourceAnnotation;
+use crate::types::typevar::TypeVarNonce;
 use crate::types::variance::{VarianceInferable, VarianceOrigin, VarianceTerm};
 use crate::types::{
     ApplyTypeMappingVisitor, BoundMethodType, BoundTypeVarIdentity, BoundTypeVarInstance,
@@ -1944,189 +1944,13 @@ impl<'db> FunctionType<'db> {
             return Cow::Borrowed(signature);
         };
 
-        if !db
-            .analysis_settings(self.file(db))
-            .return_type_inference
-            .is_active()
-            // Always preserve explicit annotations
-            || self.has_explicit_return_annotation(db)
-            // Preserve return types already supplied by decorators or signature transformations,
-            // unless they are unknown.
-            || !overload.return_ty.is_unknown()
-            // Stub and builtin declarations do not contain their implementations.
-            || self.program_file(db).is_stub(db)
-            || self.literal(db).is_builtin
-            // An (invalid) function with a single `@overload` could still fall through the filter above.
-            // We should not replace the `@overload`'s return type with the inferred type from the implementation.
-            || !self.overloads_and_implementation(db).0.is_empty()
-        {
-            return Cow::Borrowed(signature);
-        }
-        let mut overload = overload.clone();
-        overload.return_ty = self.inferred_return_type(db);
-        Cow::Owned(CallableSignature::single(overload))
-    }
-
-    #[salsa::tracked(
-        returns(copy),
-        cycle_initial=|_, id, _| Type::divergent(id),
-        cycle_fn=|db, cycle, previous: &Type<'db>, result: Type<'db>, function: FunctionType<'db>| {
-            let env = ProgramEnvironment::from_scope(function.literal(db).last_definition.body_scope(db));
-            result.cycle_normalized(db, &env, *previous, cycle)
-        },
-        heap_size=ruff_memory_usage::heap_size,
-    )]
-    fn inferred_return_type(self, db: &'db dyn Db) -> Type<'db> {
-        let scope = self.literal(db).last_definition.body_scope(db);
-        let env = ProgramEnvironment::from_scope(scope);
-        let index = semantic_index(db, scope.program_file(db));
-        let module = parsed_module(db, self.python_file(db)).load(db);
-        let function = scope.node(db).expect_function();
-
-        // Do not perform return type inference for functions in `if TYPE_CHECKING` blocks.
-        if index.is_in_type_checking_block(scope.file_scope_id(db), function.node(&module).range())
-        {
-            return Type::unknown();
-        }
-
-        // TODO: Infer return types for async functions and generator functions
-        if function.node(&module).is_async || scope.file_scope_id(db).is_generator_function(index) {
-            return Type::unknown();
-        }
-
-        // Abstract methods often have a no-op body, and even if they contain an implementation,
-        // we treat their return type as unknown, based on the assumption that these default
-        // implementations are often not a reliable indicator of the actual contract that subclass
-        // methods are expected to fulfill.
-        if self.has_known_decorator(db, FunctionDecorators::ABSTRACT_METHOD) {
-            return Type::unknown();
-        }
-
-        let Some(class_definition) = index.class_definition_of_method(scope.file_scope_id(db))
-        else {
-            // For free functions, we simply use the type inferred from the function body.
-            return infer_complete_scope_types(db, scope).return_type();
-        };
-        if self
-            .literal(db)
-            .last_definition
-            .is_exempt_from_return_type_inference(db)
-        {
-            return Type::unknown();
-        }
-        let class = original_class_type(db, class_definition);
-
-        // Protocol methods follow the same logic as abstract methods (see reasoning above).
-        if class.is_some_and(|class| class.is_protocol(db)) {
-            return Type::unknown();
-        }
-
-        // We currently skip return type inference for the `__call__` method of metaclasses.
-        if self.name(db) == "__call__"
-            && class.is_some_and(|class| {
-                class.iter_mro(db).any(|base| {
-                    base.into_class()
-                        .is_some_and(|base| base.class_literal(db).is_known(db, KnownClass::Type))
-                })
-            })
-        {
-            return Type::unknown();
-        }
-
-        let mut return_type = infer_complete_scope_types(db, scope).return_type();
-        if let Some(inherited) = self.inherited_return_annotation(db) {
-            return_type = inherited;
-        } else if !self.has_known_decorator(db, FunctionDecorators::FINAL)
-            && !class.is_some_and(|class| class.is_final(db))
-        {
-            // For non-final methods on non-final classes, we include `Unknown` in the return type
-            // to allow subclasses to widen the return type if necessary.
-            return_type = UnionType::from_two_elements(db, &env, return_type, Type::unknown());
-        }
-
-        return_type.apply_optional_specialization(db, self.class_specialization(db))
-    }
-
-    #[salsa::tracked(
-        returns(copy),
-        cycle_initial=|_, _, _| None,
-        heap_size=ruff_memory_usage::heap_size,
-    )]
-    fn inherited_return_annotation(self, db: &'db dyn Db) -> Option<Type<'db>> {
-        let scope = self.literal(db).last_definition.body_scope(db);
-        let env = ProgramEnvironment::from_scope(scope);
-        let index = semantic_index(db, scope.program_file(db));
-        let class = original_class_type(
-            db,
-            index.class_definition_of_method(scope.file_scope_id(db))?,
-        )?;
-
-        for base_class in class.iter_mro(db).skip(1) {
-            let member = class.class_member_from_mro(
-                db,
-                &env,
-                self.name(db),
-                MemberLookupPolicy::default(),
-                std::iter::once(base_class),
-            );
-            let Some(member) = member.place.ignore_possibly_undefined() else {
-                continue;
-            };
-            let base = member.as_function_literal()?;
-            if !base.has_explicit_return_annotation(db) {
-                continue;
-            }
-            let [signature] = base.signature(db).overloads.as_slice() else {
-                return None;
-            };
-
-            return Some(
-                // TODO: specialization here is important for a case like
-                //
-                // class Base:
-                //     def method[T](self, x: T) -> list[T]: ...
-                // class Derived(Base):
-                //     def method(self, x): ...
-                //
-                // The inherited return type `list[T]` cannot be used as the return type of
-                // `Derived.method`, which is not generic itself. We currently use the default
-                // specialization of the base class's return type, but we should investigate
-                // this more carefully. Maybe we should instead return `None` for such cases.
-                signature.return_ty.apply_optional_specialization(
-                    db,
-                    signature
-                        .generic_context
-                        .map(|context| context.default_specialization(db, None)),
-                ),
-            );
-        }
-        None
-    }
-
-    /// The signature of this function, with the return type possibly inferred from the body.
-    ///
-    /// TODO: We should rename this function to `signature` and use it almost everywhere where
-    /// `signature` (above) is currently used. The function above should instead be renamed to
-    /// `signature_without_inferred_return_type` or `external_signature`, and only be used in
-    /// places where this is explicitly needed. This will make signatures more consistent with
-    /// the type inferred for calls to these functions (see also corresponding TODOs in
-    /// `return_type_inference.md`).
-    pub(super) fn signature_with_inferred_return_type(
-        self,
-        db: &'db dyn Db,
-    ) -> Cow<'db, CallableSignature<'db>> {
-        let signature = self.signature(db);
-        // Never infer return types for functions with multiple overloads.
-        let [overload] = signature.overloads.as_slice() else {
-            return Cow::Borrowed(signature);
-        };
-
         // Decorators and signature transformations can supply a return type without an annotation.
         if !overload.return_ty.is_unknown()
             || !db.analysis_settings(self.file(db)).return_type_inference.is_active()
             || self.has_explicit_return_annotation(db)
-            // We never infer return types in stubs
-            || self.file(db).is_stub(db)
+            // Stub and builtin declarations do not contain their implementations.
+            || self.program_file(db).is_stub(db)
+            || self.literal(db).is_builtin
             // An (invalid) function with a single `@overload` could still fall through the filter above.
             // We should not replace the `@overload`'s return type with the inferred type from the implementation.
             || !self.overloads_and_implementation(db).0.is_empty()

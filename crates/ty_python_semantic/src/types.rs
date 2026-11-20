@@ -26,7 +26,6 @@ use ty_module_resolver::{
 };
 
 pub use self::annotation_target::is_valid_annotation_target;
-use self::callable::CallableTypeKind;
 pub(crate) use self::callable::UpcastPolicy;
 use self::class::ClassInstanceFlags;
 pub use self::cyclic::CycleDetector;
@@ -40,6 +39,7 @@ pub use self::dedicated::pytest::{
 pub(crate) use self::diagnostic::TypeCheckDiagnostics;
 pub(crate) use self::diagnostic::register_lints;
 pub use self::diagnostic::{UNDEFINED_REVEAL, UNRESOLVED_REFERENCE};
+pub(crate) use self::infer::TruthinessAnalyzer;
 pub(crate) use self::infer::{
     InferredDeclaration, TypeContext, infer_complete_scope_types, infer_deferred_types,
     infer_definition_types, infer_expression_type, infer_expression_types,
@@ -49,7 +49,6 @@ pub(crate) use self::infer::{
 use self::infer::{
     infer_function_default_types, infer_legacy_type_alias, legacy_type_alias_parameters,
 };
-use self::infer::{implicit_alias_parameters, infer_implicit_alias_type};
 pub(crate) use self::iteration::extract_fixed_length_iterable_element_types;
 pub use self::known_instance::KnownInstanceType;
 pub(crate) use self::loop_bindings::certifies_predicate as initial_binding_fixes_empty_guard;
@@ -61,7 +60,6 @@ pub(crate) use self::match_pattern::{
     starred_sequence_pattern_type, typed_dict_matches_class_pattern,
 };
 pub(crate) use self::relation_error::{ErrorContext, ErrorContextTree, ParameterDescription};
-use self::set_theoretic::KnownUnion;
 use self::set_theoretic::NegativeIntersectionElements;
 pub(crate) use self::set_theoretic::builder::{
     IntersectionBuilder, UnionAccumulator, UnionBuilder,
@@ -1368,7 +1366,9 @@ fn lookup_member_on_union_element<'db>(
     let refined = receiver.map(|ty| IntersectionType::from_two_elements(db, env, ty, element));
     let result = element.member_lookup_with_policy_and_receiver(db, env, name, policy, refined);
     match (receiver, refined) {
-        (Some(receiver @ Type::TypeVar(_)), Some(refined)) => rebind_member_receiver(db, result, receiver, refined),
+        (Some(receiver @ Type::TypeVar(_)), Some(refined)) => {
+            rebind_member_receiver(db, result, receiver, refined)
+        }
         _ => result,
     }
 }
@@ -4842,7 +4842,7 @@ impl<'db> Type<'db> {
             && interface.includes_member(db, "__eq__")
         {
             return if interface.includes_member(db, name) {
-                interface.instance_member(db, env, name)
+                interface.instance_member_with_policy(db, env, name, policy)
             } else {
                 Self::unspecified_protocol_hash(db, env, policy)
             };
@@ -5781,7 +5781,11 @@ impl<'db> Type<'db> {
         instance: Option<Type<'db>>,
         owner: Type<'db>,
     ) -> Option<Type<'db>> {
-        let (member, _, error) = Self::try_call_dunder_get_on_attribute(
+        let DescriptorAttributeOutcome {
+            member,
+            kind: _,
+            error,
+        } = Self::try_call_dunder_get_on_attribute(
             db,
             env,
             Place::bound(self).into(),
@@ -5789,6 +5793,7 @@ impl<'db> Type<'db> {
             owner,
         );
         member
+            .place
             .ignore_possibly_undefined()
             .filter(|_| error.is_none())
     }

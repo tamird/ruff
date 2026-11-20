@@ -11,8 +11,8 @@
 //! arguments must match _at least one_ overload.
 
 use crate::ProgramEnvironment;
-use std::cell::LazyCell;
 use crate::types::string_annotation::SourceAnnotation;
+use std::cell::LazyCell;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::ops::ControlFlow;
@@ -28,8 +28,9 @@ use crate::types::call::{Argument, CallArguments};
 use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::resolution::{SolutionType, resolve_solution};
 use crate::types::constraints::{
-    CandidateSolutions, ConstraintProvenance, ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension,
-    OwnedConstraintSet, Solution, SolutionPaths, SolutionValidity, Solutions,
+    CandidateSolutions, ConstraintProvenance, ConstraintSet, ConstraintSetBuilder,
+    IteratorConstraintsExtension, OwnedConstraintSet, Solution, SolutionPaths, SolutionValidity,
+    Solutions,
 };
 use crate::types::cyclic::ActiveRecursionDetector;
 use crate::types::generics::{
@@ -48,15 +49,15 @@ use crate::types::typed_dict::{
     extract_unpacked_typed_dict_keys_from_kwargs_annotation,
 };
 use crate::types::typevar::{
-    KeywordProjection, TypeVarDomain, TypeVarInstance, TypeVarSet,
-    freshening_delta,
+    KeywordProjection, TypeVarDomain, TypeVarInstance, TypeVarSet, freshening_delta,
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarIdentity, BoundTypeVarInstance,
-    CallableType, ClassLiteral, ClassType, ErrorContext, ErrorContextTree, FindLegacyTypeVarsVisitor,
-    MaterializationKind, ParamSpecAttrKind, ParamSpecValue, ParameterDescription, SelfBinding,
-    SelfTypeVarOrigin, TypeContext, TypeMapping, TypeVarBoundOrConstraints, TypeVarNonce, TypedDictType,
-    UnionBuilder, VarianceInferable, VarianceTerm, infer_complete_scope_types, todo_type,
+    CallableType, ClassLiteral, ClassType, ErrorContext, ErrorContextTree,
+    FindLegacyTypeVarsVisitor, MaterializationKind, ParamSpecAttrKind, ParamSpecValue,
+    ParameterDescription, SelfBinding, SelfTypeVarOrigin, TypeContext, TypeMapping,
+    TypeVarBoundOrConstraints, TypedDictType, UnionBuilder, VarianceInferable,
+    VarianceTerm, infer_complete_scope_types, todo_type,
 };
 use crate::{Db, FxOrderSet};
 use ruff_db::files::FileRange;
@@ -504,7 +505,8 @@ impl<'db> CallableSignature<'db> {
                             .overloads;
                     }
                 }
-                if let Some((prefix, paramspec)) = signature.parameters.forwarded_paramspec_with_prefix(db)
+                if let Some((prefix, paramspec)) =
+                    signature.parameters.forwarded_paramspec_with_prefix(db)
                     && let Some(value) = specialization.get_parameter_list(db, paramspec)
                     && let Some(value) = value.as_paramspec_value(db)
                     && let Some(result) = try_apply_type_mapping_for_paramspec(
@@ -708,6 +710,7 @@ impl<'db> CallableSignature<'db> {
                 let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Single(
                     self_typevar,
                     self_type,
+                    AliasPolicy::Expand,
                 ));
                 let mut captured =
                     signature.apply_self_mapping_with_receiver(db, env, receiver_type, &mapping);
@@ -1355,11 +1358,13 @@ impl<'db> Signature<'db> {
             has_implicitly_positional_first_parameter,
             &annotation,
         );
-        let return_ty = SourceAnnotation::function_return(db, definition.program_file(db), function_node)
-            .map(|source| match source {
-                SourceAnnotation::Native(expression) => annotation(expression).0,
-                source => source.inferred_type(db, definition),
-            }).unwrap_or_else(Type::unknown);
+        let return_ty =
+            SourceAnnotation::function_return(db, definition.program_file(db), function_node)
+                .map(|source| match source {
+                    SourceAnnotation::Native(expression) => annotation(expression).0,
+                    source => source.inferred_type(db, definition),
+                })
+                .unwrap_or_else(Type::unknown);
         let legacy_generic_context =
             GenericContext::from_function_params(db, definition, &parameters, return_ty);
         let full_generic_context = GenericContext::merge_pep695_and_legacy(
@@ -3411,7 +3416,9 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             return None;
         }
 
-        let other_parameter_type = target_signature.single_required_positional_parameter_type()?.expand_top_level_aliases(db, self.env);
+        let other_parameter_type = target_signature
+            .single_required_positional_parameter_type()?
+            .expand_top_level_aliases(db, self.env);
         // Keep this aggregate path narrowly scoped to unary target callables whose parameter
         // domain is an explicit union.
         //
@@ -3453,23 +3460,23 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                         .with_annotated_type(*parameter)]));
                 let mut covered = false;
                 for source in source_signatures {
-                    let domain = single_required_positional_parameter_type(source)?;
+                    let domain = source.single_required_positional_parameter_type()?;
                     if self
                         .without_context_collection(|| {
                             self.check_signature_pair(db, source, &target)
                         })
-                        .is_always_satisfied(db, env)
+                        .is_always_satisfied(db, env, self.inferable)
                     {
                         covered = true;
                     } else if !self
                         .as_disjointness_checker()
                         .check_type_pair(db, domain, *parameter)
-                        .is_always_satisfied(db, env)
+                        .is_always_satisfied(db, env, self.inferable)
                         && !self
                             .without_context_collection(|| {
                                 self.check_signature_return_pair(db, source, &target)
                             })
-                            .is_always_satisfied(db, env)
+                            .is_always_satisfied(db, env, self.inferable)
                     {
                         return None;
                     }
@@ -4015,7 +4022,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             // entry has been removed, and retain the original strict relation for nested members.
             let proved = self.without_context_collection(|| {
                 self.check_signature_pair(db, &specialized, target)
-                    .is_always_satisfied(db, env)
+                    .is_always_satisfied(db, env, self.inferable)
             });
             if proved {
                 return Some(true);
@@ -4404,6 +4411,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     db,
                     env,
                     self.constraints,
+                    self.provenance,
                     target.keyword_parameters(db),
                     shape,
                 ),
@@ -6956,7 +6964,9 @@ impl<'db> Parameters<'db> {
             match materialization_kind {
                 // A gradual tail may require additional arguments, so no call is guaranteed.
                 MaterializationKind::Top => return Self::top(),
-                MaterializationKind::Bottom if self.is_fully_gradual() || self.is_incomplete() => return Self::bottom(),
+                MaterializationKind::Bottom if self.is_fully_gradual() || self.is_incomplete() => {
+                    return Self::bottom();
+                }
                 // Materializing the parameter types below turns the gradual variadics into
                 // `*object, **object` and retains any explicit parameters.
                 MaterializationKind::Bottom => ParametersKind::Standard,
@@ -7757,7 +7767,9 @@ impl<'db> Parameter<'db> {
         parameter: &ast::Parameter,
         kind: ParameterKind<'db>,
     ) -> Self {
-        let source = Some(ParameterSource::Definition(index.expect_single_definition(parameter)));
+        let source = Some(ParameterSource::Definition(
+            index.expect_single_definition(parameter),
+        ));
 
         let (annotated_type, inferred_annotation, annotation_flags, has_starred_annotation) =
             if let Some(annotation) = SourceAnnotation::new(

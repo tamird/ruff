@@ -102,7 +102,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 if !has_diagnostics
                     && let Some(builder) = self
                         .context
-                        .report_lint(&UNRESOLVED_IMPORT, binding.binding.range)
+                        .report_lint(&IMPORT_NOT_FOUND, binding.binding.range)
                 {
                     builder.into_diagnostic(format_args!(
                         "Cannot resolve imported name `{}`",
