@@ -1,16 +1,16 @@
 //! Opt-in checking of a named function body under one declared overload.
 //!
 //! Domains support fixed parameters and normalized keyword rows in simple function bodies.
-//! Unsupported syntax must be rejected before inference: capture, loop, and comprehension
-//! queries do not yet carry a body domain.
+//! Unsupported syntax must be rejected before inference. Dictionary comprehension scopes carry
+//! the same domain; other captures, loops, and comprehensions remain unsupported.
 
 use itertools::Itertools;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
-use ty_python_core::scope::ScopeId;
+use ty_python_core::scope::{NodeWithScopeKind, ScopeId};
 use ty_python_core::semantic_index;
 use ty_python_core::statement::StatementInner;
 
@@ -175,11 +175,31 @@ impl<'db> OverloadBodyView<'db> {
         )
     }
 
+    /// Whether an expression is reachable in its own lexical scope in this domain.
+    pub fn is_expression_reachable(self, expression: &ast::Expr) -> bool {
+        let index = semantic_index(self.db, self.scope().program_file(self.db));
+        let Some(scope) = index.try_expression_scope_id(expression) else {
+            return false;
+        };
+        self.domain.contains_scope(self.db, index.scope_id(scope))
+            && is_range_reachable_in_domain(
+                self.db,
+                index,
+                scope,
+                expression.range(),
+                Some(self.domain),
+            )
+    }
+
     /// An already inferred expression type from this body, without cross-domain fallback.
     pub fn expression_type(self, expression: &ast::Expr) -> Option<Type<'db>> {
         let scope = self.scope();
         let index = semantic_index(self.db, scope.program_file(self.db));
-        if index.try_expression_scope_id(expression) != Some(scope.file_scope_id(self.db)) {
+        let expression_scope = index.try_expression_scope_id(expression)?;
+        if !self
+            .domain
+            .contains_scope(self.db, index.scope_id(expression_scope))
+        {
             return None;
         }
         self.inference.try_expression_type(expression)
@@ -187,7 +207,10 @@ impl<'db> OverloadBodyView<'db> {
 
     /// The binding type of a definition owned by this body.
     pub fn definition_type(self, definition: Definition<'db>) -> Option<Type<'db>> {
-        if definition.scope(self.db) != self.scope() {
+        if !self
+            .domain
+            .contains_scope(self.db, definition.scope(self.db))
+        {
             return None;
         }
         Some(infer_body_definition(self.db, definition, self.domain).binding_type(definition))
@@ -201,10 +224,16 @@ impl<'db> OverloadBodyView<'db> {
         let callee = self
             .expression_type(&call.func)
             .ok_or(CallInputError::Incomplete)?;
-        let scope = self.scope();
-        let file = scope.program_file(self.db);
-        let env = ProgramEnvironment::from_file(file);
+        let file = self.scope().program_file(self.db);
         let index = semantic_index(self.db, file);
+        let scope = index
+            .try_expression_scope_id(&ast::ExprRef::Call(call))
+            .ok_or(CallInputError::Incomplete)?;
+        let scope = index.scope_id(scope);
+        if !self.domain.contains_scope(self.db, scope) {
+            return Err(CallInputError::Incomplete);
+        }
+        let env = ProgramEnvironment::from_file(file);
         let missing = std::cell::Cell::new(false);
         let arguments = CallArguments::from_arguments_typed(&call.arguments, |expression| {
             let ty = self.expression_type(expression);
@@ -267,6 +296,25 @@ pub(crate) struct FunctionBodyDomain<'db> {
 impl<'db> FunctionBodyDomain<'db> {
     pub(crate) fn scope(self, db: &'db dyn Db) -> ScopeId<'db> {
         self.implementation(db).body_scope(db)
+    }
+
+    /// Follow lexical dictionary comprehensions, without entering another function or generator.
+    pub(crate) fn contains_scope(self, db: &'db dyn Db, mut scope: ScopeId<'db>) -> bool {
+        let owner = self.scope(db);
+        if scope.program_file(db) != owner.program_file(db) {
+            return false;
+        }
+        let index = semantic_index(db, owner.program_file(db));
+        while scope != owner {
+            if !matches!(scope.node(db), NodeWithScopeKind::DictComprehension(_)) {
+                return false;
+            }
+            let Some(parent) = index.parent_scope_id(scope.file_scope_id(db)) else {
+                return false;
+            };
+            scope = index.scope_id(parent);
+        }
+        true
     }
 
     pub(crate) fn parameter_type(
@@ -424,10 +472,18 @@ fn prepare_body_domain<'db>(
         &overload_signature,
         specialization,
     )?;
-    if !supported_body(db, function, node, &implementation_signature, &parameters) {
+    // Reject unsupported body shapes before entering domain-specific scope inference.
+    if !supported_body(
+        db,
+        function,
+        node,
+        &implementation_signature,
+        &parameters,
+        None,
+    ) {
         return Err(BodyDomainError::Unsupported);
     }
-    Ok(FunctionBodyDomain::new(
+    let domain = FunctionBodyDomain::new(
         db,
         implementation,
         overload,
@@ -435,7 +491,18 @@ fn prepare_body_domain<'db>(
         keyword_tail,
         overload_signature.return_ty,
         specialization,
-    ))
+    );
+    if !supported_body(
+        db,
+        function,
+        node,
+        &implementation_signature,
+        domain.parameters(db),
+        Some(domain),
+    ) {
+        return Err(BodyDomainError::Unsupported);
+    }
+    Ok(domain)
 }
 
 #[derive(Debug)]
@@ -650,6 +717,7 @@ fn supported_body(
     node: &ast::StmtFunctionDef,
     signature: &crate::types::Signature<'_>,
     entries: &[(Definition<'_>, Type<'_>)],
+    domain: Option<FunctionBodyDomain<'_>>,
 ) -> bool {
     fn all_reaching_assignments(
         db: &dyn Db,
@@ -659,7 +727,7 @@ fn supported_body(
     ) -> bool {
         let file = function.program_file(db);
         let index = semantic_index(db, file);
-        let scope = function.literal(db).last_definition.body_scope(db);
+        let scope = index.scope_id(index.expression_scope_id(&ast::ExprRef::Name(name)));
         let module = parsed_module(db, file.python_file(db)).load(db);
         let mut bindings = index
             .use_def_map(scope.file_scope_id(db))
@@ -805,11 +873,33 @@ fn supported_body(
     fn builtin_method(
         db: &dyn Db,
         function: FunctionType<'_>,
+        domain: Option<FunctionBodyDomain<'_>>,
         attribute: &ast::ExprAttribute,
     ) -> bool {
+        let index = semantic_index(db, function.program_file(db));
+        if let Some(domain) = domain {
+            let scope = index.expression_scope_id(&ast::ExprRef::Attribute(attribute));
+            if !is_range_reachable_in_domain(db, index, scope, attribute.range(), Some(domain)) {
+                // Ordinary preflight checked the method; this domain never calls it.
+                return true;
+            }
+        }
         let model = SemanticModel::new(db, function.program_file(db));
         let env = model.program_environment();
-        let receiver = attribute.value.inferred_type(&model);
+        let inferred_type = |expression: ast::ExprRef<'_>| match domain {
+            Some(domain) => {
+                let scope = model.scope(expression.into())?;
+                super::infer_scope_with_body_domain(
+                    db,
+                    index.scope_id(scope),
+                    TypeContext::default(),
+                    Some(domain),
+                )
+                .try_expression_type(expression)
+            }
+            None => expression.inferred_type(&model),
+        };
+        let receiver = inferred_type(attribute.value.as_ref().into());
         let (class, mutates) = if receiver.is_some_and(|ty| {
             has_exact_runtime_class(db, &env, ty)
                 && ty
@@ -821,22 +911,32 @@ fn supported_body(
             (KnownClass::Str, false)
         } else {
             match attribute.attr.id.as_str() {
-                "get" => (KnownClass::Dict, false),
+                "get" | "items" => (KnownClass::Dict, false),
                 "pop" => (KnownClass::Dict, true),
                 "append" => (KnownClass::List, true),
                 _ => return false,
             }
         };
-        if mutates && !fresh_receiver(db, function, &attribute.value, class) {
-            return false;
+        if mutates {
+            let index = semantic_index(db, function.program_file(db));
+            if index.expression_scope_id(&ast::ExprRef::Attribute(attribute))
+                != function
+                    .literal(db)
+                    .last_definition
+                    .body_scope(db)
+                    .file_scope_id(db)
+                || !fresh_receiver(db, function, &attribute.value, class)
+            {
+                return false;
+            }
         }
         if !mutates
             && receiver.is_some_and(|ty| matches!(ty.resolve_type_alias(db), Type::TypedDict(_)))
         {
-            // TypedDict get is checked by the ordinary specialized call owner.
+            // TypedDict methods are checked by the ordinary specialized call owner.
             return true;
         }
-        let Some(Type::BoundMethod(method)) = attribute.inferred_type(&model) else {
+        let Some(Type::BoundMethod(method)) = inferred_type(attribute.into()) else {
             return false;
         };
         let Some(Type::BoundMethod(declared)) = class
@@ -858,9 +958,88 @@ fn supported_body(
         }
     }
 
+    fn target_names<'ast>(target: &'ast ast::Expr, names: &mut Vec<&'ast str>) -> bool {
+        match target {
+            ast::Expr::Name(name) => {
+                names.push(name.id.as_str());
+                true
+            }
+            ast::Expr::Tuple(tuple) => tuple.elts.iter().all(|target| target_names(target, names)),
+            ast::Expr::List(list) => list.elts.iter().all(|target| target_names(target, names)),
+            _ => false,
+        }
+    }
+
+    fn dictionary_comprehension(
+        db: &dyn Db,
+        function: FunctionType<'_>,
+        domain: Option<FunctionBodyDomain<'_>>,
+        locals: &[&str],
+        callees: &[&str],
+        comprehension: &ast::ExprDictComp,
+    ) -> bool {
+        let Some(key) = comprehension.key.as_deref() else {
+            return false;
+        };
+        let mut targets = Vec::new();
+        if comprehension.generators.is_empty()
+            || !comprehension.generators.iter().all(|generator| {
+                !generator.is_async && target_names(&generator.target, &mut targets)
+            })
+        {
+            return false;
+        }
+        let mut child_locals = locals.to_vec();
+        child_locals.extend(targets.iter().copied());
+        // A target shadowing a callable parameter is a new binding, not that parameter's contract.
+        let child_callees: Vec<_> = callees
+            .iter()
+            .copied()
+            .filter(|name| !targets.contains(name))
+            .collect();
+        comprehension
+            .generators
+            .iter()
+            .enumerate()
+            .all(|(position, generator)| {
+                let (iter_locals, iter_callees) = if position == 0 {
+                    (locals, callees)
+                } else {
+                    (child_locals.as_slice(), child_callees.as_slice())
+                };
+                expression(
+                    db,
+                    function,
+                    domain,
+                    iter_locals,
+                    iter_callees,
+                    &generator.iter,
+                ) && generator.ifs.iter().all(|condition| {
+                    expression(
+                        db,
+                        function,
+                        domain,
+                        &child_locals,
+                        &child_callees,
+                        condition,
+                    )
+                })
+            })
+            && expression(db, function, domain, &child_locals, &child_callees, key)
+            && expression(
+                db,
+                function,
+                domain,
+                &child_locals,
+                &child_callees,
+                &comprehension.value,
+            )
+    }
+
     fn expression(
         db: &dyn Db,
         function: FunctionType<'_>,
+        domain: Option<FunctionBodyDomain<'_>>,
         locals: &[&str],
         callees: &[&str],
         value: &ast::Expr,
@@ -874,46 +1053,49 @@ fn supported_body(
             ast::Expr::NoneLiteral(_) => true,
             ast::Expr::Attribute(attribute) => {
                 attribute.ctx == ast::ExprContext::Load
-                    && expression(db, function, locals, callees, &attribute.value)
+                    && expression(db, function, domain, locals, callees, &attribute.value)
             }
             ast::Expr::Compare(compare) => compare
                 .operands
                 .iter()
-                .all(|operand| expression(db, function, locals, callees, operand)),
+                .all(|operand| expression(db, function, domain, locals, callees, operand)),
             ast::Expr::BoolOp(boolean) => boolean
                 .values
                 .iter()
-                .all(|value| expression(db, function, locals, callees, value)),
+                .all(|value| expression(db, function, domain, locals, callees, value)),
             ast::Expr::UnaryOp(unary) => {
                 unary.op == ast::UnaryOp::Not
-                    && expression(db, function, locals, callees, &unary.operand)
+                    && expression(db, function, domain, locals, callees, &unary.operand)
             }
             ast::Expr::If(conditional) => {
                 [&conditional.test, &conditional.body, &conditional.orelse]
                     .into_iter()
-                    .all(|value| expression(db, function, locals, callees, value))
+                    .all(|value| expression(db, function, domain, locals, callees, value))
             }
             ast::Expr::List(list) => list
                 .elts
                 .iter()
-                .all(|value| expression(db, function, locals, callees, value)),
+                .all(|value| expression(db, function, domain, locals, callees, value)),
             ast::Expr::Tuple(tuple) => tuple
                 .elts
                 .iter()
-                .all(|value| expression(db, function, locals, callees, value)),
+                .all(|value| expression(db, function, domain, locals, callees, value)),
             ast::Expr::Dict(dictionary) => dictionary.items.iter().all(|item| {
                 item.key
                     .as_ref()
-                    .is_none_or(|key| expression(db, function, locals, callees, key))
-                    && expression(db, function, locals, callees, &item.value)
+                    .is_none_or(|key| expression(db, function, domain, locals, callees, key))
+                    && expression(db, function, domain, locals, callees, &item.value)
             }),
+            ast::Expr::DictComp(comprehension) => {
+                dictionary_comprehension(db, function, domain, locals, callees, comprehension)
+            }
             ast::Expr::Subscript(subscript) => {
-                expression(db, function, locals, callees, &subscript.value)
-                    && expression(db, function, locals, callees, &subscript.slice)
+                expression(db, function, domain, locals, callees, &subscript.value)
+                    && expression(db, function, domain, locals, callees, &subscript.slice)
             }
             ast::Expr::BinOp(binary) => {
-                expression(db, function, locals, callees, &binary.left)
-                    && expression(db, function, locals, callees, &binary.right)
+                expression(db, function, domain, locals, callees, &binary.left)
+                    && expression(db, function, domain, locals, callees, &binary.right)
             }
             ast::Expr::Call(call) => {
                 match call.func.as_ref() {
@@ -934,8 +1116,8 @@ fn supported_body(
                         }
                     }
                     ast::Expr::Attribute(attribute) => {
-                        if !expression(db, function, locals, callees, &attribute.value)
-                            || !(builtin_method(db, function, attribute)
+                        if !expression(db, function, domain, locals, callees, &attribute.value)
+                            || !(builtin_method(db, function, domain, attribute)
                                 || protocol_method(db, function, attribute)
                                 || stored_function_callee(db, function, attribute))
                         {
@@ -947,12 +1129,10 @@ fn supported_body(
                 call.arguments
                     .args
                     .iter()
-                    .all(|argument| expression(db, function, locals, callees, argument))
-                    && call
-                        .arguments
-                        .keywords
-                        .iter()
-                        .all(|argument| expression(db, function, locals, callees, &argument.value))
+                    .all(|argument| expression(db, function, domain, locals, callees, argument))
+                    && call.arguments.keywords.iter().all(|argument| {
+                        expression(db, function, domain, locals, callees, &argument.value)
+                    })
             }
             _ => false,
         }
@@ -960,19 +1140,21 @@ fn supported_body(
     fn statements(
         db: &dyn Db,
         function: FunctionType<'_>,
+        domain: Option<FunctionBodyDomain<'_>>,
         locals: &[&str],
         callees: &[&str],
         body: &[ast::Stmt],
     ) -> bool {
-        let supported = |value: &ast::Expr| expression(db, function, locals, callees, value);
+        let supported =
+            |value: &ast::Expr| expression(db, function, domain, locals, callees, value);
         body.iter().all(|statement| match statement {
             ast::Stmt::Return(statement) => statement.value.as_deref().is_none_or(supported),
             ast::Stmt::If(statement) => {
                 supported(&statement.test)
-                    && statements(db, function, locals, callees, &statement.body)
+                    && statements(db, function, domain, locals, callees, &statement.body)
                     && statement.elif_else_clauses.iter().all(|clause| {
                         clause.test.as_ref().is_none_or(supported)
-                            && statements(db, function, locals, callees, &clause.body)
+                            && statements(db, function, domain, locals, callees, &clause.body)
                     })
             }
             ast::Stmt::Assign(assignment) => {
@@ -1058,7 +1240,7 @@ fn supported_body(
             parameter.name().map(ast::name::Name::as_str)
         })
         .collect();
-    statements(db, function, &locals, &callees, &node.body)
+    statements(db, function, domain, &locals, &callees, &node.body)
         && node.parameters.kwarg.as_deref().is_none_or(|kwargs| {
             !crate::types::dictionary::contents::has_value_exposure(
                 db,
@@ -1067,13 +1249,48 @@ fn supported_body(
         })
 }
 
-#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
-fn infer_body_scope<'db>(db: &'db dyn Db, domain: FunctionBodyDomain<'db>) -> ScopeInference<'db> {
-    infer_scope_region(
+fn infer_body_scope<'db>(
+    db: &'db dyn Db,
+    domain: FunctionBodyDomain<'db>,
+) -> &'db ScopeInference<'db> {
+    infer_body_scope_region(
         db,
         InferScope::new(db, domain.scope(db), TypeContext::default()),
-        Some(domain),
+        domain,
     )
+}
+
+#[salsa::tracked(
+    returns(ref),
+    cycle_initial=|_, id, _, _| ScopeInference::cycle_initial(Type::divergent(id)),
+    cycle_fn=|db, cycle, previous: &ScopeInference<'db>, inference: ScopeInference<'db>, input: InferScope<'db>, _| {
+        let (scope, _) = input.into_inner(db);
+        inference.cycle_normalized(db, &ProgramEnvironment::from_scope(scope), previous, cycle)
+    },
+    heap_size=ruff_memory_usage::heap_size
+)]
+pub(super) fn infer_body_scope_region<'db>(
+    db: &'db dyn Db,
+    input: InferScope<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> ScopeInference<'db> {
+    infer_scope_region(db, input, Some(domain))
+}
+
+#[salsa::tracked(
+    returns(ref),
+    cycle_initial=|_, id, _, _| super::UnpackResult::cycle_initial(Type::divergent(id)),
+    cycle_fn=|db, cycle, previous: &super::UnpackResult<'db>, result: super::UnpackResult<'db>, unpack: ty_python_core::unpack::Unpack<'db>, _| {
+        result.cycle_normalized(db, &ProgramEnvironment::from_file(unpack.program_file(db)), previous, cycle)
+    },
+    heap_size=ruff_memory_usage::heap_size
+)]
+pub(super) fn infer_body_unpack<'db>(
+    db: &'db dyn Db,
+    unpack: ty_python_core::unpack::Unpack<'db>,
+    domain: FunctionBodyDomain<'db>,
+) -> super::UnpackResult<'db> {
+    super::infer_unpack_region(db, unpack, Some(domain))
 }
 
 #[salsa::tracked(
@@ -1165,6 +1382,84 @@ mod tests {
             |domain| infer_body_scope(db, domain),
         );
         inference.expression_type(value)
+    }
+
+    #[test]
+    fn dictionary_comprehension_views_use_the_expression_scope() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        let source = indoc::indoc! {r#"
+            from typing import Protocol, overload
+            class Callback[T](Protocol):
+                def __call__(self, *, value: T) -> T: ...
+            @overload
+            def f(callback: Callback[int], values: dict[str, int]) -> dict[str, int]: ...
+            @overload
+            def f(callback: Callback[str], values: dict[str, str]) -> dict[str, str]: ...
+            def f[T: (int, str)](callback: Callback[T], values: dict[str, T]) -> dict[str, T]:
+                return {key: callback(**{"value": value}) for key, value in values.items() if True}
+        "#};
+        for condition in ["True", "False", "True"] {
+            db.write_file(
+                "/src/body.py",
+                source.replace("if True", &format!("if {condition}")),
+            )?;
+            let f = function(&db);
+            let analysis = OverloadBodyAnalysis::new(&db, f);
+            assert!(analysis.is_complete(), "condition={condition}");
+            let module = parsed_module(&db, f.program_file(&db).python_file(&db)).load(&db);
+            let body = f
+                .literal(&db)
+                .last_definition
+                .body_scope(&db)
+                .node(&db)
+                .expect_function()
+                .node(&module);
+            let Some(ast::Stmt::Return(returned)) = body.body.last() else {
+                panic!("expected the comprehension return");
+            };
+            let Some(ast::Expr::DictComp(comprehension)) = returned.value.as_deref() else {
+                panic!("expected a dictionary comprehension");
+            };
+            let ast::Expr::Call(call) = comprehension.value.as_ref() else {
+                panic!("expected the value callback");
+            };
+            let views: Vec<_> = analysis.domains(&db).collect();
+            assert_eq!(views.len(), 2);
+            for (index, view) in views.into_iter().enumerate() {
+                assert!(view.is_expression_reachable(&comprehension.generators[0].iter));
+                assert_eq!(
+                    view.is_expression_reachable(&comprehension.value),
+                    condition == "True"
+                );
+                if condition == "True" {
+                    let inputs = view
+                        .call_input_types(call)
+                        .expect("checked comprehension callback inputs");
+                    let expected = if index == 0 {
+                        KnownClass::Int
+                    } else {
+                        KnownClass::Str
+                    }
+                    .to_instance(&db, &db.program_environment());
+                    assert!(
+                        inputs
+                            .iter()
+                            .flatten()
+                            .any(|input| input.argument_type == expected)
+                    );
+                    let ast::Expr::Tuple(target) = &comprehension.generators[0].target else {
+                        panic!("expected the key/value target");
+                    };
+                    let ast::Expr::Name(value_target) = &target.elts[1] else {
+                        panic!("expected the value target name");
+                    };
+                    let definition = semantic_index(&db, f.program_file(&db))
+                        .expect_single_definition(value_target);
+                    assert_eq!(view.definition_type(definition), Some(expected));
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -1717,6 +2012,66 @@ mod tests {
             );
             assert_eq!(f.last_definition_signature(&db), &signature);
         }
+        for (element, integer, text, expression) in [
+            (
+                "T",
+                "int",
+                "str",
+                "{key: value for key, value in alias.items()}",
+            ),
+            (
+                "dict[str, T]",
+                "dict[str, int]",
+                "dict[str, str]",
+                "{key: {sub: value for sub, value in row.items()} for key, row in alias.items()}",
+            ),
+        ] {
+            let source = format!(
+                "from typing import overload\n@overload\ndef f(values: dict[str, {integer}]) -> dict[str, {integer}]: ...\n@overload\ndef f(values: dict[str, {text}]) -> dict[str, {text}]: ...\ndef f[T: (int, str)](values: dict[str, {element}]) -> dict[str, {element}]:\n    alias = values\n    return {expression}\n"
+            );
+            for (key, value, wrong) in [
+                ("key", "value", [false, false]),
+                ("42", "value", [true, true]),
+                ("key", "42", [false, true]),
+                ("key", "value", [false, false]),
+            ] {
+                db.write_file(
+                    "/src/body.py",
+                    source
+                        .replace("{key:", &format!("{{{key}:"))
+                        .replace(": value for", &format!(": {value} for")),
+                )?;
+                let f = function(&db);
+                let ordinary = crate::types::check_types(&db, f.program_file(&db));
+                let signature = f.last_definition_signature(&db).clone();
+                for index in [0, 1, 0] {
+                    let diagnostics = check_overload_body(&db, f, index)
+                        .expect("dictionary comprehension domain");
+                    assert_eq!(
+                    diagnostics
+                        .diagnostics()
+                        .iter()
+                        .any(|diagnostic| diagnostic.id().as_str() == "invalid-explicit-return"),
+                    wrong[index],
+                    "key={key} value={value} domain={index}: {diagnostics:#?}",
+                );
+                    if !wrong[index] {
+                        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+                        let domain = prepare_body_domain(&db, f, index).unwrap();
+                        assert!(returned_type(&db, f, Some(domain)).is_equivalent_to(
+                            &db,
+                            &db.program_environment(),
+                            domain.return_type(&db)
+                        ));
+                    }
+                }
+                assert_eq!(
+                    crate::types::check_types(&db, f.program_file(&db)),
+                    ordinary
+                );
+                assert_eq!(f.last_definition_signature(&db), &signature);
+            }
+        }
         Ok(())
     }
 
@@ -1743,6 +2098,28 @@ mod tests {
             )?;
             assert_eq!(
                 check_overload_body(&db, function(&db), 0),
+                Err(BodyDomainError::Unsupported),
+                "{body}"
+            );
+        }
+        for body in [
+            "target = []\n    return {key: target.append(value) for key, value in values.items()}",
+            "return {key: child.append(1) for key, child in rows.items()}",
+            "return {key: child.pop() for key, child in rows.items()}",
+            "return {key: callback() for key, callback in callbacks.items()}",
+            "return {key: value for target[0] in [1] for key, value in values.items()}",
+        ] {
+            db.write_file("/src/body.py", format!(
+                "from typing import Callable, Literal, overload\n@overload\ndef f(values: dict[str, int], rows: dict[str, list[int]], callbacks: dict[str, Callable[[], str]], target: list[int], callback: Callable[[], int], flag: Literal[True]) -> dict[str, int]: ...\n@overload\ndef f(values: dict[str, int], rows: dict[str, list[int]], callbacks: dict[str, Callable[[], str]], target: list[int], callback: Callable[[], int], flag: Literal[False]) -> dict[str, int]: ...\ndef f(values: dict[str, int], rows: dict[str, list[int]], callbacks: dict[str, Callable[[], str]], target: list[int], callback: Callable[[], int], flag: bool) -> dict[str, int]:\n    {body}\n"
+            ))?;
+            let f = function(&db);
+            assert_eq!(
+                check_overload_body(&db, f, 0),
+                Err(BodyDomainError::Unsupported),
+                "{body}"
+            );
+            assert_eq!(
+                check_overload_body(&db, f, 1),
                 Err(BodyDomainError::Unsupported),
                 "{body}"
             );
@@ -1857,6 +2234,25 @@ mod tests {
                 Err(BodyDomainError::Unsupported),
                 "{body}"
             );
+        }
+        for (method, expression) in [
+            ("def items(self) -> Never: raise RuntimeError", "value"),
+            (
+                "def get(self, *args: object, **kwargs: object) -> Never: raise RuntimeError",
+                "alias.get(key, value)",
+            ),
+        ] {
+            db.write_file("/src/body.py", format!(
+                "from typing import Literal, Never, overload\nclass Overridden(dict[str, int]):\n    {method}\n@overload\ndef f(values: Overridden, flag: Literal[True]) -> dict[str, int]: ...\n@overload\ndef f(values: dict[str, int], flag: Literal[False]) -> dict[str, int]: ...\ndef f(values: dict[str, int], flag: bool) -> dict[str, int]:\n    alias = values\n    return {{key: {expression} for key, value in alias.items()}}\n"
+            ))?;
+            let f = function(&db);
+            assert_eq!(
+                check_overload_body(&db, f, 0),
+                Err(BodyDomainError::Unsupported),
+                "{method}"
+            );
+            let diagnostics = check_overload_body(&db, f, 1).expect("ordinary builtin method");
+            assert!(diagnostics.is_empty(), "{method}: {diagnostics:#?}");
         }
         Ok(())
     }

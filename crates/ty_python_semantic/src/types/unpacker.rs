@@ -11,16 +11,16 @@ use ruff_python_ast::{self as ast, AnyNodeRef};
 use ruff_text_size::Ranged;
 
 use crate::Db;
-use crate::types::infer::{ExpressionInference, FrozenMap};
+use crate::types::infer::{
+    ExpressionInference, FrozenMap, FunctionBodyDomain, infer_expression_with_body_domain,
+};
 use crate::types::iteration::{precise_iterable_element_type, refine_dict_snapshot_element_type};
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
 use crate::types::tuple::{
     ResizeTupleError, Tuple, TupleBuilder, TupleElement, TupleLength, TupleSpec,
     VariableLengthTuple,
 };
-use crate::types::{
-    KnownClass, Type, TypeContext, UnionBuilder, UnionType, infer_expression_types,
-};
+use crate::types::{KnownClass, Type, TypeContext, UnionBuilder, UnionType};
 use ty_python_core::EvaluationMode;
 use ty_python_core::ExpressionNodeKey;
 use ty_python_core::ProgramFile;
@@ -74,6 +74,12 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
         }
     }
 
+    pub(super) fn with_body_domain(mut self, domain: Option<FunctionBodyDomain<'db>>) -> Self {
+        self.context.body_domain =
+            domain.filter(|domain| domain.contains_scope(self.db(), self.context.scope()));
+        self
+    }
+
     fn db(&self) -> &'db dyn Db {
         self.context.db()
     }
@@ -90,10 +96,11 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             "Unpacking target must be a list or tuple expression"
         );
 
-        let value_inference = infer_expression_types(
+        let value_inference = infer_expression_with_body_domain(
             self.context.db(),
             value.expression(),
             TypeContext::default(),
+            self.context.body_domain,
         );
         let result = self.unpack_inferred(target, value, value_inference, None);
         debug_assert!(result.is_ok());

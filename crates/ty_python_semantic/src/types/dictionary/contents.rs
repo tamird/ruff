@@ -607,7 +607,7 @@ fn definition_contents_in_domain<'db>(
     domain: Option<FunctionBodyDomain<'db>>,
 ) -> Contents<'db> {
     domain
-        .filter(|domain| domain.scope(db) == definition.scope(db))
+        .filter(|domain| domain.contains_scope(db, definition.scope(db)))
         .map_or_else(
             || definition_contents(db, definition),
             |domain| body_definition_contents(db, definition, domain),
@@ -624,7 +624,7 @@ fn infer_definition_contents<'db>(
     let index = semantic_index(db, scope.program_file(db));
     let use_def = index.use_def_map(scope.file_scope_id(db));
     let reachability = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints())
-        .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
+        .with_body_domain(domain.filter(|domain| domain.contains_scope(db, scope)));
 
     match definition.kind(db) {
         DefinitionKind::LoopHeader(_) => {
@@ -994,7 +994,7 @@ fn initial_contents<'db>(
         if PlaceExpr::try_from_expr(value).is_some() {
             let use_def = index.use_def_map(scope.file_scope_id(db));
             let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints())
-                .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
+                .with_body_domain(domain.filter(|domain| domain.contains_scope(db, scope)));
             match snapshot_contents(db, scope, value, value.into(), bound_type, &cache) {
                 ContentsValue::Mapping(source) => mapping.builtin |= source.builtin,
                 ContentsValue::Pending => return ContentsValue::Pending,
@@ -1624,7 +1624,7 @@ fn operation_contents<'db>(
         let index = semantic_index(db, scope.program_file(db));
         let use_def = index.use_def_map(scope.file_scope_id(db));
         let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints())
-            .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
+            .with_body_domain(domain.filter(|domain| domain.contains_scope(db, scope)));
         from_bindings(
             db,
             scope,
@@ -1827,7 +1827,7 @@ fn mapping_transfer<'db>(
         let index = semantic_index(db, file);
         let use_def = index.use_def_map(scope.file_scope_id(db));
         let cache = ReachabilityEvaluationCache::new(scope, use_def.reachability_constraints())
-            .with_body_domain(domain.filter(|domain| domain.scope(db) == scope));
+            .with_body_domain(domain.filter(|domain| domain.contains_scope(db, scope)));
         match from_bindings(
             db,
             scope,
