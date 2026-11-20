@@ -266,6 +266,115 @@ mod tests {
     }
 
     #[test]
+    fn later_collection_contexts_preserve_query_order() -> anyhow::Result<()> {
+        let template = dedent(
+            r#"
+            from collections.abc import Hashable
+
+            type Keys[K] = K | str
+
+            def add[K: Hashable, V](*dictionaries: dict[K, V], **kwargs: V) -> dict[RETURN_KEY, V]:
+                def consume(values: dict[CONSUMER_KEY, V]) -> None: ...
+
+                result = {}
+                for source in dictionaries:
+                    result.update(source.items())
+                result.update(kwargs)
+                consume(result)
+                return result
+            "#,
+        );
+        let sources: Vec<_> = [
+            ("K | str", "str | K"),
+            ("Keys[K]", "str | K"),
+            ("str | K", "Keys[K]"),
+            ("K | str", "str | K"),
+        ]
+        .into_iter()
+        .map(|(consumer, returned)| {
+            template
+                .replace("CONSUMER_KEY", consumer)
+                .replace("RETURN_KEY", returned)
+        })
+        .collect();
+        for first in [
+            FirstQuery::Inference,
+            FirstQuery::Reachability,
+            FirstQuery::Callee,
+            FirstQuery::Call,
+        ] {
+            let mut db = TestDbBuilder::new()
+                .with_python_version(PythonVersion::PY313)
+                .with_file(TEST_PATH, "")
+                .build()?;
+            for source in &sources {
+                db.write_file(TEST_PATH, source)?;
+                let file = system_path_to_file(&db, TEST_PATH)?;
+                let program = db.program_file(file);
+                let module = parsed_module(&db, program.python_file(&db)).load(&db);
+                let statement = module.suite().last().context("expected add function")?;
+                let function = statement
+                    .as_function_def_stmt()
+                    .context("expected add function")?;
+                let [
+                    _consumer,
+                    initializer,
+                    _copies,
+                    _keywords,
+                    consumer_call,
+                    _returned,
+                ] = function.body.as_slice()
+                else {
+                    anyhow::bail!("expected the six dictionary-inference statements");
+                };
+                let statement = consumer_call
+                    .as_expr_stmt()
+                    .context("expected consume call")?;
+                let call = statement
+                    .value
+                    .as_call_expr()
+                    .context("expected consume call")?;
+                let model = SemanticModel::new(&db, program);
+                let queried = match first {
+                    FirstQuery::Inference => None,
+                    FirstQuery::Reachability => {
+                        assert_eq!(unreachable_ranges(&db, program), []);
+                        None
+                    }
+                    FirstQuery::Callee => Some(call.func.as_ref()),
+                    FirstQuery::Call => Some(statement.value.as_ref()),
+                };
+                if let Some(expression) = queried {
+                    let _ = expression
+                        .inferred_type(&model)
+                        .context("expected call or callee type")?;
+                }
+                let assignment = initializer
+                    .as_assign_stmt()
+                    .context("expected empty dictionary initializer")?;
+                let ty = assignment
+                    .value
+                    .inferred_type(&model)
+                    .context("expected dictionary type")?;
+                let environment = model.program_environment();
+                let display = ty.display(&db, &environment).to_string();
+                assert!(
+                    ty.is_fully_static(&db, &environment),
+                    "{first:?}: {display}"
+                );
+                assert!(display.starts_with("dict["), "{first:?}: {display}");
+                assert!(!display.contains(" | dict["), "{first:?}: {display}");
+                assert!(display.contains("K@add"), "{first:?}: {display}");
+                assert!(display.contains("V@add"), "{first:?}: {display}");
+                let diagnostics = crate::check_file_unwrap(&db, program);
+                assert!(diagnostics.is_empty(), "{first:?}: {diagnostics:?}");
+                assert_eq!(unreachable_ranges(&db, program), []);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn generic_loop_types_do_not_depend_on_reachability_query_order() -> anyhow::Result<()> {
         for guard in ["not isinstance(result, Bundle)", "tag(result) != 'Bundle'"] {
             let source = dedent(
