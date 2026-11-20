@@ -152,7 +152,11 @@ impl<'db> NewType<'db> {
                 // We've reached the `ClassType`.
                 NewTypeBase::ClassType(base_class_type) => {
                     // Call `f`.
-                    let mut mapped_base = NewTypeBase::ClassType(f(base_class_type)?);
+                    let mapped_class = f(base_class_type)?;
+                    if mapped_class == base_class_type {
+                        return Some(self);
+                    }
+                    let mut mapped_base = NewTypeBase::ClassType(mapped_class);
                     // Re-wrap the mapped base class in however many newtypes we unwrapped.
                     for inner_newtype in inner_newtype_stack.into_iter().rev() {
                         mapped_base = NewTypeBase::NewType(NewType::new(
