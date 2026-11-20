@@ -1798,7 +1798,9 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             return ControlFlow::Continue(Some(true));
         }
 
-        let relation = lower.when_assignable_to_owned(db, env, bound, self.inferable);
+        // Neither side contains a variable still being inferred. Retain constraints on
+        // caller-fixed variables instead of using eager compatibility for this proof.
+        let relation = lower.when_constraint_set_assignable_to_owned(db, env, bound);
         let (node, source_order) = storage.load(db, env, &relation);
         if node == ALWAYS_TRUE {
             return ControlFlow::Continue(Some(true));
