@@ -1689,7 +1689,6 @@ impl<'db> ConstraintSetStorage<'db> {
         }
     }
 
-
     fn source_order_data(&self, source_order: SourceOrderId) -> SourceOrder {
         if let Some(compacted) = &self.compacted {
             let index = source_order.index();
@@ -2628,7 +2627,6 @@ impl Node {
             Some(storage.constraint_source_order(constraint)),
         )
     }
-
 }
 
 impl NodeId {
@@ -3125,7 +3123,6 @@ impl NodeId {
             }
         }
     }
-
 
     /// Invokes a closure for each unique BDD node that appears anywhere in a BDD.
     ///
@@ -3764,7 +3761,6 @@ impl<'db> CandidateTypeVarSolution<'db> {
             .chain(self.upper.iter_evidence(EvidenceSource::All))
             .any(|ty| ty.has_provisional_marker(db, env))
     }
-
 
     /// Returns one effective upper bound without expanding factored intersections.
     fn as_single_upper_bound(
@@ -5966,17 +5962,31 @@ mod tests {
                 );
                 let expected = allowed.contains(&witness);
                 assert_eq!(scoped.is_trivially_always_satisfied(), expected);
-                assert_eq!(scoped.is_always_satisfied(db, &env, TypeVarSet::None), expected);
-                assert_eq!(scoped.is_never_satisfied(db, &env, TypeVarSet::None), !expected);
                 assert_eq!(
-                    scoped.negate(db, &builder).is_always_satisfied(db, &env, TypeVarSet::None),
+                    scoped.is_always_satisfied(db, &env, TypeVarSet::None),
+                    expected
+                );
+                assert_eq!(
+                    scoped.is_never_satisfied(db, &env, TypeVarSet::None),
+                    !expected
+                );
+                assert_eq!(
+                    scoped
+                        .negate(db, &builder)
+                        .is_always_satisfied(db, &env, TypeVarSet::None),
                     !expected
                 );
                 let nested = create_constraint(db, &builder, outer, KnownClass::Int)
                     .and(db, &builder, || scoped)
                     .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [outer]));
-                assert_eq!(nested.is_always_satisfied(db, &env, TypeVarSet::None), expected);
-                assert_eq!(nested.is_never_satisfied(db, &env, TypeVarSet::None), !expected);
+                assert_eq!(
+                    nested.is_always_satisfied(db, &env, TypeVarSet::None),
+                    expected
+                );
+                assert_eq!(
+                    nested.is_never_satisfied(db, &env, TypeVarSet::None),
+                    !expected
+                );
             }
         }
     }
@@ -6100,11 +6110,11 @@ mod tests {
         // The local range admits a witness, but cannot establish a rigid caller condition.
         assert!(!quantified.is_always_satisfied(db, &env, TypeVarSet::None));
         assert!(!quantified.is_never_satisfied(db, &env, TypeVarSet::None));
-        assert!(
-            quantified
-                .iff(db, &builder, condition)
-                .is_always_satisfied(db, &env, TypeVarSet::None)
-        );
+        assert!(quantified.iff(db, &builder, condition).is_always_satisfied(
+            db,
+            &env,
+            TypeVarSet::None
+        ));
 
         let builder = ConstraintSetBuilder::new();
         let with_free_lower = ConstraintSet::constrain_typevar_upper_bound(
@@ -6244,7 +6254,11 @@ mod tests {
         let substitute = |value| {
             quantified.apply_type_mapping_impl(
                 db,
-                &TypeMapping::ApplySpecialization(ApplySpecialization::Single(free, value, AliasPolicy::Expand)),
+                &TypeMapping::ApplySpecialization(ApplySpecialization::Single(
+                    free,
+                    value,
+                    AliasPolicy::Expand,
+                )),
                 TypeContext::default(),
                 &ApplyTypeMappingVisitor::new(&env),
             )
@@ -6288,7 +6302,11 @@ mod tests {
         let negative = quantified.negate(db, &builder);
         assert!(!negative.is_always_satisfied(db, &env, TypeVarSet::None));
         assert!(!negative.is_never_satisfied(db, &env, TypeVarSet::None));
-        assert!(!negative.negate(db, &builder).is_always_satisfied(db, &env, TypeVarSet::None));
+        assert!(
+            !negative
+                .negate(db, &builder)
+                .is_always_satisfied(db, &env, TypeVarSet::None)
+        );
         let fixed = negative.and(db, &builder, || {
             create_constraint(db, &builder, result, KnownClass::Int)
         });
@@ -6347,11 +6365,11 @@ mod tests {
         let quantified =
             body.reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
         let covered = int_str.or(db, &builder, || str_int);
-        assert!(
-            quantified
-                .iff(db, &builder, covered)
-                .is_always_satisfied(db, &env, TypeVarSet::None)
-        );
+        assert!(quantified.iff(db, &builder, covered).is_always_satisfied(
+            db,
+            &env,
+            TypeVarSet::None
+        ));
         assert!(
             quantified
                 .and(db, &builder, || left_int)
@@ -6479,8 +6497,14 @@ mod tests {
             let scoped = create_constraint(db, &builder, free, outer)
                 .and(db, &builder, || body)
                 .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [free]));
-            assert_eq!(scoped.is_always_satisfied(db, &env, TypeVarSet::None), satisfiable);
-            assert_eq!(scoped.is_never_satisfied(db, &env, TypeVarSet::None), !satisfiable);
+            assert_eq!(
+                scoped.is_always_satisfied(db, &env, TypeVarSet::None),
+                satisfiable
+            );
+            assert_eq!(
+                scoped.is_never_satisfied(db, &env, TypeVarSet::None),
+                !satisfiable
+            );
         }
         let scoped =
             body.reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [free]));
@@ -7185,7 +7209,11 @@ mod tests {
             let instantiated = output.apply_type_mapping(
                 db,
                 &env,
-                &TypeMapping::ApplySpecialization(ApplySpecialization::Single(caller, bytes, AliasPolicy::Expand)),
+                &TypeMapping::ApplySpecialization(ApplySpecialization::Single(
+                    caller,
+                    bytes,
+                    AliasPolicy::Expand,
+                )),
                 TypeContext::default(),
             );
             assert!(
@@ -7273,10 +7301,20 @@ mod tests {
                     .iter()
                     .all(|binding| binding.solution == Type::TypeVar(outer))
             );
-            assert_matches!(relation.node.node(), Node::Interior(root));
-            assert_matches!(relation.source_order, Some(order));
+            let root = match relation.node.node() {
+                Node::Interior(root) => root,
+                Node::AlwaysTrue => panic!("expected an interior witness relation, got always true"),
+                Node::AlwaysFalse => panic!("expected an interior witness relation, got always false"),
+            };
+            let Some(order) = relation.source_order else {
+                panic!("expected source ordering for the witness relation");
+            };
             let residual = CandidateResidual {
-                relation: OwnedConstraintSetBuilder::snapshot(&builder.storage.borrow(), root, order),
+                relation: OwnedConstraintSetBuilder::snapshot(
+                    &builder.storage.borrow(),
+                    root,
+                    order,
+                ),
                 locals,
                 inferable: locals,
                 unspecialized_type_var_policy: UnspecializedTypeVarPolicy::Ignore,
@@ -8595,7 +8633,14 @@ mod tests {
                 remaining_paths: 0,
             };
             assert_eq!(
-                node.is_always_satisfied_with_limits(db, &env, &mut storage, TypeVarSet::None, None, &mut limits),
+                node.is_always_satisfied_with_limits(
+                    db,
+                    &env,
+                    &mut storage,
+                    TypeVarSet::None,
+                    None,
+                    &mut limits
+                ),
                 ControlFlow::Continue(expected)
             );
         }
@@ -8772,7 +8817,9 @@ mod tests {
             let mut upper_bound = UpperBound::unconstrained();
             upper_bound.add_clause(provenance, upper);
             let mut bounds = CandidateTypeVarSolution::from_equivalence(
-                t, lower, TypeVarSet::from_typevars(db, [t]),
+                t,
+                lower,
+                TypeVarSet::from_typevars(db, [t]),
             );
             bounds.upper = upper_bound;
             assert_eq!(
@@ -8800,7 +8847,9 @@ mod tests {
         let divergent = Type::divergent(salsa::plumbing::Id::from_bits(1));
         let solve = |lower, upper| {
             let mut bounds = CandidateTypeVarSolution::from_equivalence(
-                t, lower, TypeVarSet::from_typevars(db, [t]),
+                t,
+                lower,
+                TypeVarSet::from_typevars(db, [t]),
             );
             bounds.upper = upper;
             CandidateSolutions::preliminary_solve(db, &env, &builder, &bounds)
