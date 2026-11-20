@@ -11235,12 +11235,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             call_expression_tcx,
         );
 
-        // An argument expression of Never prevents the call from completing.
-        let never_argument = arguments.iter_source_order().any(|argument| {
-            self.try_expression_type(argument.value())
-                .is_some_and(|ty| ty == Type::Never)
-        });
-
         let mut inferred = match bindings_result {
             Ok(inferred) => inferred,
             Err(CallError(_, mut bindings)) => {
@@ -11253,11 +11247,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     true,
                 );
                 self.report_provided_call_diagnostics(call_expression, diagnostics);
-                return if never_argument {
-                    Type::Never
-                } else {
-                    bindings.return_type(db, env)
-                };
+                return bindings.return_type(db, env);
             }
         };
         let revealed_type = self.revealed_type_for_call(&inferred);
@@ -11506,9 +11496,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
-        if never_argument {
-            return Type::Never;
-        }
         let return_ty = self
             .observed_typed_dict_get_result(call_expression)
             .unwrap_or_else(|| bindings.return_type(db, env));

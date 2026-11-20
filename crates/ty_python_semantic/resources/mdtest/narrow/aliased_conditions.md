@@ -1344,13 +1344,13 @@ become valid inputs.
 def wrong_tag(token: NameToken | EndToken) -> str:
     kind = token["kind"]
     if kind == "end":
-        return token["value"]  # error: [invalid-key]
+        return token["value"]  # error: [invalid-typed-dict-key]
     return ""
 
 def wrong_return(token: NameToken | EndToken) -> str:
     kind = token["kind"]
     if kind == "name":
-        return 42  # error: [invalid-return-type]
+        return 42  # error: [invalid-explicit-return]
     return ""
 
 saved({"kind": "name", "value": 42})  # error: [invalid-argument-type]

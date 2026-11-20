@@ -8787,11 +8787,15 @@ mod tests {
         db.write_dedented(
             "/src/a.py",
             "def f[T, **P](value: T, *args: P.args, **kwargs: P.kwargs) -> T: ...",
-        ).unwrap();
+        )
+        .unwrap();
         let signature = get_function_f(&db, "/src/a.py").last_definition_signature(&db);
         let env = db.program_environment();
         let callable = Type::function_like_callable(&db, signature.clone());
-        assert_eq!(signature.upper_specialize_type(&db, &env, callable), callable);
+        assert_eq!(
+            signature.upper_specialize_type(&db, &env, callable),
+            callable
+        );
 
         // Retaining P does not shield a captured T from the outer substitution.
         let context = signature.generic_context.unwrap();
@@ -8799,18 +8803,18 @@ mod tests {
         let retained = GenericContext::from_typevar_instances(
             &db,
             &env,
-            context.variables(&db).filter(|variable| variable.is_paramspec(&db)),
+            context
+                .variables(&db)
+                .filter(|variable| variable.is_paramspec(&db)),
         );
         let mut nested = signature.clone().with_parameters(Parameters::empty());
         nested.generic_context = Some(retained);
-        let expected = nested.clone().with_return_type(
-            signature.upper_specialize_type(&db, &env, captured),
-        );
+        let expected = nested
+            .clone()
+            .with_return_type(signature.upper_specialize_type(&db, &env, captured));
         assert_ne!(expected.return_type(), captured);
         assert_eq!(
-            signature.upper_specialize_type(
-                &db, &env, Type::function_like_callable(&db, nested),
-            ),
+            signature.upper_specialize_type(&db, &env, Type::function_like_callable(&db, nested),),
             Type::function_like_callable(&db, expected),
         );
     }

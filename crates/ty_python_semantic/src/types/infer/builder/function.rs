@@ -1559,6 +1559,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
         if !typevar.is_paramspec(db)
             || typevar.paramspec_attr(db) == Some(expected)
+            || (expected == ParamSpecAttrKind::Kwargs
+                && flags.contains(TypeExpressionFlags::KEYWORD_PARAM_SPEC)
+                && typevar.is_captured_keyword_arguments(db))
             || (expected == ParamSpecAttrKind::Args && flags.contains(TypeExpressionFlags::UNPACK))
         {
             return ty;

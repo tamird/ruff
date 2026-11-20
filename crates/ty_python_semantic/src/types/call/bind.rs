@@ -8889,11 +8889,15 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     .iter()
                     .any(|(argument_index, _)| {
                         let matches = &self.argument_matches[*argument_index].parameters;
-                        // Complete keyword sets are projected onto the ParamSpec in the sub-call.
+                        // Observed keyword entries can be separated from consumed wrapper
+                        // parameters even when the mapping also has residual values.
                         // Other arguments must belong entirely to the ParamSpec.
                         matches!(
                             self.arguments.get(*argument_index),
-                            Some(CallArgument::Keywords(keywords)) if keywords.is_complete()
+                            Some(CallArgument::Keywords(
+                                KeywordArgument::Known { types: _, keywords: _ }
+                                    | KeywordArgument::Observed { types: _, keywords: _ }
+                            ))
                         ) || matches
                             .iter()
                             .all(|parameter| parameter.index >= prefix_len)
