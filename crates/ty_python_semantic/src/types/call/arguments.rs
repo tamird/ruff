@@ -1426,7 +1426,7 @@ mod tests {
     use crate::db::tests::TestDbBuilder;
     use crate::types::call::{Bindings, CallableBinding};
     use crate::types::constraints::ConstraintSetBuilder;
-    use crate::types::{DynamicType, KnownClass, Parameter, Signature};
+    use crate::types::{DynamicType, KnownClass, Parameter, Parameters, Signature};
 
     #[test]
     fn nominal_union_arguments_need_final_context() -> anyhow::Result<()> {
