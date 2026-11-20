@@ -356,13 +356,27 @@ mod tests {
         source: &str,
         first: Option<usize>,
     ) -> anyhow::Result<String> {
+        collection_write_results_after_query(source, first, false, None).map(|(ty, _)| ty)
+    }
+
+    fn collection_write_results_after_query(
+        source: &str,
+        first: Option<usize>,
+        reachability_first: bool,
+        expected_rhs: Option<&str>,
+    ) -> anyhow::Result<(String, Vec<String>)> {
         let db = TestDbBuilder::new().with_file(TEST_PATH, source).build()?;
         let file = system_path_to_file(&db, TEST_PATH)?;
         let program = db.program_file(file);
         let module = parsed_module(&db, program.python_file(&db)).load(&db);
-        let function = module.suite()[0]
-            .as_function_def_stmt()
+        let function = module
+            .suite()
+            .iter()
+            .find_map(ast::Stmt::as_function_def_stmt)
             .context("expected function")?;
+        if reachability_first {
+            assert_eq!(unreachable_ranges(&db, program), []);
+        }
         if let Some(first) = first {
             let assignment = function.body[first]
                 .as_assign_stmt()
@@ -380,8 +394,157 @@ mod tests {
         let ty = value
             .inferred_type(&model)
             .context("expected inferred type")?;
+        let returned = ty.display(&db, &model.program_environment()).to_string();
+        if let Some(expected) = expected_rhs {
+            let assignment = function
+                .body
+                .iter()
+                .rev()
+                .find_map(ast::Stmt::as_assign_stmt)
+                .context("expected fresh-value assignment")?;
+            let actual = assignment
+                .value
+                .inferred_type(&model)
+                .context("expected assigned value type")?;
+            assert_eq!(
+                actual
+                    .display(&db, &model.program_environment())
+                    .to_string(),
+                expected,
+                "{first:?}, reachability_first={reachability_first}:\n{source}",
+            );
+        }
         assert_eq!(unreachable_ranges(&db, program), []);
-        Ok(ty.display(&db, &model.program_environment()).to_string())
+        let diagnostics = crate::check_file_unwrap(&db, program);
+        let mut ids: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str().to_owned())
+            .collect();
+        ids.sort();
+        Ok((returned, ids))
+    }
+
+    #[test]
+    fn checked_collection_writes_preserve_fresh_container_context() -> anyhow::Result<()> {
+        let source = dedent(
+            r#"
+            def example(seed: list[int]):
+                grouped = {}
+                grouped['seed'] = seed
+                grouped['fresh'] = []
+                return grouped
+            "#,
+        );
+        for first in [None, Some(0)] {
+            for reachability_first in [false, true] {
+                let (returned, ids) =
+                    collection_write_results_after_query(&source, first, reachability_first, None)?;
+                assert_eq!(
+                    returned, "dict[str, list[int]]",
+                    "{first:?}, reachability_first={reachability_first}"
+                );
+                assert!(
+                    ids.is_empty(),
+                    "{first:?}, reachability_first={reachability_first}: {ids:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checked_collection_writes_preserve_declared_nested_context() -> anyhow::Result<()> {
+        for (value_type, fresh) in [
+            ("list[list[int]]", "[[]]"),
+            ("dict[str, list[int]]", "{}"),
+            ("dict[str, list[int]]", "{'values': []}"),
+        ] {
+            let source = format!(
+                "def example(grouped: dict[str, {value_type}]):\n    local = grouped\n    local['fresh'] = {fresh}\n    return local\n",
+            );
+            for first in [None, Some(0)] {
+                for reachability_first in [false, true] {
+                    let (returned, ids) = collection_write_results_after_query(
+                        &source,
+                        first,
+                        reachability_first,
+                        Some(value_type),
+                    )?;
+                    assert_eq!(
+                        returned,
+                        format!("dict[str, {value_type}]"),
+                        "{first:?}, reachability_first={reachability_first}:\n{source}"
+                    );
+                    assert!(
+                        ids.is_empty(),
+                        "{first:?}, reachability_first={reachability_first}: {ids:?}\n{source}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checked_collection_writes_preserve_callable_context() -> anyhow::Result<()> {
+        for (body, expected_ids) in [
+            ("value + 1", vec![]),
+            ("value + 'bad'", vec!["unsupported-operator"]),
+        ] {
+            let source = format!(
+                "from collections.abc import Callable\n\ndef example(grouped: dict[str, Callable[[int], int]]) -> int:\n    local = grouped\n    local['increment'] = lambda value: {body}\n    return local['increment'](1)\n",
+            );
+            for first in [None, Some(0)] {
+                for reachability_first in [false, true] {
+                    let (returned, ids) = collection_write_results_after_query(
+                        &source,
+                        first,
+                        reachability_first,
+                        None,
+                    )?;
+                    if expected_ids.is_empty() {
+                        assert_eq!(
+                            returned, "int",
+                            "{first:?}, reachability_first={reachability_first}:\n{source}"
+                        );
+                    }
+                    assert_eq!(
+                        ids, expected_ids,
+                        "{first:?}, reachability_first={reachability_first}:\n{source}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checked_collection_writes_keep_invalid_key_and_value_diagnostics() -> anyhow::Result<()> {
+        let source = dedent(
+            r#"
+            def example(grouped: dict[str, list[int]], bad_key: int, bad_value: str):
+                local = grouped
+                local[bad_key] = []
+                local['values'] = bad_value
+                return local
+            "#,
+        );
+        for first in [None, Some(0)] {
+            for reachability_first in [false, true] {
+                let (returned, ids) =
+                    collection_write_results_after_query(&source, first, reachability_first, None)?;
+                assert_eq!(
+                    returned, "dict[str, list[int]]",
+                    "{first:?}, reachability_first={reachability_first}"
+                );
+                assert_eq!(
+                    ids,
+                    ["invalid-assignment", "invalid-assignment"],
+                    "{first:?}, reachability_first={reachability_first}"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -433,10 +596,7 @@ mod tests {
         assert_eq!(unreachable_ranges(&db, program), []);
         let diagnostics = crate::check_file_unwrap(&db, program);
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(
-            diagnostics[0].id(),
-            DiagnosticId::lint("unresolved-attribute")
-        );
+        assert_eq!(diagnostics[0].id(), DiagnosticId::lint("missing-attribute"));
         Ok(())
     }
 

@@ -184,8 +184,9 @@ impl SemanticDb for Db {
             FileSettings::Global => self.settings().dependency_metadata(self).as_ref(),
             FileSettings::InheritProjectConfig => None,
             FileSettings::File {
+                rules: _,
+                analysis: _,
                 dependency_metadata,
-                ..
             } => dependency_metadata.as_ref(),
         }
     }
@@ -226,7 +227,7 @@ fn file_settings(db: &dyn SemanticDb, file: File) -> FileSettings {
 
     FileSettings::File {
         rules: MdtestRuleSelection(mdtest_rule_selection(options.rules.as_ref(), None)),
-        analysis: mdtest_analysis_settings(options.analysis.as_ref()),
+        analysis: Box::new(mdtest_analysis_settings(options.analysis.as_ref())),
         dependency_metadata: options.dependency_metadata.map(|fixture| fixture.metadata),
     }
 }
@@ -238,7 +239,7 @@ enum FileSettings {
     InheritProjectConfig,
     File {
         rules: MdtestRuleSelection,
-        analysis: AnalysisSettings,
+        analysis: Box<AnalysisSettings>,
         dependency_metadata: Option<DependencyMetadata>,
     },
 }
@@ -247,14 +248,22 @@ impl FileSettings {
     fn rules<'db>(&'db self, db: &'db Db) -> &'db RuleSelection {
         match self {
             Self::Global | Self::InheritProjectConfig => db.settings().rule_selection(db),
-            Self::File { rules, .. } => rules,
+            Self::File {
+                rules,
+                analysis: _,
+                dependency_metadata: _,
+            } => rules,
         }
     }
 
     fn analysis<'db>(&'db self, db: &'db Db) -> &'db AnalysisSettings {
         match self {
             Self::Global | Self::InheritProjectConfig => db.settings().analysis(db),
-            Self::File { analysis, .. } => analysis,
+            Self::File {
+                rules: _,
+                analysis,
+                dependency_metadata: _,
+            } => analysis,
         }
     }
 }

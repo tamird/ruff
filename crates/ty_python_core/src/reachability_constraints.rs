@@ -593,6 +593,13 @@ impl ReachabilityConstraintsBuilder {
         if_false: ScopedReachabilityConstraintId,
         cache: &mut FxHashMap<InteriorNode, ScopedReachabilityConstraintId>,
     ) -> ScopedReachabilityConstraintId {
+        #[derive(Clone, Copy)]
+        enum Edge {
+            True,
+            Ambiguous,
+            False,
+        }
+
         if if_true == if_false {
             return if_true;
         }
@@ -621,12 +628,6 @@ impl ReachabilityConstraintsBuilder {
                 atom
             })
             .fold(atom, std::cmp::max);
-        #[derive(Clone, Copy)]
-        enum Edge {
-            True,
-            Ambiguous,
-            False,
-        }
         let cofactor = |graph: &Self, id: ScopedReachabilityConstraintId, branch| {
             if id.is_terminal() {
                 return id;

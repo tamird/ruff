@@ -1137,6 +1137,10 @@ fn frozen_export_contents<'db>(
     },
     heap_size=get_size2::GetSize::get_heap_size,
 )]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Salsa owns the names in this tracked query's cache key"
+)]
 fn frozen_exported_field_contents<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
@@ -1594,6 +1598,37 @@ fn operation_contents<'db>(
     })
 }
 
+/// Whether every use of this dictionary in a call only unpacks its string keys.
+fn call_only_iterates_keyword_keys(call: &ast::ExprCall, receiver: &ast::Expr) -> bool {
+    let Some(receiver) = PlaceExpr::try_from_expr(receiver) else {
+        return false;
+    };
+    let mentions_receiver = |expression: &ast::Expr| {
+        any_over_expr(expression, |expression| {
+            PlaceExpr::try_from_expr(expression).as_ref() == Some(&receiver)
+        })
+    };
+    let iterates_keys = |expression: &ast::Expr| {
+        if let ast::Expr::Starred(starred) = expression {
+            PlaceExpr::try_from_expr(&starred.value).as_ref() == Some(&receiver)
+        } else {
+            false
+        }
+    };
+    !mentions_receiver(&call.func)
+        && call.arguments.args.iter().any(&iterates_keys)
+        && call
+            .arguments
+            .args
+            .iter()
+            .all(|argument| iterates_keys(argument) || !mentions_receiver(argument))
+        && call
+            .arguments
+            .keywords
+            .iter()
+            .all(|keyword| !mentions_receiver(&keyword.value))
+}
+
 /// Apply declaration effects only to direct arguments matched by the ordinary call binder.
 /// Other occurrences can expose the same container, including a nested argument or callee.
 fn call_preserves_contents<'db>(
@@ -1913,18 +1948,12 @@ fn mapping_transfer<'db>(
                 };
             }
             let receiver = receiver.node(&module);
-            // Positional unpacking of captured keywords passes their string keys, not the
-            // dictionary. Reject calls that also mention the dictionary elsewhere.
-            if let [ast::Expr::Starred(starred)] = call.arguments.args.as_ref()
-                && call.arguments.keywords.is_empty()
-                && let Some(place) = PlaceExpr::try_from_expr(receiver)
-                && PlaceExpr::try_from_expr(&starred.value).as_ref() == Some(&place)
-                && !any_over_expr(&call.func, |expression| {
-                    PlaceExpr::try_from_expr(expression).as_ref() == Some(&place)
-                })
-                && inference
-                    .try_expression_type(receiver)
-                    .is_some_and(|ty| ParamSpecKeywords::from_type(db, ty).is_some())
+            // Positional unpacking passes the captured dictionary's immutable string keys.
+            // Other arguments are safe unless they also pass or access the dictionary.
+            if inference
+                .try_expression_type(receiver)
+                .is_some_and(|ty| ParamSpecKeywords::from_type(db, ty).is_some())
+                && call_only_iterates_keyword_keys(call, receiver)
             {
                 return MappingTransfer::Keep {
                     exposes_descendants: false,
