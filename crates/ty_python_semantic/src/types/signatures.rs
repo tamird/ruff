@@ -468,21 +468,20 @@ impl<'db> CallableSignature<'db> {
                 if visitor.preserve_callable_binders
                     && let Some(context) = signature.generic_context
                 {
-                    let bindings: Vec<_> = context
+                    let variables: Vec<_> = context
                         .variables(db)
                         .filter(|variable| {
                             specialization
                                 .get(db, *variable)
                                 .is_some_and(|mapped| mapped != Type::TypeVar(*variable))
                         })
-                        .map(|variable| (variable, Type::TypeVar(variable)))
                         .collect();
-                    if !bindings.is_empty() {
+                    if !variables.is_empty() {
                         // These variables are still quantified by the returned callable. Shadow
                         // the outer projection while mapping its signature, including nested types.
-                        let specialization = ApplySpecialization::WithBindings {
+                        let specialization = ApplySpecialization::WithBoundVariables {
                             specialization,
-                            bindings: &bindings,
+                            variables: &variables,
                         };
                         let mapping = match type_mapping {
                             TypeMapping::ApplySpecialization(_) => {
@@ -6607,7 +6606,11 @@ impl<'db> Parameters<'db> {
             .then_some(tail)
     }
 
-    pub(super) fn keyword_projection(&self, db: &'db dyn Db, capture: &Parameter<'db>) -> Option<Self> {
+    pub(super) fn keyword_projection(
+        &self,
+        db: &'db dyn Db,
+        capture: &Parameter<'db>,
+    ) -> Option<Self> {
         if self.is_top() {
             return Some(self.clone());
         }
@@ -8770,6 +8773,40 @@ mod tests {
                 "{implementation} against {overload}",
             );
         }
+    }
+
+    #[test]
+    fn upper_result_preserves_its_own_callable_binders() {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            "def f[T, **P](value: T, *args: P.args, **kwargs: P.kwargs) -> T: ...",
+        ).unwrap();
+        let signature = get_function_f(&db, "/src/a.py").last_definition_signature(&db);
+        let env = db.program_environment();
+        let callable = Type::function_like_callable(&db, signature.clone());
+        assert_eq!(signature.upper_specialize_type(&db, &env, callable), callable);
+
+        // Retaining P does not shield a captured T from the outer substitution.
+        let context = signature.generic_context.unwrap();
+        let captured = signature.return_type();
+        let retained = GenericContext::from_typevar_instances(
+            &db,
+            &env,
+            context.variables(&db).filter(|variable| variable.is_paramspec(&db)),
+        );
+        let mut nested = signature.clone().with_parameters(Parameters::empty());
+        nested.generic_context = Some(retained);
+        let expected = nested.clone().with_return_type(
+            signature.upper_specialize_type(&db, &env, captured),
+        );
+        assert_ne!(expected.return_type(), captured);
+        assert_eq!(
+            signature.upper_specialize_type(
+                &db, &env, Type::function_like_callable(&db, nested),
+            ),
+            Type::function_like_callable(&db, expected),
+        );
     }
 
     #[test]
