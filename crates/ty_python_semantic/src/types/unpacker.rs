@@ -137,10 +137,9 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
             }
             UnpackKind::Iterable { mode } => {
                 let env = self.context.program_environment();
-                // List and dict types widen literal entries, so recover them from the expressions.
-                // Tuple inference already preserves elements and widens tuples over 64 entries
-                // to bound inference cost; use that inferred type instead of rereading expressions.
                 if !mode.is_async()
+                    // Recover literals widened by list and dict inference (e.g. 1 to int).
+                    // Reading tuple elements would undo the widening applied above 64 entries.
                     && matches!(value_expr, ast::Expr::Dict(_) | ast::Expr::List(_))
                     && let Some(element) =
                         precise_iterable_element_type(db, env, value_expr, |expr| {

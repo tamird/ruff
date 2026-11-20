@@ -262,7 +262,11 @@ impl AstIds {
                 }
                 let offset = remaining.trailing_zeros();
                 remaining &= remaining - 1;
-                let node = ast::NodeIndex::from(root_index(page.first_node) as u32 + offset);
+                let first_node = page
+                    .first_node
+                    .as_u32()
+                    .expect("expected an indexed node from the root AST");
+                let node = ast::NodeIndex::from(first_node + offset);
                 let use_id = self.use_ids.get(use_index);
                 use_index += 1;
                 Some((node, use_id))

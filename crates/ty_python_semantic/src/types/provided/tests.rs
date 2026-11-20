@@ -70,14 +70,20 @@ Literal[float]
                 let native_file = db.program_file(native_file);
                 for name in ["Bounded", "Exact", "Terminal", "Invalid"] {
                     let class = crate::place::global_symbol(db, native_file, name)
-                        .place.expect_type().as_class_literal()?;
+                        .place
+                        .expect_type()
+                        .as_class_literal()?;
                     let class = class.as_static()?;
-                    if receiver.base_class_specialization(db, &env, class).is_none() {
+                    if receiver
+                        .base_class_specialization(db, &env, class)
+                        .is_none()
+                    {
                         continue;
                     }
-                    if name == "Invalid" {
-                        panic!("invalid runtime subscription reached result refinement");
-                    }
+                    assert_ne!(
+                        name, "Invalid",
+                        "invalid runtime subscription reached result refinement"
+                    );
                     return Some(KnownClass::Str.to_instance(db, &env));
                 }
                 None
@@ -88,31 +94,63 @@ Literal[float]
         let db = builder.build()?;
         let file = system_path_to_file(&db, "/src/main.py")?;
         let diagnostics = db.check_file(file);
-        let mut ids: Vec<_> = diagnostics.iter().map(|diagnostic| diagnostic.id().as_str()).collect();
+        let mut ids: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect();
         ids.sort_unstable();
-        assert_eq!(ids, ["invalid-argument-type", "invalid-type-arguments", "invalid-type-form"],
-            "{diagnostics:#?}");
+        assert_eq!(
+            ids,
+            [
+                "invalid-argument-type",
+                "invalid-type-arguments",
+                "invalid-type-form"
+            ],
+            "{diagnostics:#?}"
+        );
         let file = db.program_file(file);
         let env = ProgramEnvironment::from_file(file);
         let model = SemanticModel::new(&db, file);
         let module = parsed_module(&db, file.python_file(&db)).load(&db);
-        let actual: Vec<_> = module.suite().iter().filter_map(ast::Stmt::as_function_def_stmt)
+        let actual: Vec<_> = module
+            .suite()
+            .iter()
+            .filter_map(ast::Stmt::as_function_def_stmt)
             .map(|function| {
                 let [ast::Stmt::Return(statement)] = function.body.as_slice() else {
                     panic!("expected one return statement");
                 };
-                let ty = statement.value.as_ref().unwrap().inferred_type(&model).unwrap();
+                let ty = statement
+                    .value
+                    .as_ref()
+                    .unwrap()
+                    .inferred_type(&model)
+                    .unwrap();
                 (function.name.as_str(), ty.display(&db, &env).to_string())
-            }).collect();
-        assert_eq!(actual, [
-            ("bounded", if supplied { "Unknown & str" } else { "Unknown" }.into()),
-            ("intersection", if supplied { "Unknown & str" } else { "Unknown" }.into()),
-            ("exact", "Literal[\"exact\"]".into()),
-            ("terminal", "Never".into()),
-            ("invalid", "Unknown".into()),
-        ]);
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                (
+                    "bounded",
+                    if supplied { "Unknown & str" } else { "Unknown" }.into()
+                ),
+                (
+                    "intersection",
+                    if supplied { "Unknown & str" } else { "Unknown" }.into()
+                ),
+                ("exact", "Literal[\"exact\"]".into()),
+                ("terminal", "Never".into()),
+                ("invalid", "Unknown".into()),
+            ]
+        );
 
-        let applications: Vec<_> = module.suite().iter().filter_map(ast::Stmt::as_expr_stmt).collect();
+        let applications: Vec<_> = module
+            .suite()
+            .iter()
+            .filter_map(ast::Stmt::as_expr_stmt)
+            .collect();
         let [class_application, literal_application] = applications.as_slice() else {
             anyhow::bail!("expected class and Literal type applications");
         };
@@ -121,8 +159,14 @@ Literal[float]
             anyhow::bail!("expected generic class recovery: {class_recovery:?}");
         };
         assert_eq!(class_recovery.origin(&db).name(&db).as_str(), "Bounded");
-        assert_eq!(class_recovery.specialization(&db).types(&db), [Type::unknown()]);
-        assert_eq!(literal_application.value.inferred_type(&model), Some(Type::unknown()));
+        assert_eq!(
+            class_recovery.specialization(&db).types(&db),
+            [Type::unknown()]
+        );
+        assert_eq!(
+            literal_application.value.inferred_type(&model),
+            Some(Type::unknown())
+        );
     }
     Ok(())
 }
@@ -1844,7 +1888,7 @@ consume(target, consumed=1, required=1)
     );
     let collision = diagnostics
         .last()
-        .and_then(|diagnostic| diagnostic.primary_span())
+        .and_then(ruff_db::diagnostic::Diagnostic::primary_span)
         .and_then(|span| span.range())
         .context("the required collision must have a source range")?;
     assert_eq!(
@@ -2610,7 +2654,7 @@ if False:
             let [keyword] = call.arguments.keywords.as_ref() else {
                 return Ok(None);
             };
-            match keyword.arg.as_ref().map(|name| name.as_str()) {
+            match keyword.arg.as_ref().map(ast::Identifier::as_str) {
                 Some("unchecked") => return Ok(None),
                 Some("rejected") => {
                     let mut diagnostic = Diagnostic::new(

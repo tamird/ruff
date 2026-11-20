@@ -6,6 +6,7 @@ use crate::types::tuple::{TupleSpec, TupleType, VariableSegment};
 use crate::types::visitor::any_over_type;
 use crate::types::{
     ClassType, DynamicType, GenericAlias, KnownClass, SubclassOfInner, SubclassOfType, Type,
+    UnionType,
 };
 use crate::{Db, ProgramEnvironment};
 
@@ -69,6 +70,36 @@ impl<'db> AmbiguousReturnMerger<'_, 'db> {
         // candidates can make the result depend on overload order.
         if let Some(equivalent) = self.equivalent_representative(types) {
             return equivalent;
+        }
+
+        let is_provisional = |ty: Type<'db>| {
+            ty.is_recursive_divergent()
+                && ty
+                    .as_divergent()
+                    .is_some_and(|divergent| divergent.materialization_kind().is_none())
+        };
+        if types.iter().copied().any(is_provisional) {
+            let other_returns: Vec<_> = types
+                .iter()
+                .copied()
+                .filter(|ty| !is_provisional(*ty))
+                .collect();
+            if !other_returns.is_empty() {
+                let merged = self.merge(&other_returns);
+                if !matches!(merged, Type::Dynamic(_) | Type::Divergent(_)) {
+                    // A recursive marker has no return shape to compare yet. Keep the other
+                    // candidates' shared structure and retain the marker for cycle recovery.
+                    return UnionType::from_elements_cycle_recovery(
+                        self.db,
+                        self.env,
+                        types
+                            .iter()
+                            .copied()
+                            .filter(|ty| is_provisional(*ty))
+                            .chain([merged]),
+                    );
+                }
+            }
         }
 
         self.visitor.visit(self.db, ReturnTypes(types.into()), || {
@@ -279,6 +310,72 @@ impl<'db> AmbiguousReturnMerger<'_, 'db> {
                         )
                     }),
                 ))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::tests::setup_db;
+    use crate::types::{ApplyTypeMappingVisitor, MaterializationKind};
+
+    #[test]
+    fn provisional_ambiguous_returns_keep_concrete_structure() {
+        let db = setup_db();
+        let env = db.program_environment();
+        let recursive = Type::divergent(salsa::plumbing::Id::from_bits(1));
+        let foreign = Type::divergent(salsa::plumbing::Id::from_bits(2));
+        let list = KnownClass::List.to_specialized_instance(&db, &env, &[Type::unknown()]);
+        let returns = UnionType::from_elements_cycle_recovery(&db, &env, [recursive, list]);
+        for candidates in [[recursive, returns], [returns, recursive]] {
+            assert_eq!(merge_ambiguous_returns(&db, &env, &candidates), returns);
+        }
+        let with_foreign = merge_ambiguous_returns(&db, &env, &[recursive, foreign, returns]);
+        assert_eq!(
+            with_foreign,
+            UnionType::from_elements_cycle_recovery(&db, &env, [recursive, foreign, list]),
+        );
+    }
+
+    #[test]
+    fn provisional_returns_do_not_hide_settled_ambiguity() {
+        let db = setup_db();
+        let env = db.program_environment();
+        let recursive = Type::divergent(salsa::plumbing::Id::from_bits(1));
+        let ambiguous = Type::Dynamic(DynamicType::AmbiguousOverload);
+        let left = Type::int_literal(1);
+        let right = Type::int_literal(2);
+        for candidates in [vec![left, right], vec![recursive, left, right]] {
+            assert_eq!(merge_ambiguous_returns(&db, &env, &candidates), ambiguous);
+        }
+        assert_eq!(
+            merge_ambiguous_returns(&db, &env, &[Type::unknown(), Type::unknown()]),
+            Type::unknown(),
+        );
+        assert_eq!(
+            merge_ambiguous_returns(&db, &env, &[ambiguous, recursive]),
+            ambiguous,
+        );
+        assert!(merge_ambiguous_returns(&db, &env, &[recursive, Type::unknown()]).is_unknown());
+    }
+
+    #[test]
+    fn bare_narrowing_and_materialized_markers_keep_ambiguity() {
+        let db = setup_db();
+        let env = db.program_environment();
+        let recursive = Type::divergent(salsa::plumbing::Id::from_bits(1));
+        let visitor = ApplyTypeMappingVisitor::new(&env);
+        let ambiguous = Type::Dynamic(DynamicType::AmbiguousOverload);
+        for other in [
+            Type::pending_narrowing(),
+            recursive.materialize(&db, MaterializationKind::Top, &visitor),
+            recursive.materialize(&db, MaterializationKind::Bottom, &visitor),
+        ] {
+            assert!(matches!(other, Type::Divergent(_)));
+            for candidates in [[recursive, other], [other, recursive]] {
+                assert_eq!(merge_ambiguous_returns(&db, &env, &candidates), ambiguous);
             }
         }
     }
