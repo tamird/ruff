@@ -973,8 +973,8 @@ impl<'db> SignatureRelationKey<'db> {
 pub(crate) type SignatureRelationVisitor<'db> =
     ActiveRecursionDetector<SignatureRelationKey<'db>, Option<(Type<'db>, Type<'db>)>>;
 
-/// Visit explicit type arguments and finite aliases without expanding recursive definitions,
-/// bounds, or class members, which can grow indefinitely.
+/// Visit explicit type arguments, attached instance storage and finite aliases without
+/// expanding recursive definitions, bounds, or class declarations, which can grow indefinitely.
 fn visit_type_arguments<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -988,6 +988,9 @@ fn visit_type_arguments<'db>(
             continue;
         }
         visit(ty)?;
+        if let Some(fields) = ty.provided_instance_fields(db) {
+            pending.extend(fields.iter().map(|field| field.ty));
+        }
         match ty {
             Type::Union(union) => pending.extend_from_slice(union.elements(db)),
             Type::Intersection(intersection) => {
@@ -1099,6 +1102,12 @@ fn receiver_arguments_decrease<'db>(
             .map(|ty| ty.materialization_kind(db))
     {
         return None;
+    }
+    // Attached instance storage can carry finite nesting without class type arguments.
+    if previous.provided_instance_fields(db).is_some()
+        && contains_type_argument(db, env, previous, current)
+    {
+        return Some(true);
     }
     let previous_alias = receiver_class(db, env, previous)?.into_generic_alias()?;
     let current_alias = receiver_class(db, env, current)?.into_generic_alias()?;
