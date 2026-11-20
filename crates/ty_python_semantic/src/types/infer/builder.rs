@@ -34,7 +34,8 @@ use super::{
     InferenceRegion, OtherDefinitionInferenceExtra, ScopeInference, ScopeInferenceExtra,
     extend_collection_use_constraints, infer_deferred_types, infer_definition_types,
     infer_definition_with_body_domain, infer_expression_types, infer_expression_with_body_domain,
-    infer_statement_with_body_domain, infer_unpack_types,
+    infer_scope_with_body_domain, infer_statement_with_body_domain, infer_unpack_types,
+    infer_unpack_with_body_domain,
 };
 use crate::diagnostic::format_enumeration;
 use crate::place::{
@@ -9566,7 +9567,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         tcx: TypeContext<'db>,
     ) -> Option<Type<'db>> {
         self.infer_collection_with_union_context(tcx, |builder, narrowed_tcx| {
-            let inference = infer_scope_types(builder.db(), scope, narrowed_tcx);
+            let inference = infer_scope_with_body_domain(
+                builder.db(),
+                scope,
+                narrowed_tcx,
+                builder.context.body_domain,
+            );
             builder.extend_scope(inference);
 
             builder.infer_collection_literal_impl(
@@ -9846,8 +9852,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             //  but only if the target is a name. We should report a diagnostic here if the target isn't a name:
             //  `[... for a.x in not_iterable]
             let (iterable_type, element_type) = if is_first {
-                let result =
-                    infer_expression_types(builder.db(), builder.index.expression(iter), tcx);
+                let result = infer_expression_with_body_domain(
+                    builder.db(),
+                    builder.index.expression(iter),
+                    tcx,
+                    builder.context.body_domain,
+                );
                 (
                     result.expression_type(iter),
                     builder
@@ -9896,7 +9906,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let mut infer_iterable_type = || {
             let expression = self.index.expression(iterable);
-            let result = infer_expression_types(self.db(), expression, TypeContext::default());
+            let result = infer_expression_with_body_domain(
+                self.db(),
+                expression,
+                TypeContext::default(),
+                self.context.body_domain,
+            );
             let iterable_type = result.expression_type(iterable);
             let element_type = if comprehension.is_async() {
                 None
@@ -9919,7 +9934,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let target_type = match comprehension.target_kind() {
             TargetKind::Sequence(unpack_position, unpack) => {
-                let unpacked = infer_unpack_types(self.db(), unpack);
+                let unpacked =
+                    infer_unpack_with_body_domain(self.db(), unpack, self.context.body_domain);
                 if unpack_position == UnpackPosition::First {
                     self.context.extend(unpacked.context_result());
                 }
