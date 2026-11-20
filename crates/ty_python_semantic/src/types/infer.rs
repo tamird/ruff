@@ -74,10 +74,12 @@ use ty_python_core::{ExpressionNodeKey, SemanticIndex, Statement, Truthiness, se
 mod body_domain;
 mod builder;
 mod legacy_type_alias;
+pub(crate) use body_domain::FunctionBodyDomain;
+pub use body_domain::{
+    BodyDomainError, OverloadBodyAnalysis, OverloadBodyView, check_overload_body,
+};
 use legacy_type_alias::legacy_type_alias_definition;
 pub(super) use legacy_type_alias::legacy_type_alias_parameters;
-pub(crate) use body_domain::FunctionBodyDomain;
-pub use body_domain::{BodyDomainError, OverloadBodyAnalysis, OverloadBodyView, check_overload_body};
 mod comparisons;
 mod expression_truthiness;
 pub(crate) use expression_truthiness::TruthinessAnalyzer;
@@ -695,7 +697,8 @@ fn evaluate_predicate_truthiness<'db>(
     let ExpressionKind::Predicate { context, .. } = expression.kind(db) else {
         return Truthiness::Ambiguous;
     };
-    let inference = infer_expression_with_body_domain(db, expression, TypeContext::default(), domain);
+    let inference =
+        infer_expression_with_body_domain(db, expression, TypeContext::default(), domain);
     let env = ProgramEnvironment::from_scope(expression.scope(db));
     let module = parsed_module(db, expression.python_file(db)).load(db);
     TruthinessAnalyzer::new(

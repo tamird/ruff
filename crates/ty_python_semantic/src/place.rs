@@ -18,9 +18,9 @@ use crate::reachability::{
     refine_initial_binding_reachability,
 };
 use crate::types::{
-    FunctionBodyDomain, infer_definition_with_body_domain, DeclaredType, KnownClass, MemberLookupPolicy, Type, TypeAndQualifiers, TypeQualifiers,
-    UnionBuilder, UnionType, binding_type, inferred_declaration, is_discarded_dict_key_assignment,
-    may_exist_at_runtime,
+    DeclaredType, FunctionBodyDomain, KnownClass, MemberLookupPolicy, Type, TypeAndQualifiers,
+    TypeQualifiers, UnionBuilder, UnionType, infer_definition_with_body_domain,
+    inferred_declaration, is_discarded_dict_key_assignment, may_exist_at_runtime,
 };
 use crate::{Db, FxIndexSet, FxOrderSet};
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
@@ -963,7 +963,18 @@ pub(crate) fn has_bound_prefix<'db>(
             DefinitionState::Deleted => {}
         }
     }
-    !place_from_bindings_impl(db, env, bindings, RequiresExplicitReExport::No, cache)
+    !place_from_bindings_impl(
+        db,
+        env,
+        bindings,
+        RequiresExplicitReExport::No,
+        cache,
+        None,
+        BindingTypeContext {
+            body_domain: cache.and_then(ReachabilityEvaluationCache::body_domain),
+            replacement: None,
+        },
+    )
         .place
         .is_undefined()
 }

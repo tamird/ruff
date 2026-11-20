@@ -18,8 +18,13 @@ use ty_module_resolver::{
 use crate::Db;
 use crate::place::definitions::{DefinitionResolution, definitions_for_module_global};
 use crate::place::implicit_globals::all_implicit_module_globals;
-use crate::place::{builtins_module_scope, implicit_builtins_symbol, implicit_builtins_symbol_source};
-use crate::place_load::{ImplicitPlaceLoad, PlaceLoadMode, PlaceLoadResolutionProcedure, PlaceLoadResolutionStep, PlaceLoadResolver, PlaceLoadSourceKind};
+use crate::place::{
+    builtins_module_scope, implicit_builtins_symbol, implicit_builtins_symbol_source,
+};
+use crate::place_load::{
+    ImplicitPlaceLoad, PlaceLoadMode, PlaceLoadResolutionProcedure, PlaceLoadResolutionStep,
+    PlaceLoadResolver, PlaceLoadSourceKind,
+};
 use crate::provided::{BuiltinUsage, ProvidedBindingValue, ProvidedClass};
 use crate::reachability::ReachabilityEvaluationCache;
 use crate::types::ide_support::{ImportAliasResolution, definition_for_name};
@@ -799,7 +804,7 @@ impl<'db> SemanticModel<'db> {
 
         // Require an expression use ID to exclude plain stores. Names in parsed string annotations
         // have no use IDs, so check them after inference instead.
-        if self.in_string_annotation_expr.is_none() {
+        if self.annotation_scope.is_none() {
             index.try_expression_use_id(expression)?;
         }
 
@@ -809,18 +814,19 @@ impl<'db> SemanticModel<'db> {
         let scope_inference = infer_complete_scope_types(self.db, scope);
 
         // Exclude names in scopes that inference skipped, such as lambda bodies.
-        if self.in_string_annotation_expr.is_some() {
+        if self.annotation_scope.is_some() {
             scope_inference.try_expression_type(expression)?;
         }
 
-        let mode = if self.in_string_annotation_expr.is_some() {
+        let mode = if self.annotation_scope.is_some() {
             PlaceLoadMode::StringAnnotation
         } else if scope_inference.is_deferred_name_load(name) {
             PlaceLoadMode::Deferred
         } else {
             PlaceLoadMode::AtExpression(expression)
         };
-        let resolver = PlaceLoadResolver::new(self.db, &env, index, scope, &place_expr, mode, None).with_builtin_usage(self.builtin_usage(name.into()));
+        let resolver = PlaceLoadResolver::new(self.db, &env, index, scope, &place_expr, mode, None)
+            .with_builtin_usage(self.builtin_usage(name.into()));
 
         Some(DefinitionResolution::from_resolver(self.db, resolver))
     }

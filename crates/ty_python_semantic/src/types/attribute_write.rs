@@ -95,15 +95,17 @@ impl<'db> AttributeWriteRequirement<'db> {
             Self::All {
                 object_ty: _,
                 element_tys,
+                receiver,
             } => element_tys.iter().all(|ty| {
-                attribute_write_requirement(db, env, *ty, attribute)
+                attribute_write_requirement(db, env, *ty, attribute, *receiver)
                     .is_definitely_bound(db, env, attribute)
             }),
             Self::Any {
                 object_ty: _,
                 intersection,
+                receiver,
             } => intersection.positive(db).iter().any(|ty| {
-                attribute_write_requirement(db, env, *ty, attribute)
+                attribute_write_requirement(db, env, *ty, attribute, *receiver)
                     .is_definitely_bound(db, env, attribute)
             }),
             Self::ProtocolMember {
@@ -113,6 +115,7 @@ impl<'db> AttributeWriteRequirement<'db> {
             } => true,
             Self::Instance {
                 object_ty,
+                receiver: _,
                 member: _,
             } => {
                 object_ty
@@ -258,7 +261,7 @@ pub(super) fn attribute_setattr_member<'db>(
             } else {
                 receiver
             };
-            Type::BoundMethod(method.with_constrained_receiver(
+            Type::BoundMethod(method.with_receivers(
                 db,
                 receiver,
                 method.signature_receiver(db),

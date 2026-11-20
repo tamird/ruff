@@ -1852,16 +1852,25 @@ impl TypeCheckDiagnostics {
 
     /// Combine alternative checks without duplicating failures or losing source ownership.
     pub(super) fn extend_deduplicated(&mut self, other: &TypeCheckDiagnostics) {
-        let Self { diagnostics, used_suppressions, shared_body_diagnostics } = self;
+        let Self {
+            diagnostics,
+            used_suppressions,
+            shared_body_diagnostics,
+        } = self;
         let Self {
             diagnostics: incoming,
             used_suppressions: incoming_suppressions,
             shared_body_diagnostics: incoming_shared,
         } = other;
         let mut positions: rustc_hash::FxHashMap<Diagnostic, usize> = diagnostics
-            .iter().cloned().enumerate().map(|(index, diagnostic)| (diagnostic, index)).collect();
-        let remapped: Vec<_> = incoming.iter().map(|diagnostic| {
-            match positions.entry(diagnostic.clone()) {
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, diagnostic)| (diagnostic, index))
+            .collect();
+        let remapped: Vec<_> = incoming
+            .iter()
+            .map(|diagnostic| match positions.entry(diagnostic.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let index = diagnostics.len();
@@ -1869,12 +1878,14 @@ impl TypeCheckDiagnostics {
                     entry.insert(index);
                     index
                 }
-            }
-        }).collect();
+            })
+            .collect();
         used_suppressions.extend(incoming_suppressions.iter().copied());
         for argument in incoming_shared.iter().flat_map(|items| items.iter()) {
             let mapped = match *argument {
-                SharedBodyDiagnostic::Diagnostic(index) => SharedBodyDiagnostic::Diagnostic(remapped[index]),
+                SharedBodyDiagnostic::Diagnostic(index) => {
+                    SharedBodyDiagnostic::Diagnostic(remapped[index])
+                }
                 SharedBodyDiagnostic::Suppression(id) => SharedBodyDiagnostic::Suppression(id),
             };
             let shared = shared_body_diagnostics.get_or_insert_with(Box::default);

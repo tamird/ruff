@@ -11,7 +11,6 @@ use ruff_python_ast::{self as ast, AnyNodeRef};
 use ruff_text_size::Ranged;
 
 use crate::Db;
-use crate::types::dict::dict_literal_key_value_types;
 use crate::types::infer::{ExpressionInference, FrozenMap};
 use crate::types::iteration::{precise_iterable_element_type, refine_dict_snapshot_element_type};
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
@@ -328,10 +327,7 @@ impl<'db, 'ast> Unpacker<'db, 'ast> {
         if filter.is_some() {
             let is_provisional = |element: UnpackElement<'db, 'ast>| {
                 super::visitor::any_over_type_expanding_aliases(db, env, element.ty, |ty| {
-                    matches!(ty, Type::Divergent(_))
-                        || ty
-                            .as_dynamic()
-                            .is_some_and(super::DynamicType::is_provisional_marker)
+                    ty.is_divergent() || ty.is_provisional_marker()
                 })
             };
             if sequences.iter().any(|sequence| {
