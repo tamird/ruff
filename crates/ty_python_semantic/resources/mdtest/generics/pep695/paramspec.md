@@ -1515,8 +1515,7 @@ def non_generic[S](fixed: S) -> None:
     def make(value: int) -> tuple[int, S]:
         return value, fixed
 
-    # TODO: Reject this call because `S` is not bounded by `str`.
-    forward(make, 1)  # ok
+    forward(make, 1)  # error: [invalid-argument-type]
 
 def bounded[S: str](fixed: S) -> None:
     def make[T](value: T) -> tuple[T, S]:
