@@ -1499,7 +1499,7 @@ def overloads(callback: FunctionType & Callable[[int], str] & Callable[[str], in
     callback(None)
 
 def unknown_signature(callback: FunctionType & Top[Callable[..., bytes]]) -> None:
-    # error: [call-top-callable]
+    # error: [call-to-function-with-unknown-signature]
     reveal_type(callback())  # revealed: bytes
 ```
 

@@ -3677,7 +3677,7 @@ class Incomplete:
     options: TextOptions | EmptyOptions
 
 def missing_member(value: Binary | Incomplete):
-    # error: [unresolved-attribute]
+    # error: [missing-union-attribute]
     if value.options.kind == "text":
         reveal_type(value)  # revealed: Incomplete
     else:

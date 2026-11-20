@@ -1114,10 +1114,10 @@ from typing import TypeVar, overload
 T = TypeVar("T")
 
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def generic_parameter_type(x: T) -> T: ...
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def generic_parameter_type(x: str) -> str: ...
 def generic_parameter_type(x: int) -> int | str:
     return x
@@ -2162,7 +2162,7 @@ def rewrite[U](value: U, transform: Callable[[str], str]) -> U | str | list[obje
     return value
 
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def identity(value: int) -> str: ...
 @overload
 def identity(value: str) -> str: ...
@@ -2170,7 +2170,7 @@ def identity[T](value: T) -> T:
     return value
 
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def accepts_all[T](value: list[T]) -> None: ...
 @overload
 def accepts_all(value: int) -> None: ...
@@ -2180,7 +2180,7 @@ def accepts_all(value: list[int] | int) -> None:
 @overload
 def rewrite_bad(value: str, transform: Callable[[str], str]) -> str: ...
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def rewrite_bad(value: list[str], transform: Callable[[str], str]) -> list[int]: ...
 @overload
 def rewrite_bad[T](value: T, transform: Callable[[str], str]) -> T | str | list[object]: ...
@@ -2204,7 +2204,7 @@ def legacy(value: T) -> T:
     return value
 
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def legacy_bad(value: int) -> str: ...
 @overload
 def legacy_bad(value: T) -> T: ...
@@ -2223,7 +2223,7 @@ def keyword[T](*, value: T, enabled: bool = False) -> T:
     return value
 
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def required(value: int = 0) -> int: ...
 @overload
 def required[T](value: T) -> T: ...
@@ -2313,7 +2313,7 @@ def f(x, y) -> object:
     return x
 
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def bad_input[T](value: T) -> T: ...
 @overload
 def bad_input(value: int, other: int) -> int: ...
@@ -2321,7 +2321,7 @@ def bad_input(value: int, other: int = 0) -> object:
     return value
 
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def bounded[T: str | int](value: T) -> T: ...
 @overload
 def bounded(value: str, other: str) -> str: ...
@@ -2329,7 +2329,7 @@ def bounded(value: str, other: str = "") -> str:
     return value
 
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def bad_return[T](value: T) -> T: ...
 @overload
 def bad_return(value: int, other: int) -> int: ...
@@ -2368,7 +2368,7 @@ from typing import overload
 @overload
 def mixed[**P](*args: P.args, **kwargs: P.kwargs) -> int: ...
 @overload
-# error: [invalid-overload]
+# error: [inconsistent-overload-implementation]
 def mixed(value: str) -> int: ...
 def mixed(value: int) -> int:
     return value

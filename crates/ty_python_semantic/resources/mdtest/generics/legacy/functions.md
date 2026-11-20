@@ -3076,7 +3076,7 @@ T = TypeVar("T", bound=PackageAlias)
 
 def update_package(value: T) -> T:
     reveal_type(value["metadata"])  # revealed: dict[str, object]
-    value["unknown"]  # error: [invalid-key]
+    value["unknown"]  # error: [invalid-typed-dict-key]
     return value
 ```
 
@@ -7162,9 +7162,9 @@ invoke(broad, values=[], flags=42)  # error: [no-matching-overload]
 R = TypeVar("R", bound=str | bytes)
 
 @overload
-def wrong_keywords(value: T, **kwargs: str) -> T: ...  # error: [invalid-overload]
+def wrong_keywords(value: T, **kwargs: str) -> T: ...  # error: [inconsistent-overload-implementation]
 @overload
-def wrong_keywords(value: bytes, **kwargs: str) -> bytes: ...  # error: [invalid-overload]
+def wrong_keywords(value: bytes, **kwargs: str) -> bytes: ...  # error: [inconsistent-overload-implementation]
 def wrong_keywords(value: R, **kwargs: int) -> R:
     return value
 ```

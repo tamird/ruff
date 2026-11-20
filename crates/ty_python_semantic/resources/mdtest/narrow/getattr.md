@@ -19,7 +19,7 @@ def check(value: WithValue | WithoutValue):
     if getattr(value, "value", None):
         reveal_type(value.value)  # revealed: int & ~AlwaysFalsy
     else:
-        # error: [unresolved-attribute]
+        # error: [missing-union-attribute]
         value.value
 ```
 
@@ -33,7 +33,7 @@ def check(value: object):
     if not getattr(value, "value", True):
         reveal_type(value.value)  # revealed: ~AlwaysTruthy
     else:
-        # error: [unresolved-attribute]
+        # error: [missing-attribute]
         value.value
 ```
 
@@ -57,10 +57,10 @@ name does not identify a particular field.
 ```py
 def check(value: object, default: object, name: str):
     if getattr(value, "value", default):
-        # error: [unresolved-attribute]
+        # error: [missing-attribute]
         value.value
     if getattr(value, name, None):
-        # error: [unresolved-attribute]
+        # error: [missing-attribute]
         value.value
     if getattr(value, "not-an-identifier", None):
         reveal_type(value)  # revealed: object
@@ -78,7 +78,7 @@ def nested(context: Context):
     if getattr(context.attributes, "value", None):
         reveal_type(context.attributes.value)  # revealed: ~AlwaysFalsy
         context.attributes = object()
-        # error: [unresolved-attribute]
+        # error: [missing-attribute]
         context.attributes.value
 
 def during_call(value: object):
@@ -102,7 +102,7 @@ def getattr(value: object, name: str, default: object) -> bool:
 
 def shadowed(value: object):
     if getattr(value, "value", None):
-        # error: [unresolved-attribute]
+        # error: [missing-attribute]
         value.value
 ```
 
