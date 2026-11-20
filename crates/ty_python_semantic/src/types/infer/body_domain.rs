@@ -870,6 +870,83 @@ fn supported_body(
             == Some(callee.definition(db))
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DictionaryMethodEvidence {
+        Absent,
+        Supported,
+        Unsupported,
+    }
+
+    fn declared_builtin_member(db: &dyn Db, member: Type<'_>, definition: Definition<'_>) -> bool {
+        match member.resolve_type_alias(db) {
+            Type::BoundMethod(method) => method
+                .function(db)
+                .is_some_and(|function| function.definition(db) == definition),
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .all(|member| declared_builtin_member(db, *member, definition)),
+            _ => false,
+        }
+    }
+
+    fn dictionary_method_evidence<'db>(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        receiver: Type<'db>,
+        name: &str,
+        definition: Definition<'db>,
+    ) -> DictionaryMethodEvidence {
+        match receiver.resolve_type_alias(db) {
+            Type::Union(union) => {
+                let Some((first, rest)) = union.elements(db).split_first() else {
+                    return DictionaryMethodEvidence::Absent;
+                };
+                let evidence = dictionary_method_evidence(db, env, *first, name, definition);
+                if evidence == DictionaryMethodEvidence::Unsupported {
+                    return evidence;
+                }
+                if rest.iter().all(|receiver| {
+                    dictionary_method_evidence(db, env, *receiver, name, definition) == evidence
+                }) {
+                    evidence
+                } else {
+                    DictionaryMethodEvidence::Unsupported
+                }
+            }
+            Type::Intersection(intersection) => {
+                let mut evidence = DictionaryMethodEvidence::Absent;
+                for constraint in intersection.positive(db) {
+                    match dictionary_method_evidence(db, env, *constraint, name, definition) {
+                        DictionaryMethodEvidence::Absent => {}
+                        DictionaryMethodEvidence::Supported => {
+                            evidence = DictionaryMethodEvidence::Supported;
+                        }
+                        DictionaryMethodEvidence::Unsupported => {
+                            return DictionaryMethodEvidence::Unsupported;
+                        }
+                    }
+                }
+                evidence
+            }
+            // TypedDict get/items use the canonical synthesized method, not a function literal.
+            Type::TypedDict(_) => DictionaryMethodEvidence::Supported,
+            _ => {
+                let Ok(member) = receiver.try_member_lookup(db, env, name) else {
+                    return DictionaryMethodEvidence::Unsupported;
+                };
+                let Some(member) = member.member(db).place.ignore_possibly_undefined() else {
+                    return DictionaryMethodEvidence::Absent;
+                };
+                if declared_builtin_member(db, member, definition) {
+                    DictionaryMethodEvidence::Supported
+                } else {
+                    DictionaryMethodEvidence::Unsupported
+                }
+            }
+        }
+    }
+
     fn builtin_method(
         db: &dyn Db,
         function: FunctionType<'_>,
@@ -930,15 +1007,6 @@ fn supported_body(
                 return false;
             }
         }
-        if !mutates
-            && receiver.is_some_and(|ty| matches!(ty.resolve_type_alias(db), Type::TypedDict(_)))
-        {
-            // TypedDict methods are checked by the ordinary specialized call owner.
-            return true;
-        }
-        let Some(Type::BoundMethod(method)) = inferred_type(attribute.into()) else {
-            return false;
-        };
         let Some(Type::BoundMethod(declared)) = class
             .to_instance(db, &env)
             .member_lookup_with_policy(
@@ -952,10 +1020,29 @@ fn supported_body(
         else {
             return false;
         };
-        match (method.function(db), declared.function(db)) {
-            (Some(method), Some(declared)) => method.definition(db) == declared.definition(db),
-            _ => false,
+        let Some(declared) = declared.function(db) else {
+            return false;
+        };
+        if !mutates && class == KnownClass::Dict {
+            let Some(receiver) = receiver else {
+                return false;
+            };
+            // A union needs proof for every receiver. Within an intersection, absent members
+            // impose no additional method, but a conflicting member must not be discarded.
+            return dictionary_method_evidence(
+                db,
+                &env,
+                receiver,
+                attribute.attr.id.as_str(),
+                declared.definition(db),
+            ) == DictionaryMethodEvidence::Supported;
         }
+        let Some(Type::BoundMethod(method)) = inferred_type(attribute.into()) else {
+            return false;
+        };
+        method
+            .function(db)
+            .is_some_and(|method| method.definition(db) == declared.definition(db))
     }
 
     fn target_names<'ast>(target: &'ast ast::Expr, names: &mut Vec<&'ast str>) -> bool {
@@ -2072,6 +2159,33 @@ mod tests {
                 assert_eq!(f.last_definition_signature(&db), &signature);
             }
         }
+        let source = indoc::indoc! {r#"
+            from typing import TypedDict, overload
+            class Record(TypedDict):
+                value: str
+            @overload
+            def f(values: dict[str, int]) -> dict[str, int]: ...
+            @overload
+            def f(values: Record) -> dict[str, object]: ...
+            def f(values: dict[str, int] | Record) -> object:
+                return {key: value for key, value in values.items()}
+        "#};
+        for (expression, wrong) in [("key", [false, false]), ("42", [true, true])] {
+            db.write_file(
+                "/src/body.py",
+                source.replace("{key:", &format!("{{{expression}:")),
+            )?;
+            let f = function(&db);
+            for index in [0, 1, 0] {
+                let diagnostics = check_overload_body(&db, f, index)
+                    .expect("nominal and TypedDict receiver alternatives");
+                assert_eq!(
+                    !diagnostics.is_empty(),
+                    wrong[index],
+                    "key={expression} domain={index}: {diagnostics:#?}"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2254,6 +2368,25 @@ mod tests {
             let diagnostics = check_overload_body(&db, f, 1).expect("ordinary builtin method");
             assert!(diagnostics.is_empty(), "{method}: {diagnostics:#?}");
         }
+        db.write_file(
+            "/src/body.py",
+            indoc::indoc! {r#"
+                from typing import Literal, overload
+                class Overridden(dict[str, int]):
+                    def items(self) -> list[tuple[str, int]]: ...
+                @overload
+                def f(values: Overridden | dict[str, str], flag: Literal[True]) -> object: ...
+                @overload
+                def f(values: dict[str, str], flag: Literal[False]) -> object: ...
+                def f(values: Overridden | dict[str, str], flag: bool) -> object:
+                    return {key: value for key, value in values.items()}
+            "#},
+        )?;
+        assert_eq!(
+            check_overload_body(&db, function(&db), 0),
+            Err(BodyDomainError::Unsupported),
+            "every receiver alternative must use the builtin method"
+        );
         Ok(())
     }
 
