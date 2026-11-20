@@ -631,3 +631,130 @@ reveal_type(x["b"])  # revealed: Unknown
 x["c"]: int = ...
 reveal_type(x["c"])  # revealed: Unknown
 ```
+
+## Context from later uses
+
+Later calls and return annotations can provide types for an empty dictionary. Writes still check
+fixed schemas and aliases.
+
+### Fixed and aliased schemas
+
+```py
+def annotated(target: dict[str, int], wrong: dict[str, str]) -> None:
+    target.update(wrong)  # error: [no-matching-overload]
+
+def alias(target: dict[str, int], wrong: dict[str, str]) -> None:
+    other = target
+    other.update(wrong)  # error: [no-matching-overload]
+
+def rebound(target: dict[str, int], wrong: dict[str, str], choose: bool) -> None:
+    result = {}
+    if choose:
+        result = target
+    result.update(wrong)  # error: [no-matching-overload]
+```
+
+### Read-only calls
+
+```py
+def readonly() -> dict[str, int]:
+    result = {}
+    result.update({"key": 1})
+    text: str = result.get("key", "")  # error: [invalid-assignment]
+    return result
+```
+
+### TypedDict fields
+
+```py
+from typing import TypedDict
+
+class Config(TypedDict, total=False):
+    count: int
+
+def good_config() -> Config:
+    result = {}
+    result.update(count=1)
+    return result
+
+def bad_config() -> Config:
+    result = {}
+    result.update(count="bad")  # error: [invalid-argument-type]
+    return result
+```
+
+### Overload alternatives
+
+```py
+from typing import overload
+
+@overload
+def consume(values: dict[str, int]) -> str: ...
+@overload
+def consume(values: dict[int, int]) -> int: ...
+def consume(values: dict[str, int] | dict[int, int]) -> str | int:
+    raise NotImplementedError
+
+@overload
+def reversed_consume(values: dict[int, int]) -> int: ...
+@overload
+def reversed_consume(values: dict[str, int]) -> str: ...
+def reversed_consume(values: dict[str, int] | dict[int, int]) -> str | int:
+    raise NotImplementedError
+
+def integer_keys() -> dict[int, int]:
+    result = {}
+    consume(result)
+    result[1] = 2
+    return result
+
+def reversed_integer_keys() -> dict[int, int]:
+    result = {}
+    reversed_consume(result)
+    result[1] = 2
+    return result
+```
+
+### Agreeing consumers
+
+```py
+def consume(values: dict[str, int]) -> None: ...
+def consume_again(values: dict[str, int]) -> None: ...
+def forward() -> dict[str, int]:
+    result = {}
+    consume(result)
+    result["key"] = 1
+    consume_again(result)
+    return result
+
+def reverse() -> dict[str, int]:
+    result = {}
+    consume_again(result)
+    result["key"] = 1
+    consume(result)
+    return result
+```
+
+### Conflicting consumers
+
+```py
+def consume_int(values: dict[str, int]) -> None: ...
+def consume_str(values: dict[str, str]) -> None: ...
+def conflicting_forward() -> None:
+    result = {}
+    result["key"] = 1
+    consume_int(result)  # error: [invalid-argument-type]
+    consume_str(result)  # error: [invalid-argument-type]
+```
+
+### Reversed conflicting consumers
+
+```py
+def consume_int(values: dict[str, int]) -> None: ...
+def consume_str(values: dict[str, str]) -> None: ...
+def conflicting_reverse() -> None:
+    result = {}
+    result["key"] = 1
+    consume_str(result)  # error: [invalid-argument-type]
+    consume_int(result)  # error: [invalid-argument-type]
+```
