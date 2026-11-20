@@ -1,0 +1,14 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "mdtest",
+    deps = [
+        "//crates/ruff_db:ruff_db",
+        "//crates/ruff_diagnostics:ruff_diagnostics",
+        "//crates/ruff_index:ruff_index",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_python_trivia:ruff_python_trivia",
+        "//crates/ruff_source_file:ruff_source_file",
+        "//crates/ruff_text_size:ruff_text_size",
+    ],
+)

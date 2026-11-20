@@ -1,0 +1,16 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ruff_python_formatter",
+    proc_macro_deps = ["//crates/ruff_macros:ruff_macros"],
+    deps = [
+        "//crates/ruff_cache:ruff_cache",
+        "//crates/ruff_db:ruff_db",
+        "//crates/ruff_formatter:ruff_formatter",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_python_parser:ruff_python_parser",
+        "//crates/ruff_python_trivia:ruff_python_trivia",
+        "//crates/ruff_source_file:ruff_source_file",
+        "//crates/ruff_text_size:ruff_text_size",
+    ],
+)

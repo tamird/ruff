@@ -1,0 +1,16 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ruff_annotate_snippets",
+    compile_data = glob(["examples/*.rs", "examples/*.svg"]) + [
+        "README.md",
+        "//:cargo_workspace_metadata",
+    ],
+    # Its native feature-name lints use `cargo metadata --no-deps`.
+    rustc_env = {
+        "CARGO": "$(CARGO)",
+        "CARGO_NET_OFFLINE": "true",
+        "RUSTC": "$(RUSTC)",
+    },
+    toolchains = ["@rules_rust//rust/toolchain:current_rust_toolchain"],
+)

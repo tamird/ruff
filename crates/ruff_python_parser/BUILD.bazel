@@ -1,0 +1,11 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ruff_python_parser",
+    deps = [
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_python_trivia:ruff_python_trivia",
+        "//crates/ruff_text_size:ruff_text_size",
+        "//crates/ruff_unicode_names2:ruff_unicode_names2",
+    ],
+)

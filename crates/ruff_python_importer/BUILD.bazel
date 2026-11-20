@@ -1,0 +1,13 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ruff_python_importer",
+    deps = [
+        "//crates/ruff_diagnostics:ruff_diagnostics",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_python_codegen:ruff_python_codegen",
+        "//crates/ruff_python_trivia:ruff_python_trivia",
+        "//crates/ruff_source_file:ruff_source_file",
+        "//crates/ruff_text_size:ruff_text_size",
+    ],
+)
