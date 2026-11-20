@@ -4,7 +4,7 @@ use crate::place::{global_symbol, typing_extensions_symbol, typing_symbol};
 use crate::types::call::bind::CallableDescription;
 use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::type_alias::PEP695TypeAliasType;
-use crate::types::typevar::TypeVarSet;
+use crate::types::typevar::{SelfTypeVarOrigin, TypeVarSet};
 use crate::{Db, ProgramEnvironment};
 use ruff_db::files::system_path_to_file;
 use ruff_db::system::DbWithWritableSystem as _;
@@ -421,6 +421,7 @@ fn concrete_member_lookup_dynamic_instances() {
     ] {
         let typevar = BoundTypeVarInstance::synthetic_self(
             &db,
+            SelfTypeVarOrigin::ReceiverPlaceholder,
             bound,
             BindingContext::Synthetic(env.program(&db)),
         );
@@ -489,6 +490,7 @@ fn concrete_member_lookup_declared_storage() -> anyhow::Result<()> {
     let instance = class.to_instance_approximation(&db, &env).unwrap();
     let typevar = Type::TypeVar(BoundTypeVarInstance::synthetic_self(
         &db,
+        SelfTypeVarOrigin::Class(class.as_class_literal().expect("Declared is a class")),
         instance,
         BindingContext::Synthetic(env.program(&db)),
     ));
