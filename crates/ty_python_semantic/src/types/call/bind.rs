@@ -9173,9 +9173,9 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                         provided_ty,
                     });
                 }
-
-                None
-            };
+            }
+            None
+        };
 
         if let Some(CallArgument::Keywords(KeywordArgument::Observed { types: _, keywords: _ })) = self.arguments.get(argument_index) {
             self.check_variadic_argument_type(

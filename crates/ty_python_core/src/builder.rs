@@ -1215,7 +1215,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     }
 
     fn record_collection_use(&mut self, expression: &ast::Expr) {
-        if let Some(use_id) = self.ast_ids.try_scoped_use(self.current_scope(), expression)
+        if let Some(use_id) = self
+            .ast_ids
+            .try_scoped_use(self.current_scope(), expression)
             && let Some(definition) = self.unannotated_collection_initializer_binding(use_id)
             && let Some(statement) = self.current_statements.last_mut()
         {
