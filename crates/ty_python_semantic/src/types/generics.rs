@@ -2491,7 +2491,7 @@ impl<'db> ApplySpecialization<'_, 'db> {
                 let context = underlying.generic_context(db);
                 let types = context.variables(db).map(|variable| {
                     self.get(db, variable).unwrap_or(Type::TypeVar(variable))
-                }).collect::<Vec<_>>();
+                }).collect::<Box<[_]>>();
                 Some(Specialization::new(db, context, types, underlying.materialization_kind(db), underlying.tuple_inner(db)))
             }
             ApplySpecialization::WithBindings { specialization, .. } => {

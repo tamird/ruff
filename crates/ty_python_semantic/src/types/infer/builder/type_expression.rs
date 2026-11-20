@@ -122,18 +122,16 @@ impl<'db> TypeExpressionContext<'db> for TypeInferenceBuilder<'db, '_> {
         signature: &Signature<'db>,
     ) -> Type<'db> {
         let db = self.db();
-        let context = signature.generic_context.unwrap_or_else(|| {
-            GenericContext::from_typevar_instances(db, self.program_environment(), [])
-        });
+        let context = signature.generic_context;
         let value_ty = Type::single_callable(db, signature.clone());
         self.infer_explicit_callable_specialization(
             subscript,
             value_ty,
-            Some(context),
+            context,
             &|arguments| {
-                signature.return_type().apply_specialization(
+                signature.return_type().apply_optional_specialization(
                     db,
-                    context.specialize_partial(db, arguments.iter().copied()),
+                    context.map(|context| context.specialize_partial(db, arguments.iter().copied())),
                 )
             },
         )
