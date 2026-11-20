@@ -4318,6 +4318,82 @@ def use() -> None:
 }
 
 #[test]
+fn dictionary_argument_snapshots_follow_evaluation() -> anyhow::Result<()> {
+    fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+        if call.declaration()?.name(db)?.as_str() != "observe" {
+            return None;
+        }
+        let known_entries = call.dictionary_argument(db, "value").is_some_and(|items| {
+            items.is_complete() && items.items.iter().any(DictionaryItem::is_required)
+        });
+        Some(Type::bool_literal(known_entries))
+    }
+    let mut db = TestDbBuilder::new()
+        .with_file(
+            "/src/native.pyi",
+            "from typing import LiteralString\ndef observe(value: object, other: object = ...) -> bool: ...\ndef suffix(value: object) -> LiteralString: ...\ndef open_string() -> str: ...\n",
+        )
+        .with_file("/src/main.py", "")
+        .with_call_result_provider(|db, call| observe(db, call).into())
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    for (source, expected) in [
+        (
+            "from typing import final\n@final\nclass Text(str):\n    def __radd__(self, other: str) -> str:\n        values.clear()\n        return ''\nsuffix = Text()\nvalues = {'first': 1}\nresult = observe(value=values, other='prefix' + suffix)",
+            false,
+        ),
+        (
+            "from native import open_string\nsuffix = open_string()\ndef mutate() -> None:\n    values.clear()\nvalues = {'first': 1}\nresult = observe(value=values, other='prefix' + suffix)",
+            false,
+        ),
+        (
+            "from native import suffix\nvalues = {'first': 1}\nresult = observe(value=values, other='prefix' + suffix(values))",
+            false,
+        ),
+        (
+            "class Text(str):\n    def __radd__(self, other: str) -> str:\n        values.clear()\n        return ''\nsuffix = Text()\nvalues = {'first': 1}\nresult = observe(value=values, other='prefix' + suffix)",
+            false,
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(value=values, other=values.clear())",
+            false,
+        ),
+        (
+            "values = {'first': 1}\nalias = values\nresult = observe(value=values, other=alias.clear())",
+            false,
+        ),
+        (
+            "values = {}\nresult = observe(value=values, other=(values := {'first': 1}))",
+            false,
+        ),
+        (
+            "suffix = ', '.join(['tar', 'zip'])\nvalues = {'first': 1}\nresult = observe(value=values, other='prefix' + suffix)",
+            true,
+        ),
+        (
+            "values = {'first': 1}\nresult = observe(values, values.clear())",
+            false,
+        ),
+        (
+            "suffix = ', '.join(['tar', 'zip'])\nvalues = {'first': 1}\nresult = observe(values, 'prefix' + suffix)",
+            true,
+        ),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!("from native import observe\n{source}\n"),
+        )?;
+        let diagnostics = db.check_file(file);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        let result = crate::place::global_symbol(&db, db.program_file(file), "result")
+            .place
+            .expect_type();
+        assert_eq!(result.as_bool_literal(), Some(expected), "{source}");
+    }
+    Ok(())
+}
+
+#[test]
 fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
     fn observe<'db>(db: &'db TestDb, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
         let contents = match call.declaration()?.name(db)?.as_str() {
@@ -4384,7 +4460,7 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
         ),
         (
             "values = {'first': 1}\nresult = observe(value=values, other=values.clear())",
-            "unavailable",
+            "empty",
         ),
         (
             "values = {'first': 1}\nresult = observe(values, other=values.clear())",
@@ -4424,7 +4500,7 @@ fn dictionary_observations_preserve_first_entries() -> anyhow::Result<()> {
         ),
         (
             "values = {'first': 1}\nresult = observe(values, values.update({'first': 2}))",
-            "unavailable",
+            "first: Literal[2]",
         ),
         (
             "values = {'first': 1}\nresult = observe(values, other=values.update({'first': 2}))",

@@ -26,7 +26,7 @@ use crate::Db;
 use crate::place::loop_header_reachability;
 use crate::provided::ProvidedBindingValue;
 use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
-use crate::types::call::{Argument, CallArguments};
+use crate::types::call::{Argument, CallArguments, has_exact_runtime_class};
 use crate::types::infer::{
     FunctionBodyDomain, StatementInference, infer_definition_with_body_domain,
     infer_statement_with_body_domain,
@@ -1192,15 +1192,18 @@ fn frozen_exported_field_contents<'db>(
             {
                 return None;
             }
-            if std::iter::once(keyword)
-                .chain(keywords)
-                .any(|keyword| keyword.arg.is_none() || !inert_field_argument(&keyword.value))
-            {
+            let env = ProgramEnvironment::from_scope(scope);
+            if std::iter::once(keyword).chain(keywords).any(|keyword| {
+                keyword.arg.is_none()
+                    || !inert_field_argument(db, &env, &keyword.value, &|expression| {
+                        inference.try_expression_type(expression)
+                    })
+            }) {
                 return None;
             }
             return Some(ContentsValue::from_literal(
                 db,
-                &ProgramEnvironment::from_scope(scope),
+                &env,
                 scope,
                 &keyword.value,
                 &inference,
@@ -1250,7 +1253,12 @@ fn frozen_exported_field_contents<'db>(
 
 /// Expressions that cannot call user code while evaluating a factory argument. Dictionary keys
 /// are limited to string literals because hashing other objects can execute user code.
-fn inert_field_argument(expression: &ast::Expr) -> bool {
+fn inert_field_argument<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    expression: &ast::Expr,
+    expression_type: &impl Fn(&ast::Expr) -> Option<Type<'db>>,
+) -> bool {
     !any_over_expr(expression, |expression| match expression {
         ast::Expr::Name(_) | ast::Expr::List(_) | ast::Expr::Tuple(_) => false,
         ast::Expr::Dict(dictionary) => dictionary.items.iter().any(|item| {
@@ -1259,8 +1267,37 @@ fn inert_field_argument(expression: &ast::Expr) -> bool {
                 .as_ref()
                 .is_some_and(ast::Expr::is_string_literal_expr)
         }),
+        ast::Expr::BinOp(binary) => {
+            let ast::ExprBinOp {
+                node_index: _,
+                range: _,
+                left,
+                op,
+                right,
+            } = binary;
+            match op {
+                ast::Operator::Add => ![left.as_ref(), right.as_ref()].into_iter().all(|operand| {
+                    expression_type(operand).is_some_and(|ty| is_sealed_builtin_string(db, env, ty))
+                }),
+                _ => true,
+            }
+        }
         expression => !expression.is_literal_expr(),
     })
+}
+
+fn is_sealed_builtin_string<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
+    let is_builtin_string = match ty {
+        Type::LiteralValue(literal) => literal.is_string() || literal.is_literal_string(),
+        Type::NominalInstance(instance) => instance.known_class(db) == Some(KnownClass::Str),
+        _ => false,
+    };
+    // An open builtin str type can include subclasses with a reflected operator.
+    is_builtin_string && has_exact_runtime_class(db, env, ty)
 }
 
 fn is_builtin_allocation<'db>(
@@ -2632,8 +2669,11 @@ pub(crate) fn needs_call_snapshot<'db>(
                 .map(ast::ArgOrKeyword::Keyword),
         );
     arguments.find(|argument| std::ptr::eq(argument.value(), expression))?;
-    if !arguments.any(|argument| argument.is_variadic() || !inert_field_argument(argument.value()))
-    {
+    let env = ProgramEnvironment::from_file(scope.program_file(db));
+    if !arguments.any(|argument| {
+        argument.is_variadic()
+            || !inert_field_argument(db, &env, argument.value(), &expression_type)
+    }) {
         return Some(false);
     }
     let ast::Expr::BinOp(ast::ExprBinOp {
@@ -2648,7 +2688,6 @@ pub(crate) fn needs_call_snapshot<'db>(
     };
     // A builtin union copies the slots of both operands before the next argument runs.
     // An overloaded operator could return an existing mapping instead.
-    let env = ProgramEnvironment::from_file(scope.program_file(db));
     let mut expression_type = expression_type;
     let mut builtin = |operand: &ast::Expr| {
         is_builtin_allocation(db, operand, &expression_type)
@@ -2951,13 +2990,15 @@ pub(crate) fn fresh_argument_items<'db>(
     expression: &ast::Expr,
     ty: Type<'db>,
     reachability: &ReachabilityEvaluationCache<'db>,
+    expression_type: impl Fn(&ast::Expr) -> Option<Type<'db>>,
 ) -> Option<DictionaryItems<'db>> {
     let name = expression.as_name_expr()?;
+    let env = ProgramEnvironment::from_scope(scope);
     if !call.func.is_name_expr()
-        || call
-            .arguments
-            .iter_source_order()
-            .any(|argument| argument.is_variadic() || !inert_field_argument(argument.value()))
+        || call.arguments.iter_source_order().any(|argument| {
+            argument.is_variadic()
+                || !inert_field_argument(db, &env, argument.value(), &expression_type)
+        })
     {
         return None;
     }
