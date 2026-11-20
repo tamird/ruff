@@ -422,4 +422,24 @@ def _(x: LiteralString):
     reveal_type(x)  # revealed: LiteralString
 ```
 
+## Nominal string subclasses
+
+```py
+from typing_extensions import LiteralString, final
+
+def accept(value: LiteralString) -> None: ...
+
+class Text(str): ...
+
+@final
+class FinalText(str): ...
+
+def check(value: str, literal: LiteralString) -> None:
+    accept(value)  # error: [invalid-argument-type]
+    accept(Text())  # error: [invalid-argument-type]
+    accept(FinalText())  # error: [invalid-argument-type]
+    accept(literal)
+    accept("prefix" + literal)
+```
+
 [1]: https://typing.python.org/en/latest/spec/literal.html#literalstring

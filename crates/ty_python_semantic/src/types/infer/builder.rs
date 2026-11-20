@@ -10364,6 +10364,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         expression,
                         ty,
                         self.reachability_cache(),
+                        |expr| self.try_expression_type(expr),
                     )
                 {
                     return Some(fresh);
