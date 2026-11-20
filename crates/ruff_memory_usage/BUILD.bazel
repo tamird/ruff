@@ -1,0 +1,5 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ruff_memory_usage",
+)

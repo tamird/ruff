@@ -1,0 +1,73 @@
+module(name = "ruff")
+
+bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "hermetic_cc_toolchain", version = "4.3.0")
+
+zig = use_extension("@hermetic_cc_toolchain//toolchain:ext.bzl", "toolchains")
+zig.exec_platform(arch = "amd64", os = "linux")
+use_repo(zig, "zig_sdk")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    extra_target_triples = ["x86_64-unknown-linux-gnu"],
+    versions = ["1.100.0"],
+)
+use_repo(rust, "rust_toolchains")
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+# datatest 0.3.3 otherwise excludes symlinked files in directory runfiles.
+# Remove this annotation when its native file discovery includes file symlinks.
+crate.annotation(
+    crate = "datatest-stable",
+    version = "=0.3.3",
+    patches = ["//bazel:datatest-stable-file-symlinks.patch"],
+    patch_args = ["-p1"],
+)
+# Match the explicit Cargo.toml [profile.dev.package.*] overrides.
+crate.annotation(
+    crate = "insta",
+    rustc_flags = ["-Copt-level=3", "-Cdebug-assertions=on", "-Coverflow-checks=on"],
+)
+crate.annotation(
+    crate = "similar",
+    rustc_flags = ["-Copt-level=3", "-Cdebug-assertions=on", "-Coverflow-checks=on"],
+)
+crate.annotation(
+    crate = "salsa",
+    rustc_flags = ["-Copt-level=3", "-Cdebug-assertions=on", "-Coverflow-checks=on"],
+)
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//bazel:cargo-bazel.json",
+    manifests = ["//:Cargo.toml"],
+    skip_cargo_lockfile_overwrite = True,
+    strip_internal_dependencies_from_cargo_lockfile = False,
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+use_repo(crate, "crates")
+
+metadata = use_extension("//bazel:workspace_metadata.bzl", "workspace_metadata")
+metadata.from_cargo(
+    name = "ruff_workspace_metadata",
+    hub = "@crates//:defs.bzl",
+    lockfile = "//bazel:cargo-bazel.json",
+)
+use_repo(metadata, "ruff_workspace_metadata")
+
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_archive(
+    name = "uv_linux_amd64",
+    urls = ["https://github.com/astral-sh/uv/releases/download/0.13.9/uv-x86_64-unknown-linux-gnu.tar.gz"],
+    sha256 = "a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39c2471d5",
+    strip_prefix = "uv-x86_64-unknown-linux-gnu",
+    build_file_content = 'exports_files(["uv"])',
+)

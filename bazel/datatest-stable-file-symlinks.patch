@@ -1,0 +1,13 @@
+--- a/src/data_source.rs
++++ b/src/data_source.rs
+@@ -79,7 +79,9 @@
+         .filter(|res| {
+             // Continue to bubble up all errors to the parent.
+             res.as_ref().map_or(true, |entry| {
+-                entry.file_type().is_file()
++                // Follow file symlinks without traversing directory symlinks.
++                (entry.file_type().is_file()
++                    || (entry.file_type().is_symlink() && entry.path().is_file()))
+                     && entry
+                         .file_name()
+                         .to_str()
