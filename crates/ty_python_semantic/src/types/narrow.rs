@@ -101,7 +101,7 @@ pub(crate) fn infer_narrowing_constraints<'db>(
     let constraints = match predicate.node {
         PredicateNode::Expression(expression) => {
             let constraints = domain
-                .filter(|domain| domain.scope(db) == expression.scope(db))
+                .filter(|domain| domain.contains_scope(db, expression.scope(db)))
                 .map_or_else(
                     || all_narrowing_constraints_for_expression(db, expression),
                     |domain| all_body_narrowing_constraints_for_expression(db, expression, domain),
@@ -126,7 +126,7 @@ pub(crate) fn infer_narrowing_constraints<'db>(
         }
         PredicateNode::SuccessfulSubscript { receiver, key } => {
             let constraints = domain
-                .filter(|domain| domain.scope(db) == receiver.scope(db))
+                .filter(|domain| domain.contains_scope(db, receiver.scope(db)))
                 .map_or_else(
                     || successful_subscript_constraints(db, receiver, key),
                     |domain| successful_body_subscript_constraints(db, receiver, key, domain),
@@ -4440,7 +4440,12 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         let tested_index = tested_index?;
         let constraint = constraints.get(&definition.place(db))?;
         let value = unpack.value(db);
-        let inference = infer_expression_types(db, value.expression(), TypeContext::default());
+        let inference = infer_expression_with_body_domain(
+            db,
+            value.expression(),
+            TypeContext::default(),
+            self.body_domain,
+        );
         if inference.is_provisional()
             || inference
                 .expression_type(value.expression().node_ref(db))
@@ -4450,6 +4455,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             return None;
         }
         let projected = super::unpacker::Unpacker::new(db, &self.env, scope, file, self.module)
+            .with_body_domain(self.body_domain)
             .unpack_filtered(target, value, inference, tested_index, &|ty| {
                 !NarrowingConstraint::intersection(ty)
                     .merge_constraint_and(constraint.clone())

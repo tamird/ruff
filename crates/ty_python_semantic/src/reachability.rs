@@ -750,7 +750,7 @@ fn analyze_body_non_terminal_call_range<'db>(
     index: usize,
     domain: FunctionBodyDomain<'db>,
 ) {
-    debug_assert_eq!(scope, domain.scope(db));
+    debug_assert!(domain.contains_scope(db, scope));
     analyze_non_terminal_call_range_impl(db, scope, level, index, Some(domain));
 }
 
@@ -813,7 +813,7 @@ fn evaluate_reachability_constraint<'db>(
     let use_def = use_def_map(db, scope);
     let constraints = use_def.reachability_constraints();
     let predicates = use_def.predicates();
-    let domain = domain.filter(|domain| domain.scope(db) == scope);
+    let domain = domain.filter(|domain| domain.contains_scope(db, scope));
     let root = constraints.get_interior_node(id);
     analyze_non_terminal_calls_up_to_predicate(db, predicates, root, domain);
     evaluate_reachability_path(
@@ -1323,7 +1323,7 @@ fn evaluate_body_projected_narrowing_checkpoint<'db>(
     base_ty: Type<'db>,
     domain: FunctionBodyDomain<'db>,
 ) -> ProjectedNarrowingCheckpoint<'db> {
-    debug_assert_eq!(scope, domain.scope(db));
+    debug_assert!(domain.contains_scope(db, scope));
     evaluate_projected_narrowing_checkpoint_impl(
         db,
         scope,
@@ -1702,7 +1702,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                         let checkpoint = self
                             .predicates
                             .body_domain
-                            .filter(|domain| domain.scope(db) == scope)
+                            .filter(|domain| domain.contains_scope(db, scope))
                             .map_or_else(
                                 || {
                                     evaluate_projected_narrowing_checkpoint(
@@ -2137,7 +2137,7 @@ fn analyze_body_non_terminal_call<'db>(
     call_expr: CallableAndCallExpr<'db>,
     domain: FunctionBodyDomain<'db>,
 ) -> Truthiness {
-    debug_assert_eq!(call_expr.call_expr(db).scope(db), domain.scope(db));
+    debug_assert!(domain.contains_scope(db, call_expr.call_expr(db).scope(db)));
     analyze_non_terminal_call_impl(db, call_expr, Some(domain))
 }
 
@@ -2352,7 +2352,7 @@ fn analyze_single_in_domain<'db>(
     domain: Option<FunctionBodyDomain<'db>>,
 ) -> Truthiness {
     let _span = tracing::trace_span!("analyze_single", ?predicate).entered();
-    let domain = domain.filter(|domain| domain.scope(db) == predicate_scope(db, predicate));
+    let domain = domain.filter(|domain| domain.contains_scope(db, predicate_scope(db, predicate)));
 
     match predicate.node {
         PredicateNode::Expression(expression) => {
@@ -2463,10 +2463,11 @@ pub(crate) fn is_range_reachable_in_domain<'db>(
                         .map_or_else(
                             || evaluate_reachability(db, use_def, constraint),
                             |domain| {
-                                if domain.scope(db).file_scope_id(db) == scope_id {
+                                let scope = index.scope_id(scope_id);
+                                if domain.contains_scope(db, scope) {
                                     evaluate_reachability_in_domain(
                                         db,
-                                        domain.scope(db),
+                                        scope,
                                         constraint,
                                         Some(domain),
                                     )
@@ -2493,17 +2494,12 @@ pub(crate) fn is_end_of_scope_reachable_in_domain<'db>(
     scope: ScopeId<'db>,
     domain: Option<FunctionBodyDomain<'db>>,
 ) -> bool {
-    let Some(domain) = domain else {
+    let Some(domain) = domain.filter(|domain| domain.contains_scope(db, scope)) else {
         return is_end_of_scope_reachable(db, scope);
     };
     let use_def = use_def_map(db, scope);
-    evaluate_reachability_in_domain(
-        db,
-        domain.scope(db),
-        use_def.end_of_scope_reachability(),
-        Some(domain),
-    )
-    .may_be_true()
+    evaluate_reachability_in_domain(db, scope, use_def.end_of_scope_reachability(), Some(domain))
+        .may_be_true()
 }
 
 pub(crate) fn is_reachable<'db>(

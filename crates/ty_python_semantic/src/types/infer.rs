@@ -653,7 +653,7 @@ pub(crate) fn infer_predicate_truthiness<'db>(
     expression: Expression<'db>,
     domain: Option<FunctionBodyDomain<'db>>,
 ) -> Truthiness {
-    let domain = domain.filter(|domain| domain.scope(db) == expression.scope(db));
+    let domain = domain.filter(|domain| domain.contains_scope(db, expression.scope(db)));
     if matches!(
         expression.kind(db),
         ExpressionKind::Predicate { in_loop: true, .. }
@@ -831,13 +831,39 @@ pub(super) fn infer_statement_types<'db>(
     infer_statement_with_body_domain(db, statement, None)
 }
 
+pub(crate) fn infer_scope_with_body_domain<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    tcx: TypeContext<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> &'db ScopeInference<'db> {
+    if let Some(domain) = domain.filter(|domain| domain.contains_scope(db, scope)) {
+        body_domain::infer_body_scope_region(db, InferScope::new(db, scope, tcx), domain)
+    } else {
+        infer_scope_types(db, scope, tcx)
+    }
+}
+
+pub(super) fn infer_unpack_with_body_domain<'db>(
+    db: &'db dyn Db,
+    unpack: Unpack<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> &'db UnpackResult<'db> {
+    if let Some(domain) = domain.filter(|domain| domain.contains_scope(db, unpack.target_scope(db)))
+    {
+        body_domain::infer_body_unpack(db, unpack, domain)
+    } else {
+        infer_unpack_types(db, unpack)
+    }
+}
+
 /// Keep module declarations and other scopes on their ordinary query identity.
 pub(crate) fn infer_definition_with_body_domain<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
     domain: Option<FunctionBodyDomain<'db>>,
 ) -> &'db DefinitionInference<'db> {
-    if let Some(domain) = domain.filter(|domain| domain.scope(db) == definition.scope(db)) {
+    if let Some(domain) = domain.filter(|domain| domain.contains_scope(db, definition.scope(db))) {
         body_domain::infer_body_definition(db, definition, domain)
     } else {
         infer_definition_types(db, definition)
@@ -850,7 +876,7 @@ pub(crate) fn infer_expression_with_body_domain<'db>(
     tcx: TypeContext<'db>,
     domain: Option<FunctionBodyDomain<'db>>,
 ) -> &'db ExpressionInference<'db> {
-    if let Some(domain) = domain.filter(|domain| domain.scope(db) == expression.scope(db)) {
+    if let Some(domain) = domain.filter(|domain| domain.contains_scope(db, expression.scope(db))) {
         body_domain::infer_body_expression(db, InferExpression::new(db, expression, tcx), domain)
     } else {
         infer_expression_types(db, expression, tcx)
@@ -872,7 +898,7 @@ pub(crate) fn infer_statement_with_body_domain<'db>(
         ),
         Statement::Other(statement) => {
             let inference = if let Some(domain) =
-                domain.filter(|domain| domain.scope(db) == statement.scope(db))
+                domain.filter(|domain| domain.contains_scope(db, statement.scope(db)))
             {
                 body_domain::infer_body_statement(db, statement, domain)
             } else {
@@ -977,7 +1003,7 @@ impl<'db> InferExpression<'db> {
 }
 
 /// A `ScopeId` with an optional `TypeContext`.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, salsa::Supertype)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, salsa::Supertype, salsa::SalsaValue)]
 pub(super) enum InferScope<'db> {
     Bare(ScopeId<'db>),
     WithContext(ScopeWithContext<'db>),
@@ -1026,6 +1052,14 @@ impl<'db> InferScope<'db> {
     heap_size=ruff_memory_usage::heap_size
 )]
 pub(super) fn infer_unpack_types<'db>(db: &'db dyn Db, unpack: Unpack<'db>) -> UnpackResult<'db> {
+    infer_unpack_region(db, unpack, None)
+}
+
+fn infer_unpack_region<'db>(
+    db: &'db dyn Db,
+    unpack: Unpack<'db>,
+    domain: Option<FunctionBodyDomain<'db>>,
+) -> UnpackResult<'db> {
     let program_file = unpack.program_file(db);
     let python_file = program_file.python_file(db);
     let module = parsed_module(db, python_file).load(db);
@@ -1037,7 +1071,8 @@ pub(super) fn infer_unpack_types<'db>(db: &'db dyn Db, unpack: Unpack<'db>) -> U
     .entered();
 
     let env = ProgramEnvironment::from_file(program_file);
-    let mut unpacker = Unpacker::new(db, &env, unpack.target_scope(db), program_file, &module);
+    let mut unpacker = Unpacker::new(db, &env, unpack.target_scope(db), program_file, &module)
+        .with_body_domain(domain);
     unpacker.unpack(unpack.target(db, &module), unpack.value(db));
     unpacker.finish()
 }
