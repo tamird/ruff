@@ -1,0 +1,18 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ty_test",
+    proc_macro_deps = ["//crates/ruff_macros:ruff_macros"],
+    deps = [
+        "//crates/mdtest:mdtest",
+        "//crates/ruff_db:ruff_db",
+        "//crates/ruff_diagnostics:ruff_diagnostics",
+        "//crates/ruff_notebook:ruff_notebook",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_source_file:ruff_source_file",
+        "//crates/ty_module_resolver:ty_module_resolver",
+        "//crates/ty_python_core:ty_python_core",
+        "//crates/ty_python_semantic:ty_python_semantic",
+        "//crates/ty_vendored:ty_vendored",
+    ],
+)

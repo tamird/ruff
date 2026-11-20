@@ -1,0 +1,15 @@
+common --repo_env=CARGO_BAZEL_ISOLATED=false
+import %workspace%/bazel/buildbuddy.bazelrc
+try-import %workspace%/.bazelrc.local
+
+build --enable_runfiles
+build --incompatible_strict_action_env
+build --experimental_convenience_symlinks=ignore
+test --test_output=errors
+build --@rules_rust//rust/settings:rustfmt.toml=//:rustfmt.toml
+build --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
+
+# Match Cargo.toml [profile.dev] in the qualification profile.
+build:cargo-dev --compilation_mode=fastbuild
+build:cargo-dev --@rules_rust//rust/settings:extra_rustc_flags=-Copt-level=1,-Cdebuginfo=line-tables-only,-Cdebug-assertions=on,-Coverflow-checks=on
+build:cargo-dev --@rules_rust//rust/settings:lto=off

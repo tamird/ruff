@@ -1,0 +1,14 @@
+load("//bazel:rust_crate.bzl", "rust_crate")
+
+rust_crate(
+    name = "ty_vendored",
+    compile_data = ["vendor/typeshed/source_commit.txt"],
+    deps = [
+        "//crates/ruff_db:ruff_db",
+    ],
+    # rules_rust 0.74 drops dependencies shared by build and dev roles. The only
+    # dev dependency here is walkdir, also used by build.rs. Remove this bridge
+    # when crate_universe retains overlapping build dependencies.
+    build_dev_deps = True,
+    build_data = glob(["vendor/typeshed/**", "ty_extensions/*.pyi"]),
+)
