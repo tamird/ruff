@@ -554,6 +554,68 @@ fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyh
 }
 
 #[test]
+fn supplied_nested_storage_checks_receiver_eligibility() -> anyhow::Result<()> {
+    let db = TestDbBuilder::new()
+        .with_file(
+            "/src/main.pyi",
+            r#"
+from collections.abc import Hashable
+from typing import Generic, Protocol, TypeVar
+from ty_extensions import Intersection
+
+Receiver = TypeVar("Receiver")
+class Record(Generic[Receiver]):
+    def __hash__(self: Receiver) -> int: ...
+
+type Immutable = int | tuple[Immutable, ...] | Intersection[Record, Hashable]
+
+class Required(Protocol):
+    @property
+    def value(self) -> Immutable: ...
+
+class Box(Record[Required]): ...
+box: Box
+"#,
+        )
+        .build()?;
+    let file = system_path_to_file(&db, "/src/main.pyi")?;
+    let program = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program);
+    let symbol = |name| {
+        crate::place::global_symbol(&db, program, name)
+            .place
+            .expect_type()
+    };
+    let base = symbol("box");
+    let hashable = symbol("Hashable")
+        .to_instance_approximation(&db, &env)
+        .expect("Hashable instance");
+    let with_value = |ty| {
+        base.with_provided_instance_fields(
+            &db,
+            Box::from([ProvidedField {
+                name: Name::new_static("value"),
+                ty,
+                is_required: true,
+                source: None,
+            }]),
+            ProvidedInstanceDisplay::Full,
+        )
+        .expect("nominal instance")
+    };
+    let int = KnownClass::Int.to_instance(&db, &env);
+    let valid = with_value(int);
+    let invalid = with_value(KnownClass::List.to_specialized_instance(&db, &env, &[int]));
+    assert!(valid.is_assignable_to(&db, &env, hashable));
+    assert!(!invalid.is_assignable_to(&db, &env, hashable));
+    assert!(with_value(valid).is_assignable_to(&db, &env, hashable));
+    assert!(!with_value(invalid).is_assignable_to(&db, &env, hashable));
+    assert!(with_value(with_value(valid)).is_assignable_to(&db, &env, hashable));
+    assert!(!with_value(with_value(invalid)).is_assignable_to(&db, &env, hashable));
+    Ok(())
+}
+
+#[test]
 fn optional_supplied_fields_preserve_storage_relations_and_specialization() -> anyhow::Result<()> {
     let db = TestDbBuilder::new()
         .with_file(
