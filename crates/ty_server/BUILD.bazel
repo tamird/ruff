@@ -1,3 +1,21 @@
-load("//bazel:cargo_metadata.bzl", "cargo_metadata_files")
+load("//bazel:rust_crate.bzl", "rust_crate")
 
-cargo_metadata_files()
+rust_crate(
+    name = "ty_server",
+    proc_macro_deps = ["//crates/ruff_macros:ruff_macros"],
+    deps = [
+        "//crates/ruff_db:ruff_db",
+        "//crates/ruff_diagnostics:ruff_diagnostics",
+        "//crates/ruff_notebook:ruff_notebook",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_ranged_value:ruff_ranged_value",
+        "//crates/ruff_source_file:ruff_source_file",
+        "//crates/ruff_text_size:ruff_text_size",
+        "//crates/ty_combine:ty_combine",
+        "//crates/ty_ide:ty_ide",
+        "//crates/ty_module_resolver:ty_module_resolver",
+        "//crates/ty_project:ty_project",
+        "//crates/ty_python_core:ty_python_core",
+        "//crates/ty_python_semantic:ty_python_semantic",
+    ],
+)

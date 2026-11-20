@@ -1,3 +1,8 @@
-load("//bazel:cargo_metadata.bzl", "cargo_metadata_files")
+load("//bazel:rust_crate.bzl", "rust_crate")
 
-cargo_metadata_files()
+rust_crate(
+    name = "ruff_command_line",
+    deps = [
+        "//crates/ty_static:ty_static",
+    ],
+)

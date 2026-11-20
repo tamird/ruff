@@ -1,3 +1,20 @@
-load("//bazel:cargo_metadata.bzl", "cargo_metadata_files")
+load("//bazel:rust_crate.bzl", "rust_crate")
 
-cargo_metadata_files()
+rust_crate(
+    name = "ty_lib",
+    binaries = {"ty": "src/main.rs"},
+    deps = [
+        "//crates/ruff_command_line:ruff_command_line",
+        "//crates/ruff_db:ruff_db",
+        "//crates/ruff_diagnostics:ruff_diagnostics",
+        "//crates/ruff_python_ast:ruff_python_ast",
+        "//crates/ruff_python_parser:ruff_python_parser",
+        "//crates/ruff_ranged_value:ruff_ranged_value",
+        "//crates/ty_combine:ty_combine",
+        "//crates/ty_project:ty_project",
+        "//crates/ty_python_semantic:ty_python_semantic",
+        "//crates/ty_server:ty_server",
+        "//crates/ty_site_packages:ty_site_packages",
+        "//crates/ty_static:ty_static",
+    ],
+)
