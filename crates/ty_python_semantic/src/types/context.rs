@@ -956,7 +956,11 @@ mod tests {
             Span::from(file).with_range(TextRange::new(0.into(), 4.into())),
         ));
         context.extend_provided_diagnostics(vec![diagnostic]);
-        let diagnostics = check_suppressions(&db, program_file.python_file(&db), context.finish().diagnostics);
+        let diagnostics = check_suppressions(
+            &db,
+            program_file.python_file(&db),
+            context.finish().diagnostics,
+        );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         Ok(())
     }
@@ -1012,7 +1016,8 @@ mod tests {
             has_invalid_type_form: false,
             has_failed_call: false,
         };
-        let diagnostics = check_suppressions(&db, program_file.python_file(&db), result.diagnostics);
+        let diagnostics =
+            check_suppressions(&db, program_file.python_file(&db), result.diagnostics);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(
             diagnostics.iter().all(|diagnostic| {

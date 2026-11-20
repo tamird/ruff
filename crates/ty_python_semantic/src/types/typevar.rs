@@ -2759,7 +2759,6 @@ impl<'db> super::cyclic::HasIdentity<'db> for TypeVarInstance<'db> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::assert_matches;
 
     use ruff_db::testing::assert_function_query_was_not_run_by_name;
 
@@ -2936,11 +2935,7 @@ mod tests {
             .expect("freshening a typevar should return a typevar");
         // Freshening `U` changes `T`'s domain as well as its nonce. A later freshening of the
         // original context still needs to see that nonce, or it could recreate `fresh_t`.
-        let delta = freshening_delta(
-            db,
-            [Type::TypeVar(fresh_t)],
-            both_context,
-        );
+        let delta = freshening_delta(db, [Type::TypeVar(fresh_t)], both_context);
         assert_eq!(delta, Some(TypeVarNonce::FIRST.increment().value()));
         let next_mapping = TypeMapping::FreshenBoundTypeVars {
             generic_context: both_context,
@@ -3178,7 +3173,9 @@ mod tests {
         let db = setup_db();
         let db = &db;
         let env = db.program_environment();
-        assert_matches!(KnownClass::List.to_class_literal(db, &env), Type::ClassLiteral(origin));
+        let Type::ClassLiteral(origin) = KnownClass::List.to_class_literal(db, &env) else {
+            panic!("expected the builtin list class literal");
+        };
         let t = BoundTypeVarInstance::synthetic(
             db,
             &env,
@@ -3277,7 +3274,9 @@ mod tests {
         let db = setup_db();
         let db = &db;
         let env = db.program_environment();
-        assert_matches!(KnownClass::List.to_class_literal(db, &env), Type::ClassLiteral(origin));
+        let Type::ClassLiteral(origin) = KnownClass::List.to_class_literal(db, &env) else {
+            panic!("expected the builtin list class literal");
+        };
         let t = BoundTypeVarInstance::synthetic(
             db,
             &env,
@@ -3331,7 +3330,9 @@ mod tests {
         let db = setup_db();
         let db = &db;
         let env = db.program_environment();
-        assert_matches!(KnownClass::Dict.to_class_literal(db, &env), Type::ClassLiteral(origin));
+        let Type::ClassLiteral(origin) = KnownClass::Dict.to_class_literal(db, &env) else {
+            panic!("expected the builtin dict class literal");
+        };
         let t = BoundTypeVarInstance::synthetic(
             db,
             &env,
@@ -3389,7 +3390,9 @@ mod tests {
         let db = setup_db();
         let db = &db;
         let env = db.program_environment();
-        assert_matches!(KnownClass::Int.to_class_literal(db, &env), Type::ClassLiteral(origin));
+        let Type::ClassLiteral(origin) = KnownClass::Int.to_class_literal(db, &env) else {
+            panic!("expected the builtin int class literal");
+        };
         let self_typevar = BoundTypeVarInstance::synthetic_self(
             db,
             SelfTypeVarOrigin::Class(origin),
@@ -3561,8 +3564,11 @@ mod tests {
 
         // An exact component binding neither rewrites the base nor retags its replacement.
         let other_kwargs = Type::TypeVar(other.with_paramspec_attr(db, ParamSpecAttrKind::Kwargs));
-        let mapping =
-            TypeMapping::ApplySpecialization(ApplySpecialization::Single(args, other_kwargs, AliasPolicy::Expand));
+        let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Single(
+            args,
+            other_kwargs,
+            AliasPolicy::Expand,
+        ));
         for (variable, expected) in [
             (paramspec, Type::TypeVar(paramspec)),
             (args, other_kwargs),

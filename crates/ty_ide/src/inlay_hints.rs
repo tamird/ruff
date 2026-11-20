@@ -941,7 +941,7 @@ mod tests {
         DbWithTestSystem, DbWithWritableSystem, SystemPathBuf, SystemVirtualPath,
     };
     use ty_project::metadata::options::{AnalysisOptions, Options};
-    use ty_project::{ProjectMetadata, SemanticDb as _};
+    use ty_project::ProjectMetadata;
     use ty_python_core::semantic_index;
     use ty_python_semantic::ReturnTypeInference;
 
