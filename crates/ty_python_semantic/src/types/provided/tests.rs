@@ -356,7 +356,7 @@ fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyh
         .infer(generic_storage, string_with_storage)
         .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
     let inferred = inference
-        .build_inference_with(|_, _| None)
+        .build_inference_with(crate::types::constraints::ReportDiagnostics::No, |_, _| None)
         .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?
         .merged_specialization(&db);
     assert_eq!(inferred.types(&db), [int]);
@@ -395,7 +395,7 @@ fn supplied_instance_refinement_preserves_storage_and_nominal_behavior() -> anyh
         .infer(formal, actual)
         .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
     let inferred = inference
-        .build_inference_with(|_, _| None)
+        .build_inference_with(crate::types::constraints::ReportDiagnostics::No, |_, _| None)
         .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?
         .merged_specialization(&db);
     assert_eq!(inferred.types(&db), expected.types(&db));
@@ -550,7 +550,7 @@ descriptor: Descriptor
         .infer(generic, optional)
         .map_err(|error| anyhow::anyhow!("unexpected inference error: {error:?}"))?;
     let inferred = inference
-        .build_inference_with(|_, _| None)
+        .build_inference_with(crate::types::constraints::ReportDiagnostics::No, |_, _| None)
         .map_err(|_| anyhow::anyhow!("expected satisfiable inference"))?;
     let inferred = inferred.merged_specialization(&db);
     assert_eq!(inferred.types(&db), [int]);
@@ -1286,7 +1286,7 @@ ordinary: list[int] = ["bad"]
         [
             "invalid-argument-type",
             "missing-typed-dict-key",
-            "invalid-key",
+            "invalid-typed-dict-key",
             "invalid-assignment",
             "invalid-type-form",
             "invalid-assignment"
@@ -1791,7 +1791,7 @@ def different_rows[**Q, **R](left: Injected[Q], right: Injected[R]) -> Injected[
         file.file(&db),
         &[
             ("invalid-argument-type", "callback"),
-            ("invalid-return-type", "shared(left, right)"),
+            ("invalid-explicit-return", "shared(left, right)"),
         ],
     );
     let module = parsed_module(&db, file.python_file(&db)).load(&db);
@@ -3353,7 +3353,7 @@ fn overload_bodies_check_functions_in_immutable_storage() -> anyhow::Result<()> 
             "object",
             "namespace.operation('ok')\n        return None",
             true,
-            Some("invalid-return-type"),
+            Some("invalid-explicit-return"),
         ),
         ("Shadowed", "return namespace.operation('ok')", false, None),
     ] {
@@ -6150,7 +6150,7 @@ def intersection(metadata: Metadata) -> Intersection[Uniform[Metadata | dict[str
     assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| diagnostic.id().as_str() == "invalid-return-type"),
+            .all(|diagnostic| diagnostic.id().as_str() == "invalid-explicit-return"),
         "{diagnostics:#?}"
     );
     db.write_file(
@@ -6166,7 +6166,7 @@ def intersection(metadata: Metadata) -> Intersection[Uniform[Metadata | dict[str
     assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| diagnostic.id().as_str() == "invalid-return-type"),
+            .all(|diagnostic| diagnostic.id().as_str() == "invalid-explicit-return"),
         "{diagnostics:#?}"
     );
     db.write_file("/src/native.pyi", native)?;
@@ -6182,7 +6182,7 @@ def ordinary(metadata: Metadata) -> Uniform[Metadata | dict[str, str], Fields]:
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     assert_eq!(
         diagnostics[0].id().as_str(),
-        "invalid-return-type",
+        "invalid-explicit-return",
         "{diagnostics:#?}"
     );
     Ok(())
