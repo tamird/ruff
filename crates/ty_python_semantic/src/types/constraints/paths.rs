@@ -11,15 +11,16 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use ruff_index::{IndexVec, newtype_index};
 
-use crate::types::constraints::sequents::{CachedSequent, GroupedSequents, Sequent, SequentGroup, SequentMap};
+use crate::types::constraints::sequents::{
+    CachedSequent, GroupedSequents, Sequent, SequentGroup, SequentMap,
+};
 use crate::types::constraints::support::Support;
 use crate::types::constraints::variables::AtomicConstraint::{
     ConcreteEquivalence, ConcreteLower, ConcreteUpper, TypeVarEquivalence, TypeVarRange,
 };
 use crate::types::constraints::variables::{AtomicConstraint, UnspecializedTypeVarPolicy};
 use crate::types::constraints::{
-    Assignment, AtomicConstraintId, ConstraintSetStorage, NodeId, SourceOrderId,
-    TypeVarId,
+    Assignment, AtomicConstraintId, ConstraintSetStorage, NodeId, SourceOrderId, TypeVarId,
 };
 use crate::{Db, FxIndexMap, FxIndexSet, ProgramEnvironment};
 
@@ -1224,10 +1225,38 @@ mod tests {
         let u = Type::TypeVar(create_typevar(db, "U"));
         let cases = [
             create_constraint(db, &builder, t, KnownClass::Int),
-            ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, t, integer),
-            ConstraintSet::constrain_typevar_upper_bound(db, &env, &builder, ConstraintProvenance::INFERRED, t, integer),
-            ConstraintSet::constrain_typevar_upper_bound(db, &env, &builder, ConstraintProvenance::INFERRED, t, u),
-            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, ConstraintProvenance::INFERRED, t, u),
+            ConstraintSet::constrain_typevar_lower_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                t,
+                integer,
+            ),
+            ConstraintSet::constrain_typevar_upper_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                t,
+                integer,
+            ),
+            ConstraintSet::constrain_typevar_upper_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                t,
+                u,
+            ),
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                t,
+                u,
+            ),
         ];
         let different = [
             create_constraint(db, &builder, t, KnownClass::Str),
@@ -1354,9 +1383,16 @@ mod tests {
                 assert!(!conflict);
                 // This branch discovers `T = object => str <= T`. Its consequence is then
                 // rolled back while the implication remains cached for sibling branches.
-                path.walk_edge(db, &env, storage, lower.when_true(), UnspecializedTypeVarPolicy::Ignore, |_, _, _, conflict| {
-                    assert!(!conflict);
-                });
+                path.walk_edge(
+                    db,
+                    &env,
+                    storage,
+                    lower.when_true(),
+                    UnspecializedTypeVarPolicy::Ignore,
+                    |_, _, _, conflict| {
+                        assert!(!conflict);
+                    },
+                );
                 path.walk_edge(
                     db,
                     &env,
@@ -1443,9 +1479,16 @@ mod tests {
                     },
                 );
                 // Removing either antecedent makes the negative consequence satisfiable.
-                path.walk_edge(db, &env, storage, post.when_false(), UnspecializedTypeVarPolicy::Ignore, |_, _, _, conflict| {
-                    assert!(!conflict);
-                });
+                path.walk_edge(
+                    db,
+                    &env,
+                    storage,
+                    post.when_false(),
+                    UnspecializedTypeVarPolicy::Ignore,
+                    |_, _, _, conflict| {
+                        assert!(!conflict);
+                    },
+                );
             },
         );
         path.walk_edge(
@@ -1456,9 +1499,16 @@ mod tests {
             UnspecializedTypeVarPolicy::Ignore,
             |storage, path, _, conflict| {
                 assert!(!conflict);
-                path.walk_edge(db, &env, storage, post.when_false(), UnspecializedTypeVarPolicy::Ignore, |_, _, _, conflict| {
-                    assert!(!conflict);
-                });
+                path.walk_edge(
+                    db,
+                    &env,
+                    storage,
+                    post.when_false(),
+                    UnspecializedTypeVarPolicy::Ignore,
+                    |_, _, _, conflict| {
+                        assert!(!conflict);
+                    },
+                );
             },
         );
     }
@@ -1491,7 +1541,12 @@ mod tests {
                 let body =
                     create_constraint(db, builder, local, KnownClass::Str).and(db, builder, || {
                         ConstraintSet::constrain_typevar_equivalence_bound(
-                            db, &env, builder, ConstraintProvenance::INFERRED, result, list_local,
+                            db,
+                            &env,
+                            builder,
+                            ConstraintProvenance::INFERRED,
+                            result,
+                            list_local,
                         )
                     });
                 let relation = body.reduce_inferable(
@@ -1511,7 +1566,12 @@ mod tests {
             let rhs = create_constraint(db, &builder, right, KnownClass::Int);
             let set = lhs.and(db, &builder, || rhs).and(db, &builder, || {
                 ConstraintSet::constrain_typevar_equivalence_bound(
-                    db, &env, &builder, ConstraintProvenance::INFERRED, result, expected,
+                    db,
+                    &env,
+                    &builder,
+                    ConstraintProvenance::INFERRED,
+                    result,
+                    expected,
                 )
             });
             let mut storage = builder.storage.borrow_mut();
@@ -1525,11 +1585,11 @@ mod tests {
                 .expect_atomic(&storage);
             let mut map = SequentMap::default();
             map.sequents = Box::new([SequentGroup::Ungrouped(Box::new([Sequent::PairRelation {
-                    ante1: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante1)),
-                    ante2: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante2)),
-                    post: (relation, ConstraintProvenance::INFERRED),
-                    fuel_cost: (),
-                }]))]);
+                ante1: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante1)),
+                ante2: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante2)),
+                post: (relation, ConstraintProvenance::INFERRED),
+                fuel_cost: (),
+            }]))]);
             let mut path = set
                 .node
                 .path_assignments(db, &env, &mut storage, set.source_order);
@@ -1602,7 +1662,14 @@ mod tests {
         let relation = ConstraintSetBuilder::new().into_owned(|builder| {
             create_constraint(db, builder, local, KnownClass::Str)
                 .and(db, builder, || {
-                    ConstraintSet::constrain_typevar_lower_bound(db, &env, builder, ConstraintProvenance::INFERRED, result, gradual)
+                    ConstraintSet::constrain_typevar_lower_bound(
+                        db,
+                        &env,
+                        builder,
+                        ConstraintProvenance::INFERRED,
+                        result,
+                        gradual,
+                    )
                 })
                 .reduce_inferable(db, &env, builder, TypeVarSet::from_typevars(db, [local]))
         });
@@ -1613,7 +1680,12 @@ mod tests {
                 let rhs = create_constraint(db, &builder, right, KnownClass::Int);
                 let antecedents = lhs.and(db, &builder, || rhs);
                 let later = ConstraintSet::constrain_typevar_upper_bound(
-                    db, &env, &builder, ConstraintProvenance::INFERRED, result, string,
+                    db,
+                    &env,
+                    &builder,
+                    ConstraintProvenance::INFERRED,
+                    result,
+                    string,
                 );
                 let explicit = builder.load(db, &env, &relation);
                 let explicit = if reverse {
@@ -1660,9 +1732,16 @@ mod tests {
                     .constraint
                     .expect_atomic(&storage);
                 let mut map = SequentMap::default();
-                map.sequents = Box::new([SequentGroup::Ungrouped(Box::new([Sequent::PairRelation {
-                        ante1: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante1)),
-                        ante2: InternedSequentConstraint::new(db, storage.atomic_constraint_data(ante2)),
+                map.sequents =
+                    Box::new([SequentGroup::Ungrouped(Box::new([Sequent::PairRelation {
+                        ante1: InternedSequentConstraint::new(
+                            db,
+                            storage.atomic_constraint_data(ante1),
+                        ),
+                        ante2: InternedSequentConstraint::new(
+                            db,
+                            storage.atomic_constraint_data(ante2),
+                        ),
                         post: (relation.clone(), ConstraintProvenance::INFERRED),
                         fuel_cost: (),
                     }]))]);

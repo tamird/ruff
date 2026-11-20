@@ -207,12 +207,13 @@ impl<'db> OverloadBodyView<'db> {
         let index = semantic_index(self.db, file);
         let missing = std::cell::Cell::new(false);
         let arguments = CallArguments::from_arguments_typed(&call.arguments, |expression| {
-            self.expression_type(expression).unwrap_or_else(|| {
+            let ty = self.expression_type(expression);
+            if ty.is_none() {
                 missing.set(true);
-                Type::unknown()
-            })
+            }
+            ty
         })
-        .with_known_unpacking(
+        .with_observed_unpacking(
             &call.arguments,
             |expression| self.expression_type(expression),
             |expression| {

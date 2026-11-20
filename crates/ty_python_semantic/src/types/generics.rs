@@ -43,11 +43,11 @@ use crate::types::visitor::{
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallableType, CallableTypes,
-    ClassLiteral, DynamicType, ErrorContext, FindLegacyTypeVarsVisitor, IntersectionType, KnownClass,
-    KnownInstanceType, MaterializationKind, RecursiveType, SelfTypeVarOrigin, SubclassOfInner,
-    Type, TypeAliasType, TypeContext, TypeMapping, TypeVarBoundOrConstraints, TypeVarKind,
-    TypeVarVariance, UnionAccumulator, UnionType, binding_type, infer_definition_types,
-    inferred_declaration,
+    ClassLiteral, DynamicType, ErrorContext, FindLegacyTypeVarsVisitor, IntersectionType,
+    KnownClass, KnownInstanceType, MaterializationKind, RecursiveType, SelfTypeVarOrigin,
+    SubclassOfInner, Type, TypeAliasType, TypeContext, TypeMapping, TypeVarBoundOrConstraints,
+    TypeVarKind, TypeVarVariance, UnionAccumulator, UnionType, binding_type,
+    infer_definition_types, inferred_declaration,
 };
 use crate::{Db, FxIndexMap, FxOrderMap, FxOrderSet};
 use ty_python_core::definition::{Definition, DefinitionKind};
@@ -5053,7 +5053,8 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     let mut found_matching_element = false;
                     // One matching positive makes errors from other positives irrelevant;
                     // successful recursive inference alone does not establish assignability.
-                    let redundant_function = actual_intersection.redundant_function_type_for_callable(db, self.env, formal);
+                    let redundant_function = actual_intersection
+                        .redundant_function_type_for_callable(db, self.env, formal);
                     for positive in actual_intersection.iter_positive(db) {
                         if Some(positive) == redundant_function {
                             continue;

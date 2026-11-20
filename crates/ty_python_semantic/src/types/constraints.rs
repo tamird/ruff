@@ -106,21 +106,20 @@ use ty_python_core::rank::RankBitBox;
 use ty_static::EnvVars;
 
 use crate::types::callable::CallableTypeKind;
-use crate::types::class::GenericAlias;
 use crate::types::constraints::projection::{
     ProjectionError, ProjectionTypeBudget, SolutionBudget,
 };
 use crate::types::constraints::support::{Support, SupportId};
 use crate::types::generics::{ApplySpecialization, GenericContext, Specialization};
 use crate::types::typevar::{
-    BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarConstraints, TypeVarDomain, TypeVarInstance,
+    BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarConstraints, TypeVarDomain,
     TypeVarNonce, TypeVarSet,
 };
 use crate::types::visitor::{
     NonAtomicType, TypeKind, TypeVisitor, any_over_type_expanding_aliases, walk_non_atomic_type,
 };
 use crate::types::{
-    ApplyTypeMappingVisitor, BoundTypeVarInstance, IntersectionType, Type, TypeContext,
+    ApplyTypeMappingVisitor, BoundTypeVarInstance, DynamicType, IntersectionType, Type, TypeContext,
     TypeMapping, TypePair, TypeVarBoundOrConstraints, TypeVarVariance, UnionType,
 };
 use crate::{Db, FxIndexMap, FxIndexSet, FxOrderSet, ProgramEnvironment};
@@ -644,7 +643,11 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
         // Selection can reject a candidate after the walker has validated its declared
         // domains. If such a candidate stopped the walk, check all paths before
         // concluding that the arguments are disjoint.
-        if let CandidateSolutions::Constrained(paths) = &candidates
+        if let CandidateSolutions::Constrained {
+            paths,
+            inferable: _,
+            incomplete: _,
+        } = &candidates
             && paths
                 .iter()
                 .any(|path| matches!(path.validity, SolutionValidity::Valid))
@@ -1759,7 +1762,8 @@ impl<'db> ConstraintSetStorage<'db> {
                     result.insert(constraint);
                 }
                 SourceOrder::QuantifiedConstraint(constraint) => {
-                    let Constraint::Existential(existential) = self.constraint_data(constraint) else {
+                    let Constraint::Existential(existential) = self.constraint_data(constraint)
+                    else {
                         panic!("quantified source order must refer to an existential constraint");
                     };
                     pending.extend(existential.source_order);
@@ -1964,7 +1968,9 @@ impl<'db> ConstraintSetStorage<'db> {
                         let right = self.source_order(right);
                         self.storage.ordered_source_order(left, right)
                     }
-                    SourceOrder::AtomicConstraint(constraint) => self.constraint(constraint.into_inner()).1,
+                    SourceOrder::AtomicConstraint(constraint) => {
+                        self.constraint(constraint.into_inner()).1
+                    }
                     SourceOrder::QuantifiedConstraint(constraint) => self.constraint(constraint).1,
                 };
                 self.source_orders[old.index()] = SourceOrderMapping::Mapped(remapped);
@@ -2851,8 +2857,14 @@ impl NodeId {
                 // Bounded callers account for each visit in the exact traversal.
                 let try_all_negative_path = limits.traversal_budget().is_none();
                 let source_orders = storage.calculate_source_orders(source_order);
-                let mut walker =
-                    SolutionWalker::new(db, storage, source_orders, inferable, limits, (self, source_order));
+                let mut walker = SolutionWalker::new(
+                    db,
+                    storage,
+                    source_orders,
+                    inferable,
+                    limits,
+                    (self, source_order),
+                );
                 let mut path = interior.path_assignments(db, env, storage, source_order);
                 if try_all_negative_path
                     && let Some(atoms) = self.all_negative_path_to_false(storage)
@@ -2957,8 +2969,14 @@ impl NodeId {
                     false
                 } else {
                     let source_orders = storage.calculate_source_orders(source_order);
-                    let mut walker =
-                        SolutionWalker::new(db, storage, source_orders, inferable, limits, (self, source_order));
+                    let mut walker = SolutionWalker::new(
+                        db,
+                        storage,
+                        source_orders,
+                        inferable,
+                        limits,
+                        (self, source_order),
+                    );
                     let mut path = interior.path_assignments(db, env, storage, source_order);
                     walker.is_never_satisfied(
                         db,
@@ -3220,7 +3238,8 @@ impl NodeId {
             _ => panic!("at least one type should be a typevar"),
         };
 
-        let node = self.implies(storage, constraint);
+        let negated = self.negate(storage);
+        let node = negated.or(storage, constraint);
         (node, constraint_source_order)
     }
 
@@ -3865,9 +3884,7 @@ impl<'db> CandidateTypeVarSolution<'db> {
     ) -> bool {
         self.evidence_lower
             .into_iter()
-            .chain(self.mixed_lower)
-            .chain(self.upper.iter_evidence())
-            .chain(self.upper.iter_mixed())
+            .chain(self.upper.iter_evidence(EvidenceSource::All))
             .any(|ty| ty.has_provisional_marker(db, env))
     }
 
@@ -3878,7 +3895,7 @@ impl<'db> CandidateTypeVarSolution<'db> {
         env: &ProgramEnvironment<'db>,
         ty: Type<'db>,
     ) -> bool {
-        self.upper.is_satisfied_by(db, env, ty)
+        self.upper.is_satisfied_by(db, env, EvidenceSource::All, ty)
     }
 
     /// Returns one effective upper bound without expanding factored intersections.
@@ -4172,7 +4189,6 @@ impl<'db> CandidateResidual<'db> {
         let mapping = TypeMapping::ApplySpecialization(ApplySpecialization::Partial {
             generic_context: context,
             types: &types,
-            skip: None,
         });
         let visitor = ApplyTypeMappingVisitor::new(env);
         set.apply_type_mapping_impl(db, &mapping, TypeContext::default(), &visitor)
@@ -4620,8 +4636,9 @@ impl<'db> CandidateSolutions<'db> {
             inferable,
             limits,
             (node, source_order),
-        ).with_unspecialized_type_var_policy(unspecialized_type_var_policy)
-            .with_search(search);
+        )
+        .with_unspecialized_type_var_policy(unspecialized_type_var_policy)
+        .with_search(search);
         // Sequent discovery must also happen in source order. Sorting the collected paths is
         // too late: sequent pairs are not commutative, and TDD traversal order can otherwise
         // discard gradual evidence before solution extraction.
@@ -4825,14 +4842,16 @@ impl<'db> CandidateSolutions<'db> {
         env: &ProgramEnvironment<'db>,
         builder: &ConstraintSetBuilder<'db>,
     ) -> Solutions<'db> {
-        self.solve_with(db, env, |_variance, path_bound| {
-            match Self::preliminary_solve(db, env, builder, path_bound) {
+        self.solve_with(
+            db,
+            env,
+            |_variance, path_bound| match Self::preliminary_solve(db, env, builder, path_bound) {
                 PathBoundSolution::Solved(ty) if ty.is_provisional_marker() => {
                     PathBoundSolution::Unsolved
                 }
                 solution => solution,
-            }
-        })
+            },
+        )
     }
 
     /// Widen the inferred arguments for the next pass only when one viable path permits
@@ -4848,7 +4867,11 @@ impl<'db> CandidateSolutions<'db> {
         let paths = match self {
             Self::Unconstrained => return widest,
             Self::Unsatisfiable => return original,
-            Self::Constrained { inferable: _, paths, incomplete: _ } => paths,
+            Self::Constrained {
+                inferable: _,
+                paths,
+                incomplete: _,
+            } => paths,
         };
         let context = original.generic_context(db);
         if original == widest
@@ -5166,6 +5189,7 @@ impl<'db> CandidateSolutions<'db> {
                 db,
                 env,
                 &mut constraints.storage.borrow_mut(),
+                inferable,
                 relation.source_order,
                 limits,
             )?;
@@ -5352,8 +5376,7 @@ impl<'db> CandidateSolutions<'db> {
             {
                 let equivalent_uppers = path_bound
                     .upper
-                    .iter_evidence()
-                    .chain(path_bound.upper.iter_mixed())
+                    .iter_evidence(source)
                     .filter(|upper| {
                         upper.is_fully_static(db, env)
                             && !upper.has_indeterminate_inference(db, env)
@@ -5596,18 +5619,19 @@ impl InteriorNode {
         let mut seen = FxHashSet::from_iter([self.node()]);
         let mut queue = VecDeque::from(vec![self.node()]);
         while let Some(node) = queue.pop_front() {
-            node.for_each_unique_constraint(storage, &mut |constraint_id| {
-                match storage.constraint_data(constraint_id) {
-                    Constraint::Atomic(_) => {
-                        let constraint = constraint_id.expect_atomic(storage);
-                        let index = source_orders.get_index_of(&constraint)
-                            .expect("every BDD constraint should have a source-order entry");
-                        constraints[index] = Some(constraint);
-                    }
-                    Constraint::Existential(existential) => {
-                        if seen.insert(existential.body) {
-                            queue.push_back(existential.body);
-                        }
+            node.for_each_unique_constraint(storage, &mut |constraint_id| match storage
+                .constraint_data(constraint_id)
+            {
+                Constraint::Atomic(_) => {
+                    let constraint = constraint_id.expect_atomic(storage);
+                    let index = source_orders
+                        .get_index_of(&constraint)
+                        .expect("every BDD constraint should have a source-order entry");
+                    constraints[index] = Some(constraint);
+                }
+                Constraint::Existential(existential) => {
+                    if seen.insert(existential.body) {
+                        queue.push_back(existential.body);
                     }
                 }
             });
@@ -6060,7 +6084,12 @@ mod tests {
             for witness in [integer, string, bytes] {
                 let builder = ConstraintSetBuilder::new();
                 let body = ConstraintSet::constrain_typevar_equivalence_bound(
-                    db, &env, &builder, ConstraintProvenance::INFERRED, local, witness,
+                    db,
+                    &env,
+                    &builder,
+                    ConstraintProvenance::INFERRED,
+                    local,
+                    witness,
                 );
                 // Free declarations are intentionally ignored by this query.
                 assert!(!body.is_never_satisfied(db, &env));
@@ -6100,8 +6129,14 @@ mod tests {
             Some(TypeVarBoundOrConstraints::UpperBound(Type::TypeVar(free)))
         });
         let builder = ConstraintSetBuilder::new();
-        let body =
-            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, ConstraintProvenance::INFERRED, local, string);
+        let body = ConstraintSet::constrain_typevar_equivalence_bound(
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            local,
+            string,
+        );
         let quantified =
             body.reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
         // Only the binder's declarations apply: this query leaves Free rigid and ignores its
@@ -6110,8 +6145,14 @@ mod tests {
         // Free occurs only in Local's declared bound, so proof support must include the domain.
         assert!(!quantified.is_always_satisfied(db, &env));
         assert!(!quantified.is_trivially_always_satisfied());
-        let obligation =
-            ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, free, string);
+        let obligation = ConstraintSet::constrain_typevar_lower_bound(
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            free,
+            string,
+        );
         assert!(
             quantified
                 .iff(db, &builder, obligation)
@@ -6122,8 +6163,20 @@ mod tests {
         // imported proof, but must stabilize afterward. Reuse the same binder, since
         // constructing another scope deliberately freshens it.
         let mut owned = ConstraintSetBuilder::new().into_owned(|builder| {
-            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, builder, ConstraintProvenance::INFERRED, local, string)
-                .reduce_inferable(db, &env, builder, TypeVarSet::from_typevars(db, [local]))
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                builder,
+                ConstraintProvenance::INFERRED,
+                local,
+                string,
+            )
+            .reduce_inferable(
+                db,
+                &env,
+                builder,
+                TypeVarSet::from_typevars(db, [local]),
+            )
         });
         owned = ConstraintSetBuilder::new().into_owned(|builder| builder.load(db, &env, &owned));
         for iteration in 0..17 {
@@ -6314,8 +6367,14 @@ mod tests {
             Type::TypeVar(free),
         );
         let quantified = body.reduce_inferable(db, &env, &builder, locals);
-        let obligation =
-            ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, free, string);
+        let obligation = ConstraintSet::constrain_typevar_lower_bound(
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            free,
+            string,
+        );
         let substitute = |value| {
             quantified.apply_type_mapping_impl(
                 db,
@@ -6745,10 +6804,22 @@ mod tests {
         let positional = Type::homogeneous_tuple(db, &env, Type::TypeVar(free));
         let keywords = KnownClass::Dict.to_specialized_instance(db, &env, &[string, string]);
         let body = ConstraintSet::constrain_typevar_equivalence_bound(
-            db, &env, &builder, ConstraintProvenance::INFERRED, args, positional,
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            args,
+            positional,
         )
         .and(db, &builder, || {
-            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, ConstraintProvenance::INFERRED, kwargs, keywords)
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                kwargs,
+                keywords,
+            )
         })
         .and(db, &builder, || {
             ConstraintSet::constrain_typevar_equivalence_bound(
@@ -6852,22 +6923,29 @@ mod tests {
         );
 
         // Projection-only contexts bind the exact component, not its free sibling.
-        let args_only = quantify_constraint(
-            db, body, TypeVarSet::from_typevars(db, [args]),
-        );
+        let args_only = quantify_constraint(db, body, TypeVarSet::from_typevars(db, [args]));
         {
             let storage = builder.storage.borrow();
             let scoped_constraint = storage.interior_node_data(args_only.node).constraint;
-            let Constraint::Existential(existential) = storage.constraint_data(scoped_constraint) else {
+            let Constraint::Existential(existential) = storage.constraint_data(scoped_constraint)
+            else {
                 panic!("expected a retained positional-component scope");
             };
-            let variables: Vec<_> = existential.locals.iter()
-                .map(|id| storage.typevar_data(id)).collect();
+            let variables: Vec<_> = existential
+                .locals
+                .iter()
+                .map(|id| storage.typevar_data(id))
+                .collect();
             assert_matches!(variables.as_slice(), [fresh_args]);
             assert_eq!(fresh_args.paramspec_attr(db), Some(ParamSpecAttrKind::Args));
             assert_ne!(fresh_args.identity(db), args.identity(db));
-            assert!(storage.node_support(existential.body).unwrap().iter()
-                .any(|id| storage.typevar_data(id).identity(db) == kwargs.identity(db)));
+            assert!(
+                storage
+                    .node_support(existential.body)
+                    .unwrap()
+                    .iter()
+                    .any(|id| storage.typevar_data(id).identity(db) == kwargs.identity(db))
+            );
         }
 
         // Quantifying a component alone leaves the other component's identity free.
@@ -6938,18 +7016,39 @@ mod tests {
             let builder = ConstraintSetBuilder::new();
             let list_local =
                 KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
-            let set =
-                ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, local, string)
-                    .and(db, &builder, || {
-                        ConstraintSet::constrain_typevar_equivalence_bound(
-                            db, &env, &builder, ConstraintProvenance::INFERRED, result, list_local,
-                        )
-                    })
-                    .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+            let set = ConstraintSet::constrain_typevar_lower_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                local,
+                string,
+            )
+            .and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db,
+                    &env,
+                    &builder,
+                    ConstraintProvenance::INFERRED,
+                    result,
+                    list_local,
+                )
+            })
+            .reduce_inferable(
+                db,
+                &env,
+                &builder,
+                TypeVarSet::from_typevars(db, [local]),
+            );
             let set = match context {
                 Some(context) => set.and(db, &builder, || {
                     ConstraintSet::constrain_typevar_lower_bound(
-                        db, &env, &builder, ConstraintProvenance::INFERRED, result, context,
+                        db,
+                        &env,
+                        &builder,
+                        ConstraintProvenance::INFERRED,
+                        result,
+                        context,
                     )
                 }),
                 None => set,
@@ -7009,25 +7108,49 @@ mod tests {
         let string = known_instance(db, KnownClass::Str);
         let builder = ConstraintSetBuilder::new();
         let body = ConstraintSet::constrain_typevar(
-            db, &env, &builder, ConstraintProvenance::INFERRED,
-            local, string, Type::TypeVar(free),
-        ).and(db, &builder, || {
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            local,
+            string,
+            Type::TypeVar(free),
+        )
+        .and(db, &builder, || {
             ConstraintSet::constrain_typevar_equivalence_bound(
-                db, &env, &builder, ConstraintProvenance::INFERRED, result, literal,
-            ).negate(db, &builder)
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                result,
+                literal,
+            )
+            .negate(db, &builder)
         });
-        let set = body.reduce_inferable(
-            db, &env, &builder, TypeVarSet::from_typevars(db, [local]),
-        ).negate(db, &builder);
+        let set = body
+            .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]))
+            .negate(db, &builder);
         let candidates = CandidateSolutions::compute(
-            db, &env, &mut builder.storage.borrow_mut(), set.node,
-            context.inferable_typevars(db), set.source_order,
+            db,
+            &env,
+            &mut builder.storage.borrow_mut(),
+            set.node,
+            context.inferable_typevars(db),
+            set.source_order,
             UnspecializedTypeVarPolicy::Retain,
         );
-        let CandidateSolutions::Constrained { inferable: _, paths, incomplete: _ } = &candidates else {
+        let CandidateSolutions::Constrained {
+            inferable: _,
+            paths,
+            incomplete: _,
+        } = &candidates
+        else {
             panic!("expected scoped candidates, got {candidates:?}");
         };
-        assert!(paths.iter().any(|path| path.residual.is_some()), "{candidates:?}");
+        assert!(
+            paths.iter().any(|path| path.residual.is_some()),
+            "{candidates:?}"
+        );
         // Result == Literal["x"] refutes the body for every Free. Widening Result to str
         // instead requires a witness for the rigid Free, which per-variable bounds cannot prove.
         let original = context.repeat_specialization(db, literal);
@@ -7053,7 +7176,12 @@ mod tests {
             let builder = ConstraintSetBuilder::new();
             let arm = |local, ground| {
                 ConstraintSet::constrain_typevar_equivalence_bound(
-                    db, &env, &builder, ConstraintProvenance::INFERRED, local, ground,
+                    db,
+                    &env,
+                    &builder,
+                    ConstraintProvenance::INFERRED,
+                    local,
+                    ground,
                 )
                 .and(db, &builder, || {
                     ConstraintSet::constrain_typevar_equivalence_bound(
@@ -7081,7 +7209,12 @@ mod tests {
             for selected in [integer, string, bytes] {
                 let set = either.and(db, &builder, || {
                     ConstraintSet::constrain_typevar_equivalence_bound(
-                        db, &env, &builder, ConstraintProvenance::INFERRED, caller, selected,
+                        db,
+                        &env,
+                        &builder,
+                        ConstraintProvenance::INFERRED,
+                        caller,
+                        selected,
                     )
                 });
                 let actual = set
@@ -7134,7 +7267,12 @@ mod tests {
         for value in [integer, string, bytes] {
             let fixed = set.and(db, &builder, || {
                 ConstraintSet::constrain_typevar_equivalence_bound(
-                    db, &env, &builder, ConstraintProvenance::INFERRED, caller, value,
+                    db,
+                    &env,
+                    &builder,
+                    ConstraintProvenance::INFERRED,
+                    caller,
+                    value,
                 )
             });
             let result = fixed.solutions(db, &env, inferable).unwrap();
@@ -7228,7 +7366,12 @@ mod tests {
             .and(db, &builder, || {
                 if negative_atom {
                     ConstraintSet::constrain_typevar_equivalence_bound(
-                        db, &env, &builder, ConstraintProvenance::INFERRED, left, string,
+                        db,
+                        &env,
+                        &builder,
+                        ConstraintProvenance::INFERRED,
+                        left,
+                        string,
                     )
                     .negate(db, &builder)
                 } else {
@@ -7279,19 +7422,36 @@ mod tests {
         let builder = ConstraintSetBuilder::new();
         let list_local =
             KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
-        let set = ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, local, string)
-            .and(db, &builder, || {
-                ConstraintSet::constrain_typevar_equivalence_bound(
-                    db, &env, &builder, ConstraintProvenance::INFERRED, result, list_local,
-                )
-            })
-            .and(db, &builder, || {
-                ConstraintSet::constrain_typevar_equivalence_bound(
-                    db, &env, &builder, ConstraintProvenance::INFERRED, local, string,
-                )
-                .negate(db, &builder)
-            })
-            .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        let set = ConstraintSet::constrain_typevar_lower_bound(
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            local,
+            string,
+        )
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                result,
+                list_local,
+            )
+        })
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                local,
+                string,
+            )
+            .negate(db, &builder)
+        })
+        .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
         // A larger local witness exists, but the selected str witness fails the negative atom.
         // Its list[str] result must not escape even as an ordinary fallback binding.
         assert_eq!(
@@ -7341,13 +7501,25 @@ mod tests {
         let builder = ConstraintSetBuilder::new();
         let list_local =
             KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
-        let set = ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, local, string)
-            .and(db, &builder, || {
-                ConstraintSet::constrain_typevar_equivalence_bound(
-                    db, &env, &builder, ConstraintProvenance::INFERRED, result, list_local,
-                )
-            })
-            .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+        let set = ConstraintSet::constrain_typevar_lower_bound(
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            local,
+            string,
+        )
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                result,
+                list_local,
+            )
+        })
+        .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
         let (candidates, _) = set
             .bounded_path_bounds(
                 db,
@@ -7408,12 +7580,22 @@ mod tests {
         for chosen in [Type::object(), integer, Type::TypeVar(free)] {
             let builder = ConstraintSetBuilder::new();
             let set = ConstraintSet::constrain_typevar_equivalence_bound(
-                db, &env, &builder, ConstraintProvenance::INFERRED, local, string,
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                local,
+                string,
             )
             .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]))
             .and(db, &builder, || {
                 ConstraintSet::constrain_typevar_equivalence_bound(
-                    db, &env, &builder, ConstraintProvenance::INFERRED, caller, chosen,
+                    db,
+                    &env,
+                    &builder,
+                    ConstraintProvenance::INFERRED,
+                    caller,
+                    chosen,
                 )
             });
             let result = set.solutions(db, &env, TypeVarSet::from_typevars(db, [caller]));
@@ -7459,20 +7641,26 @@ mod tests {
             Some(TypeVarBoundOrConstraints::UpperBound(Type::TypeVar(result)))
         });
         let builder = ConstraintSetBuilder::new();
-        let nested =
-            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, ConstraintProvenance::INFERRED, inner, integer)
-                .and(db, &builder, || {
-                    ConstraintSet::constrain_typevar_equivalence_bound(
-                        db,
-                        &env,
-                        &builder,
-                        ConstraintProvenance::INFERRED,
-                        outer,
-                        Type::TypeVar(inner),
-                    )
-                })
-                .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [inner]))
-                .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [outer]));
+        let nested = ConstraintSet::constrain_typevar_equivalence_bound(
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            inner,
+            integer,
+        )
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                outer,
+                Type::TypeVar(inner),
+            )
+        })
+        .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [inner]))
+        .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [outer]));
         let alternative = ConstraintSet::constrain_typevar_equivalence_bound(
             db,
             &env,
@@ -7487,8 +7675,14 @@ mod tests {
             &builder,
             TypeVarSet::from_typevars(db, [alternative]),
         );
-        let same_source_free =
-            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, ConstraintProvenance::INFERRED, outer, integer);
+        let same_source_free = ConstraintSet::constrain_typevar_equivalence_bound(
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            outer,
+            integer,
+        );
         for (set, expected) in [
             (nested.negate(db, &builder), vec![free]),
             (nested.or(db, &builder, || alternative), vec![free, result]),
@@ -7598,12 +7792,22 @@ mod tests {
                 domain
                     .and(db, builder, || {
                         ConstraintSet::constrain_typevar_equivalence_bound(
-                            db, &env, builder, ConstraintProvenance::INFERRED, local, integer,
+                            db,
+                            &env,
+                            builder,
+                            ConstraintProvenance::INFERRED,
+                            local,
+                            integer,
                         )
                     })
                     .and(db, builder, || {
                         ConstraintSet::constrain_typevar_equivalence_bound(
-                            db, &env, builder, ConstraintProvenance::INFERRED, result, integer,
+                            db,
+                            &env,
+                            builder,
+                            ConstraintProvenance::INFERRED,
+                            result,
+                            integer,
                         )
                     })
             });
@@ -7645,24 +7849,35 @@ mod tests {
         let result = create_typevar(db, "Result")
             .map_bound_or_constraints(db, |_| Some(TypeVarBoundOrConstraints::UpperBound(integer)));
         let builder = ConstraintSetBuilder::new();
-        let set =
-            ConstraintSet::constrain_typevar_equivalence_bound(db, &env, &builder, ConstraintProvenance::INFERRED, local, integer)
-                .and(db, &builder, || {
-                    ConstraintSet::constrain_typevar_equivalence_bound(
-                        db,
-                        &env,
-                        &builder,
-                        ConstraintProvenance::INFERRED,
-                        result,
-                        Type::TypeVar(local),
-                    )
-                })
-                .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]))
-                .and(db, &builder, || {
-                    ConstraintSet::constrain_typevar_lower_bound(
-                        db, &env, &builder, ConstraintProvenance::INFERRED, result, integer,
-                    )
-                });
+        let set = ConstraintSet::constrain_typevar_equivalence_bound(
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            local,
+            integer,
+        )
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                result,
+                Type::TypeVar(local),
+            )
+        })
+        .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]))
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_lower_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                result,
+                integer,
+            )
+        });
         let (candidates, _) = set
             .bounded_path_bounds(
                 db,
@@ -7747,7 +7962,13 @@ mod tests {
             body.reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
         let inferable = TypeVarSet::from_typevars(db, [left, right]);
         let (candidates, _) = quantified
-            .bounded_path_bounds(db, &env, inferable, SolutionBudget::default(), CandidateSearch::All(ReportDiagnostics::Yes))
+            .bounded_path_bounds(
+                db,
+                &env,
+                inferable,
+                SolutionBudget::default(),
+                CandidateSearch::All(ReportDiagnostics::Yes),
+            )
             .unwrap();
         let CandidateSolutions::Constrained {
             paths,
@@ -7864,12 +8085,33 @@ mod tests {
         let builder = ConstraintSetBuilder::new();
         let list_local =
             KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
-        let set = ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, local, string)
-            .and(db, &builder, || {
-                ConstraintSet::constrain_typevar_equivalence_bound(
-                    db, &env, &builder, ConstraintProvenance::INFERRED, result, list_local,
-                )
-            })
+        let set = ConstraintSet::constrain_typevar_lower_bound(
+            db,
+            &env,
+            &builder,
+            ConstraintProvenance::INFERRED,
+            local,
+            string,
+        )
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                result,
+                list_local,
+            )
+        })
+        .and(db, &builder, || {
+            ConstraintSet::constrain_typevar_equivalence_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                nested,
+                Type::TypeVar(local),
+            )
             .and(db, &builder, || {
                 ConstraintSet::constrain_typevar_equivalence_bound(
                     db,
@@ -7877,19 +8119,22 @@ mod tests {
                     &builder,
                     ConstraintProvenance::INFERRED,
                     nested,
-                    Type::TypeVar(local),
+                    string,
                 )
-                .and(db, &builder, || {
-                    ConstraintSet::constrain_typevar_equivalence_bound(
-                        db, &env, &builder, ConstraintProvenance::INFERRED, nested, string,
-                    )
-                })
-                .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [nested]))
-                .negate(db, &builder)
             })
-            .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+            .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [nested]))
+            .negate(db, &builder)
+        })
+        .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
         let set = set.and(db, &builder, || {
-            ConstraintSet::constrain_typevar_lower_bound(db, &env, &builder, ConstraintProvenance::INFERRED, result, list_object)
+            ConstraintSet::constrain_typevar_lower_bound(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                result,
+                list_object,
+            )
         });
         assert_eq!(
             set.solutions(db, &env, TypeVarSet::from_typevars(db, [result])),
@@ -7921,13 +8166,31 @@ mod tests {
             let builder = ConstraintSetBuilder::new();
             let list_local =
                 KnownClass::List.to_specialized_instance(db, &env, &[Type::TypeVar(local)]);
-            let set = ConstraintSet::constrain_typevar(db, &env, &builder, ConstraintProvenance::INFERRED, local, string, upper)
-                .and(db, &builder, || {
-                    ConstraintSet::constrain_typevar_equivalence_bound(
-                        db, &env, &builder, ConstraintProvenance::INFERRED, result, list_local,
-                    )
-                })
-                .reduce_inferable(db, &env, &builder, TypeVarSet::from_typevars(db, [local]));
+            let set = ConstraintSet::constrain_typevar(
+                db,
+                &env,
+                &builder,
+                ConstraintProvenance::INFERRED,
+                local,
+                string,
+                upper,
+            )
+            .and(db, &builder, || {
+                ConstraintSet::constrain_typevar_equivalence_bound(
+                    db,
+                    &env,
+                    &builder,
+                    ConstraintProvenance::INFERRED,
+                    result,
+                    list_local,
+                )
+            })
+            .reduce_inferable(
+                db,
+                &env,
+                &builder,
+                TypeVarSet::from_typevars(db, [local]),
+            );
             let list_string = KnownClass::List.to_specialized_instance(db, &env, &[string]);
             let paths = if expected {
                 SolutionPaths::Complete(vec![solution([TypeVarSolution {
@@ -9977,14 +10240,17 @@ class E: ...
         // Freezing must also visit the shared sidecar as a DAG and retain its first occurrences.
         let node = right.node;
         let source_order = right.source_order;
-        let owned = builder.into_owned(|builder| {
-            ConstraintSet::from_node(builder, node, source_order)
-        });
+        let owned =
+            builder.into_owned(|builder| ConstraintSet::from_node(builder, node, source_order));
         assert_eq!(owned.inner.as_ref().unwrap().source_orders.len(), 3);
         owned.query(|builder, set| {
             assert_eq!(
-                builder.storage.borrow().calculate_source_orders(set.source_order)
-                    .into_iter().collect::<Vec<_>>(),
+                builder
+                    .storage
+                    .borrow()
+                    .calculate_source_orders(set.source_order)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
                 expected,
             );
         });
@@ -10256,17 +10522,17 @@ class E: ...
                     .collect(),
             )));
 
-        let owned = ConstraintSetBuilder::new().into_owned(|builder| {
-            let u_t = ConstraintSet::constrain_typevar_equivalence_bound(
-                db,
-                &env,
-                builder,
-                ConstraintProvenance::INFERRED,
-                u,
-                Type::TypeVar(t),
-            );
-            let t_str = create_constraint(db, builder, t, KnownClass::Str);
-            let u_int = create_constraint(db, builder, u, KnownClass::Int);
+            let owned = ConstraintSetBuilder::new().into_owned(|builder| {
+                let u_t = ConstraintSet::constrain_typevar_equivalence_bound(
+                    db,
+                    &env,
+                    builder,
+                    ConstraintProvenance::INFERRED,
+                    u,
+                    Type::TypeVar(t),
+                );
+                let t_str = create_constraint(db, builder, t, KnownClass::Str);
+                let u_int = create_constraint(db, builder, u, KnownClass::Int);
 
                 // Both the scoped U = str branch and direct U = int retain their source order.
                 let derived = u_t.and(db, builder, || t_str);

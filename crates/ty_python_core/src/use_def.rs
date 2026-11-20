@@ -3760,15 +3760,21 @@ mod tests {
 
         let mut pending = PendingReachability::default();
         let root = pending.current;
-        pending.push(reach_a, narrow_a);
+        pending.push(
+            reach_a,
+            narrow_a,
+            ScopedReachabilityConstraintId::ALWAYS_TRUE,
+            reach_a,
+        );
         let common = pending.current;
-        pending.push(reach_b, narrow_b);
+        let current_reachability = reachability.add_and_constraint(reach_a, reach_b);
+        pending.push(reach_b, narrow_b, reach_a, current_reachability);
         let current = pending.current;
         pending.current = common;
-        pending.push(not_b, narrow_not_b);
+        let branch_reachability = reachability.add_and_constraint(reach_a, not_b);
+        pending.push(not_b, narrow_not_b, reach_a, branch_reachability);
         let branch = pending.current;
         pending.current = current;
-        let branch_reachability = reachability.add_and_constraint(reach_a, not_b);
 
         let unbound = PlaceState::undefined(ScopedReachabilityConstraintId::ALWAYS_TRUE);
         let mut inputs = vec![PendingPlaceState::new(unbound.clone(), root)];

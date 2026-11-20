@@ -179,7 +179,6 @@ fn producers<'db, 'ast>(
     for predicate in use_def.predicates().iter() {
         let expression = match predicate.node {
             PredicateNode::Expression(expression) => expression,
-            PredicateNode::Condition(expression) => expression,
             _ => continue,
         };
         let ast::Expr::UnaryOp(unary) = expression.node_ref(db).node(module) else {

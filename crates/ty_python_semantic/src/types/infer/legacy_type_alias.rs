@@ -494,7 +494,9 @@ impl<'ast> Visitor<'ast> for LegacyTypeVarCollector<'_> {
             && let Some(string_literal) = string.as_single_part_string()
         {
             let file = self.alias_definition.program_file(self.db);
-            if let Ok(parsed) = parsed_string_annotation(self.db, file.python_file(self.db), string_literal) {
+            if let Ok(parsed) =
+                parsed_string_annotation(self.db, file.python_file(self.db), string_literal)
+            {
                 let string_scope = self
                     .string_annotation_scope
                     .unwrap_or_else(|| semantic_index(self.db, file).expression_scope_id(expr));

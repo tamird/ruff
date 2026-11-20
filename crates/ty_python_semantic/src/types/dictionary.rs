@@ -652,9 +652,7 @@ impl<'db> DictionaryItems<'db> {
                 if test_type.is_some_and(|ty| ty.resolve_type_alias(db).is_never()) {
                     return Err(DictionaryFallback::Unreachable);
                 }
-                let truthiness = test_type
-                    .and_then(|ty| ty.bool_if_inhabited(db, env))
-                    .unwrap_or(Truthiness::Ambiguous);
+                let truthiness = test_type.map_or(Truthiness::Ambiguous, |ty| ty.bool(db, env));
                 let mut observe = |branch: &ast::Expr| {
                     Self::builtin_source(
                         db,
@@ -670,6 +668,7 @@ impl<'db> DictionaryItems<'db> {
                     Truthiness::AlwaysTrue => return observe(&conditional.body),
                     Truthiness::AlwaysFalse => return observe(&conditional.orelse),
                     Truthiness::Ambiguous => {}
+                    Truthiness::Uninhabited => return Err(DictionaryFallback::Unreachable),
                 }
                 match (observe(&conditional.body), observe(&conditional.orelse)) {
                     (Ok(left), Ok(right)) => Ok(left.join(db, env, &right, false)),

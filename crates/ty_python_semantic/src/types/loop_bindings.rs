@@ -25,7 +25,6 @@ pub(crate) fn certifies_predicate<'db>(
 ) -> bool {
     let guard = match predicate.node {
         PredicateNode::Expression(expression) => expression,
-        PredicateNode::Condition(expression) => expression,
         _ => return false,
     };
     if guard.scope(db) != binding.scope(db) {
@@ -396,8 +395,7 @@ def select(rows: list[tuple[bool, list[str], str]]) -> str:
                 for predicate in use_def.predicates().iter() {
                     let guard = match predicate.node {
                         PredicateNode::Expression(expression) => expression,
-                        PredicateNode::Condition(expression) => expression,
-                        _ => continue,
+                                    _ => continue,
                     };
                     if empty_length_guard(guard.node_ref(db).node(module)).is_some() {
                         return (definition, guard);

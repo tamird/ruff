@@ -215,7 +215,9 @@ impl OwnedConstraintSetBuilder {
             let next = self.source_orders.push(order);
             mapped = Some(match mapped {
                 None => next,
-                Some(previous) => self.source_orders.push(SourceOrder::Ordered(previous, next)),
+                Some(previous) => self
+                    .source_orders
+                    .push(SourceOrder::Ordered(previous, next)),
             });
         }
         mapped
