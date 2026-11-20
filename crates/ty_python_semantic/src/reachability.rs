@@ -2258,15 +2258,6 @@ fn context_manager_suppresses<'db>(
     )
 }
 
-/// Evaluate a predicate, returning `Uninhabited` when it cannot produce a boolean outcome.
-///
-/// Unlike ambiguous truthiness, an uninhabited condition does not make either branch reachable.
-/// In particular, treating `Never` as ambiguous can introduce loop bindings that then exclude each
-/// other, causing inference to settle on different types depending on file-checking order.
-fn analyze_single(db: &dyn Db, env: &ProgramEnvironment<'_>, predicate: &Predicate) -> Truthiness {
-    analyze_single_in_domain(db, env, predicate, None)
-}
-
 #[salsa::tracked(
     returns(copy),
     cycle_initial = |_, _, _, _| false,
@@ -2338,6 +2329,11 @@ fn analyze_reachability_atom<'db>(
     ReachabilityAtom::Known(predicates.evaluate(db, env, id))
 }
 
+/// Evaluate a predicate, returning `Uninhabited` when it cannot produce a boolean outcome.
+///
+/// Unlike ambiguous truthiness, an uninhabited condition does not make either branch reachable.
+/// In particular, treating `Never` as ambiguous can introduce loop bindings that then exclude each
+/// other, causing inference to settle on different types depending on file-checking order.
 fn analyze_single_in_domain<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -3161,11 +3157,21 @@ class TargetB:
                 assert_eq!(id, previous, "the edit must reuse the warmed expression");
             }
             previous_id = Some(id);
-            assert_eq!(
-                analyze_non_terminal_call(&db, expression),
-                expected,
-                "{statement}"
-            );
+            let use_def = use_def_map(&db, expression.scope(&db));
+            let calls: Vec<_> = use_def
+                .predicates()
+                .iter()
+                .filter_map(|predicate| match predicate.node {
+                    PredicateNode::IsNonTerminalCall(call) => Some(call),
+                    _ => None,
+                })
+                .collect();
+            let actual = match calls.as_slice() {
+                [] => Truthiness::AlwaysTrue,
+                [call] => analyze_non_terminal_call(&db, *call),
+                calls => panic!("expected at most one statement call: {calls:?}"),
+            };
+            assert_eq!(actual, expected, "{statement}");
         }
         Ok(())
     }
@@ -3282,7 +3288,7 @@ class TargetB:
                     None,
                 );
                 projector.constraints = &constraints;
-                projector.predicates = &predicates;
+                projector.predicates = PredicateEvaluator::uncached(&predicates, None);
 
                 assert_eq!(
                     projector.project(ScopedNarrowingConstraint::new(DEPTH - 1), false),

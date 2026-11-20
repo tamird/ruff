@@ -4561,15 +4561,6 @@ impl<'db> Type<'db> {
     ///
     /// [descriptor guide]: https://docs.python.org/3/howto/descriptor.html#invocation-from-an-instance
     /// [`_PyType_Lookup`]: https://github.com/python/cpython/blob/e285232c76606e3be7bf216efb1be1e742423e4b/Objects/typeobject.c#L5223
-    fn find_name_in_mro(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        name: &str,
-    ) -> Option<PlaceAndQualifiers<'db>> {
-        self.find_name_in_mro_with_policy(db, env, name, MemberLookupPolicy::default())
-    }
-
     fn find_name_in_mro_with_policy(
         &self,
         db: &'db dyn Db,
@@ -4591,7 +4582,7 @@ impl<'db> Type<'db> {
                         .find_name_in_mro_with_policy(db, env, name, policy)
                         // If some elements are classes, and some are not, we simply fall back to `Unbound` for the non-class
                         // elements instead of short-circuiting the whole result to `None`. We would need a more detailed
-                        // return type otherwise, and since `find_name_in_mro` is usually called via `class_member`, this is
+                        // return type otherwise, and since `find_name_in_mro_with_policy` is usually called via `class_member`, this is
                         // not a problem.
                         .unwrap_or_default();
                     policy.preserve_missing_alternative(db, *elem, member)
@@ -4757,8 +4748,8 @@ impl<'db> Type<'db> {
     /// Look up an attribute in the MRO of the meta-type of `self`. This returns class-level attributes
     /// when called on an instance-like type, and metaclass attributes when called on a class-like type.
     ///
-    /// Basically corresponds to `self.to_meta_type().find_name_in_mro(name)`, except for the handling
-    /// of union and intersection types.
+    /// Corresponds to an MRO lookup on `self.to_meta_type()` with the default policy,
+    /// except for the handling of union and intersection types.
     fn class_member(
         self,
         db: &'db dyn Db,
@@ -4877,14 +4868,14 @@ impl<'db> Type<'db> {
                 let type_result = KnownClass::Type
                     .to_class_literal(db, env)
                     .find_name_in_mro_with_policy(db, env, name, policy)
-                    .expect("`find_name_in_mro` should return `Some` for a class literal");
+                    .expect("`find_name_in_mro_with_policy` should return `Some` for a class literal");
                 if !type_result.place.is_undefined() {
                     type_result
                 } else {
                     ty.to_meta_type(db, env)
                         .find_name_in_mro_with_policy(db, env, name, policy)
                         .expect(
-                            "`Type::find_name_in_mro()` should return `Some()` \
+                            "`Type::find_name_in_mro_with_policy()` should return `Some()` \
                             when called on a meta-type",
                         )
                 }
@@ -4906,7 +4897,7 @@ impl<'db> Type<'db> {
                 .to_meta_type(db, env)
                 .find_name_in_mro_with_policy(db, env, name, policy)
                 .expect(
-                    "`Type::find_name_in_mro()` should return `Some()` \
+                    "`Type::find_name_in_mro_with_policy()` should return `Some()` \
                     when called on a meta-type",
                 ),
         }

@@ -340,7 +340,7 @@ mod tests {
                     assert_eq!(
                         ids,
                         if invalid_return {
-                            vec!["invalid-return-type"]
+                            vec!["invalid-explicit-return"]
                         } else {
                             vec![]
                         },
