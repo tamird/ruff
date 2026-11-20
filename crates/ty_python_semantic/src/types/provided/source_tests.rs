@@ -3163,7 +3163,7 @@ fn supplied_builtin_usage_selects_the_declaration() -> anyhow::Result<()> {
 }
 
 #[test]
-fn supplied_builtin_calls_propagate_never_arguments() -> anyhow::Result<()> {
+fn supplied_builtin_calls_share_native_bottom_argument_policy() -> anyhow::Result<()> {
     struct Calls<'a, 'db> {
         model: &'a SemanticModel<'db>,
         types: Vec<Type<'db>>,
@@ -3209,6 +3209,10 @@ def bottom(value: Never):
     Scalar(*value)
     Scalar(**value)
     Scalar(value, 1)
+    sentinel(value)
+    sentinel(*value)
+    sentinel(**value)
+    sentinel(value, 1)
 
 def gradual(value: Any | int):
     Scalar(value)
@@ -3234,7 +3238,7 @@ Scalar(None)
         .build()?;
     let file = system_path_to_file(&db, "/src/main.py")?;
     let diagnostics = db.check_file(file);
-    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert_eq!(diagnostics.len(), 3, "{diagnostics:#?}");
     assert!(
         diagnostics
             .iter()
@@ -3251,19 +3255,31 @@ Scalar(None)
     let env = model.program_environment();
     let string = KnownClass::Str.to_instance(&db, &env);
     let integer = KnownClass::Int.to_instance(&db, &env);
-    assert_matches!(
-        calls.types.as_slice(),
-        [Type::Never, Type::Never, Type::Never, Type::Never, Type::Never, Type::Never,
+    let [supplied_absent, native_absent,
+         supplied_value, supplied_positional, supplied_keywords, supplied_invalid,
+         native_value, native_positional, native_keywords, native_invalid,
          gradual_overload, gradual, dynamic, reachable, empty_positional, empty_keywords, invalid]
-            if *gradual_overload == string
-                && !gradual.is_never()
-                && !gradual.is_fully_static(&db, &env)
-                && *dynamic == Type::any()
-                && *reachable == string
-                && *empty_positional == integer
-                && *empty_keywords == integer
-                && invalid.is_unknown()
-    );
+        = calls.types.as_slice()
+    else {
+        panic!("expected every supplied and native call control: {:?}", calls.types);
+    };
+    for (kind, supplied, native) in [
+        ("impossible branch", supplied_absent, native_absent),
+        ("positional value", supplied_value, native_value),
+        ("positional unpacking", supplied_positional, native_positional),
+        ("keyword unpacking", supplied_keywords, native_keywords),
+        ("invalid argument count", supplied_invalid, native_invalid),
+    ] {
+        assert_eq!(supplied, native, "{kind}");
+    }
+    assert_eq!(*gradual_overload, string);
+    assert!(!gradual.is_never());
+    assert!(!gradual.is_fully_static(&db, &env));
+    assert_eq!(*dynamic, Type::any());
+    assert_eq!(*reachable, string);
+    assert_eq!(*empty_positional, integer);
+    assert_eq!(*empty_keywords, integer);
+    assert!(invalid.is_unknown());
     Ok(())
 }
 

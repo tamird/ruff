@@ -8895,8 +8895,13 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                         matches!(
                             self.arguments.get(*argument_index),
                             Some(CallArgument::Keywords(
-                                KeywordArgument::Known { types: _, keywords: _ }
-                                    | KeywordArgument::Observed { types: _, keywords: _ }
+                                KeywordArgument::Known {
+                                    types: _,
+                                    keywords: _
+                                } | KeywordArgument::Observed {
+                                    types: _,
+                                    keywords: _
+                                }
                             ))
                         ) || matches
                             .iter()
