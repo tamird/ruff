@@ -316,6 +316,24 @@ impl KnownClass {
         matches!(self, Self::SpecialForm)
     }
 
+    /// Whether `bool(x)` always returns the same result for an instance of this builtin.
+    ///
+    /// A subclass may override `__bool__` or `__len__`, so this does not apply to subclasses.
+    pub(crate) const fn has_stable_truthiness(self) -> bool {
+        matches!(
+            self,
+            Self::Bool
+                | Self::Int
+                | Self::Float
+                | Self::Complex
+                | Self::Str
+                | Self::Bytes
+                | Self::Tuple
+                | Self::FrozenSet
+                | Self::Range
+        )
+    }
+
     /// Determine whether instances of this class are always truthy, always falsy,
     /// or have an ambiguous truthiness.
     ///

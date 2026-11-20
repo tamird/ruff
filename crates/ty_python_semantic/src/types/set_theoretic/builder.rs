@@ -45,6 +45,7 @@ use std::ops::ControlFlow;
 
 use super::RecursivelyDefined;
 use super::generic_gradual_intersections::{GenericIntersection, generic_gradual_intersection};
+use crate::types::call::has_exact_runtime_class;
 use crate::types::enums::EnumComplement;
 use crate::types::set_theoretic::expand_intersection_typevars_and_newtypes;
 use crate::types::visitor::any_over_type;
@@ -2663,12 +2664,40 @@ impl<'db> InnerIntersectionBuilder<'db> {
         }
     }
 
+    fn has_stable_truthiness(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+        self.positive.iter().any(|ty| {
+            let ty = ty.resolve_type_alias(db);
+            let Type::NominalInstance(instance) = ty else {
+                return false;
+            };
+            instance
+                .known_class(db)
+                .is_some_and(KnownClass::has_stable_truthiness)
+                && has_exact_runtime_class(db, env, ty)
+        })
+    }
+
     fn build(mut self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
         if self.has_empty_enum_complement(db, env) {
             return Type::Never;
         }
 
         self.simplify_constrained_typevars(db, env);
+
+        let excludes_truthy = self
+            .negative
+            .iter()
+            .any(|ty| ty.resolve_type_alias(db) == Type::AlwaysTruthy);
+        let excludes_falsy = self
+            .negative
+            .iter()
+            .any(|ty| ty.resolve_type_alias(db) == Type::AlwaysFalsy);
+        // `range & ~AlwaysTruthy & ~AlwaysFalsy` is empty: a range's length cannot
+        // change between truthiness checks. The same holds for other exact immutable
+        // builtins; a mutable container or custom `__bool__` may change instead.
+        if excludes_truthy && excludes_falsy && self.has_stable_truthiness(db, env) {
+            return Type::Never;
+        }
 
         // If any typevars are in `self.positive`, speculatively solve all bounded type variables
         // to their upper bound and all constrained type variables to the union of their constraints.
@@ -2701,6 +2730,17 @@ impl<'db> InnerIntersectionBuilder<'db> {
             EnumComplement::from_intersection_parts(db, env, &self.positive, &self.negative)
         {
             return Type::EnumComplement(complement);
+        }
+
+        // Keep an immutable value's guard so a later check can contradict it. For example,
+        // a range returned by `mask and payload` was empty and cannot later be truthy.
+        // Otherwise, discard leftover guards to keep the inferred types simple.
+        if (excludes_truthy || excludes_falsy)
+            && !self.positive.is_empty()
+            && !self.has_stable_truthiness(db, env)
+        {
+            self.negative.swap_remove(&Type::AlwaysTruthy);
+            self.negative.swap_remove(&Type::AlwaysFalsy);
         }
 
         match (self.positive.len(), self.negative.len()) {

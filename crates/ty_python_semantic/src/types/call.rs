@@ -52,11 +52,10 @@ enum ReflectedMethodPriority {
     Definitely,
 }
 
-/// Returns whether every inhabitant of `ty` has the same nominal runtime class.
+/// Whether `ty` fixes the runtime class of its values.
 ///
-/// This is intentionally conservative: a false negative only widens a binary operation's result,
-/// while a false positive could discard a valid normal-method result.
-fn has_exact_runtime_class<'db>(
+/// For example, `Literal[1]` can only be an `int`, while `int` also includes subclasses.
+pub(super) fn has_exact_runtime_class<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
