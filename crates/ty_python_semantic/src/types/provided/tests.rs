@@ -25,6 +25,109 @@ use crate::types::{
 use crate::{HasType, SemanticModel};
 
 #[test]
+fn supplied_subscript_result_bound_preserves_checked_results() -> anyhow::Result<()> {
+    let declarations = r#"
+from typing import Literal, Never
+from ty_extensions._internal import Unknown
+
+class Bounded[T]:
+    def __getitem__(self, key: int) -> Unknown: ...
+class Exact[T]:
+    def __getitem__(self, key: int) -> Literal["exact"]: ...
+class Terminal[T]:
+    def __getitem__(self, key: int) -> Never: ...
+class Invalid[T]:
+    def __getitem__(self, key: int) -> Unknown: ...
+class Marker: ...
+"#;
+    let source = r#"
+from typing import Literal
+from ty_extensions import Intersection
+from native import Bounded, Exact, Terminal, Invalid, Marker
+
+def bounded(value: Bounded[int]):
+    return value[0]
+def intersection(value: Intersection[Bounded[int], Marker]):
+    return value[0]
+def exact(value: Exact[int]):
+    return value[0]
+def terminal(value: Terminal[int]):
+    return value[0]
+def invalid(value: Invalid[int]):
+    return value["wrong"]
+
+Bounded[int, str]
+Literal[float]
+"#;
+    for supplied in [false, true] {
+        let builder = TestDbBuilder::new()
+            .with_file("/src/native.pyi", declarations)
+            .with_file("/src/main.py", source);
+        let builder = if supplied {
+            builder.with_subscript_result_bound_provider(|db, file, receiver| {
+                let env = ProgramEnvironment::from_file(file);
+                let native_file = system_path_to_file(db, "/src/native.pyi").ok()?;
+                let native_file = db.program_file(native_file);
+                for name in ["Bounded", "Exact", "Terminal", "Invalid"] {
+                    let class = crate::place::global_symbol(db, native_file, name)
+                        .place.expect_type().as_class_literal()?;
+                    let class = class.as_static()?;
+                    if receiver.base_class_specialization(db, &env, class).is_none() {
+                        continue;
+                    }
+                    if name == "Invalid" {
+                        panic!("invalid runtime subscription reached result refinement");
+                    }
+                    return Some(KnownClass::Str.to_instance(db, &env));
+                }
+                None
+            })
+        } else {
+            builder
+        };
+        let db = builder.build()?;
+        let file = system_path_to_file(&db, "/src/main.py")?;
+        let diagnostics = db.check_file(file);
+        let mut ids: Vec<_> = diagnostics.iter().map(|diagnostic| diagnostic.id().as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["invalid-argument-type", "invalid-type-arguments", "invalid-type-form"],
+            "{diagnostics:#?}");
+        let file = db.program_file(file);
+        let env = ProgramEnvironment::from_file(file);
+        let model = SemanticModel::new(&db, file);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let actual: Vec<_> = module.suite().iter().filter_map(ast::Stmt::as_function_def_stmt)
+            .map(|function| {
+                let [ast::Stmt::Return(statement)] = function.body.as_slice() else {
+                    panic!("expected one return statement");
+                };
+                let ty = statement.value.as_ref().unwrap().inferred_type(&model).unwrap();
+                (function.name.as_str(), ty.display(&db, &env).to_string())
+            }).collect();
+        assert_eq!(actual, [
+            ("bounded", if supplied { "Unknown & str" } else { "Unknown" }.into()),
+            ("intersection", if supplied { "Unknown & str" } else { "Unknown" }.into()),
+            ("exact", "Literal[\"exact\"]".into()),
+            ("terminal", "Never".into()),
+            ("invalid", "Unknown".into()),
+        ]);
+
+        let applications: Vec<_> = module.suite().iter().filter_map(ast::Stmt::as_expr_stmt).collect();
+        let [class_application, literal_application] = applications.as_slice() else {
+            anyhow::bail!("expected class and Literal type applications");
+        };
+        let class_recovery = class_application.value.inferred_type(&model).unwrap();
+        let Type::GenericAlias(class_recovery) = class_recovery else {
+            anyhow::bail!("expected generic class recovery: {class_recovery:?}");
+        };
+        assert_eq!(class_recovery.origin(&db).name(&db).as_str(), "Bounded");
+        assert_eq!(class_recovery.specialization(&db).types(&db), [Type::unknown()]);
+        assert_eq!(literal_application.value.inferred_type(&model), Some(Type::unknown()));
+    }
+    Ok(())
+}
+
+#[test]
 fn supplied_mapping_read_schema() -> anyhow::Result<()> {
     let source = r#"
 from typing import Generic, Literal, TypeVar

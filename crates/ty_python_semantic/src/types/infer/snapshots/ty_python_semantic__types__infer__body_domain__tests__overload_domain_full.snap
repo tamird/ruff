@@ -1,8 +1,8 @@
 ---
 source: crates/ty_python_semantic/src/types/infer/body_domain.rs
-expression: "DisplayDiagnostics::new(&db, &DisplayDiagnosticConfig::new(\"ty\").context(0),\n&diagnostics,)"
+expression: "FullRenderer::new(&db,\n&DisplayDiagnosticConfig::new(\"ty\").context(0)).display(&diagnostics).to_string()"
 ---
-error[invalid-return-type]: Return type does not match returned value
+error[invalid-explicit-return]: Return type does not match returned value
  --> src/body.py:7:12
   |
 3 | def f(flag: Literal[True]) -> int: ...
