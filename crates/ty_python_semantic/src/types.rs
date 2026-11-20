@@ -2401,15 +2401,38 @@ impl<'db> ParamSpecValue<'db> {
     }
 
     /// Reifies captured parameter lists as callables for argument matching and checking.
-    fn to_callable_type(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Option<Type<'db>> {
+    fn to_callable_type(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        keyword_capture: Option<&Parameter<'db>>,
+    ) -> Option<Type<'db>> {
         match self {
-            Self::Callable(callable) => Some(Type::Callable(callable.into_regular(db))),
-            Self::ParamSpec(paramspec) => Some(Type::Callable(CallableType::single(
-                db,
-                Signature::new(Parameters::paramspec(db, paramspec), Type::unknown()),
-            ))),
+            Self::Callable(callable) => {
+                let callable = if let Some(capture) = keyword_capture {
+                    let signatures = callable.signatures(db).overloads.iter().map(|signature| {
+                        let parameters = signature.parameters().keyword_projection(db, capture)?;
+                        Some(signature.clone().with_parameters(parameters))
+                    }).collect::<Option<Vec<_>>>()?;
+                    callable.with_signatures(db, CallableSignature::from_overloads(signatures))
+                } else {
+                    callable
+                };
+                Some(Type::Callable(callable.into_regular(db)))
+            }
+            Self::ParamSpec(paramspec) => {
+                let parameters = Parameters::paramspec(db, paramspec);
+                let parameters = if let Some(capture) = keyword_capture {
+                    parameters.keyword_projection(db, capture)?
+                } else {
+                    parameters
+                };
+                Some(Type::Callable(CallableType::single(
+                    db, Signature::new(parameters, Type::unknown()),
+                )))
+            }
             Self::Intersection(_) => {
-                self.try_map(db, env, &mut |value| value.to_callable_type(db, env))
+                self.try_map(db, env, &mut |value| value.to_callable_type(db, env, keyword_capture))
             }
         }
     }
@@ -7409,14 +7432,6 @@ impl<'db> Type<'db> {
         };
 
         non_negative_int_literal(db, env, return_ty)
-    }
-
-    /// If this type is a `ParamSpec` type variable, returns it. Otherwise, returns `None`.
-    fn as_paramspec_typevar(self, db: &'db dyn Db) -> Option<Type<'db>> {
-        match self {
-            Type::TypeVar(tv) if tv.is_paramspec(db) => Some(self),
-            _ => None,
-        }
     }
 
     /// Return this type if it represents a runtime keyword-argument dictionary.

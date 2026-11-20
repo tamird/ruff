@@ -18,6 +18,7 @@ use crate::FxIndexMap;
 use crate::ProgramEnvironment;
 use crate::subscript::PyIndex;
 use crate::types::tuple::{TupleLength, TupleSpec};
+use crate::types::typevar::ParamSpecAttrKind;
 use crate::types::type_expansion::expand_elements;
 use crate::types::typed_dict::{
     TypedDictOpenness, UnpackedTypedDictKey, extract_unpacked_typed_dict_from_value_type,
@@ -352,11 +353,13 @@ impl<'db> VariadicArgument<'db> {
         };
 
         // Iterating `P.args` would discard its identity and yield its `object` upper bound.
-        if let Some(paramspec) = ty.as_paramspec_typevar(db) {
+        if let Type::TypeVar(paramspec) = ty
+            && paramspec.paramspec_attr(db) == Some(ParamSpecAttrKind::Args)
+        {
             return VariadicArgumentMatch {
                 types: Vec::new(),
                 length: TupleLength::unknown(),
-                variable_element: Some(paramspec),
+                variable_element: Some(ty),
             };
         }
 

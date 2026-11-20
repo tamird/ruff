@@ -6607,7 +6607,7 @@ impl<'db> Parameters<'db> {
             .then_some(tail)
     }
 
-    fn keyword_projection(&self, db: &'db dyn Db, capture: &Parameter<'db>) -> Option<Self> {
+    pub(super) fn keyword_projection(&self, db: &'db dyn Db, capture: &Parameter<'db>) -> Option<Self> {
         if self.is_top() {
             return Some(self.clone());
         }

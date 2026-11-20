@@ -926,7 +926,7 @@ fn external_overload_body_domain_fallthrough_location() -> anyhow::Result<()> {
         .unwrap()
         .into_diagnostics();
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-implicit-return");
     let span = diagnostics[0].primary_annotation().unwrap().get_span();
     assert_eq!(span.file(), &ruff_db::diagnostic::UnifiedFile::Ty(file));
     assert_eq!(
@@ -1191,7 +1191,7 @@ fourth = native('ok')
         [
             "invalid-explicit-return",
             "invalid-explicit-return",
-            "unresolved-attribute",
+            "missing-attribute",
             "invalid-explicit-return",
             "invalid-parameter-default"
         ],
@@ -1360,12 +1360,12 @@ fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Re
     for (scalar, expected) in [
         (
             "str",
-            vec!["invalid-explicit-return", "invalid-explicit-return"],
+            vec!["invalid-explicit-return", "invalid-implicit-return"],
         ),
-        ("int", vec!["invalid-explicit-return"]),
+        ("int", vec!["invalid-implicit-return"]),
         (
             "str",
-            vec!["invalid-explicit-return", "invalid-explicit-return"],
+            vec!["invalid-explicit-return", "invalid-implicit-return"],
         ),
     ] {
         // Deliberately place the foreign annotations past the end of the implementation.
@@ -2233,7 +2233,7 @@ actual_return: int = wrong_return(None)
             "invalid-explicit-return",
             "invalid-explicit-return",
             "invalid-argument-type",
-            "invalid-explicit-return",
+            "invalid-implicit-return",
             "invalid-explicit-return",
             "missing-typed-dict-key"
         ],
@@ -3661,7 +3661,7 @@ fn external_annotations_preserve_dictionary_key_checks() -> anyhow::Result<()> {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.id().as_str() == "invalid-typed-dict-key"),
+                .any(|diagnostic| diagnostic.id().as_str() == "unknown-typed-dict-constructor-key"),
             "{source}\n{diagnostics:#?}"
         );
     }
