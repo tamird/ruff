@@ -1121,9 +1121,8 @@ pub(super) fn infer_body_statement<'db>(
 mod tests {
     use std::fmt::Write as _;
 
-    use ruff_db::diagnostic::{
-        DiagnosticFormat, DisplayDiagnosticConfig, DisplayDiagnostics, SubDiagnostic,
-    };
+    use ruff_db::diagnostic::render::{ConciseRenderer, FullRenderer, Renderer as _};
+    use ruff_db::diagnostic::{DisplayDiagnosticConfig, SubDiagnostic};
     use ruff_db::files::system_path_to_file;
     use ruff_db::system::DbWithWritableSystem;
     use ruff_text_size::Ranged;
@@ -1274,7 +1273,7 @@ mod tests {
                 "return use(42)",
                 "invalid-argument-type",
             ),
-            ("return use(override)", "return 42", "invalid-return-type"),
+            ("return use(override)", "return 42", "invalid-explicit-return"),
             (
                 "ctx.value",
                 "ctx.value  # ty: ignore[unresolved-attribute]",
@@ -1388,9 +1387,9 @@ mod tests {
             (r#""value".replace(42, "x")"#, Some("no-matching-overload")),
             (
                 r#"("{}".format("value"), 42)[1]"#,
-                Some("invalid-return-type"),
+                Some("invalid-explicit-return"),
             ),
-            ("(str(value), 42)[1]", Some("invalid-return-type")),
+            ("(str(value), 42)[1]", Some("invalid-explicit-return")),
         ] {
             db.write_file("/src/body.py", source.replace("EXPRESSION", expression))?;
             let f = function(&db);
@@ -1918,7 +1917,7 @@ mod tests {
                     diagnostics
                         .diagnostics()
                         .iter()
-                        .filter(|diagnostic| diagnostic.id().as_str() == "invalid-return-type")
+                        .filter(|diagnostic| diagnostic.id().as_str() == "invalid-explicit-return")
                         .count(),
                     usize::from(wrong && index == 1),
                     "domain {index}: {diagnostics:#?}"
@@ -2035,7 +2034,7 @@ mod tests {
                         diagnostics
                             .diagnostics()
                             .iter()
-                            .all(|diagnostic| diagnostic.id().as_str() == "invalid-return-type")
+                            .all(|diagnostic| diagnostic.id().as_str() == "invalid-explicit-return")
                     );
                     assert_eq!(
                         crate::types::check_types(&db, f.program_file(&db)),
@@ -2101,7 +2100,7 @@ mod tests {
         "};
         for (body, expected) in [
             ("return value", &[][..]),
-            ("return 'bad'", &["invalid-return-type"][..]),
+            ("return 'bad'", &["invalid-explicit-return"][..]),
         ] {
             db.write_file("/src/body.py", source.replacen("return value", body, 1))?;
             let f = function(&db);
@@ -2187,7 +2186,7 @@ mod tests {
                 if result == "42" {
                     assert_eq!(
                         diagnostics.diagnostics()[0].id().as_str(),
-                        "invalid-return-type"
+                        "invalid-explicit-return"
                     );
                 } else {
                     assert!(returned_type(&db, f, Some(domain)).is_equivalent_to(
@@ -2543,7 +2542,7 @@ mod tests {
                     .declared()
                     .unwrap()
                     .inner_type(),
-                f.last_definition_signature(&db).parameters()[0].annotated_type(),
+                Some(f.last_definition_signature(&db).parameters()[0].annotated_type()),
             );
             let diagnostics = check_overload_body(&db, f, 0).unwrap();
             assert_eq!(
@@ -2575,7 +2574,7 @@ mod tests {
             if index == 1 {
                 assert_eq!(
                     diagnostics.diagnostics()[0].id().as_str(),
-                    "invalid-return-type"
+                    "invalid-explicit-return"
                 );
             }
             assert_eq!(
@@ -2742,7 +2741,7 @@ mod tests {
         assert_eq!(diagnostics.diagnostics().len(), 1, "{diagnostics:#?}");
         assert_eq!(
             diagnostics.diagnostics()[0].id().as_str(),
-            "invalid-return-type"
+            "invalid-explicit-return"
         );
         Ok(())
     }
@@ -2827,7 +2826,7 @@ mod tests {
         assert_eq!(diagnostics.diagnostics().len(), 1, "{diagnostics:#?}");
         assert_eq!(
             diagnostics.diagnostics()[0].id().as_str(),
-            "invalid-return-type"
+            "invalid-explicit-return"
         );
         Ok(())
     }
@@ -3117,7 +3116,7 @@ mod tests {
         assert!(check_overload_body(&db, f, 1).unwrap().is_empty());
         let diagnostics = check_overload_body(&db, f, 0).unwrap().into_diagnostics();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
         Ok(())
     }
 
@@ -3170,7 +3169,7 @@ mod tests {
         assert!(check_overload_body(&db, f, 1).unwrap().is_empty());
         let diagnostics = check_overload_body(&db, f, 0).unwrap().into_diagnostics();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
         db.write_file(
             "/src/body.py",
             source.replace("shared: list[int] = [1]", "shared: list[str] = ['ok']"),
@@ -3381,22 +3380,18 @@ mod tests {
         let file = f.program_file(&db);
         let diagnostics = check_types_with_overload_bodies(&db, file, [], [f, other, f]);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
         insta::assert_snapshot!(
             "overload_domain_full",
-            DisplayDiagnostics::new(
-                &db,
-                &DisplayDiagnosticConfig::new("ty").context(0),
-                &diagnostics,
-            )
+            FullRenderer::new(&db, &DisplayDiagnosticConfig::new("ty").context(0))
+                .display(&diagnostics)
+                .to_string()
         );
         insta::assert_snapshot!(
             "overload_domain_concise",
-            DisplayDiagnostics::new(
-                &db,
-                &DisplayDiagnosticConfig::new("ty").format(DiagnosticFormat::Concise),
-                &diagnostics,
-            )
+            ConciseRenderer::new(&db, &DisplayDiagnosticConfig::new("ty"))
+                .display(&diagnostics)
+                .to_string()
         );
         assert!(
             diagnostics[0]
@@ -3422,7 +3417,7 @@ mod tests {
             "/src/body.py",
             source.replace(
                 "return b'wrong'",
-                "return b'wrong'  # ty: ignore[invalid-return-type]",
+                "return b'wrong'  # ty: ignore[invalid-explicit-return]",
             ),
         )?;
         let f = function(&db);
@@ -3441,7 +3436,7 @@ mod tests {
         assert_eq!(ordinary.len(), 1, "{ordinary:#?}");
         let combined = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
         assert_eq!(combined.len(), 1, "{combined:#?}");
-        assert_eq!(combined[0].id().as_str(), "invalid-return-type");
+        assert_eq!(combined[0].id().as_str(), "invalid-explicit-return");
         assert!(!combined[0].sub_diagnostics().is_empty(), "{combined:#?}");
         Ok(())
     }
@@ -3706,7 +3701,7 @@ mod tests {
     #[test]
     fn boolean_return_domains_do_not_use_unreachable_suppressions() -> anyhow::Result<()> {
         let mut db = setup_db();
-        let source = "from typing import Literal, overload\n@overload\ndef f(flag: Literal[True]) -> int: ...\n@overload\ndef f(flag: Literal[False]) -> str: ...\ndef f(flag: bool) -> int | str:\n    if flag:\n        return 1  # ty: ignore[invalid-return-type]\n    return 'value'\n";
+        let source = "from typing import Literal, overload\n@overload\ndef f(flag: Literal[True]) -> int: ...\n@overload\ndef f(flag: Literal[False]) -> str: ...\ndef f(flag: bool) -> int | str:\n    if flag:\n        return 1  # ty: ignore[invalid-explicit-return]\n    return 'value'\n";
         for (value, expected) in [
             ("1", Some("unused-ignore-comment")),
             ("'wrong'", None),
@@ -3728,14 +3723,14 @@ mod tests {
             "/src/body.py",
             source
                 .replace("return 1", "return 'wrong'")
-                .replace("  # ty: ignore[invalid-return-type]", ""),
+                .replace("  # ty: ignore[invalid-explicit-return]", ""),
         )?;
         let f = function(&db);
         let diagnostics = check_types_with_overload_bodies(&db, f.program_file(&db), [], [f]);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
 
-        db.write_file("/src/body.py", "def f() -> int:\n    if False:\n        return 'wrong'  # ty: ignore[invalid-return-type]\n    return 1\n")?;
+        db.write_file("/src/body.py", "def f() -> int:\n    if False:\n        return 'wrong'  # ty: ignore[invalid-explicit-return]\n    return 1\n")?;
         let f = function(&db);
         assert!(crate::types::check_types(&db, f.program_file(&db)).is_empty());
         Ok(())
@@ -3779,7 +3774,7 @@ mod tests {
         assert!(crate::types::check_types(&db, f.program_file(&db)).is_empty());
         let diagnostics = check_overload_body(&db, f, 0).unwrap().into_diagnostics();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
         for index in [1, 2, 3] {
             assert!(check_overload_body(&db, f, index).unwrap().is_empty());
         }
@@ -3806,7 +3801,7 @@ mod tests {
         assert!(check_overload_body(&db, f, 0).unwrap().is_empty());
         let diagnostics = check_overload_body(&db, f, 1).unwrap().into_diagnostics();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
         Ok(())
     }
 
@@ -3838,7 +3833,7 @@ mod tests {
             if errors != 0 {
                 assert_eq!(
                     diagnostics.diagnostics()[0].id().as_str(),
-                    "invalid-return-type"
+                    "invalid-explicit-return"
                 );
             }
             assert!(check_overload_body(&db, f, 1).unwrap().is_empty());
@@ -3927,7 +3922,7 @@ mod tests {
             .unwrap()
             .into_diagnostics();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
         let domain = prepare_body_domain(&db, function, 1).unwrap();
         assert_eq!(
             returned_type(&db, function, Some(domain))
@@ -4002,7 +3997,7 @@ mod tests {
                 for index in [0, 1, 0] {
                     let diagnostics = check_overload_body(&db, f, index).unwrap();
                     let expected = match member {
-                        "marker" => (index == 0).then_some("invalid-return-type"),
+                        "marker" => (index == 0).then_some("invalid-explicit-return"),
                         "missing" => Some("unresolved-attribute"),
                         _ => None,
                     };
@@ -4066,7 +4061,7 @@ mod tests {
                         diagnostics
                             .diagnostics()
                             .iter()
-                            .all(|diagnostic| diagnostic.id().as_str() == "invalid-return-type")
+                            .all(|diagnostic| diagnostic.id().as_str() == "invalid-explicit-return")
                     );
                     assert_eq!(
                         crate::types::check_types(&db, f.program_file(&db)),
@@ -4223,7 +4218,7 @@ mod tests {
                         diagnostics
                             .diagnostics()
                             .iter()
-                            .filter(|diagnostic| diagnostic.id().as_str() == "invalid-return-type")
+                            .filter(|diagnostic| diagnostic.id().as_str() == "invalid-explicit-return")
                             .count(),
                         usize::from(index == 1 && replacement == "42"),
                         "{replacement}; domain {index}: {diagnostics:#?}"

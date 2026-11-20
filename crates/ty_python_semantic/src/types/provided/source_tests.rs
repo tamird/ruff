@@ -292,7 +292,7 @@ fn external_overload_body_domains() -> anyhow::Result<()> {
         .unwrap()
         .into_diagnostics();
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
     assert_eq!(
         diagnostics[0]
             .primary_annotation()
@@ -512,7 +512,7 @@ fn external_overload_body_domains_project_keyword_rows() -> anyhow::Result<()> {
                 "{diagnostics:#?}"
             );
             for diagnostic in diagnostics {
-                assert_eq!(diagnostic.id().as_str(), "invalid-return-type");
+                assert_eq!(diagnostic.id().as_str(), "invalid-explicit-return");
                 assert_eq!(
                     diagnostic.primary_annotation().unwrap().get_span().file(),
                     &ruff_db::diagnostic::UnifiedFile::Ty(source_file)
@@ -666,7 +666,7 @@ fn external_overload_body_domains_use_source_defaults() -> anyhow::Result<()> {
         .unwrap()
         .into_diagnostics();
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
     db.write_file("/src/main.py", source)?;
     assert!(
         check_overload_body(&db, function(&db), 0)
@@ -926,7 +926,7 @@ fn external_overload_body_domain_fallthrough_location() -> anyhow::Result<()> {
         .unwrap()
         .into_diagnostics();
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+    assert_eq!(diagnostics[0].id().as_str(), "invalid-explicit-return");
     let span = diagnostics[0].primary_annotation().unwrap().get_span();
     assert_eq!(span.file(), &ruff_db::diagnostic::UnifiedFile::Ty(file));
     assert_eq!(
@@ -969,7 +969,7 @@ fn external_generic_function_annotations() -> anyhow::Result<()> {
             "{diagnostics:#?}"
         );
         for diagnostic in diagnostics {
-            assert_eq!(diagnostic.id().as_str(), "invalid-return-type");
+            assert_eq!(diagnostic.id().as_str(), "invalid-explicit-return");
             assert_eq!(
                 diagnostic.primary_annotation().unwrap().get_span().file(),
                 &ruff_db::diagnostic::UnifiedFile::Ty(file)
@@ -1189,10 +1189,10 @@ fourth = native('ok')
             .map(|diagnostic| diagnostic.id().as_str())
             .collect::<Vec<_>>(),
         [
-            "invalid-return-type",
-            "invalid-return-type",
+            "invalid-explicit-return",
+            "invalid-explicit-return",
             "unresolved-attribute",
-            "invalid-return-type",
+            "invalid-explicit-return",
             "invalid-parameter-default"
         ],
         "{diagnostics:#?}"
@@ -1358,9 +1358,9 @@ fn external_annotations_check_implementations_in_their_own_scope() -> anyhow::Re
     let file = system_path_to_file(&db, "/src/main.py")?;
     let stub = system_path_to_file(&db, "/src/contracts.pyi")?;
     for (scalar, expected) in [
-        ("str", vec!["invalid-return-type", "invalid-return-type"]),
-        ("int", vec!["invalid-return-type"]),
-        ("str", vec!["invalid-return-type", "invalid-return-type"]),
+        ("str", vec!["invalid-explicit-return", "invalid-explicit-return"]),
+        ("int", vec!["invalid-explicit-return"]),
+        ("str", vec!["invalid-explicit-return", "invalid-explicit-return"]),
     ] {
         // Deliberately place the foreign annotations past the end of the implementation.
         db.write_file("/src/contracts.pyi", format!("{}Scalar = {scalar}\ndef compute(value: Scalar = ...) -> Scalar: ...\ndef implicit(value: Scalar) -> Scalar: ...\ndef native(value: str) -> str: ...\n", "# declarations\n".repeat(30)))?;
@@ -1410,10 +1410,10 @@ fn external_parameter_contracts_allow_local_rebinding() -> anyhow::Result<()> {
             "int",
             "str",
             "",
-            vec!["invalid-assignment", "invalid-return-type"],
+            vec!["invalid-assignment", "invalid-explicit-return"],
         ),
         ("value", "str", "str", "", vec!["unsupported-operator"]),
-        ("value", "int", "int", "", vec!["invalid-return-type"]),
+        ("value", "int", "int", "", vec!["invalid-explicit-return"]),
         (
             "value",
             "int",
@@ -2186,7 +2186,7 @@ def unreachable(ctx):
         return 42
     return {'value': 1}
 def suppressed(ctx):
-    return 42 # ty: ignore[invalid-return-type]
+    return 42 # ty: ignore[invalid-explicit-return]
 def fallthrough(ctx):
     if ctx:
         return {'value': 1}
@@ -2220,15 +2220,15 @@ actual_return: int = wrong_return(None)
             .map(|diagnostic| diagnostic.id().as_str())
             .collect::<Vec<_>>(),
         [
-            "invalid-return-type",
+            "invalid-explicit-return",
             "missing-typed-dict-key",
-            "invalid-return-type",
+            "invalid-explicit-return",
             "invalid-argument-type",
-            "invalid-return-type",
-            "invalid-return-type",
+            "invalid-explicit-return",
+            "invalid-explicit-return",
             "invalid-argument-type",
-            "invalid-return-type",
-            "invalid-return-type",
+            "invalid-explicit-return",
+            "invalid-explicit-return",
             "missing-typed-dict-key"
         ],
         "{diagnostics:#?}",
@@ -2238,7 +2238,7 @@ actual_return: int = wrong_return(None)
         ruff_db::diagnostic::Span::from(native).with_range(TextRange::new(0.into(), 6.into()));
     assert!(
         diagnostics.iter().any(|diagnostic| {
-            diagnostic.id().as_str() == "invalid-return-type"
+            diagnostic.id().as_str() == "invalid-explicit-return"
                 && diagnostic
                     .annotations()
                     .iter()
@@ -2933,7 +2933,7 @@ fn supplied_declarations_follow_source_and_export_edits() -> anyhow::Result<()> 
     ids.sort_unstable();
     assert_eq!(
         ids,
-        ["invalid-argument-type", "invalid-return-type"],
+        ["invalid-argument-type", "invalid-explicit-return"],
         "{diagnostics:#?}"
     );
 
@@ -2952,7 +2952,7 @@ fn supplied_declarations_follow_source_and_export_edits() -> anyhow::Result<()> 
         [
             "invalid-argument-type",
             "invalid-argument-type",
-            "invalid-return-type"
+            "invalid-explicit-return"
         ],
         "{diagnostics:#?}"
     );
@@ -3655,7 +3655,7 @@ fn external_annotations_preserve_dictionary_key_checks() -> anyhow::Result<()> {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.id().as_str() == "invalid-key"),
+                .any(|diagnostic| diagnostic.id().as_str() == "invalid-typed-dict-key"),
             "{source}\n{diagnostics:#?}"
         );
     }

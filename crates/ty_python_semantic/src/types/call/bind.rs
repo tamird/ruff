@@ -9964,39 +9964,6 @@ impl<'db> Binding<'db> {
             .get(argument_index + usize::from(bound_receiver))
     }
 
-    /// Returns the number of occurrences of inferable type variables in the parameter(s) matching the
-    /// provided argument index.
-    pub(crate) fn typevar_occurrences_for_parameter(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        binding: &CallableBinding<'db>,
-        argument_index: usize,
-    ) -> usize {
-        let Some(generic_context) = self.signature.generic_context else {
-            return 0;
-        };
-        let Some(argument) =
-            self.matched_argument_for_call_argument(binding.bound_type.is_some(), argument_index)
-        else {
-            return 0;
-        };
-
-        let inferable_typevars = generic_context.inferable_typevars(db);
-        argument
-            .parameters
-            .iter()
-            .map(|parameter| {
-                inferable_typevar_occurrences(
-                    db,
-                    env,
-                    self.signature.parameters()[parameter.index].annotated_type(),
-                    inferable_typevars,
-                )
-            })
-            .sum()
-    }
-
     /// Returns source argument indices matched to the `ParamSpec` component.
     ///
     /// The returned indices are relative to the original call site, excluding any synthetic bound
@@ -13039,6 +13006,7 @@ mod tests {
     use crate::place::global_symbol;
     use crate::types::constraints::resolution::SolutionType::Resolved;
     use crate::types::generics::TypeVarInferenceSolutions;
+    use crate::types::ApplyTypeMappingVisitor;
 
     #[test]
     fn bool_constructor_accepts_object() -> anyhow::Result<()> {

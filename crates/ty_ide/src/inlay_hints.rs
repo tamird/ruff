@@ -613,7 +613,7 @@ impl<'a> SourceOrderVisitor<'a> for InlayHintVisitor<'a, '_> {
                             InlayHintImportContext {
                                 db: self.db,
                                 file: self.model.program_file(),
-                                importer: &self.importer,
+                                importer: self.importer.as_ref(),
                             },
                             function,
                             ty,
