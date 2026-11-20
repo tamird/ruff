@@ -4868,7 +4868,9 @@ impl<'db> Type<'db> {
                 let type_result = KnownClass::Type
                     .to_class_literal(db, env)
                     .find_name_in_mro_with_policy(db, env, name, policy)
-                    .expect("`find_name_in_mro_with_policy` should return `Some` for a class literal");
+                    .expect(
+                        "`find_name_in_mro_with_policy` should return `Some` for a class literal",
+                    );
                 if !type_result.place.is_undefined() {
                     type_result
                 } else {

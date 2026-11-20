@@ -18,10 +18,7 @@ use crate::types::constraints::{
     UnspecializedTypeVarPolicy,
 };
 use crate::types::signatures::{Parameter, Parameters, Signature};
-use crate::types::typevar::{
-    BindingContext, TypeVarBoundOrConstraints, TypeVarConstraints, TypeVarIdentity,
-    TypeVarInstance, TypeVarKind, TypeVarNonce, TypeVarSet,
-};
+use crate::types::typevar::{TypeVarBoundOrConstraints, TypeVarConstraints, TypeVarSet};
 use crate::types::{
     BoundTypeVarInstance, DynamicType, IntersectionType, KnownClass, Type, TypeVarVariance,
     UnionType,

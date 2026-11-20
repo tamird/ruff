@@ -12980,9 +12980,9 @@ mod tests {
 
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::global_symbol;
+    use crate::types::ApplyTypeMappingVisitor;
     use crate::types::constraints::resolution::SolutionType::Resolved;
     use crate::types::generics::TypeVarInferenceSolutions;
-    use crate::types::ApplyTypeMappingVisitor;
 
     #[test]
     fn bool_constructor_accepts_object() -> anyhow::Result<()> {

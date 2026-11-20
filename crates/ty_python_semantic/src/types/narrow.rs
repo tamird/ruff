@@ -261,18 +261,6 @@ impl<'db, 'ast> RuntimeTypeTest<'db, 'ast> {
             kind: RuntimeTypeTestKind::Native,
         })
     }
-
-    fn constraint(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-    ) -> NarrowingConstraint<'db> {
-        let target = match self.kind {
-            RuntimeTypeTestKind::Native => self.target.top_materialization(db, env),
-            RuntimeTypeTestKind::ExactClass => self.target,
-        };
-        NarrowingConstraint::intersection(target.negate_if(db, env, !self.is_positive))
-    }
 }
 
 /// Attempt to find an underlying class literal for purposes of `if type(x) is Y` narrowing.
