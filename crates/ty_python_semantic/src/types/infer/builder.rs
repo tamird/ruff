@@ -110,6 +110,7 @@ use crate::types::infer::{
     TypeAndRange, TypeExpressionFlags, infer_statement_types, nearest_enclosing_class,
     nearest_enclosing_function, original_class_type,
 };
+use crate::types::iteration::iterable_element_type;
 use crate::types::match_pattern::{ClassPatternPositionalResult, class_pattern_positional_result};
 use crate::types::member::{class_body_declaration_from_bases, inherited_class_body_declaration};
 use crate::types::narrow::NarrowingEvaluatorExtension;
@@ -146,8 +147,8 @@ use crate::types::{
     SentinelInstance, Signature, SpecialFormType, SubclassOfType, Type, TypeAliasType,
     TypeAndQualifiers, TypeContext, TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind,
     TypeVarVariance, TypingModule, UnionAccumulator, UnionBuilder, UnionType, any_over_type,
-    binding_type, extract_fixed_length_iterable_element_types, infer_complete_scope_types,
-    infer_scope_types, is_discarded_dict_key_assignment, todo_type,
+    binding_type, infer_complete_scope_types, infer_scope_types, is_discarded_dict_key_assignment,
+    todo_type,
 };
 use crate::{AnalysisSettings, Db, DisplaySettings, FxIndexSet, FxOrderSet, SemanticModel};
 use ty_python_core::ast_ids::PlaceUse;
@@ -5446,31 +5447,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_definition(node);
     }
 
-    fn precise_iterable_element_type(
-        &self,
-        iterable: &ast::Expr,
-        expression_type: impl FnMut(&ast::Expr) -> Type<'db>,
-    ) -> Option<Type<'db>> {
-        let db = self.db();
-        let env = self.program_environment();
-        if let ast::Expr::Dict(dict) = iterable {
-            return dict_literal_key_value_types(db, env, dict, expression_type)
-                .map(|(keys, _)| keys);
-        }
-        let element_types =
-            extract_fixed_length_iterable_element_types(db, env, iterable, expression_type)?;
-
-        if element_types.is_empty() {
-            None
-        } else {
-            Some(UnionType::from_elements(
-                db,
-                env,
-                element_types.iter().copied(),
-            ))
-        }
-    }
-
     fn infer_for_statement(&mut self, for_statement: &ast::StmtFor) {
         let db = self.db();
         let ast::StmtFor {
@@ -5488,17 +5464,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             //  but only if the target is a name. We should report a diagnostic here if the target isn't a name:
             //  `for a.x in not_iterable: ...
             let iterable_type = builder.infer_standalone_expression(iter, tcx);
-            if !*is_async
-                && let Some(element_type) = builder
-                    .precise_iterable_element_type(iter, |expr| builder.expression_type(expr))
-            {
-                element_type
-            } else {
-                let env = builder.program_environment();
-                iterable_type
+            let env = builder.program_environment();
+            if *is_async {
+                return iterable_type
                     .iterate(db, env)
-                    .homogeneous_element_type(db, env)
+                    .homogeneous_element_type(db, env);
             }
+            iterable_element_type(
+                db,
+                env,
+                iterable_type,
+                iter,
+                |expr| builder.expression_type(expr),
+                EvaluationMode::Sync,
+            )
+            .unwrap_or_else(|err| err.fallback_element_type(db, env))
         });
 
         self.infer_body(body);
@@ -5527,25 +5507,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let iterable_type =
                     self.infer_standalone_expression(iterable, TypeContext::default());
 
-                if !for_stmt.is_async()
-                    && let Some(element_type) = self
-                        .precise_iterable_element_type(iterable, |expr| self.expression_type(expr))
-                {
-                    element_type
-                } else {
-                    let env = self.program_environment();
-                    iterable_type
-                        .try_iterate_with_mode(
-                            db,
-                            env,
-                            EvaluationMode::from_is_async(for_stmt.is_async()),
-                        )
-                        .map(|tuple| tuple.homogeneous_element_type(db, env))
-                        .unwrap_or_else(|err| {
-                            err.report_diagnostic(&self.context, iterable_type, iterable.into());
-                            err.fallback_element_type(db, env)
-                        })
-                }
+                let env = self.program_environment();
+                iterable_element_type(
+                    db,
+                    env,
+                    iterable_type,
+                    iterable,
+                    |expr| self.expression_type(expr),
+                    EvaluationMode::from_is_async(for_stmt.is_async()),
+                )
+                .unwrap_or_else(|err| {
+                    err.report_diagnostic(&self.context, iterable_type, iterable.into());
+                    err.fallback_element_type(db, env)
+                })
             }
         };
 
@@ -9036,29 +9010,30 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // TODO: `infer_comprehension_definition` reports a diagnostic if `iter_ty` isn't iterable
             //  but only if the target is a name. We should report a diagnostic here if the target isn't a name:
             //  `[... for a.x in not_iterable]
-            let (iterable_type, element_type) = if is_first {
-                let result =
-                    infer_expression_types(builder.db(), builder.index.expression(iter), tcx);
-                (
-                    result.expression_type(iter),
-                    builder
-                        .precise_iterable_element_type(iter, |expr| result.expression_type(expr)),
-                )
+            let outer_inference = is_first
+                .then(|| infer_expression_types(builder.db(), builder.index.expression(iter), tcx));
+            let iterable_type = if let Some(result) = &outer_inference {
+                result.expression_type(iter)
             } else {
-                let iterable_type = builder.infer_maybe_standalone_expression(iter, tcx);
-                (
-                    iterable_type,
-                    builder
-                        .precise_iterable_element_type(iter, |expr| builder.expression_type(expr)),
-                )
+                builder.infer_maybe_standalone_expression(iter, tcx)
             };
-            if !*is_async && let Some(element_type) = element_type {
-                element_type
-            } else {
-                iterable_type
+            if *is_async {
+                return iterable_type
                     .iterate(db, env)
-                    .homogeneous_element_type(db, env)
+                    .homogeneous_element_type(db, env);
             }
+            iterable_element_type(
+                db,
+                env,
+                iterable_type,
+                iter,
+                |expr| match &outer_inference {
+                    Some(result) => result.expression_type(expr),
+                    None => builder.expression_type(expr),
+                },
+                EvaluationMode::Sync,
+            )
+            .unwrap_or_else(|err| err.fallback_element_type(db, env))
         });
 
         for expr in ifs {
@@ -9085,11 +9060,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let expression = self.index.expression(iterable);
             let result = infer_expression_types(self.db(), expression, TypeContext::default());
             let iterable_type = result.expression_type(iterable);
-            let element_type = if comprehension.is_async() {
-                None
-            } else {
-                self.precise_iterable_element_type(iterable, |expr| result.expression_type(expr))
-            };
+            let element_type = iterable_element_type(
+                db,
+                self.program_environment(),
+                iterable_type,
+                iterable,
+                |expr| result.expression_type(expr),
+                EvaluationMode::from_is_async(comprehension.is_async()),
+            );
 
             // Two things are different if it's the first comprehension:
             // (1) We must lookup the `ScopedExpressionId` of the iterable expression in the outer scope,
@@ -9116,22 +9094,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             TargetKind::Single => {
                 let (iterable_type, element_type) = infer_iterable_type();
 
-                if let Some(element_type) = element_type {
-                    element_type
-                } else {
-                    let env = self.program_environment();
-                    iterable_type
-                        .try_iterate_with_mode(
-                            db,
-                            env,
-                            EvaluationMode::from_is_async(comprehension.is_async()),
-                        )
-                        .map(|tuple| tuple.homogeneous_element_type(db, env))
-                        .unwrap_or_else(|err| {
-                            err.report_diagnostic(&self.context, iterable_type, iterable.into());
-                            err.fallback_element_type(db, env)
-                        })
-                }
+                let env = self.program_environment();
+                element_type.unwrap_or_else(|err| {
+                    err.report_diagnostic(&self.context, iterable_type, iterable.into());
+                    err.fallback_element_type(db, env)
+                })
             }
         };
 

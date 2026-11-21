@@ -1,5 +1,6 @@
 use crate::Db;
 use crate::ProgramEnvironment;
+use crate::types::dict::dict_literal_key_value_types;
 use crate::types::{
     AwaitError, Bindings, CallArguments, CallDunderError, KnownClass, LintDiagnosticGuard,
     LintDiagnosticGuardBuilder, LiteralValueTypeKind, Type, TypeContext, TypeVarBoundOrConstraints,
@@ -179,6 +180,46 @@ pub(crate) fn extract_fixed_length_iterable_element_types<'db>(
     let mut element_types = Vec::new();
     extend_fixed_length_iterable(db, env, iterable, &mut expression_type, &mut element_types)?;
     Some(element_types.into_boxed_slice())
+}
+
+/// Return the element type of an already-inferred iterable expression.
+pub(super) fn iterable_element_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    iterable_type: Type<'db>,
+    iterable: &ast::Expr,
+    expression_type: impl FnMut(&ast::Expr) -> Type<'db>,
+    mode: EvaluationMode,
+) -> Result<Type<'db>, IterationError<'db>> {
+    if !mode.is_async() {
+        match iterable {
+            ast::Expr::List(_) => {
+                // List inference promotes literals for later mutation. This display is consumed
+                // immediately, so use its already-inferred element expression types.
+                if let Some(element_types) =
+                    extract_fixed_length_iterable_element_types(db, env, iterable, expression_type)
+                    && !element_types.is_empty()
+                {
+                    return Ok(UnionType::from_elements(
+                        db,
+                        env,
+                        element_types.iter().copied(),
+                    ));
+                }
+            }
+            ast::Expr::Dict(dict) => {
+                if let Some((keys, _values)) =
+                    dict_literal_key_value_types(db, env, dict, expression_type)
+                {
+                    return Ok(keys);
+                }
+            }
+            _ => {}
+        }
+    }
+    iterable_type
+        .try_iterate_with_mode(db, env, mode)
+        .map(|tuple| tuple.homogeneous_element_type(db, env))
 }
 
 impl<'db> Type<'db> {
