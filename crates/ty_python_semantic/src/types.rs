@@ -7622,13 +7622,20 @@ impl<'db> Type<'db> {
                 Binding::single(self, Signature::dynamic(self)).into()
             }
 
-            // Note that this correctly returns `None` if none of the union elements are callable.
-            Type::Union(union) => Bindings::from_union(
-                self,
-                union.elements(db).iter().map(|element| {
-                    element.bindings_with_receiver(db, env, recursion_guard, receiver)
-                }),
-            ),
+            // Select one function's overloads against all of its possible receivers together.
+            Type::Union(union) => {
+                if let Some(method) = BoundMethodType::from_receiver_union(db, env, union) {
+                    return Type::BoundMethod(method)
+                        .bindings_with_receiver(db, env, recursion_guard, receiver)
+                        .with_callable_type(self);
+                }
+                Bindings::from_union(
+                    self,
+                    union.elements(db).iter().map(|element| {
+                        element.bindings_with_receiver(db, env, recursion_guard, receiver)
+                    }),
+                )
+            }
 
             // A narrowed `type[T: Base] & type[Child]` still needs to construct `T & Child`,
             // but its constructor must come from `Child`, not from `Base` as an independent,

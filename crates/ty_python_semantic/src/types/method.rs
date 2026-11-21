@@ -137,6 +137,57 @@ impl<'db> BoundMethodType<'db> {
         )
     }
 
+    /// Keep one method's receiver alternatives together before overload selection.
+    /// Receiver-dependent signatures retain their separate bindings.
+    pub(super) fn from_receiver_union(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        union: UnionType<'db>,
+    ) -> Option<Self> {
+        let (first, remaining) = union.elements(db).split_first()?;
+        let Type::BoundMethod(first) = *first else {
+            return None;
+        };
+        let function = first.func(db);
+        let Type::FunctionLiteral(_) = function else {
+            return None;
+        };
+        if first.class_method(db)
+            || first.self_instance(db) != first.signature_receiver(db)
+            || remaining.iter().any(|element| match element {
+                Type::BoundMethod(method) => {
+                    method.func(db) != function
+                        || method.program(db) != first.program(db)
+                        || method.class_method(db)
+                        || method.self_instance(db) != method.signature_receiver(db)
+                }
+                _ => true,
+            })
+        {
+            return None;
+        }
+        let signatures = first.unbound_signatures_with_inferred_return_type(db)?;
+        if signatures.overloads.is_empty()
+            || !signatures
+                .overloads
+                .iter()
+                .all(|signature| signature.supports_receiver_union(db, env))
+        {
+            return None;
+        }
+        let receiver = UnionType::from_elements(
+            db,
+            env,
+            union.elements(db).iter().map(|element| {
+                let Type::BoundMethod(method) = element else {
+                    unreachable!("all union elements are bound methods");
+                };
+                method.self_instance(db)
+            }),
+        );
+        Some(first.map_self_type(db, |_receiver| receiver))
+    }
+
     pub(super) fn apply_type_mapping_impl(
         self,
         db: &'db dyn Db,

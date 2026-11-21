@@ -12,6 +12,12 @@ def _(foo: str):
     reveal_type(False or False)  # revealed: Literal[False]
     reveal_type(foo or False)  # revealed: (str & ~AlwaysFalsy) | Literal[False]
     reveal_type(foo or True)  # revealed: (str & ~AlwaysFalsy) | Literal[True]
+
+    # Splitting str with an empty-string fallback still returns list[str].
+    reveal_type((foo or "").split())  # revealed: list[str]
+
+# A literal receiver still selects the LiteralString overload.
+reveal_type("".split())  # revealed: list[LiteralString]
 ```
 
 ## AND

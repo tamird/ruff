@@ -835,8 +835,12 @@ def narrowed(color: Color):
         return
     reveal_type(color.label())  # revealed: int | str
 
-def explicit(color: Literal[Color.GREEN, Color.BLUE]):
+def explicit(
+    color: Literal[Color.GREEN, Color.BLUE],
+    unsupported: Literal[Color.RED, Color.GREEN],
+):
     reveal_type(color.label())  # revealed: int | str
+    unsupported.label()  # error: [no-matching-overload]
 ```
 
 ### Expanding PEP 695 type alias

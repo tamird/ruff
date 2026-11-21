@@ -1347,6 +1347,24 @@ impl<'db> Signature<'db> {
         self.receiver_constraints().is_none() && !self.is_paramspec_value()
     }
 
+    /// Whether receiver alternatives can share overload selection without generic correlations.
+    pub(super) fn supports_receiver_union(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
+        let Some((receiver, parameters)) = self.parameters.as_slice().split_first() else {
+            return false;
+        };
+        self.supports_overload_aggregation()
+            && receiver.is_positional()
+            && !self.needs_self_mapping(db, env, parameters)
+            && !super::visitor::any_over_type_expanding_aliases(db, env, self.return_ty, |ty| {
+                matches!(ty, Type::TypeIs(_) | Type::TypeGuard(_))
+            })
+            && (self.is_non_generic() || self.with_unused_self_upper_bound(db, env).is_some())
+    }
+
     /// Restrict the base signature to positional calls for parameters whose keyword name
     /// is lost in every overriding overload. This comparison-only signature may contain
     /// a positional-only parameter after a positional-or-keyword parameter so that we
