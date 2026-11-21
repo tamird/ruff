@@ -1421,6 +1421,23 @@ def _(x: int, z: list[int]):
     x2: Sequence[int | str] = as_sequence(x, [x], z)  # error: [invalid-argument-type]
 ```
 
+A fresh collection can use the element type required by another argument. This does not narrow a
+collection that already has a wider element type:
+
+```py
+from typing import Literal
+
+def invoke[T](callback: Callable[[T], None], values: T) -> None:
+    callback(values)
+
+def only_ok(values: list[Literal["ok"]]) -> None: ...
+
+invoke(only_ok, ["ok"])
+invoke(only_ok, ["wrong"])  # error: [invalid-argument-type]
+values: list[str] = ["ok"]
+invoke(only_ok, values)  # error: [invalid-argument-type]
+```
+
 Partially specialized type context is not ignored:
 
 ```py
