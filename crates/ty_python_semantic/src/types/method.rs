@@ -137,6 +137,72 @@ impl<'db> BoundMethodType<'db> {
         )
     }
 
+    /// Combine receivers of the same instance method before choosing its overloads.
+    ///
+    /// Signatures that depend on individual receivers must still be bound separately.
+    pub(super) fn from_receiver_union(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        union: UnionType<'db>,
+    ) -> Option<Self> {
+        let (first, remaining) = union.elements(db).split_first()?;
+        let Type::BoundMethod(first) = *first else {
+            return None;
+        };
+        let function = first.func(db);
+        let Type::FunctionLiteral(_) = function else {
+            return None;
+        };
+        // Class methods capture a class object but substitute its instance type for `Self`.
+        // They cannot use the single instance-receiver union constructed below.
+        if first.class_method(db) {
+            return None;
+        }
+        // A constrained receiver checks one alternative while retaining the original `__self__`.
+        // Combining it with other receivers would lose that alternative's constraint.
+        if first.self_instance(db) != first.signature_receiver(db) {
+            return None;
+        }
+
+        let program = first.program(db);
+        for element in remaining {
+            let Type::BoundMethod(method) = element else {
+                return None;
+            };
+            // Binding only the first method must not discard another function's overloads or
+            // class specialization, or use signatures from a different program.
+            if method.func(db) != function || method.program(db) != program {
+                return None;
+            }
+            if method.class_method(db) {
+                return None;
+            }
+            if method.self_instance(db) != method.signature_receiver(db) {
+                return None;
+            }
+        }
+        let signatures = first.unbound_signatures_with_inferred_return_type(db)?;
+        if signatures.overloads.is_empty()
+            || !signatures
+                .overloads
+                .iter()
+                .all(|signature| signature.supports_receiver_union(db, env))
+        {
+            return None;
+        }
+        let receiver = UnionType::from_elements(
+            db,
+            env,
+            union.elements(db).iter().map(|element| {
+                let Type::BoundMethod(method) = element else {
+                    unreachable!("all union elements are bound methods");
+                };
+                method.self_instance(db)
+            }),
+        );
+        Some(first.map_self_type(db, |_receiver| receiver))
+    }
+
     pub(super) fn apply_type_mapping_impl(
         self,
         db: &'db dyn Db,
