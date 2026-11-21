@@ -3258,6 +3258,9 @@ def _(a: A, b: list[A]):
 
     x6 = pair(a, {"a": 1, "b": 2})
     reveal_type(x6)  # revealed: A
+
+    # A dictionary argument can have different keys from the TypedDict.
+    pair(a, {"other": 1})
 ```
 
 A call argument contributes constraints to its siblings even if they form an arbitrary subset of its

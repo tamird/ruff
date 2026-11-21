@@ -6966,6 +6966,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let contexts = overloads_with_binding
                     .iter()
                     .map(|(overload, binding, cache)| {
+                        let ordinary_context = || {
+                            overload.argument_type_context(
+                                db,
+                                env,
+                                constraints,
+                                binding,
+                                argument_types,
+                                argument_index,
+                                call_expression_tcx,
+                                source,
+                                mode,
+                                cache,
+                            )
+                        };
                         if let Some(collection) = empty_collection
                             && let Some(context) = overload.empty_getattr_default_context(
                                 db,
@@ -6996,21 +7010,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             argument_index,
                             call_expression_tcx,
                             mode,
+                            ordinary_context,
                         ) {
                             return Some(context);
                         }
-                        overload.argument_type_context(
-                            db,
-                            env,
-                            constraints,
-                            binding,
-                            argument_types,
-                            argument_index,
-                            call_expression_tcx,
-                            source,
-                            mode,
-                            cache,
-                        )
+                        ordinary_context()
                     });
                 Some(match contexts.exactly_one() {
                     Ok(context) => MatchingArgumentTypeContext::Unique(context),
@@ -7018,6 +7022,30 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 })
             })
             .collect()
+    }
+
+    fn infer_argument_with_type_context(
+        &mut self,
+        argument_index: usize,
+        expression: &ast::Expr,
+        context: Option<ArgumentTypeContext<'db>>,
+        infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
+    ) -> Type<'db> {
+        let tcx = context.map_or_default(ArgumentTypeContext::type_context);
+        if let Some(fallback) = context.and_then(ArgumentTypeContext::fallback_type_context) {
+            self.infer_with_type_context_fallback(
+                tcx,
+                fallback,
+                |builder, ty| {
+                    tcx.expected_type().is_none_or(|expected| {
+                        ty.is_assignable_to(builder.db(), builder.program_environment(), expected)
+                    })
+                },
+                |builder, tcx| infer_argument_ty(builder, (argument_index, expression, tcx)),
+            )
+        } else {
+            infer_argument_ty(self, (argument_index, expression, tcx))
+        }
     }
 
     fn infer_all_argument_types(
@@ -7060,9 +7088,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             match argument_tcx {
                 MatchingArgumentTypeContext::Unique(argument_tcx) => {
-                    let tcx = argument_tcx.map_or_default(ArgumentTypeContext::type_context);
                     let had_failed_call = self.context.has_failed_call();
-                    let inferred_ty = infer_argument_ty(self, (argument_index, ast_argument, tcx));
+                    let inferred_ty = self.infer_argument_with_type_context(
+                        argument_index,
+                        ast_argument,
+                        *argument_tcx,
+                        infer_argument_ty,
+                    );
                     // If this parameter cannot constrain the call's specialization and its
                     // context is independent of the proposed return type, then keep its
                     // diagnostics, but do not let its recovery invalidate union narrowing.
@@ -7085,22 +7117,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
 
                 MatchingArgumentTypeContext::Many(argument_tcx) => {
-                    let shared_context = argument_tcx
-                        .first()
-                        .map(|context| context.map_or_default(ArgumentTypeContext::type_context))
-                        .filter(|context| {
-                            argument_tcx.iter().all(|candidate| {
-                                candidate.map_or_default(ArgumentTypeContext::type_context)
-                                    == *context
-                            })
-                        });
+                    let shared_context = argument_tcx.first().copied().filter(|context| {
+                        argument_tcx.iter().all(|candidate| {
+                            candidate.map_or_default(ArgumentTypeContext::type_context)
+                                == context.map_or_default(ArgumentTypeContext::type_context)
+                                && candidate.and_then(ArgumentTypeContext::fallback_type_context)
+                                    == context.and_then(ArgumentTypeContext::fallback_type_context)
+                        })
+                    });
                     if mode.requires_default_inference()
-                        && let Some(tcx) = shared_context
+                        && let Some(context) = shared_context
                     {
                         // Matching overloads agree on this argument's context. Commit its
                         // inferred types and diagnostics instead of discarding a speculative pass.
-                        let inferred_ty =
-                            infer_argument_ty(self, (argument_index, ast_argument, tcx));
+                        let inferred_ty = self.infer_argument_with_type_context(
+                            argument_index,
+                            ast_argument,
+                            context,
+                            infer_argument_ty,
+                        );
                         argument_types.insert_type(
                             argument_index,
                             TypeContext::default(),
@@ -7166,12 +7201,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             continue;
                         }
 
-                        let tcx = argument_tcx.map_or_default(ArgumentTypeContext::type_context);
-
                         let mut speculative_builder = self.speculate();
-                        let inferred_ty = infer_argument_ty(
-                            &mut speculative_builder,
-                            (argument_index, ast_argument, tcx),
+                        let inferred_ty = speculative_builder.infer_argument_with_type_context(
+                            argument_index,
+                            ast_argument,
+                            *argument_tcx,
+                            infer_argument_ty,
                         );
 
                         insert_argument_ty(
@@ -7312,11 +7347,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return infer_expression(self, tcx);
         };
 
-        self.infer_with_type_context_fallback(peer_tcx, tcx, infer_expression)
+        self.infer_with_type_context_fallback(
+            peer_tcx,
+            tcx,
+            |builder, _| !builder.context.has_diagnostics(),
+            infer_expression,
+        )
     }
 
-    /// Tries `tcx`, retrying with `fallback_tcx` if inference reports diagnostics other than
-    /// `allowed_lint`. Only the chosen attempt's types and diagnostics are retained.
+    /// Tries `tcx`, retrying with `fallback_tcx` when `accept_context` rejects the inferred result.
+    /// Only the chosen attempt's types and diagnostics are retained.
     ///
     /// For a cast's value, the outer context can introduce errors by supplying parameter types to
     /// an unannotated lambda:
@@ -7333,13 +7373,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ///
     /// With the outer context, the lambda parameter has type `int | None`, so its call to `convert`
     /// produces an `invalid-argument-type` diagnostic. Retrying without that context leaves the
-    /// parameter's type unknown, and the cast is neither redundant nor disjoint. Casts allow
-    /// `redundant-cast` diagnostics from nested casts so that those warnings do not interrupt
-    /// context propagation.
+    /// parameter's type unknown, and the cast is neither redundant nor disjoint.
     fn infer_with_type_context_fallback(
         &mut self,
         tcx: TypeContext<'db>,
         fallback_tcx: TypeContext<'db>,
+        accept_context: impl FnOnce(&Self, Type<'db>) -> bool,
         mut infer_expression: impl FnMut(&mut Self, TypeContext<'db>) -> Type<'db>,
     ) -> Type<'db> {
         if tcx == fallback_tcx {
@@ -7351,13 +7390,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut speculative_builder = self.speculate();
         let ty = infer_expression(&mut speculative_builder, tcx);
 
-        // This context is only an inference hint. Discard it if inference reports a diagnostic
-        // other than the explicitly allowed lint, then infer with the original context.
-        let ty = if speculative_builder.context.has_diagnostics() {
-            infer_expression(self, fallback_tcx)
-        } else {
+        let ty = if accept_context(&speculative_builder, ty) {
             self.extend(speculative_builder);
             ty
+        } else {
+            infer_expression(self, fallback_tcx)
         };
 
         if teardown_expression_cache {
@@ -11399,6 +11436,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     return builder.infer_with_type_context_fallback(
                         value_tcx,
                         TypeContext::default(),
+                        |builder, _| !builder.context.has_diagnostics(),
                         |builder, tcx| builder.infer_expression(value, tcx),
                     );
                 }
@@ -11838,14 +11876,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
         for (index, name) in parameters {
             if let Some(parameter_type) = self.db().provided_call_argument_context(&context, name)
-                && let Some(MatchingArgumentTypeContext::Unique(Some(
-                    ArgumentTypeContext::Standard {
-                        raw_parameter_type: _,
-                        context: inferred_context,
-                    },
-                ))) = contexts.get_mut(*index).and_then(Option::as_mut)
+                && let Some(MatchingArgumentTypeContext::Unique(Some(argument_context))) =
+                    contexts.get_mut(*index).and_then(Option::as_mut)
             {
-                *inferred_context = inferred_context.with_expected_type(Some(parameter_type));
+                *argument_context = argument_context.without_fresh_collection_context();
+                if let ArgumentTypeContext::Standard {
+                    raw_parameter_type: _raw_parameter_type,
+                    context,
+                } = argument_context
+                {
+                    *context = context.with_expected_type(Some(parameter_type));
+                }
             }
         }
     }
