@@ -9514,6 +9514,13 @@ pub(crate) enum ArgumentTypeContext<'db> {
         context: TypeContext<'db>,
     },
 
+    /// A sibling-derived hint that must fit the fresh collection before it is retained.
+    FreshCollection {
+        raw_parameter_type: Type<'db>,
+        context: TypeContext<'db>,
+        fallback_context: TypeContext<'db>,
+    },
+
     ParamSpec {
         /// The `P.args` or `P.kwargs` parameter that this argument is bound to.
         paramspec_parameter_type: Type<'db>,
@@ -9549,8 +9556,55 @@ impl<'db> ArgumentTypeContext<'db> {
     /// Returns the type context used for inferring the argument expression.
     pub(crate) fn type_context(self) -> TypeContext<'db> {
         match self {
-            Self::Standard { context, .. } => context,
-            Self::ParamSpec { declared_type, .. } => TypeContext::preference(Some(declared_type)),
+            Self::Standard {
+                raw_parameter_type: _raw_parameter_type,
+                context,
+            } => context,
+            Self::FreshCollection {
+                raw_parameter_type: _raw_parameter_type,
+                context,
+                fallback_context: _fallback_context,
+            } => context,
+            Self::ParamSpec {
+                paramspec_parameter_type: _paramspec_parameter_type,
+                declared_type,
+            } => TypeContext::preference(Some(declared_type)),
+        }
+    }
+
+    pub(crate) fn fallback_type_context(self) -> Option<TypeContext<'db>> {
+        match self {
+            Self::Standard {
+                raw_parameter_type: _raw_parameter_type,
+                context: _context,
+            } => None,
+            Self::FreshCollection {
+                raw_parameter_type: _raw_parameter_type,
+                context: _context,
+                fallback_context,
+            } => Some(fallback_context),
+            Self::ParamSpec {
+                paramspec_parameter_type: _paramspec_parameter_type,
+                declared_type: _declared_type,
+            } => None,
+        }
+    }
+
+    pub(crate) fn without_fresh_collection_context(self) -> Self {
+        match self {
+            Self::Standard {
+                raw_parameter_type,
+                context,
+            } => Self::standard(raw_parameter_type, context),
+            Self::FreshCollection {
+                raw_parameter_type,
+                context: _context,
+                fallback_context,
+            } => Self::standard(raw_parameter_type, fallback_context),
+            Self::ParamSpec {
+                paramspec_parameter_type,
+                declared_type,
+            } => Self::paramspec(paramspec_parameter_type, declared_type),
         }
     }
 
@@ -9559,14 +9613,23 @@ impl<'db> ArgumentTypeContext<'db> {
     /// Standard parameters are cached by their raw parameter type, since later type checking asks
     /// for that type. `ParamSpec` arguments are cached by the concrete forwarded parameter type,
     /// but still inserted through their full context so the original `P.args` or `P.kwargs` lookup
-    /// key is populated too.
-    pub(crate) fn inference_cache_key(self) -> TypeContext<'db> {
+    /// key is populated too. A tentative collection hint includes its fallback so that a rejected
+    /// hint cannot reuse a result inferred with another ordinary context.
+    pub(crate) fn inference_cache_key(self) -> (TypeContext<'db>, Option<TypeContext<'db>>) {
         match self {
             Self::Standard {
                 raw_parameter_type,
                 context,
-            } => context.with_expected_type(Some(raw_parameter_type)),
-            Self::ParamSpec { declared_type, .. } => TypeContext::preference(Some(declared_type)),
+            } => (context.with_expected_type(Some(raw_parameter_type)), None),
+            Self::FreshCollection {
+                raw_parameter_type: _raw_parameter_type,
+                context,
+                fallback_context,
+            } => (context, Some(fallback_context)),
+            Self::ParamSpec {
+                paramspec_parameter_type: _paramspec_parameter_type,
+                declared_type,
+            } => (TypeContext::preference(Some(declared_type)), None),
         }
     }
 
@@ -9583,7 +9646,15 @@ impl<'db> ArgumentTypeContext<'db> {
     ) {
         match self {
             Self::Standard {
-                raw_parameter_type, ..
+                raw_parameter_type,
+                context: _context,
+            } => {
+                arguments_types.insert_type(argument_index, raw_parameter_type, inferred_ty);
+            }
+            Self::FreshCollection {
+                raw_parameter_type,
+                context: _context,
+                fallback_context: _fallback_context,
             } => {
                 arguments_types.insert_type(argument_index, raw_parameter_type, inferred_ty);
             }
@@ -10269,6 +10340,45 @@ impl<'db> Binding<'db> {
             .ok()
     }
 
+    fn provided_keyword_field_type(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        binding: &CallableBinding<'db>,
+        arguments: &CallArguments<'_, 'db>,
+        argument_index: usize,
+        tcx: TypeContext<'db>,
+    ) -> Option<Type<'db>> {
+        if !matches!(binding.callable_type, Type::FunctionLiteral(_))
+            || binding.overloads().len() != 1
+        {
+            return None;
+        }
+        let expected = tcx.expected_type()?;
+        let Some(CallArgument::Keyword { name, types: _ }) = arguments.iter().nth(argument_index)
+        else {
+            return None;
+        };
+        let definition = self.signature.definition()?;
+        if !db.provided_keyword_field_factory(definition) {
+            return None;
+        }
+        if let Type::ProtocolInstance(protocol) = expected.resolve_type_alias(db) {
+            protocol
+                .interface(db)
+                .readonly_property_type(db, env, expected, name)
+        } else if expected.has_immutable_field_path(db, env, &[Name::new(name)]) {
+            // A nominal schema can carry different types for each stored field even
+            // when the factory's generic signature has one shared value parameter.
+            expected
+                .member(db, env, name)
+                .place
+                .ignore_possibly_undefined()
+        } else {
+            None
+        }
+    }
+
     /// Returns the type context to use for bidirectional inference of a source call argument.
     ///
     /// Request the shared argument specialization only when this parameter needs it. Unmatched
@@ -10304,35 +10414,18 @@ impl<'db> Binding<'db> {
 
         let parameter = &self.signature.parameters()[matched_parameter.index];
         let original_parameter_type = parameter.annotated_type();
-        if matches!(binding.callable_type, Type::FunctionLiteral(_))
-            && binding.overloads().len() == 1
-            && let Some(expected) = call_expression_tcx.expected_type()
-            && let Some(CallArgument::Keyword { name, types: _ }) =
-                arguments_types.iter().nth(argument_index)
-            && let Some(definition) = self.signature.definition()
-            && db.provided_keyword_field_factory(definition)
-        {
-            let field_type =
-                if let Type::ProtocolInstance(protocol) = expected.resolve_type_alias(db) {
-                    protocol
-                        .interface(db)
-                        .readonly_property_type(db, env, expected, name)
-                } else if expected.has_immutable_field_path(db, env, &[Name::new(name)]) {
-                    // A nominal schema can carry different types for each stored field even
-                    // when the factory's generic signature has one shared value parameter.
-                    expected
-                        .member(db, env, name)
-                        .place
-                        .ignore_possibly_undefined()
-                } else {
-                    None
-                };
-            if let Some(field_type) = field_type {
-                return Some(ArgumentTypeContext::standard(
-                    original_parameter_type,
-                    TypeContext::new(Some(field_type), call_expression_tcx.kind()),
-                ));
-            }
+        if let Some(field_type) = self.provided_keyword_field_type(
+            db,
+            env,
+            binding,
+            arguments_types,
+            argument_index,
+            call_expression_tcx,
+        ) {
+            return Some(ArgumentTypeContext::standard(
+                original_parameter_type,
+                TypeContext::new(Some(field_type), call_expression_tcx.kind()),
+            ));
         }
         let mut parameter_type = matched_parameter
             .expected_type
@@ -10510,6 +10603,7 @@ impl<'db> Binding<'db> {
         argument_index: usize,
         tcx: TypeContext<'db>,
         mode: CheckTypesMode,
+        fallback_context: impl FnOnce() -> Option<ArgumentTypeContext<'db>>,
     ) -> Option<ArgumentTypeContext<'db>> {
         if arguments.is_variadic(argument_index) {
             return None;
@@ -10521,6 +10615,14 @@ impl<'db> Binding<'db> {
         };
         let formal = &self.signature.parameters()[parameter.index];
         let original_parameter_type = formal.annotated_type();
+        if let Some(field_type) =
+            self.provided_keyword_field_type(db, env, binding, arguments, argument_index, tcx)
+        {
+            return Some(ArgumentTypeContext::standard(
+                original_parameter_type,
+                TypeContext::new(Some(field_type), tcx.kind()),
+            ));
+        }
         let parameter_type = parameter
             .expected_type
             .or_else(|| formal.argument_context_type())?;
@@ -10607,10 +10709,11 @@ impl<'db> Binding<'db> {
         if expected != inferred && !eligible(expected) {
             return None;
         }
-        Some(ArgumentTypeContext::standard(
-            original_parameter_type,
-            TypeContext::preference(Some(expected)),
-        ))
+        Some(ArgumentTypeContext::FreshCollection {
+            raw_parameter_type: original_parameter_type,
+            context: TypeContext::preference(Some(expected)),
+            fallback_context: fallback_context().map_or_default(ArgumentTypeContext::type_context),
+        })
     }
 
     /// For `x: T | list[T]`, a `list[int]` argument can match `T` with `T = list[int]` or
