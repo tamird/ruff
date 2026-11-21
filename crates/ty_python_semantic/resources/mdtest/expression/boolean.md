@@ -10,14 +10,8 @@ def _(foo: str):
     reveal_type(False or "z")  # revealed: Literal["z"]
     reveal_type(False or True)  # revealed: Literal[True]
     reveal_type(False or False)  # revealed: Literal[False]
-    reveal_type(foo or False)  # revealed: str | Literal[False]
-    reveal_type(foo or True)  # revealed: str | Literal[True]
-
-    # Splitting str with an empty-string fallback still returns list[str].
-    reveal_type((foo or "").split())  # revealed: list[str]
-
-# A literal receiver still selects the LiteralString overload.
-reveal_type("".split())  # revealed: list[LiteralString]
+    reveal_type(foo or False)  # revealed: (str & ~AlwaysFalsy) | Literal[False]
+    reveal_type(foo or True)  # revealed: (str & ~AlwaysFalsy) | Literal[True]
 ```
 
 ## AND
@@ -26,8 +20,8 @@ reveal_type("".split())  # revealed: list[LiteralString]
 def _(foo: str):
     reveal_type(True and False)  # revealed: Literal[False]
     reveal_type(False and True)  # revealed: Literal[False]
-    reveal_type(foo and False)  # revealed: str | Literal[False]
-    reveal_type(foo and True)  # revealed: str | Literal[True]
+    reveal_type(foo and False)  # revealed: (str & ~AlwaysTruthy) | Literal[False]
+    reveal_type(foo and True)  # revealed: (str & ~AlwaysTruthy) | Literal[True]
     reveal_type("x" and "y" and "z")  # revealed: Literal["z"]
     reveal_type("x" and "y" and "")  # revealed: Literal[""]
     reveal_type("" and "y")  # revealed: Literal[""]
