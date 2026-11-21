@@ -311,7 +311,6 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
             .iter()
             .filter_map(|(assignment, _)| assignment.as_constrained())
     }
-
 }
 
 impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
