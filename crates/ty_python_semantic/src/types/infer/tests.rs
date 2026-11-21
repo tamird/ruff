@@ -7,6 +7,7 @@ use crate::lint::{LintSource, RuleSelection};
 use crate::place::symbol;
 use crate::place::{ConsideredDefinitions, Place, PlaceAndQualifiers};
 use crate::types::{KnownClass, KnownInstanceType, TypeAndQualifiers, check_types};
+use ruff_db::Db as _;
 use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::system::DbWithWritableSystem as _;
@@ -1796,6 +1797,44 @@ fn dependency_implicit_alias_definition() -> anyhow::Result<()> {
             assert_function_query_was_not_run(&db, infer_definition_types, definition, &events);
         }
     }
+    Ok(())
+}
+
+#[test]
+fn statement_call_index_survives_unrelated_revisions() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    // Project files have LOW durability, unlike setup_db's search paths.
+    db.files().try_add_root(
+        &db,
+        ruff_db::system::SystemPath::new("/src/project"),
+        ruff_db::files::FileRootKind::Project,
+    );
+    let source = format!("def run(callback):\n{}", "    callback()\n".repeat(4));
+    db.write_file("/src/project/target.py", &source)?;
+    let file = system_path_to_file(&db, "/src/project/target.py")?;
+    let mut others = Vec::new();
+    for revision in 0..4 {
+        let path = format!("/src/project/other_{revision}.py");
+        db.write_file(&path, "")?;
+        let other = system_path_to_file(&db, &path)?;
+        others.push((path, other));
+    }
+    semantic_index(&db, program_file(&db, file));
+    // Fresh call keys in four revisions age Salsa's three-revision retention queue.
+    for (path, other) in others {
+        let source = format!("def run(callback):\n{}", "    callback()\n".repeat(16));
+        db.write_file(&path, source)?;
+        semantic_index(&db, program_file(&db, other));
+    }
+    db.clear_salsa_events();
+    semantic_index(&db, program_file(&db, file));
+    let events = db.take_salsa_events();
+    assert_function_query_was_not_run(&db, semantic_index, program_file(&db, file), &events);
+
+    db.write_file("/src/project/target.py", format!("{source}changed = 1\n"))?;
+    semantic_index(&db, program_file(&db, file));
+    let events = db.take_salsa_events();
+    assert_function_query_was_run(&db, semantic_index, program_file(&db, file), &events);
     Ok(())
 }
 
