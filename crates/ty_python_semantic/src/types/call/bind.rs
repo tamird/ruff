@@ -78,7 +78,7 @@ use crate::types::typevar::{BoundTypeVarIdentity, TypeVarKind, TypeVarNonceGener
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
     TypeCollector, TypeKind, TypeVisitor, any_over_type, any_over_type_expanding_aliases,
-    walk_non_atomic_type, walk_type_with_recursion_guard,
+    any_over_type_including_alias_arguments, walk_non_atomic_type, walk_type_with_recursion_guard,
 };
 use crate::types::{
     BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
@@ -8449,6 +8449,13 @@ pub(crate) enum ArgumentTypeContext<'db> {
         context: TypeContext<'db>,
     },
 
+    /// A sibling-derived hint that must fit the fresh collection before it is retained.
+    FreshCollection {
+        raw_parameter_type: Type<'db>,
+        context: TypeContext<'db>,
+        fallback_context: TypeContext<'db>,
+    },
+
     ParamSpec {
         /// The `P.args` or `P.kwargs` parameter that this argument is bound to.
         paramspec_parameter_type: Type<'db>,
@@ -8484,8 +8491,37 @@ impl<'db> ArgumentTypeContext<'db> {
     /// Returns the type context used for inferring the argument expression.
     pub(crate) fn type_context(self) -> TypeContext<'db> {
         match self {
-            Self::Standard { context, .. } => context,
-            Self::ParamSpec { declared_type, .. } => TypeContext::preference(Some(declared_type)),
+            Self::Standard {
+                raw_parameter_type: _raw_parameter_type,
+                context,
+            } => context,
+            Self::FreshCollection {
+                raw_parameter_type: _raw_parameter_type,
+                context,
+                fallback_context: _fallback_context,
+            } => context,
+            Self::ParamSpec {
+                paramspec_parameter_type: _paramspec_parameter_type,
+                declared_type,
+            } => TypeContext::preference(Some(declared_type)),
+        }
+    }
+
+    pub(crate) fn fallback_type_context(self) -> Option<TypeContext<'db>> {
+        match self {
+            Self::Standard {
+                raw_parameter_type: _raw_parameter_type,
+                context: _context,
+            } => None,
+            Self::FreshCollection {
+                raw_parameter_type: _raw_parameter_type,
+                context: _context,
+                fallback_context,
+            } => Some(fallback_context),
+            Self::ParamSpec {
+                paramspec_parameter_type: _paramspec_parameter_type,
+                declared_type: _declared_type,
+            } => None,
         }
     }
 
@@ -8494,14 +8530,23 @@ impl<'db> ArgumentTypeContext<'db> {
     /// Standard parameters are cached by their raw parameter type, since later type checking asks
     /// for that type. `ParamSpec` arguments are cached by the concrete forwarded parameter type,
     /// but still inserted through their full context so the original `P.args` or `P.kwargs` lookup
-    /// key is populated too.
-    pub(crate) fn inference_cache_key(self) -> TypeContext<'db> {
+    /// key is populated too. A tentative collection hint includes its fallback so that a rejected
+    /// hint cannot reuse a result inferred with another ordinary context.
+    pub(crate) fn inference_cache_key(self) -> (TypeContext<'db>, Option<TypeContext<'db>>) {
         match self {
             Self::Standard {
                 raw_parameter_type,
                 context,
-            } => context.with_expected_type(Some(raw_parameter_type)),
-            Self::ParamSpec { declared_type, .. } => TypeContext::preference(Some(declared_type)),
+            } => (context.with_expected_type(Some(raw_parameter_type)), None),
+            Self::FreshCollection {
+                raw_parameter_type: _raw_parameter_type,
+                context,
+                fallback_context,
+            } => (context, Some(fallback_context)),
+            Self::ParamSpec {
+                paramspec_parameter_type: _paramspec_parameter_type,
+                declared_type,
+            } => (TypeContext::preference(Some(declared_type)), None),
         }
     }
 
@@ -8518,7 +8563,15 @@ impl<'db> ArgumentTypeContext<'db> {
     ) {
         match self {
             Self::Standard {
-                raw_parameter_type, ..
+                raw_parameter_type,
+                context: _context,
+            } => {
+                arguments_types.insert_type(argument_index, raw_parameter_type, inferred_ty);
+            }
+            Self::FreshCollection {
+                raw_parameter_type,
+                context: _context,
+                fallback_context: _fallback_context,
             } => {
                 arguments_types.insert_type(argument_index, raw_parameter_type, inferred_ty);
             }
@@ -9199,6 +9252,122 @@ impl<'db> Binding<'db> {
             original_parameter_type,
             TypeContext::new(Some(parameter_type), tcx_kind),
         ))
+    }
+
+    /// Infer a fresh collection's context from the other call arguments.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn fresh_collection_argument_context(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        constraints: &ConstraintSetBuilder<'db>,
+        binding: &CallableBinding<'db>,
+        arguments: &CallArguments<'_, 'db>,
+        argument_index: usize,
+        tcx: TypeContext<'db>,
+        fallback_context: impl FnOnce() -> Option<ArgumentTypeContext<'db>>,
+    ) -> Option<ArgumentTypeContext<'db>> {
+        if arguments.is_variadic(argument_index) {
+            return None;
+        }
+        let matched = self.matched_argument_for_call_argument(binding, argument_index)?;
+        let [parameter] = matched.parameters.as_slice() else {
+            return None;
+        };
+        let formal = &self.signature.parameters()[parameter.index];
+        let original_parameter_type = formal.annotated_type();
+        let parameter_type = parameter
+            .expected_type
+            .or_else(|| formal.argument_context_type())?;
+        let Type::TypeVar(variable) = parameter_type else {
+            return None;
+        };
+        let context = self.signature.generic_context?;
+        if self.is_partial_application
+            || !matched.matched
+            || variable.is_paramspec(db)
+            || variable.typevar(db).is_self(db)
+            || !context.contains(db, variable.identity(db))
+        {
+            return None;
+        }
+        let arguments = arguments.with_self(binding.bound_type);
+        let mut rematched = self.clone();
+        rematched.errors.clear();
+        rematched.match_parameters(db, env, &arguments);
+        if !rematched.errors.is_empty() {
+            return None;
+        }
+        let mut matches = self.argument_matches.clone();
+        let adjusted_index = argument_index + usize::from(binding.bound_type.is_some());
+        // Exclude this collection's earlier inferred type so it cannot widen the context
+        // supplied by the other arguments.
+        matches.get_mut(adjusted_index)?.parameters.clear();
+        let mut call = CallInference::new(db, env, self, &arguments, tcx);
+        call.argument_matches = &matches;
+        call.return_ty = self.unspecialized_return_type(db);
+        let inferred = call.infer(constraints);
+        if !inferred.errors.is_empty() {
+            return None;
+        }
+        let inference = inferred.inference?;
+        let variable_index = context.variable_index(db, variable.identity(db))?;
+        match inference.solutions(db) {
+            TypeVarInferenceSolutions::Single => {
+                if !inference.has_inferred_type(db, variable.identity(db)) {
+                    return None;
+                }
+            }
+            TypeVarInferenceSolutions::Alternatives(alternatives) => {
+                if alternatives.is_empty()
+                    || alternatives.iter().any(|alternative| {
+                        !matches!(
+                            alternative.get(variable_index),
+                            Some(Some(SolutionType::Resolved(_)))
+                        )
+                    })
+                {
+                    return None;
+                }
+            }
+            TypeVarInferenceSolutions::Incomplete(_) => return None,
+            TypeVarInferenceSolutions::Unavailable(_) => return None,
+        }
+        let inferred_specialization = inference.merged_specialization(db);
+        if !call.accepts_arguments(inferred_specialization) {
+            return None;
+        }
+        let eligible = |ty: Type<'db>| {
+            ty.is_fully_static(db, env)
+                && !any_over_type_expanding_aliases(db, env, ty, |nested| {
+                    nested.is_divergent() || nested.is_provisional_marker()
+                })
+                && !any_over_type_including_alias_arguments(db, env, ty, |nested| {
+                    nested.is_divergent() || nested.is_provisional_marker()
+                })
+        };
+        let inferred = parameter_type.apply_specialization(db, inferred_specialization);
+        // Do not derive context from unresolved inference placeholders.
+        if !eligible(inferred) {
+            return None;
+        }
+        let specialization = self.argument_type_context_specialization(
+            db,
+            env,
+            context,
+            Some(inference),
+            constraints,
+            tcx,
+        );
+        let expected = parameter_type.apply_specialization(db, specialization.specialization);
+        if expected != inferred && !eligible(expected) {
+            return None;
+        }
+        Some(ArgumentTypeContext::FreshCollection {
+            raw_parameter_type: original_parameter_type,
+            context: TypeContext::preference(Some(expected)),
+            fallback_context: fallback_context().map_or_default(ArgumentTypeContext::type_context),
+        })
     }
 
     /// For `x: T | list[T]`, a `list[int]` argument can match `T` with `T = list[int]` or
