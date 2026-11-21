@@ -207,7 +207,6 @@ def f(x: A | B):
         reveal_type(x)  # revealed: A | B
     else:
         reveal_type(x)  # revealed: (A & ~AlwaysTruthy & ~AlwaysFalsy) | (B & ~AlwaysTruthy & ~AlwaysFalsy)
-
 ```
 
 A range has a fixed length. If `mask and payload` returns the range, it was empty and cannot pass
@@ -219,7 +218,6 @@ def range_result(mask: range, payload: str | None) -> str:
     if selected:
         return selected
     return ""
-
 ```
 
 An `int` annotation includes subclasses that override `__bool__`. Successive checks can return
