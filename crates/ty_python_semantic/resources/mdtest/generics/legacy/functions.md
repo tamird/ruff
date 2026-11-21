@@ -63,6 +63,45 @@ reveal_type(f(True))  # revealed: Literal[True]
 reveal_type(f("string"))  # revealed: Literal["string"]
 ```
 
+Other arguments can provide the element type for a fresh collection. A collection that already has a
+wider element type keeps that type.
+
+```py
+from typing import Callable, Literal, TypedDict
+
+def invoke(callback: Callable[[T], None], values: T) -> T:
+    callback(values)
+    return values
+
+def only_ok(values: list[Literal["ok"]]) -> None: ...
+
+reveal_type(invoke(only_ok, ["ok"]))  # revealed: list[Literal["ok"]]
+invoke(only_ok, ["wrong"])  # error: [invalid-argument-type]
+wide: list[str] = ["ok"]
+invoke(only_ok, wide)  # error: [invalid-argument-type]
+```
+
+The return type keeps the literal element type supplied by an annotated list.
+
+```py
+def pair(left: T, right: T) -> T:
+    return left
+
+narrow: list[Literal["ok"]] = ["ok"]
+reveal_type(pair(narrow, ["ok"]))  # revealed: list[Literal["ok"]]
+```
+
+The arguments to `pair` can have different dictionary keys.
+
+```py
+class Fields(TypedDict):
+    a: int
+    b: int
+
+fields: Fields = {"a": 1, "b": 2}
+pair(fields, {"other": 1})
+```
+
 ## Inferring a type variable through an identity alias
 
 The expected callback return type `Id[R]` expands to `R`, so a callback returning the caller's type

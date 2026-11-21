@@ -3701,6 +3701,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         })
     }
 
+    /// Returns the constraints accumulated by inference, without its compatibility mappings.
+    pub(crate) fn pending_constraints(&self) -> ConstraintSet<'db, 'c> {
+        self.pending
+    }
+
     /// Records one relation in the call-wide constraint set.
     ///
     /// Generic unsatisfiability is retained in `pending` rather than reported as a misleading
