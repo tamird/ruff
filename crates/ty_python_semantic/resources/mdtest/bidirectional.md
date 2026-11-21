@@ -5315,7 +5315,7 @@ A provisional empty collection must use compatible sibling evidence even when it
 a union bound. Bare calls below deliberately have no result context that could rescue inference.
 
 ```py
-from typing import Any, Callable, Never, NotRequired, Protocol, Sequence, Unpack, overload
+from typing import Any, Callable, Literal, Never, NotRequired, Protocol, Sequence, Unpack, overload
 from typing_extensions import TypedDict
 from ty_extensions._internal import Unknown
 
@@ -5343,7 +5343,7 @@ def invoke(rule: Callable[..., object], **kwargs: Unpack[DefaultForwarded]) -> N
 def invoke(rule: Callable[..., object], *, inner_data: Input = [], **kwargs: Any) -> None:
     rule(data=inner_data, **kwargs)
 
-def listed(*, data: list[str], srcs: list[str]) -> None: ...
+def listed(*, data: list[Literal["ok"]], srcs: list[str]) -> None: ...
 def tupled(*, data: tuple[str]) -> None: ...
 def sequence(*, data: Sequence[str]) -> None: ...
 
@@ -5353,7 +5353,7 @@ invoke(listed, inner_data=["ok"], srcs=["ok"])  # no diagnostic
 invoke(tupled, inner_data=("ok",))  # no diagnostic
 invoke(sequence, inner_data=[])  # no diagnostic
 # error: [no-matching-overload]
-invoke(listed, inner_data=[42], srcs=["ok"])
+invoke(listed, inner_data=["wrong"], srcs=["ok"])
 # error: [no-matching-overload]
 invoke(tupled, inner_data=[])
 # error: [no-matching-overload]
@@ -5365,7 +5365,7 @@ def identity[D: Input](rule: Rule[D], *, data: D) -> D:
 # Keep result precision separate from the context-free invocation checks.
 listed_result = identity(listed, data=[])
 sequence_result = identity(sequence, data=[])
-reveal_type(listed_result)  # revealed: list[str]
+reveal_type(listed_result)  # revealed: list[Literal["ok"]]
 reveal_type(sequence_result)  # revealed: list[str]
 ```
 

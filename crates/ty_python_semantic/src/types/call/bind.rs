@@ -90,7 +90,7 @@ use crate::types::typevar::{
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
     TypeCollector, TypeKind, TypeVisitor, any_over_type, any_over_type_expanding_aliases,
-    walk_non_atomic_type, walk_type_with_recursion_guard,
+    any_over_type_including_alias_arguments, walk_non_atomic_type, walk_type_with_recursion_guard,
 };
 use crate::types::{
     BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
@@ -10495,6 +10495,125 @@ impl<'db> Binding<'db> {
         Some(ArgumentTypeContext::standard(
             original_parameter_type,
             TypeContext::new(Some(parameter_type), tcx_kind),
+        ))
+    }
+
+    /// Infer a fresh collection's context from the other call arguments.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn fresh_collection_argument_context(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        constraints: &ConstraintSetBuilder<'db>,
+        binding: &CallableBinding<'db>,
+        arguments: &CallArguments<'_, 'db>,
+        argument_index: usize,
+        tcx: TypeContext<'db>,
+        mode: CheckTypesMode,
+    ) -> Option<ArgumentTypeContext<'db>> {
+        if arguments.is_variadic(argument_index) {
+            return None;
+        }
+        let matched =
+            self.matched_argument_for_call_argument(binding.bound_type.is_some(), argument_index)?;
+        let [parameter] = matched.parameters.as_slice() else {
+            return None;
+        };
+        let formal = &self.signature.parameters()[parameter.index];
+        let original_parameter_type = formal.annotated_type();
+        let parameter_type = parameter
+            .expected_type
+            .or_else(|| formal.argument_context_type())?;
+        let Type::TypeVar(variable) = parameter_type else {
+            return None;
+        };
+        let context = self.signature.generic_context?;
+        if self.is_partial_application
+            || !matched.matched
+            || variable.is_paramspec(db)
+            || variable.typevar(db).is_self(db)
+            || !context.contains(db, variable.identity(db))
+            || !matches!(
+                variable.typevar(db).bound_or_constraints(db, env),
+                Some(TypeVarBoundOrConstraints::UpperBound(_))
+            )
+        {
+            return None;
+        }
+        let arguments = arguments.with_self(binding.bound_type);
+        let mut rematched = self.clone();
+        rematched.errors.clear();
+        rematched.match_parameters(db, env, &arguments);
+        if !rematched.errors.is_empty() {
+            return None;
+        }
+        let mut matches = self.argument_matches.clone();
+        let adjusted_index = argument_index + usize::from(binding.bound_type.is_some());
+        // Exclude this collection's earlier inferred type so it cannot widen the context
+        // supplied by the other arguments.
+        matches.get_mut(adjusted_index)?.parameters.clear();
+        let mut call = CallInference::new(db, env, self, &arguments, tcx);
+        call.argument_matches = &matches;
+        call.return_ty = self.unspecialized_return_type(db);
+        let inferred = call.infer(constraints);
+        if !inferred.errors.is_empty() {
+            return None;
+        }
+        let inference = inferred.inference?;
+        let variable_index = context.variable_index(db, variable.identity(db))?;
+        match inference.solutions(db) {
+            TypeVarInferenceSolutions::Single => {
+                if !inference.has_inferred_type(db, variable.identity(db)) {
+                    return None;
+                }
+            }
+            TypeVarInferenceSolutions::Alternatives(alternatives) => {
+                if alternatives.is_empty()
+                    || alternatives.iter().any(|alternative| {
+                        !matches!(
+                            alternative.get(variable_index),
+                            Some(Some(SolutionType::Resolved(_)))
+                        )
+                    })
+                {
+                    return None;
+                }
+            }
+            TypeVarInferenceSolutions::Incomplete(_) => return None,
+            TypeVarInferenceSolutions::Unavailable(_) => return None,
+        }
+        let inferred_specialization = inference.merged_specialization(db);
+        if !call.accepts_arguments(inferred_specialization) {
+            return None;
+        }
+        let eligible = |ty: Type<'db>| {
+            ty.is_fully_static(db, env)
+                && !ty.has_indeterminate_inference(db, env)
+                && !any_over_type_including_alias_arguments(db, env, ty, |nested| {
+                    nested.is_divergent() || nested.is_provisional_marker()
+                })
+        };
+        let inferred = parameter_type.apply_specialization(db, inferred_specialization);
+        // Finalization can replace a provisional type with its bound. That replacement is
+        // not independent evidence for this initializer.
+        if !eligible(inferred) {
+            return None;
+        }
+        let specialization = self.argument_type_context_specialization(
+            db,
+            env,
+            Some(inference),
+            constraints,
+            tcx,
+            mode,
+        );
+        let expected = parameter_type.apply_specialization(db, specialization.specialization);
+        if expected != inferred && !eligible(expected) {
+            return None;
+        }
+        Some(ArgumentTypeContext::standard(
+            original_parameter_type,
+            TypeContext::preference(Some(expected)),
         ))
     }
 

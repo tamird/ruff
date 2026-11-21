@@ -6976,6 +6976,28 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         {
                             return Some(context);
                         }
+                        // Fresh displays can take a sibling's element type. A stored collection
+                        // already has its own element type, which this context must not narrow.
+                        if matches!(
+                            argument.value(),
+                            ast::Expr::List(_)
+                                | ast::Expr::Dict(_)
+                                | ast::Expr::Set(_)
+                                | ast::Expr::ListComp(_)
+                                | ast::Expr::DictComp(_)
+                                | ast::Expr::SetComp(_)
+                        ) && let Some(context) = overload.fresh_collection_argument_context(
+                            db,
+                            env,
+                            constraints,
+                            binding,
+                            argument_types,
+                            argument_index,
+                            call_expression_tcx,
+                            mode,
+                        ) {
+                            return Some(context);
+                        }
                         overload.argument_type_context(
                             db,
                             env,
