@@ -110,6 +110,7 @@ use crate::types::infer::{
     TypeAndRange, TypeExpressionFlags, infer_statement_types, nearest_enclosing_class,
     nearest_enclosing_function, original_class_type,
 };
+use crate::types::iteration::precise_iterable_element_type;
 use crate::types::match_pattern::{ClassPatternPositionalResult, class_pattern_positional_result};
 use crate::types::member::{class_body_declaration_from_bases, inherited_class_body_declaration};
 use crate::types::narrow::NarrowingEvaluatorExtension;
@@ -146,8 +147,8 @@ use crate::types::{
     SentinelInstance, Signature, SpecialFormType, SubclassOfType, Type, TypeAliasType,
     TypeAndQualifiers, TypeContext, TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind,
     TypeVarVariance, TypingModule, UnionAccumulator, UnionBuilder, UnionType, any_over_type,
-    binding_type, extract_fixed_length_iterable_element_types, infer_complete_scope_types,
-    infer_scope_types, is_discarded_dict_key_assignment, todo_type,
+    binding_type, infer_complete_scope_types, infer_scope_types, is_discarded_dict_key_assignment,
+    todo_type,
 };
 use crate::{AnalysisSettings, Db, DisplaySettings, FxIndexSet, FxOrderSet, SemanticModel};
 use ty_python_core::ast_ids::PlaceUse;
@@ -5451,24 +5452,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         iterable: &ast::Expr,
         expression_type: impl FnMut(&ast::Expr) -> Type<'db>,
     ) -> Option<Type<'db>> {
-        let db = self.db();
-        let env = self.program_environment();
-        if let ast::Expr::Dict(dict) = iterable {
-            return dict_literal_key_value_types(db, env, dict, expression_type)
-                .map(|(keys, _)| keys);
-        }
-        let element_types =
-            extract_fixed_length_iterable_element_types(db, env, iterable, expression_type)?;
-
-        if element_types.is_empty() {
-            None
-        } else {
-            Some(UnionType::from_elements(
-                db,
-                env,
-                element_types.iter().copied(),
-            ))
-        }
+        precise_iterable_element_type(
+            self.db(),
+            self.program_environment(),
+            iterable,
+            expression_type,
+        )
     }
 
     fn infer_for_statement(&mut self, for_statement: &ast::StmtFor) {
