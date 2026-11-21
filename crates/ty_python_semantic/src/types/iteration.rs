@@ -1,5 +1,6 @@
 use crate::Db;
 use crate::ProgramEnvironment;
+use crate::types::dict::dict_literal_key_value_types;
 use crate::types::{
     AwaitError, Bindings, CallArguments, CallDunderError, KnownClass, LintDiagnosticGuard,
     LintDiagnosticGuardBuilder, LiteralValueTypeKind, Type, TypeContext, TypeVarBoundOrConstraints,
@@ -179,6 +180,38 @@ pub(crate) fn extract_fixed_length_iterable_element_types<'db>(
     let mut element_types = Vec::new();
     extend_fixed_length_iterable(db, env, iterable, &mut expression_type, &mut element_types)?;
     Some(element_types.into_boxed_slice())
+}
+
+/// Recover element types when iterating directly over a list or dictionary display.
+pub(super) fn precise_iterable_element_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    iterable: &ast::Expr,
+    expression_type: impl FnMut(&ast::Expr) -> Type<'db>,
+) -> Option<Type<'db>> {
+    match iterable {
+        ast::Expr::List(_) => {
+            // List inference promotes element literals to allow later mutation. This display is
+            // consumed immediately, so use the original element expression types.
+            let element_types =
+                extract_fixed_length_iterable_element_types(db, env, iterable, expression_type)?;
+            if element_types.is_empty() {
+                None
+            } else {
+                Some(UnionType::from_elements(
+                    db,
+                    env,
+                    element_types.iter().copied(),
+                ))
+            }
+        }
+        ast::Expr::Dict(dict) => {
+            dict_literal_key_value_types(db, env, dict, expression_type).map(|(keys, _values)| keys)
+        }
+        // Other expressions use their inferred iterable type. Tuple inference already preserves
+        // literals or widens large tuples; rereading their elements would undo that widening.
+        _ => None,
+    }
 }
 
 impl<'db> Type<'db> {
