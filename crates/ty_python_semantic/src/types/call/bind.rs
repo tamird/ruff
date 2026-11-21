@@ -10533,10 +10533,6 @@ impl<'db> Binding<'db> {
             || variable.is_paramspec(db)
             || variable.typevar(db).is_self(db)
             || !context.contains(db, variable.identity(db))
-            || !matches!(
-                variable.typevar(db).bound_or_constraints(db, env),
-                Some(TypeVarBoundOrConstraints::UpperBound(_))
-            )
         {
             return None;
         }
