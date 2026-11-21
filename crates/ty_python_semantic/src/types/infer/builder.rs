@@ -61,7 +61,8 @@ use crate::types::attribute_write::{
 };
 use crate::types::call::bind::{
     ArgumentContextCache, ArgumentTypeContext, ArgumentTypeContextSource, CallableDescription,
-    CheckTypesMode, OverloadSet, inferable_typevar_occurrences, requires_overload_evaluation,
+    CheckTypesMode, FreshCollectionSolutionCache, OverloadSet, inferable_typevar_occurrences,
+    requires_overload_evaluation,
 };
 use crate::types::call::{
     Binding, Bindings, CallArguments, CallError, CallErrorKind, DictionaryAccess,
@@ -6251,6 +6252,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let db = self.db();
         let constraints = ConstraintSetBuilder::new();
+        let fresh_solutions = FreshCollectionSolutionCache::default();
         let initial_argument_types = argument_types.clone();
         let env = self.program_environment();
 
@@ -6402,6 +6404,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         infer_argument_ty,
                         bindings,
                         &constraints,
+                        &fresh_solutions,
                         tcx,
                         &overload_candidates,
                         narrowing,
@@ -6416,6 +6419,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         infer_argument_ty,
                         bindings,
                         &constraints,
+                        &fresh_solutions,
                         tcx,
                         &generic_arguments,
                         fixpoint_iteration_limit,
@@ -6585,6 +6589,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
         bindings: &mut Bindings<'db>,
         constraints: &ConstraintSetBuilder<'db>,
+        fresh_solutions: &FreshCollectionSolutionCache<'db>,
         call_expression_tcx: TypeContext<'db>,
         candidates: &OverloadSet,
         narrowing: bool,
@@ -6600,6 +6605,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             bindings,
             requires_overload_evaluation.then_some(candidates),
             constraints,
+            fresh_solutions,
             call_expression_tcx,
             &[],
         );
@@ -6661,6 +6667,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             bindings,
             None,
             constraints,
+            fresh_solutions,
             call_expression_tcx,
             &[],
         );
@@ -6689,6 +6696,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
         bindings: &mut Bindings<'db>,
         constraints: &ConstraintSetBuilder<'db>,
+        fresh_solutions: &FreshCollectionSolutionCache<'db>,
         call_expression_tcx: TypeContext<'db>,
         generic_arguments: &SmallVec<[usize; 4]>,
         fixpoint_iteration_limit: usize,
@@ -6706,6 +6714,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             bindings,
             Some(candidates),
             constraints,
+            fresh_solutions,
             call_expression_tcx,
             &[],
         );
@@ -6771,6 +6780,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 &next_bindings,
                 Some(candidates),
                 constraints,
+                fresh_solutions,
                 call_expression_tcx,
                 &[],
             );
@@ -6819,6 +6829,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 &next_bindings,
                 Some(candidates),
                 constraints,
+                fresh_solutions,
                 call_expression_tcx,
                 &final_arguments,
             );
@@ -6876,6 +6887,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 &next_bindings,
                 None,
                 constraints,
+                fresh_solutions,
                 call_expression_tcx,
                 &final_arguments,
             );
@@ -6917,6 +6929,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         bindings: &'bindings Bindings<'db>,
         candidates: Option<&'bindings OverloadSet>,
         constraints: &ConstraintSetBuilder<'db>,
+        fresh_solutions: &FreshCollectionSolutionCache<'db>,
         call_expression_tcx: TypeContext<'db>,
         final_arguments: &[usize],
     ) -> Vec<Option<MatchingArgumentTypeContext<'db>>> {
@@ -6926,7 +6939,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Collect the set of candidate overloads and bindings.
         let mut overloads_with_binding = Vec::new();
         let mut add_overload = |overload, binding| {
-            overloads_with_binding.push((overload, binding, ArgumentContextCache::default()));
+            overloads_with_binding.push((
+                overload,
+                binding,
+                ArgumentContextCache::new(fresh_solutions),
+            ));
         };
         if let Some(candidates) = candidates {
             bindings.visit_overload_set(candidates, &mut add_overload);
@@ -7011,6 +7028,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             call_expression_tcx,
                             mode,
                             ordinary_context,
+                            cache,
                         ) {
                             return Some(context);
                         }
@@ -7033,6 +7051,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Type<'db> {
         let tcx = context.map_or_default(ArgumentTypeContext::type_context);
         if let Some(fallback) = context.and_then(ArgumentTypeContext::fallback_type_context) {
+            // Use ordinary context directly when these keys cannot match the TypedDict.
+            // This avoids inferring the dictionary with an incompatible hint and again on fallback.
+            if let ast::Expr::Dict(dict) = expression
+                && let Some(expected) = tcx.expected_type()
+                && let Some(schema) = expected
+                    .expand_top_level_aliases(self.db(), self.program_environment())
+                    .as_typed_dict()
+                && typed_dict::literal_candidates(self.db(), dict, vec![schema])
+                    .next()
+                    .is_none()
+            {
+                return infer_argument_ty(self, (argument_index, expression, fallback));
+            }
             self.infer_with_type_context_fallback(
                 tcx,
                 fallback,

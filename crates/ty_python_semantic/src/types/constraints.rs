@@ -384,7 +384,51 @@ pub struct ConstraintSet<'db, 'c> {
     _invariant: PhantomData<fn(&'c ()) -> &'c ()>,
 }
 
+/// Identifies an ordered constraint set within its builder's arena.
+pub(crate) struct OrderedConstraintSetKey {
+    builder: *const (),
+    node: NodeId,
+    source_order: Option<SourceOrderId>,
+    normalized_order: Option<Box<[ConstraintId]>>,
+}
+
 impl<'db, 'c> ConstraintSet<'db, 'c> {
+    /// Borrows the same arena with a shorter lifetime.
+    pub(crate) fn reborrow(&self) -> ConstraintSet<'db, '_> {
+        ConstraintSet::from_node(self.builder, self.node, self.source_order)
+    }
+
+    pub(crate) fn ordered_key(self) -> OrderedConstraintSetKey {
+        OrderedConstraintSetKey {
+            builder: std::ptr::from_ref(self.builder).cast(),
+            node: self.node,
+            source_order: self.source_order,
+            normalized_order: None,
+        }
+    }
+
+    pub(crate) fn matches_ordered_key(self, key: &mut OrderedConstraintSetKey) -> bool {
+        if key.builder != std::ptr::from_ref(self.builder).cast() || key.node != self.node {
+            return false;
+        }
+        if key.source_order == self.source_order {
+            return true;
+        }
+        // Different sidecar trees can record the same first-occurrence order. Only
+        // normalize when the arena, node and raw sidecar identity do not settle equality.
+        let storage = self.builder.storage.borrow();
+        let normalized = key.normalized_order.get_or_insert_with(|| {
+            storage
+                .calculate_immediate_source_order(key.source_order)
+                .into_iter()
+                .collect()
+        });
+        storage
+            .calculate_immediate_source_order(self.source_order)
+            .iter()
+            .eq(normalized.iter())
+    }
+
     fn from_node(
         builder: &'c ConstraintSetBuilder<'db>,
         node: NodeId,
@@ -1017,23 +1061,7 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
     /// Orders the immediate constraints without flattening quantified scopes.
     fn ordered_constraints(self) -> SmallVec<[ConstraintId; 8]> {
         let storage = self.builder.storage.borrow();
-        let mut pending = Vec::from_iter(self.source_order);
-        let mut visited = FxHashSet::default();
-        let mut source_orders = FxIndexSet::default();
-        while let Some(current) = pending.pop() {
-            if !visited.insert(current) {
-                continue;
-            }
-            match storage.source_order_data(current) {
-                SourceOrder::Ordered(left, right) => pending.extend([right, left]),
-                SourceOrder::AtomicConstraint(constraint) => {
-                    source_orders.insert(constraint.into_inner());
-                }
-                SourceOrder::QuantifiedConstraint(constraint) => {
-                    source_orders.insert(constraint);
-                }
-            }
-        }
+        let source_orders = storage.calculate_immediate_source_order(self.source_order);
         let mut constraints = SmallVec::new();
         self.node
             .for_each_unique_constraint(&storage, &mut |constraint| constraints.push(constraint));
@@ -1689,6 +1717,31 @@ impl<'db> ConstraintSetStorage<'db> {
             return self.source_orders[SourceOrderId::from_usize(index - split)];
         }
         self.source_orders[source_order]
+    }
+
+    /// Orders immediate constraints, retaining quantified scopes and ordering-only evidence.
+    fn calculate_immediate_source_order(
+        &self,
+        source_order: Option<SourceOrderId>,
+    ) -> FxIndexSet<ConstraintId> {
+        let mut pending = Vec::from_iter(source_order);
+        let mut visited = FxHashSet::default();
+        let mut source_orders = FxIndexSet::default();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            match self.source_order_data(current) {
+                SourceOrder::Ordered(left, right) => pending.extend([right, left]),
+                SourceOrder::AtomicConstraint(constraint) => {
+                    source_orders.insert(constraint.into_inner());
+                }
+                SourceOrder::QuantifiedConstraint(constraint) => {
+                    source_orders.insert(constraint);
+                }
+            }
+        }
+        source_orders
     }
 
     fn calculate_source_orders(

@@ -48,8 +48,8 @@ use crate::types::constraints::projection::{ProjectionTypeBudget, SolutionBudget
 use crate::types::constraints::resolution::SolutionType;
 use crate::types::constraints::{
     CandidateSolutions, CandidateTypeVarSolution, ConstraintFailureEvidence, ConstraintProvenance,
-    ConstraintSet, ConstraintSetBuilder, PathBoundSolution, ReportDiagnostics, SolutionPaths,
-    Solutions,
+    ConstraintSet, ConstraintSetBuilder, OrderedConstraintSetKey, PathBoundSolution,
+    ReportDiagnostics, SolutionPaths, Solutions,
 };
 use crate::types::context::LintDiagnosticGuardBuilder;
 use crate::types::cyclic::PairVisitor;
@@ -7111,7 +7111,7 @@ struct InferredCall<'db> {
 }
 
 /// Fixed inputs used to infer a call before its arguments are validated.
-/// No validation result can be written through this object.
+/// Validation can memoize checks of a prepared argument snapshot, but cannot modify the binding.
 struct CallInference<'a, 'db> {
     db: &'db dyn Db,
     env: &'a ProgramEnvironment<'db>,
@@ -7121,6 +7121,10 @@ struct CallInference<'a, 'db> {
     arguments: &'a CallArguments<'a, 'db>,
     /// Parameter matches indexed by `arguments`; unpacked arguments can match multiple parameters.
     argument_matches: &'a [MatchedArgument<'db>],
+    /// A fresh argument omitted from this inference's relation sequence.
+    excluded_argument: Option<usize>,
+    /// Validation of the immutable, full argument snapshot used to prepare constraints.
+    argument_validation: Option<&'a RefCell<Option<(Specialization<'db>, ArgumentFailures)>>>,
     /// Expected result type used to prefer solutions compatible with the argument evidence.
     call_expression_tcx: TypeContext<'db>,
     /// Return type before applying this call's inferred type arguments.
@@ -7147,6 +7151,8 @@ impl<'a, 'db> CallInference<'a, 'db> {
             signature: &binding.signature,
             arguments,
             argument_matches: &binding.argument_matches,
+            excluded_argument: None,
+            argument_validation: None,
             call_expression_tcx,
             return_ty: binding.return_ty,
             is_partial_application: binding.is_partial_application,
@@ -7164,6 +7170,12 @@ impl<'a, 'db> CallInference<'a, 'db> {
     /// Gradual variadic parameters do not contribute constraints. For unpacked tuple parameters,
     /// the matched parameter can provide a more specific formal type for the corresponding element.
     fn argument_relations(&self) -> impl Iterator<Item = ArgumentRelation<'db>> + 'a {
+        let excluded = self.excluded_argument;
+        self.all_argument_relations()
+            .filter(move |relation| Some(relation.argument_index) != excluded)
+    }
+
+    fn all_argument_relations(&self) -> impl Iterator<Item = ArgumentRelation<'db>> + 'a {
         let parameters: &'a Parameters<'db> = self.signature.parameters();
         let argument_matches: &'a [MatchedArgument<'db>] = self.argument_matches;
 
@@ -7349,7 +7361,7 @@ impl<'db> ArgumentTypeChecker<'_, 'db> {
     }
 }
 
-impl<'db> CallInference<'_, 'db> {
+impl<'a, 'db> CallInference<'a, 'db> {
     /// Conservatively checks whether two inferred returns differ in an invariant component.
     /// Matching tuple positions and generic arguments can vary independently of fixed mutable
     /// components, as in `tuple[A, list[int]]` versus `tuple[B, list[int]]`.
@@ -7794,20 +7806,113 @@ impl<'db> CallInference<'_, 'db> {
         IntersectionType::bounded_from_elements(db, env, returns)
     }
 
+    fn accepts_argument(
+        &self,
+        relation: ArgumentRelation<'db>,
+        specialization: Specialization<'db>,
+    ) -> bool {
+        let actual = relation
+            .argument_type
+            .apply_specialization(self.db, specialization);
+        let formal = relation
+            .declared_type
+            .apply_specialization(self.db, specialization);
+        actual.is_assignable_to(self.db, self.env, formal)
+    }
+
     fn accepts_arguments(&self, specialization: Specialization<'db>) -> bool {
+        let Some(validation) = self.argument_validation else {
+            return self
+                .argument_relations()
+                .all(|relation| self.accepts_argument(relation, specialization));
+        };
+        if let Some((previous, failures)) = *validation.borrow()
+            && previous == specialization
+        {
+            return failures.accepts_without(self.excluded_argument);
+        }
+        let mut failures = ArgumentFailures::None;
+        for relation in self.all_argument_relations() {
+            if !self.accepts_argument(relation, specialization) {
+                failures = failures.with_failure(relation.argument_index);
+                if matches!(failures, ArgumentFailures::Multiple) {
+                    break;
+                }
+            }
+        }
+        *validation.borrow_mut() = Some((specialization, failures));
+        failures.accepts_without(self.excluded_argument)
+    }
+
+    fn can_prepare_argument_evidence(&self) -> bool {
+        self.signature
+            .generic_context
+            .is_some_and(|context| !uses_legacy_inference(self.db, context))
+            && !self
+                .signature
+                .parameters()
+                .iter()
+                .any(Parameter::has_starred_annotation)
+    }
+
+    fn prepare_argument_constraints<'c>(
+        &self,
+        env: &'c ProgramEnvironment<'db>,
+        constraints: &'c ConstraintSetBuilder<'db>,
+    ) -> Option<PreparedArgumentEvidence<'db, 'c>> {
         let db = self.db;
-        self.argument_relations().all(|relation| {
-            let actual = relation
-                .argument_type
-                .apply_specialization(db, specialization);
-            let formal = relation
-                .declared_type
-                .apply_specialization(db, specialization);
-            actual.is_assignable_to(db, self.env, formal)
+        let generic_context = self.signature.generic_context?;
+        if !self.can_prepare_argument_evidence() {
+            return None;
+        }
+        let identity = ConstraintSet::from_bool(constraints, true);
+        let mut contributions = vec![Some(identity); self.arguments.len()];
+        for relation in self.all_argument_relations() {
+            let mut builder = SpecializationBuilder::new(db, env, constraints, generic_context);
+            if builder
+                .infer(relation.declared_type, relation.argument_type)
+                .is_err()
+            {
+                contributions[relation.argument_index] = None;
+            } else if let Some(contribution) = &mut contributions[relation.argument_index] {
+                contribution.intersect(db, constraints, builder.pending_constraints());
+            }
+        }
+        let mut prefix = Vec::with_capacity(contributions.len() + 1);
+        prefix.push(Some(identity));
+        for contribution in &contributions {
+            let next =
+                prefix.last().copied().flatten().zip(*contribution).map(
+                    |(mut before, contribution)| before.intersect(db, constraints, contribution),
+                );
+            prefix.push(next);
+        }
+        let mut suffix = vec![Some(identity); contributions.len() + 1];
+        for index in (0..contributions.len()).rev() {
+            suffix[index] = contributions[index]
+                .zip(suffix[index + 1])
+                .map(|(mut contribution, after)| contribution.intersect(db, constraints, after));
+        }
+        Some(PreparedArgumentEvidence {
+            prefix,
+            suffix,
+            validation: RefCell::new(None),
         })
     }
 
     fn infer(&self, constraints: &ConstraintSetBuilder<'db>) -> InferredCall<'db> {
+        self.infer_with_argument_constraints(constraints, None, None)
+    }
+
+    fn infer_with_argument_constraints<'c>(
+        &self,
+        constraints: &'c ConstraintSetBuilder<'db>,
+        argument_constraints: Option<ConstraintSet<'db, 'c>>,
+        solution_cache: Option<&FreshCollectionSolutionCache<'db>>,
+    ) -> InferredCall<'db>
+    where
+        'a: 'c,
+    {
         let db = self.db;
         let mut constraint_set_errors = vec![false; self.arguments.len()];
         let Some(generic_context) = self.signature.generic_context else {
@@ -7828,13 +7933,17 @@ impl<'db> CallInference<'_, 'db> {
         let mut specialization_errors = Vec::new();
         let mut builder = SpecializationBuilder::new(db, self.env, constraints, generic_context);
 
-        self.infer_argument_constraints(
-            &mut builder,
-            &FxHashMap::default(),
-            &FxHashSet::default(),
-            &mut specialization_errors,
-            &mut constraint_set_errors,
-        );
+        if let Some(argument_constraints) = argument_constraints {
+            builder.record_constraint_set(argument_constraints);
+        } else {
+            self.infer_argument_constraints(
+                &mut builder,
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                &mut specialization_errors,
+                &mut constraint_set_errors,
+            );
+        }
 
         let return_context = self.call_expression_tcx.expected_type().map(|tcx| {
             let return_ty = self
@@ -7862,6 +7971,7 @@ impl<'db> CallInference<'_, 'db> {
             &mut builder,
             return_context,
             specialization_errors.is_empty() && !constraint_set_errors.iter().any(|error| *error),
+            solution_cache,
         );
 
         // If we failed to infer a compatible specialization, retry without the expected return type.
@@ -7874,13 +7984,17 @@ impl<'db> CallInference<'_, 'db> {
             specialization_errors.clear();
             constraint_set_errors.fill(false);
 
-            self.infer_argument_constraints(
-                &mut builder,
-                &FxHashMap::default(),
-                &FxHashSet::default(),
-                &mut specialization_errors,
-                &mut constraint_set_errors,
-            );
+            if let Some(argument_constraints) = argument_constraints {
+                builder.record_constraint_set(argument_constraints);
+            } else {
+                self.infer_argument_constraints(
+                    &mut builder,
+                    &FxHashMap::default(),
+                    &FxHashSet::default(),
+                    &mut specialization_errors,
+                    &mut constraint_set_errors,
+                );
+            }
 
             solution = self.solve(
                 constraints,
@@ -7888,6 +8002,7 @@ impl<'db> CallInference<'_, 'db> {
                 None,
                 specialization_errors.is_empty()
                     && !constraint_set_errors.iter().any(|error| *error),
+                solution_cache,
             );
         }
 
@@ -8144,6 +8259,7 @@ impl<'db> CallInference<'_, 'db> {
         builder: &mut SpecializationBuilder<'db, '_>,
         return_context: Option<(Type<'db>, Type<'db>)>,
         allow_deferred_return: bool,
+        solution_cache: Option<&FreshCollectionSolutionCache<'db>>,
     ) -> Result<(TypeVarInference<'db>, Type<'db>, bool), Vec<SpecializationError<'db>>> {
         let db = self.db;
 
@@ -8155,15 +8271,58 @@ impl<'db> CallInference<'_, 'db> {
             ReportDiagnostics::Yes
         };
 
-        let inference = builder.build_inference_with(report_diagnostics, |_, bounds| {
-            bounds.map(|bounds| {
-                self.solve_typevar(
-                    constraints,
-                    bounds,
-                    self.call_expression_tcx.should_prefer_expected_type(),
-                )
-            })
-        })?;
+        let key = solution_cache.and_then(|_| {
+            self.signature
+                .generic_context
+                .map(|generic_context| FreshCollectionSolutionKey {
+                    constraints: builder.pending_constraints().ordered_key(),
+                    generic_context,
+                    return_type: self.return_ty,
+                    type_context: self.call_expression_tcx,
+                    report_diagnostics: report_diagnostics.is_yes(),
+                })
+        });
+        let cached = solution_cache.zip(key.as_ref()).and_then(|(cache, key)| {
+            let mut cache = cache.last.borrow_mut();
+            let (cached_key, inference) = cache.as_mut()?;
+            (cached_key.generic_context == key.generic_context
+                && cached_key.return_type == key.return_type
+                && cached_key.type_context == key.type_context
+                && cached_key.report_diagnostics == key.report_diagnostics
+                && builder
+                    .pending_constraints()
+                    .matches_ordered_key(&mut cached_key.constraints))
+            .then_some(*inference)
+        });
+        let inference = if let Some(inference) = cached {
+            inference
+        } else {
+            let inference = builder.build_inference_with(report_diagnostics, |_, bounds| {
+                bounds.map(|bounds| {
+                    self.solve_typevar(
+                        constraints,
+                        bounds,
+                        self.call_expression_tcx.should_prefer_expected_type(),
+                    )
+                })
+            })?;
+            if let Some(cache) = solution_cache
+                && let Some(key) = key
+            {
+                let complete = match inference.solutions(db) {
+                    TypeVarInferenceSolutions::Single => true,
+                    TypeVarInferenceSolutions::Alternatives(alternatives) => {
+                        !alternatives.is_empty()
+                    }
+                    TypeVarInferenceSolutions::Incomplete(_alternatives) => false,
+                    TypeVarInferenceSolutions::Unavailable(_reason) => false,
+                };
+                if complete {
+                    *cache.last.borrow_mut() = Some((key, inference));
+                }
+            }
+            inference
+        };
         let (return_ty, arguments_validated) =
             self.select_return_type(inference, allow_deferred_return);
 
@@ -9404,12 +9563,17 @@ fn nested_union_members<'db>(
 }
 
 /// Specializations shared by all arguments of one overload during an inference pass.
-#[derive(Default)]
-pub(crate) struct ArgumentContextCache<'db> {
+pub(crate) struct ArgumentContextCache<'db, 'c> {
     all_provisional: ArgumentContextCacheEntry<'db>,
     all_final: ArgumentContextCacheEntry<'db>,
     without_arguments_provisional: ArgumentContextCacheEntry<'db>,
     without_arguments_final: ArgumentContextCacheEntry<'db>,
+    // Fresh constraints use this pass's full argument snapshot. Source and finalization
+    // mode affect only the context produced after projecting those constraints.
+    fresh_shape_valid: OnceCell<bool>,
+    fresh_primed: Cell<bool>,
+    fresh_constraints: OnceCell<Option<Box<PreparedArgumentEvidence<'db, 'c>>>>,
+    fresh_solutions: &'c FreshCollectionSolutionCache<'db>,
 }
 
 #[derive(Default)]
@@ -9418,7 +9582,91 @@ struct ArgumentContextCacheEntry<'db> {
     nested: OnceCell<Option<Specialization<'db>>>,
 }
 
-impl<'db> ArgumentContextCache<'db> {
+impl<'db, 'c> ArgumentContextCache<'db, 'c> {
+    pub(crate) fn new(fresh_solutions: &'c FreshCollectionSolutionCache<'db>) -> Self {
+        Self {
+            all_provisional: ArgumentContextCacheEntry::default(),
+            all_final: ArgumentContextCacheEntry::default(),
+            without_arguments_provisional: ArgumentContextCacheEntry::default(),
+            without_arguments_final: ArgumentContextCacheEntry::default(),
+            fresh_shape_valid: OnceCell::new(),
+            fresh_primed: Cell::new(false),
+            fresh_constraints: OnceCell::new(),
+            fresh_solutions,
+        }
+    }
+}
+
+/// Reuses one completed projection within an `infer_and_check_argument_types` invocation.
+///
+/// Keys contain arena-relative IDs, so this cache must not survive that invocation.
+/// Keeping only the last result bounds retained ordering-key storage to the input size.
+/// Argument and return validation remain outside this cache.
+#[derive(Default)]
+pub(crate) struct FreshCollectionSolutionCache<'db> {
+    last: RefCell<Option<(FreshCollectionSolutionKey<'db>, TypeVarInference<'db>)>>,
+}
+
+struct FreshCollectionSolutionKey<'db> {
+    constraints: OrderedConstraintSetKey,
+    generic_context: GenericContext<'db>,
+    return_type: Type<'db>,
+    type_context: TypeContext<'db>,
+    report_diagnostics: bool,
+}
+
+struct PreparedArgumentEvidence<'db, 'c> {
+    prefix: Vec<Option<ConstraintSet<'db, 'c>>>,
+    suffix: Vec<Option<ConstraintSet<'db, 'c>>>,
+    validation: RefCell<Option<(Specialization<'db>, ArgumentFailures)>>,
+}
+
+/// Failures grouped by original argument, including synthetic receivers and unpacked groups.
+#[derive(Clone, Copy)]
+enum ArgumentFailures {
+    None,
+    One(usize),
+    Multiple,
+}
+
+impl ArgumentFailures {
+    fn with_failure(self, argument: usize) -> Self {
+        match self {
+            Self::None => Self::One(argument),
+            Self::One(previous) => {
+                if previous == argument {
+                    self
+                } else {
+                    Self::Multiple
+                }
+            }
+            Self::Multiple => Self::Multiple,
+        }
+    }
+
+    fn accepts_without(self, excluded: Option<usize>) -> bool {
+        match self {
+            Self::None => true,
+            Self::One(argument) => excluded == Some(argument),
+            Self::Multiple => false,
+        }
+    }
+}
+
+impl<'db> PreparedArgumentEvidence<'db, '_> {
+    fn without_argument<'borrow>(
+        &'borrow self,
+        db: &'db dyn Db,
+        constraints: &'borrow ConstraintSetBuilder<'db>,
+        index: usize,
+    ) -> Option<ConstraintSet<'db, 'borrow>> {
+        let mut before = self.prefix.get(index)?.as_ref()?.reborrow();
+        let after = self.suffix.get(index + 1)?.as_ref()?.reborrow();
+        Some(before.intersect(db, constraints, after))
+    }
+}
+
+impl<'db> ArgumentContextCache<'db, '_> {
     fn for_context(
         &self,
         source: ArgumentTypeContextSource,
@@ -10404,7 +10652,7 @@ impl<'db> Binding<'db> {
         call_expression_tcx: TypeContext<'db>,
         source: ArgumentTypeContextSource,
         mode: CheckTypesMode,
-        cache: &ArgumentContextCache<'db>,
+        cache: &ArgumentContextCache<'db, '_>,
     ) -> Option<ArgumentTypeContext<'db>> {
         let argument_matches =
             self.matched_argument_for_call_argument(binding.bound_type.is_some(), argument_index)?;
@@ -10593,17 +10841,18 @@ impl<'db> Binding<'db> {
 
     /// Infer a fresh collection's context from the other call arguments.
     #[expect(clippy::too_many_arguments)]
-    pub(crate) fn fresh_collection_argument_context(
+    pub(crate) fn fresh_collection_argument_context<'c>(
         &self,
         db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        constraints: &ConstraintSetBuilder<'db>,
+        env: &'c ProgramEnvironment<'db>,
+        constraints: &'c ConstraintSetBuilder<'db>,
         binding: &CallableBinding<'db>,
         arguments: &CallArguments<'_, 'db>,
         argument_index: usize,
         tcx: TypeContext<'db>,
         mode: CheckTypesMode,
         fallback_context: impl FnOnce() -> Option<ArgumentTypeContext<'db>>,
+        cache: &ArgumentContextCache<'db, 'c>,
     ) -> Option<ArgumentTypeContext<'db>> {
         if arguments.is_variadic(argument_index) {
             return None;
@@ -10638,22 +10887,64 @@ impl<'db> Binding<'db> {
         {
             return None;
         }
+        let adjusted_index = argument_index + usize::from(binding.bound_type.is_some());
         let arguments = arguments.with_self(binding.bound_type);
-        let mut rematched = self.clone();
-        rematched.errors.clear();
-        rematched.match_parameters(db, env, &arguments);
-        if !rematched.errors.is_empty() {
+        if !cache.fresh_shape_valid.get_or_init(|| {
+            let mut rematched = self.clone();
+            rematched.errors.clear();
+            rematched.match_parameters(db, env, &arguments);
+            rematched.errors.is_empty()
+        }) {
             return None;
         }
-        let mut matches = self.argument_matches.clone();
-        let adjusted_index = argument_index + usize::from(binding.bound_type.is_some());
-        // Exclude this collection's earlier inferred type so it cannot widen the context
-        // supplied by the other arguments.
-        matches.get_mut(adjusted_index)?.parameters.clear();
         let mut call = CallInference::new(db, env, self, &arguments, tcx);
-        call.argument_matches = &matches;
         call.return_ty = self.unspecialized_return_type(db);
-        let inferred = call.infer(constraints);
+        let can_prepare = call.can_prepare_argument_evidence();
+        let mut matches;
+        // Exclude this collection's earlier inferred type so it cannot widen the context
+        // supplied by the other arguments. Pack inference still reads the original match table.
+        if can_prepare {
+            call.excluded_argument = Some(adjusted_index);
+        } else {
+            matches = self.argument_matches.clone();
+            matches.get_mut(adjusted_index)?.parameters.clear();
+            call.argument_matches = &matches;
+        }
+        // Solve once with the target omitted before preparing its relation. This preserves
+        // solver variable registration order when later arguments reuse the prepared constraints.
+        let prepared = if cache.fresh_primed.get() && !uses_legacy_inference(db, context) {
+            cache
+                .fresh_constraints
+                .get_or_init(|| {
+                    call.prepare_argument_constraints(env, constraints)
+                        .map(Box::new)
+                })
+                .as_deref()
+        } else {
+            None
+        };
+        let argument_constraints = prepared
+            .and_then(|prepared| prepared.without_argument(db, constraints, adjusted_index));
+        call.argument_validation = prepared.map(|evidence| &evidence.validation);
+        let inferred = call.infer_with_argument_constraints(
+            constraints,
+            argument_constraints,
+            Some(cache.fresh_solutions),
+        );
+        if inferred.errors.is_empty()
+            && inferred
+                .inference
+                .is_some_and(|inference| match inference.solutions(db) {
+                    TypeVarInferenceSolutions::Single => true,
+                    TypeVarInferenceSolutions::Alternatives(alternatives) => {
+                        !alternatives.is_empty()
+                    }
+                    TypeVarInferenceSolutions::Incomplete(_alternatives) => false,
+                    TypeVarInferenceSolutions::Unavailable(_reason) => false,
+                })
+        {
+            cache.fresh_primed.set(true);
+        }
         if !inferred.errors.is_empty() {
             return None;
         }
@@ -10709,9 +11000,10 @@ impl<'db> Binding<'db> {
         if expected != inferred && !eligible(expected) {
             return None;
         }
+        let context = TypeContext::preference(Some(expected));
         Some(ArgumentTypeContext::FreshCollection {
             raw_parameter_type: original_parameter_type,
-            context: TypeContext::preference(Some(expected)),
+            context,
             fallback_context: fallback_context().map_or_default(ArgumentTypeContext::type_context),
         })
     }
@@ -13597,7 +13889,8 @@ mod tests {
                 [CheckTypesMode::Provisional, CheckTypesMode::Finalize],
                 [CheckTypesMode::Finalize, CheckTypesMode::Provisional],
             ] {
-                let cache = ArgumentContextCache::default();
+                let fresh_solutions = FreshCollectionSolutionCache::default();
+                let cache = ArgumentContextCache::new(&fresh_solutions);
                 for source in sources {
                     for mode in modes {
                         let context = binding
