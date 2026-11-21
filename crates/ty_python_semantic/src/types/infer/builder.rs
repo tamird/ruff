@@ -2659,7 +2659,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             )
         };
 
-        if let Some(tuple_spec) = ty.tuple_instance_spec(db, env) {
+        if let Some(tuple_spec) = ty.resolve_type_alias(db).tuple_instance_spec(db, env) {
             infer_from_tuple(&tuple_spec)
         } else if ty.is_assignable_to(db, env, type_base_exception) {
             // `except ValueError as e:`

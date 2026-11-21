@@ -103,12 +103,18 @@ python-version = "3.12"
 ```py
 from ty_extensions import AlwaysFalsy, Intersection, Not
 
+type Errors = tuple[type[ValueError], ...]
 type NonemptyErrors = Intersection[tuple[type[ValueError], ...], Not[AlwaysFalsy]]
 
-def catch(classes: NonemptyErrors):
+def catch(classes: NonemptyErrors, plain: Errors):
     try:
         help()
     except classes as exc:
+        reveal_type(exc)  # revealed: ValueError
+
+    try:
+        help()
+    except plain as exc:
         reveal_type(exc)  # revealed: ValueError
 ```
 
