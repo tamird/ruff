@@ -12,6 +12,20 @@ def _(foo: str):
     reveal_type(False or False)  # revealed: Literal[False]
     reveal_type(foo or False)  # revealed: (str & ~AlwaysFalsy) | Literal[False]
     reveal_type(foo or True)  # revealed: (str & ~AlwaysFalsy) | Literal[True]
+    reveal_type(foo or "")  # revealed: str
+    reveal_type((foo or "").split())  # revealed: list[str]
+    reveal_type(foo or "fallback")  # revealed: str & ~AlwaysFalsy
+
+# A literal receiver still selects the LiteralString overload.
+reveal_type("".split())  # revealed: list[LiteralString]
+
+from typing import LiteralString
+
+def _(s: str, t: LiteralString, i: int):
+    reveal_type(s or t)  # revealed: str
+    if s:
+        a: list[str] = (s, t, "")[i].split()  # ok
+        b: list[str] = (t, s, "")[i].split()  # ok
 ```
 
 ## AND

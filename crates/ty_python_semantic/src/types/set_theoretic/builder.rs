@@ -59,6 +59,22 @@ use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
+fn is_exact_truthy_str<'db>(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
+    let Type::Intersection(intersection) = ty else {
+        return false;
+    };
+    intersection
+        .positive(db)
+        .iter()
+        .copied()
+        .eq([KnownClass::Str.to_instance(db, env)])
+        && intersection
+            .negative(db)
+            .iter()
+            .copied()
+            .eq([Type::AlwaysFalsy])
+}
+
 /// The truthiness excluded by a single guard, e.g. `AlwaysFalsy` in `A & ~AlwaysFalsy`.
 /// Intersections that exclude both truthy and falsy values have no single guard.
 fn excluded_truthiness<'db>(db: &'db dyn Db, ty: Type<'db>) -> Option<Type<'db>> {
@@ -257,10 +273,21 @@ fn normalize_covered_literal_exclusions<'db>(
     if literals.is_empty() {
         return false;
     }
+    // LiteralString can subsume an explicit empty-string member during insertion.
+    let covers_empty_string = literals.iter().any(|literal| match literal {
+        LiteralValueTypeKind::LiteralString => true,
+        LiteralValueTypeKind::String(literal) => literal.value(db).is_empty(),
+        _ => false,
+    });
 
     let mut changed = false;
     for ty in types {
         if !unpack_aliases && any_over_type(db, env, *ty, false, Type::is_alias_like) {
+            continue;
+        }
+        if covers_empty_string && is_exact_truthy_str(db, env, *ty) {
+            *ty = KnownClass::Str.to_instance(db, env);
+            changed = true;
             continue;
         }
         if let Some(widened) = remove_covered_exclusions(db, env, *ty, |excluded| {
