@@ -620,10 +620,10 @@ def _(x: Literal["foo", ""] | list[int]):
         reveal_type(x)  # revealed: Literal[""] | list[int]
 ```
 
-## Narrowing away empty literals
+## An empty fallback restores `str`
 
-This pattern is common when a prior truthiness check narrows a type, and then a conditional
-expression adds an empty literal back:
+A truthiness check narrows a string, but adding an empty string back restores broad `str`, in either
+branch order. A later length check leaves that type unchanged:
 
 ```py
 def _(lines: list[str]):
@@ -633,11 +633,11 @@ def _(lines: list[str]):
 
         reveal_type(line)  # revealed: str & ~AlwaysFalsy
         value = line if len(line) < 3 else ""
-        reveal_type(value)  # revealed: (str & ~AlwaysFalsy) | Literal[""]
+        reveal_type(value)  # revealed: str
+        value = "" if len(line) < 3 else line
+        reveal_type(value)  # revealed: str
 
         if len(value):
-            # `Literal[""]` is removed, `str & ~AlwaysFalsy` is unchanged
-            reveal_type(value)  # revealed: str & ~AlwaysFalsy
-            # Accessing value[0] is safe here
+            reveal_type(value)  # revealed: str
             _ = value[0]
 ```

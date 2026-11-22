@@ -59,6 +59,27 @@ use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
+fn is_exact_truthy_builtin<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    class: KnownClass,
+) -> bool {
+    let Type::Intersection(intersection) = ty else {
+        return false;
+    };
+    intersection
+        .positive(db)
+        .iter()
+        .copied()
+        .eq([class.to_instance(db, env)])
+        && intersection
+            .negative(db)
+            .iter()
+            .copied()
+            .eq([Type::AlwaysFalsy])
+}
+
 /// The truthiness excluded by a single guard, e.g. `AlwaysFalsy` in `A & ~AlwaysFalsy`.
 /// Intersections that exclude both truthy and falsy values have no single guard.
 fn excluded_truthiness<'db>(db: &'db dyn Db, ty: Type<'db>) -> Option<Type<'db>> {
@@ -250,10 +271,26 @@ fn normalize_covered_literal_exclusions<'db>(
     }) {
         return false;
     }
-    let literals: FxHashSet<_> = types
-        .iter()
-        .filter_map(|ty| ty.as_literal_value_kind())
-        .collect();
+    // LiteralString can subsume an explicit empty-string member during insertion.
+    let mut literals = FxHashSet::default();
+    let mut covers_empty_string = false;
+    let mut covers_empty_bytes = false;
+    let mut covers_zero = false;
+    for literal in types.iter().filter_map(|ty| ty.as_literal_value_kind()) {
+        literals.insert(literal);
+        match literal {
+            LiteralValueTypeKind::LiteralString => covers_empty_string = true,
+            LiteralValueTypeKind::String(literal) => {
+                covers_empty_string |= literal.value(db).is_empty();
+            }
+            LiteralValueTypeKind::Bytes(literal) => {
+                covers_empty_bytes |= literal.value(db).is_empty();
+            }
+            LiteralValueTypeKind::Int(literal) => covers_zero |= literal.as_i64() == 0,
+            LiteralValueTypeKind::Bool(_) => {}
+            LiteralValueTypeKind::Enum(_) => {}
+        }
+    }
     if literals.is_empty() {
         return false;
     }
@@ -261,6 +298,22 @@ fn normalize_covered_literal_exclusions<'db>(
     let mut changed = false;
     for ty in types {
         if !unpack_aliases && any_over_type(db, env, *ty, false, Type::is_alias_like) {
+            continue;
+        }
+        // Widen the guarded built-in when its matching empty or zero value is present.
+        // This also admits falsy subclass values and, for int, False.
+        let widened_builtin = [
+            (KnownClass::Str, covers_empty_string),
+            (KnownClass::Bytes, covers_empty_bytes),
+            (KnownClass::Int, covers_zero),
+        ]
+        .into_iter()
+        .find_map(|(class, covered)| {
+            (covered && is_exact_truthy_builtin(db, env, *ty, class)).then_some(class)
+        });
+        if let Some(class) = widened_builtin {
+            *ty = class.to_instance(db, env);
+            changed = true;
             continue;
         }
         if let Some(widened) = remove_covered_exclusions(db, env, *ty, |excluded| {
