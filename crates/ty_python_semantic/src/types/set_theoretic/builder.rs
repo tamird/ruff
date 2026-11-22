@@ -58,6 +58,22 @@ use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
+fn is_exact_truthy_str<'db>(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
+    let Type::Intersection(intersection) = ty else {
+        return false;
+    };
+    intersection
+        .positive(db)
+        .iter()
+        .copied()
+        .eq([KnownClass::Str.to_instance(db, env)])
+        && intersection
+            .negative(db)
+            .iter()
+            .copied()
+            .eq([Type::AlwaysFalsy])
+}
+
 /// Extract `(core, guard)` from truthiness-guarded intersections.
 ///
 /// e.g.
@@ -524,6 +540,15 @@ impl<'db> UnionElement<'db> {
             return ReduceResult::KeepIf(true);
         }
 
+        // Treat an empty-string fallback as broad `str`, while keeping truthiness
+        // narrowing for nonempty fallbacks and intersections with other constraints.
+        if let UnionElement::StringLiterals(literals) = self
+            && is_exact_truthy_str(db, env, other_type)
+            && literals.keys().any(|literal| literal.value(db).is_empty())
+        {
+            return ReduceResult::Merged(KnownClass::Str.to_instance(db, env));
+        }
+
         let mut other_type_negated_cache = None;
 
         let mut collapse = false;
@@ -645,6 +670,8 @@ enum ReduceResult<'db> {
     /// The given `Type` can stand-in for the entire `UnionElement` for further union
     /// simplification checks.
     Type(Type<'db>),
+    /// Replace both this element and the incoming type, reconsidering earlier elements.
+    Merged(Type<'db>),
 }
 
 /// If the value ​​is defined recursively, widening is performed from fewer literal elements,
@@ -894,6 +921,16 @@ impl<'db> UnionBuilder<'db> {
                                 UnionElement::Type(existing)
                                     if can_compare_with_literals(*existing) =>
                                 {
+                                    if string_literal.value(db).is_empty()
+                                        && is_exact_truthy_str(db, &self.env, *existing)
+                                    {
+                                        self.elements.swap_remove(index);
+                                        self.add_in_place_impl(
+                                            KnownClass::Str.to_instance(db, &self.env),
+                                            seen_aliases,
+                                        );
+                                        return;
+                                    }
                                     // e.g. `existing` could be `Literal[""] & Any`,
                                     // and `ty` could be `Literal[""]`
                                     if ty.is_redundant_with(db, &self.env, *existing) {
@@ -1209,6 +1246,19 @@ impl<'db> UnionBuilder<'db> {
         }
     }
 
+    fn reinsert_merged_type(
+        &mut self,
+        merged: Type<'db>,
+        to_remove: SmallVec<[usize; 2]>,
+        seen_aliases: &mut Vec<Type<'db>>,
+    ) {
+        for index in to_remove.into_iter().rev() {
+            self.elements.swap_remove(index);
+        }
+        // A merged type may subsume elements visited before the pair that produced it.
+        self.add_in_place_impl(merged, seen_aliases);
+    }
+
     fn push_type(&mut self, ty: Type<'db>, seen_aliases: &mut Vec<Type<'db>>) {
         let db = self.db;
         let mut ty = ty;
@@ -1241,6 +1291,11 @@ impl<'db> UnionBuilder<'db> {
                         to_remove.push(i);
                     }
                     continue;
+                }
+                ReduceResult::Merged(merged) => {
+                    to_remove.push(i);
+                    self.reinsert_merged_type(merged, to_remove, seen_aliases);
+                    return;
                 }
                 ReduceResult::Type(ty) => ty,
                 ReduceResult::CollapseToObject => {
@@ -1308,12 +1363,7 @@ impl<'db> UnionBuilder<'db> {
                     ty = merged_type;
                     continue;
                 }
-                for index in to_remove.into_iter().rev() {
-                    self.elements.swap_remove(index);
-                }
-                // The merged type can also subsume earlier elements, such as `bool` when
-                // the truthy and falsy parts of `int` merge.
-                self.add_in_place_impl(merged_type, seen_aliases);
+                self.reinsert_merged_type(merged_type, to_remove, seen_aliases);
                 return;
             }
 
