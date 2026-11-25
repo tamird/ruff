@@ -3865,9 +3865,6 @@ def _(flag: bool):
     def inner2(a_and_b: Intersection[A2, B1]):
         reveal_type(a_and_b.x)  # revealed: P & Q
 
-        # TODO: this should not be an error, we need better intersection
-        # handling in `validate_attribute_assignment` for this
-        # error: [possibly-missing-attribute]
         a_and_b.x = R()
     # Same for class objects
     def inner2_class(a_and_b: Intersection[type[A2], type[B1]]):
