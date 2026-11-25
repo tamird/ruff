@@ -16,7 +16,7 @@ use crate::types::class::FrozenDataclassDispatch;
 use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
     DEPRECATED, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS, MISSING_ATTRIBUTE, MISSING_SLOT,
-    report_bad_dunder_set_call, report_invalid_attribute_assignment,
+    POSSIBLY_MISSING_ATTRIBUTE, report_bad_dunder_set_call, report_invalid_attribute_assignment,
     report_possibly_missing_attribute,
 };
 use crate::types::{
@@ -51,6 +51,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             value,
             object_ty,
             attribute,
+            requirement: &requirement,
+            definitely_bound: None,
             infer_value_ty: MultiInferenceGuard::new(infer_value_ty),
         };
         let valid = evaluator.evaluate(&requirement, emit_diagnostics, deprecation.as_mut());
@@ -202,12 +204,78 @@ impl<'db> AttributeDeprecation<'db> {
     }
 }
 
+/// Check presence across the receiver independently of which member accepts the write.
+/// An intersection can require a member that is optional on another positive element.
+/// Only concrete declarations establish presence; dynamic read fallbacks do not.
+fn attribute_is_definitely_bound<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    requirement: &AttributeWriteRequirement<'db>,
+    attribute: &str,
+) -> bool {
+    match requirement {
+        AttributeWriteRequirement::All {
+            object_ty: _,
+            element_tys,
+            receiver,
+        } => element_tys.iter().all(|ty| {
+            let requirement = attribute_write_requirement(db, env, *ty, attribute, *receiver);
+            attribute_is_definitely_bound(db, env, &requirement, attribute)
+        }),
+        AttributeWriteRequirement::Any {
+            object_ty: _,
+            intersection,
+            receiver,
+        } => intersection.positive(db).iter().any(|ty| {
+            let requirement = attribute_write_requirement(db, env, *ty, attribute, *receiver);
+            attribute_is_definitely_bound(db, env, &requirement, attribute)
+        }),
+        AttributeWriteRequirement::ProtocolMember {
+            receiver_ty: _,
+            write: _,
+            qualifiers: _,
+        } => true,
+        AttributeWriteRequirement::Instance {
+            object_ty,
+            receiver: _,
+            member: _,
+        } => {
+            object_ty
+                .class_member_with_policy(db, env, attribute, MemberLookupPolicy::REQUIRE_CONCRETE)
+                .place
+                .is_definitely_bound()
+                || object_ty
+                    .instance_member(db, env, attribute)
+                    .place
+                    .is_definitely_bound()
+        }
+        AttributeWriteRequirement::Class {
+            object_ty,
+            member: _,
+        } => {
+            object_ty
+                .class_member_with_policy(db, env, attribute, MemberLookupPolicy::REQUIRE_CONCRETE)
+                .place
+                .is_definitely_bound()
+                || object_ty
+                    .class_object_member(db, env, attribute, MemberLookupPolicy::REQUIRE_CONCRETE)
+                    .place
+                    .is_definitely_bound()
+        }
+        AttributeWriteRequirement::Unconstrained => false,
+        AttributeWriteRequirement::CannotAssign => false,
+        AttributeWriteRequirement::Module(_) => false,
+    }
+}
+
 struct AssignmentAttributeWriteEvaluator<'a, 'db, 'ast, 'infer> {
     builder: &'a mut TypeInferenceBuilder<'db, 'ast>,
     target: &'a ast::ExprAttribute,
     value: &'a ast::Expr,
     object_ty: Type<'db>,
     attribute: &'a str,
+    requirement: &'a AttributeWriteRequirement<'db>,
+    definitely_bound: Option<bool>,
     infer_value_ty: MultiInferenceGuard<'db, 'ast, 'infer>,
 }
 
@@ -1130,12 +1198,21 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                 );
             }
             AssignmentAttributeWriteDiagnostic::PossiblyMissing => {
-                report_possibly_missing_attribute(
-                    &self.builder.context,
-                    self.target,
-                    self.attribute,
-                    self.object_ty,
-                );
+                if self
+                    .builder
+                    .context
+                    .is_lint_enabled(&POSSIBLY_MISSING_ATTRIBUTE)
+                    && !*self.definitely_bound.get_or_insert_with(|| {
+                        attribute_is_definitely_bound(db, env, self.requirement, self.attribute)
+                    })
+                {
+                    report_possibly_missing_attribute(
+                        &self.builder.context,
+                        self.target,
+                        self.attribute,
+                        self.object_ty,
+                    );
+                }
             }
             AssignmentAttributeWriteDiagnostic::BadSetAttr { value_ty, failure } => {
                 failure.report_diagnostics_with_override(
