@@ -3492,6 +3492,16 @@ impl<'db> From<Binding<'db>> for Bindings<'db> {
     }
 }
 
+/// The source argument narrowed by a type predicate after matching the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypeGuardArgument {
+    /// No matching overload supplied a parameter mapping.
+    Unmapped,
+    /// The target was omitted or the matching overloads or expansions disagree.
+    NoTarget,
+    Index(usize),
+}
+
 /// Binding information for a single callable. If the callable is overloaded, there is a separate
 /// [`Binding`] for each overload.
 ///
@@ -4807,6 +4817,64 @@ impl<'db> CallableBinding<'db> {
                     MatchingOverloadIndex::Single(first)
                 }
             }
+        }
+    }
+
+    /// Find the source argument narrowed by every matching overload and argument expansion.
+    pub(crate) fn type_guard_argument_index(&self, db: &'db dyn Db) -> TypeGuardArgument {
+        let bound_argument_offset = usize::from(self.bound_type.is_some());
+        let has_implicit_receiver = self
+            .signature_type
+            .as_function_literal()
+            .or_else(|| self.callable_type.as_function_literal())
+            .is_some_and(|function| function.has_implicit_receiver(db));
+        let parameter_index = usize::from(bound_argument_offset > 0 || has_implicit_receiver);
+        let argument_index = |matches: &[MatchedArgument<'db>]| {
+            matches
+                .iter()
+                .enumerate()
+                .skip(bound_argument_offset)
+                .find_map(|(index, matched)| {
+                    matched
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.index == parameter_index)
+                        .then_some(index - bound_argument_offset)
+                })
+        };
+        let mut matches = if let Some(result) = &self.overload_call_result
+            && let OverloadCallResult::ArgumentTypeExpansion(expanded) = result
+        {
+            // Merged bindings retain only one expansion's argument mapping for each overload.
+            // Check the saved evaluations so a later expansion cannot change the guard's target.
+            Either::Left(expanded.cases.iter().flat_map(|case| {
+                case.snapshot
+                    .matching_overloads
+                    .iter()
+                    .filter(|(_, snapshot)| {
+                        !snapshot
+                            .errors
+                            .iter()
+                            .any(BindingError::affects_overload_resolution)
+                    })
+                    .map(|(_, snapshot)| snapshot.argument_matches.as_ref())
+            }))
+        } else {
+            Either::Right(
+                self.matching_overloads()
+                    .map(|(_, binding)| binding.argument_matches()),
+            )
+        };
+        let Some(first) = matches.next() else {
+            return TypeGuardArgument::Unmapped;
+        };
+        let Some(first_index) = argument_index(first) else {
+            return TypeGuardArgument::NoTarget;
+        };
+        if matches.all(|matched| argument_index(matched) == Some(first_index)) {
+            TypeGuardArgument::Index(first_index)
+        } else {
+            TypeGuardArgument::NoTarget
         }
     }
 
