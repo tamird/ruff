@@ -1,6 +1,5 @@
 use crate::Db;
 use crate::FxOrderSet;
-use crate::place::PlaceAndQualifiers;
 use crate::types::class::{DynamicClassLiteral, metaclass_instance_type};
 use crate::types::constraints::ConstraintSet;
 use crate::types::relation::{DisjointnessChecker, TypeRelationChecker, try_constraint};
@@ -266,20 +265,20 @@ impl<'db> SubclassOfType<'db> {
         }
     }
 
-    pub(crate) fn find_name_in_mro_with_policy(
+    pub(super) fn find_name_in_mro_with_presence(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
         policy: MemberLookupPolicy,
-    ) -> Option<PlaceAndQualifiers<'db>> {
+    ) -> Option<super::class::ClassMemberLookup<'db>> {
         if let SubclassOfInner::Protocol(protocol) = self.subclass_of {
             let interface = protocol.interface(db);
             if let Some(member) = interface.meta_member(db, env, name) {
-                return Some(member);
+                return Some(member.into());
             }
             if name == "__hash__" && interface.includes_member(db, "__eq__") {
-                return Some(Type::unspecified_protocol_hash(db, env, policy));
+                return Some(Type::unspecified_protocol_hash(db, env, policy).into());
             }
         }
 
@@ -298,7 +297,7 @@ impl<'db> SubclassOfType<'db> {
             }
         };
 
-        class_like.find_name_in_mro_with_policy(db, env, name, policy)
+        class_like.find_name_in_mro_with_presence(db, env, name, policy)
     }
 
     pub(super) fn recursive_type_normalized_impl(

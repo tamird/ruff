@@ -4,11 +4,11 @@ use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 
 use crate::Db;
-use crate::place::{Place, PlaceAndQualifiers};
+use crate::place::Place;
 use crate::types::class::known::KnownClass;
 use crate::types::class::{
-    ClassLiteral, ClassType, DynamicClassHeaderAnchor, DynamicClassScopeOffset, MemberLookupPolicy,
-    dynamic_class_header_range,
+    ClassLiteral, ClassMemberLookup, ClassType, DynamicClassHeaderAnchor, DynamicClassScopeOffset,
+    MemberLookupPolicy, dynamic_class_header_range,
 };
 use crate::types::class_base::ClassBase;
 use crate::types::member::Member;
@@ -228,10 +228,10 @@ impl<'db> DynamicEnumLiteral<'db> {
     fn with_unknown_member_fallback(
         self,
         db: &'db dyn Db,
-        result: PlaceAndQualifiers<'db>,
-    ) -> PlaceAndQualifiers<'db> {
-        if !self.has_known_members(db) && result.place.is_undefined() {
-            Place::bound(Type::unknown()).into()
+        result: ClassMemberLookup<'db>,
+    ) -> ClassMemberLookup<'db> {
+        if !self.has_known_members(db) && result.member.is_undefined() {
+            ClassMemberLookup::unproven(Place::bound(Type::unknown()).into())
         } else {
             result
         }
@@ -282,20 +282,20 @@ impl<'db> DynamicEnumLiteral<'db> {
     /// The unknown-member fallback at the end does not consult `policy`. It exists to avoid false
     /// `missing-attribute` errors when the member names are not statically known, which is a
     /// property of the enum rather than of the lookup being performed.
-    pub(crate) fn class_member(
+    pub(super) fn class_member_with_presence(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
         policy: MemberLookupPolicy,
-    ) -> PlaceAndQualifiers<'db> {
+    ) -> ClassMemberLookup<'db> {
         let own = self.own_class_member(db, name);
         if !own.is_undefined() {
-            return own.inner;
+            return own.inner.into();
         }
         if let Some(mixin_class) = self.mixin_class(db, env) {
-            let result = mixin_class.class_member(db, env, name, policy);
-            if !result.place.is_undefined() {
+            let result = mixin_class.class_member_with_presence(db, env, name, policy);
+            if !result.member.is_undefined() {
                 return result;
             }
         }
@@ -303,8 +303,8 @@ impl<'db> DynamicEnumLiteral<'db> {
             .base_class(db)
             .to_class_literal(db, env)
             .as_class_literal()
-            .map(|cls| cls.class_member(db, env, name, policy))
-            .unwrap_or_else(|| Place::Undefined.into());
+            .map(|cls| cls.class_member_with_presence(db, env, name, policy))
+            .unwrap_or_default();
 
         // When members are unknown (e.g. `Enum("E", some_var)`), any name could
         // still be a member. Only fall back to `Unknown` after exhausting the
@@ -314,25 +314,23 @@ impl<'db> DynamicEnumLiteral<'db> {
     }
 
     /// Look up an instance member by name, checking mixin and base class.
-    ///
-    /// If members are unknown and nothing was found, returns `Unknown`
-    /// as a last resort.
-    pub(crate) fn instance_member(
+    /// If members are unknown and nothing was found, returns `Unknown` as a last resort.
+    pub(in crate::types) fn instance_member_with_presence(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
-    ) -> PlaceAndQualifiers<'db> {
+    ) -> ClassMemberLookup<'db> {
         if let Some(mixin_class) = self.mixin_class(db, env) {
-            let result = mixin_class.instance_member(db, env, name);
-            if !result.place.is_undefined() {
+            let result = mixin_class.instance_member_with_presence(db, env, name);
+            if !result.member.is_undefined() {
                 return result;
             }
         }
         let result = self
             .base_class(db)
             .to_instance(db, env)
-            .instance_member(db, env, name);
+            .instance_member_with_presence(db, env, name);
 
         self.with_unknown_member_fallback(db, result)
     }

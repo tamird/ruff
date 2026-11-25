@@ -33,10 +33,10 @@ use crate::{
         call::{CallError, CallErrorKind},
         callable::CallableTypeKind,
         class::{
-            ClassInstanceFlags, ClassMemberResult, ClassMetaclass, CodeGeneratorKind, DisjointBase,
-            DynamicTypedDictLiteral, Field, FieldKind, InstanceMemberResult, MetaclassError,
-            MetaclassErrorKind, MethodDecorator, MroLookup, NamedTupleField,
-            synthesize_namedtuple_class_member,
+            ClassInstanceFlags, ClassMemberLookup, ClassMemberResult, ClassMetaclass,
+            CodeGeneratorKind, DisjointBase, DynamicTypedDictLiteral, Field, FieldKind,
+            InstanceMemberResult, MetaclassError, MetaclassErrorKind, MethodDecorator, MroLookup,
+            NamedTupleField, synthesize_namedtuple_class_member,
             typed_dict::{TypedDictFields, synthesize_typed_dict_method, typed_dict_class_member},
         },
         context::InferContext,
@@ -1539,24 +1539,14 @@ impl<'db> StaticClassLiteral<'db> {
     /// The member resolves to a member on the class itself or any of its proper superclasses.
     ///
     /// TODO: Should this be made private...?
-    pub(super) fn class_member(
-        self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        name: &str,
-        policy: MemberLookupPolicy,
-    ) -> PlaceAndQualifiers<'db> {
-        self.class_member_inner(db, env, None, name, policy)
-    }
-
-    pub(super) fn class_member_inner(
+    pub(super) fn class_member_inner_with_presence(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         specialization: Option<Specialization<'db>>,
         name: &str,
         policy: MemberLookupPolicy,
-    ) -> PlaceAndQualifiers<'db> {
+    ) -> ClassMemberLookup<'db> {
         // An unspecialized MRO retains mappings such as `Parent[T@Child]`, so ordinary members
         // accessed through `Child` must use its default arguments. Constructor methods are different:
         // we add their class's type variables to the callable's generic context, so those variables
@@ -1569,7 +1559,7 @@ impl<'db> StaticClassLiteral<'db> {
                     // Specifically apply the identity specialization; otherwise `iter_mro` will
                     // apply the default specialization for us.
                     let specialization = generic_context.identity_specialization(db);
-                    self.class_member_from_mro(
+                    self.class_member_from_mro_with_presence(
                         db,
                         env,
                         name,
@@ -1578,8 +1568,13 @@ impl<'db> StaticClassLiteral<'db> {
                     )
                 }
                 _ => {
-                    let member =
-                        self.class_member_from_mro(db, env, name, policy, self.iter_mro(db, None));
+                    let member = self.class_member_from_mro_with_presence(
+                        db,
+                        env,
+                        name,
+                        policy,
+                        self.iter_mro(db, None),
+                    );
                     let specialization = generic_context.default_specialization(db, self.known(db));
                     // An inherited method's `Self` bound can still contain this class's type
                     // variables, so the default arguments must also specialize that bound.
@@ -1589,7 +1584,13 @@ impl<'db> StaticClassLiteral<'db> {
                 }
             }
         } else {
-            self.class_member_from_mro(db, env, name, policy, self.iter_mro(db, specialization))
+            self.class_member_from_mro_with_presence(
+                db,
+                env,
+                name,
+                policy,
+                self.iter_mro(db, specialization),
+            )
         }
     }
 
@@ -1601,6 +1602,18 @@ impl<'db> StaticClassLiteral<'db> {
         policy: MemberLookupPolicy,
         mro_iter: impl Iterator<Item = ClassBase<'db>>,
     ) -> PlaceAndQualifiers<'db> {
+        self.class_member_from_mro_with_presence(db, env, name, policy, mro_iter)
+            .member
+    }
+
+    pub(in crate::types) fn class_member_from_mro_with_presence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+        policy: MemberLookupPolicy,
+        mro_iter: impl Iterator<Item = ClassBase<'db>>,
+    ) -> ClassMemberLookup<'db> {
         fn into_function_like_callable<'d>(
             db: &'d dyn Db,
             env: &ProgramEnvironment<'d>,
@@ -1644,7 +1657,8 @@ impl<'db> StaticClassLiteral<'db> {
                 module,
                 policy,
                 name,
-            ),
+            )
+            .into(),
         };
 
         // We generally treat dunder attributes with `Callable` types as function-like callables.
@@ -3245,13 +3259,13 @@ impl<'db> StaticClassLiteral<'db> {
     /// Look up an instance attribute (available in `__dict__`) of the given name.
     ///
     /// See [`Type::instance_member`] for more details.
-    pub(super) fn instance_member(
+    pub(super) fn instance_member_with_presence(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         specialization: Option<Specialization<'db>>,
         name: &str,
-    ) -> PlaceAndQualifiers<'db> {
+    ) -> ClassMemberLookup<'db> {
         if self.is_typed_dict(db) || self.lacks_instance_storage(db, name) {
             return Place::Undefined.into();
         }
@@ -3275,7 +3289,8 @@ impl<'db> StaticClassLiteral<'db> {
                         },
                         TypeContext::default(),
                     )
-                }),
+                })
+                .into(),
         }
     }
 

@@ -16,7 +16,7 @@ use crate::types::class::FrozenDataclassDispatch;
 use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
     DEPRECATED, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS, MISSING_ATTRIBUTE, MISSING_SLOT,
-    report_bad_dunder_set_call, report_invalid_attribute_assignment,
+    POSSIBLY_MISSING_ATTRIBUTE, report_bad_dunder_set_call, report_invalid_attribute_assignment,
     report_possibly_missing_attribute,
 };
 use crate::types::{
@@ -43,18 +43,31 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let db = self.db();
         let requirement =
             attribute_write_requirement(db, self.program_environment(), object_ty, attribute, None);
-        let mut deprecation = (emit_diagnostics && self.context.is_lint_enabled(&DEPRECATED))
-            .then_some(AttributeDeprecation::Missing);
+        let composite = matches!(
+            requirement,
+            AttributeWriteRequirement::All { .. } | AttributeWriteRequirement::Any { .. }
+        );
+        let mut facts = AttributeWriteFacts {
+            definitely_bound: (composite
+                && self.context.is_lint_enabled(&POSSIBLY_MISSING_ATTRIBUTE))
+            .then_some(false),
+            deprecation: (emit_diagnostics && self.context.is_lint_enabled(&DEPRECATED))
+                .then_some(AttributeDeprecation::Missing),
+        };
         let mut evaluator = AssignmentAttributeWriteEvaluator {
             builder: self,
             target,
             value,
             object_ty,
             attribute,
+            possibly_missing: false,
             infer_value_ty: MultiInferenceGuard::new(infer_value_ty),
         };
-        let valid = evaluator.evaluate(&requirement, emit_diagnostics, deprecation.as_mut());
-        if let Some(AttributeDeprecation::Deprecated(properties)) = deprecation {
+        let valid = evaluator.evaluate(&requirement, emit_diagnostics, &mut facts, true);
+        if evaluator.possibly_missing && facts.definitely_bound != Some(true) {
+            report_possibly_missing_attribute(&self.context, target, attribute, object_ty);
+        }
+        if let Some(AttributeDeprecation::Deprecated(properties)) = facts.deprecation {
             self.check_deprecated_property(target, properties, ast::ExprContext::Store);
         }
         valid
@@ -106,40 +119,8 @@ enum AttributeDeprecation<'db> {
 }
 
 impl<'db> AttributeDeprecation<'db> {
-    /// Inspect a resolved requirement without inferring or validating the assigned value.
-    /// Composite requirements need further attribute lookups.
-    fn from_requirement(
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        requirement: &AttributeWriteRequirement<'db>,
-        attribute: &str,
-    ) -> Self {
+    fn from_leaf(db: &'db dyn Db, requirement: &AttributeWriteRequirement<'db>) -> Self {
         match requirement {
-            AttributeWriteRequirement::All {
-                element_tys,
-                receiver,
-                ..
-            } => element_tys.iter().fold(Self::Missing, |deprecation, ty| {
-                let requirement = attribute_write_requirement(db, env, *ty, attribute, *receiver);
-                deprecation.union(db, Self::from_requirement(db, env, &requirement, attribute))
-            }),
-            AttributeWriteRequirement::Any {
-                intersection,
-                receiver,
-                ..
-            } => {
-                let mut deprecation = Self::Missing;
-                for ty in intersection.positive(db) {
-                    let requirement =
-                        attribute_write_requirement(db, env, *ty, attribute, *receiver);
-                    deprecation = deprecation
-                        .intersection(db, Self::from_requirement(db, env, &requirement, attribute));
-                    if matches!(deprecation, Self::NotDeprecated) {
-                        break;
-                    }
-                }
-                deprecation
-            }
             AttributeWriteRequirement::ProtocolMember {
                 write: Some(ProtocolMemberWriteRequirement::Descriptor { descriptor_ty, .. }),
                 ..
@@ -202,12 +183,152 @@ impl<'db> AttributeDeprecation<'db> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct AttributeWriteFacts<'db> {
+    definitely_bound: Option<bool>,
+    deprecation: Option<AttributeDeprecation<'db>>,
+}
+
+impl<'db> AttributeWriteFacts<'db> {
+    fn start_alternatives(&mut self, any: bool) {
+        if let Some(bound) = self.definitely_bound.as_mut() {
+            *bound = !any;
+        }
+    }
+
+    fn next_alternative(self, any: bool) -> Self {
+        Self {
+            // OR stops at true, AND at false.
+            definitely_bound: self.definitely_bound.filter(|bound| *bound != any),
+            deprecation: self
+                .deprecation
+                .filter(|deprecation| {
+                    !any || !matches!(deprecation, AttributeDeprecation::NotDeprecated)
+                })
+                .map(|_| AttributeDeprecation::Missing),
+        }
+    }
+
+    fn merge(&mut self, db: &'db dyn Db, other: Self, any: bool) {
+        if let (Some(bound), Some(other_bound)) =
+            (&mut self.definitely_bound, other.definitely_bound)
+        {
+            *bound = if any {
+                *bound || other_bound
+            } else {
+                *bound && other_bound
+            };
+        }
+        if let (Some(deprecation), Some(other_deprecation)) =
+            (&mut self.deprecation, other.deprecation)
+        {
+            *deprecation = if any {
+                deprecation.intersection(db, other_deprecation)
+            } else {
+                deprecation.union(db, other_deprecation)
+            };
+        }
+    }
+
+    fn observe_leaf(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        attribute: &str,
+        requirement: &AttributeWriteRequirement<'db>,
+    ) {
+        if let Some(bound) = self.definitely_bound.as_mut() {
+            *bound = match requirement {
+                AttributeWriteRequirement::Instance {
+                    object_ty,
+                    receiver: _,
+                    member: _,
+                    declared_presence,
+                } => declared_presence.is_declared(db, env, *object_ty, attribute, false),
+                AttributeWriteRequirement::Class {
+                    object_ty,
+                    member: _,
+                    declared_presence,
+                } => declared_presence.is_declared(db, env, *object_ty, attribute, true),
+                AttributeWriteRequirement::ProtocolMember { .. } => true,
+                AttributeWriteRequirement::CannotAssign
+                | AttributeWriteRequirement::Unconstrained
+                | AttributeWriteRequirement::Module(_) => false,
+                AttributeWriteRequirement::All { .. } | AttributeWriteRequirement::Any { .. } => {
+                    unreachable!()
+                }
+            };
+        }
+        if let Some(deprecation) = self.deprecation.as_mut() {
+            *deprecation = AttributeDeprecation::from_leaf(db, requirement);
+        }
+    }
+
+    /// Finish collecting facts after checking the write has short-circuited. This does not
+    /// infer the assigned value or change the context selected by write validation.
+    fn observe_remaining(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        attribute: &str,
+        remaining: &mut dyn Iterator<Item = AttributeWriteRequirement<'db>>,
+        any: bool,
+    ) {
+        loop {
+            let mut alternative = self.next_alternative(any);
+            if alternative.definitely_bound.is_none() && alternative.deprecation.is_none() {
+                break;
+            }
+            let Some(requirement) = remaining.next() else {
+                break;
+            };
+            match requirement {
+                AttributeWriteRequirement::All {
+                    object_ty: _,
+                    element_tys,
+                    receiver,
+                } => {
+                    alternative.start_alternatives(false);
+                    alternative.observe_remaining(
+                        db,
+                        env,
+                        attribute,
+                        &mut element_tys.iter().map(|ty| {
+                            attribute_write_requirement(db, env, *ty, attribute, receiver)
+                        }),
+                        false,
+                    );
+                }
+                AttributeWriteRequirement::Any {
+                    object_ty: _,
+                    intersection,
+                    receiver,
+                } => {
+                    alternative.start_alternatives(true);
+                    alternative.observe_remaining(
+                        db,
+                        env,
+                        attribute,
+                        &mut intersection.positive(db).iter().map(|ty| {
+                            attribute_write_requirement(db, env, *ty, attribute, receiver)
+                        }),
+                        true,
+                    );
+                }
+                _ => alternative.observe_leaf(db, env, attribute, &requirement),
+            }
+            self.merge(db, alternative, any);
+        }
+    }
+}
+
 struct AssignmentAttributeWriteEvaluator<'a, 'db, 'ast, 'infer> {
     builder: &'a mut TypeInferenceBuilder<'db, 'ast>,
     target: &'a ast::ExprAttribute,
     value: &'a ast::Expr,
     object_ty: Type<'db>,
     attribute: &'a str,
+    possibly_missing: bool,
     infer_value_ty: MultiInferenceGuard<'db, 'ast, 'infer>,
 }
 
@@ -268,25 +389,20 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
         (setattr_result, value_ty)
     }
 
-    /// Validate the assignment and optionally record its accessor deprecations.
-    /// After validation short-circuits, a pure collector inspects the remaining alternatives
-    /// without changing the inference context selected for the assigned value.
-    /// When provided, `deprecation` receives the result even if validation fails.
     fn evaluate(
         &mut self,
         requirement: &AttributeWriteRequirement<'db>,
         emit_diagnostics: bool,
-        mut deprecation: Option<&mut AttributeDeprecation<'db>>,
+        facts: &mut AttributeWriteFacts<'db>,
+        root: bool,
     ) -> bool {
         let db = self.builder.db();
         let env = self.builder.program_environment();
-        if let Some(deprecation) = deprecation.as_deref_mut() {
-            *deprecation = match requirement {
-                AttributeWriteRequirement::All { .. } | AttributeWriteRequirement::Any { .. } => {
-                    AttributeDeprecation::Missing
-                }
-                _ => AttributeDeprecation::from_requirement(db, env, requirement, self.attribute),
-            };
+        if !matches!(
+            requirement,
+            AttributeWriteRequirement::All { .. } | AttributeWriteRequirement::Any { .. }
+        ) {
+            facts.observe_leaf(db, env, self.attribute, requirement);
         }
 
         match requirement {
@@ -300,31 +416,17 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                 let mut requirements = element_tys
                     .iter()
                     .map(|ty| attribute_write_requirement(db, env, *ty, attribute, *receiver));
+                facts.start_alternatives(false);
                 let valid = requirements.by_ref().all(|requirement| {
-                    let mut current = AttributeDeprecation::Missing;
-                    let valid = self.evaluate(
-                        &requirement,
-                        false,
-                        deprecation.as_ref().map(|_| &mut current),
-                    );
-                    if let Some(deprecation) = deprecation.as_deref_mut() {
-                        *deprecation = deprecation.union(db, current);
-                    }
+                    let mut alternative = facts.next_alternative(false);
+                    let valid = self.evaluate(&requirement, false, &mut alternative, false);
+                    facts.merge(db, alternative, false);
                     valid
                 });
-                if let Some(deprecation) = deprecation {
-                    *deprecation = requirements.fold(*deprecation, |deprecation, requirement| {
-                        deprecation.union(
-                            db,
-                            AttributeDeprecation::from_requirement(
-                                db,
-                                env,
-                                &requirement,
-                                attribute,
-                            ),
-                        )
-                    });
+                if root && !self.possibly_missing {
+                    facts.definitely_bound = None;
                 }
+                facts.observe_remaining(db, env, attribute, &mut requirements, false);
                 if valid {
                     self.validate_composite_final_assignment(*object_ty, emit_diagnostics);
                 } else if emit_diagnostics {
@@ -347,33 +449,17 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                     .positive(db)
                     .iter()
                     .map(|ty| attribute_write_requirement(db, env, *ty, attribute, *receiver));
+                facts.start_alternatives(true);
                 let valid = requirements.by_ref().any(|requirement| {
-                    let mut current = AttributeDeprecation::Missing;
-                    let valid = self.evaluate(
-                        &requirement,
-                        false,
-                        deprecation.as_ref().map(|_| &mut current),
-                    );
-                    if let Some(deprecation) = deprecation.as_deref_mut() {
-                        *deprecation = deprecation.intersection(db, current);
-                    }
+                    let mut alternative = facts.next_alternative(true);
+                    let valid = self.evaluate(&requirement, false, &mut alternative, false);
+                    facts.merge(db, alternative, true);
                     valid
                 });
-                if let Some(deprecation) = deprecation {
-                    while !matches!(deprecation, AttributeDeprecation::NotDeprecated)
-                        && let Some(requirement) = requirements.next()
-                    {
-                        *deprecation = deprecation.intersection(
-                            db,
-                            AttributeDeprecation::from_requirement(
-                                db,
-                                env,
-                                &requirement,
-                                attribute,
-                            ),
-                        );
-                    }
+                if root && !self.possibly_missing {
+                    facts.definitely_bound = None;
                 }
+                facts.observe_remaining(db, env, attribute, &mut requirements, true);
                 if valid {
                     self.infer_with_last_context(emit_diagnostics);
                     self.validate_composite_final_assignment(*object_ty, emit_diagnostics);
@@ -485,10 +571,13 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                 object_ty,
                 receiver,
                 member,
+                declared_presence: _,
             } => self.evaluate_instance(*object_ty, *receiver, member, emit_diagnostics),
-            AttributeWriteRequirement::Class { object_ty, member } => {
-                self.evaluate_class(*object_ty, member, emit_diagnostics)
-            }
+            AttributeWriteRequirement::Class {
+                object_ty,
+                member,
+                declared_presence: _,
+            } => self.evaluate_class(*object_ty, member, emit_diagnostics),
         }
     }
 
@@ -1130,12 +1219,7 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                 );
             }
             AssignmentAttributeWriteDiagnostic::PossiblyMissing => {
-                report_possibly_missing_attribute(
-                    &self.builder.context,
-                    self.target,
-                    self.attribute,
-                    self.object_ty,
-                );
+                self.possibly_missing = true;
             }
             AssignmentAttributeWriteDiagnostic::BadSetAttr { value_ty, failure } => {
                 failure.report_diagnostics_with_override(

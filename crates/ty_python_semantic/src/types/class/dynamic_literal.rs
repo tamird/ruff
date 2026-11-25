@@ -5,12 +5,12 @@ use ruff_text_size::TextRange;
 
 use crate::{
     Db, TypeQualifiers,
-    place::{Place, PlaceAndQualifiers},
+    place::Place,
     types::{
         ClassBase, ClassLiteral, ClassType, DataclassParams, KnownClass, MemberLookupPolicy,
         SubclassOfType, Type,
         class::{
-            ClassMemberResult, ClassMetaclass, CodeGeneratorKind, DisjointBase,
+            ClassMemberLookup, ClassMemberResult, ClassMetaclass, CodeGeneratorKind, DisjointBase,
             DynamicClassHeaderAnchor, DynamicClassScopeOffset, InstanceMemberResult, MroLookup,
             dynamic_class_header_range, typed_dict::typed_dict_fallback_class_member,
         },
@@ -386,12 +386,12 @@ impl<'db> DynamicClassLiteral<'db> {
     }
 
     /// Look up an instance member by iterating through the MRO.
-    pub(crate) fn instance_member(
+    pub(super) fn instance_member_with_presence(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
-    ) -> PlaceAndQualifiers<'db> {
+    ) -> ClassMemberLookup<'db> {
         match MroLookup::new(db, env, self.iter_mro(db)).instance_member(name) {
             InstanceMemberResult::Done(result) => result,
             InstanceMemberResult::TypedDict => {
@@ -399,6 +399,7 @@ impl<'db> DynamicClassLiteral<'db> {
                 KnownClass::TypedDictFallback
                     .to_instance(db, env)
                     .instance_member(db, env, name)
+                    .into()
             }
         }
     }
@@ -408,13 +409,13 @@ impl<'db> DynamicClassLiteral<'db> {
     /// Uses `MroLookup` with:
     /// - No inherited generic context (dynamic classes aren't generic).
     /// - `is_self_object = false` (dynamic classes are never `object`).
-    pub(crate) fn class_member(
+    pub(in crate::types) fn class_member_with_presence(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
         policy: MemberLookupPolicy,
-    ) -> PlaceAndQualifiers<'db> {
+    ) -> ClassMemberLookup<'db> {
         // Check if this dynamic class is dataclass-like (via dataclass_transform inheritance).
         if CodeGeneratorKind::from_class(db, self.into())
             .is_some_and(CodeGeneratorKind::is_dataclass_like)
@@ -429,10 +430,13 @@ impl<'db> DynamicClassLiteral<'db> {
                         KnownClass::Field.to_specialized_instance(db, env, &[Type::any()]),
                     ],
                 ))
-                .with_qualifiers(TypeQualifiers::CLASS_VAR);
+                .with_qualifiers(TypeQualifiers::CLASS_VAR)
+                .into();
             } else if name == "__dataclass_params__" {
                 // There is no typeshed class for this. For now, we model it as `Any`.
-                return Place::declared(Type::any()).with_qualifiers(TypeQualifiers::CLASS_VAR);
+                return Place::declared(Type::any())
+                    .with_qualifiers(TypeQualifiers::CLASS_VAR)
+                    .into();
             }
         }
 
@@ -444,7 +448,7 @@ impl<'db> DynamicClassLiteral<'db> {
         match result {
             ClassMemberResult::Done(result) => result.finalize(db, env),
             ClassMemberResult::TypedDict(module) => {
-                typed_dict_fallback_class_member(db, env, module, policy, name)
+                typed_dict_fallback_class_member(db, env, module, policy, name).into()
             }
         }
     }
@@ -454,13 +458,28 @@ impl<'db> DynamicClassLiteral<'db> {
     /// Returns [`Member::unbound`] if the member is not found in the namespace dict,
     /// unless the namespace is dynamic, in which case returns `Unknown`.
     pub(super) fn own_class_member(self, db: &'db dyn Db, name: &str) -> Member<'db> {
-        // If the namespace is dynamic (not a literal dict) and the name isn't in `self.members`,
-        // return Unknown since we can't know what attributes might be defined.
-        self.members(db)
+        self.own_class_member_with_presence(db, name).0
+    }
+
+    pub(super) fn own_class_member_with_presence(
+        self,
+        db: &'db dyn Db,
+        name: &str,
+    ) -> (Member<'db>, bool) {
+        if let Some(ty) = self
+            .members(db)
             .iter()
             .find_map(|(member_name, ty)| (name == member_name).then_some(*ty))
-            .or_else(|| self.has_dynamic_namespace(db).then(Type::unknown))
-            .map_or_default(Member::definitely_declared)
+        {
+            return (Member::definitely_declared(ty), !ty.is_divergent());
+        }
+        // An opaque namespace permits the attribute without declaring it.
+        (
+            self.has_dynamic_namespace(db)
+                .then(Type::unknown)
+                .map_or_default(Member::definitely_declared),
+            false,
+        )
     }
 
     /// Look up an instance member defined directly on this class (not inherited).

@@ -71,11 +71,13 @@ pub(super) enum AttributeWriteRequirement<'db> {
         object_ty: Type<'db>,
         receiver: Option<Type<'db>>,
         member: InstanceAttributeWriteMember<'db>,
+        declared_presence: AttributePresence,
     },
     /// A write through a class object, resolved against its metaclass and class attributes.
     Class {
         object_ty: Type<'db>,
         member: ClassAttributeWriteMember<'db>,
+        declared_presence: AttributePresence,
     },
 }
 
@@ -92,6 +94,7 @@ impl<'db> AttributeWriteRequirement<'db> {
             object_ty,
             receiver,
             member: InstanceAttributeWriteMember::SetAttr,
+            declared_presence: _,
         } = self
         else {
             return None;
@@ -126,6 +129,65 @@ pub(super) enum AttributeWriteFailure<'db> {
         definition: Option<Definition<'db>>,
         missing_slot: bool,
     },
+}
+
+/// Presence retained from raw write-member lookup, before descriptor interpretation.
+#[derive(Clone, Copy)]
+pub(super) enum AttributePresence {
+    Present,
+    Missing,
+    /// Dispatch was settled before receiver storage needed to be queried.
+    UncheckedReceiver,
+}
+
+impl AttributePresence {
+    fn from_members(members: Option<&AssignmentAttributeMembers<'_>>) -> Self {
+        match members {
+            Some(
+                AssignmentAttributeMembers::TypeMember {
+                    member: _,
+                    receiver_fallback: _,
+                    declared_presence,
+                }
+                | AssignmentAttributeMembers::ReceiverMember {
+                    member: _,
+                    declared_presence,
+                },
+            ) => *declared_presence,
+            None => Self::Missing,
+        }
+    }
+
+    /// Query skipped receiver storage only when a composite write needs its presence.
+    pub(super) fn is_declared<'db>(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        object_ty: Type<'db>,
+        attribute: &str,
+        class_object: bool,
+    ) -> bool {
+        match self {
+            Self::Present => true,
+            Self::Missing => false,
+            Self::UncheckedReceiver => {
+                if class_object {
+                    object_ty
+                        .class_object_member_with_presence(
+                            db,
+                            env,
+                            attribute,
+                            MemberLookupPolicy::default(),
+                        )
+                        .declared_presence
+                } else {
+                    object_ty
+                        .instance_member_with_presence(db, env, attribute)
+                        .declared_presence
+                }
+            }
+        }
+    }
 }
 
 /// How a writable protocol member validates an assigned value.
@@ -351,10 +413,14 @@ pub(super) enum AssignmentAttributeMembers<'db> {
     TypeMember {
         member: PlaceAndQualifiers<'db>,
         receiver_fallback: Option<PlaceAndQualifiers<'db>>,
+        declared_presence: AttributePresence,
     },
     /// The receiver member governs the write, as `C.plain` does above because `Meta.plain` is
     /// definitely not a data descriptor.
-    ReceiverMember(PlaceAndQualifiers<'db>),
+    ReceiverMember {
+        member: PlaceAndQualifiers<'db>,
+        declared_presence: AttributePresence,
+    },
 }
 
 impl<'db> AssignmentAttributeMembers<'db> {
@@ -362,13 +428,19 @@ impl<'db> AssignmentAttributeMembers<'db> {
     pub(super) fn type_member(self) -> Option<PlaceAndQualifiers<'db>> {
         match self {
             Self::TypeMember { member, .. } => Some(member),
-            Self::ReceiverMember(_) => None,
+            Self::ReceiverMember {
+                member: _,
+                declared_presence: _,
+            } => None,
         }
     }
 
     pub(super) fn receiver_member(&self) -> Option<&PlaceAndQualifiers<'db>> {
         match self {
-            Self::ReceiverMember(member) => Some(member),
+            Self::ReceiverMember {
+                member,
+                declared_presence: _,
+            } => Some(member),
             Self::TypeMember {
                 receiver_fallback, ..
             } => receiver_fallback.as_ref(),
@@ -674,10 +746,12 @@ fn instance_attribute_write_requirement<'db>(
     receiver: Option<Type<'db>>,
     members: Option<&AssignmentAttributeMembers<'db>>,
 ) -> AttributeWriteRequirement<'db> {
+    let declared_presence = AttributePresence::from_members(members);
     let instance = |member| AttributeWriteRequirement::Instance {
         object_ty,
         receiver,
         member,
+        declared_presence,
     };
     let fallback_requirement = |member| {
         instance_fallback_write_requirement(db, env, object_ty, attribute, member, receiver)
@@ -686,8 +760,12 @@ fn instance_attribute_write_requirement<'db>(
         Some(&AssignmentAttributeMembers::TypeMember {
             member,
             receiver_fallback,
+            declared_presence: _,
         }) => (member, receiver_fallback),
-        Some(&AssignmentAttributeMembers::ReceiverMember(member)) => {
+        Some(&AssignmentAttributeMembers::ReceiverMember {
+            member,
+            declared_presence: _,
+        }) => {
             return instance(InstanceAttributeWriteMember::Instance(
                 fallback_requirement(member),
             ));
@@ -788,14 +866,20 @@ fn class_attribute_write_requirement<'db>(
     let Some(class_attr_self_ty) = object_ty.to_instance_approximation(db, env) else {
         return AttributeWriteRequirement::Unconstrained;
     };
+    let declared_presence = AttributePresence::from_members(Some(&members));
     let (type_member, receiver_fallback) = match members {
         AssignmentAttributeMembers::TypeMember {
             member,
             receiver_fallback,
+            declared_presence: _,
         } => (member, receiver_fallback),
-        AssignmentAttributeMembers::ReceiverMember(member) => {
+        AssignmentAttributeMembers::ReceiverMember {
+            member,
+            declared_presence: _,
+        } => {
             return AttributeWriteRequirement::Class {
                 object_ty,
+                declared_presence,
                 member: ClassAttributeWriteMember::ClassAttribute(
                     class_fallback_write_requirement(
                         db,
@@ -827,6 +911,7 @@ fn class_attribute_write_requirement<'db>(
                 };
                 return AttributeWriteRequirement::Class {
                     object_ty,
+                    declared_presence,
                     member: ClassAttributeWriteMember::ClassAttribute(
                         instance_fallback_write_requirement(
                             db, env, object_ty, attribute, member, None,
@@ -880,7 +965,11 @@ fn class_attribute_write_requirement<'db>(
         },
     };
 
-    AttributeWriteRequirement::Class { object_ty, member }
+    AttributeWriteRequirement::Class {
+        object_ty,
+        member,
+        declared_presence,
+    }
 }
 
 /// Recover the concrete descriptor hidden by an uncertain metaclass-member annotation.
@@ -1199,7 +1288,7 @@ fn class_object_assignment_members<'db>(
     env: &ProgramEnvironment<'db>,
     object_ty: Type<'db>,
     attribute: &str,
-    type_member: PlaceAndQualifiers<'db>,
+    lookup: super::class::ClassMemberLookup<'db>,
 ) -> Option<AssignmentAttributeMembers<'db>> {
     if !matches!(
         object_ty,
@@ -1208,6 +1297,7 @@ fn class_object_assignment_members<'db>(
         return None;
     }
 
+    let type_member = lookup.member;
     let type_member_ty = type_member.place.ignore_possibly_undefined()?;
     let definitely_non_data_descriptor = type_member_ty.is_definitely_non_data_descriptor(db, env);
     if !definitely_non_data_descriptor
@@ -1217,15 +1307,24 @@ fn class_object_assignment_members<'db>(
     }
 
     let receiver_member = object_ty
-        .find_name_in_mro_with_policy(db, env, attribute, MemberLookupPolicy::default())
-        .filter(|class_attr| !class_attr.place.is_undefined())?;
+        .find_name_in_mro_with_presence(db, env, attribute, MemberLookupPolicy::default())
+        .filter(|class_attr| !class_attr.member.place.is_undefined())?;
 
+    let declared_presence = if lookup.declared_presence || receiver_member.declared_presence {
+        AttributePresence::Present
+    } else {
+        AttributePresence::Missing
+    };
     Some(if definitely_non_data_descriptor {
-        AssignmentAttributeMembers::ReceiverMember(receiver_member)
+        AssignmentAttributeMembers::ReceiverMember {
+            member: receiver_member.member,
+            declared_presence,
+        }
     } else {
         AssignmentAttributeMembers::TypeMember {
             member: type_member,
-            receiver_fallback: Some(receiver_member),
+            receiver_fallback: Some(receiver_member.member),
+            declared_presence,
         }
     })
 }
@@ -1249,24 +1348,28 @@ pub(super) fn assignment_attribute_members<'db>(
 ) -> Option<AssignmentAttributeMembers<'db>> {
     // Precise `functools.partial` instances synthesize a refined `__call__` member instead of
     // using the broad signature from typeshed.
-    let type_member = if attribute == "__call__"
+    let lookup = if attribute == "__call__"
         && matches!(
             object_ty,
             Type::KnownInstance(KnownInstanceType::FunctoolsPartial(_))
         ) {
-        object_ty.member(db, env, attribute)
+        super::class::ClassMemberLookup::from(object_ty.member(db, env, attribute))
     } else if let Type::ProtocolInstance(protocol) = object_ty
         && let Some(origin) = protocol.materialized_origin_property(db, attribute)
     {
-        Type::instance(db, env, *origin).class_member(db, env, attribute)
+        Type::instance(db, env, *origin).class_member_with_presence(
+            db,
+            env,
+            attribute,
+            MemberLookupPolicy::default(),
+        )
     } else {
-        object_ty.class_member(db, env, attribute)
+        object_ty.class_member_with_presence(db, env, attribute, MemberLookupPolicy::default())
     };
-    if let Some(members) =
-        class_object_assignment_members(db, env, object_ty, attribute, type_member)
-    {
+    if let Some(members) = class_object_assignment_members(db, env, object_ty, attribute, lookup) {
         return Some(members);
     }
+    let type_member = lookup.member;
     let needs_receiver_fallback = matches!(
         type_member.place,
         Place::Defined(DefinedPlace {
@@ -1301,10 +1404,16 @@ pub(super) fn assignment_attribute_members<'db>(
             | Type::TypeGuard(_)
             | Type::TypeForm(_)
             | Type::TypedDict(_)
-            | Type::NewTypeInstance(_) => object_ty.instance_member(db, env, attribute),
-            Type::ClassLiteral(..) | Type::GenericAlias(..) | Type::SubclassOf(..) => {
-                object_ty.class_object_member(db, env, attribute, MemberLookupPolicy::default())
+            | Type::NewTypeInstance(_) => {
+                object_ty.instance_member_with_presence(db, env, attribute)
             }
+            Type::ClassLiteral(..) | Type::GenericAlias(..) | Type::SubclassOf(..) => object_ty
+                .class_object_member_with_presence(
+                    db,
+                    env,
+                    attribute,
+                    MemberLookupPolicy::default(),
+                ),
             Type::Union(..)
             | Type::Intersection(..)
             | Type::TypeAlias(..)
@@ -1318,9 +1427,19 @@ pub(super) fn assignment_attribute_members<'db>(
     } else {
         None
     };
+    let declared_presence = if lookup.declared_presence
+        || receiver_fallback.is_some_and(|member| member.declared_presence)
+    {
+        AttributePresence::Present
+    } else if needs_receiver_fallback {
+        AttributePresence::Missing
+    } else {
+        AttributePresence::UncheckedReceiver
+    };
     Some(AssignmentAttributeMembers::TypeMember {
         member: type_member,
-        receiver_fallback,
+        receiver_fallback: receiver_fallback.map(|lookup| lookup.member),
+        declared_presence,
     })
 }
 
@@ -1697,6 +1816,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 object_ty,
                 receiver,
                 member,
+                declared_presence: _,
             } => self.check_instance_attribute_write(
                 db,
                 *object_ty,

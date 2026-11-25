@@ -4406,8 +4406,19 @@ impl<'db> Type<'db> {
         name: &str,
         policy: MemberLookupPolicy,
     ) -> Option<PlaceAndQualifiers<'db>> {
+        self.find_name_in_mro_with_presence(db, env, name, policy)
+            .map(|lookup| lookup.member)
+    }
+
+    fn find_name_in_mro_with_presence(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+        policy: MemberLookupPolicy,
+    ) -> Option<class::ClassMemberLookup<'db>> {
         if let Some(fallback) = (*self).materialized_divergent_fallback() {
-            return fallback.find_name_in_mro_with_policy(db, env, name, policy);
+            return fallback.find_name_in_mro_with_presence(db, env, name, policy);
         }
 
         match self {
@@ -4415,21 +4426,32 @@ impl<'db> Type<'db> {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
             Type::Union(union) => {
-                Some(union.map_with_boundness_and_qualifiers(db, env, |elem| {
-                    elem.find_name_in_mro_with_policy(db, env, name, policy)
-                        // If some elements are classes, and some are not, we simply fall back to `Unbound` for the non-class
-                        // elements instead of short-circuiting the whole result to `None`. We would need a more detailed
-                        // return type otherwise, and since `find_name_in_mro` is usually called via `class_member`, this is
-                        // not a problem.
-                        .unwrap_or_default()
-                }))
+                let mut declared_presence = true;
+                let member = union.map_with_boundness_and_qualifiers(db, env, |elem| {
+                    let lookup = elem
+                        .find_name_in_mro_with_presence(db, env, name, policy)
+                        .unwrap_or_default();
+                    declared_presence &= lookup.declared_presence;
+                    lookup.member
+                });
+                Some(class::ClassMemberLookup {
+                    member,
+                    declared_presence,
+                })
             }
             Type::Intersection(inter) => {
-                Some(inter.map_with_boundness_and_qualifiers(db, env, |elem| {
-                    elem.find_name_in_mro_with_policy(db, env, name, policy)
-                        // Fall back to Unbound, similar to the union case (see above).
-                        .unwrap_or_default()
-                }))
+                let mut declared_presence = false;
+                let member = inter.map_with_boundness_and_qualifiers(db, env, |elem| {
+                    let lookup = elem
+                        .find_name_in_mro_with_presence(db, env, name, policy)
+                        .unwrap_or_default();
+                    declared_presence |= lookup.declared_presence;
+                    lookup.member
+                });
+                Some(class::ClassMemberLookup {
+                    member,
+                    declared_presence,
+                })
             }
 
             Type::Dynamic(_) | Type::Divergent(_) if policy.require_concrete() => {
@@ -4438,13 +4460,17 @@ impl<'db> Type<'db> {
 
             Type::Recursive(recursive) => recursive
                 .unfold(db, env)
-                .map(|unfolded| unfolded.find_name_in_mro_with_policy(db, env, name, policy))
-                .unwrap_or(Some(Place::bound(self).into())),
+                .map(|unfolded| unfolded.find_name_in_mro_with_presence(db, env, name, policy))
+                .unwrap_or(Some(class::ClassMemberLookup::unproven(
+                    Place::bound(self).into(),
+                ))),
 
-            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => Some(Place::bound(self).into()),
+            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => Some(
+                class::ClassMemberLookup::unproven(Place::bound(self).into()),
+            ),
 
             Type::ClassLiteral(class) if class.is_typed_dict(db) => {
-                Some(class.typed_dict_member(db, env, None, name, policy))
+                Some(class.typed_dict_member(db, env, None, name, policy).into())
             }
 
             Type::ClassLiteral(class) => {
@@ -4480,37 +4506,34 @@ impl<'db> Type<'db> {
 
                     _ => Some(
                         class
-                            .class_member(db, env, name, policy)
+                            .class_member_with_presence(db, env, name, policy)
                             .map_type(|member| property_wrapper_descriptor(db, env, name, member)),
                     ),
                 }
             }
 
-            Type::GenericAlias(alias) if alias.is_typed_dict(db) => {
-                Some(alias.origin(db).typed_dict_member(
-                    db,
-                    env,
-                    Some(alias.specialization(db)),
-                    name,
-                    policy,
-                ))
-            }
+            Type::GenericAlias(alias) if alias.is_typed_dict(db) => Some(
+                alias
+                    .origin(db)
+                    .typed_dict_member(db, env, Some(alias.specialization(db)), name, policy)
+                    .into(),
+            ),
 
             Type::GenericAlias(alias) => Some(
                 ClassType::from(*alias)
-                    .class_member(db, env, name, policy)
+                    .class_member_with_presence(db, env, name, policy)
                     .map_type(|member| property_wrapper_descriptor(db, env, name, member)),
             ),
 
             Type::SubclassOf(subclass_of_ty) => {
-                subclass_of_ty.find_name_in_mro_with_policy(db, env, name, policy)
+                subclass_of_ty.find_name_in_mro_with_presence(db, env, name, policy)
             }
 
             // Note: `super(pivot, owner).__class__` is `builtins.super`, not the owner's class.
             // `BoundSuper` should look up the name in the MRO of `builtins.super`.
             Type::BoundSuper(_) => KnownClass::Super
                 .to_class_literal(db, env)
-                .find_name_in_mro_with_policy(db, env, name, policy),
+                .find_name_in_mro_with_presence(db, env, name, policy),
 
             // We eagerly normalize type[object], i.e. Type::SubclassOf(object) to `type`,
             // i.e. Type::NominalInstance(type). So looking up a name in the MRO of
@@ -4522,13 +4545,13 @@ impl<'db> Type<'db> {
                 } else {
                     KnownClass::Object
                         .to_class_literal(db, env)
-                        .find_name_in_mro_with_policy(db, env, name, policy)
+                        .find_name_in_mro_with_presence(db, env, name, policy)
                 }
             }
 
             Type::TypeAlias(alias) => alias
                 .value_type(db)
-                .find_name_in_mro_with_policy(db, env, name, policy),
+                .find_name_in_mro_with_presence(db, env, name, policy),
 
             Type::FunctionLiteral(_)
             | Type::Callable(_)
@@ -4602,6 +4625,17 @@ impl<'db> Type<'db> {
         name: &str,
         policy: MemberLookupPolicy,
     ) -> PlaceAndQualifiers<'db> {
+        self.class_member_with_presence(db, env, name, policy)
+            .member
+    }
+
+    fn class_member_with_presence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+        policy: MemberLookupPolicy,
+    ) -> class::ClassMemberLookup<'db> {
         Self::class_member_with_policy_inner(
             db,
             MemberLookupKey::new(
@@ -4616,16 +4650,20 @@ impl<'db> Type<'db> {
 
     #[salsa::tracked(
         returns(copy),
-        cycle_initial=|_, id, _, _| Place::bound(Type::divergent(id)).into(),
-        cycle_fn=|db, cycle, previous: &PlaceAndQualifiers<'db>, member: PlaceAndQualifiers<'db>, key: MemberLookupKey<'db>| {
-            member.cycle_normalized(db, &ProgramEnvironment::from_program(key.program(db)), *previous, cycle)
+        cycle_initial=|_, id, _, _| class::ClassMemberLookup::unproven(Place::bound(Type::divergent(id)).into()),
+        cycle_fn=|db, cycle, previous: &class::ClassMemberLookup<'db>, member: class::ClassMemberLookup<'db>, key: MemberLookupKey<'db>| {
+            let normalized = member.member.cycle_normalized(db, &ProgramEnvironment::from_program(key.program(db)), previous.member, cycle);
+            class::ClassMemberLookup {
+                member: normalized,
+                declared_presence: member.declared_presence && class::ClassMemberLookup::from(normalized).declared_presence,
+            }
         },
         heap_size=ruff_memory_usage::heap_size
     )]
     fn class_member_with_policy_inner(
         db: &'db dyn Db,
         key: MemberLookupKey<'db>,
-    ) -> PlaceAndQualifiers<'db> {
+    ) -> class::ClassMemberLookup<'db> {
         let ty = key.ty(db);
         let name = key.name(db);
         let policy = key.policy(db);
@@ -4634,7 +4672,7 @@ impl<'db> Type<'db> {
 
         tracing::trace!("class_member: {}.{}", ty.display(db, env), name);
         if let Some(fallback) = ty.materialized_divergent_fallback() {
-            return fallback.class_member_with_policy(db, env, name, policy);
+            return fallback.class_member_with_presence(db, env, name, policy);
         }
         if name == "__hash__"
             && let Type::ProtocolInstance(protocol) = ty
@@ -4642,9 +4680,9 @@ impl<'db> Type<'db> {
             && interface.includes_member(db, "__eq__")
         {
             return if interface.includes_member(db, name) {
-                interface.instance_member(db, env, name)
+                interface.instance_member(db, env, name).into()
             } else {
-                Self::unspecified_protocol_hash(db, env, policy)
+                Self::unspecified_protocol_hash(db, env, policy).into()
             };
         }
         if let Type::ProtocolInstance(protocol) = ty
@@ -4652,25 +4690,44 @@ impl<'db> Type<'db> {
         {
             let interface = protocol.interface(db);
             return if interface.includes_member(db, name) {
-                interface.instance_member(db, env, name)
+                interface.instance_member(db, env, name).into()
             } else {
-                Type::instance(db, env, *origin).class_member_with_policy(db, env, name, policy)
+                Type::instance(db, env, *origin).class_member_with_presence(db, env, name, policy)
             };
         }
 
         match ty {
-            Type::Union(union) => union.map_with_boundness_and_qualifiers(db, env, |elem| {
-                elem.class_member_with_policy(db, env, name, policy)
-            }),
-            Type::Intersection(inter) => inter.map_with_boundness_and_qualifiers(db, env, |elem| {
-                elem.class_member_with_policy(db, env, name, policy)
-            }),
+            Type::Union(union) => {
+                let mut declared_presence = true;
+                let member = union.map_with_boundness_and_qualifiers(db, env, |elem| {
+                    let lookup = elem.class_member_with_presence(db, env, name, policy);
+                    declared_presence &= lookup.declared_presence;
+                    lookup.member
+                });
+                class::ClassMemberLookup {
+                    member,
+                    declared_presence,
+                }
+            }
+            Type::Intersection(inter) => {
+                let mut declared_presence = false;
+                let member = inter.map_with_boundness_and_qualifiers(db, env, |elem| {
+                    let lookup = elem.class_member_with_presence(db, env, name, policy);
+                    declared_presence |= lookup.declared_presence;
+                    lookup.member
+                });
+                class::ClassMemberLookup {
+                    member,
+                    declared_presence,
+                }
+            }
             Type::TypedDict(TypedDictType::Synthesized(synthesized)) => {
                 class::synthesized_typed_dict_class_member(db, env, synthesized, policy, name)
+                    .into()
             }
             // TODO: Remove this once synthesized protocols have a precise meta-type.
             Type::ProtocolInstance(protocol) if protocol.class_origin(db).is_none() => {
-                ty.instance_member(db, env, name)
+                ty.instance_member(db, env, name).into()
             }
 
             Type::LiteralValue(literal)
@@ -4700,13 +4757,13 @@ impl<'db> Type<'db> {
             Type::SubclassOf(subclass_of) if subclass_of.is_dynamic() => {
                 let type_result = KnownClass::Type
                     .to_class_literal(db, env)
-                    .find_name_in_mro_with_policy(db, env, name, policy)
+                    .find_name_in_mro_with_presence(db, env, name, policy)
                     .expect("`find_name_in_mro` should return `Some` for a class literal");
-                if !type_result.place.is_undefined() {
+                if !type_result.member.place.is_undefined() {
                     type_result
                 } else {
                     ty.to_meta_type(db, env)
-                        .find_name_in_mro_with_policy(db, env, name, policy)
+                        .find_name_in_mro_with_presence(db, env, name, policy)
                         .expect(
                             "`Type::find_name_in_mro()` should return `Some()` \
                             when called on a meta-type",
@@ -4714,21 +4771,23 @@ impl<'db> Type<'db> {
                 }
             }
 
-            Type::NominalInstance(instance) => ty.to_meta_type(db, env).class_namespace_member(
-                db,
-                env,
-                instance.class(db, env),
-                name,
-                policy,
-            ),
+            Type::NominalInstance(instance) => ty
+                .to_meta_type(db, env)
+                .class_namespace_member_with_presence(
+                    db,
+                    env,
+                    instance.class(db, env),
+                    name,
+                    policy,
+                ),
 
             Type::ClassLiteral(_) | Type::GenericAlias(_) | Type::SubclassOf(_) => ty
                 .to_meta_type(db, env)
-                .class_object_member(db, env, name, policy),
+                .class_object_member_with_presence(db, env, name, policy),
 
             _ => ty
                 .to_meta_type(db, env)
-                .find_name_in_mro_with_policy(db, env, name, policy)
+                .find_name_in_mro_with_presence(db, env, name, policy)
                 .expect(
                     "`Type::find_name_in_mro()` should return `Some()` \
                     when called on a meta-type",
@@ -4804,7 +4863,7 @@ impl<'db> Type<'db> {
         if let Some(literal) = ty.literal_member_representative(key.name(db)) {
             return literal.class_member_with_policy(db, env, key.name(db), key.policy(db));
         }
-        Self::class_member_with_policy_inner(db, key)
+        Self::class_member_with_policy_inner(db, key).member
     }
 
     /// Look up attributes stored in the namespace of a class object.
@@ -4819,8 +4878,19 @@ impl<'db> Type<'db> {
         name: &str,
         policy: MemberLookupPolicy,
     ) -> PlaceAndQualifiers<'db> {
+        self.class_object_member_with_presence(db, env, name, policy)
+            .member
+    }
+
+    fn class_object_member_with_presence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+        policy: MemberLookupPolicy,
+    ) -> class::ClassMemberLookup<'db> {
         let class_attr = self
-            .find_name_in_mro_with_policy(db, env, name, policy)
+            .find_name_in_mro_with_presence(db, env, name, policy)
             .expect(
                 "Calling `class_object_member` on class literals and subclass-of types \
                 should always find an MRO",
@@ -4864,7 +4934,7 @@ impl<'db> Type<'db> {
         else {
             return class_attr;
         };
-        let metaclass_attr = metaclass_instance.instance_member(db, env, name);
+        let metaclass_attr = metaclass_instance.instance_member_with_presence(db, env, name);
 
         if own_declaration_definedness.is_some() {
             // A conditionally-declared attribute is a contract only on paths where that
@@ -4917,8 +4987,20 @@ impl<'db> Type<'db> {
         name: &str,
         policy: MemberLookupPolicy,
     ) -> PlaceAndQualifiers<'db> {
+        self.class_namespace_member_with_presence(db, env, class, name, policy)
+            .member
+    }
+
+    fn class_namespace_member_with_presence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        class: ClassType<'db>,
+        name: &str,
+        policy: MemberLookupPolicy,
+    ) -> class::ClassMemberLookup<'db> {
         let class_attr = self
-            .find_name_in_mro_with_policy(db, env, name, policy)
+            .find_name_in_mro_with_presence(db, env, name, policy)
             .expect("The meta-type of an instance-like type should always have an MRO");
         let Some(metaclass) = class
             .inferred_metaclass(db)
@@ -4928,15 +5010,16 @@ impl<'db> Type<'db> {
         else {
             return class_attr;
         };
-        let metaclass_member = metaclass.instance_member(db, env, name);
-        if metaclass_member.is_undefined() {
+        let metaclass_member = metaclass.instance_member_with_presence(db, env, name);
+        if metaclass_member.member.is_undefined() {
             return class_attr;
         }
         let metaclass_member_is_implicit = metaclass_member
+            .member
             .qualifiers
             .contains(TypeQualifiers::IMPLICIT_INSTANCE_ATTRIBUTE);
 
-        let own_class_member = class.class_literal(db).class_member_from_mro(
+        let own_class_member = class.class_literal(db).class_member_from_mro_with_presence(
             db,
             env,
             name,
@@ -4945,7 +5028,7 @@ impl<'db> Type<'db> {
         );
         // A non-ClassVar declaration-only member describes instance storage but does not add a
         // value to the class namespace.
-        let own_class_member = if !own_class_member.is_class_var()
+        let own_class_member = if !own_class_member.member.is_class_var()
             && class.static_class_literal(db).is_some_and(|(class, _)| {
                 let scope = class.body_scope(db);
                 place_table(db, scope)
@@ -4960,11 +5043,11 @@ impl<'db> Type<'db> {
                         .is_undefined()
                     })
             }) {
-            PlaceAndQualifiers::default()
+            class::ClassMemberLookup::default()
         } else {
             own_class_member
         };
-        let inherited_class_member = class.class_literal(db).class_member_from_mro(
+        let inherited_class_member = class.class_literal(db).class_member_from_mro_with_presence(
             db,
             env,
             name,
@@ -4973,7 +5056,13 @@ impl<'db> Type<'db> {
         );
 
         let metaclass_member = if metaclass_member_is_implicit {
-            Self::with_definedness(metaclass_member, Definedness::PossiblyUndefined)
+            class::ClassMemberLookup {
+                member: Self::with_definedness(
+                    metaclass_member.member,
+                    Definedness::PossiblyUndefined,
+                ),
+                declared_presence: metaclass_member.declared_presence,
+            }
         } else {
             metaclass_member
         };
@@ -4983,56 +5072,67 @@ impl<'db> Type<'db> {
         let class_member = if metaclass_member_is_implicit {
             // Preserve the existing convention that an inferred instance member is assumed to be
             // available even when no lower-precedence fallback exists.
-            Self::with_definedness(class_member, Definedness::AlwaysDefined)
+            class::ClassMemberLookup {
+                member: Self::with_definedness(class_member.member, Definedness::AlwaysDefined),
+                declared_presence: class_member.declared_presence || metaclass_member_is_implicit,
+            }
         } else {
             class_member
         };
         if policy.no_instance_fallback() || policy.require_concrete() {
             return class_member;
         }
-        let Some(dynamic_instance_type) = class.iter_mro(db).find_map(|base| match base {
-            ClassBase::Any | ClassBase::Dynamic(_) | ClassBase::Divergent(_) => {
-                Some(Type::from(base))
-            }
-            _ => None,
-        }) else {
-            return class_member;
-        };
-        let dynamic_instance_fallback = Place::bound(dynamic_instance_type).into();
+        let declared_presence = class_member.declared_presence;
+        let member = (|| {
+            let class_member = class_member.member;
+            let Some(dynamic_instance_type) = class.iter_mro(db).find_map(|base| match base {
+                ClassBase::Any | ClassBase::Dynamic(_) | ClassBase::Divergent(_) => {
+                    Some(Type::from(base))
+                }
+                _ => None,
+            }) else {
+                return class_member;
+            };
+            let dynamic_instance_fallback = Place::bound(dynamic_instance_type).into();
 
-        // A dynamic base can provide arbitrary instance storage that shadows non-data class
-        // attributes. Preserve only the data-descriptor alternatives before falling back to the
-        // actual dynamic type.
-        let Some(class_member_ty) = class_member.ignore_possibly_undefined() else {
-            return dynamic_instance_fallback;
-        };
-        if !class_member_ty.may_be_data_descriptor(db, env) {
-            return dynamic_instance_fallback;
+            // A dynamic base can provide arbitrary instance storage that shadows non-data class
+            // attributes. Preserve only the data-descriptor alternatives before falling back to the
+            // actual dynamic type.
+            let Some(class_member_ty) = class_member.ignore_possibly_undefined() else {
+                return dynamic_instance_fallback;
+            };
+            if !class_member_ty.may_be_data_descriptor(db, env) {
+                return dynamic_instance_fallback;
+            }
+            let PlaceAndQualifiers {
+                place: Place::Defined(declaration),
+                qualifiers,
+            } = class_member
+            else {
+                return dynamic_instance_fallback;
+            };
+            let mut all_arms_are_possible_data_descriptors = true;
+            let descriptor_ty = declaration.ty.filter_union(db, env, |ty| {
+                let is_possible_data_descriptor = ty.may_be_data_descriptor(db, env);
+                all_arms_are_possible_data_descriptors &= is_possible_data_descriptor;
+                is_possible_data_descriptor
+            });
+            Place::Defined(DefinedPlace {
+                ty: descriptor_ty,
+                definedness: if all_arms_are_possible_data_descriptors {
+                    declaration.definedness
+                } else {
+                    Definedness::PossiblyUndefined
+                },
+                ..declaration
+            })
+            .with_qualifiers(qualifiers)
+            .or_fall_back_to(db, env, || dynamic_instance_fallback)
+        })();
+        class::ClassMemberLookup {
+            member,
+            declared_presence,
         }
-        let PlaceAndQualifiers {
-            place: Place::Defined(declaration),
-            qualifiers,
-        } = class_member
-        else {
-            return dynamic_instance_fallback;
-        };
-        let mut all_arms_are_possible_data_descriptors = true;
-        let descriptor_ty = declaration.ty.filter_union(db, env, |ty| {
-            let is_possible_data_descriptor = ty.may_be_data_descriptor(db, env);
-            all_arms_are_possible_data_descriptors &= is_possible_data_descriptor;
-            is_possible_data_descriptor
-        });
-        Place::Defined(DefinedPlace {
-            ty: descriptor_ty,
-            definedness: if all_arms_are_possible_data_descriptors {
-                declaration.definedness
-            } else {
-                Definedness::PossiblyUndefined
-            },
-            ..declaration
-        })
-        .with_qualifiers(qualifiers)
-        .or_fall_back_to(db, env, || dynamic_instance_fallback)
     }
 
     /// This function roughly corresponds to looking up an attribute in the `__dict__` of an object.
@@ -5057,103 +5157,142 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         name: &str,
     ) -> PlaceAndQualifiers<'db> {
+        self.instance_member_with_presence(db, env, name).member
+    }
+
+    fn instance_member_with_presence(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+    ) -> class::ClassMemberLookup<'db> {
         match self {
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
-            Type::Union(union) => union.map_with_boundness_and_qualifiers(db, env, |elem| {
-                elem.instance_member(db, env, name)
-            }),
+            Type::Union(union) => {
+                let mut declared_presence = true;
+                let member = union.map_with_boundness_and_qualifiers(db, env, |elem| {
+                    let lookup = elem.instance_member_with_presence(db, env, name);
+                    declared_presence &= lookup.declared_presence;
+                    lookup.member
+                });
+                class::ClassMemberLookup {
+                    member,
+                    declared_presence,
+                }
+            }
 
             Type::Intersection(intersection) => {
                 if let Some(complement) = intersection.enum_complement(db, env) {
-                    enums::instance_member_for_enum_complement(db, env, complement, name)
+                    enums::instance_member_for_enum_complement(db, env, complement, name).into()
                 } else {
-                    intersection.map_with_boundness_and_qualifiers(db, env, |elem| {
-                        elem.instance_member(db, env, name)
-                    })
+                    let mut declared_presence = false;
+                    let member = intersection.map_with_boundness_and_qualifiers(db, env, |elem| {
+                        let lookup = elem.instance_member_with_presence(db, env, name);
+                        declared_presence |= lookup.declared_presence;
+                        lookup.member
+                    });
+                    class::ClassMemberLookup {
+                        member,
+                        declared_presence,
+                    }
                 }
             }
 
             Type::EnumComplement(complement) => {
-                enums::instance_member_for_enum_complement(db, env, *complement, name)
+                enums::instance_member_for_enum_complement(db, env, *complement, name).into()
             }
 
             Type::Recursive(recursive) => recursive
                 .unfold(db, env)
-                .map(|unfolded| unfolded.instance_member(db, env, name))
-                .unwrap_or(Place::bound(self).into()),
+                .map(|unfolded| unfolded.instance_member_with_presence(db, env, name))
+                .unwrap_or(class::ClassMemberLookup::unproven(
+                    Place::bound(self).into(),
+                )),
 
-            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => Place::bound(self).into(),
-
-            Type::NominalInstance(instance) => {
-                instance.class(db, env).instance_member(db, env, name)
+            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => {
+                class::ClassMemberLookup::unproven(Place::bound(self).into())
             }
+
+            Type::NominalInstance(instance) => instance
+                .class(db, env)
+                .instance_member_with_presence(db, env, name),
             Type::NewTypeInstance(newtype) => newtype
                 .concrete_base_type(db)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
 
-            Type::ProtocolInstance(protocol) => protocol.instance_member(db, env, name),
+            Type::ProtocolInstance(protocol) => protocol.instance_member(db, env, name).into(),
 
             Type::FunctionLiteral(function) => function
                 .runtime_class(db)
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
 
             Type::BoundMethod(_) => KnownClass::MethodType
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
             Type::KnownBoundMethod(method) => method
                 .class()
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
             Type::WrapperDescriptor(_) => KnownClass::WrapperDescriptorType
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
             Type::DataclassDecorator(_) => KnownClass::FunctionType
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
             Type::Callable(_) | Type::DataclassTransformer(_) => {
-                Type::object().instance_member(db, env, name)
+                Type::object().instance_member_with_presence(db, env, name)
             }
 
             Type::TypeVar(bound_typevar) => {
                 match bound_typevar.require_bound_or_constraints(db, env) {
                     TypeVarBoundOrConstraints::UpperBound(bound) => {
-                        bound.instance_member(db, env, name)
+                        bound.instance_member_with_presence(db, env, name)
                     }
-                    TypeVarBoundOrConstraints::Constraints(constraints) => constraints
-                        .map_with_boundness_and_qualifiers(db, env, |constraint| {
-                            constraint.instance_member(db, env, name)
-                        }),
+                    TypeVarBoundOrConstraints::Constraints(constraints) => {
+                        let mut declared_presence = true;
+                        let member =
+                            constraints.map_with_boundness_and_qualifiers(db, env, |constraint| {
+                                let lookup =
+                                    constraint.instance_member_with_presence(db, env, name);
+                                declared_presence &= lookup.declared_presence;
+                                lookup.member
+                            });
+                        class::ClassMemberLookup {
+                            member,
+                            declared_presence,
+                        }
+                    }
                 }
             }
 
             Type::TypeIs(_) | Type::TypeGuard(_) => KnownClass::Bool
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
 
             Type::LiteralValue(literal) => literal
                 .fallback_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
 
             Type::AlwaysTruthy | Type::AlwaysFalsy | Type::TypeForm(_) => {
-                Type::object().instance_member(db, env, name)
+                Type::object().instance_member_with_presence(db, env, name)
             }
             Type::ModuleLiteral(_) => KnownClass::ModuleType
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
 
             Type::SpecialForm(_) | Type::KnownInstance(_) => Place::Undefined.into(),
 
             Type::PropertyInstance(property) => property
                 .instance_class(db)
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
 
             Type::SlotDescriptor(_) => KnownClass::MemberDescriptorType
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
 
             // Note: `super(pivot, owner).__dict__` refers to the `__dict__` of the `builtins.super` instance,
             // not that of the owner.
@@ -5162,7 +5301,7 @@ impl<'db> Type<'db> {
             // refer to [`Type::member`] instead.
             Type::BoundSuper(_) => KnownClass::Super
                 .to_instance(db, env)
-                .instance_member(db, env, name),
+                .instance_member_with_presence(db, env, name),
 
             // TODO: we currently don't model the fact that class literals and subclass-of types have
             // a `__dict__` that is filled with class level attributes. Modeling this is currently not
@@ -5174,7 +5313,9 @@ impl<'db> Type<'db> {
 
             Type::TypedDict(_) => Place::Undefined.into(),
 
-            Type::TypeAlias(alias) => alias.value_type(db).instance_member(db, env, name),
+            Type::TypeAlias(alias) => alias
+                .value_type(db)
+                .instance_member_with_presence(db, env, name),
         }
     }
 

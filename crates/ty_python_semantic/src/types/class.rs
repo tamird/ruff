@@ -830,12 +830,31 @@ impl<'db> ClassLiteral<'db> {
         name: &str,
         policy: MemberLookupPolicy,
     ) -> PlaceAndQualifiers<'db> {
+        self.class_member_with_presence(db, env, name, policy)
+            .member
+    }
+
+    pub(super) fn class_member_with_presence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+        policy: MemberLookupPolicy,
+    ) -> ClassMemberLookup<'db> {
         match self {
-            Self::Static(class) => class.class_member(db, env, name, policy),
-            Self::Dynamic(class) => class.class_member(db, env, name, policy),
-            Self::DynamicNamedTuple(namedtuple) => namedtuple.class_member(db, env, name, policy),
-            Self::DynamicTypedDict(typeddict) => typeddict.class_member(db, env, name, policy),
-            Self::DynamicEnum(enum_lit) => enum_lit.class_member(db, env, name, policy),
+            Self::Static(class) => {
+                class.class_member_inner_with_presence(db, env, None, name, policy)
+            }
+            Self::Dynamic(class) => class.class_member_with_presence(db, env, name, policy),
+            Self::DynamicNamedTuple(namedtuple) => {
+                namedtuple.class_member_with_presence(db, env, name, policy)
+            }
+            Self::DynamicTypedDict(typeddict) => {
+                typeddict.class_member(db, env, name, policy).into()
+            }
+            Self::DynamicEnum(enum_lit) => {
+                enum_lit.class_member_with_presence(db, env, name, policy)
+            }
         }
     }
 
@@ -850,8 +869,22 @@ impl<'db> ClassLiteral<'db> {
         policy: MemberLookupPolicy,
         mro_iter: impl Iterator<Item = ClassBase<'db>>,
     ) -> PlaceAndQualifiers<'db> {
+        self.class_member_from_mro_with_presence(db, env, name, policy, mro_iter)
+            .member
+    }
+
+    pub(super) fn class_member_from_mro_with_presence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+        policy: MemberLookupPolicy,
+        mro_iter: impl Iterator<Item = ClassBase<'db>>,
+    ) -> ClassMemberLookup<'db> {
         match self {
-            Self::Static(class) => class.class_member_from_mro(db, env, name, policy, mro_iter),
+            Self::Static(class) => {
+                class.class_member_from_mro_with_presence(db, env, name, policy, mro_iter)
+            }
             Self::Dynamic(_)
             | Self::DynamicNamedTuple(_)
             | Self::DynamicTypedDict(_)
@@ -863,6 +896,7 @@ impl<'db> ClassLiteral<'db> {
                     ClassMemberResult::Done(result) => result.finalize(db, env),
                     ClassMemberResult::TypedDict(module) => {
                         typed_dict::typed_dict_fallback_class_member(db, env, module, policy, name)
+                            .into()
                     }
                 }
             }
@@ -1151,12 +1185,27 @@ impl<'db> ClassLiteral<'db> {
         specialization: Option<Specialization<'db>>,
         name: &str,
     ) -> PlaceAndQualifiers<'db> {
+        self.instance_member_with_presence(db, env, specialization, name)
+            .member
+    }
+
+    pub(super) fn instance_member_with_presence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        specialization: Option<Specialization<'db>>,
+        name: &str,
+    ) -> ClassMemberLookup<'db> {
         match self {
-            Self::Static(class) => class.instance_member(db, env, specialization, name),
-            Self::Dynamic(class) => class.instance_member(db, env, name),
-            Self::DynamicNamedTuple(namedtuple) => namedtuple.instance_member(db, env, name),
-            Self::DynamicTypedDict(_) => PlaceAndQualifiers::default(),
-            Self::DynamicEnum(enum_lit) => enum_lit.instance_member(db, env, name),
+            Self::Static(class) => {
+                class.instance_member_with_presence(db, env, specialization, name)
+            }
+            Self::Dynamic(class) => class.instance_member_with_presence(db, env, name),
+            Self::DynamicNamedTuple(namedtuple) => {
+                namedtuple.instance_member_with_presence(db, env, name)
+            }
+            Self::DynamicTypedDict(_) => ClassMemberLookup::default(),
+            Self::DynamicEnum(enum_lit) => enum_lit.instance_member_with_presence(db, env, name),
         }
     }
 
@@ -1927,9 +1976,20 @@ impl<'db> ClassType<'db> {
         name: &str,
         policy: MemberLookupPolicy,
     ) -> PlaceAndQualifiers<'db> {
+        self.class_member_with_presence(db, env, name, policy)
+            .member
+    }
+
+    pub(super) fn class_member_with_presence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+        policy: MemberLookupPolicy,
+    ) -> ClassMemberLookup<'db> {
         match self {
-            Self::NonGeneric(class) => class.class_member(db, env, name, policy),
-            Self::Generic(generic) => generic.origin(db).class_member_inner(
+            Self::NonGeneric(class) => class.class_member_with_presence(db, env, name, policy),
+            Self::Generic(generic) => generic.origin(db).class_member_inner_with_presence(
                 db,
                 env,
                 Some(generic.specialization(db)),
@@ -2235,17 +2295,28 @@ impl<'db> ClassType<'db> {
         env: &ProgramEnvironment<'db>,
         name: &str,
     ) -> PlaceAndQualifiers<'db> {
+        self.instance_member_with_presence(db, env, name).member
+    }
+
+    pub(super) fn instance_member_with_presence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+    ) -> ClassMemberLookup<'db> {
         match self {
-            Self::NonGeneric(ClassLiteral::Dynamic(class)) => class.instance_member(db, env, name),
-            Self::NonGeneric(ClassLiteral::DynamicNamedTuple(namedtuple)) => {
-                namedtuple.instance_member(db, env, name)
+            Self::NonGeneric(ClassLiteral::Dynamic(class)) => {
+                class.instance_member_with_presence(db, env, name)
             }
-            Self::NonGeneric(ClassLiteral::DynamicTypedDict(_)) => PlaceAndQualifiers::default(),
+            Self::NonGeneric(ClassLiteral::DynamicNamedTuple(namedtuple)) => {
+                namedtuple.instance_member_with_presence(db, env, name)
+            }
+            Self::NonGeneric(ClassLiteral::DynamicTypedDict(_)) => ClassMemberLookup::default(),
             Self::NonGeneric(ClassLiteral::DynamicEnum(enum_lit)) => {
-                enum_lit.instance_member(db, env, name)
+                enum_lit.instance_member_with_presence(db, env, name)
             }
             Self::NonGeneric(ClassLiteral::Static(class)) => {
-                class.instance_member(db, env, None, name)
+                class.instance_member_with_presence(db, env, None, name)
             }
             Self::Generic(generic) => {
                 let class_literal = generic.origin(db);
@@ -2255,7 +2326,7 @@ impl<'db> ClassType<'db> {
                 // Applying the receiver's specialization again would also substitute type
                 // variables inside the replacement types. For example, applying `T -> list[T]`
                 // twice changes an attribute's type from `list[T]` to `list[list[T]]`.
-                class_literal.instance_member(db, env, specialization, name)
+                class_literal.instance_member_with_presence(db, env, specialization, name)
             }
         }
     }
@@ -3057,12 +3128,14 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
     ) -> ClassMemberResult<'db> {
         let db = self.db;
 
+        let mut declared_presence = false;
         let mut dynamic_type: Option<Type<'db>> = None;
         let mut lookup_result: LookupResult<'db> =
             Err(LookupError::Undefined(TypeQualifiers::empty()));
         let mut pending_augmented_bindings = Vec::new();
 
         for superclass in self.mro_iter {
+            let dispatch_complete = lookup_result.is_ok();
             match superclass {
                 ClassBase::Generic | ClassBase::Protocol => {
                     // Skip over these very special class bases that aren't really classes.
@@ -3072,10 +3145,14 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                     // Note: calling `Type::from(superclass).member()` would be incorrect here.
                     // What we'd really want is a `Type::Any.own_class_member()` method,
                     // but adding such a method wouldn't make much sense -- it would always return `Any`!
-                    dynamic_type.get_or_insert(Type::from(superclass));
+                    if !dispatch_complete {
+                        dynamic_type.get_or_insert(Type::from(superclass));
+                    }
                 }
                 ClassBase::Divergent(_) => {
-                    dynamic_type.get_or_insert(Type::from(superclass));
+                    if !dispatch_complete {
+                        dynamic_type.get_or_insert(Type::from(superclass));
+                    }
                 }
                 ClassBase::Class(class) => {
                     let known = class.known(db);
@@ -3098,9 +3175,32 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                         continue;
                     }
 
+                    let (own_member, own_declared_presence) = match class {
+                        ClassType::NonGeneric(ClassLiteral::Dynamic(dynamic)) => {
+                            dynamic.own_class_member_with_presence(db, name)
+                        }
+                        _ => {
+                            let member = class.own_class_member(
+                                db,
+                                &self.env,
+                                inherited_generic_context,
+                                name,
+                            );
+                            let declared_presence =
+                                ClassMemberLookup::from(member.inner).declared_presence;
+                            (member, declared_presence)
+                        }
+                    };
+                    declared_presence |= own_declared_presence;
+                    if dispatch_complete {
+                        if declared_presence {
+                            break;
+                        }
+                        continue;
+                    }
                     let implicit = class.member_with_augmented_bindings(
                         db,
-                        class.own_class_member(db, &self.env, inherited_generic_context, name),
+                        own_member,
                         name,
                         MethodDecorator::ClassMethod,
                     );
@@ -3109,6 +3209,8 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                     }
 
                     let mut member = implicit.member.inner;
+                    declared_presence |=
+                        own_declared_presence && ClassMemberLookup::from(member).declared_presence;
                     if let Place::Defined(defined) = &mut member.place
                         && !pending_augmented_bindings.is_empty()
                     {
@@ -3135,10 +3237,12 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                     });
                 }
                 ClassBase::TypedDict(module) => {
-                    return ClassMemberResult::TypedDict(module);
+                    if !dispatch_complete {
+                        return ClassMemberResult::TypedDict(module);
+                    }
                 }
             }
-            if lookup_result.is_ok() {
+            if lookup_result.is_ok() && declared_presence {
                 break;
             }
         }
@@ -3146,6 +3250,7 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
         ClassMemberResult::Done(CompletedMemberLookup {
             lookup_result,
             dynamic_type,
+            declared_presence,
         })
     }
 
@@ -3164,6 +3269,7 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
         // Collect the inputs in MRO order so their normalization can be reused.
         let mut types = SmallVec::<[Type<'db>; 1]>::new();
         let mut known_nonempty = false;
+        let mut declared_presence = false;
         let combined_type = |types: &[Type<'db>]| {
             if types.is_empty() {
                 return Type::Never;
@@ -3184,10 +3290,18 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                     // We already return the dynamic type for class member lookup, so we can
                     // just return unbound here (to avoid having to build a union of the
                     // dynamic type with itself).
-                    return InstanceMemberResult::Done(PlaceAndQualifiers::unbound());
+                    return InstanceMemberResult::Done(ClassMemberLookup::unproven(
+                        PlaceAndQualifiers::unbound(),
+                    ));
                 }
                 ClassBase::Class(class) => {
                     let member = class.own_instance_member(db, &self.env, name);
+                    let concrete_member = !matches!(
+                        class,
+                        ClassType::NonGeneric(ClassLiteral::DynamicNamedTuple(_))
+                    );
+                    declared_presence |=
+                        concrete_member && ClassMemberLookup::from(member.inner).declared_presence;
                     let definitely_declared = matches!(
                         member.inner.place,
                         Place::Defined(place) if place.is_definitely_defined()
@@ -3206,7 +3320,10 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                         if !overriding_class_default {
                             // Annotations take precedence over inferred writes, including augmented
                             // assignments. Avoid inferring method bodies just to discard their types.
-                            return InstanceMemberResult::Done(member.inner);
+                            return InstanceMemberResult::Done(ClassMemberLookup {
+                                member: member.inner,
+                                declared_presence,
+                            });
                         }
                     }
 
@@ -3289,7 +3406,10 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                             // Once a type contributes, later defaults cannot make the union
                             // empty. Avoid interning a growing union at each default.
                             if !known_nonempty && combined_type(&types) == Type::Never {
-                                return InstanceMemberResult::Done(class_member.inner);
+                                return InstanceMemberResult::Done(ClassMemberLookup {
+                                    member: class_member.inner,
+                                    declared_presence,
+                                });
                             }
                             known_nonempty = true;
 
@@ -3340,7 +3460,10 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
             .with_qualifiers(union_qualifiers)
         };
 
-        InstanceMemberResult::Done(result)
+        InstanceMemberResult::Done(ClassMemberLookup {
+            member: result,
+            declared_presence,
+        })
     }
 }
 
@@ -3352,18 +3475,87 @@ pub(super) enum ClassMemberResult<'db> {
     TypedDict(TypingModule),
 }
 
+/// A member's dispatch value and presence established by concrete declarations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
+pub(super) struct ClassMemberLookup<'db> {
+    pub(super) member: PlaceAndQualifiers<'db>,
+    pub(super) declared_presence: bool,
+}
+
+impl<'db> From<PlaceAndQualifiers<'db>> for ClassMemberLookup<'db> {
+    fn from(member: PlaceAndQualifiers<'db>) -> Self {
+        Self {
+            declared_presence: member.place.is_definitely_bound()
+                && !member
+                    .ignore_possibly_undefined()
+                    .is_some_and(|ty| ty.is_divergent()),
+            member,
+        }
+    }
+}
+
+impl<'db> From<Place<'db>> for ClassMemberLookup<'db> {
+    fn from(place: Place<'db>) -> Self {
+        PlaceAndQualifiers::from(place).into()
+    }
+}
+
+impl<'db> ClassMemberLookup<'db> {
+    pub(super) fn unproven(member: PlaceAndQualifiers<'db>) -> Self {
+        Self {
+            member,
+            declared_presence: false,
+        }
+    }
+
+    pub(super) fn map_type(self, f: impl FnOnce(Type<'db>) -> Type<'db>) -> Self {
+        let Self {
+            member,
+            declared_presence,
+        } = self;
+        Self {
+            member: member.map_type(f),
+            declared_presence,
+        }
+    }
+
+    pub(super) fn or_fall_back_to(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        fallback: impl FnOnce() -> Self,
+    ) -> Self {
+        let Self {
+            member,
+            declared_presence,
+        } = self;
+        if member.place.is_definitely_bound() && declared_presence {
+            return self;
+        }
+        let fallback = fallback();
+        Self {
+            member: member.or_fall_back_to(db, env, || fallback.member),
+            declared_presence: declared_presence || fallback.declared_presence,
+        }
+    }
+}
+
 pub(super) struct CompletedMemberLookup<'db> {
     lookup_result: LookupResult<'db>,
     dynamic_type: Option<Type<'db>>,
+    declared_presence: bool,
 }
 
 impl<'db> CompletedMemberLookup<'db> {
     /// Finalize the lookup result by handling dynamic type intersection.
-    fn finalize(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> PlaceAndQualifiers<'db> {
-        match (
-            PlaceAndQualifiers::from(self.lookup_result),
-            self.dynamic_type,
-        ) {
+    fn finalize(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> ClassMemberLookup<'db> {
+        let Self {
+            lookup_result,
+            dynamic_type,
+            declared_presence,
+        } = self;
+        let concrete_member = PlaceAndQualifiers::from(lookup_result);
+        let member = match (concrete_member, dynamic_type) {
             (symbol_and_qualifiers, None) => symbol_and_qualifiers,
 
             (
@@ -3383,6 +3575,10 @@ impl<'db> CompletedMemberLookup<'db> {
                 },
                 Some(dynamic),
             ) => Place::bound(dynamic).with_qualifiers(qualifiers),
+        };
+        ClassMemberLookup {
+            member,
+            declared_presence,
         }
     }
 }
@@ -3391,7 +3587,7 @@ impl<'db> CompletedMemberLookup<'db> {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(super) enum InstanceMemberResult<'db> {
     /// Found the member or exhausted the MRO
-    Done(PlaceAndQualifiers<'db>),
+    Done(ClassMemberLookup<'db>),
     /// Encountered a `TypedDict` base - caller should handle this specially
     TypedDict,
 }

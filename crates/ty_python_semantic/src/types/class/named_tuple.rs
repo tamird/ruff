@@ -5,13 +5,16 @@ use ruff_text_size::TextRange;
 
 use crate::{
     Db,
-    place::{Place, PlaceAndQualifiers},
+    place::Place,
     types::{
         BindingContext, BoundTypeVarInstance, ClassBase, ClassLiteral, ClassType, GenericContext,
         KnownClass, KnownInstanceType, MemberLookupPolicy, Parameter, Parameters,
         PropertyInstanceType, SelfTypeVarOrigin, Signature, SubclassOfType, Type, TypeContext,
         TypeMapping,
-        class::{DynamicClassHeaderAnchor, DynamicClassScopeOffset, dynamic_class_header_range},
+        class::{
+            ClassMemberLookup, DynamicClassHeaderAnchor, DynamicClassScopeOffset,
+            dynamic_class_header_range,
+        },
         definition_expression_type,
         member::Member,
         mro::Mro,
@@ -303,46 +306,41 @@ impl<'db> DynamicNamedTupleLiteral<'db> {
     }
 
     /// Look up an instance member by name (including superclasses).
-    pub(crate) fn instance_member(
+    pub(in crate::types) fn instance_member_with_presence(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
-    ) -> PlaceAndQualifiers<'db> {
-        // First check own instance members.
-        let result = self.own_instance_member(db, name);
-        if !result.is_undefined() {
-            return result.inner;
+    ) -> ClassMemberLookup<'db> {
+        // Unknown fields permit arbitrary access without establishing a concrete declaration.
+        if !self.has_known_fields(db) {
+            return ClassMemberLookup::unproven(Place::declared(Type::any()).into());
         }
 
-        // Fall back to the tuple base type for other attributes.
-        Type::instance(db, env, self.tuple_base_class(db, env)).instance_member(db, env, name)
+        Type::instance(db, env, self.tuple_base_class(db, env))
+            .instance_member_with_presence(db, env, name)
     }
 
     /// Look up a class-level member by name.
-    pub(crate) fn class_member(
+    pub(super) fn class_member_with_presence(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         name: &str,
         policy: MemberLookupPolicy,
-    ) -> PlaceAndQualifiers<'db> {
-        // First check synthesized members and fields.
+    ) -> ClassMemberLookup<'db> {
         let member = self.own_class_member(db, name);
         if !member.is_undefined() {
-            return member.inner;
+            return member.inner.into();
         }
 
-        // Fall back to tuple class members.
         let result = self
             .tuple_base_class(db, env)
             .class_literal(db)
-            .class_member(db, env, name, policy);
+            .class_member_with_presence(db, env, name, policy);
 
-        // If fields are unknown (dynamic) and the attribute wasn't found,
-        // return `Any` instead of failing.
-        if !self.has_known_fields(db) && result.place.is_undefined() {
-            return Place::bound(Type::any()).into();
+        if !self.has_known_fields(db) && result.member.is_undefined() {
+            return ClassMemberLookup::unproven(Place::bound(Type::any()).into());
         }
 
         result
