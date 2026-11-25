@@ -127,7 +127,7 @@ impl VendoredFileSystem {
     }
 
     /// Read the direct children of the directory
-    /// identified by `path`.
+    /// identified by `path`. An empty path lists the archive root.
     ///
     /// If `path` is not a directory, then this will
     /// return an empty iterator.
@@ -135,10 +135,13 @@ impl VendoredFileSystem {
         &self,
         dir: impl AsRef<VendoredPath>,
     ) -> impl Iterator<Item = DirectoryEntry> + '_ {
-        let directory_prefix = NormalizedVendoredPath::from(dir.as_ref())
-            .with_trailing_slash()
-            .0
-            .into_owned();
+        let directory = NormalizedVendoredPath::from(dir.as_ref());
+        let directory_prefix = if directory.0.is_empty() {
+            directory
+        } else {
+            directory.with_trailing_slash()
+        };
+        let directory_prefix = directory_prefix.0.into_owned();
 
         self.inner.0.file_names().filter_map(move |name| {
             let name = name.expect("vendored paths are valid UTF-8");
@@ -634,6 +637,14 @@ pub(crate) mod tests {
             .collect::<Vec<String>>();
         paths.sort();
         paths.join("\n")
+    }
+
+    #[test]
+    fn read_directory_root() {
+        let mock_typeshed = mock_typeshed();
+        for path in ["", ".", "stdlib/.."] {
+            assert_eq!(readdir_snapshot(&mock_typeshed, path), "vendored://stdlib/");
+        }
     }
 
     #[test]
