@@ -1939,6 +1939,77 @@ impl<'db> ClassType<'db> {
         }
     }
 
+    /// Prove presence from the class MRO without interpreting descriptors. Limit the proof
+    /// to static names: functional classes can synthesize bound members for unknown names.
+    pub(super) fn has_concrete_class_member(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+        for_instance: bool,
+    ) -> bool {
+        let mut policy = MemberLookupPolicy::REQUIRE_CONCRETE;
+        if for_instance
+            && name == "__dict__"
+            && self
+                .static_class_literal(db)
+                .is_some_and(|(class, _)| class.lacks_instance_storage(db, name))
+        {
+            // As in ordinary instance lookup, the typeshed object.__dict__ fallback
+            // does not describe storage on a slotted instance.
+            policy |= MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK;
+        }
+        let bases = self.iter_mro(db).filter(|base| {
+            matches!(base, ClassBase::Class(class) if class.static_class_literal(db).is_some())
+        });
+        match MroLookup::new(db, env, bases).class_member(
+            name,
+            policy,
+            None,
+            self.known(db) == Some(KnownClass::Object),
+        ) {
+            ClassMemberResult::Done(CompletedMemberLookup {
+                lookup_result: Ok(member),
+                dynamic_type: _,
+            }) => !member.inner_type().is_divergent(),
+            _ => false,
+        }
+    }
+
+    /// Prove receiver storage from the known part of the MRO. The normal instance lookup
+    /// stops at a dynamic base. Also stop before functional classes can supply synthetic storage.
+    pub(super) fn has_concrete_instance_member(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+    ) -> bool {
+        let Some((class, _)) = self.static_class_literal(db) else {
+            return false;
+        };
+        if class.lacks_instance_storage(db, name) {
+            return false;
+        }
+        let bases = self.iter_mro(db).map(|base| match base {
+            ClassBase::Class(class) if class.static_class_literal(db).is_none() => ClassBase::Any,
+            base => base,
+        });
+        match MroLookup::new(db, env, bases).instance_member(name) {
+            InstanceMemberResult::Done(PlaceAndQualifiers {
+                place:
+                    Place::Defined(DefinedPlace {
+                        ty,
+                        definedness: Definedness::AlwaysDefined,
+                        origin: _,
+                        public_type_policy: _,
+                        provenance: _,
+                    }),
+                qualifiers: _,
+            }) => !ty.is_divergent(),
+            _ => false,
+        }
+    }
+
     /// Returns the inferred type of the class member named `name`. Only bound members
     /// or those marked as `ClassVars` are considered.
     ///

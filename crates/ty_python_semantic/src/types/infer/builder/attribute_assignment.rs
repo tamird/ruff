@@ -12,16 +12,16 @@ use crate::types::attribute_write::{
     instance_setattr_dispatch, property_setter_returns_never,
 };
 use crate::types::call::{Bindings, CallArguments, CallDiagnosticOverride, CallError};
-use crate::types::class::FrozenDataclassDispatch;
+use crate::types::class::{ClassType, FrozenDataclassDispatch};
 use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
     DEPRECATED, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS, MISSING_ATTRIBUTE, MISSING_SLOT,
-    report_bad_dunder_set_call, report_invalid_attribute_assignment,
+    POSSIBLY_MISSING_ATTRIBUTE, report_bad_dunder_set_call, report_invalid_attribute_assignment,
     report_possibly_missing_attribute,
 };
 use crate::types::{
     CallDunderError, DisplaySettings, MemberLookupPolicy, PropertyDeprecations, Type, TypeContext,
-    TypeQualifiers,
+    TypeQualifiers, TypeVarBoundOrConstraints,
 };
 use crate::{Db, ProgramEnvironment};
 
@@ -51,6 +51,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             value,
             object_ty,
             attribute,
+            requirement: &requirement,
+            definitely_present: None,
             infer_value_ty: MultiInferenceGuard::new(infer_value_ty),
         };
         let valid = evaluator.evaluate(&requirement, emit_diagnostics, deprecation.as_mut());
@@ -202,12 +204,57 @@ impl<'db> AttributeDeprecation<'db> {
     }
 }
 
+/// A positive intersection member can establish presence even when another member
+/// governs the write. Only use concrete class declarations and receiver storage as proof.
+fn has_concrete_attribute<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    attribute: &str,
+) -> bool {
+    let visit = |ty| has_concrete_attribute(db, env, ty, attribute);
+    let as_class = |ty: Type<'db>| -> Option<ClassType<'db>> {
+        match ty {
+            Type::SubclassOf(subclass) => subclass.subclass_of().into_class(db, env),
+            _ => ty.to_class_type(db),
+        }
+    };
+    match ty {
+        Type::Union(union) => union.elements(db).iter().copied().all(visit),
+        Type::Intersection(intersection) => intersection.positive(db).iter().copied().any(visit),
+        Type::TypeAlias(alias) => visit(alias.value_type(db)),
+        Type::TypeVar(typevar) => match typevar.typevar(db).bound_or_constraints(db, env) {
+            Some(TypeVarBoundOrConstraints::UpperBound(bound)) => bound != ty && visit(bound),
+            Some(TypeVarBoundOrConstraints::Constraints(constraints)) => {
+                constraints.elements(db).iter().copied().all(visit)
+            }
+            None => false,
+        },
+        Type::NominalInstance(instance) => {
+            let class = instance.class(db, env);
+            class.has_concrete_class_member(db, env, attribute, true)
+                || class.has_concrete_instance_member(db, env, attribute)
+        }
+        Type::ClassLiteral(_) | Type::GenericAlias(_) | Type::SubclassOf(_) => {
+            as_class(ty)
+                .is_some_and(|class| class.has_concrete_class_member(db, env, attribute, false))
+                || as_class(ty.to_meta_type(db, env)).is_some_and(|class| {
+                    class.has_concrete_class_member(db, env, attribute, false)
+                        || class.has_concrete_instance_member(db, env, attribute)
+                })
+        }
+        _ => false,
+    }
+}
+
 struct AssignmentAttributeWriteEvaluator<'a, 'db, 'ast, 'infer> {
     builder: &'a mut TypeInferenceBuilder<'db, 'ast>,
     target: &'a ast::ExprAttribute,
     value: &'a ast::Expr,
     object_ty: Type<'db>,
     attribute: &'a str,
+    requirement: &'a AttributeWriteRequirement<'db>,
+    definitely_present: Option<bool>,
     infer_value_ty: MultiInferenceGuard<'db, 'ast, 'infer>,
 }
 
@@ -1130,12 +1177,31 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                 );
             }
             AssignmentAttributeWriteDiagnostic::PossiblyMissing => {
-                report_possibly_missing_attribute(
-                    &self.builder.context,
-                    self.target,
-                    self.attribute,
-                    self.object_ty,
-                );
+                if self
+                    .builder
+                    .context
+                    .is_lint_enabled(&POSSIBLY_MISSING_ATTRIBUTE)
+                    && !*self
+                        .definitely_present
+                        .get_or_insert_with(|| match self.requirement {
+                            AttributeWriteRequirement::Any {
+                                object_ty: _,
+                                intersection,
+                                receiver: _,
+                            } => intersection
+                                .positive(db)
+                                .iter()
+                                .any(|ty| has_concrete_attribute(db, env, *ty, self.attribute)),
+                            _ => false,
+                        })
+                {
+                    report_possibly_missing_attribute(
+                        &self.builder.context,
+                        self.target,
+                        self.attribute,
+                        self.object_ty,
+                    );
+                }
             }
             AssignmentAttributeWriteDiagnostic::BadSetAttr { value_ty, failure } => {
                 failure.report_diagnostics_with_override(
